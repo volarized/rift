@@ -39,7 +39,7 @@ Greif provides a skill and an MCP server with tools and resources. Agents can us
 
 <TODO>
 
-## Why "greif"?
+## Why `greif`?
 
 There are many tools that provide code search and editing capabilities, but:
 
