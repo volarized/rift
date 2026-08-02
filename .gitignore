@@ -1,0 +1,18 @@
+# Rust
+target/
+
+# Plans: design documents live outside the tree until they become code.
+.plans/
+
+# Agents, skills, and editor state: local tooling, not project contract.
+.claude/
+.agents/
+skills-lock.json
+.DS_Store
+.idea/
+.vscode/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
