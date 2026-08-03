@@ -1,7 +1,7 @@
 import "@/app/global.css";
-import type { Metadata } from "next";
 import { RootProvider } from "fumadocs-ui/provider";
-import { Inter, Geist_Mono } from "next/font/google";
+import type { Metadata } from "next";
+import { Geist_Mono, Inter } from "next/font/google";
 import { cn } from "@/lib/utils";
 
 // Two families, per the design system: Geist Mono for display, section
@@ -25,7 +25,9 @@ export const metadata: Metadata = {
   },
   description:
     "rift is an MCP assistant that provides capabilities for agentic-driven, typesafe development. It provides tools and resources to read, search, discover and edit codebases.",
-  icons: { icon: "/logo.svg" },
+  // Next does not apply next.config `basePath` to metadata icons, so it has
+  // to be prefixed by hand or the favicon 404s under /rift.
+  icons: { icon: `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/logo.svg` },
 };
 
 export default function Layout({ children }: LayoutProps<"/">) {

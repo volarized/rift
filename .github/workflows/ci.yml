@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # DO NOT DELETE as redundant with setup-bun. setup-bun caches only the
+      # downloaded *bun executable* (`no-cache` input, `cache-hit` output —
+      # both scoped to the binary). It has no `cache:` /
+      # `cache-dependency-path` input like actions/setup-node. Dependency
+      # caching is entirely on us; without this step `bun install` refetches
+      # every package on every run.
+      #
+      # `actions/cache` paths are relative to the workspace root, NOT to
+      # `defaults.run.working-directory`. Hence the `docs/` prefixes below.
+      - name: Cache bun install
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache # $BUN_INSTALL/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('docs/bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      # Next reuses .next/cache across builds for compilation and, once
+      # `output: export` is on, for the static render. Key on sources so a
+      # content-only edit still gets a warm compiler cache via restore-keys.
+      - name: Cache Next build
+        uses: actions/cache@v6
+        with:
+          path: docs/.next/cache
+          key: >-
+            ${{ runner.os }}-next-${{ hashFiles('docs/bun.lock') }}-${{
+            hashFiles('docs/src/**', 'docs/content/**', 'docs/*.ts', 'docs/*.mjs') }}
+          restore-keys: |
+            ${{ runner.os }}-next-${{ hashFiles('docs/bun.lock') }}-
+            ${{ runner.os }}-next-
+
+      - run: bun install --frozen-lockfile
+
+      # `biome ci` = format + lint + assists (import sorting), non-mutating.
+      # Baseline is RED today (25 errors / 12 warnings) — see plan step 0.
+      - run: bunx biome ci .
+
+      # `LayoutProps`/`PageProps` are globals Next generates into .next/types.
+      # Without this, `tsc` on a cold checkout fails with TS2304 "Cannot find
+      # name 'LayoutProps'". Caching does not help — we cache .next/cache, not
+      # .next/types — and it passes locally only off a stale .next from an
+      # earlier build. `typegen` emits them without paying for a full build.
+      - run: bunx next typegen
+
+      - run: bunx tsc --noEmit
+
+      - run: bun run build
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # No toolchain action on purpose: rust-toolchain.toml already pins
+      # 1.97 + rustfmt + clippy, and rustup on the runner honours it. One
+      # source of truth; a setup action here would silently override it.
+      - uses: Swatinem/rust-cache@v2
+
+      # Verified green on main 2026-08-03, both of these.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - run: cargo test --all-features

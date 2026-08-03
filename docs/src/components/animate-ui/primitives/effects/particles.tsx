@@ -1,10 +1,10 @@
 "use client";
 
-import * as React from "react";
-import { motion, AnimatePresence, type HTMLMotionProps } from "motion/react";
+import { AnimatePresence, type HTMLMotionProps, motion } from "motion/react";
+import type * as React from "react";
 
 import { Slot, type WithAsChild } from "@/components/animate-ui/primitives/animate/slot";
-import { useIsInView, type UseIsInViewOptions } from "@/hooks/use-is-in-view";
+import { type UseIsInViewOptions, useIsInView } from "@/hooks/use-is-in-view";
 import { getStrictContext } from "@/lib/get-strict-context";
 
 type Side = "top" | "bottom" | "left" | "right";
@@ -118,6 +118,7 @@ function ParticlesEffect({
 
           return (
             <motion.div
+              // biome-ignore lint/suspicious/noArrayIndexKey: fixed-length ring of `count` particles, positioned by index and never reordered or filtered — the index IS the identity
               key={i}
               style={{ ...containerStyle, ...style }}
               initial={{ scale: 0, opacity: 0 }}
@@ -141,4 +142,4 @@ function ParticlesEffect({
   );
 }
 
-export { Particles, ParticlesEffect, type ParticlesProps, type ParticlesEffectProps };
+export { Particles, ParticlesEffect, type ParticlesEffectProps, type ParticlesProps };

@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+
+  // ┌────────────────────────────────────────────────────────────────────┐
+  // │ DO NOT ADD A `main` FIELD.                                         │
+  // │                                                                    │
+  // │ With no `main` this is an assets-only Worker: no script runs, and  │
+  // │ Cloudflare serves static asset requests free and unlimited on both │
+  // │ Free and Paid plans. Adding `main` turns every request into a      │
+  // │ billable Worker invocation. That one line is the difference        │
+  // │ between $0/mo and a metered bill.                                  │
+  // │ https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/
+  // └────────────────────────────────────────────────────────────────────┘
+  "name": "rift-docs",
+  "compatibility_date": "2026-08-03",
+
+  "assets": {
+    // Produced by `bun run pack`: dist/rift/** is the site (Next is built
+    // with basePath "/rift"), dist/404.html is a root-level not-found.
+    // No "binding" key — that is only valid alongside `main`.
+    "directory": "./dist",
+
+    // Next `trailingSlash: true` emits /rift/docs/index.html and links to
+    // /rift/docs/; auto-trailing-slash resolves both spellings.
+    "html_handling": "auto-trailing-slash",
+
+    // Serves the nearest 404.html for unmatched paths.
+    "not_found_handling": "404-page"
+  },
+
+  // Apex custom domain. Cloudflare creates the DNS record itself.
+  // Verified 2026-08-03: volar.sh had no A/CNAME records, nothing displaced.
+  "routes": [{ "pattern": "volar.sh", "custom_domain": true }],
+
+  "observability": { "enabled": true }
+}

@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { animated, useSpring, type SpringValue } from "@react-spring/three";
+import { animated, type SpringValue, useSpring } from "@react-spring/three";
 import { animated as html, useSpring as useHtmlSpring } from "@react-spring/web";
 import { Canvas, useThree } from "@react-three/fiber";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
 import { inkOpacity, useInkColor, useSurfaceColor } from "@/hooks/use-ink-color";
