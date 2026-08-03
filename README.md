@@ -1,7 +1,7 @@
 # greif - agentic development toolkit
 
 `greif` is an MCP assistant that provides capabilities for agentic-driven, typesafe development.
-It provides tools and resources to read, search, discover and edit codebases.
+It gives agents tools and resources to read, search, discover and edit codebases at scale and with high token efficiency.
 
 ## Installation
 
