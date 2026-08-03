@@ -208,7 +208,7 @@ export default function HomePage() {
       <Section wide className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
           <Statement className="max-w-125">
-            Coming soon, reach out to us if you want to get involved.
+            Coming soon, reach out if you want to get involved.
           </Statement>
           <Link
             href="mailto:contact@volar.sh"
