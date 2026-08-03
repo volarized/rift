@@ -20,11 +20,11 @@ const inter = Inter({
 
 export const metadata: Metadata = {
   title: {
-    default: 'greif — agentic development toolkit',
-    template: '%s — greif',
+    default: 'rift — agentic development toolkit',
+    template: '%s — rift',
   },
   description:
-    'greif is an MCP assistant that provides capabilities for agentic-driven, typesafe development. It provides tools and resources to read, search, discover and edit codebases.',
+    'rift is an MCP assistant that provides capabilities for agentic-driven, typesafe development. It provides tools and resources to read, search, discover and edit codebases.',
   icons: { icon: '/logo.svg' },
 };
 

@@ -9,7 +9,7 @@ rust-version = "1.97"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-greif = { path = "crates/greif" }
+rift = { path = "crates/rift" }
 clap = { version = "4.6.5", features = ["derive"] }
 
 [workspace.lints.rust]

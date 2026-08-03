@@ -7,7 +7,7 @@ import { useViewportBloom } from '@/hooks/use-viewport-bloom';
 import { cn } from '@/lib/utils';
 
 /**
- * The greif logo: an inverted triangle strung with curve stitching. Each side
+ * The rift logo: an inverted triangle strung with curve stitching. Each side
  * is subdivided, and every subdivision point is joined to its mirror on the
  * next side, so the straight strings envelope a parabola.
  *
@@ -242,7 +242,7 @@ export function Logo({
       ref={host}
       viewBox={`${-PAD} ${-PAD} ${VIEW_W + PAD * 2} ${VIEW_H + PAD * 2}`}
       role="img"
-      aria-label="greif"
+      aria-label="rift"
       className={cn('block', className)}
       {...props}
     >
