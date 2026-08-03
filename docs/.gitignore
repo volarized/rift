@@ -10,8 +10,12 @@
 /coverage
 /.next/
 /out/
+/dist/
 /build
 *.tsbuildinfo
+
+# wrangler
+.wrangler
 
 # misc
 .DS_Store
