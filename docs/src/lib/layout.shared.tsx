@@ -1,6 +1,7 @@
-import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
+import type { BaseLayoutProps } from "fumadocs-ui/layouts/shared";
 
-import { Logo } from '@/components/logo';
+import { ThemeTogglerButton } from "@/components/animate-ui/components/buttons/theme-toggler";
+import { Logo } from "@/components/logo";
 
 /**
  * Shared layout configuration.
@@ -23,15 +24,29 @@ export function baseOptions(): BaseLayoutProps {
           <span className="text-foreground">rift</span>
         </span>
       ),
-      transparentMode: 'top',
+      transparentMode: "top",
+    },
+    // Replaces fumadocs' built-in switch with the animate-ui one, which wipes
+    // the new theme across the page via a View Transition instead of swapping
+    // it instantly. Ghost variant so it reads as a bare icon in the nav.
+    themeSwitch: {
+      component: (
+        <ThemeTogglerButton
+          variant="ghost"
+          size="sm"
+          direction="ltr"
+          modes={["light", "dark", "system"]}
+          className="text-muted-foreground hover:text-foreground"
+        />
+      ),
     },
     // see https://fumadocs.dev/docs/ui/navigation/links
-    links: [
-      {
-        text: 'Documentation',
-        url: '/docs',
-        active: 'nested-url',
-      },
-    ],
+    // links: [
+    //   {
+    //     text: 'Documentation',
+    //     url: '/docs',
+    //     active: 'nested-url',
+    //   },
+    // ],
   };
 }
