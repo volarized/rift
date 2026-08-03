@@ -7,6 +7,9 @@
     "dev": "next dev --turbo",
     "start": "next start",
     "logo": "node scripts/logo.mjs",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check": "biome check --write .",
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
