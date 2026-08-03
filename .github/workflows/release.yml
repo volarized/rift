@@ -1,0 +1,102 @@
+name: release
+
+on:
+  push:
+    # Any `v*` tag is a release. Deliberately broad — semver prerelease and
+    # build suffixes must all match: v0.0.1-hotfix, v1.2.3-rc.1, v1.2.3+ci.4.
+    # GitHub tag filters are globs, not regex, so a stricter semver pattern
+    # is not expressible here anyway.
+    tags: ["v*"]
+
+# Never cancel a deploy mid-flight, and never let two tags race the same
+# Worker. Second tag queues behind the first.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # gh release create
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+
+    # Scopes CLOUDFLARE_* to this job only and, with the protection rule
+    # from plan step 5, pauses here for manual approval before deploying.
+    environment:
+      name: production
+      url: https://volar.sh/rift/
+
+    defaults:
+      run:
+        working-directory: docs
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Same cache keys as ci.yml — a tag cut from a CI-green commit restores
+      # that commit's warm caches instead of rebuilding cold. Keep the two
+      # files' keys identical or that reuse silently stops working.
+      #
+      # Not redundant with setup-bun: that caches the bun executable only.
+      # See the longer note in ci.yml.
+      - name: Cache bun install
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache # $BUN_INSTALL/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('docs/bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      - name: Cache Next build
+        uses: actions/cache@v6
+        with:
+          path: docs/.next/cache
+          key: >-
+            ${{ runner.os }}-next-${{ hashFiles('docs/bun.lock') }}-${{
+            hashFiles('docs/src/**', 'docs/content/**', 'docs/*.ts', 'docs/*.mjs') }}
+          restore-keys: |
+            ${{ runner.os }}-next-${{ hashFiles('docs/bun.lock') }}-
+            ${{ runner.os }}-next-
+
+      - run: bun install --frozen-lockfile
+
+      # `output: export` + `basePath: /rift` → docs/out/ holding a site whose
+      # URLs are all /rift/*, with the files themselves at the root of out/
+      # (verified 2026-08-03). `pack` nests them one level to match.
+      - run: bun run build
+
+      # Nests out/ under dist/rift/ and fails the build on a missing entry
+      # point or any absolute URL that lost the basePath. See scripts/pack.mjs.
+      - run: bun run pack
+
+      - uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: docs
+          packageManager: bun
+          command: deploy
+
+      - name: Verify live
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error -o /dev/null "https://volar.sh/rift/"
+          test "$(curl -s -o /dev/null -w '%{http_code}' https://volar.sh/)" = "302"
+
+      - name: GitHub release
+        run: |
+          set -euo pipefail
+          # SemVer §9: a hyphen suffix denotes a prerelease. Mark it as such
+          # so v1.2.3-rc.1 does not become the repo's "Latest release".
+          case "$GITHUB_REF_NAME" in
+            *-*) prerelease=--prerelease ;;
+            *)   prerelease= ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" \
+            --generate-notes --verify-tag $prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
