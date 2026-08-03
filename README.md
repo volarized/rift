@@ -1,4 +1,4 @@
-# rift - 
+# rift
 
 `rift` is an agentic development toolkit, with tools and resources to read, search, discover and edit codebases at scale and with high token efficiency.
 
