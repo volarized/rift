@@ -130,4 +130,4 @@ function ThemeToggler({
   );
 }
 
-export { ThemeToggler, type ThemeTogglerProps, type ThemeSelection, type Resolved, type Direction };
+export { type Direction, type Resolved, type ThemeSelection, ThemeToggler, type ThemeTogglerProps };

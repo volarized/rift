@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
 import { inkOpacity, useInkColor } from "@/hooks/use-ink-color";
@@ -304,7 +304,7 @@ function build(kind: LineObjectKind): Polyline[] {
   const lines: Polyline[] = [];
   for (let i = 0; i < rings; i++) {
     const t = i / rings;
-    const scale = Math.pow(1 - t, 0.72);
+    const scale = (1 - t) ** 0.72;
     const twist = t * 2.6;
     const ring: Polyline = [];
     for (let k = 0; k <= segments; k++) {

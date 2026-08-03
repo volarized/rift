@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type RefObject } from "react";
+import { type RefObject, useEffect, useState } from "react";
 
 type Ink = {
   /** An `rgb()` string, which is all three.js knows how to parse. */

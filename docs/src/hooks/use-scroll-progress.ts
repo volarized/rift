@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type RefObject } from "react";
+import { type RefObject, useEffect, useState } from "react";
 
 /**
  * How far the viewport has travelled through a tall element, 0 to 1 — the

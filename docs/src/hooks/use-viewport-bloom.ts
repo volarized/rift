@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, type RefObject } from "react";
+import { type RefObject, useEffect, useRef } from "react";
 
 /**
  * How centred an element is in the viewport, 0 to 1: nothing while it is out

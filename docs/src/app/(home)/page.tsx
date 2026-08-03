@@ -1,12 +1,12 @@
-import Link from "next/link";
 import { ArrowRightIcon } from "@phosphor-icons/react/dist/ssr";
+import Link from "next/link";
 
 import { Command } from "@/components/command";
-import { IsoStack, type IsoLayer } from "@/components/iso-stack";
+import { type ExplodedKind, ExplodedObject } from "@/components/exploded-object";
+import { type IsoLayer, IsoStack } from "@/components/iso-stack";
 import { LineObject, type LineObjectKind } from "@/components/line-object";
 import { Logo } from "@/components/logo";
 import { Reveal } from "@/components/reveal";
-import { ExplodedObject, type ExplodedKind } from "@/components/exploded-object";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";

@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
 import { inkOpacity, useInkColor } from "@/hooks/use-ink-color";
@@ -513,6 +513,7 @@ function Assembly({
   return (
     <group ref={holder}>
       {drawing.pieces.map((piece, index) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: `drawing.pieces` is derived geometry of fixed length and order; pieces are never added, removed, or sorted
         <group key={index}>
           <lineSegments geometry={piece.shell} material={drawing.materials.shell} />
           {piece.cut ? (

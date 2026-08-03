@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
 import { animated, useReducedMotion, useSprings } from "@react-spring/web";
+import { useEffect, useMemo, useRef } from "react";
 
 import { useViewportBloom } from "@/hooks/use-viewport-bloom";
 import { cn } from "@/lib/utils";
@@ -235,6 +235,7 @@ export function Logo({
         {stitching
           ? springs.map((spring, i) => (
               <animated.line
+                // biome-ignore lint/suspicious/noArrayIndexKey: `springs` is index-aligned with the constant `segments` geometry table; reordering is impossible by construction
                 key={i}
                 strokeWidth={segments[i].edge ? edgeWidth : strokeWidth}
                 opacity={segments[i].edge ? 1 : stringOpacity}
@@ -250,6 +251,7 @@ export function Logo({
             ))
           : segments.map((segment, i) => (
               <line
+                // biome-ignore lint/suspicious/noArrayIndexKey: `segments` is a module-level constant; the index is also the key into `drawn.current[i]` below, so it must stay the identity
                 key={i}
                 ref={(element) => {
                   drawn.current[i] = element;
