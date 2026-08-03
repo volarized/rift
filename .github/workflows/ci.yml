@@ -61,6 +61,13 @@ jobs:
       # Baseline is RED today (25 errors / 12 warnings) — see plan step 0.
       - run: bunx biome ci .
 
+      # `LayoutProps`/`PageProps` are globals Next generates into .next/types.
+      # Without this, `tsc` on a cold checkout fails with TS2304 "Cannot find
+      # name 'LayoutProps'". Caching does not help — we cache .next/cache, not
+      # .next/types — and it passes locally only off a stale .next from an
+      # earlier build. `typegen` emits them without paying for a full build.
+      - run: bunx next typegen
+
       - run: bunx tsc --noEmit
 
       - run: bun run build
