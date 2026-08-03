@@ -1,6 +1,6 @@
-'use client';
+"use client";
 
-import { useEffect, useState, type RefObject } from 'react';
+import { useEffect, useState, type RefObject } from "react";
 
 type Ink = {
   /** An `rgb()` string, which is all three.js knows how to parse. */
@@ -9,7 +9,7 @@ type Ink = {
   onLight: boolean;
 };
 
-const FALLBACK: Ink = { color: 'rgb(201, 201, 196)', onLight: false };
+const FALLBACK: Ink = { color: "rgb(201, 201, 196)", onLight: false };
 
 /**
  * The design tokens are authored in oklch, and `getComputedStyle` hands those
@@ -18,18 +18,18 @@ const FALLBACK: Ink = { color: 'rgb(201, 201, 196)', onLight: false };
  * browser accepts, without hard-coding a second copy of the palette.
  */
 function resolve(css: string): Ink | null {
-  const canvas = document.createElement('canvas');
+  const canvas = document.createElement("canvas");
   canvas.width = 1;
   canvas.height = 1;
 
-  const context = canvas.getContext('2d', { willReadFrequently: true });
+  const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) return null;
 
   // A rejected assignment leaves fillStyle untouched, so seed it with a colour
   // nothing would legitimately resolve to.
-  context.fillStyle = '#ff00ff';
+  context.fillStyle = "#ff00ff";
   context.fillStyle = css;
-  if (context.fillStyle === '#ff00ff') return null;
+  if (context.fillStyle === "#ff00ff") return null;
 
   context.fillRect(0, 0, 1, 1);
   const [r, g, b] = context.getImageData(0, 0, 1, 1).data;
@@ -61,7 +61,7 @@ export function useInkColor(ref: RefObject<HTMLElement | null>) {
     const observer = new MutationObserver(read);
     observer.observe(document.documentElement, {
       attributes: true,
-      attributeFilter: ['class', 'style'],
+      attributeFilter: ["class", "style"],
     });
 
     return () => observer.disconnect();
@@ -75,7 +75,7 @@ export function useInkColor(ref: RefObject<HTMLElement | null>) {
  * matches the void is how a hairline object occludes what sits behind it.
  */
 export function useSurfaceColor() {
-  const [surface, setSurface] = useState('rgb(21, 21, 24)');
+  const [surface, setSurface] = useState("rgb(21, 21, 24)");
 
   useEffect(() => {
     const read = () => {
@@ -87,7 +87,7 @@ export function useSurfaceColor() {
     const observer = new MutationObserver(read);
     observer.observe(document.documentElement, {
       attributes: true,
-      attributeFilter: ['class', 'style'],
+      attributeFilter: ["class", "style"],
     });
 
     return () => observer.disconnect();

@@ -1,6 +1,6 @@
-'use client';
+"use client";
 
-import { useEffect, useState, type RefObject } from 'react';
+import { useEffect, useState, type RefObject } from "react";
 
 /**
  * How far the viewport has travelled through a tall element, 0 to 1 — the
@@ -38,13 +38,13 @@ export function useScrollProgress(ref: RefObject<HTMLElement | null>) {
     };
 
     read();
-    window.addEventListener('scroll', schedule, { passive: true });
-    window.addEventListener('resize', schedule);
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
 
     return () => {
       if (frame) cancelAnimationFrame(frame);
-      window.removeEventListener('scroll', schedule);
-      window.removeEventListener('resize', schedule);
+      window.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
     };
   }, [ref]);
 

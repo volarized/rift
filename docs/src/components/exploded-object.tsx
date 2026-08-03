@@ -1,12 +1,12 @@
-'use client';
+"use client";
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import * as THREE from 'three';
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import * as THREE from "three";
 
-import { inkOpacity, useInkColor } from '@/hooks/use-ink-color';
-import { useViewportBloom } from '@/hooks/use-viewport-bloom';
-import { cn } from '@/lib/utils';
+import { inkOpacity, useInkColor } from "@/hooks/use-ink-color";
+import { useViewportBloom } from "@/hooks/use-viewport-bloom";
+import { cn } from "@/lib/utils";
 
 /**
  * Wireframe solids taken apart, and put back together, by the scroll.
@@ -21,7 +21,7 @@ import { cn } from '@/lib/utils';
  * the object is to the middle of the viewport: composed on the way in, fully
  * apart as it passes the centre line, composed again on the way out.
  */
-export type ExplodedKind = 'sphere' | 'torus' | 'geodesic';
+export type ExplodedKind = "sphere" | "torus" | "geodesic";
 
 const TAU = Math.PI * 2;
 
@@ -131,9 +131,7 @@ function sphereAssembly(): Assembly {
     const ring: THREE.Vector3[] = [];
     for (let k = 0; k <= RESOLUTION; k++) {
       const t = (k / RESOLUTION) * TAU;
-      ring.push(
-        new THREE.Vector3(radius * Math.cos(t), y, radius * Math.sin(t)),
-      );
+      ring.push(new THREE.Vector3(radius * Math.cos(t), y, radius * Math.sin(t)));
     }
     lines.push(ring);
   }
@@ -144,11 +142,7 @@ function sphereAssembly(): Assembly {
     for (let k = 0; k <= RESOLUTION; k++) {
       const t = (k / RESOLUTION) * TAU;
       ring.push(
-        new THREE.Vector3(
-          Math.cos(t) * Math.cos(lon),
-          Math.sin(t),
-          Math.cos(t) * Math.sin(lon),
-        ),
+        new THREE.Vector3(Math.cos(t) * Math.cos(lon), Math.sin(t), Math.cos(t) * Math.sin(lon)),
       );
     }
     lines.push(ring);
@@ -195,17 +189,9 @@ function sphereAssembly(): Assembly {
 }
 
 /** Concentric rings on a plane — how a section face is drawn. */
-function disc(
-  centre: THREE.Vector3,
-  normal: THREE.Vector3,
-  radius: number,
-  rings: number,
-): Seg[] {
+function disc(centre: THREE.Vector3, normal: THREE.Vector3, radius: number, rings: number): Seg[] {
   // Any vector off the normal will do to start the basis the disc is drawn in.
-  const helper =
-    Math.abs(normal.y) < 0.9
-      ? new THREE.Vector3(0, 1, 0)
-      : new THREE.Vector3(1, 0, 0);
+  const helper = Math.abs(normal.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
   const u = new THREE.Vector3().crossVectors(helper, normal).normalize();
   const v = new THREE.Vector3().crossVectors(normal, u);
 
@@ -280,11 +266,7 @@ function torusAssembly(): Assembly {
     // The two severed ends, each a disc facing along the ring.
     const cut: Seg[] = [];
     for (const u of [start, end]) {
-      const centre = new THREE.Vector3(
-        MAJOR * Math.cos(u),
-        0,
-        MAJOR * Math.sin(u),
-      );
+      const centre = new THREE.Vector3(MAJOR * Math.cos(u), 0, MAJOR * Math.sin(u));
       const normal = new THREE.Vector3(-Math.sin(u), 0, Math.cos(u));
       cut.push(...disc(centre, normal, MINOR, 6));
     }
@@ -310,16 +292,41 @@ function geodesicAssembly(): Assembly {
 
   const phi = (1 + Math.sqrt(5)) / 2;
   const corners = [
-    [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
-    [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
-    [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    [-1, phi, 0],
+    [1, phi, 0],
+    [-1, -phi, 0],
+    [1, -phi, 0],
+    [0, -1, phi],
+    [0, 1, phi],
+    [0, -1, -phi],
+    [0, 1, -phi],
+    [phi, 0, -1],
+    [phi, 0, 1],
+    [-phi, 0, -1],
+    [-phi, 0, 1],
   ].map(([x, y, z]) => new THREE.Vector3(x, y, z).normalize());
 
   const faces = [
-    [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
-    [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
-    [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
-    [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
+    [0, 11, 5],
+    [0, 5, 1],
+    [0, 1, 7],
+    [0, 7, 10],
+    [0, 10, 11],
+    [1, 5, 9],
+    [5, 11, 4],
+    [11, 10, 2],
+    [10, 7, 6],
+    [7, 1, 8],
+    [3, 9, 4],
+    [3, 4, 2],
+    [3, 2, 6],
+    [3, 6, 8],
+    [3, 8, 9],
+    [4, 9, 5],
+    [2, 4, 11],
+    [6, 2, 10],
+    [8, 6, 7],
+    [9, 8, 1],
   ];
 
   const pieces: Piece[] = faces.map(([ai, bi, ci]) => {
@@ -354,19 +361,30 @@ function geodesicAssembly(): Assembly {
       }
     }
 
-    const centroid = new THREE.Vector3()
-      .add(a)
-      .add(b)
-      .add(c)
-      .normalize();
+    const centroid = new THREE.Vector3().add(a).add(b).add(c).normalize();
 
     return {
       shell: Float32Array.from(shell),
       // The patch outline, drawn heavier so the pieces read as pieces.
       cut: Float32Array.from([
-        a.x, a.y, a.z, b.x, b.y, b.z,
-        b.x, b.y, b.z, c.x, c.y, c.z,
-        c.x, c.y, c.z, a.x, a.y, a.z,
+        a.x,
+        a.y,
+        a.z,
+        b.x,
+        b.y,
+        b.z,
+        b.x,
+        b.y,
+        b.z,
+        c.x,
+        c.y,
+        c.z,
+        c.x,
+        c.y,
+        c.z,
+        a.x,
+        a.y,
+        a.z,
       ]),
       direction: [centroid.x, centroid.y, centroid.z],
     };
@@ -383,11 +401,7 @@ function assemblyFor(kind: ExplodedKind) {
   if (cached) return cached;
 
   const built =
-    kind === 'sphere'
-      ? sphereAssembly()
-      : kind === 'torus'
-        ? torusAssembly()
-        : geodesicAssembly();
+    kind === "sphere" ? sphereAssembly() : kind === "torus" ? torusAssembly() : geodesicAssembly();
 
   cache.set(kind, built);
   return built;
@@ -425,10 +439,7 @@ function Assembly({
     const built = pieces.map((piece) => {
       const attach = (positions: Float32Array) => {
         const geometry = new THREE.BufferGeometry();
-        geometry.setAttribute(
-          'position',
-          new THREE.BufferAttribute(positions, 3),
-        );
+        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
         return geometry;
       };
 
@@ -473,8 +484,7 @@ function Assembly({
     const group = holder.current;
     if (!group) return;
 
-    open.current +=
-      ((still ? 1 : bloom.current) - open.current) * (still ? 1 : 0.12);
+    open.current += ((still ? 1 : bloom.current) - open.current) * (still ? 1 : 0.12);
 
     // How much of its width a slice still has. Fat when the object is off at
     // the edge of the screen, thin as it crosses the middle.
@@ -485,9 +495,7 @@ function Assembly({
       const child = group.children[i];
 
       if (piece.pivot === undefined) {
-        child.position
-          .copy(piece.direction)
-          .multiplyScalar(open.current * separation);
+        child.position.copy(piece.direction).multiplyScalar(open.current * separation);
         continue;
       }
 
@@ -506,15 +514,9 @@ function Assembly({
     <group ref={holder}>
       {drawing.pieces.map((piece, index) => (
         <group key={index}>
-          <lineSegments
-            geometry={piece.shell}
-            material={drawing.materials.shell}
-          />
+          <lineSegments geometry={piece.shell} material={drawing.materials.shell} />
           {piece.cut ? (
-            <lineSegments
-              geometry={piece.cut}
-              material={drawing.materials.section}
-            />
+            <lineSegments geometry={piece.cut} material={drawing.materials.section} />
           ) : null}
         </group>
       ))}
@@ -567,21 +569,20 @@ export function ExplodedObject({
   const [still, setStill] = useState(false);
 
   useEffect(() => {
-    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
     const sync = () => setStill(query.matches);
     sync();
-    query.addEventListener('change', sync);
-    return () => query.removeEventListener('change', sync);
+    query.addEventListener("change", sync);
+    return () => query.removeEventListener("change", sync);
   }, []);
 
   useEffect(() => {
     const element = host.current;
     if (!element) return;
 
-    const observer = new IntersectionObserver(
-      ([entry]) => setInView(entry.isIntersecting),
-      { rootMargin: '150px 0px' },
-    );
+    const observer = new IntersectionObserver(([entry]) => setInView(entry.isIntersecting), {
+      rootMargin: "150px 0px",
+    });
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
@@ -589,10 +590,10 @@ export function ExplodedObject({
   const { frame, spread } = assemblyFor(kind);
 
   return (
-    <div ref={host} className={cn('text-foreground', className)}>
+    <div ref={host} className={cn("text-foreground", className)}>
       <Canvas
         orthographic
-        frameloop={inView && !still ? 'always' : 'demand'}
+        frameloop={inView && !still ? "always" : "demand"}
         // The ink is a design token; tone mapping would repaint it.
         flat
         dpr={[1, 2]}

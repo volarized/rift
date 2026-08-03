@@ -13,9 +13,9 @@
  * The in-page mark is the <Logo> component, which takes the same count as a
  * `stitches` prop and needs no regeneration.
  */
-import { writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Divisions per triangle side. Each side contributes STITCHES - 1 strings. */
 const STITCHES = Number(process.argv[2] ?? 68);
@@ -25,8 +25,8 @@ const SIDE = 576;
 const MARGIN = 40;
 
 /** Ink, and the plate it is printed on. Set BACKGROUND to null for none. */
-const INK = '#C9C9C4';
-const BACKGROUND = '#09090B';
+const INK = "#C9C9C4";
+const BACKGROUND = "#09090B";
 const OPACITY = 1;
 
 /**
@@ -64,9 +64,7 @@ for (let i = 1; i < STITCHES; i++) {
   const u = i / STITCHES;
   const from = lerp(A, B, u);
   const to = lerp(A, C, 1 - u);
-  fan.push(
-    `        M ${round(from.x)} ${round(from.y)} L ${round(to.x)} ${round(to.y)}`,
-  );
+  fan.push(`        M ${round(from.x)} ${round(from.y)} L ${round(to.x)} ${round(to.y)}`);
 }
 
 const centroid = {
@@ -79,7 +77,7 @@ const edge = round(weight * EDGE_RATIO);
 
 const plate = BACKGROUND
   ? `\n  <!-- Remove this rectangle for a transparent background. -->\n  <rect width="${WIDTH}" height="${VIEW_H}" fill="${BACKGROUND}"/>\n`
-  : '';
+  : "";
 
 const svg = `<svg xmlns="http://www.w3.org/2000/svg"
      viewBox="0 0 ${WIDTH} ${VIEW_H}"
@@ -110,7 +108,7 @@ ${plate}
 
     <defs>
       <path id="fan" d="
-${fan.join('\n')}
+${fan.join("\n")}
       "/>
     </defs>
 
@@ -123,7 +121,7 @@ ${fan.join('\n')}
 </svg>
 `;
 
-const out = resolve(dirname(fileURLToPath(import.meta.url)), '../public/logo.svg');
+const out = resolve(dirname(fileURLToPath(import.meta.url)), "../public/logo.svg");
 writeFileSync(out, svg);
 
 console.log(

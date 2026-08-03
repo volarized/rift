@@ -1,10 +1,10 @@
-'use client';
+"use client";
 
-import { useEffect, useMemo, useRef } from 'react';
-import { animated, useReducedMotion, useSprings } from '@react-spring/web';
+import { useEffect, useMemo, useRef } from "react";
+import { animated, useReducedMotion, useSprings } from "@react-spring/web";
 
-import { useViewportBloom } from '@/hooks/use-viewport-bloom';
-import { cn } from '@/lib/utils';
+import { useViewportBloom } from "@/hooks/use-viewport-bloom";
+import { cn } from "@/lib/utils";
 
 /**
  * The rift logo: an inverted triangle strung with curve stitching. Each side
@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils';
  * differ only by props, because line weight is not scale-invariant: the mesh
  * that reads as a drawing at 440px silts up into a blob at 22px.
  */
-export type LogoProps = Omit<React.ComponentProps<'svg'>, 'children'> & {
+export type LogoProps = Omit<React.ComponentProps<"svg">, "children"> & {
   /**
    * Strings per side. 26 is the full mark; drop toward 5-8 for small
    * placements, where a dense mesh fills in solid.
@@ -117,13 +117,7 @@ const CHASE = 0.16;
 
 const cache = new Map<number, Segment[]>();
 
-function add(
-  into: Segment[],
-  from: Point,
-  to: Point,
-  offset: number,
-  edge: boolean,
-) {
+function add(into: Segment[], from: Point, to: Point, offset: number, edge: boolean) {
   into.push({
     from,
     to,
@@ -149,13 +143,7 @@ function segmentsFor(stitches: number): Segment[] {
 
     for (let i = 1; i < stitches; i++) {
       const u = i / stitches;
-      add(
-        segments,
-        place(lerp(a, b, u)),
-        place(lerp(a, d, 1 - u)),
-        0.1 + u * 0.72,
-        false,
-      );
+      add(segments, place(lerp(a, b, u)), place(lerp(a, d, 1 - u)), 0.1 + u * 0.72, false);
     }
   }
 
@@ -200,10 +188,7 @@ export function Logo({
         const line = drawn.current[i];
         if (!line) continue;
         const lead = (segments[i].offset / LAST) * SPREAD;
-        const drawnTo = Math.min(
-          1,
-          Math.max(0, (extent - lead) / (1 - SPREAD)),
-        );
+        const drawnTo = Math.min(1, Math.max(0, (extent - lead) / (1 - SPREAD)));
         line.style.strokeDashoffset = String(segments[i].length * (1 - drawnTo));
       }
 
@@ -243,7 +228,7 @@ export function Logo({
       viewBox={`${-PAD} ${-PAD} ${VIEW_W + PAD * 2} ${VIEW_H + PAD * 2}`}
       role="img"
       aria-label="rift"
-      className={cn('block', className)}
+      className={cn("block", className)}
       {...props}
     >
       <g fill="none" stroke="currentColor" strokeLinecap="round">
@@ -256,14 +241,10 @@ export function Logo({
                 x1={segments[i].from.x}
                 y1={segments[i].from.y}
                 x2={spring.extent.to(
-                  (e) =>
-                    segments[i].from.x +
-                    (segments[i].to.x - segments[i].from.x) * e,
+                  (e) => segments[i].from.x + (segments[i].to.x - segments[i].from.x) * e,
                 )}
                 y2={spring.extent.to(
-                  (e) =>
-                    segments[i].from.y +
-                    (segments[i].to.y - segments[i].from.y) * e,
+                  (e) => segments[i].from.y + (segments[i].to.y - segments[i].from.y) * e,
                 )}
               />
             ))

@@ -1,10 +1,10 @@
-'use client';
+"use client";
 
-import { useEffect, useState } from 'react';
-import { CheckIcon, CopyIcon } from '@phosphor-icons/react';
+import { useEffect, useState } from "react";
+import { CheckIcon, CopyIcon } from "@phosphor-icons/react";
 
-import { Button } from '@/components/ui/button';
-import { cn } from '@/lib/utils';
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
 /**
  * A shell line. A 1px-outlined region on the void: no fill, no radius, no
@@ -13,7 +13,7 @@ import { cn } from '@/lib/utils';
  */
 export function Command({
   children,
-  prompt = '$',
+  prompt = "$",
   className,
 }: {
   children: string;
@@ -31,7 +31,7 @@ export function Command({
   return (
     /* `min-w-0` so a long command scrolls inside the box rather than
        widening whatever grid track it was dropped into. */
-    <div className={cn('group relative w-full min-w-0', className)}>
+    <div className={cn("group relative w-full min-w-0", className)}>
       <pre className="overflow-x-auto border border-border px-[18px] py-4 pr-12 text-left font-mono text-[13px] leading-relaxed">
         <span className="select-none text-muted-foreground">{prompt} </span>
         {children}
@@ -39,7 +39,7 @@ export function Command({
       <Button
         variant="ghost"
         size="icon-xs"
-        aria-label={copied ? 'Copied' : 'Copy command'}
+        aria-label={copied ? "Copied" : "Copy command"}
         onClick={() => {
           void navigator.clipboard.writeText(children).then(() => {
             setCopied(true);

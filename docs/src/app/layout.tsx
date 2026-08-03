@@ -1,42 +1,38 @@
-import '@/app/global.css';
-import type { Metadata } from 'next';
-import { RootProvider } from 'fumadocs-ui/provider';
-import { Inter, Geist_Mono } from 'next/font/google';
-import { cn } from '@/lib/utils';
+import "@/app/global.css";
+import type { Metadata } from "next";
+import { RootProvider } from "fumadocs-ui/provider";
+import { Inter, Geist_Mono } from "next/font/google";
+import { cn } from "@/lib/utils";
 
 // Two families, per the design system: Geist Mono for display, section
 // labels and code; Inter 300 for lead and body copy.
 const geistMono = Geist_Mono({
-  subsets: ['latin'],
-  weight: ['400', '500'],
-  variable: '--font-geist-mono',
+  subsets: ["latin"],
+  weight: ["400", "500"],
+  variable: "--font-geist-mono",
 });
 
 const inter = Inter({
-  subsets: ['latin'],
-  weight: ['300', '400', '500'],
-  variable: '--font-inter',
+  subsets: ["latin"],
+  weight: ["300", "400", "500"],
+  variable: "--font-inter",
 });
 
 export const metadata: Metadata = {
   title: {
-    default: 'rift — agentic development toolkit',
-    template: '%s — rift',
+    default: "rift — agentic development toolkit",
+    template: "%s — rift",
   },
   description:
-    'rift is an MCP assistant that provides capabilities for agentic-driven, typesafe development. It provides tools and resources to read, search, discover and edit codebases.',
-  icons: { icon: '/logo.svg' },
+    "rift is an MCP assistant that provides capabilities for agentic-driven, typesafe development. It provides tools and resources to read, search, discover and edit codebases.",
+  icons: { icon: "/logo.svg" },
 };
 
-export default function Layout({ children }: LayoutProps<'/'>) {
+export default function Layout({ children }: LayoutProps<"/">) {
   return (
-    <html
-      lang="en"
-      className={cn(inter.variable, geistMono.variable)}
-      suppressHydrationWarning
-    >
+    <html lang="en" className={cn(inter.variable, geistMono.variable)} suppressHydrationWarning>
       <body className="flex flex-col min-h-screen">
-        <RootProvider>{children}</RootProvider>
+        <RootProvider search={{ enabled: false }}>{children}</RootProvider>
       </body>
     </html>
   );

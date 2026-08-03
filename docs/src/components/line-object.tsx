@@ -1,12 +1,12 @@
-'use client';
+"use client";
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import * as THREE from 'three';
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import * as THREE from "three";
 
-import { inkOpacity, useInkColor } from '@/hooks/use-ink-color';
-import { useViewportBloom } from '@/hooks/use-viewport-bloom';
-import { cn } from '@/lib/utils';
+import { inkOpacity, useInkColor } from "@/hooks/use-ink-color";
+import { useViewportBloom } from "@/hooks/use-viewport-bloom";
+import { cn } from "@/lib/utils";
 
 /**
  * Line objects — the design system's only graphic. Strange attractors, wireframe
@@ -14,19 +14,19 @@ import { cn } from '@/lib/utils';
  * over the void. No glow, no bloom, no fill, no colour. One object per section.
  */
 export type LineObjectKind =
-  | 'aizawa'
-  | 'thomas'
-  | 'halvorsen'
-  | 'lorenz'
-  | 'rikitake'
-  | 'shimizu'
-  | 'tsucs1'
-  | 'triangle'
-  | 'loft'
-  | 'globe'
-  | 'lens'
-  | 'contour'
-  | 'terrain';
+  | "aizawa"
+  | "thomas"
+  | "halvorsen"
+  | "lorenz"
+  | "rikitake"
+  | "shimizu"
+  | "tsucs1"
+  | "triangle"
+  | "loft"
+  | "globe"
+  | "lens"
+  | "contour"
+  | "terrain";
 
 type Vec3 = [number, number, number];
 type Polyline = Vec3[];
@@ -74,7 +74,7 @@ function integrate(
 }
 
 function build(kind: LineObjectKind): Polyline[] {
-  if (kind === 'aizawa') {
+  if (kind === "aizawa") {
     const a = 0.95,
       b = 0.7,
       c = 0.6,
@@ -85,11 +85,7 @@ function build(kind: LineObjectKind): Polyline[] {
       (x, y, z) => [
         (z - b) * x - d * y,
         d * x + (z - b) * y,
-        c +
-          a * z -
-          (z * z * z) / 3 -
-          (x * x + y * y) * (1 + e * z) +
-          f * z * x * x * x,
+        c + a * z - (z * z * z) / 3 - (x * x + y * y) * (1 + e * z) + f * z * x * x * x,
       ],
       [0.1, 0, 0],
       0.004,
@@ -98,14 +94,10 @@ function build(kind: LineObjectKind): Polyline[] {
     );
   }
 
-  if (kind === 'thomas') {
+  if (kind === "thomas") {
     const b = 0.19;
     return integrate(
-      (x, y, z) => [
-        Math.sin(y) - b * x,
-        Math.sin(z) - b * y,
-        Math.sin(x) - b * z,
-      ],
+      (x, y, z) => [Math.sin(y) - b * x, Math.sin(z) - b * y, Math.sin(x) - b * z],
       [1.1, 1.1, -0.01],
       0.02,
       17000,
@@ -113,7 +105,7 @@ function build(kind: LineObjectKind): Polyline[] {
     );
   }
 
-  if (kind === 'halvorsen') {
+  if (kind === "halvorsen") {
     const a = 1.4;
     return integrate(
       (x, y, z) => [
@@ -128,7 +120,7 @@ function build(kind: LineObjectKind): Polyline[] {
     );
   }
 
-  if (kind === 'tsucs1') {
+  if (kind === "tsucs1") {
     // Three-Scroll Unified Chaotic System, type 1. Fast dynamics — the step
     // has to stay small or Euler walks straight off the attractor.
     const a = 40,
@@ -137,11 +129,7 @@ function build(kind: LineObjectKind): Polyline[] {
       e = 0.65,
       f = 20;
     return integrate(
-      (x, y, z) => [
-        a * (y - x) + d * x * z,
-        f * y - x * z,
-        c * z + x * y - e * x * x,
-      ],
+      (x, y, z) => [a * (y - x) + d * x * z, f * y - x * z, c * z + x * y - e * x * x],
       [1, 1, 1],
       0.0006,
       30000,
@@ -149,7 +137,7 @@ function build(kind: LineObjectKind): Polyline[] {
     );
   }
 
-  if (kind === 'rikitake') {
+  if (kind === "rikitake") {
     // The two-disc dynamo: a pair of scrolls the trajectory swaps between,
     // which is what a field reversal looks like as a curve.
     const mu = 1,
@@ -163,7 +151,7 @@ function build(kind: LineObjectKind): Polyline[] {
     );
   }
 
-  if (kind === 'shimizu') {
+  if (kind === "shimizu") {
     const a = 0.75,
       b = 0.45;
     return integrate(
@@ -175,7 +163,7 @@ function build(kind: LineObjectKind): Polyline[] {
     );
   }
 
-  if (kind === 'lorenz') {
+  if (kind === "lorenz") {
     const sigma = 10,
       rho = 28,
       beta = 8 / 3;
@@ -190,7 +178,7 @@ function build(kind: LineObjectKind): Polyline[] {
 
   // The wireframe topologies. Parallels, meridians, contours and a warped
   // ground plane, all traced off three's own curve primitives.
-  if (kind === 'globe') {
+  if (kind === "globe") {
     const lines: Polyline[] = [];
     const BANDS = 15;
 
@@ -198,26 +186,20 @@ function build(kind: LineObjectKind): Polyline[] {
       const phi = -Math.PI / 2 + (i / BANDS) * Math.PI;
       const radius = Math.cos(phi);
       const parallel = new THREE.EllipseCurve(0, 0, radius, radius, 0, TAU);
-      lines.push(
-        parallel.getPoints(96).map((p) => [p.x, Math.sin(phi), p.y] as Vec3),
-      );
+      lines.push(parallel.getPoints(96).map((p) => [p.x, Math.sin(phi), p.y] as Vec3));
     }
 
     const meridian = new THREE.EllipseCurve(0, 0, 1, 1, 0, TAU);
     const ring = meridian.getPoints(96);
     for (let i = 0; i < BANDS; i++) {
       const lon = (i / BANDS) * Math.PI;
-      lines.push(
-        ring.map(
-          (p) => [p.x * Math.cos(lon), p.y, p.x * Math.sin(lon)] as Vec3,
-        ),
-      );
+      lines.push(ring.map((p) => [p.x * Math.cos(lon), p.y, p.x * Math.sin(lon)] as Vec3));
     }
 
     return lines;
   }
 
-  if (kind === 'lens') {
+  if (kind === "lens") {
     // A family of ellipses collapsing through the edge-on plane and back.
     const COUNT = 42;
     const lines: Polyline[] = [];
@@ -241,7 +223,7 @@ function build(kind: LineObjectKind): Polyline[] {
     return lines;
   }
 
-  if (kind === 'contour') {
+  if (kind === "contour") {
     // A survey nest: radius grows monotonically per level and the harmonics
     // drift only slightly, so rings deform without ever crossing.
     const RINGS = 16;
@@ -269,14 +251,14 @@ function build(kind: LineObjectKind): Polyline[] {
         );
       }
 
-      const curve = new THREE.CatmullRomCurve3(control, true, 'centripetal');
+      const curve = new THREE.CatmullRomCurve3(control, true, "centripetal");
       lines.push(curve.getPoints(180).map((p) => [p.x, p.y, p.z] as Vec3));
     }
 
     return lines;
   }
 
-  if (kind === 'terrain') {
+  if (kind === "terrain") {
     const N = 26;
     const height = (u: number, v: number) =>
       0.3 * Math.sin(u * Math.PI * 2.2) * Math.cos(v * Math.PI * 1.6);
@@ -297,7 +279,7 @@ function build(kind: LineObjectKind): Polyline[] {
     return lines;
   }
 
-  if (kind === 'triangle') {
+  if (kind === "triangle") {
     // Nested triangles spiralling inward — the mark, extruded.
     const rings = 54;
     const lines: Polyline[] = [];
@@ -328,10 +310,7 @@ function build(kind: LineObjectKind): Polyline[] {
     for (let k = 0; k <= segments; k++) {
       const theta = (k / segments) * Math.PI * 2;
       const r =
-        (1 +
-          0.3 * Math.sin(3 * theta + twist) +
-          0.12 * Math.sin(5 * theta - twist * 1.7)) *
-        scale;
+        (1 + 0.3 * Math.sin(3 * theta + twist) + 0.12 * Math.sin(5 * theta - twist * 1.7)) * scale;
       ring.push([
         r * Math.cos(theta + twist * 0.5),
         r * Math.sin(theta + twist * 0.5),
@@ -344,10 +323,7 @@ function build(kind: LineObjectKind): Polyline[] {
 }
 
 /** Integrating an attractor is not cheap; do it once per kind per session. */
-const geometryCache = new Map<
-  LineObjectKind,
-  { lines: Polyline[]; radius: number }
->();
+const geometryCache = new Map<LineObjectKind, { lines: Polyline[]; radius: number }>();
 
 function geometryFor(kind: LineObjectKind) {
   const cached = geometryCache.get(kind);
@@ -394,17 +370,7 @@ type ObjectProps = {
   bloom?: React.RefObject<number>;
 };
 
-function Lines({
-  kind,
-  speed,
-  tilt,
-  yaw,
-  spin,
-  opacity,
-  color,
-  still,
-  bloom,
-}: ObjectProps) {
+function Lines({ kind, speed, tilt, yaw, spin, opacity, color, still, bloom }: ObjectProps) {
   const holder = useRef<THREE.Group>(null);
   const invalidate = useThree((state) => state.invalidate);
 
@@ -451,7 +417,7 @@ function Lines({
       extent.current += ((still ? 1 : bloom.current) - extent.current) * CHASE;
       for (const child of object.group.children) {
         if (!(child instanceof THREE.Line)) continue;
-        const count = child.geometry.getAttribute('position').count;
+        const count = child.geometry.getAttribute("position").count;
         child.geometry.setDrawRange(0, Math.round(count * extent.current));
       }
       // Held still: a drawn-on object is read, not watched.
@@ -461,7 +427,7 @@ function Lines({
 
     const t = still ? 0 : clock.getElapsedTime();
 
-    if (kind === 'triangle') {
+    if (kind === "triangle") {
       group.rotation.z = t * speed;
       group.rotation.y = Math.sin(t * speed * 0.8) * 0.3;
       group.rotation.x = Math.sin(t * speed * 0.55) * 0.18;
@@ -517,21 +483,20 @@ export function LineObject({
   const [still, setStill] = useState(false);
 
   useEffect(() => {
-    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
     const sync = () => setStill(query.matches);
     sync();
-    query.addEventListener('change', sync);
-    return () => query.removeEventListener('change', sync);
+    query.addEventListener("change", sync);
+    return () => query.removeEventListener("change", sync);
   }, []);
 
   useEffect(() => {
     const element = host.current;
     if (!element) return;
 
-    const observer = new IntersectionObserver(
-      ([entry]) => setInView(entry.isIntersecting),
-      { rootMargin: '150px 0px' },
-    );
+    const observer = new IntersectionObserver(([entry]) => setInView(entry.isIntersecting), {
+      rootMargin: "150px 0px",
+    });
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
@@ -540,16 +505,14 @@ export function LineObject({
   const distance = useMemo(() => {
     const { radius } = geometryFor(kind);
     return (
-      ((radius / Math.sin(((FOV * Math.PI) / 180) / 2)) *
-        (kind === 'triangle' ? 1 : 0.72)) /
-      fit
+      ((radius / Math.sin((FOV * Math.PI) / 180 / 2)) * (kind === "triangle" ? 1 : 0.72)) / fit
     );
   }, [kind, fit]);
 
   return (
-    <div ref={host} className={cn('text-foreground', className)}>
+    <div ref={host} className={cn("text-foreground", className)}>
       <Canvas
-        frameloop={inView && !still ? 'always' : 'demand'}
+        frameloop={inView && !still ? "always" : "demand"}
         // The ink is a design token; tone mapping would repaint it.
         flat
         dpr={[1, 2]}

@@ -1,17 +1,14 @@
-'use client';
+"use client";
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { animated, useSpring, type SpringValue } from '@react-spring/three';
-import {
-  animated as html,
-  useSpring as useHtmlSpring,
-} from '@react-spring/web';
-import { Canvas, useThree } from '@react-three/fiber';
-import * as THREE from 'three';
+import { useEffect, useMemo, useRef, useState } from "react";
+import { animated, useSpring, type SpringValue } from "@react-spring/three";
+import { animated as html, useSpring as useHtmlSpring } from "@react-spring/web";
+import { Canvas, useThree } from "@react-three/fiber";
+import * as THREE from "three";
 
-import { inkOpacity, useInkColor, useSurfaceColor } from '@/hooks/use-ink-color';
-import { useScrollProgress } from '@/hooks/use-scroll-progress';
-import { cn } from '@/lib/utils';
+import { inkOpacity, useInkColor, useSurfaceColor } from "@/hooks/use-ink-color";
+import { useScrollProgress } from "@/hooks/use-scroll-progress";
+import { cn } from "@/lib/utils";
 
 /**
  * An exploded isometric stack, played by the scroll. Four plates start nested
@@ -58,9 +55,7 @@ type Rect = { x: number; z: number; w: number; d: number };
  */
 const MOTIFS: { rects: Rect[]; hatch?: number }[] = [
   {
-    rects: [-1.2, 0, 1.2].flatMap((x) =>
-      [-1.2, 0, 1.2].map((z) => ({ x, z, w: 1, d: 1 })),
-    ),
+    rects: [-1.2, 0, 1.2].flatMap((x) => [-1.2, 0, 1.2].map((z) => ({ x, z, w: 1, d: 1 }))),
   },
   {
     rects: [
@@ -164,8 +159,7 @@ function Plate({
   );
 
   const centre = (count - 1) / 2;
-  const lift = (value: number) =>
-    (centre - index) * (GAP_MIN + (GAP_MAX - GAP_MIN) * value);
+  const lift = (value: number) => (centre - index) * (GAP_MIN + (GAP_MAX - GAP_MIN) * value);
   const alpha = (value: number) => (0.24 + 0.64 * revealAt(value, index)) * boost;
 
   return (
@@ -175,11 +169,7 @@ function Plate({
         <meshBasicMaterial color={surface} />
       </mesh>
       <lineSegments geometry={edges}>
-        <animated.lineBasicMaterial
-          color={ink}
-          transparent
-          opacity={open.to(alpha)}
-        />
+        <animated.lineBasicMaterial color={ink} transparent opacity={open.to(alpha)} />
       </lineSegments>
       <lineSegments geometry={rules}>
         <animated.lineBasicMaterial
@@ -234,11 +224,11 @@ export function IsoStack({
   const [still, setStill] = useState(false);
 
   useEffect(() => {
-    const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
     const sync = () => setStill(motion.matches);
     sync();
-    motion.addEventListener('change', sync);
-    return () => motion.removeEventListener('change', sync);
+    motion.addEventListener("change", sync);
+    return () => motion.removeEventListener("change", sync);
   }, []);
 
   // Reduced motion gets the finished state: fully exploded, every label read.
@@ -249,13 +239,13 @@ export function IsoStack({
   const { read } = useHtmlSpring({ read: progress, immediate: still, config });
 
   return (
-    <div ref={scene} className={cn(still ? '' : 'h-[300vh]', className)}>
+    <div ref={scene} className={cn(still ? "" : "h-[300vh]", className)}>
       <div
         className={cn(
           // One column on mobile — heading and rail first, scene taking
           // whatever height is left — and two side by side from md up.
-          'relative flex flex-col gap-6 md:grid md:grid-cols-2 md:items-start md:gap-14',
-          still ? 'py-16' : 'sticky top-14 h-[calc(100svh-3.5rem)] py-8 md:py-10',
+          "relative flex flex-col gap-6 md:grid md:grid-cols-2 md:items-start md:gap-14",
+          still ? "py-16" : "sticky top-14 h-[calc(100svh-3.5rem)] py-8 md:py-10",
         )}
       >
         {/* Plotting-paper ground: a dot grid under the scene half only, ruled
@@ -281,9 +271,7 @@ export function IsoStack({
                 key={layer.label}
                 className="relative grid grid-cols-[auto_1fr] items-start gap-5"
                 style={{
-                  opacity: read.to(
-                    (value) => 0.3 + 0.7 * clamp(revealAt(value, index) * 1.5),
-                  ),
+                  opacity: read.to((value) => 0.3 + 0.7 * clamp(revealAt(value, index) * 1.5)),
                 }}
               >
                 {/* Opaque, so the node reads as a break in the rail. */}
@@ -291,9 +279,7 @@ export function IsoStack({
                   <html.span
                     className="size-1.5 rounded-full bg-foreground"
                     style={{
-                      opacity: read.to((value) =>
-                        clamp(revealAt(value, index) * 1.5),
-                      ),
+                      opacity: read.to((value) => clamp(revealAt(value, index) * 1.5)),
                     }}
                   />
                 </span>
@@ -312,10 +298,7 @@ export function IsoStack({
           </ol>
         </div>
 
-        <div
-          ref={host}
-          className="relative min-h-0 flex-1 text-foreground md:h-full"
-        >
+        <div ref={host} className="relative min-h-0 flex-1 text-foreground md:h-full">
           <Canvas
             orthographic
             // No tone mapping: the occluder has to come out the exact colour

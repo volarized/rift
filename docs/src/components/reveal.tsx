@@ -1,8 +1,8 @@
-'use client';
+"use client";
 
-import { animated, useInView, useReducedMotion } from '@react-spring/web';
+import { animated, useInView, useReducedMotion } from "@react-spring/web";
 
-import { cn } from '@/lib/utils';
+import { cn } from "@/lib/utils";
 
 /**
  * Entry reveal: opacity 0 to 1 plus a 16px rise as the section comes into
@@ -23,7 +23,7 @@ export function Reveal({
       immediate: reduced ?? false,
       config: { tension: 170, friction: 26, clamp: true },
     }),
-    { rootMargin: '-10% 0px -15% 0px', once: true },
+    { rootMargin: "-10% 0px -15% 0px", once: true },
   );
 
   return (

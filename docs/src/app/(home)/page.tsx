@@ -18,13 +18,7 @@ const WIDE = "mx-auto w-full max-w-280 px-6 sm:px-7";
 const SCREEN = "min-h-[calc(80svh)]";
 
 /** Inter 300 at display size — one statement per section, never more. */
-function Statement({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
+function Statement({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <p
       className={cn(
@@ -38,13 +32,7 @@ function Statement({
 }
 
 /** Inter 300, 16/1.6 — body copy. */
-function Body({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
+function Body({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <p
       className={cn(
@@ -70,11 +58,7 @@ function Section({
 }) {
   return (
     <section id={id} className={cn("flex scroll-mt-14 items-center", SCREEN)}>
-      <Reveal
-        className={cn(wide ? WIDE : SHELL, "grid gap-9 py-16", className)}
-      >
-        {children}
-      </Reveal>
+      <Reveal className={cn(wide ? WIDE : SHELL, "grid gap-9 py-16", className)}>{children}</Reveal>
     </section>
   );
 }
@@ -130,9 +114,7 @@ export default function HomePage() {
   return (
     <main className="flex flex-1 flex-col">
       {/* 1 — hero, standing on a warped ground plane */}
-      <section
-        className={cn("relative flex items-center overflow-hidden", SCREEN)}
-      >
+      <section className={cn("relative flex items-center overflow-hidden", SCREEN)}>
         <div
           className={cn(
             SHELL,
@@ -145,8 +127,7 @@ export default function HomePage() {
             </h1>
 
             <Body className="max-w-115">
-              Agentic development toolkit for reading, discovering and editing
-              codebases.
+              Agentic development toolkit for reading, discovering and editing codebases.
             </Body>
           </div>
 
@@ -161,10 +142,7 @@ export default function HomePage() {
       </section>
 
       {/* 2 — the claim, over a soft Lorenz attractor */}
-      <Section
-        wide
-        className="md:grid-cols-[auto_1fr] md:items-center"
-      >
+      <Section wide className="md:grid-cols-[auto_1fr] md:items-center">
         <LineObject
           kind="lorenz"
           reveal
@@ -185,11 +163,7 @@ export default function HomePage() {
       {/* 4 — the design position, one point per screen, each against the same
           sphere taken apart on a different plane */}
       {DIFFERENCES.map((item, index) => (
-        <Section
-          key={item.title}
-          wide
-          className="md:grid-cols-2 md:items-center text-base"
-        >
+        <Section key={item.title} wide className="md:grid-cols-2 md:items-center text-base">
           <div className="grid max-w-165 gap-7">
             {index === 0 ? (
               <Statement className="max-w-125">
@@ -197,9 +171,7 @@ export default function HomePage() {
               </Statement>
             ) : null}
             <div className="grid gap-3">
-              <h3 className="m-0 font-mono font-medium tracking-[0.02em]">
-                {item.title}
-              </h3>
+              <h3 className="m-0 font-mono font-medium tracking-[0.02em]">{item.title}</h3>
               <Body>{item.body}</Body>
             </div>
           </div>
@@ -233,32 +205,20 @@ export default function HomePage() {
 
       {/* 7 — the two ways out, against the Aizawa attractor drawn on by the
           scroll and unpicked again on the way back up */}
-      <Section
-        wide
-        className="md:grid-cols-2 md:items-center md:gap-20"
-      >
+      <Section wide className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
           <Statement className="max-w-125">
-            Start using <span className="font-mono font-bold">rift</span>
+            Coming soon, reach out to us if you want to get involved.
           </Statement>
-          <div className="flex flex-wrap items-center gap-3">
-            <Button
-              size="lg"
-              nativeButton={false}
-              render={<a href="#install" />}
-            >
-              Install
-              {/* <ArrowRightIcon data-icon="inline-end" /> */}
+          <Link
+            href="mailto:contact@volar.sh"
+            className="flex items-center gap-2 text-sm font-medium w-0"
+          >
+            <Button variant="outline" size="lg" className="w-fit">
+              Get in touch
+              <ArrowRightIcon weight="bold" className="h-4 w-4" />
             </Button>
-            <Button
-              size="lg"
-              variant="outline"
-              nativeButton={false}
-              render={<Link href="/docs" />}
-            >
-              Docs
-            </Button>
-          </div>
+          </Link>
         </div>
 
         {/* The disk lies in x–y with the tube down z: face it near-on, so the

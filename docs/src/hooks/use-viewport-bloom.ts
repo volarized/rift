@@ -1,6 +1,6 @@
-'use client';
+"use client";
 
-import { useEffect, useRef, type RefObject } from 'react';
+import { useEffect, useRef, type RefObject } from "react";
 
 /**
  * How centred an element is in the viewport, 0 to 1: nothing while it is out
@@ -62,13 +62,13 @@ export function useViewportBloom(
     };
 
     read();
-    window.addEventListener('scroll', schedule, { passive: true });
-    window.addEventListener('resize', schedule);
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
 
     return () => {
       if (frame) cancelAnimationFrame(frame);
-      window.removeEventListener('scroll', schedule);
-      window.removeEventListener('resize', schedule);
+      window.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
     };
   }, [ref]);
 
