@@ -5,27 +5,15 @@ It gives agents tools and resources to read, search, discover and edit codebases
 
 ## Installation
 
-On MacOS and Linux, you can install `rift` using the following command:
-
-```bash
-curl -fsSL https://volar.sh/rift/install.sh | sh
-```
-
-For Windows, you can install `rift` using the following command:
-
-```powershell
-iwr -useb https://volar.sh/rift/install.ps1 | iex
-```
+<TODO>
 
 ## Usage
 
-To use `rift` with a specific project, navigate to the project directory and run:
+To use `rift` in a specific project with a selected agent, navigate to the project directory and run:
 
 ```bash
-rift init --agent <agent_name>
+rift init
 ```
-
-Where `<agent_name>` is the name of the agent you want to use for development, for example `rift init --agent claude`.
 
 ## How it works?
 
