@@ -1,9 +1,11 @@
 import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
 
+import { Logo } from '@/components/logo';
+
 /**
- * Shared layout configurations
+ * Shared layout configuration.
  *
- * you can customise layouts individually from:
+ * Layouts can still be customised individually from:
  * Home Layout: app/(home)/layout.tsx
  * Docs Layout: app/docs/layout.tsx
  */
@@ -11,20 +13,25 @@ export function baseOptions(): BaseLayoutProps {
   return {
     nav: {
       title: (
-        <>
-          <svg
-            width="24"
-            height="24"
-            xmlns="http://www.w3.org/2000/svg"
-            aria-label="Logo"
-          >
-            <circle cx={12} cy={12} r={12} fill="currentColor" />
-          </svg>
-          My App
-        </>
+        // Baseline-aligned, so the mark's apex sits on the wordmark's baseline
+        // and its top edge on the cap line — the two read as one object rather
+        // than an icon parked next to some text. The stroke is heavy because it
+        // is in viewBox units: at this size 1 unit is ~0.13px, so the hairline
+        // that suits the hero disappears here.
+        <span className="flex items-center justify-items-center gap-2 font-mono text-[15px] leading-none tracking-[0.04em]">
+          <Logo stitches={40} strokeWidth={0.5} className="h-8 w-auto" />
+          <span className="text-foreground">rift</span>
+        </span>
       ),
+      transparentMode: 'top',
     },
     // see https://fumadocs.dev/docs/ui/navigation/links
-    links: [],
+    links: [
+      {
+        text: 'Documentation',
+        url: '/docs',
+        active: 'nested-url',
+      },
+    ],
   };
 }
