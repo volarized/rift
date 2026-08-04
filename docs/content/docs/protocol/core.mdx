@@ -2,8 +2,6 @@
 title: Core model
 ---
 
-import { CoreReference } from "@/components/protocol/core";
-
 Rift works in a workspace only if git is enabled there, which is true of virtually every repository. If
 it isn't, run `git init` in the workspace. Requiring it enforces a practice you want anyway.
 
@@ -64,7 +62,7 @@ resolved; attach `?rev=` to pin it to one:
 rift://symbol/python/pkg/util.py:load_config?rev=v1.2.0
 ```
 
-The full shape is [`Symbol`](#Symbol) in the reference below.
+Its fields are listed under [`Symbol`](/docs/protocol/reference#Symbol).
 
 ## Leaf
 
@@ -81,6 +79,4 @@ A leaf is identified by where it sits: the file, and the byte range it spans.
 rift://leaf/python/pkg/util.py@1204-1266
 ```
 
-The full shape is [`Leaf`](#Leaf) in the reference below.
-
-<CoreReference />
+Its fields are listed under [`Leaf`](/docs/protocol/reference#Leaf).

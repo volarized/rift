@@ -22,7 +22,6 @@ import {
   defs,
   documents,
   homeOf,
-  PROTOCOL_FILES,
   type ProtocolFile,
   props,
   refName,
@@ -166,34 +165,6 @@ export const adapterOperations: AdapterOperation[] = (() => {
 
 /** `hello` is a frame rather than an operation: no request, no `op`, sent once. */
 export const ADAPTER_HELLO = "AdapterHello";
-
-// ---------------------------------------------------------------------------
-// Which definitions the surface already anchors
-// ---------------------------------------------------------------------------
-
-/**
- * A definition gets exactly one heading. Types shown under a tool, resource, or
- * operation are anchored there; everything else falls to that page's reference
- * section. `ResourceTemplate` is deliberately not claimed by any one resource —
- * all five share it.
- */
-const anchoredBySurface = new Set<string>([
-  ...mcpTools.flatMap((tool) => [tool.params, tool.result]),
-  ...mcpResources.map((resource) => resource.uri),
-  ADAPTER_HELLO,
-  ...adapterOperations.flatMap((operation) => [
-    operation.request.name,
-    ...operation.responses.map((response) => response.name),
-  ]),
-]);
-
-/** The definitions a page lists in its reference section, in document order. */
-export const referenceTypes = Object.fromEntries(
-  PROTOCOL_FILES.map((file) => [
-    file,
-    defNamesByFile[file].filter((name) => !anchoredBySurface.has(name)),
-  ]),
-) as Record<ProtocolFile, string[]>;
 
 // ---------------------------------------------------------------------------
 // The reference, grouped by axis and nested by reference
@@ -353,13 +324,7 @@ function prose(name: string): { heading: string; content: string }[] {
   return parts.map((content) => ({ heading: name, content }));
 }
 
-function referenceSection(_file: ProtocolFile) {
-  // Types moved to their own page; a surface page carries only its surface.
-  return { toc: [], headings: [], contents: [] };
-}
-
 function mcpPage(): PageData {
-  const reference = referenceSection("mcp");
   return {
     toc: [
       { title: "Tools", url: "#tools", depth: 2 },
@@ -370,7 +335,6 @@ function mcpPage(): PageData {
         url: `#resource-${resource.name}`,
         depth: 3,
       })),
-      ...reference.toc,
     ],
     structuredData: {
       headings: [
@@ -381,7 +345,6 @@ function mcpPage(): PageData {
           id: `resource-${resource.name}`,
           content: resource.name,
         })),
-        ...reference.headings,
       ],
       contents: [
         ...mcpTools.flatMap((tool) => [
@@ -397,14 +360,12 @@ function mcpPage(): PageData {
             : []),
           ...prose(resource.uri),
         ]),
-        ...reference.contents,
       ],
     },
   };
 }
 
 function adapterPage(): PageData {
-  const reference = referenceSection("adapter");
   return {
     toc: [
       { title: "Handshake", url: "#handshake", depth: 2 },
@@ -414,7 +375,6 @@ function adapterPage(): PageData {
         url: `#op-${operation.op}`,
         depth: 3,
       })),
-      ...reference.toc,
     ],
     structuredData: {
       headings: [
@@ -424,7 +384,6 @@ function adapterPage(): PageData {
           id: `op-${operation.op}`,
           content: operation.op,
         })),
-        ...reference.headings,
       ],
       contents: [
         ...prose(ADAPTER_HELLO),
@@ -435,27 +394,6 @@ function adapterPage(): PageData {
           ...prose(operation.request.name),
           ...operation.responses.flatMap((response) => prose(response.name)),
         ]),
-        ...reference.contents,
-      ],
-    },
-  };
-}
-
-function corePage(): PageData {
-  const names = defNamesByFile.core;
-  return {
-    toc: [
-      { title: "Type reference", url: "#type-reference", depth: 2 },
-      ...names.map((name) => ({ title: name, url: `#${name}`, depth: 3 })),
-    ],
-    structuredData: {
-      headings: [
-        { id: "type-reference", content: "Type reference" },
-        ...names.map((name) => ({ id: name, content: name })),
-      ],
-      contents: [
-        { heading: undefined, content: documents.core.description },
-        ...names.flatMap(prose),
       ],
     },
   };
@@ -496,6 +434,7 @@ function referencePage(): PageData {
 export const pageData: Record<string, PageData> = {
   [pageUrl("mcp")]: mcpPage(),
   [pageUrl("adapter")]: adapterPage(),
-  [pageUrl("core")]: corePage(),
+  // No entry for `core`: it is prose and nothing else, so remark already sees
+  // every heading it has. Its types are anchored on the reference page.
   [`${PROTOCOL_ROOT}/reference`]: referencePage(),
 };
