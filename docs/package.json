@@ -47,7 +47,6 @@
     "@types/three": "^0.185.3",
     "json-schema-typed": "^8.0.2",
     "postcss": "^8.5.25",
-    "shadcn": "^4.16.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "wrangler": "^4.118.0"
