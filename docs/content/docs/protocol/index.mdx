@@ -6,9 +6,6 @@ description: The protocol behind Rift, and how the processes that implement it r
 import { Callout } from "fumadocs-ui/components/callout";
 import { IsoDiagram } from "@/components/iso-diagram";
 
-At the core of Rift there is a protocol. It describes how the components of the system behave, and how
-they operate.
-
 Rift reaches agents through MCP. Each agent talks to its own `rift mcp` process, over stdio.
 
 That process is launched in a workspace — a distinct path on the filesystem of your machine:
@@ -63,11 +60,11 @@ own contract, and neither knows the other exists.
 | audience | an agent choosing what to do next | a compiler being driven |
 
 **MCP knows nothing about adapters.** It sees what Rift can do for a language, not how the adapter
-recognises its files or what it fingerprints. Checked-out trees, refresh calls and environment digests
-never reach it — they are how the server keeps a compiler warm, which is the server's problem.
+recognises its files or what it reads from them. Checked-out trees and refresh calls never reach it:
+they are how the server keeps a compiler warm, which is the server's problem.
 
 **The adapter knows nothing about agents.** It has no notion of a tool call, a cursor, or a resource
-URI. It is handed a directory and told what state that directory holds.
+URI. It is handed a working tree and told what state that tree holds.
 
 That directory is not your worktree and it is not a `git worktree` either. The server checks the code
 out with `git checkout-index`, so what the adapter gets has no `.git` in it and no way to reach your

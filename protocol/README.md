@@ -22,24 +22,24 @@ MCP is JSON-RPC, so its surface is JSON Schema. The adapter seam is gRPC over a 
 its surface is a `.proto` with a service definition. Neither is a translation of the other, and neither
 side knows the other exists:
 
-- **MCP knows nothing about adapters.** No workspace path, no refresh, no environment digest and no
-  path claim reaches it. Those are how the server keeps a compiler warm, which is the server's
+- **MCP knows nothing about adapters.** No workspace path, no refresh and no path claim reaches it. Those are how the server keeps a compiler warm, which is the server's
   problem. MCP publishes `LanguageSupport` — what Rift can do for a language — and stops there.
 - **The adapter knows nothing about agents.** It has no notion of a tool call, a cursor, or a resource
-  URI. It is handed a directory and told what state that directory holds.
+  URI. It is handed a working tree and told what state that tree holds.
 
 ## Who owns the filesystem
 
-Rift checks a tree out per adapter with `git checkout-index` and passes the path. No `.git` lands in
-it, so an adapter cannot reach your branches, your remotes or the credentials in your git config —
-which a linked `git worktree` would have left one symlink away.
+Rift materializes a working tree per adapter with `git checkout-index` and passes the path, which is
+also the workspace's identity. No `.git` lands in it, so an adapter cannot reach your branches, your
+remotes or the credentials in your git config — which a linked `git worktree` would have left one
+gitdir link away.
 
 Rift writes source and the adapter does not. A fix or a refactor comes back from `Resolve` as
 `Edit`, and Rift applies it. That makes a change reviewable before it lands, and it keeps one
 agent's `rustfmt` run out of the tree another agent is reading.
 
 Compilers write regardless — `Cargo.lock` at the workspace root, `node_modules` beside its package —
-so an adapter declares those paths as `WriteClaim`s in `Hello` and Rift stops reading them as source.
+so an adapter declares those paths as `WriteClaim`s in `Describe` and Rift stops reading them as source.
 Everything redirectable should be redirected into `state_root` instead, because a claim is a hole in
 what Rift can see.
 
@@ -79,8 +79,13 @@ cancelled context or an expired deadline ends the work, and failures are `google
 part of the contract rather than a list in the documentation code:
 
 - **Versioning** — `Revision` is the question, `Snapshot` is what it resolved to.
-- **Physical** — `File` at a path, `Leaf` as a node of one language's parse of it.
+- **Filesystem** — `File` at a path, `Leaf` as a node of one language's parse of it.
 - **Semantic** — `Symbol`, and the relationships between symbols.
+- **Discovery** — `Filter` and the two query grammars. Written by the caller, before an answer exists.
+- **Reachability** — `Coverage` and `Diagnostic`: how much of an answer Rift could see, and what the
+  compiler said on the way.
+- **Operations** — `Address`, `CodeActionDescriptor`, and the keys that pin a discovery to the state it
+  was made in.
 
 Crossings are one-way and explicit: `Leaf.symbol` goes up, `Relationship.evidence` goes down. Nothing
 else crosses.
@@ -104,7 +109,7 @@ These carry contract facts JSON Schema has no keyword for:
 
 ## What the schemas cannot assert about themselves
 
-Some guarantees are relational — adapter coverage, the environment equality a `Refresh` reports,
+Some guarantees are relational — adapter coverage, the snapshot equality a `Refresh` reports,
 retention ordering, that two `Edit`s in one set do not overlap. No JSON Schema keyword ties one
 field's value to a digest of another, so those are asserted by executable conformance tests rather
 than pretended here.

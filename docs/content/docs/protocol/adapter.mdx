@@ -25,25 +25,32 @@ request id, no operation name, no sequence number and no cancel call: an RPC met
 operation, a stream is ordered, and a cancelled context or an expired deadline ends the work. Failures
 are `google.rpc.Status`, carrying `Refusal` or `StaleState` in `status.details`.
 
-## The adapter gets a directory
+## The adapter gets a working tree
 
-Rift writes the code to disk and passes the path:
+Rift materializes the code and passes the path:
 
 ```
 ~/projects/charming-aurora          your worktree, Rift's to write
-~/.cache/rift/ws/8f21c4/root        what the Rust adapter reads
+~/.cache/rift/ws/8f21c4/root        the Rust adapter's working tree
 ~/.cache/rift/state/rust            what the Rust adapter writes
 ```
 
-`root` is a plain directory. Rift fills it with `git checkout-index` for the commit the snapshot sits
-on, then overwrites the files the snapshot reports dirty, and there is no `.git` anywhere in it. That
-last part is the point: a `git worktree` would leave a `.git` file pointing back at your real object
-store, and an adapter that wanted to could walk from there into every branch you have, your remotes,
-and whatever credentials your git config holds. A checkout has nothing to walk to.
+That second path holds every file the snapshot names, laid out the way the repository lays them out.
+It is a working tree in everything a compiler cares about, and Rift builds it with
+`git checkout-index` for the commit the snapshot sits on, then overwrites the files the snapshot
+reports dirty.
 
-Handing over a path rather than streaming bytes is not a shortcut. rust-analyzer, gopls and tsc all
-want a filesystem, so an adapter fed a byte stream would spend its first act writing that stream to
-disk — and Rift would have spent its own computing a delta that `git diff` already had.
+What it does not have is the `.git` that would make it a `git worktree`. A linked worktree leaves a
+`.git` file pointing back at your real object store, and an adapter that wanted to could walk from
+there into every branch you have, your remotes, and whatever credentials your git config holds. There
+is no gitdir link here, so there is nothing to walk to.
+
+rust-analyzer, gopls and tsc all want a filesystem. An adapter fed a byte stream would spend its first
+act writing that stream back to disk, and Rift would have spent its own computing a delta `git diff`
+already had. So Rift hands over a tree.
+
+The path is the workspace's identity. One tree, one workspace, and Rift never reuses a path once
+`CloseWorkspace` has taken it, so there is no minted handle to map back to a directory.
 
 <Callout>
   `state_root` is the adapter's, and Rift never reads it. Point `CARGO_TARGET_DIR`, `GOCACHE` and
@@ -69,7 +76,7 @@ thing behind it.
 
 **Compilers write anyway, and that is fine.** `cargo` puts `Cargo.lock` at the workspace root, npm
 insists on `node_modules` beside the package it belongs to, and neither is redirectable. So the
-adapter declares those paths in `Hello` as `WriteClaim`s, and Rift stops treating anything under them
+adapter declares those paths in `Describe` as `WriteClaim`s, and Rift stops treating anything under them
 as source: never analyzed, never diffed against the snapshot, never shown to an agent.
 
 Declare only what will not move. Most build output redirects with an environment variable, and
