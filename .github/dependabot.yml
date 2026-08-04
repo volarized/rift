@@ -1,5 +1,18 @@
 version: 2
 
+# Commit prefixes carry 🤖 so Dependabot's commits match the repo's
+# emoji-prefixed convention and are greppable as machine-authored.
+#
+# GitHub inserts the colon itself because the prefix ends in a letter, and
+# `include: scope` appends `(deps)` / `(deps-dev)`. Net result:
+#     🤖 build(deps): bump github/codeql-action from 4 to 4.37.4
+# The PR title derives from the same string, so squash-merged commits on main
+# inherit it too. 50-character limit on `prefix`.
+#
+# `prefix-development` is only honoured by bundler, composer, mix, maven, npm,
+# and pip — so it applies to bun (npm family) and is inert for cargo and
+# github-actions, where every update is treated as production.
+
 updates:
   # docs/ JavaScript. NOTE: Dependabot supports *version* updates for bun but
   # NOT security updates — that gap is why ci.yml also runs `bun audit` as a
@@ -9,6 +22,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    commit-message:
+      prefix: "🤖 build"
+      prefix-development: "🤖 build"
+      include: scope
     groups:
       # One PR per week for the routine churn instead of a dozen.
       docs-minor-patch:
@@ -19,6 +36,9 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    commit-message:
+      prefix: "🤖 build"
+      include: scope
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
@@ -29,6 +49,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "🤖 build"
+      include: scope
     groups:
       actions-minor-patch:
         update-types: [minor, patch]
