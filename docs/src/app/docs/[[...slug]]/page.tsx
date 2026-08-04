@@ -2,6 +2,7 @@ import { createRelativeLink } from "fumadocs-ui/mdx";
 import { DocsBody, DocsDescription, DocsPage, DocsTitle } from "fumadocs-ui/page";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+import { PROTOCOL_PAGE_URL, protocolToc } from "@/lib/protocol";
 import { source } from "@/lib/source";
 import { getMDXComponents } from "@/mdx-components";
 
@@ -12,8 +13,13 @@ export default async function Page(props: PageProps<"/docs/[[...slug]]">) {
 
   const MDXContent = page.data.body;
 
+  // The protocol page's body is a component reading protocol/definition.json,
+  // so remark never sees its headings and `page.data.toc` is empty. Its table
+  // of contents is derived from the same schema instead.
+  const toc = page.url === PROTOCOL_PAGE_URL ? protocolToc : page.data.toc;
+
   return (
-    <DocsPage toc={page.data.toc} full={page.data.full}>
+    <DocsPage toc={toc} full={page.data.full}>
       <DocsTitle>{page.data.title}</DocsTitle>
       <DocsDescription>{page.data.description}</DocsDescription>
       <DocsBody>
