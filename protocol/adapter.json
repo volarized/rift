@@ -529,7 +529,7 @@
       },
       "additionalProperties": false
     },
-    "ElementAnalysisChunk": {
+    "LeafAnalysisChunk": {
       "type": "object",
       "required": [
         "kind",
@@ -538,7 +538,7 @@
       ],
       "properties": {
         "kind": {
-          "const": "elements"
+          "const": "leaves"
         },
         "unit": {
           "$ref": "core.json#/$defs/SourceUnitRef"
@@ -546,7 +546,7 @@
         "items": {
           "type": "array",
           "items": {
-            "$ref": "core.json#/$defs/Element"
+            "$ref": "core.json#/$defs/Leaf"
           }
         }
       },
@@ -642,7 +642,7 @@
           "$ref": "#/$defs/SymbolAnalysisChunk"
         },
         {
-          "$ref": "#/$defs/ElementAnalysisChunk"
+          "$ref": "#/$defs/LeafAnalysisChunk"
         },
         {
           "$ref": "#/$defs/RelationshipAnalysisChunk"

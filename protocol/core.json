@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://volar.sh/rift/protocol/core.json",
   "title": "Rift core semantic model",
-  "description": "Vocabulary shared by every Rift seam: Symbols, Elements, Types, Relationships, identity, source addressing, coverage, and diagnostics. The MCP surface and the adapter IPC are both defined in terms of these, so they belong to neither.",
+  "description": "Vocabulary shared by every Rift seam: Symbols, Leaves, Types, Relationships, identity, source addressing, coverage, and diagnostics. The MCP surface and the adapter IPC are both defined in terms of these, so they belong to neither.",
   "$defs": {
     "ProtocolVersion": {
       "type": "integer",
@@ -45,14 +45,14 @@
         "rift://symbol/typescript/src/config.ts:ConfigLoader.parse"
       ]
     },
-    "ElementId": {
-      "description": "Identity of one source region, and the URI that resolves it. `rift://element/<language>/<unit-path>@<start>-<end>`, where the offsets are the half-open UTF-8 byte range the element spans — which is what makes it unique, since a region is a place rather than a thing. A revision can be attached as `?rev=`.",
+    "LeafId": {
+      "description": "Identity of one leaf of a file's syntax tree, and the URI that resolves it. `rift://leaf/<language>/<unit-path>@<start>-<end>`, where the offsets are the half-open UTF-8 byte range the leaf spans. A revision can be attached as `?rev=`.",
       "type": "string",
       "minLength": 18,
       "maxLength": 1024,
-      "pattern": "^rift://element/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}@\\d+-\\d+(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+      "pattern": "^rift://leaf/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}@\\d+-\\d+(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
       "examples": [
-        "rift://element/python/pkg/util.py@1204-1266"
+        "rift://leaf/python/pkg/util.py@1204-1266"
       ]
     },
     "OwnerId": {
@@ -647,7 +647,7 @@
             "null"
           ]
         },
-        "element": {
+        "leaf": {
           "$ref": "#/$defs/ResolvedEntityTarget"
         },
         "types": {
@@ -820,7 +820,7 @@
       "type": "string",
       "pattern": "^[A-Za-z][A-Za-z0-9._-]*\\.[A-Za-z][A-Za-z0-9._-]*$"
     },
-    "ElementFacet": {
+    "LeafFacet": {
       "enum": [
         "declaration",
         "definition",
@@ -888,7 +888,7 @@
       },
       "additionalProperties": false
     },
-    "ElementKindDescriptor": {
+    "LeafKindDescriptor": {
       "type": "object",
       "required": [
         "entity",
@@ -897,7 +897,7 @@
       ],
       "properties": {
         "entity": {
-          "const": "element"
+          "const": "leaf"
         },
         "kind": {
           "$ref": "#/$defs/ExactKind"
@@ -906,7 +906,7 @@
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/ElementFacet"
+            "$ref": "#/$defs/LeafFacet"
           }
         }
       },
@@ -942,7 +942,7 @@
           "$ref": "#/$defs/SymbolKindDescriptor"
         },
         {
-          "$ref": "#/$defs/ElementKindDescriptor"
+          "$ref": "#/$defs/LeafKindDescriptor"
         },
         {
           "$ref": "#/$defs/RelationshipKindDescriptor"
@@ -979,7 +979,7 @@
             "enum": [
               "source_unit",
               "symbol",
-              "element",
+              "leaf",
               "relationship",
               "type",
               "diagnostic",
@@ -1343,7 +1343,7 @@
       ]
     },
     "Symbol": {
-      "description": "Compiler-resolved semantic identity. Source structure lives in Element and is connected through Relationship.",
+      "description": "Compiler-resolved semantic identity. Source structure lives in Leaf and is connected through Relationship.",
       "type": "object",
       "required": [
         "id",
@@ -1477,7 +1477,7 @@
       },
       "additionalProperties": false
     },
-    "ElementRegion": {
+    "LeafRegion": {
       "type": "object",
       "required": [
         "role",
@@ -1501,8 +1501,8 @@
       },
       "additionalProperties": false
     },
-    "Element": {
-      "description": "One region of source text, owned by the language that produced it. A symbol is a thing; an element is a place where that thing is written. One symbol has one identity and as many elements as it has occurrences.",
+    "Leaf": {
+      "description": "One leaf of a file's concrete syntax tree: the place where a symbol is physically written. It carries where it is — the unit, the byte range, the syntax kind — and the symbol it writes. Everything semantic about that symbol is read from the symbol.",
       "type": "object",
       "required": [
         "id",
@@ -1512,13 +1512,16 @@
         "facets",
         "range",
         "regions",
-        "types",
         "extensions"
       ],
       "properties": {
         "id": {
           "description": "Unique identifier of this source region, and the URI that resolves it.",
-          "$ref": "#/$defs/ElementId"
+          "$ref": "#/$defs/LeafId"
+        },
+        "symbol": {
+          "description": "The symbol written at this leaf. Absent where a leaf writes no symbol — punctuation, a keyword, a comment.",
+          "$ref": "#/$defs/SymbolId"
         },
         "unit": {
           "$ref": "#/$defs/SourceUnitRef"
@@ -1533,7 +1536,7 @@
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/ElementFacet"
+            "$ref": "#/$defs/LeafFacet"
           }
         },
         "range": {
@@ -1542,18 +1545,12 @@
         "regions": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/ElementRegion"
+            "$ref": "#/$defs/LeafRegion"
           }
         },
         "parent": {
           "description": "The region this one is nested inside. Absent at the top level of a unit.",
-          "$ref": "#/$defs/ElementId"
-        },
-        "types": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TypeBinding"
-          }
+          "$ref": "#/$defs/LeafId"
         },
         "extensions": {
           "$ref": "#/$defs/Extensions"
@@ -1562,7 +1559,7 @@
       "additionalProperties": false
     },
     "Relationship": {
-      "description": "One directed connection between Symbols and/or Elements. This single model covers source bindings and graph edges.",
+      "description": "One directed connection between Symbols and/or Leaves. This single model covers source bindings and graph edges.",
       "type": "object",
       "required": [
         "from",
@@ -1853,7 +1850,7 @@
       },
       "additionalProperties": false
     },
-    "PublicElementTarget": {
+    "PublicLeafTarget": {
       "type": "object",
       "required": [
         "kind",
@@ -1861,7 +1858,7 @@
       ],
       "properties": {
         "kind": {
-          "const": "element"
+          "const": "leaf"
         },
         "id": {
           "$ref": "#/$defs/SymbolId"
@@ -1922,7 +1919,7 @@
           "$ref": "#/$defs/PublicSymbolTarget"
         },
         {
-          "$ref": "#/$defs/PublicElementTarget"
+          "$ref": "#/$defs/PublicLeafTarget"
         },
         {
           "$ref": "#/$defs/MatchEntityTarget"
@@ -2124,7 +2121,7 @@
           "$ref": "#/$defs/ExactKind"
         },
         "facet": {
-          "$ref": "#/$defs/ElementFacet"
+          "$ref": "#/$defs/LeafFacet"
         },
         "text_regex": {
           "type": "string",
@@ -2474,7 +2471,7 @@
           "$ref": "#/$defs/PublicSymbolTarget"
         },
         {
-          "$ref": "#/$defs/PublicElementTarget"
+          "$ref": "#/$defs/PublicLeafTarget"
         }
       ]
     },
@@ -2483,7 +2480,7 @@
       "enum": [
         "source_maps",
         "symbols",
-        "elements",
+        "leaves",
         "relationships",
         "types",
         "diagnostics"

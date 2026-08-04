@@ -409,10 +409,10 @@
       ],
       "properties": {
         "target": {
-          "description": "Which entity kinds may be returned. Types are not standalone hits: they are reached through the Symbol and Element views that bind them, and searched over by filter.",
+          "description": "Which entity kinds may be returned. Types are not standalone hits: they are reached through the Symbol and Leaf views that bind them, and searched over by filter.",
           "enum": [
             "symbol",
-            "element",
+            "leaf",
             "file",
             "all"
           ]
@@ -649,7 +649,7 @@
         "environment",
         "symbol",
         "source_maps",
-        "elements",
+        "leaves",
         "relationships",
         "source",
         "diagnostics",
@@ -677,10 +677,10 @@
             "$ref": "core.json#/$defs/SourceMapEntry"
           }
         },
-        "elements": {
+        "leaves": {
           "type": "array",
           "items": {
-            "$ref": "core.json#/$defs/Element"
+            "$ref": "core.json#/$defs/Leaf"
           }
         },
         "relationships": {
@@ -2035,14 +2035,14 @@
           "type": "object",
           "required": [
             "target",
-            "element"
+            "leaf"
           ],
           "properties": {
             "target": {
-              "const": "element"
+              "const": "leaf"
             },
-            "element": {
-              "$ref": "core.json#/$defs/Element"
+            "leaf": {
+              "$ref": "core.json#/$defs/Leaf"
             }
           },
           "additionalProperties": false

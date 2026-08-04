@@ -7,6 +7,12 @@ import { CoreReference } from "@/components/protocol/core";
 Rift works in a workspace only if git is enabled there, which is true of virtually every repository. If
 it isn't, run `git init` in the workspace. Requiring it enforces a practice you want anyway.
 
+The model has three axes:
+
+- **temporal** — revisions
+- **semantic** — symbols
+- **physical** — files, as syntax trees, with leaves
+
 ## Revision
 
 By default Rift indexes and works with the current revision: the default branch, at its latest commit.
@@ -45,29 +51,36 @@ compiler-driven facts — for instance the list of dependants and dependencies.
 A declared type is a symbol as well. `struct Config` and `interface Props` are declarations like any
 other, and they carry the `type` facet. Languages without types still have symbols.
 
-Every symbol is identified by the URI that resolves it:
+A symbol is identified by the URI that resolves it:
 
 ```
 rift://symbol/python/pkg/util.py:load_config
 ```
 
+Symbols live across revisions. That identity is the symbol itself, at whichever revision the request
+resolved; attach `?rev=` to pin it to one:
+
+```
+rift://symbol/python/pkg/util.py:load_config?rev=v1.2.0
+```
+
 The full shape is [`Symbol`](#Symbol) in the reference below.
 
-## Element
+## Leaf
 
-A symbol is a thing. An element is a place where that thing is written.
+Physically, a codebase is files, and each file is a
+[concrete syntax tree](https://en.wikipedia.org/wiki/Parse_tree) — every token the source contains, in
+the shape the grammar gives it. A leaf of that tree is where a symbol is physically written.
 
-You need both because they answer different questions. *What is this?* is a symbol question — one
-answer, whatever file you asked from. *What exactly gets replaced if I rename it?* is an element
-question, and it needs a file and a byte range. One symbol has one identity and as many elements as it
-has occurrences: the line that declares it, and every line that mentions it.
+So a symbol is a semantic object, and its leaves are the places it is defined and mentioned. One symbol,
+many leaves.
 
-So an element is addressed by where it is, not by what it is:
+A leaf is identified by where it sits: the file, and the byte range it spans.
 
 ```
-rift://element/python/pkg/util.py@1204-1266
+rift://leaf/python/pkg/util.py@1204-1266
 ```
 
-The full shape is [`Element`](#Element) in the reference below.
+The full shape is [`Leaf`](#Leaf) in the reference below.
 
 <CoreReference />
