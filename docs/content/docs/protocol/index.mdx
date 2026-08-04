@@ -26,7 +26,7 @@ That is the constraint the rest of the design follows from. Several agents can b
 workspace at once, and they need a central point behind them. That central point is the rift server.
 
 <IsoDiagram
-  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB, the git worktrees and the language adapters."
+  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB and the git worktrees, drives the language adapters over gRPC, and checks out a separate tree that those adapters read."
   chart={`
     flowchart LR
       agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp"]:::rift
@@ -36,6 +36,8 @@ workspace at once, and they need a central point behind them. That central point
       server --> semantic["semantic DB"]:::store
       server --> worktrees["git worktrees"]:::git
       server -- "gRPC<br/>over Unix socket" --> adapters["adapters"]:::adapter
+      server -- "checkout" --> trees["adapter trees"]:::git
+      adapters -- "read" --> trees
   `}
 />
 
@@ -48,10 +50,10 @@ identifier when a `rift mcp` process connects, and remembers which workspace tha
 When the rift server starts, it scans the repository and builds the semantic level using the language
 adapters.
 
-## Two seams, two contracts
+## Seams
 
-The server sits between an agent and a compiler, and they want different things. So the two sides are
-different contracts, and neither knows the other exists.
+The server sits between an agent and a compiler, and they want different things. So each side is its
+own contract, and neither knows the other exists.
 
 | | agent ↔ server | server ↔ adapter |
 | --- | --- | --- |
@@ -61,11 +63,17 @@ different contracts, and neither knows the other exists.
 | audience | an agent choosing what to do next | a compiler being driven |
 
 **MCP knows nothing about adapters.** It sees what Rift can do for a language, not how the adapter
-recognises its files or what it fingerprints. Mirrors, sync streams and environment digests never
-reach it — they are how the server keeps a compiler warm, which is the server's problem.
+recognises its files or what it fingerprints. Checked-out trees, refresh calls and environment digests
+never reach it — they are how the server keeps a compiler warm, which is the server's problem.
 
 **The adapter knows nothing about agents.** It has no notion of a tool call, a cursor, or a resource
-URI. It is told which mirror to make and which state that mirror holds.
+URI. It is handed a directory and told what state that directory holds.
+
+That directory is not your worktree and it is not a `git worktree` either. The server checks the code
+out with `git checkout-index`, so what the adapter gets has no `.git` in it and no way to reach your
+branches, your remotes or the credentials in your git config. It reads that tree and never writes to
+it: `rustfmt` and its equivalents hand their changes back as data, and the server is what touches a
+file. Two agents working in the same repository therefore cannot land in each other's edits.
 
 <Callout>
   The adapter seam is gRPC over a Unix domain socket, one adapter per language, all owned by the
@@ -73,10 +81,10 @@ URI. It is told which mirror to make and which state that mirror holds.
   the adapter is a subprocess speaking this service.
 </Callout>
 
-### One model, two spellings
+### Where the model lives
 
-Both seams carry the same things — a symbol, a leaf, a file, a snapshot. Writing that model twice
-would guarantee it drifts, so it is written once:
+Both seams carry the same things — a symbol, a leaf, a file, a snapshot. Writing that model on each
+side would guarantee it drifts, so it is written once:
 
 ```
 core.json  ──generated──▶  core.proto
@@ -89,11 +97,11 @@ core.json  ──generated──▶  core.proto
 `core.json` is the model. `core.proto` is generated from it, so a protobuf message and a JSON Schema
 definition of the same name describe the same thing by construction — there is no second place to
 edit. Each seam then adds only what is its own: `mcp.json` adds tools, resources and cursors;
-`adapter.proto` adds mirrors, sync and the service itself.
+`adapter.proto` adds workspaces, path claims and the service itself.
 
 ## Definitions
 
-- [Core model](/docs/protocol/core) — the three axes, and what each addresses
+- [Core model](/docs/protocol/core) — the axes the model is filed on, and what each addresses
 - [MCP](/docs/protocol/mcp) — tools and resources provided to an agent
 - [Adapter](/docs/protocol/adapter) — the gRPC service the server drives a compiler with
 - [Reference](/docs/protocol/reference) — every type in the model, grouped by axis

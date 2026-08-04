@@ -1,6 +1,6 @@
 # protocol
 
-The Rift contract. Two seams, two artifacts, one model.
+The Rift contract: what an agent may ask the server, and what the server may ask a compiler.
 
 | File | Holds |
 | --- | --- |
@@ -16,19 +16,34 @@ source of truth.
 These files are **normative**. Generated clients and the documentation are projections of them; where
 a projection disagrees, the file wins.
 
-## Why two artifacts
+## Why the seams are described differently
 
 MCP is JSON-RPC, so its surface is JSON Schema. The adapter seam is gRPC over a Unix domain socket, so
 its surface is a `.proto` with a service definition. Neither is a translation of the other, and neither
 side knows the other exists:
 
-- **MCP knows nothing about adapters.** No mirror, no sync stream, no environment digest and no path
-  claim reaches it. Those are how the server keeps a compiler warm, which is the server's problem.
-  MCP publishes `LanguageSupport` — what Rift can do for a language — and stops there.
+- **MCP knows nothing about adapters.** No workspace path, no refresh, no environment digest and no
+  path claim reaches it. Those are how the server keeps a compiler warm, which is the server's
+  problem. MCP publishes `LanguageSupport` — what Rift can do for a language — and stops there.
 - **The adapter knows nothing about agents.** It has no notion of a tool call, a cursor, or a resource
-  URI. It is told which mirror to make and which state that mirror holds.
+  URI. It is handed a directory and told what state that directory holds.
 
-## One model, two spellings
+## Who owns the filesystem
+
+Rift checks a tree out per adapter with `git checkout-index` and passes the path. No `.git` lands in
+it, so an adapter cannot reach your branches, your remotes or the credentials in your git config —
+which a linked `git worktree` would have left one symlink away.
+
+Rift writes source and the adapter does not. A fix or a refactor comes back from `Resolve` as
+`Edit`, and Rift applies it. That makes a change reviewable before it lands, and it keeps one
+agent's `rustfmt` run out of the tree another agent is reading.
+
+Compilers write regardless — `Cargo.lock` at the workspace root, `node_modules` beside its package —
+so an adapter declares those paths as `WriteClaim`s in `Hello` and Rift stops reading them as source.
+Everything redirectable should be redirected into `state_root` instead, because a claim is a hole in
+what Rift can see.
+
+## Where the model lives
 
 ```
 core.json  ──generated──▶  core.proto
@@ -49,17 +64,16 @@ cannot express a constraint — a string pattern, a conditional requirement, `mi
 Schema stays normative and the proto carries the shape only.
 
 Scalar identities inline as their scalar. `SymbolId` is a `string` in the proto, because protobuf has
-no newtype and a one-field wrapper buys nothing but indirection; the URI pattern lives in `core.json`.
+no newtype and a one-field wrapper would only add indirection; the URI pattern lives in `core.json`.
 
 ## What gRPC already does
 
 `adapter.proto` carries no framing of its own — no envelope, no request id, no operation name, no
 sequence number, no cancel operation. An RPC method is the operation, a stream is ordered, a
 cancelled context or an expired deadline ends the work, and failures are `google.rpc.Status` with
-`Refusal` or `StaleState` in `status.details`. Eight RPCs replace what was thirteen operations and
-twenty-nine envelope types.
+`Refusal` or `StaleState` in `status.details`.
 
-## The three axes
+## Axes
 
 `core.json` declares its own grouping under `rift:axes`, so which definition belongs to which axis is
 part of the contract rather than a list in the documentation code:
@@ -76,23 +90,24 @@ else crosses.
 `mcp.json` points at `core.json` with `$id`-relative `$ref` — `{"$ref": "core.json#/$defs/Symbol"}` —
 and nothing points back. Definition names are unique across both documents. Consumers must map `$id`
 to a local file themselves; the specification does not mandate retrieval. Anything that can only read
-a single document needs the two bundled first; draft 2020-12 compound schema documents are the
-standard shape for that.
+a single document needs them bundled first; draft 2020-12 compound schema documents are the standard
+shape for that.
 
 ## Extension keys
 
-Two keys carry contract facts JSON Schema has no keyword for:
+These carry contract facts JSON Schema has no keyword for:
 
 - `rift:entryPoints` — the seams every other definition is reachable from. `mcp.json` declares
   `mcp.tools`, `mcp.resources`, `mcp.resources.read` and `mcp.error`. `core.json` declares none,
   because nothing enters the contract through it.
-- `rift:axes` — the three axes, the definitions that identify each, and how the rest are filed.
+- `rift:axes` — the axes, the definitions that identify each, and how the rest are filed.
 
 ## What the schemas cannot assert about themselves
 
-Some guarantees are relational — adapter coverage, the environment equality a `Sync` commit reports,
-retention ordering. No JSON Schema keyword ties one field's value to a digest of another, so those are
-asserted by executable conformance tests rather than pretended here.
+Some guarantees are relational — adapter coverage, the environment equality a `Refresh` reports,
+retention ordering, that two `Edit`s in one set do not overlap. No JSON Schema keyword ties one
+field's value to a digest of another, so those are asserted by executable conformance tests rather
+than pretended here.
 
 ## Not here yet
 

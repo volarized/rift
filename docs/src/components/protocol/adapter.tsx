@@ -86,8 +86,10 @@ export function AdapterReference(): ReactNode {
         Service
       </h2>
       <p>
-        Eight calls. There is no envelope, no request id, no operation name and no cancel call: gRPC
-        is the framing, a stream is ordered, and a cancelled context ends the work.
+        <code>Hello</code> runs at startup. <code>OpenWorkspace</code>, <code>Refresh</code> and{" "}
+        <code>CloseWorkspace</code> manage the directory Rift checked out. <code>Analyze</code>,{" "}
+        <code>Match</code> and <code>Actions</code> ask what is in it, and <code>Resolve</code>{" "}
+        turns one of those answers into edits.
       </p>
 
       {(service?.rpcs ?? []).map((rpc) => (
@@ -114,8 +116,8 @@ export function AdapterReference(): ReactNode {
       </h2>
       <p>
         What the seam itself defines. Everything it carries about code — <code>Symbol</code>,{" "}
-        <code>Leaf</code>, <code>File</code>, <code>Snapshot</code> — is generated from the model
-        and described in the reference.
+        <code>Leaf</code>, <code>File</code>, <code>Snapshot</code>, <code>Edit</code> — is
+        generated from the model and described in the reference.
       </p>
 
       {owned.map((message) => (

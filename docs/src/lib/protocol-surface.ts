@@ -385,7 +385,7 @@ function referencePage(): PageData {
 export const pageData: Record<string, PageData> = {
   [pageUrl("mcp")]: mcpPage(),
   [`${PROTOCOL_ROOT}/adapter`]: adapterPage(),
-  // No entry for `core`: it is prose and nothing else, so remark already sees
-  // every heading it has. Its types are anchored on the reference page.
+  // No entry for `core`: it is plain prose, so remark already sees every
+  // heading it has. Its types are anchored on the reference page.
   [`${PROTOCOL_ROOT}/reference`]: referencePage(),
 };

@@ -238,7 +238,7 @@ for (const name of defNames) {
  * traverser: `rift:entryPoints` is not a schema, so the traverser does not
  * reach it, and it is where the tool and resource catalogue is declared. A
  * `$ref` there naming a definition that was renamed out from under it produces
- * a page with a link to nothing, and nothing else says so.
+ * a page with a link to nothing, and no other check catches it.
  */
 for (const file of PROTOCOL_FILES) {
   const walk = (node: unknown, path: string): void => {

@@ -1,22 +1,31 @@
 ---
-title: Core model
+title: Core
 ---
 
-Rift works in a workspace only if git is enabled there, which is true of virtually every repository. If
-it isn't, run `git init` in the workspace. Requiring it enforces a practice you want anyway.
+Rift works in a workspace only if git is enabled there, which is true of virtually every repository. 
 
-The model has three axes:
+<Callout type="info" title="Git is required">
+    If it isn't already enabled, run `git init` in the workspace.
+</Callout>
+
+Every definition in the model sits on an axis:
 
 - **versioning** — which state you are asking about
-- **physical** — files, as syntax trees, with leaves
-- **semantic** — symbols
+- **semantic** — symbols, and how they connect
+- **physical** — files, their syntax trees, and the changes proposed to them
 
-Each is addressed by a URI that resolves it, and a versioning coordinate narrows the other two. Nothing
-else crosses between them: a file never mentions a symbol, a symbol never mentions a path.
+Each is addressed by a URI that resolves it, and a versioning coordinate narrows the other two.
 
-## Revision and Snapshot
+The axes touch only where the model says so. A leaf names the symbol written at it, and a relationship
+points at the leaves it was read from. Past that a file never mentions a symbol and a symbol never
+mentions a path, which is what lets you move a file without invalidating a single symbol URI.
 
-A revision is the question. A snapshot is the answer.
+## Versioning
+
+You ask against a revision. Git resolves it to a commit or to a working tree, and Rift reports what it
+resolved to, because otherwise you could not ask the same question twice.
+
+### Revision
 
 By default Rift works with the default branch at its latest commit. Every tool and every resource also
 takes an optional `rev` that points somewhere else. It is a git revision parameter —
@@ -38,6 +47,8 @@ The worktree spellings are git's own — per-worktree refs are reachable from an
 `worktrees/<id>/HEAD` and `main-worktree/HEAD`. Dropping the `/HEAD` is Rift's one addition, because
 gitrevisions has no way to name work that isn't committed yet, and that is usually what you are editing.
 
+### Snapshot
+
 Because `main` names a different commit tomorrow, and a working tree changes under you, the answer says
 what it actually resolved to. A [`Snapshot`](/docs/protocol/reference#Snapshot) comes back with every
 response:
@@ -56,7 +67,12 @@ A snapshot names bytes. The same bytes mean different things to a compiler depen
 dependencies are installed, so every response reports the snapshot *and* the environment. Pass both back
 when two calls have to agree.
 
-## Symbol
+## Semantic
+
+Everything on this axis is addressed by what the language calls it, so none of it moves when a file
+does.
+
+### Symbol
 
 A symbol is any entity of a given language that carries compiler-provided metadata, at a given revision.
 Think of classes, functions or methods as examples of symbols. An arbitrarily large codebase can have
@@ -79,7 +95,8 @@ rift://symbol/rust/serde::de::Deserialize
 No file appears there unless the language puts one there — a TypeScript module *is* a file, a Rust
 one is not. Where a symbol is written is read from its leaves, so moving a file leaves every symbol
 in it addressable by the same URI. The same spelling names a symbol the compiler invented, and one
-whose declaration Rift cannot read; `origin` says which.
+whose declaration Rift cannot read; `origin` says which — your own source, a package the manager
+installed, the standard library, or something the compiler synthesised.
 
 Symbols live across revisions. That identity is the symbol itself, at whichever revision the request
 resolved; attach `?rev=` to pin it to one:
@@ -90,9 +107,40 @@ rift://symbol/python/pkg.util.load_config?rev=v1.2.0
 
 Its fields are listed under [`Symbol`](/docs/protocol/reference#Symbol).
 
-## File and Leaf
+### Relationship
 
-Physically, a codebase is files. A file is identified by its path and nothing else:
+A [`Relationship`](/docs/protocol/reference#Relationship) is a directed edge from one symbol to
+another: a call, an implementation, an import. Rift indexes the edges, so "every caller of
+`parse_config`" is a lookup rather than a scan.
+
+An edge carries `evidence` — the leaves the compiler read it from. That is the semantic axis reaching
+down into the physical one, and it is the only direction that crossing goes:
+
+```
+from:     rift://symbol/python/pkg.api.handler
+to:       rift://symbol/python/pkg.util.load_config
+evidence: rift://leaf/python/pkg/api.py@880-899
+```
+
+Every edge reaches Rift from an adapter, so naming the sender would tell you nothing. What differs is
+how much the compiler actually knew, and `derivation` says which:
+
+| `derivation` | The compiler |
+| --- | --- |
+| `resolution` | resolved it — name resolution or the type checker produced this edge |
+| `syntax` | did not, so the adapter read it off the tree: a call on an untyped receiver matched by name, a component matched to a tag |
+| `heuristic` | did not, and the adapter guessed — `confidence` says how strongly |
+
+A refactor can act on `resolution` without checking. Below that an edge is a candidate to show you,
+not a fact to rewrite from.
+
+## Physical
+
+Everything on this axis is addressed by path and byte offset, so it changes whenever the file does.
+
+### File
+
+Physically, a codebase is files. A file is identified by its path, relative to the project root:
 
 ```
 rift://file/pkg/util.py
@@ -101,6 +149,8 @@ rift://file/pkg/util.py
 No language appears there. Bytes are bytes whether three adapters claim the path or none do, and the
 same URI resolves to the entry — what Git records for it, which languages read it — and to its content.
 A `LICENSE` file is as addressable as a source file.
+
+### Leaf
 
 Parsing turns those bytes into a
 [concrete syntax tree](https://en.wikipedia.org/wiki/Parse_tree): every token the source contains, in
@@ -118,5 +168,40 @@ without a grammar. One file can hold several: JavaScript inside Svelte, CSS insi
 Python. Two adapters reading the same bytes produce two trees, and `rift://leaf/svelte/App.svelte@100-200`
 and `rift://leaf/typescript/App.svelte@100-200` are different nodes.
 
+A leaf also marks out its named parts — `name`, `header`, `body`, `documentation` — so an operation can
+address the body of a function without touching the docstring above it.
+
 Its fields are listed under [`File`](/docs/protocol/reference#File) and
 [`Leaf`](/docs/protocol/reference#Leaf).
+
+### Edit
+
+A change to the code is a value before it is a write to disk. An
+[`Edit`](/docs/protocol/reference#Edit) is a byte range and what replaces it, or a file created,
+deleted or renamed:
+
+```
+{ "kind": "replace",
+  "span": { "unit":  "rift://file/pkg/util.py",
+            "range": { "start": 1204, "end": 1266 } },
+  "text": "def load_config(path: Path) -> Config:" }
+```
+
+Language adapters never write to the code they read. Ask for a fix or a refactor and the compiler
+computes the change, hands it back in this shape, and Rift is what touches the file. So a change can be
+read before it lands, and with several agents working in one repository, the one who asked is the only
+one it reaches.
+
+The same shape reads a change that already happened. A
+[`FileChange`](/docs/protocol/reference#FileChange) is the file entry on each side of a comparison and
+the edits between them, so a diff and a refactor speak one vocabulary:
+
+```
+before: rift://file/pkg/util.py   digest 3f8a…  1204 bytes
+after:  rift://file/pkg/util.py   digest 9c21…  1198 bytes
+edits:  [ { "kind": "replace", … } ]
+```
+
+Nothing restates the path or the kind of change: a created file has no `before`, a deleted one has no
+`after`, and a rename is two paths. Read the whole comparison at
+[`rift://diff/main..feature-x`](/docs/protocol/mcp).
