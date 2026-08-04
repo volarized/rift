@@ -4,19 +4,17 @@ title: MCP
 
 import { McpReference } from "@/components/protocol/mcp";
 
-An agent calls three tools and reads four resources. `search`, `match` and `actions` take parameters
-and return a result; the repository, symbol, diff and file resources are read by URI.
+An agent calls Rift through tools and resources. A tool accepts parameters and returns a result. A
+resource URI identifies data the agent can read, such as `rift://file/pkg/util.py`.
 
-Everything answers against the default branch unless you pass a `rev`. Every response reports the
-snapshot it resolved to, so when two calls have to agree you pass that back rather than naming the
-branch twice and hoping it did not move.
+A request uses the latest commit on the default branch when `rev` is absent. The response reports the
+resolved state as a `Snapshot`. Reuse that snapshot when later calls must read the same state.
 
-An answer too large for one response ends with a **cursor**: an opaque string naming the request, the
-state and the page size it was produced under. Send it back for the next page. If the workspace has
-moved past that state the cursor is refused, because the alternative is a second page answered against
-code the first page never saw.
+An answer too large for one response includes an opaque continuation string called a `Cursor`. It is
+bound to the original request and snapshot. Send it back to read the next page. Rift refuses it after
+the workspace moves because every page must use the same source state.
 
-When something cannot be done you get a typed failure: a stable code, whether retrying can help, and
-the evidence behind it.
+A failed request returns a stable error code. Its retry directive says whether another attempt can
+succeed, and the remaining fields carry the evidence for the failure.
 
 <McpReference />

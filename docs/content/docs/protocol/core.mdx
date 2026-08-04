@@ -2,22 +2,20 @@
 title: Core
 ---
 
-Every answer Rift gives is answered against a revision, and a revision is a git object. A workspace
-without git has nothing to resolve, so Rift needs one.
+Rift resolves every request against a Git revision, so the workspace must be a Git repository.
 
 <Callout type="info" title="Git is required">
     If it isn't already enabled, run `git init` in the workspace.
 </Callout>
 
-`core.json` files every definition into a group under `rift:axes`, so which group a type belongs to is
-part of the contract rather than a heading someone picked here. The six below are the ones that say
-something about your code; the [reference](/docs/protocol/reference) also lists the contract's own
-machinery and the shapes only MCP uses.
+`core.json` assigns each definition to a group under `rift:axes`. That assignment is part of the
+contract. This page explains the groups that describe code; the [reference](/docs/protocol/reference)
+also includes protocol machinery and MCP-specific shapes.
 
 ## Versioning
 
-You ask against a revision. Git resolves it to a commit or to a working tree, and Rift reports what it
-resolved to, because otherwise you could not ask the same question twice.
+A request names Git state. The protocol calls that input a `Revision`. Rift resolves it to a commit or
+working tree and returns the exact state, called a `Snapshot`, so another call can reuse it.
 
 ### Revision
 
@@ -53,18 +51,16 @@ response:
                       "base": "dae86e1…", "changes": "9f2c…" }
 ```
 
-A working tree is derived state, so it is never restated in full: it names the commit it sits on and
-digests only the files that differ. Editing one file leaves every other file's state, and the answers
-derived from it, untouched.
+A working-tree snapshot contains its base commit and a digest of the files that differ from it.
+Editing one file therefore leaves every other file's state unchanged.
 
-A snapshot is the whole coordinate. Which dependencies are installed and how the compiler is
-configured are read from the tree, and the tree is what the snapshot names — so the adapter tracks
-them across a `Refresh` and nothing about them has to ride on a call. Which compiler is answering at
-all is fixed when the server starts it, and the repository resource says so once.
+The tree also contains dependency and compiler configuration files. An adapter tracks changes to
+those inputs across `Refresh`. The repository resource identifies the compiler serving the snapshot.
 
 ## Filesystem
 
-Everything here is addressed by path and byte offset, so it changes whenever the file does.
+File and leaf identities use project-relative paths and byte offsets. Editing a file can change those
+identities.
 
 ### File
 
@@ -74,32 +70,34 @@ Physically, a codebase is files. A file is identified by its path, relative to t
 rift://file/pkg/util.py
 ```
 
-No language appears there. Bytes are bytes whether three adapters claim the path or none do, and the
-same URI resolves to the entry — what Git records for it, which languages read it — and to its content.
-A `LICENSE` file is as addressable as a source file.
+The URI contains the path. The resource returns the Git entry and file content. It also reports which
+languages read the file. The same resource reads `LICENSE` and compiler-owned source.
 
-Where more than one language claims a file, the entry says which bytes each one owns. `App.svelte`
-lists `svelte`, `typescript` and `css`, and its `regions` are what tell you the TypeScript starts at
-byte 412.
+Where more than one language claims a file, the entry says which bytes each one owns. In `App.svelte`,
+the `regions` field can record that TypeScript starts at byte 412.
 
 ### Leaf
 
 Parsing turns those bytes into a
 [concrete syntax tree](https://en.wikipedia.org/wiki/Parse_tree): every token the source contains, in
-the shape the grammar gives it. A leaf of that tree is one node of it, identified by the grammar that
-produced it, the file, and the byte range it spans:
+the shape the grammar gives it. A leaf is one node of that tree. Its identity contains the grammar and
+file, followed by the byte range it spans:
 
 ```
 rift://leaf/python/pkg/util.py@1204-1266
 ```
 
-The language is part of that identity rather than a fact about it, because there is no parse tree
-without a grammar. One file can hold several: JavaScript inside Svelte, CSS inside Vue, SQL inside
-Python. Two adapters reading the same bytes produce two trees, and `rift://leaf/svelte/App.svelte@100-200`
-and `rift://leaf/typescript/App.svelte@100-200` are different nodes.
+The grammar determines the tree, so the language is part of the leaf identity. One file can contain
+several grammars. For example, Svelte and TypeScript adapters can parse the same byte range into
+different nodes:
 
-A leaf also marks out its named parts — `name`, `header`, `body`, `documentation` — so an operation can
-address the body of a function without touching the docstring above it.
+```
+rift://leaf/svelte/App.svelte@100-200
+rift://leaf/typescript/App.svelte@100-200
+```
+
+A leaf also marks named regions. For a function, an operation can address its `body` independently
+from its `documentation`.
 
 A leaf is where a [symbol](#symbol) is written. One symbol has many leaves: the place it is declared,
 and every place it is mentioned.
@@ -107,8 +105,8 @@ and every place it is mentioned.
 ### Edit
 
 A change to the code is a value before it is a write to disk. An
-[`Edit`](/docs/protocol/reference#Edit) is a byte range and what replaces it, or a file created,
-deleted or renamed:
+[`Edit`](/docs/protocol/reference#Edit) can replace a byte range with new text. Other variants create
+or delete a file. A rename changes its path:
 
 ```
 { "kind": "replace",
@@ -117,14 +115,14 @@ deleted or renamed:
   "text": "def load_config(path: Path) -> Config:" }
 ```
 
-Language adapters never write to the code they read. Ask for a fix or a refactor and the compiler
-computes the change, hands it back in this shape, and Rift is what touches the file. So a change can be
-read before it lands, and with several agents working in one repository, the one who asked is the only
-one it reaches.
+An adapter returns proposed source changes to Rift as `Edit` values. Rift can inspect the values before
+writing them to the task worktree. The [adapter contract](/docs/protocol/adapter#source-ownership)
+defines that ownership boundary.
 
 The same shape reads a change that already happened. A
 [`FileChange`](/docs/protocol/reference#FileChange) is the file entry on each side of a comparison and
-the edits between them, so a diff and a refactor speak one vocabulary:
+the edits between them. The same byte replacement can therefore appear in a diff or a proposed
+refactor:
 
 ```
 before: rift://file/pkg/util.py   digest 3f8a…  1204 bytes
@@ -132,27 +130,24 @@ after:  rift://file/pkg/util.py   digest 9c21…  1198 bytes
 edits:  [ { "kind": "replace", … } ]
 ```
 
-The path and the kind of change are read from the two entries: a created file has no `before`, a
-deleted one has no `after`, and a rename is two paths. So the edits in a comparison only ever replace
-byte ranges — an edit that also claimed to delete the file could contradict them. Read the whole
-comparison at
+The two entries determine the file-level change. A created file has an `after` entry. A deleted file
+has a `before` entry. A rename has different paths on each side. The nested edits then describe byte
+replacements within those entries. Read the whole comparison at
 [`rift://diff/main..feature-x`](/docs/protocol/mcp).
 
 ## Semantic
 
-Everything here is addressed by what the language calls it, so none of it moves when a file does.
+Semantic identities use compiler names, so moving a file preserves them when the language's name stays
+the same.
 
 ### Symbol
 
-A symbol is any entity of a given language that carries compiler-provided metadata, at a given revision.
-Think of classes, functions or methods as examples of symbols. An arbitrarily large codebase can have
-thousands of them.
+A symbol is a compiler-recognized entity at one revision. For example, the Python function
+`pkg.util.load_config` is one symbol. The server indexes symbols and the relationships returned by the
+compiler, so a caller can retrieve the function's callers.
 
-What the rift server does well is indexing those symbols, the relationships between them, and other
-compiler-driven facts — for instance the list of dependants and dependencies.
-
-A declared type is a symbol as well. `struct Config` and `interface Props` are declarations like any
-other, and they carry the `type` facet. Languages without types still have symbols.
+A declared type is also a symbol. The portable marker for a type declaration is stored in the symbol's
+`facets` field as `type`. A Python adapter can emit a function symbol without attaching that facet.
 
 A symbol is identified by the URI that resolves it: the language, then the name the language itself
 gives the declaration.
@@ -162,11 +157,10 @@ rift://symbol/python/pkg.util.load_config
 rift://symbol/rust/serde::de::Deserialize
 ```
 
-No file appears there unless the language puts one there — a TypeScript module *is* a file, a Rust
-one is not. Where a symbol is written is read from its leaves, so moving a file leaves every symbol
-in it addressable by the same URI. The same spelling names a symbol the compiler invented, and one
-whose declaration Rift cannot read; `origin` says which — your own source, a package the manager
-installed, the standard library, or something the compiler synthesised.
+The URI follows the language's naming rules. A TypeScript module name includes its file path; a Rust
+module name follows the module tree. Leaves record where the symbol is written, so the symbol URI can
+survive a file move. The `origin` field records whether Rift can open the declaration and what can
+replace it. A dependency upgrade replaces a package symbol. Rebuilding can replace a generated one.
 
 Symbols live across revisions. That identity is the symbol itself, at whichever revision the request
 resolved; attach `?rev=` to pin it to one:
@@ -177,9 +171,9 @@ rift://symbol/python/pkg.util.load_config?rev=v1.2.0
 
 ### Relationship
 
-A [`Relationship`](/docs/protocol/reference#Relationship) is a directed edge from one symbol to
-another: a call, an implementation, an import. Rift indexes the edges, so "every caller of
-`parse_config`" is a lookup rather than a scan.
+A [`Relationship`](/docs/protocol/reference#Relationship) is a directed edge between symbols. A call
+from `handler` to `load_config` is one such edge. Rift indexes these edges, so a caller query reads the
+index.
 
 An edge carries `evidence` — the leaves the compiler read it from:
 
@@ -189,23 +183,24 @@ to:       rift://symbol/python/pkg.util.load_config
 evidence: rift://leaf/python/pkg/api.py@880-899
 ```
 
-That reference and `Leaf.symbol` are the only two places the semantic and filesystem groups touch, and
-they run in opposite directions. Past them a file never mentions a symbol and a symbol never mentions
-a path, which is what lets you move a file without invalidating a single symbol URI.
+`Leaf.symbol` links a syntax-tree node to semantic identity. `Relationship.evidence` links a semantic
+edge back to the node that established it. The symbol URI remains stable when only the file path
+changes.
 
-Not every edge is worth the same. `derivation` grades how much the compiler knew when it produced
-one, which decides whether a refactor can act on it or should only show it to you.
+The compiler also reports how it derived each edge. In the `derivation` field, `resolution` comes from
+the compiler's name resolver or type checker. `syntax` comes from the parsed tree. `heuristic` marks a
+guess with a confidence value.
 
 ## Discovery
 
-Nothing here is a fact about the code. You write it before there is an answer, and Rift turns it into
-one. Two grammars do that, and they ask different questions.
+Callers use a `Filter` to test compiler facts. A `StructuralQuery` parses a source-shaped pattern with
+the target language's grammar.
 
 ### Filter
 
-A [`Filter`](/docs/protocol/reference#Filter) asks by what the compiler knows. Every node is tagged —
-`field`, `relation`, `all`, `any`, `not` — so the tree parses in one pass and nests without precedence
-rules:
+A [`Filter`](/docs/protocol/reference#Filter) asks by what the compiler knows. Each node has a tag.
+`field` tests a value, while `relation` follows an edge. `all` and `any` combine child nodes;
+`not` negates one. The tags make nesting explicit:
 
 ```
 all: [ { field:    { field: "facets", op: "contains", value: "function" } },
@@ -213,12 +208,11 @@ all: [ { field:    { field: "facets", op: "contains", value: "function" } },
                      target: { field: { field: "facets", op: "contains", value: "test" } } } } ]
 ```
 
-That reads "functions called from a test". The nested `target` is what makes it one query rather than
-two queries and a join written in your own code.
+That reads "functions called from a test". The nested `target` performs the relationship join inside
+the query.
 
-A `relation` node walks edges instead of testing a value, so it is bounded: `max_depth` stops the walk,
-because a call graph has cycles and a workspace has no natural end. `quantifier: "not_exists"` inverts
-it, which is how "a symbol nothing calls" is asked.
+A `relation` node can traverse a cyclic graph, so `max_depth` bounds the walk. The
+`quantifier: "not_exists"` form selects symbols with no matching edge.
 
 ### StructuralQuery
 
@@ -232,36 +226,33 @@ The pattern is written in the target language's own syntax, with `$NAME` standin
   "constraints": [ { "capture": "T", "cardinality": "one", "text_regex": "^[0-9]+$" } ] }
 ```
 
-Grep would need that call spelled the same way every time. Here the grammar parses it, so whitespace,
-line breaks and a trailing comma are the parser's problem rather than yours.
+The grammar parses the pattern, so whitespace and a trailing comma preserve the same match.
 
-A constraint is where a pattern over syntax reaches the compiler's knowledge: match every call, then
-keep only the ones whose target carries the `test` facet. Rift evaluates those and every
-caller-supplied regex itself, never the adapter — two engines behind one wire field disagree silently,
-and a backtracking one turns someone's pattern into a stall inside a process every workspace shares.
+A constraint combines a syntax match with compiler facts. For example, it can retain only calls whose
+target carries the `test` facet. Rift evaluates caller-supplied regular expressions with one engine.
+A second engine could accept different syntax, and backtracking could stall a shared adapter process.
 
 ### PathSelector
 
-Both grammars run over a set of files rather than the whole tree, and
-[`PathSelector`](/docs/protocol/reference#PathSelector) is that set: two lists of git-style globs
-matched against the project-relative path.
+A [`PathSelector`](/docs/protocol/reference#PathSelector) limits either query to project-relative
+paths. It contains `include` and `exclude` lists of Git-style globs.
 
 ```
 { "include": ["src/**"], "exclude": ["src/generated/**"] }
 ```
 
-`exclude` is applied after `include`, so sweeping a directory while skipping the generated output in it
-is two patterns rather than an enumeration of what is left.
+Rift applies `exclude` after `include`. The example searches `src` while skipping its generated
+subtree.
 
 ## Reachability
 
-An empty answer has two readings: nothing is there, or Rift never got that far. Every answer carries
-what tells them apart, because a caller that reads absence as proof would be wrong.
+Every answer reports how much source Rift inspected. This keeps an incomplete analysis from appearing
+as a complete empty result.
 
 ### Coverage
 
-A [`Coverage`](/docs/protocol/reference#Coverage) rides beside the facts in an answer and says which
-reading applies:
+A [`Coverage`](/docs/protocol/reference#Coverage) value accompanies the returned facts and records the
+analysis state:
 
 ```
 { "state": "complete",    "scope": { "kind": "project" } }
@@ -276,30 +267,25 @@ Absence proves absence only under `complete`. Under `partial` the `reason` says 
 cannot produce this at all; `not_applicable` means the language has no such concept, like source maps
 for a language nothing generates.
 
-Coverage is stated per fact family — source maps, symbols, leaves, relationships, types, diagnostics —
-because an adapter can resolve every symbol in a file and still fail to type one of them, and one
-number over the two would hide it.
+Coverage is recorded separately for each fact family. An adapter can resolve every symbol in a file
+while failing to type one of them, so one combined value would hide the incomplete type analysis.
 
 ### Diagnostic
 
-A [`Diagnostic`](/docs/protocol/reference#Diagnostic) is one thing the compiler said, passed through in
-its own words and under its own code — `TS2345`, `E0308`. A normalised message loses the detail that
-makes it actionable, so nothing is rewritten on the way through.
+A [`Diagnostic`](/docs/protocol/reference#Diagnostic) is one compiler finding under its original code,
+such as `TS2345`. Rift forwards the compiler's message unchanged.
 
-Two fields say how far to trust the facts around it. `reliability` is `recovered` when the parser
-repaired the source to keep going, so the tree there is a guess and so is anything read from it.
-`continuation` says whether the finding is an artefact of source that stops mid-way, which is the
-normal state of a file an agent is halfway through writing.
+The `reliability` field is `recovered` when the parser repaired invalid source to continue, so facts in
+that region may be approximate. The `continuation` field marks a diagnostic caused by source that ends
+mid-construct, as it can while an agent is writing a file.
 
 ## Operations
 
-An operation needs somewhere to apply, something to apply there, and a way to say which state of the
-code it was computed against.
+An operation carries an address and the snapshot used to compute it.
 
 ### Address
 
-An [`Address`](/docs/protocol/reference#Address) is where an operation applies. There are three ways
-to name a place, and they reach different amounts of code:
+An [`Address`](/docs/protocol/reference#Address) names the code an operation applies to:
 
 ```
 { "kind": "symbol", "symbol": "rift://symbol/python/pkg.util.load_config" }
@@ -308,9 +294,9 @@ to name a place, and they reach different amounts of code:
                               "range": { "start": 0, "end": 11 } } }
 ```
 
-A rename addressed at a symbol reaches every leaf the compiler knows about. The same rename addressed
-at a leaf touches that one node. The `source` branch addresses bytes whether or not anything was
-parsed there, which is what reaches a `LICENSE` file, or a region of a file no adapter claims.
+A symbol address lets a rename reach every leaf known to the compiler. A leaf address selects one
+syntax-tree node. A source address selects raw bytes, including bytes in `LICENSE` or in an unclaimed
+file.
 
 ### CodeActionDescriptor
 
@@ -327,22 +313,19 @@ target:        rift://leaf/python/pkg/api.py@88-94
 Computing an action's edits costs about as much as performing it, and only one of the actions offered
 gets picked, so listing and resolving are two calls.
 
-`kind` is a dotted name whose prefixes nest, so an agent that wants a fix asks for `quickfix` and never
-sees a refactor. `applicability` says how much has to be checked first: `always` is safe to apply
-unread, `conditional` holds only under something the compiler could not check, `speculative` is a guess
-at what you meant.
+`kind` is a dotted name whose prefixes nest. An agent can request `quickfix` to select that branch.
+`applicability` records the checks still required. `always` records compiler-complete preconditions.
+`conditional` records a condition the caller must verify. `speculative` records inferred intent.
 
 ### Action and match keys
 
-An action and a match are both discoveries about one state of the code, and neither survives into the
-next: an action computed byte offsets, and a match points at bytes that have moved. So each comes back
-with a key carrying the snapshot it was made in, and Rift checks that before applying anything.
+An action or match points into one snapshot. After the source moves, its byte offsets can be stale.
+Each result therefore carries a key bound to the snapshot, which Rift checks before applying it.
 
-A [`MatchKey`](/docs/protocol/reference#MatchKey) is the snapshot, the span, and a digest of the query.
-One query cannot match the same span twice, so those pin a match exactly and there is nothing left to
-hash.
+A [`MatchKey`](/docs/protocol/reference#MatchKey) contains the snapshot and matched span. It also
+contains a digest of the query. One query produces at most one match for a given span, so these fields
+identify the match.
 
-An [`ActionKey`](/docs/protocol/reference#ActionKey) is the snapshot, the address, and the adapter's own
-token. Two actions can sit at one address — `quickfix.import.add` for two different imports — and only
-the compiler that offered them can tell those apart, so Rift passes its handle back unread rather than
-inventing an identity it cannot derive.
+An [`ActionKey`](/docs/protocol/reference#ActionKey) contains the snapshot and address. It also carries
+the adapter's token. Two import actions can share one address, so the compiler uses that token to
+distinguish them. Rift returns it unchanged.

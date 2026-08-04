@@ -5,31 +5,26 @@ title: Adapter
 import { Callout } from "fumadocs-ui/components/callout";
 import { AdapterReference } from "@/components/protocol/adapter";
 
-An adapter is how a language gets into Rift: a process wrapping that language's real compiler, and
-answering questions about it. The Rift server drives it over **gRPC on a Unix domain socket**, and the
-contract is `protocol/adapter.proto`.
+A language adapter is a process that drives the language's compiler. The Rift server calls it over
+gRPC on a Unix domain socket, using the service in `protocol/adapter.proto`.
 
 ## Transport
 
-One Rift server starts its adapters, one per language, and owns them. Nothing else connects to them.
-That decides more of this page than anything else: a workspace has exactly one party creating,
-refreshing and closing it, so the adapter arbitrates nothing.
+The Rift server starts one adapter per language and is its only client. The server issues every
+workspace lifecycle call. The adapter updates the workspace state named by each request.
 
-One adapter still holds several workspaces at once, because many agents work against one repository.
-So in-flight work is bounded per workspace rather than per process, and the adapter interleaves
-streams rather than draining one before starting the next — one agent's large analysis must not stall
-everyone else on the connection.
+One adapter holds a workspace for each concurrent task in its language. Limits apply to each
+workspace, and interleaved RPC streams let `worktrees/a2` make progress while `worktrees/a1` runs a
+long analysis.
 
-Because the transport is gRPC, this contract carries no framing of its own. There is no envelope, no
-request id, no operation name, no sequence number and no cancel call: an RPC method *is* the
-operation, a stream is ordered, and a cancelled context or an expired deadline ends the work. Failures
-are `google.rpc.Status`, carrying `Refusal` or `StaleState` in `status.details`.
+gRPC supplies the transport mechanics. The RPC method identifies the operation. A stream preserves
+event order. The request context carries cancellation and deadlines. Failures use `google.rpc.Status`,
+with `Refusal` or `StaleState` in `status.details`.
 
-## The adapter gets a worktree
+## Worktree
 
-rust-analyzer, gopls and tsc all end up calling `open(2)`. Feed one a byte stream and its first act
-is writing that stream back to disk, so Rift hands over a path into a real `git worktree` — the one
-belonging to the task this work is for:
+rust-analyzer reads source through `open(2)`, so Rift gives the adapter the path of the task's real
+`git worktree`:
 
 ```
 ~/projects/charming-aurora            the main working tree — yours
@@ -37,63 +32,51 @@ belonging to the task this work is for:
   .rift/state/rust                    what the Rust adapter writes
 ```
 
-There is at least one such tree per MCP client connected to the server. Every adapter driven for a
-given task is pointed at that task's tree, so the Svelte adapter and the TypeScript adapter reading
-one `.svelte` file are reading one copy of it. The tree is git's own because the work in it gets
-committed and merged back when it is done — see
-[the lifecycle](/docs/protocol#a-task-gets-a-worktree).
+Every adapter used by a task reads the same tree. For example, the Svelte and TypeScript adapters read
+one copy of `App.svelte`. The server later commits and integrates that tree through the
+[task lifecycle](/docs/protocol#task-worktrees).
 
-Two consequences for this seam. gRPC carries control and results, not source: `Analyze` says what
-was found in files the compiler opened itself. And `Snapshot` names the tree in git's own spelling,
-`worktrees/a1`, so an answer says which tree it was computed against and in what state. That is also
-why one adapter holds several workspaces at once — several clients, several tasks, one compiler.
+The `Analyze` RPC returns facts about files the compiler opened from the worktree. Each response also
+names the tree and state it used. That coordinate is a `Snapshot`; its worktree value uses Git's
+spelling, such as `worktrees/a1`.
 
-The exception is a file the adapter *generated*. Nothing else can open that, so its bytes do cross —
-`VirtualUnit` and `VirtualText`, in chunks, and Rift writes them into the consuming adapter's tree.
+For generated source, the adapter sends a `VirtualUnit` manifest followed by `VirtualText` chunks.
+Rift writes those bytes into the consuming adapter's tree.
 
-The path of that tree is the workspace's identity across this seam. One tree, one workspace, and Rift
-never reuses a path once `CloseWorkspace` has taken it, so there is no minted handle to map back to a
-directory.
+The tree path identifies the compiler workspace across this service. After `CloseWorkspace`, Rift
+retires the path and creates future workspaces at new paths.
 
 <Callout>
-  `state_root` is the adapter's, and Rift never reads it. Point `CARGO_TARGET_DIR`, `GOCACHE` and
-  `tsBuildInfoFile` at it. It outlives any one workspace, which is what makes the second compile
-  faster than the first.
+  The adapter also receives a private cache directory named `state_root`. Point compiler caches such
+  as `CARGO_TARGET_DIR` at it. The directory outlives a task workspace, so later compiles can reuse it.
 </Callout>
 
-## Who writes what
+## Source ownership
 
-**Rift writes source. The adapter never does.** When you ask for a fix or a refactor, the compiler
-computes the change and returns it — `Resolve` hands back a list of `Edit`, which is a byte
-range and what replaces it. Rift applies those to the agent's worktree and tells the adapter about it
-on the next `Refresh`.
+Rift is the source writer for each task worktree. When the compiler computes a fix, `Resolve` returns
+each replacement as a byte range and new text. The protocol calls that value an `Edit`. Rift applies
+the edits and reports the changed paths on the next `Refresh`.
 
-Several adapters read that one tree, so an adapter writing into it would be writing under the others.
-Keeping mutation on Rift's side is what makes one writer per worktree true, and one writer is what
-lets `git diff` be the whole answer to what the agent changed — which is the thing validated and
-committed at the end of the run.
+Several adapters can read the same tree. Routing source changes through Rift gives the tree one writer,
+so `git diff` contains the task's complete source change for validation and commit.
 
-A change that arrives as a value is also a change you can reject before it lands. Every formatter can
-already work this way — `cargo fmt --emit=stdout`, `gofmt` without `-w`, `black --diff`,
-`ruff format --diff`. Writing in place is the default of the command-line tool, not a limit of the
-thing behind it.
+Returning the change as a value lets Rift inspect it before writing. For example, `gofmt` writes the
+formatted source to stdout when invoked without `-w`.
 
-**Compilers write anyway, and that is fine.** `cargo` puts `Cargo.lock` at the workspace root, npm
-insists on `node_modules` beside the package it belongs to, and neither is redirectable. So the
-adapter declares those paths in `Describe` as `WriteClaim`s, and Rift stops treating anything under them
-as source: never analyzed, never diffed against the snapshot, never shown to an agent. That tree is
-the one that merges back, so a compiler's scratch output must not read as the agent's work.
+Some compiler processes create files while analyzing. For example, npm creates `node_modules` beside
+its package. The adapter reports each compiler-owned path from `Describe`; the protocol calls the
+record a `WriteClaim`. Rift excludes claimed paths from source analysis and from the task diff.
 
-Declare only what will not move. Most build output redirects with an environment variable, and
-redirecting it is better than claiming it, because a claim is a hole in what Rift can see.
+A claim must cover a stable path. Redirectable build output belongs under `state_root`, which keeps
+the corresponding source path visible to Rift.
 
-## What crosses this seam
+## Service boundary
 
-**A workspace is a cache; the worktree is not.** Losing an adapter costs a reopen and a cold compile.
-The tree survives it — that is the agent's work, not the adapter's.
+The adapter's compiler workspace is a cache. If the adapter exits, the server opens a replacement and
+recompiles. The task worktree remains on disk throughout that recovery.
 
-**The model is not defined here.** `Symbol`, `Leaf`, `File`, `Snapshot`, `Edit` and everything
-else about code is generated from `core.json` into `core.proto`, so the messages below are only what
-the seam itself adds. The model is documented once, in the [reference](/docs/protocol/reference).
+Code entities use Protobuf messages generated from `core.json`. The service below adds the workspace
+and RPC messages needed to drive a compiler. The [reference](/docs/protocol/reference) documents the
+shared model.
 
 <AdapterReference />

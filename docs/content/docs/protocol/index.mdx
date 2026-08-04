@@ -1,12 +1,12 @@
 ---
 title: Protocol
-description: The protocol behind Rift, and how the processes that implement it run.
 ---
 
 import { Callout } from "fumadocs-ui/components/callout";
 import { IsoDiagram } from "@/components/iso-diagram";
 
-Rift reaches agents through MCP. Each agent talks to its own `rift mcp` process, over stdio.
+Agents reach Rift via the [Model Context Protocol](https://modelcontextprotocol.io/specification/latest).
+Each agent talks to its own `rift mcp` process over stdio.
 
 That process is launched in a workspace — a distinct path on the filesystem of your machine:
 
@@ -15,15 +15,15 @@ That process is launched in a workspace — a distinct path on the filesystem of
 ```
 
 <Callout>
-  An MCP server on the stdio transport is a subprocess of the client that launched it. Two agents means
-  two `rift mcp` processes, and neither can see what the other is doing.
+  On the stdio transport, the client launches the MCP server as a subprocess. Two agents therefore
+  launch two `rift mcp` processes, each with its own client connection.
 </Callout>
 
-That is the constraint the rest of the design follows from. Several agents can be working in the same
-workspace at once, and they need a central point behind them. That central point is the rift server.
+Several agents can work in the same workspace, but their MCP subprocesses cannot share memory. They
+connect to one rift server, which owns the shared repository state.
 
 <IsoDiagram
-  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB, creates and integrates at least one git worktree per MCP client, and drives the language adapters over gRPC. The adapters read those worktrees straight off the filesystem."
+  alt="Two agents each talk to a separate rift mcp process over stdio. Both processes connect to one rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic database. It creates and integrates task worktrees, and it drives language adapters over gRPC. The adapters read the worktrees from disk."
   chart={`
     flowchart LR
       agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp"]:::rift
@@ -37,20 +37,19 @@ workspace at once, and they need a central point behind them. That central point
   `}
 />
 
-So `rift mcp` is a proxy. It holds no state of its own — it forwards what the agent asks, and returns
-what the server answers.
+`rift mcp` forwards each agent request to the server and returns the response. The shared state stays
+in the server.
 
-MCP is stateless, so nothing in it identifies a connection across calls. The rift server assigns its own
-identifier when a `rift mcp` process connects, and remembers which workspace that connection belongs to.
+MCP calls carry no connection identity. When `rift mcp` connects, the server assigns an identifier and
+binds it to the workspace path.
 
-When the rift server starts, it scans the repository and builds the semantic level using the language
-adapters.
+When the server starts, it asks each language adapter to analyze the repository and stores the returned
+symbols and relationships in the semantic database.
 
-## A task gets a worktree
+## Task worktrees
 
-An agent does not edit your working tree. Each task gets a `git worktree` of its own, cut from a
-recorded base commit onto a branch of its own — so there is at least one per MCP client connected to
-the server, and more when a client is running more than one task at a time:
+Each task runs in a separate `git worktree`, created from a recorded base commit on a task branch. A
+connected MCP client has at least one task worktree and may have more when it runs tasks concurrently:
 
 ```
 base commit B
@@ -58,7 +57,7 @@ base commit B
   └── .rift/worktrees/a2   branch rift/a2   another task, possibly the same client
 ```
 
-The lifecycle of one of those:
+For task `a1`, the server records base commit `B` before creating its branch and worktree:
 
 1. Record the base commit
 2. Create the branch and the worktree
@@ -71,9 +70,8 @@ The lifecycle of one of those:
 9. Integrate it with a three-way merge or a cherry-pick
 10. Remove the worktree
 
-Step 9 is where the base commit earns being recorded rather than assumed. A revision is immutable, so
-there is nothing to merge *into* it — the work merges into the branch that was based on it, and that
-branch has probably moved on:
+The recorded base becomes the merge base during integration. The target branch may have advanced
+while the task was running:
 
 ```
 B ── X ── Y      target, three commits further along
@@ -81,32 +79,34 @@ B ── X ── Y      target, three commits further along
   └── A          rift/a1, still based on B
 ```
 
-Rift integrates `A` onto `Y`. Three-way, with `B` as the base — never a fast-forward assumption that
-`B` is still the tip.
+Rift integrates `A` onto `Y` with a three-way merge using `B` as the base.
 
-Integration goes through git objects, not through copied files. Committing the agent's result and
-merging that commit keeps renames, deletions, file modes, ancestry and conflict information; copying
-changed files out of the worktree throws all five away and leaves you diffing text.
+Integration commits the task tree and merges the resulting Git object. The commit retains the tree
+metadata and ancestry that Git needs to detect renames and conflicts. Copying changed files would
+reduce the result to content differences.
 
-A tree moves through **preparing**, **active**, **validating**, **ready to integrate**, **integrating**
-and **integrated**, and leaves that line at **conflicted** when step 9 cannot resolve or **failed**
-when step 6 or 7 rejects the work. Either way the exit is the same: **disposed**, which is `git
-worktree remove`. Rollback is deleting a directory.
+The worktree state follows this path:
+
+```
+preparing -> active -> validating -> ready to integrate -> integrating -> integrated
+                              \-> failed          \-> conflicted
+```
+
+Every outcome ends at `disposed`, after `git worktree remove` deletes the directory.
 
 <Callout>
   One writer per worktree. Several adapters read one tree at once, but source mutation in it is one
   party's at a time, which is what makes "what changed" answerable by `git diff` alone.
 </Callout>
 
-This is what buys the whole design out of filesystem virtualization. No mirroring source over gRPC,
-no FUSE, no per-compiler VFS integration: compilers open real files, and concurrent agents are kept
-apart by being in different trees. A virtual filesystem only becomes worth its cost if worktree
-creation, disk usage or the number of live speculative trees turns out to be a measured bottleneck.
+Compilers open files directly in the task worktree. Separate worktrees isolate concurrent tasks and
+keep source bytes off the gRPC connection. A virtual filesystem becomes relevant only if measurements
+show that creating or retaining worktrees is the bottleneck.
 
 ## Seams
 
-The server sits between an agent and a compiler, and they want different things. So each side is its
-own contract, and neither knows the other exists.
+The server translates between an agent request and compiler operations. Each side has a contract for
+the information it consumes:
 
 | | agent ↔ server | server ↔ adapter |
 | --- | --- | --- |
@@ -115,27 +115,24 @@ own contract, and neither knows the other exists.
 | described by | JSON Schema | Protobuf |
 | audience | an agent choosing what to do next | a compiler being driven |
 
-**MCP knows nothing about adapters.** It sees what Rift can do for a language, not how the adapter
-recognises its files or what it reads from them. Workspace paths and refresh calls never reach it:
-they are how the server keeps a compiler warm, which is the server's problem.
+MCP exposes the capabilities available for each language. The server handles workspace paths and
+refresh calls while serving those capabilities.
 
-**The adapter knows nothing about agents.** It has no notion of a tool call, a cursor, or a resource
-URI. It is handed a working tree and told what state that tree holds.
+The adapter receives a worktree path and its current state. Its service methods describe compiler
+operations; the server maps MCP calls and resource URIs onto those methods.
 
-Because the compiler reads that tree off the disk itself, gRPC here carries control and results only —
-what to analyze, and what was found. Source bytes cross it in one direction and one case: a file an
-adapter *generated*, which has no on-disk original for anyone else to read.
+The compiler reads source from the worktree, so gRPC carries requests and compiler results. For a file
+generated by an adapter, the adapter sends the bytes because the file has no source entry on disk.
 
 <Callout>
-  The adapter seam is gRPC over a Unix domain socket, one adapter per language, all owned by the
-  server that started them. Rift itself is written in Rust; for languages with no native Rust API,
-  the adapter is a subprocess speaking this service.
+  The server owns one adapter per language and calls it through gRPC on a Unix domain socket. Rift is
+  written in Rust. A compiler without a native Rust API runs in a subprocess that implements this
+  service.
 </Callout>
 
-### Where the model lives
+### Model
 
-Both seams carry the same things — a symbol, a leaf, a file, a snapshot. Writing that model on each
-side would guarantee it drifts, so it is written once:
+Both contracts refer to the same code entities. Their shared model has one source:
 
 ```
 core.json  ──generated──▶  core.proto
@@ -145,14 +142,13 @@ core.json  ──generated──▶  core.proto
  (JSON Schema)            (gRPC service)
 ```
 
-`core.json` is the model. `core.proto` is generated from it, so a protobuf message and a JSON Schema
-definition of the same name describe the same thing by construction — there is no second place to
-edit. Each seam then adds only what is its own: `mcp.json` adds tools, resources and cursors;
-`adapter.proto` adds workspaces, path claims and the service itself.
+`core.json` defines the model, and `core.proto` is generated from it. A Protobuf message and a JSON
+Schema definition with the same name therefore have the same shape. `mcp.json` defines the agent
+calls. `adapter.proto` defines the compiler workspaces and service methods.
 
 ## Definitions
 
-- [Core model](/docs/protocol/core) — the axes the model is filed on, and what each addresses
+- [Core model](/docs/protocol/core) — entities shared by the MCP and adapter contracts
 - [MCP](/docs/protocol/mcp) — tools and resources provided to an agent
 - [Adapter](/docs/protocol/adapter) — the gRPC service the server drives a compiler with
 - [Reference](/docs/protocol/reference) — every type in the model, grouped by axis
