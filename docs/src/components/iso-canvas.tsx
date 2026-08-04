@@ -59,7 +59,7 @@ const CAMERA_DISTANCE = 600;
 const INK = {
   plate: 0.5,
   connector: 0.95,
-  floor: 0.14,
+  floor: 0.05,
 };
 
 /** How far the floor runs past the drawing, as a multiple of its own size. */
