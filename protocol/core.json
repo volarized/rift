@@ -34,6 +34,17 @@
       "maxLength": 256,
       "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
     },
+    "SymbolId": {
+      "description": "Identity of one symbol, and the URI that resolves it. The identifier you get back is the address you read, so there is nothing to assemble and no second form to convert to.\n\n`rift://symbol/<language>/<unit-path>:<symbol-path>` — for example `rift://symbol/python/pkg/util.py:load_config`. The symbol path is the chain of containers ending in the name, joined by `.`, so a method reads as its class and then itself. Where one unit declares two symbols that would otherwise write the same, the adapter appends `~` and an index.\n\nA revision can be attached as `?rev=`, pinning the identity to one state; without it the identity is the symbol itself, at whichever revision the request resolved. The language segment is what keeps two adapters apart, so one workspace runs one adapter per language.",
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 1024,
+      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
+      "examples": [
+        "rift://symbol/python/pkg/util.py:load_config~1?rev=HEAD~3",
+        "rift://symbol/typescript/src/config.ts:ConfigLoader.parse"
+      ]
+    },
     "OwnerId": {
       "description": "Identity of one adapter: its LanguageId, '.', and the first 16 hex characters of SHA-256 over the length-prefixed implementation and compiler strings. Both inputs arrive in `hello`, so Rift verifies the value at startup. Compiler configuration and dependencies are excluded because they identify an environment, and the environment is reported separately on every result. Deriving it rather than allocating it means the same adapter build yields the same owner on every machine and across every restart, so cached facts that embed it stay valid.",
       "type": "string",
@@ -47,7 +58,7 @@
       "maxLength": 64
     },
     "LocalId": {
-      "description": "An adapter-minted address for one virtual source unit — a location the adapter produced rather than read from disk. Restricted to printable ASCII so its character length and its UTF-8 byte length are the same number, since JSON Schema counts code points. Entities are addressed by GlobalEntityId; this addresses a unit.",
+      "description": "An adapter-minted address for one virtual source unit — a location the adapter produced rather than read from disk. Restricted to printable ASCII so its character length and its UTF-8 byte length are the same number, since JSON Schema counts code points. Entities are addressed by SymbolId; this addresses a unit.",
       "type": "string",
       "pattern": "^[\\x21-\\x7E]{1,192}$"
     },
@@ -544,13 +555,13 @@
           "type": "string"
         },
         "type": {
-          "$ref": "#/$defs/GlobalEntityId"
+          "$ref": "#/$defs/SymbolId"
         }
       },
       "additionalProperties": false
     },
     "Type": {
-      "description": "Opaque language-owned semantic type, named by the same GlobalEntityId as every other entity. Rift displays and routes it but never decides equality, assignability, members, or overload selection.",
+      "description": "Opaque language-owned semantic type, named by the same SymbolId as every other entity. Rift displays and routes it but never decides equality, assignability, members, or overload selection.",
       "type": "object",
       "required": [
         "id",
@@ -563,7 +574,7 @@
       ],
       "properties": {
         "id": {
-          "$ref": "#/$defs/GlobalEntityId"
+          "$ref": "#/$defs/SymbolId"
         },
         "display": {
           "type": "string"
@@ -657,7 +668,7 @@
         "resolved": {
           "oneOf": [
             {
-              "$ref": "#/$defs/GlobalEntityId"
+              "$ref": "#/$defs/SymbolId"
             },
             {
               "type": "null"
@@ -1488,11 +1499,11 @@
       ],
       "properties": {
         "id": {
-          "$ref": "#/$defs/GlobalEntityId",
+          "$ref": "#/$defs/SymbolId",
           "examples": [
-            "typescript/src/config.ts:ConfigLoader.parse"
+            "rift://symbol/python/pkg/util.py:load_config~1?rev=HEAD~3"
           ],
-          "description": "Unique identifier of this symbol across the whole workspace, readable as `<language>/<unit-path>:<symbol-path>`. Every other call takes this value when it means this symbol."
+          "description": "Unique identifier of this symbol across the whole workspace, and the URI that resolves it. Hand it to the symbol resource as it stands."
         },
         "language": {
           "description": "The language this symbol belongs to.",
@@ -1537,9 +1548,9 @@
           "description": "Where the symbol comes from: code in this workspace, or a package it depends on."
         },
         "container": {
-          "$ref": "#/$defs/GlobalEntityId",
+          "$ref": "#/$defs/SymbolId",
           "examples": [
-            "typescript/src/config.ts:ConfigLoader"
+            "rift://symbol/typescript/src/config.ts:ConfigLoader"
           ],
           "description": "The symbol this one is declared inside — the class that owns a method, the module that owns a function. Absent at the top level."
         },
@@ -1643,7 +1654,7 @@
       ],
       "properties": {
         "id": {
-          "$ref": "#/$defs/GlobalEntityId"
+          "$ref": "#/$defs/SymbolId"
         },
         "unit": {
           "$ref": "#/$defs/SourceUnitRef"
@@ -1671,7 +1682,7 @@
           }
         },
         "parent": {
-          "$ref": "#/$defs/GlobalEntityId"
+          "$ref": "#/$defs/SymbolId"
         },
         "types": {
           "type": "array",
@@ -1961,18 +1972,6 @@
       },
       "additionalProperties": false
     },
-    "GlobalEntityId": {
-      "description": "Identity of one entity, unique across the workspace, and composed so that reading it tells you where the entity is: the language, the unit it is declared in, and its path inside that unit.\n\n`<language>/<unit-path>:<symbol-path>` — for example `typescript/src/config.ts:ConfigLoader.parse`. The symbol path is the chain of containers ending in the name, joined by `.`, so a method reads as its class then itself. Where one unit declares two entities that would otherwise write the same, the adapter appends `~` and an index: `python/pkg/util.py:load_config~1`.\n\nThe language prefix is what keeps two adapters apart, so one workspace runs one adapter per language. The value contains `/` and is therefore the whole path remainder of a symbol resource URI rather than a single segment; `?` and `#` are excluded so the query and fragment delimiters stay unambiguous.",
-      "type": "string",
-      "minLength": 3,
-      "maxLength": 1024,
-      "pattern": "^[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}$",
-      "examples": [
-        "typescript/src/config.ts:ConfigLoader.parse",
-        "rust/src/lib.rs:Config",
-        "python/pkg/util.py:load_config~1"
-      ]
-    },
     "PublicSymbolTarget": {
       "type": "object",
       "required": [
@@ -1984,7 +1983,7 @@
           "const": "symbol"
         },
         "id": {
-          "$ref": "#/$defs/GlobalEntityId"
+          "$ref": "#/$defs/SymbolId"
         }
       },
       "additionalProperties": false
@@ -2000,7 +1999,7 @@
           "const": "element"
         },
         "id": {
-          "$ref": "#/$defs/GlobalEntityId"
+          "$ref": "#/$defs/SymbolId"
         }
       },
       "additionalProperties": false
@@ -2604,7 +2603,7 @@
       "additionalProperties": false
     },
     "ResolvedEntityTarget": {
-      "description": "A resolved entity, named by the single canonical GlobalEntityId. This is the only entity vocabulary in the contract; there is no adapter-local alternative.",
+      "description": "A resolved entity, named by the single canonical SymbolId. This is the only entity vocabulary in the contract; there is no adapter-local alternative.",
       "oneOf": [
         {
           "$ref": "#/$defs/PublicSymbolTarget"

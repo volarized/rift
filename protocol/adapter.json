@@ -4,7 +4,7 @@
   "title": "Rift language-adapter IPC",
   "description": "The newline-delimited JSON contract between the Rift server and one language adapter: hello, mirror lifecycle, sync, and the streaming analysis, matching, resolution, and validation operations.",
   "rift:entryPoints": {
-    "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as GlobalEntityId and Address is deliberately reachable from several.",
+    "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as SymbolId and Address is deliberately reachable from several.",
     "adapter.frame": {
       "$ref": "#/$defs/AdapterFrame"
     }
@@ -125,7 +125,7 @@
       "additionalProperties": false
     },
     "TargetBinding": {
-      "description": "Exact cross-owner identity supplied to a propagation participant that cannot resolve a target from its own mirror. Entity and match identity need no binding: GlobalEntityId is canonical on both seams. Bindings are request-local and never appear through MCP.",
+      "description": "Exact cross-owner identity supplied to a propagation participant that cannot resolve a target from its own mirror. Entity and match identity need no binding: SymbolId is canonical on both seams. Bindings are request-local and never appear through MCP.",
       "oneOf": [
         {
           "description": "Exact cross-owner identity supplied to a propagation participant that does not own the target declaration.",
@@ -140,7 +140,7 @@
               "const": "external"
             },
             "id": {
-              "$ref": "core.json#/$defs/GlobalEntityId"
+              "$ref": "core.json#/$defs/SymbolId"
             },
             "external": {
               "$ref": "core.json#/$defs/ExternalSymbolRef"

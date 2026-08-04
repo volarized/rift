@@ -4,7 +4,7 @@
   "title": "Rift MCP tools, resources, and records",
   "description": "Rift's first-party MCP surface — five tools, five resource templates, and the categorical error contract — together with the durable records a transaction writes.",
   "rift:entryPoints": {
-    "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as GlobalEntityId and Address is deliberately reachable from several.",
+    "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as SymbolId and Address is deliberately reachable from several.",
     "mcp.tools": {
       "search": {
         "description": "Find things. You can search by text, or by what the compiler knows — every symbol that implements a given trait, every function carrying an error, everything a file imports. Filters nest, so \"callers of `parse_config` that live under `src/api`\" is one query rather than three. Results come back in a stated order with a cursor you can replay, and they tell you how much of the repository Rift could actually see.",
@@ -53,7 +53,7 @@
           "$ref": "#/$defs/ResourceTemplate"
         },
         "uri": {
-          "$ref": "#/$defs/SymbolResourceUri"
+          "$ref": "core.json#/$defs/SymbolId"
         },
         "link": {
           "$ref": "#/$defs/ResourceLink"
@@ -539,14 +539,6 @@
       },
       "additionalProperties": false
     },
-    "SymbolResourceUri": {
-      "description": "A Symbol-centred view of the semantic model. The revision and the cursor are query arguments; the symbol's identifier is the path.",
-      "type": "string",
-      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
-      "examples": [
-        "rift://symbol/python/pkg/util.py:load_config~1?rev=HEAD~3"
-      ]
-    },
     "ResourceLink": {
       "description": "A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed per resource, and the URI is the one that resource accepts.",
       "oneOf": [
@@ -563,7 +555,7 @@
               "const": "resource_link"
             },
             "uri": {
-              "$ref": "#/$defs/SymbolResourceUri"
+              "$ref": "core.json#/$defs/SymbolId"
             },
             "name": {
               "const": "symbol"
@@ -668,7 +660,7 @@
       ],
       "properties": {
         "uri": {
-          "$ref": "#/$defs/SymbolResourceUri"
+          "$ref": "core.json#/$defs/SymbolId"
         },
         "at": {
           "$ref": "#/$defs/SnapshotRef"
@@ -722,7 +714,7 @@
         "next": {
           "oneOf": [
             {
-              "$ref": "#/$defs/SymbolResourceUri"
+              "$ref": "core.json#/$defs/SymbolId"
             },
             {
               "type": "null"
@@ -746,7 +738,7 @@
       ],
       "properties": {
         "uri": {
-          "$ref": "#/$defs/SymbolResourceUri"
+          "$ref": "core.json#/$defs/SymbolId"
         },
         "mimeType": {
           "const": "application/vnd.rift.symbol+json"
@@ -1940,7 +1932,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://symbol/{entity}{?rev,cursor}"
+              "const": "rift://symbol/{language}/{unit}:{path}{?rev,cursor}"
             },
             "name": {
               "const": "symbol"

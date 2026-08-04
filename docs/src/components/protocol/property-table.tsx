@@ -56,8 +56,15 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
                     </sup>
                   ) : null}
                 </td>
+                {/* Constraints narrow the type, so they belong with it. In the
+                    description column they read as prose the author wrote. */}
                 <td>
-                  <TypeExpr schema={property} />
+                  <span className="grid gap-0.5">
+                    <span>
+                      <TypeExpr schema={property} />
+                    </span>
+                    {constraints}
+                  </span>
                 </td>
                 {hasDefaults ? (
                   <td>
@@ -89,8 +96,6 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
                 ) : null}
                 <td>
                   {property.description ? <Prose text={property.description} /> : null}
-                  {property.description && constraints ? <br /> : null}
-                  {constraints}
                   {nested ? (
                     <details className="mt-2">
                       <summary className="cursor-pointer text-fd-muted-foreground text-sm">
@@ -99,7 +104,7 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
                       <PropertyTable schema={nested} />
                     </details>
                   ) : null}
-                  {!property.description && !constraints && !nested ? (
+                  {!property.description && !nested ? (
                     <span className="text-fd-muted-foreground">—</span>
                   ) : null}
                 </td>
