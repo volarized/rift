@@ -30,15 +30,19 @@ are `google.rpc.Status`, carrying `Refusal` or `StaleState` in `status.details`.
 Rift materializes the code and passes the path:
 
 ```
-~/projects/charming-aurora          your worktree, Rift's to write
-~/.cache/rift/trees/8f21c4          the Rust adapter's working tree
-~/.cache/rift/state/rust            what the Rust adapter writes
+~/projects/charming-aurora            your worktree, Rift's to write
+  .rift/worktrees/8f21c4              the Rust adapter's working tree
+  .rift/state/rust                    what the Rust adapter writes
 ```
 
-That second path holds every file the snapshot names, laid out the way the repository lays them out.
-It is a working tree in everything a compiler cares about, and Rift builds it with
-`git checkout-index` for the commit the snapshot sits on, then overwrites the files the snapshot
-reports dirty.
+`.rift/` is Rift's own directory, inside your project. Nothing under it is read as source and it is
+ignored, so the trees Rift materializes never come back as changes to the repository they were cut
+from.
+
+The tree at `.rift/worktrees/8f21c4` holds every file the snapshot names, laid out the way the
+repository lays them out. It is a working tree in everything a compiler cares about, and Rift builds
+it with `git checkout-index` for the commit the snapshot sits on, then overwrites the files the
+snapshot reports dirty.
 
 What it does not have is the `.git` that would make it a `git worktree`. A linked worktree leaves a
 `.git` file pointing back at your real object store, and an adapter that wanted to could walk from
