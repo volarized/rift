@@ -98,30 +98,6 @@
       "minLength": 1,
       "maxLength": 4096
     },
-    "RevisionRef": {
-      "type": "object",
-      "required": [
-        "kind",
-        "commit"
-      ],
-      "properties": {
-        "kind": {
-          "const": "revision"
-        },
-        "commit": {
-          "$ref": "core.json#/$defs/GitOid"
-        }
-      },
-      "additionalProperties": false
-    },
-    "SnapshotRef": {
-      "description": "An accepted revision, rejected attempt, or retained non-head preview, identified by its Git commit OID.",
-      "oneOf": [
-        {
-          "$ref": "#/$defs/RevisionRef"
-        }
-      ]
-    },
     "SemanticEnvironment": {
       "description": "Rift-composed identity of every adapter environment that can change semantic facts. adapters sort by owner, which is total because an owner is unique per adapter; fingerprint is the SHA-256 digest of the sorted adapters in RFC 8785 canonical JSON form. This is the one uniqueItems array not sorted by canonical bytes, because sorting by owner is what makes the fingerprint stable under a field addition.",
       "type": "object",
@@ -172,86 +148,53 @@
         "gitlink"
       ]
     },
-    "GitBlobPayload": {
-      "description": "The Git blob bytes are the canonical file payload.",
-      "type": "object",
-      "required": [
-        "kind"
-      ],
-      "properties": {
-        "kind": {
-          "const": "git_blob"
-        }
-      },
-      "additionalProperties": false
-    },
-    "LfsPointerPayload": {
-      "description": "A valid Git LFS v1 pointer recognized from the canonical Git blob. Rift verifies pointer syntax but does not fetch or expose the referenced content.",
-      "type": "object",
-      "required": [
-        "kind",
-        "version",
-        "oid",
-        "size"
-      ],
-      "properties": {
-        "kind": {
-          "const": "lfs_pointer"
-        },
-        "version": {
-          "const": "https://git-lfs.github.com/spec/v1"
-        },
-        "oid": {
-          "type": "string",
-          "pattern": "^sha256:[0-9a-f]{64}$"
-        },
-        "size": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991
-        }
-      },
-      "additionalProperties": false
-    },
-    "SymlinkPayload": {
-      "type": "object",
-      "required": [
-        "kind"
-      ],
-      "properties": {
-        "kind": {
-          "const": "symlink"
-        }
-      },
-      "additionalProperties": false
-    },
-    "GitlinkPayload": {
-      "description": "A link to another repository, recorded as the commit it points at. `File.object` holds that commit, and Rift neither follows it nor reads the linked repository's content.",
-      "type": "object",
-      "required": [
-        "kind"
-      ],
-      "properties": {
-        "kind": {
-          "const": "gitlink"
-        }
-      },
-      "additionalProperties": false
-    },
     "FilePayload": {
-      "description": "Interpretation of a Git tree entry without changing its canonical object identity.",
+      "description": "What a Git tree entry points at. A regular or executable entry holds the blob's own bytes unless those bytes are an LFS pointer, in which case Rift checks the pointer's syntax and stops there; a symlink holds its target; a gitlink holds the commit of another repository, and `File.object` is that commit.",
       "oneOf": [
         {
-          "$ref": "#/$defs/GitBlobPayload"
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "git_blob",
+                "symlink",
+                "gitlink"
+              ]
+            }
+          },
+          "additionalProperties": false
         },
         {
-          "$ref": "#/$defs/LfsPointerPayload"
-        },
-        {
-          "$ref": "#/$defs/SymlinkPayload"
-        },
-        {
-          "$ref": "#/$defs/GitlinkPayload"
+          "type": "object",
+          "required": [
+            "kind",
+            "version",
+            "oid",
+            "size"
+          ],
+          "properties": {
+            "kind": {
+              "const": "lfs_pointer"
+            },
+            "version": {
+              "const": "https://git-lfs.github.com/spec/v1"
+            },
+            "oid": {
+              "description": "The content hash the pointer names. Rift does not fetch it.",
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "size": {
+              "description": "Size in bytes of the content the pointer names.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -593,7 +536,8 @@
           "$ref": "core.json#/$defs/SymbolId"
         },
         "at": {
-          "$ref": "#/$defs/SnapshotRef"
+          "description": "The commit this answer was resolved against.",
+          "$ref": "core.json#/$defs/GitOid"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -652,31 +596,6 @@
       },
       "additionalProperties": false
     },
-    "SymbolResourceContents": {
-      "description": "MCP text resource whose text is the JSON serialization of SymbolResourcePayload.",
-      "type": "object",
-      "required": [
-        "uri",
-        "mimeType",
-        "text"
-      ],
-      "properties": {
-        "uri": {
-          "$ref": "core.json#/$defs/SymbolId"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.symbol+json"
-        },
-        "text": {
-          "type": "string",
-          "contentMediaType": "application/vnd.rift.symbol+json",
-          "contentSchema": {
-            "$ref": "#/$defs/SymbolResourcePayload"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
     "DiffResourceUri": {
       "description": "Paginated diff URI; both commits are query arguments, never path identity.",
       "type": "string",
@@ -714,57 +633,10 @@
       },
       "additionalProperties": false
     },
-    "DiffResourceContents": {
-      "description": "MCP text resource whose text is the JSON serialization of DiffResourcePayload.",
-      "type": "object",
-      "required": [
-        "uri",
-        "mimeType",
-        "text"
-      ],
-      "properties": {
-        "uri": {
-          "$ref": "#/$defs/DiffResourceUri"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.diff+json"
-        },
-        "text": {
-          "type": "string",
-          "contentMediaType": "application/vnd.rift.diff+json",
-          "contentSchema": {
-            "$ref": "#/$defs/DiffResourcePayload"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
     "BlobResourceUri": {
       "description": "Opaque Git blob resource addressed by object ID as a query argument, never by a traversable path.",
       "type": "string",
       "pattern": "^rift://blob\\?object=[0-9a-f]{40}([0-9a-f]{24})?$"
-    },
-    "BlobResourceContents": {
-      "description": "MCP blob resource; blob is canonical base64 of the exact Git object payload, returned whole. This resource does not paginate: it is exact bytes, not a result set. Objects larger than DriverLimits.max_blob_bytes fail with limit_exceeded rather than being truncated or chunked.",
-      "type": "object",
-      "required": [
-        "uri",
-        "mimeType",
-        "blob"
-      ],
-      "properties": {
-        "uri": {
-          "$ref": "#/$defs/BlobResourceUri"
-        },
-        "mimeType": {
-          "const": "application/octet-stream"
-        },
-        "blob": {
-          "type": "string",
-          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
-        }
-      },
-      "additionalProperties": false
     },
     "ContractDescriptor": {
       "type": "object",
@@ -868,7 +740,8 @@
           "$ref": "#/$defs/RepositoryResourceUri"
         },
         "at": {
-          "$ref": "#/$defs/SnapshotRef"
+          "description": "The commit this answer was resolved against.",
+          "$ref": "core.json#/$defs/GitOid"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -952,31 +825,6 @@
       },
       "additionalProperties": false
     },
-    "RepositoryResourceContents": {
-      "description": "MCP text resource whose text is the JSON serialization of RepositoryResourcePayload.",
-      "type": "object",
-      "required": [
-        "uri",
-        "mimeType",
-        "text"
-      ],
-      "properties": {
-        "uri": {
-          "$ref": "#/$defs/RepositoryResourceUri"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.repository+json"
-        },
-        "text": {
-          "type": "string",
-          "contentMediaType": "application/vnd.rift.repository+json",
-          "contentSchema": {
-            "$ref": "#/$defs/RepositoryResourcePayload"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
     "SearchResult": {
       "type": "object",
       "required": [
@@ -989,7 +837,8 @@
       ],
       "properties": {
         "at": {
-          "$ref": "#/$defs/SnapshotRef"
+          "description": "The commit this answer was resolved against.",
+          "$ref": "core.json#/$defs/GitOid"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -1087,7 +936,8 @@
       ],
       "properties": {
         "at": {
-          "$ref": "#/$defs/SnapshotRef"
+          "description": "The commit this answer was resolved against.",
+          "$ref": "core.json#/$defs/GitOid"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -1181,99 +1031,96 @@
       ],
       "description": "One match request, tagged by the engine that must answer it."
     },
-    "StructuralMatchHit": {
-      "description": "One explained deterministic match. Matches sort by physical path, range, then canonical capture bytes.",
-      "type": "object",
-      "required": [
-        "kind",
-        "ref",
-        "language",
-        "span",
-        "replacement_ranges",
-        "captures",
-        "explanation",
-        "extensions"
-      ],
-      "properties": {
-        "ref": {
-          "$ref": "core.json#/$defs/PublicMatchRef"
-        },
-        "span": {
-          "$ref": "core.json#/$defs/SourceSpan"
-        },
-        "replacement_ranges": {
-          "$ref": "core.json#/$defs/StructuralMatchRanges"
-        },
-        "captures": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/StructuralCapture"
-          }
-        },
-        "explanation": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "maxLength": 4096
-          }
-        },
-        "extensions": {
-          "$ref": "core.json#/$defs/Extensions"
-        },
-        "kind": {
-          "const": "structural"
-        },
-        "language": {
-          "$ref": "core.json#/$defs/LanguageId"
-        }
-      },
-      "additionalProperties": false
-    },
-    "TextMatchHit": {
-      "type": "object",
-      "required": [
-        "kind",
-        "ref",
-        "span",
-        "captures",
-        "explanation"
-      ],
-      "properties": {
-        "ref": {
-          "$ref": "core.json#/$defs/PublicMatchRef"
-        },
-        "span": {
-          "$ref": "core.json#/$defs/SourceSpan"
-        },
-        "captures": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/StructuralCapture"
-          }
-        },
-        "explanation": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "maxLength": 4096
-          }
-        },
-        "kind": {
-          "const": "text"
-        }
-      },
-      "additionalProperties": false
-    },
     "MatchHit": {
+      "description": "One match, tagged by the engine that produced it. A structural match knows the language it parsed and the syntax node it landed on, so it can also say which surrounding ranges are safe to replace; a text match knows neither.",
       "oneOf": [
         {
-          "$ref": "#/$defs/StructuralMatchHit"
+          "type": "object",
+          "required": [
+            "kind",
+            "ref",
+            "language",
+            "span",
+            "replacement_ranges",
+            "captures",
+            "explanation",
+            "extensions"
+          ],
+          "properties": {
+            "kind": {
+              "const": "structural"
+            },
+            "ref": {
+              "$ref": "core.json#/$defs/PublicMatchRef"
+            },
+            "span": {
+              "$ref": "core.json#/$defs/SourceSpan"
+            },
+            "captures": {
+              "description": "The named captures this match bound, in the order the pattern declares them.",
+              "type": "array",
+              "items": {
+                "$ref": "core.json#/$defs/StructuralCapture"
+              }
+            },
+            "explanation": {
+              "description": "Why this is a match, one step per line.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 4096
+              }
+            },
+            "language": {
+              "$ref": "core.json#/$defs/LanguageId"
+            },
+            "replacement_ranges": {
+              "$ref": "core.json#/$defs/StructuralMatchRanges"
+            },
+            "extensions": {
+              "$ref": "core.json#/$defs/Extensions"
+            }
+          },
+          "additionalProperties": false
         },
         {
-          "$ref": "#/$defs/TextMatchHit"
+          "type": "object",
+          "required": [
+            "kind",
+            "ref",
+            "span",
+            "captures",
+            "explanation"
+          ],
+          "properties": {
+            "kind": {
+              "const": "text"
+            },
+            "ref": {
+              "$ref": "core.json#/$defs/PublicMatchRef"
+            },
+            "span": {
+              "$ref": "core.json#/$defs/SourceSpan"
+            },
+            "captures": {
+              "description": "The named captures this match bound, in the order the pattern declares them.",
+              "type": "array",
+              "items": {
+                "$ref": "core.json#/$defs/StructuralCapture"
+              }
+            },
+            "explanation": {
+              "description": "Why this is a match, one step per line.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 4096
+              }
+            }
+          },
+          "additionalProperties": false
         }
-      ],
-      "description": "One match, tagged by the engine that produced it."
+      ]
     },
     "MatchParams": {
       "type": "object",
@@ -1314,7 +1161,8 @@
       ],
       "properties": {
         "at": {
-          "$ref": "#/$defs/SnapshotRef"
+          "description": "The commit this answer was resolved against.",
+          "$ref": "core.json#/$defs/GitOid"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -1377,7 +1225,8 @@
           ]
         },
         "at": {
-          "$ref": "#/$defs/SnapshotRef"
+          "description": "The commit this answer was resolved against.",
+          "$ref": "core.json#/$defs/GitOid"
         },
         "diagnostic": {
           "$ref": "core.json#/$defs/Diagnostic"
@@ -1600,10 +1449,12 @@
       ],
       "properties": {
         "from": {
-          "$ref": "#/$defs/SnapshotRef"
+          "description": "The old side of the comparison.",
+          "$ref": "core.json#/$defs/GitOid"
         },
         "to": {
-          "$ref": "#/$defs/SnapshotRef"
+          "description": "The new side of the comparison.",
+          "$ref": "core.json#/$defs/GitOid"
         },
         "files": {
           "type": "array",
@@ -1715,9 +1566,10 @@
           ]
         },
         "at": {
+          "description": "The commit this answer was resolved against. Null where the failure happened before one was resolved.",
           "oneOf": [
             {
-              "$ref": "#/$defs/SnapshotRef"
+              "$ref": "core.json#/$defs/GitOid"
             },
             {
               "type": "null"
@@ -1910,7 +1762,7 @@
       ]
     },
     "ResourceReadResult": {
-      "description": "The result of one MCP resource read. Contents are discriminated by mimeType.",
+      "description": "The result of one MCP resource read. `mimeType` says which payload `text` holds, and the three payload resources serialize their JSON into it. The blob resource returns bytes instead.",
       "type": "object",
       "required": [
         "contents"
@@ -1922,16 +1774,98 @@
           "items": {
             "oneOf": [
               {
-                "$ref": "#/$defs/RepositoryResourceContents"
+                "type": "object",
+                "required": [
+                  "uri",
+                  "mimeType",
+                  "text"
+                ],
+                "properties": {
+                  "uri": {
+                    "$ref": "#/$defs/RepositoryResourceUri"
+                  },
+                  "mimeType": {
+                    "const": "application/vnd.rift.repository+json"
+                  },
+                  "text": {
+                    "type": "string",
+                    "contentMediaType": "application/vnd.rift.repository+json",
+                    "contentSchema": {
+                      "$ref": "#/$defs/RepositoryResourcePayload"
+                    }
+                  }
+                },
+                "additionalProperties": false
               },
               {
-                "$ref": "#/$defs/SymbolResourceContents"
+                "type": "object",
+                "required": [
+                  "uri",
+                  "mimeType",
+                  "text"
+                ],
+                "properties": {
+                  "uri": {
+                    "$ref": "core.json#/$defs/SymbolId"
+                  },
+                  "mimeType": {
+                    "const": "application/vnd.rift.symbol+json"
+                  },
+                  "text": {
+                    "type": "string",
+                    "contentMediaType": "application/vnd.rift.symbol+json",
+                    "contentSchema": {
+                      "$ref": "#/$defs/SymbolResourcePayload"
+                    }
+                  }
+                },
+                "additionalProperties": false
               },
               {
-                "$ref": "#/$defs/DiffResourceContents"
+                "type": "object",
+                "required": [
+                  "uri",
+                  "mimeType",
+                  "text"
+                ],
+                "properties": {
+                  "uri": {
+                    "$ref": "#/$defs/DiffResourceUri"
+                  },
+                  "mimeType": {
+                    "const": "application/vnd.rift.diff+json"
+                  },
+                  "text": {
+                    "type": "string",
+                    "contentMediaType": "application/vnd.rift.diff+json",
+                    "contentSchema": {
+                      "$ref": "#/$defs/DiffResourcePayload"
+                    }
+                  }
+                },
+                "additionalProperties": false
               },
               {
-                "$ref": "#/$defs/BlobResourceContents"
+                "description": "The exact Git object payload, base64-encoded, returned whole. This resource does not paginate — it is opaque bytes, and a cursor over bytes buys nothing a byte range would not do better — so an object over DriverLimits.max_blob_bytes fails with limit_exceeded instead of being truncated.",
+                "type": "object",
+                "required": [
+                  "uri",
+                  "mimeType",
+                  "blob"
+                ],
+                "properties": {
+                  "uri": {
+                    "$ref": "#/$defs/BlobResourceUri"
+                  },
+                  "mimeType": {
+                    "const": "application/octet-stream"
+                  },
+                  "blob": {
+                    "type": "string",
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+                  }
+                },
+                "additionalProperties": false
               }
             ]
           }

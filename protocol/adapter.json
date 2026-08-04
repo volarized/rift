@@ -64,91 +64,26 @@
       },
       "additionalProperties": false
     },
-    "PhysicalSourceUnit": {
-      "description": "Metadata for one physical source owned by its selected physical adapter.",
-      "type": "object",
-      "required": [
-        "kind",
-        "ref",
-        "regions",
-        "extensions"
-      ],
-      "properties": {
-        "ref": {
-          "$ref": "core.json#/$defs/FileId"
-        },
-        "regions": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/LanguageRegion"
-          }
-        },
-        "extensions": {
-          "$ref": "core.json#/$defs/Extensions"
-        },
-        "kind": {
-          "const": "physical"
-        }
-      },
-      "additionalProperties": false
-    },
-    "VirtualSourceUnit": {
-      "description": "Manifest for an adapter-produced virtual source. The ref owner produces bytes and maps; language selects a separate semantic consumer through VirtualClaim.",
-      "type": "object",
-      "required": [
-        "kind",
-        "ref",
-        "language",
-        "regions",
-        "extensions"
-      ],
-      "properties": {
-        "ref": {
-          "$ref": "core.json#/$defs/FileId"
-        },
-        "language": {
-          "$ref": "core.json#/$defs/LanguageId"
-        },
-        "regions": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/LanguageRegion"
-          }
-        },
-        "extensions": {
-          "$ref": "core.json#/$defs/Extensions"
-        },
-        "kind": {
-          "const": "virtual"
-        }
-      },
-      "additionalProperties": false
-    },
     "TargetBinding": {
-      "description": "Exact cross-owner identity supplied to a propagation participant that cannot resolve a target from its own mirror. Entity and match identity need no binding: SymbolId is canonical on both seams. Bindings are request-local and never appear through MCP.",
-      "oneOf": [
-        {
-          "description": "Exact cross-owner identity supplied to a propagation participant that does not own the target declaration.",
-          "type": "object",
-          "required": [
-            "kind",
-            "id",
-            "external"
-          ],
-          "properties": {
-            "kind": {
-              "const": "external"
-            },
-            "id": {
-              "$ref": "core.json#/$defs/SymbolId"
-            },
-            "external": {
-              "$ref": "core.json#/$defs/ExternalSymbolRef"
-            }
-          },
-          "additionalProperties": false
+      "description": "Exact cross-owner identity handed to a propagation participant that cannot resolve the target from its own mirror. A symbol or leaf needs no binding, because SymbolId and LeafId are canonical on both seams. Bindings are request-local and never appear through MCP.",
+      "type": "object",
+      "required": [
+        "kind",
+        "id",
+        "external"
+      ],
+      "properties": {
+        "kind": {
+          "const": "external"
+        },
+        "id": {
+          "$ref": "core.json#/$defs/SymbolId"
+        },
+        "external": {
+          "$ref": "core.json#/$defs/ExternalSymbolRef"
         }
-      ]
+      },
+      "additionalProperties": false
     },
     "TargetBindings": {
       "description": "Canonical, duplicate-free binding table sorted by canonical public target bytes.",
@@ -184,87 +119,84 @@
       },
       "additionalProperties": false
     },
-    "SyncSourceUnitInput": {
-      "description": "One contiguous UTF-8 text chunk for a physical or routed virtual unit. Chunks for a unit are contiguous by offset and exactly one has final=true.",
-      "type": "object",
-      "required": [
-        "kind",
-        "mirror",
-        "unit",
-        "language",
-        "offset",
-        "text",
-        "final"
-      ],
-      "properties": {
-        "mirror": {
-          "$ref": "core.json#/$defs/MirrorId"
-        },
-        "unit": {
-          "$ref": "core.json#/$defs/FileId"
-        },
-        "language": {
-          "$ref": "core.json#/$defs/LanguageId"
-        },
-        "offset": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991
-        },
-        "text": {
-          "type": "string"
-        },
-        "final": {
-          "type": "boolean"
-        },
-        "kind": {
-          "const": "source"
-        }
-      },
-      "additionalProperties": false
-    },
-    "SyncAuxiliaryUnitInput": {
-      "description": "One contiguous UTF-8 text chunk for a non-owning auxiliary project input. Chunks for a unit are contiguous by offset and exactly one has final=true.",
-      "type": "object",
-      "required": [
-        "kind",
-        "mirror",
-        "unit",
-        "offset",
-        "text",
-        "final"
-      ],
-      "properties": {
-        "mirror": {
-          "$ref": "core.json#/$defs/MirrorId"
-        },
-        "unit": {
-          "$ref": "#/$defs/AuxiliaryUnitRef"
-        },
-        "offset": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991
-        },
-        "text": {
-          "type": "string"
-        },
-        "final": {
-          "type": "boolean"
-        },
-        "kind": {
-          "const": "auxiliary"
-        }
-      },
-      "additionalProperties": false
-    },
     "SyncUnitInput": {
+      "description": "One contiguous UTF-8 text chunk of one file. Chunks for a file are contiguous by offset and exactly one has `final`. A source chunk carries the language whose adapter owns the file; an auxiliary chunk is a project input mirrored read-only — a manifest, a compiler config — that no adapter owns.",
       "oneOf": [
         {
-          "$ref": "#/$defs/SyncSourceUnitInput"
+          "type": "object",
+          "required": [
+            "kind",
+            "mirror",
+            "unit",
+            "language",
+            "offset",
+            "text",
+            "final"
+          ],
+          "properties": {
+            "kind": {
+              "const": "source"
+            },
+            "mirror": {
+              "$ref": "core.json#/$defs/MirrorId"
+            },
+            "offset": {
+              "description": "Byte offset of this chunk within the unit's text.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "text": {
+              "type": "string"
+            },
+            "final": {
+              "description": "Whether this is the unit's last chunk. Exactly one chunk per unit sets it.",
+              "type": "boolean"
+            },
+            "unit": {
+              "$ref": "core.json#/$defs/FileId"
+            },
+            "language": {
+              "$ref": "core.json#/$defs/LanguageId"
+            }
+          },
+          "additionalProperties": false
         },
         {
-          "$ref": "#/$defs/SyncAuxiliaryUnitInput"
+          "type": "object",
+          "required": [
+            "kind",
+            "mirror",
+            "unit",
+            "offset",
+            "text",
+            "final"
+          ],
+          "properties": {
+            "kind": {
+              "const": "auxiliary"
+            },
+            "mirror": {
+              "$ref": "core.json#/$defs/MirrorId"
+            },
+            "offset": {
+              "description": "Byte offset of this chunk within the unit's text.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "text": {
+              "type": "string"
+            },
+            "final": {
+              "description": "Whether this is the unit's last chunk. Exactly one chunk per unit sets it.",
+              "type": "boolean"
+            },
+            "unit": {
+              "$ref": "#/$defs/AuxiliaryUnitRef"
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -418,39 +350,87 @@
       },
       "additionalProperties": false
     },
-    "SourceUnitAnalysisChunk": {
-      "description": "Authoritative metadata for one physical source unit.",
-      "type": "object",
-      "required": [
-        "kind",
-        "unit"
-      ],
-      "properties": {
-        "kind": {
-          "const": "source_unit"
+    "UnitAnalysisChunk": {
+      "description": "The manifest for one source file the adapter is publishing. A physical unit is a file on disk the adapter owns. A virtual unit is one the adapter produced from a physical one — a template compiled to script, a macro expanded — so it names the language that will consume it, and its text and source map follow in their own chunks before AnalyzeEnd.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit"
+          ],
+          "properties": {
+            "kind": {
+              "const": "source_unit"
+            },
+            "unit": {
+              "type": "object",
+              "required": [
+                "ref",
+                "regions",
+                "extensions"
+              ],
+              "properties": {
+                "ref": {
+                  "$ref": "core.json#/$defs/FileId"
+                },
+                "regions": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/LanguageRegion"
+                  }
+                },
+                "extensions": {
+                  "$ref": "core.json#/$defs/Extensions"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
         },
-        "unit": {
-          "$ref": "#/$defs/PhysicalSourceUnit"
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit"
+          ],
+          "properties": {
+            "kind": {
+              "const": "virtual_unit"
+            },
+            "unit": {
+              "type": "object",
+              "required": [
+                "ref",
+                "language",
+                "regions",
+                "extensions"
+              ],
+              "properties": {
+                "ref": {
+                  "$ref": "core.json#/$defs/FileId"
+                },
+                "language": {
+                  "description": "The language that consumes these bytes, selected through VirtualClaim.",
+                  "$ref": "core.json#/$defs/LanguageId"
+                },
+                "regions": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/LanguageRegion"
+                  }
+                },
+                "extensions": {
+                  "$ref": "core.json#/$defs/Extensions"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
         }
-      },
-      "additionalProperties": false
-    },
-    "VirtualUnitAnalysisChunk": {
-      "description": "Manifest for a virtual source published by a container adapter. Text arrives through VirtualTextAnalysisChunk and maps through SourceMapAnalysisChunk before AnalyzeEnd.",
-      "type": "object",
-      "required": [
-        "kind",
-        "unit"
-      ],
-      "properties": {
-        "kind": {
-          "const": "virtual_unit"
-        },
-        "unit": {
-          "$ref": "#/$defs/VirtualSourceUnit"
-        }
-      },
-      "additionalProperties": false
+      ]
     },
     "VirtualTextAnalysisChunk": {
       "description": "One contiguous UTF-8 chunk of a published virtual source. Chunks for a unit are contiguous by offset and exactly one has final=true.",
@@ -483,120 +463,125 @@
       },
       "additionalProperties": false
     },
-    "SymbolAnalysisChunk": {
-      "type": "object",
-      "required": [
-        "kind",
-        "unit",
-        "items"
-      ],
-      "properties": {
-        "kind": {
-          "const": "symbols"
+    "FactAnalysisChunk": {
+      "description": "One file's worth of one semantic fact family. `kind` names the family and decides what `items` holds; the families are the ones Coverage reports on.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit",
+            "items"
+          ],
+          "properties": {
+            "kind": {
+              "const": "source_maps"
+            },
+            "unit": {
+              "$ref": "core.json#/$defs/FileId"
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "core.json#/$defs/SourceMapEntry"
+              }
+            }
+          },
+          "additionalProperties": false
         },
-        "unit": {
-          "$ref": "core.json#/$defs/FileId"
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit",
+            "items"
+          ],
+          "properties": {
+            "kind": {
+              "const": "symbols"
+            },
+            "unit": {
+              "$ref": "core.json#/$defs/FileId"
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "core.json#/$defs/Symbol"
+              }
+            }
+          },
+          "additionalProperties": false
         },
-        "items": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/Symbol"
-          }
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit",
+            "items"
+          ],
+          "properties": {
+            "kind": {
+              "const": "leaves"
+            },
+            "unit": {
+              "$ref": "core.json#/$defs/FileId"
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "core.json#/$defs/Leaf"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit",
+            "items"
+          ],
+          "properties": {
+            "kind": {
+              "const": "relationships"
+            },
+            "unit": {
+              "$ref": "core.json#/$defs/FileId"
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "core.json#/$defs/Relationship"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit",
+            "items"
+          ],
+          "properties": {
+            "kind": {
+              "const": "diagnostics"
+            },
+            "unit": {
+              "$ref": "core.json#/$defs/FileId"
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "core.json#/$defs/Diagnostic"
+              }
+            }
+          },
+          "additionalProperties": false
         }
-      },
-      "additionalProperties": false
-    },
-    "SourceMapAnalysisChunk": {
-      "type": "object",
-      "required": [
-        "kind",
-        "unit",
-        "items"
-      ],
-      "properties": {
-        "kind": {
-          "const": "source_maps"
-        },
-        "unit": {
-          "$ref": "core.json#/$defs/FileId"
-        },
-        "items": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/SourceMapEntry"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "LeafAnalysisChunk": {
-      "type": "object",
-      "required": [
-        "kind",
-        "unit",
-        "items"
-      ],
-      "properties": {
-        "kind": {
-          "const": "leaves"
-        },
-        "unit": {
-          "$ref": "core.json#/$defs/FileId"
-        },
-        "items": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/Leaf"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "RelationshipAnalysisChunk": {
-      "type": "object",
-      "required": [
-        "kind",
-        "unit",
-        "items"
-      ],
-      "properties": {
-        "kind": {
-          "const": "relationships"
-        },
-        "unit": {
-          "$ref": "core.json#/$defs/FileId"
-        },
-        "items": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/Relationship"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "DiagnosticAnalysisChunk": {
-      "type": "object",
-      "required": [
-        "kind",
-        "unit",
-        "items"
-      ],
-      "properties": {
-        "kind": {
-          "const": "diagnostics"
-        },
-        "unit": {
-          "$ref": "core.json#/$defs/FileId"
-        },
-        "items": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/Diagnostic"
-          }
-        }
-      },
-      "additionalProperties": false
+      ]
     },
     "CoverageAnalysisChunk": {
       "description": "Completes one unit's buffered replacement. present=false clears all prior facts for the unit.",
@@ -627,28 +612,13 @@
       "description": "One strongly typed bounded chunk. Rift buffers semantic facts by stream-owner and unit until CoverageAnalysisChunk and AnalyzeEnd; complete virtual manifests, text, and maps are then routed to their claimed consumer.",
       "oneOf": [
         {
-          "$ref": "#/$defs/SourceUnitAnalysisChunk"
-        },
-        {
-          "$ref": "#/$defs/VirtualUnitAnalysisChunk"
+          "$ref": "#/$defs/UnitAnalysisChunk"
         },
         {
           "$ref": "#/$defs/VirtualTextAnalysisChunk"
         },
         {
-          "$ref": "#/$defs/SourceMapAnalysisChunk"
-        },
-        {
-          "$ref": "#/$defs/SymbolAnalysisChunk"
-        },
-        {
-          "$ref": "#/$defs/LeafAnalysisChunk"
-        },
-        {
-          "$ref": "#/$defs/RelationshipAnalysisChunk"
-        },
-        {
-          "$ref": "#/$defs/DiagnosticAnalysisChunk"
+          "$ref": "#/$defs/FactAnalysisChunk"
         },
         {
           "$ref": "#/$defs/CoverageAnalysisChunk"
@@ -929,81 +899,78 @@
       },
       "additionalProperties": false
     },
-    "AdapterRefusalError": {
-      "type": "object",
-      "required": [
-        "code",
-        "message",
-        "retryable",
-        "refusal"
-      ],
-      "properties": {
-        "code": {
-          "enum": [
-            "refused",
-            "operation_unsupported"
-          ]
-        },
-        "message": {
-          "type": "string",
-          "maxLength": 4096
-        },
-        "retryable": {
-          "const": false
-        },
-        "refusal": {
-          "$ref": "#/$defs/AdapterRefusal"
-        },
-        "actual_state": {
-          "$ref": "core.json#/$defs/MirrorState"
-        }
-      },
-      "additionalProperties": false
-    },
-    "AdapterGeneralError": {
-      "type": "object",
-      "required": [
-        "code",
-        "message",
-        "retryable"
-      ],
-      "properties": {
-        "code": {
-          "enum": [
-            "invalid_request",
-            "unknown_op",
-            "mirror_depth_exceeded",
-            "mirror_in_use",
-            "stale_state",
-            "coverage_incomplete",
-            "incomplete_validation",
-            "sequence_error",
-            "digest_mismatch",
-            "frame_too_large",
-            "cancelled",
-            "handler_failed"
-          ]
-        },
-        "message": {
-          "type": "string",
-          "maxLength": 4096
-        },
-        "retryable": {
-          "type": "boolean"
-        },
-        "actual_state": {
-          "$ref": "core.json#/$defs/MirrorState"
-        }
-      },
-      "additionalProperties": false
-    },
     "AdapterError": {
+      "description": "A failed operation. A refusal is the adapter declining work it understood — the target is ambiguous, the action went stale, the language forbids it — and carries what blocked it. Everything else is a protocol or runtime failure, and says whether retrying can help.",
       "oneOf": [
         {
-          "$ref": "#/$defs/AdapterRefusalError"
+          "type": "object",
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "refusal"
+          ],
+          "properties": {
+            "code": {
+              "enum": [
+                "refused",
+                "operation_unsupported"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "actual_state": {
+              "description": "The mirror state the adapter actually holds, where the failure was a stale pin.",
+              "$ref": "core.json#/$defs/MirrorState"
+            },
+            "retryable": {
+              "const": false
+            },
+            "refusal": {
+              "$ref": "#/$defs/AdapterRefusal"
+            }
+          },
+          "additionalProperties": false
         },
         {
-          "$ref": "#/$defs/AdapterGeneralError"
+          "type": "object",
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "properties": {
+            "code": {
+              "enum": [
+                "invalid_request",
+                "unknown_op",
+                "mirror_depth_exceeded",
+                "mirror_in_use",
+                "stale_state",
+                "coverage_incomplete",
+                "incomplete_validation",
+                "sequence_error",
+                "digest_mismatch",
+                "frame_too_large",
+                "cancelled",
+                "handler_failed"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "actual_state": {
+              "description": "The mirror state the adapter actually holds, where the failure was a stale pin.",
+              "$ref": "core.json#/$defs/MirrorState"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },

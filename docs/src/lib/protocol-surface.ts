@@ -209,10 +209,7 @@ export const referenceTypes = Object.fromEntries(
  * grouped as such rather than filed somewhere it does not belong.
  */
 const AXIS_SEEDS: [string, string[]][] = [
-  [
-    "Temporal",
-    ["GitRevision", "GitOid", "SnapshotRef", "RevisionRef", "SemanticSnapshotDigest", "Timestamp"],
-  ],
+  ["Temporal", ["GitRevision", "GitOid", "SemanticSnapshotDigest"]],
   [
     "Physical",
     [
@@ -226,6 +223,7 @@ const AXIS_SEEDS: [string, string[]][] = [
       "PathSelector",
       "LeafFacet",
       "LeafRegion",
+      "RegionRole",
     ],
   ],
   [
