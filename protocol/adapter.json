@@ -655,9 +655,6 @@
         }
       ]
     },
-    "AnalyzeInput": {
-      "$ref": "#/$defs/MirrorScopedInput"
-    },
     "AnalyzeEnd": {
       "description": "Analyze is rerun-equal: the same revision under the same environment yields the same facts, the same coverage and the same digest, which is what makes the fact store a rebuildable cache rather than a second source of truth.",
       "type": "object",
@@ -1334,7 +1331,7 @@
           "const": "analyze"
         },
         "body": {
-          "$ref": "#/$defs/AnalyzeInput"
+          "$ref": "#/$defs/MirrorScopedInput"
         }
       },
       "additionalProperties": false

@@ -544,16 +544,6 @@
       },
       "additionalProperties": false
     },
-    "RelationshipTargetRef": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/ResolvedEntityTarget"
-        },
-        {
-          "$ref": "#/$defs/ExternalSymbolRef"
-        }
-      ]
-    },
     "TypeExpression": {
       "description": "How a type is written in the source, plus the symbol that declares it when one does. A type with a declaration resolves to that symbol; a structural type — `string | null`, `{ a: string }` — has the spelling and nothing to resolve to.",
       "type": "object",
@@ -936,19 +926,6 @@
       },
       "additionalProperties": false
     },
-    "KindDescriptor": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/SymbolKindDescriptor"
-        },
-        {
-          "$ref": "#/$defs/LeafKindDescriptor"
-        },
-        {
-          "$ref": "#/$defs/RelationshipKindDescriptor"
-        }
-      ]
-    },
     "JsonSchemaDocument": {
       "description": "A self-contained JSON Schema draft 2020-12 document. Remote references are forbidden.",
       "type": "object"
@@ -1212,7 +1189,17 @@
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/KindDescriptor"
+            "oneOf": [
+              {
+                "$ref": "#/$defs/SymbolKindDescriptor"
+              },
+              {
+                "$ref": "#/$defs/LeafKindDescriptor"
+              },
+              {
+                "$ref": "#/$defs/RelationshipKindDescriptor"
+              }
+            ]
           }
         },
         "structural_matching": {
@@ -1586,7 +1573,14 @@
           }
         },
         "to": {
-          "$ref": "#/$defs/RelationshipTargetRef"
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ResolvedEntityTarget"
+            },
+            {
+              "$ref": "#/$defs/ExternalSymbolRef"
+            }
+          ]
         },
         "evidence": {
           "type": "array",
@@ -1912,20 +1906,6 @@
       },
       "additionalProperties": false
     },
-    "EntityTarget": {
-      "description": "An entity nameable in any position: a resolved entity, or an entity-valued capture from a previously discovered match.",
-      "oneOf": [
-        {
-          "$ref": "#/$defs/PublicSymbolTarget"
-        },
-        {
-          "$ref": "#/$defs/PublicLeafTarget"
-        },
-        {
-          "$ref": "#/$defs/MatchEntityTarget"
-        }
-      ]
-    },
     "Address": {
       "description": "A source region resolved by the owning adapter against the operation's current candidate.",
       "oneOf": [
@@ -1941,7 +1921,17 @@
               "const": "entity"
             },
             "target": {
-              "$ref": "#/$defs/EntityTarget"
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/PublicSymbolTarget"
+                },
+                {
+                  "$ref": "#/$defs/PublicLeafTarget"
+                },
+                {
+                  "$ref": "#/$defs/MatchEntityTarget"
+                }
+              ]
             },
             "region": {
               "enum": [
@@ -1995,7 +1985,17 @@
               "type": "string"
             },
             "within": {
-              "$ref": "#/$defs/EntityTarget"
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/PublicSymbolTarget"
+                },
+                {
+                  "$ref": "#/$defs/PublicLeafTarget"
+                },
+                {
+                  "$ref": "#/$defs/MatchEntityTarget"
+                }
+              ]
             }
           },
           "additionalProperties": false
