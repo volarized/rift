@@ -111,10 +111,18 @@ for (const file of PROTOCOL_FILES) {
 /** `allKeys` so keywords outside the walker's own table are still visited. */
 const TRAVERSE_OPTIONS = { allKeys: true } as const;
 
-/** Every schema node inside a definition, including the definition itself. */
+/**
+ * Every schema node inside a definition, including the definition itself.
+ *
+ * Anything under a `rift:` keyword is left out. Those carry Rift's own
+ * annotations rather than subschemas, and `allKeys` cannot tell the difference —
+ * without this, `rift:enumDescriptions` reads as a schema whose keywords are the
+ * enum values it documents.
+ */
 function nodes(root: Schema): Schema[] {
   const found: Schema[] = [];
-  traverse(root as traverse.SchemaObject, TRAVERSE_OPTIONS, (node) => {
+  traverse(root as traverse.SchemaObject, TRAVERSE_OPTIONS, (node, pointer) => {
+    if (pointer.split("/").some((segment) => segment.startsWith("rift:"))) return;
     found.push(node as Schema);
   });
   return found;
@@ -216,6 +224,15 @@ export function refName(node: Schema | undefined): string | null {
   return pointer.slice("/$defs/".length);
 }
 
+/**
+ * What an enum's individual values mean, where the schema says. The cast is
+ * because `rift:` keywords are Rift's own and the JSON Schema types know
+ * nothing about them.
+ */
+export function enumDescriptions(node: Schema): Record<string, string> | undefined {
+  return (node as { "rift:enumDescriptions"?: Record<string, string> })["rift:enumDescriptions"];
+}
+
 export function isLossy(root: Schema): boolean {
   return nodes(root).some((node) => Object.keys(node).some((key) => LOSSY_KEYWORDS.has(key)));
 }
@@ -227,6 +244,27 @@ for (const name of defNames) {
       throw new Error(
         `unhandled JSON Schema keyword \`${key}\` in ${name}. Teach src/components/protocol to render it before it reaches the page.`,
       );
+    }
+  }
+}
+
+/**
+ * Every key of a `rift:enumDescriptions` is one of the values it documents.
+ * A key that is not — a typo, or a value renamed out from under it — describes
+ * nothing and reaches the page as silence. Incompleteness is fine: the values
+ * are documented as the docs are written, and an undescribed one still renders.
+ */
+for (const name of defNames) {
+  for (const node of nodes(defs[name])) {
+    const described = enumDescriptions(node);
+    if (!described) continue;
+    const values = new Set((node.enum ?? []).filter((value) => typeof value === "string"));
+    for (const value of Object.keys(described)) {
+      if (!values.has(value)) {
+        throw new Error(
+          `\`rift:enumDescriptions\` in ${name} describes \`${value}\`, which is not one of its enum values`,
+        );
+      }
     }
   }
 }

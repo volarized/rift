@@ -2,19 +2,63 @@ import type { ReactNode } from "react";
 import { Prose } from "@/components/protocol/prose";
 import {
   adapterOwned,
+  type ProtoEnum,
+  type ProtoField,
   type ProtoMessage,
-  protoEnums,
+  protoEnumOwner,
   protoMessages,
+  protoSections,
   protoServices,
+  protoWrappers,
 } from "@/lib/proto";
+import { homeOf } from "@/lib/protocol";
+import { hrefFor } from "@/lib/protocol-surface";
 
-/** A proto type name links to wherever that type is rendered on this page. */
-function TypeRef({ name, link }: { name: string; link?: string }): ReactNode {
-  if (!link) return <code className="text-[0.875em]">{name}</code>;
+/**
+ * Where a proto type name points, or null if nothing on either page holds it.
+ *
+ * Two destinations, because this page holds only half of what it renders. A
+ * type the adapter file declares is on this page. A type generated from
+ * `core.json` is documented once, on the reference page, and linking it here to
+ * `#msg-…` would point at an anchor that does not exist. The plumbing wrappers
+ * get no heading, so they get no link either, and a nested enum resolves to the
+ * message it is declared in, which is the heading it is rendered under.
+ */
+function hrefForProtoType(name: string): string | null {
+  if (protoWrappers.has(name)) return null;
+  const owner = protoEnumOwner[name];
+  if (owner) return `#msg-${owner}`;
+  if (adapterOwned.has(name)) return `#msg-${name}`;
+  return homeOf[name] === "core" ? hrefFor(name) : null;
+}
+
+function TypeRef({ name }: { name: string }): ReactNode {
+  const href = hrefForProtoType(name);
+  if (!href) return <code className="text-[0.875em]">{name}</code>;
   return (
-    <a href={`#msg-${link}`} className="font-mono text-[0.875em] no-underline hover:underline">
+    <a href={href} className="font-mono text-[0.875em] no-underline hover:underline">
       {name}
     </a>
+  );
+}
+
+/**
+ * A field's type, with the plumbing wrappers seen through. A `SymbolFacets`
+ * field is a repeated `SymbolFacet` and reads better as one — and the wrapper
+ * has no heading of its own to link to.
+ */
+function FieldType({ field }: { field: ProtoField }): ReactNode {
+  const element = protoWrappers.has(field.type)
+    ? messagesByName.get(field.type)?.fields[0].type
+    : undefined;
+  return (
+    <>
+      {field.repeated || element ? (
+        <span className="text-fd-muted-foreground">repeated </span>
+      ) : null}
+      {field.optional ? <span className="text-fd-muted-foreground">optional </span> : null}
+      <TypeRef name={element ?? field.type} />
+    </>
   );
 }
 
@@ -44,17 +88,11 @@ function Fields({ message }: { message: ProtoMessage }): ReactNode {
                 ) : null}
               </td>
               <td className="whitespace-nowrap">
-                {field.repeated ? (
-                  <span className="text-fd-muted-foreground">repeated </span>
-                ) : null}
-                {field.optional ? (
-                  <span className="text-fd-muted-foreground">optional </span>
-                ) : null}
-                <TypeRef name={field.type} link={field.link} />
+                <FieldType field={field} />
               </td>
               <td>
                 {field.comment ? (
-                  <Prose text={field.comment} />
+                  <Prose text={field.comment} resolve={hrefForProtoType} />
                 ) : (
                   <span className="text-fd-muted-foreground">—</span>
                 )}
@@ -67,18 +105,84 @@ function Fields({ message }: { message: ProtoMessage }): ReactNode {
   );
 }
 
+const messagesByName = new Map<string, ProtoMessage>(
+  protoMessages.filter((message) => adapterOwned.has(message.name)).map((m) => [m.name, m]),
+);
+/** A section heading's anchor. */
+export function sectionId(name: string): string {
+  return `sec-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+}
+
+/** An enum's values, described one by one where the file says what they mean. */
+function EnumValues({ declared }: { declared: ProtoEnum }): ReactNode {
+  if (!declared.values.some((value) => value.comment)) {
+    return (
+      <p>
+        {declared.values.map((value, index) => (
+          <span key={value.name}>
+            {index > 0 ? " · " : null}
+            <code className="text-[0.875em]">{value.name}</code>
+          </span>
+        ))}
+      </p>
+    );
+  }
+
+  return (
+    <ul>
+      {declared.values.map((value) => (
+        <li key={value.name}>
+          <code className="text-[0.875em]">{value.name}</code>
+          {value.comment ? (
+            <>
+              {" — "}
+              <Prose text={value.comment} resolve={hrefForProtoType} />
+            </>
+          ) : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function Declaration({ name }: { name: string }): ReactNode {
+  const message = messagesByName.get(name);
+  if (!message) return null;
+  return (
+    <section>
+      <h3 id={`msg-${name}`} className="scroll-m-20 font-mono">
+        {name}
+      </h3>
+      {message.comment ? (
+        <p>
+          <Prose text={message.comment} resolve={hrefForProtoType} />
+        </p>
+      ) : null}
+      <Fields message={message} />
+      {message.enums.map((declared) => (
+        <div key={declared.name}>
+          <h4 className="font-mono">{`${name}.${declared.name}`}</h4>
+          {declared.comment ? (
+            <p>
+              <Prose text={declared.comment} resolve={hrefForProtoType} />
+            </p>
+          ) : null}
+          <EnumValues declared={declared} />
+        </div>
+      ))}
+    </section>
+  );
+}
+
 /**
  * The adapter seam, as its service declares it.
  *
  * This page reads `adapter.proto` rather than a JSON Schema, because that is
- * what the seam is. Only the messages the adapter file declares are printed
- * here — the model messages it carries are generated from `core.json` and
- * documented once, in the reference.
+ * what the seam is. Messages are grouped the way the file groups itself, so a
+ * reader and an editor see the same shape.
  */
 export function AdapterReference(): ReactNode {
   const service = protoServices[0];
-  const owned = protoMessages.filter((message) => adapterOwned.has(message.name));
-  const ownedEnums = protoEnums.filter((declared) => adapterOwned.has(declared.name));
 
   return (
     <>
@@ -86,7 +190,7 @@ export function AdapterReference(): ReactNode {
         Service
       </h2>
       <p>
-        <code>Hello</code> runs at startup. <code>OpenWorkspace</code>, <code>Refresh</code> and{" "}
+        <code>Describe</code> runs at startup. <code>OpenWorkspace</code>, <code>Refresh</code> and{" "}
         <code>CloseWorkspace</code> manage the directory Rift checked out. <code>Analyze</code>,{" "}
         <code>Match</code> and <code>Actions</code> ask what is in it, and <code>Resolve</code>{" "}
         turns one of those answers into edits.
@@ -105,54 +209,21 @@ export function AdapterReference(): ReactNode {
           </pre>
           {rpc.comment ? (
             <p>
-              <Prose text={rpc.comment} />
+              <Prose text={rpc.comment} resolve={hrefForProtoType} />
             </p>
           ) : null}
         </section>
       ))}
 
-      <h2 id="messages" className="scroll-m-20">
-        Messages
-      </h2>
-      <p>
-        What the seam itself defines. Everything it carries about code — <code>Symbol</code>,{" "}
-        <code>Leaf</code>, <code>File</code>, <code>Snapshot</code>, <code>Edit</code> — is
-        generated from the model and described in the reference.
-      </p>
-
-      {owned.map((message) => (
-        <section key={message.name}>
-          <h3 id={`msg-${message.name}`} className="scroll-m-20 font-mono">
-            {message.name}
-          </h3>
-          {message.comment ? (
-            <p>
-              <Prose text={message.comment} />
-            </p>
-          ) : null}
-          <Fields message={message} />
-        </section>
-      ))}
-
-      {ownedEnums.map((declared) => (
-        <section key={declared.name}>
-          <h3 id={`msg-${declared.name}`} className="scroll-m-20 font-mono">
-            {declared.name}
-          </h3>
-          {declared.comment ? (
-            <p>
-              <Prose text={declared.comment} />
-            </p>
-          ) : null}
-          <p>
-            {declared.values.map((value, index) => (
-              <span key={value.name}>
-                {index > 0 ? " · " : null}
-                <code className="text-[0.875em]">{value.name}</code>
-              </span>
-            ))}
-          </p>
-        </section>
+      {protoSections.map((section) => (
+        <div key={section.name}>
+          <h2 id={sectionId(section.name)} className="scroll-m-20">
+            {section.name}
+          </h2>
+          {section.types.map((name) => (
+            <Declaration key={name} name={name} />
+          ))}
+        </div>
       ))}
     </>
   );

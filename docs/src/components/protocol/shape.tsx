@@ -3,14 +3,15 @@ import { PropertyTable } from "@/components/protocol/property-table";
 import { Prose } from "@/components/protocol/prose";
 import { Constraints } from "@/components/protocol/type-expr";
 import { defs } from "@/lib/protocol";
+import { hrefFor } from "@/lib/protocol-surface";
 
 /**
  * One named type, shown where it is used rather than in a list somewhere else.
  *
  * A tool's input and output are the two things a reader actually came for, so
- * they get their own heading and carry the definition's anchor with them. That
- * is why the type reference at the bottom of each page skips whatever a surface
- * section already showed: every definition has exactly one home.
+ * they get their own heading here. The name links to the reference entry, which
+ * is the same type with everything this view leaves out — its branches, its
+ * examples, and what else refers to it.
  */
 export function Shape({ label, name }: { label: string; name: string }): ReactNode {
   const schema = defs[name];
@@ -22,7 +23,9 @@ export function Shape({ label, name }: { label: string; name: string }): ReactNo
         <span className="mr-2 font-sans font-normal text-fd-muted-foreground text-sm uppercase tracking-wide">
           {label}
         </span>
-        {name}
+        <a href={hrefFor(name)} className="no-underline hover:underline">
+          {name}
+        </a>
       </h4>
       {schema.description ? (
         <p>

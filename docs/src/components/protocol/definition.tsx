@@ -6,6 +6,7 @@ import {
   backlinks,
   branches,
   defs,
+  enumDescriptions,
   homeOf,
   isLossy,
   props,
@@ -98,6 +99,51 @@ function Variants({ schema }: { schema: Schema }): ReactNode {
   );
 }
 
+/** A definition's enum values, described one by one where the schema says what they mean. */
+function EnumValues({ schema }: { schema: Schema }): ReactNode {
+  if (!schema.enum) return null;
+  const described = enumDescriptions(schema);
+  const label = (value: unknown) => (typeof value === "string" ? value : JSON.stringify(value));
+
+  if (!described) {
+    return (
+      <p>
+        Values:{" "}
+        {schema.enum.map((value, index) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: positional list over a fixed schema array
+          <span key={index}>
+            {index > 0 ? " · " : null}
+            <code className="text-[0.875em]">{label(value)}</code>
+          </span>
+        ))}
+      </p>
+    );
+  }
+
+  return (
+    <div className="my-4">
+      <p className="font-medium">Values</p>
+      <ul>
+        {schema.enum.map((value, index) => {
+          const description = described[label(value)];
+          return (
+            // biome-ignore lint/suspicious/noArrayIndexKey: positional list over a fixed schema array
+            <li key={index}>
+              <code className="text-[0.875em]">{label(value)}</code>
+              {description ? (
+                <>
+                  {" — "}
+                  <Prose text={description} />
+                </>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 /** The shape of a definition, whichever of the schema's forms it takes. */
 function Shape({ schema }: { schema: Schema }): ReactNode {
   const alias = refName(schema);
@@ -112,20 +158,7 @@ function Shape({ schema }: { schema: Schema }): ReactNode {
         </p>
       ) : null}
 
-      {schema.enum ? (
-        <p>
-          Values:{" "}
-          {schema.enum.map((value, index) => (
-            // biome-ignore lint/suspicious/noArrayIndexKey: positional list over a fixed schema array
-            <span key={index}>
-              {index > 0 ? " · " : null}
-              <code className="text-[0.875em]">
-                {typeof value === "string" ? value : JSON.stringify(value)}
-              </code>
-            </span>
-          ))}
-        </p>
-      ) : null}
+      <EnumValues schema={schema} />
 
       {"const" in schema && !schema.enum ? (
         <p>

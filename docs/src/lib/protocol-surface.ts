@@ -15,7 +15,8 @@
 
 import type { StructuredData } from "fumadocs-core/mdx-plugins";
 import type { TableOfContents } from "fumadocs-core/server";
-import { adapterOwned, protoMessages, protoServices } from "@/lib/proto";
+import { sectionId } from "@/components/protocol/adapter";
+import { adapterOwned, protoMessages, protoSections, protoServices } from "@/lib/proto";
 import {
   axisGroups,
   defNames,
@@ -296,9 +297,12 @@ function mcpPage(): PageData {
  */
 function adapterPage(): PageData {
   const service = protoServices[0];
-  const owned = protoMessages
-    .filter((message) => adapterOwned.has(message.name))
-    .map((message) => message.name);
+  // The file's own section banners decide the grouping, so a message that moves
+  // between sections moves on the page without anything here changing.
+  const grouped = protoSections.flatMap((section) => [
+    { name: section.name, id: sectionId(section.name), depth: 2 },
+    ...section.types.map((name) => ({ name, id: `msg-${name}`, depth: 3 })),
+  ]);
 
   // `Transport` and `What crosses this seam` are headings in the MDX, so remark
   // already produced them. Only what the component renders belongs here.
@@ -310,15 +314,13 @@ function adapterPage(): PageData {
         url: `#rpc-${rpc.name}`,
         depth: 3,
       })),
-      { title: "Messages", url: "#messages", depth: 2 },
-      ...owned.map((name) => ({ title: name, url: `#msg-${name}`, depth: 3 })),
+      ...grouped.map((entry) => ({ title: entry.name, url: `#${entry.id}`, depth: entry.depth })),
     ],
     structuredData: {
       headings: [
         { id: "service", content: "Service" },
         ...(service?.rpcs ?? []).map((rpc) => ({ id: `rpc-${rpc.name}`, content: rpc.name })),
-        { id: "messages", content: "Messages" },
-        ...owned.map((name) => ({ id: `msg-${name}`, content: name })),
+        ...grouped.map((entry) => ({ id: entry.id, content: entry.name })),
       ],
       contents: [
         ...(service?.rpcs ?? []).flatMap((rpc) =>
