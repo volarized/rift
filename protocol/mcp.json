@@ -256,7 +256,7 @@
       ]
     },
     "File": {
-      "description": "A Git tree entry from the complete leaf snapshot. object is the canonical Git blob for files/symlinks and commit for gitlinks. LFS pointers, symlinks, and gitlinks are semantically opaque and never followed or hydrated. The oneOf constrains which payload may accompany which entry kind; it never varies the entry's shape.",
+      "description": "A Git tree entry from the workspace's complete snapshot at one revision.",
       "type": "object",
       "required": [
         "path",
@@ -447,10 +447,6 @@
         "cursor": {
           "$ref": "#/$defs/Cursor"
         },
-        "leaf": {
-          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
-          "$ref": "#/$defs/LeafId"
-        },
         "rev": {
           "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
           "$ref": "core.json#/$defs/GitRevision",
@@ -544,12 +540,12 @@
       "additionalProperties": false
     },
     "SymbolResourceUri": {
-      "description": "Paginated Symbol URI. The GlobalEntityId alphabet is URL-safe, so the identity path segment needs no encoding rule. Code snapshot, semantic snapshot, leaf, and cursor are query arguments.",
+      "description": "A Symbol-centred view of the semantic model. The revision and the cursor are query arguments; the symbol's identifier is the path.",
       "type": "string",
-      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(leaf=[A-Za-z0-9_-]{1,128}&)?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?(&cursor=[^&#]+)?)?$"
+      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$"
     },
     "SymbolResourceLink": {
-      "description": "A portable link to the symbol resource. Rift always emits the explicit leaf form.",
+      "description": "A portable link to the symbol resource.",
       "type": "object",
       "required": [
         "type",
@@ -689,7 +685,7 @@
     "DiffResourceUri": {
       "description": "Paginated diff URI; both commits are query arguments, never path identity.",
       "type": "string",
-      "pattern": "^rift://diff\\?(leaf=[A-Za-z0-9_-]{1,128}&)?from=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}&to=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?$"
+      "pattern": "^rift://diff\\?from=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}&to=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?$"
     },
     "DiffResourcePayload": {
       "type": "object",
@@ -751,7 +747,7 @@
     "BlobResourceUri": {
       "description": "Opaque Git blob resource addressed by object ID as a query argument, never by a traversable path.",
       "type": "string",
-      "pattern": "^rift://blob\\?(leaf=[A-Za-z0-9_-]{1,128}&)?object=[0-9a-f]{40}([0-9a-f]{24})?$"
+      "pattern": "^rift://blob\\?object=[0-9a-f]{40}([0-9a-f]{24})?$"
     },
     "BlobResourceContents": {
       "description": "MCP blob resource; blob is canonical base64 of the exact Git object payload, returned whole. This resource does not paginate: it is exact bytes, not a result set. Objects larger than DriverLimits.max_blob_bytes fail with limit_exceeded rather than being truncated or chunked.",
@@ -848,12 +844,12 @@
       "additionalProperties": false
     },
     "RepositoryResourceUri": {
-      "description": "Paginated leaf metadata/capability URI at one retained snapshot. leaf is optional on the wire and defaults to the session binding; Rift always emits the explicit form so links stay portable.",
+      "description": "Paginated workspace metadata and capabilities at one revision.",
       "type": "string",
-      "pattern": "^rift://repository(\\?(leaf=[A-Za-z0-9_-]{1,128}&)?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?(&cursor=[^&#]+)?)?$"
+      "pattern": "^rift://repository(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$"
     },
     "RepositoryResourceLink": {
-      "description": "A portable link to the repository resource. Rift always emits the explicit leaf form.",
+      "description": "A portable link to the repository resource.",
       "type": "object",
       "required": [
         "type",
@@ -878,7 +874,7 @@
       "additionalProperties": false
     },
     "RepositoryResourcePayload": {
-      "description": "Driver-style leaf metadata: effective contract, ACID semantics, semantic coverage, and installed adapter capabilities. Pages are deterministic and snapshot-bound.",
+      "description": "What Rift can do for this workspace right now: the languages it understands, what their adapters support, the snapshot it answered from, and the limits a request has to stay inside.",
       "type": "object",
       "required": [
         "uri",
@@ -892,7 +888,6 @@
         "tools",
         "resources",
         "next",
-        "leaf",
         "object_format",
         "matching",
         "profile",
@@ -932,7 +927,7 @@
           "$ref": "core.json#/$defs/SemanticCoverage"
         },
         "tools": {
-          "description": "Effective MCP tools authorized for this caller at this leaf.",
+          "description": "The MCP tools this workspace serves.",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -946,14 +941,13 @@
           }
         },
         "resources": {
-          "description": "Effective MCP resource families authorized for this caller at this leaf.",
+          "description": "The MCP resource families this workspace serves.",
           "type": "array",
           "uniqueItems": true,
           "items": {
             "enum": [
               "repository",
               "symbol",
-              "preview",
               "diff",
               "blob"
             ]
@@ -968,9 +962,6 @@
               "type": "null"
             }
           ]
-        },
-        "leaf": {
-          "$ref": "#/$defs/LeafId"
         },
         "object_format": {
           "enum": [
@@ -1096,10 +1087,6 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9_.-]*$"
           }
-        },
-        "leaf": {
-          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
-          "$ref": "#/$defs/LeafId"
         },
         "limit": {
           "type": "integer",
@@ -1336,10 +1323,6 @@
         },
         "cursor": {
           "$ref": "#/$defs/Cursor"
-        },
-        "leaf": {
-          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
-          "$ref": "#/$defs/LeafId"
         },
         "rev": {
           "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
@@ -1854,13 +1837,8 @@
       },
       "additionalProperties": false
     },
-    "LeafId": {
-      "description": "Deterministic identity of one leaf, the pair of repository and selected worktree. Derived from the canonical worktree path, so it is stable across restarts and carries no host path in its value. A session binds one leaf; any request or URI may name a different leaf under the same server. That is intentional and is what makes a preview link portable between a supervisor and its subagents. There is no inter-agent isolation: every session on one server shares the invoking user's single trust domain, and host authorization is the only boundary.",
-      "type": "string",
-      "pattern": "^[A-Za-z0-9_-]{1,128}$"
-    },
     "DiffResourceLink": {
-      "description": "A portable link to the diff resource. Rift always emits the explicit leaf form.",
+      "description": "A portable link to the diff resource.",
       "type": "object",
       "required": [
         "type",
@@ -1885,7 +1863,7 @@
       "additionalProperties": false
     },
     "BlobResourceLink": {
-      "description": "A portable link to the blob resource. Rift always emits the explicit leaf form.",
+      "description": "A portable link to the blob resource.",
       "type": "object",
       "required": [
         "type",
@@ -1910,7 +1888,7 @@
       "additionalProperties": false
     },
     "MatchingDialects": {
-      "description": "The matching grammars this leaf accepts, advertised rather than assumed. rust-regex is the Rust regex crate grammar. The exact crate and Unicode versions are reported as the engine and version of every QueryExecution, so a result set always carries the identity of the engine that produced it, and the dialect name is bumped whenever either changes matching semantics: no backreferences or lookaround, linear match time, Unicode mode on by default with a pinned Unicode version, UTF-8 haystacks with byte offsets, leftmost-first alternation, greedy quantifiers, no implicit CRLF handling, dot excluding newline unless (?s), anchors matching only at haystack ends unless (?m), leftmost-longest capture disambiguation within a match, non-overlapping iteration advancing by one byte past a zero-width match, and inline (?-u) permitted. It is deliberately not RE2: RE2 defines the Perl classes and word boundaries as ASCII where this dialect defines them as Unicode. Structural pattern grammar is per adapter and advertised in its own capability record, but regex is not: rust-regex is the only dialect for a caller-supplied regex — structural patterns and git-glob path selectors are separate grammars, declared separately — is executed only by Rift, and covers text matching, capture text filters, FieldFilter regex ops, and regex_replace transforms alike. JSON Schema pattern keywords are ECMA-262 and validated by each ecosystem's own validator; they are authored here rather than supplied by a caller, so they are neither a divergence risk nor an attack surface.",
+      "description": "The matching grammars this workspace accepts, advertised rather than assumed.",
       "type": "object",
       "required": [
         "text",
@@ -1938,7 +1916,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://repository{?leaf,rev,cursor}"
+              "const": "rift://repository{?rev,cursor}"
             },
             "name": {
               "const": "repository"
@@ -1958,7 +1936,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://symbol/{entity}{?leaf,rev,cursor}"
+              "const": "rift://symbol/{entity}{?rev,cursor}"
             },
             "name": {
               "const": "symbol"
@@ -1978,27 +1956,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://preview{?leaf,rev,cursor}"
-            },
-            "name": {
-              "const": "preview"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.preview+json"
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "uriTemplate",
-            "name",
-            "mimeType"
-          ],
-          "properties": {
-            "uriTemplate": {
-              "const": "rift://diff{?leaf,from,to,cursor}"
+              "const": "rift://diff{?from,to,cursor}"
             },
             "name": {
               "const": "diff"
@@ -2018,7 +1976,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://blob{?leaf,object}"
+              "const": "rift://blob{?object}"
             },
             "name": {
               "const": "blob"
@@ -2119,7 +2077,7 @@
       ]
     },
     "ConformanceProfile": {
-      "description": "What this leaf actually implements, advertised rather than assumed. Profiles are a ladder: each includes the one below it. A leaf must not advertise a profile whose full conformance suite it does not pass, and a caller must not infer capability from version or deployment.",
+      "description": "What this workspace actually implements, advertised rather than assumed. Profiles are a ladder: each includes the one below it. A workspace must advertise only a profile whose full conformance suite it passes, and a caller reads capability from here rather than inferring it from a version number.",
       "enum": [
         "read",
         "edit",
