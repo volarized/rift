@@ -1,10 +1,27 @@
 // The Rift server to language adapter seam.
 //
 // gRPC over a Unix domain socket. One Rift server starts and owns its adapters,
-// one per language, and no other server shares them — so a mirror has exactly
-// one party opening, filling and releasing it, and the adapter arbitrates
-// nothing. One adapter still serves many mirrors at once, because many agents
-// work against one workspace.
+// one per language, and no other server shares them — so a workspace has
+// exactly one party creating, refreshing and closing it, and the adapter
+// arbitrates nothing. One adapter still holds several workspaces at once,
+// because many agents work against one repository.
+//
+// Rift materializes the code on disk and hands the adapter a path. Real
+// compilers want a real filesystem — rust-analyzer, gopls and tsc all end up
+// calling open(2) — so streaming bytes across this seam would only pay for a
+// second diff on top of the one git already computed.
+//
+// The directory holds no `.git`. Rift checks the base commit out with
+// `git checkout-index` and overwrites the files the snapshot says are dirty,
+// which is what keeps the adapter unable to read your branches, your remotes or
+// the credentials in your git config.
+//
+// The adapter never writes source. Fixes and refactors come back as
+// rift.core.v1.Edit and Rift applies them, so a change can be rejected
+// before it lands and one agent's `rustfmt` run cannot reach another agent's
+// files. Compilers still write — `target/`, `node_modules/`, `Cargo.lock` — so
+// the adapter declares those paths in Hello and Rift stops treating them as
+// source.
 //
 // This seam is protobuf; the MCP surface is JSON Schema. The model both carry —
 // Symbol, Leaf, File, Snapshot — is defined once in core.json and generated
@@ -28,26 +45,22 @@ service Adapter {
   // adapter to exactly what it claims here and never probes or feature-tests.
   rpc Hello(google.protobuf.Empty) returns (Capabilities);
 
-  // Give me somewhere to put the code. An adapter cannot read the repository,
-  // so Rift opens a mirror and sends content into it.
-  rpc OpenMirror(OpenMirrorRequest) returns (OpenMirrorResponse);
+  // Here is a checked-out tree and here is the state it holds. Rift has already
+  // written every file before this call, so the adapter can start its compiler
+  // against a directory that is complete the moment it is named.
+  rpc OpenWorkspace(OpenWorkspaceRequest) returns (WorkspaceState);
 
-  // Throw a mirror away. Nothing is reclaimed implicitly, so this has to be
-  // said. Refused while the mirror has live children or in-flight requests: an
-  // analyze stream against a mirror that just stopped being newest is still a
-  // valid pinned read, and killing it turns a correct answer into a failure.
-  rpc ReleaseMirror(ReleaseMirrorRequest) returns (google.protobuf.Empty);
+  // The files on disk moved to a new state, and these are the paths that
+  // changed. Without this the adapter would have to stat the tree to find out,
+  // and a fresh workspace per edit would make every keystroke a cold compile.
+  rpc Refresh(RefreshRequest) returns (WorkspaceState);
 
-  // A change was published, so the child that held it becomes a base in its own
-  // right. Without this, publishing from a child leaves the next edit to open a
-  // fresh mirror and full-sync it, making every sequential edit a cold start.
-  rpc PromoteMirror(PromoteMirrorRequest) returns (MirrorState);
-
-  // Send content into a mirror. The stream is the transaction: it opens on the
-  // first message, and either the client half-closes and the adapter commits,
-  // or the call is cancelled and nothing is kept. Only one may be open per
-  // mirror. Ordering is the stream's, so no sequence numbers appear here.
-  rpc Sync(stream SyncChunk) returns (SyncResult);
+  // Stop holding this workspace. Nothing is reclaimed implicitly, so this has
+  // to be said. Refused while calls are in flight against it: an analyze stream
+  // pinned to a state that just stopped being newest is still a valid read, and
+  // killing it turns a correct answer into a failure. Rift deletes the
+  // directory once the adapter has let go of it.
+  rpc CloseWorkspace(CloseWorkspaceRequest) returns (google.protobuf.Empty);
 
   // Read the code and say what is in it: symbols, where they appear, how they
   // connect, and what the compiler complains about. Facts stream per file and
@@ -60,6 +73,11 @@ service Adapter {
 
   // List the fixes and refactors the compiler can offer at one address.
   rpc Actions(ActionsRequest) returns (ActionsResponse);
+
+  // Work out what one of those actions would actually change. Separate from
+  // Actions because computing every offered action's edits costs about as much
+  // as performing them, and a menu of twelve gets one pick.
+  rpc Resolve(ResolveRequest) returns (ResolveResponse);
 }
 
 // ── capabilities ──────────────────────────────────────────────────────────────
@@ -78,21 +96,23 @@ message Capabilities {
   repeated SourceClaim claims = 5;
   repeated AuxiliaryClaim auxiliary_claims = 6;
   repeated VirtualClaim virtual_claims = 7;
+  // Which paths inside the workspace this adapter's compiler writes to.
+  repeated WriteClaim write_claims = 8;
   // The exact kinds this adapter emits, and the portable facets each carries.
-  repeated KindDescriptor kinds = 8;
+  repeated KindDescriptor kinds = 9;
   // Whether this adapter can parse the Rift pattern grammar. It declares
   // nothing about transforms: those read from captures Rift already holds.
-  StructuralMatching structural_matching = 9;
+  StructuralMatching structural_matching = 10;
   // Whether compiler actions can be discovered, and where not, why. Absence is
   // never read as "no actions".
-  rift.core.v1.Coverage action_discovery = 10;
+  rift.core.v1.Coverage action_discovery = 11;
   // Versioned extension values this adapter emits, and where each may appear.
-  repeated ExtensionDescriptor extension_values = 11;
+  repeated ExtensionDescriptor extension_values = 12;
   // Constants every adapter must echo, so a mismatch fails at startup rather
   // than as a wrong answer later.
-  DeterminismContract determinism = 12;
-  Limits limits = 13;
-  RuntimeRequirements runtime = 14;
+  DeterminismContract determinism = 13;
+  Limits limits = 14;
+  RuntimeRequirements runtime = 15;
 }
 
 // A deterministic claim on physical files, re-evaluated after every path or
@@ -118,8 +138,9 @@ message AuxiliaryClaim {
   repeated string path_names = 3;
   // Whether editing a matched file changes this adapter's environment. Declared
   // by the adapter and never inferred from purpose or path, because only the
-  // adapter knows whether its compiler rereads a given file. True forces a
-  // fresh base rather than a child mirror.
+  // adapter knows whether its compiler rereads a given file. True means a
+  // Refresh touching it invalidates the resolved environment, so the adapter
+  // rebuilds it rather than updating incrementally.
   bool environment_defining = 4;
 }
 
@@ -138,6 +159,26 @@ enum AuxiliaryPurpose {
 message VirtualClaim {
   string language = 1;
   uint32 priority = 2;
+}
+
+// Paths inside the workspace that this adapter's compiler writes to, and that
+// Rift must therefore stop reading as source. Nothing under a write claim is
+// ever analyzed, diffed against the snapshot, or reported to an agent.
+//
+// Most build output can be pushed out of the tree instead — CARGO_TARGET_DIR,
+// GOCACHE, PYTHONPYCACHEPREFIX, tsBuildInfoFile all point somewhere else, and
+// an adapter should aim them at `state_root`. Declare what is left: `cargo`
+// rewrites Cargo.lock at the workspace root, npm insists on `node_modules` next
+// to the package it belongs to.
+//
+// Selectors follow SourceClaim's bytewise rules. A directory name matches the
+// directory and everything beneath it.
+message WriteClaim {
+  repeated string path_names = 1;
+  repeated string path_suffixes = 2;
+  // Why the compiler needs it, in one line. Rift logs this when a claim shadows
+  // a file the repository actually tracks, which is nearly always a mistake.
+  string reason = 3;
 }
 
 // One kind this adapter emits, and the portable facets it carries. The entity
@@ -204,18 +245,18 @@ message DeterminismContract {
   string owner_id = 7;
 }
 
-// Bounds this adapter advertises. One adapter serves many mirrors over one
-// connection, so in-flight work is bounded per mirror rather than per process.
+// Bounds this adapter advertises. One adapter holds several workspaces over one
+// connection, so in-flight work is bounded per workspace rather than per
+// process.
 message Limits {
   uint64 max_message_bytes = 1;
   uint32 max_in_flight = 2;
-  // Concurrent calls accepted for any one mirror, so one agent cannot consume
-  // the process.
-  uint32 max_in_flight_per_mirror = 3;
-  // Concurrent bases held for candidates that change the environment. Such a
-  // candidate cannot be a child of the accepted base and takes a base of its
-  // own, which is the one legitimate route to N times base memory.
-  uint32 max_provisional_bases = 4;
+  // Concurrent calls accepted for any one workspace, so one agent cannot
+  // consume the process.
+  uint32 max_in_flight_per_workspace = 3;
+  // Workspaces this adapter will hold open at once. Each one is a parsed tree
+  // and a compiler's state, so this is the number that decides its memory.
+  uint32 max_workspaces = 4;
 }
 
 // What the host must enforce for this adapter to run on untrusted source.
@@ -227,114 +268,66 @@ message RuntimeRequirements {
   bool spawns_subprocesses = 2;
   // "denied"
   string network = 3;
-  // "mirror_and_declared_dependencies"
+  // "workspace_and_declared_dependencies"
   string filesystem = 4;
-  // "private_temp_only"
+  // "state_root_and_write_claims"
   string writes = 5;
 }
 
-// ── mirrors ───────────────────────────────────────────────────────────────────
+// ── workspaces ────────────────────────────────────────────────────────────────
 
-// One mirror inside this adapter process. A base is immutable and shared; each
-// same-environment candidate opens a child whose content map is complete in
-// structure and delta in content, so every unchanged entry is a shared
-// reference and parsed-source memory is one base plus the deltas rather than
-// one base per agent. Per-mirror compiler state is not shared.
-message MirrorId { string value = 1; }
+// One checked-out tree this adapter holds. Rift creates the directory, fills
+// it, and deletes it after CloseWorkspace; the adapter reads it and keeps
+// whatever compiler state it derives from it.
+message WorkspaceId { string value = 1; }
 
-// Which adapter state a pinned call expects. A call carrying a snapshot the
-// mirror has moved past is refused rather than answered against the wrong
-// content. This exists only after a Sync commits, because the environment is
-// derived from synced content rather than known in advance.
-message MirrorState {
-  MirrorId mirror = 1;
-  // The state this mirror holds.
+// Which state a pinned call expects. A call carrying a snapshot the workspace
+// has moved past is refused rather than answered against the wrong content.
+message WorkspaceState {
+  WorkspaceId workspace = 1;
+  // The state the files on disk hold.
   rift.core.v1.Snapshot snapshot = 2;
   // Digest of the environment that content produced: compiler build, its
-  // configuration, and the resolved dependencies.
+  // configuration, and the resolved dependencies. Empty until the adapter has
+  // resolved one, because it is derived from the tree rather than known in
+  // advance.
   string environment = 3;
 }
 
-message OpenMirrorRequest {
-  oneof base {
-    // Start empty, pinned to this state. Rift then fills it with one full Sync,
-    // which is the only way a cold mirror can materialize.
-    rift.core.v1.Snapshot snapshot = 1;
-    // Start as a depth-one child sharing that mirror's committed content. Rift
-    // sends only what differs. A child may not itself be a base.
-    MirrorId mirror = 2;
-  }
+message OpenWorkspaceRequest {
+  WorkspaceId workspace = 1;
+  // Absolute path to a directory Rift has already filled. Source only: no
+  // `.git`, and nothing the adapter is expected to write.
+  string root = 2;
+  // Absolute path to a directory the adapter owns and Rift never reads. Build
+  // output belongs here — point CARGO_TARGET_DIR and friends at it. It outlives
+  // any one workspace, which is what lets a second compile be warm.
+  //
+  // Two workspaces of the same adapter get the same path today. Whether that
+  // holds when their compilers lock the directory against each other is not yet
+  // settled.
+  string state_root = 3;
+  // The state `root` holds.
+  rift.core.v1.Snapshot snapshot = 4;
 }
 
-// A freshly opened, still-empty mirror. It has no environment yet: one is
-// derived from the configuration and dependency material in the synced content,
-// so Sync is where the adapter first publishes it.
-message OpenMirrorResponse { MirrorId mirror = 1; }
-
-message ReleaseMirrorRequest { MirrorId mirror = 1; }
-
-// Re-root a child as a base of its own. Pinned to the state the caller expects,
-// because a child advances and re-rooting one that moved on would label the
-// wrong content. The mirror must be committed-idle: no Sync in flight.
-message PromoteMirrorRequest { MirrorState state = 1; }
-
-// ── sync ──────────────────────────────────────────────────────────────────────
-
-// One message of a Sync stream. The first carries `open`; the rest carry
-// content. Half-closing the stream commits; cancelling discards.
-message SyncChunk {
-  oneof chunk {
-    SyncOpen open = 1;
-    SyncUnit unit = 2;
-    SyncMap map = 3;
-    SyncRemove remove = 4;
-  }
+// Rift rewrote the tree in place. Paths are project-relative and cover every
+// file it touched, so the adapter reparses exactly this set. Content already
+// sits on disk by the time this call arrives.
+message RefreshRequest {
+  // The state the adapter last acknowledged. A mismatch means Rift and the
+  // adapter disagree about what is on disk, and comes back as StaleState.
+  WorkspaceState from = 1;
+  rift.core.v1.Snapshot to = 2;
+  repeated string written = 3;
+  repeated string removed = 4;
 }
 
-message SyncOpen {
-  MirrorId mirror = 1;
-  // Return the mirror to its base before applying anything.
-  bool reset = 2;
-}
-
-// One contiguous UTF-8 chunk of one file's text. Chunks for a file are
-// contiguous by offset and exactly one has `final`. A source file carries the
-// language whose adapter owns it; an auxiliary file is a project input mirrored
-// read-only — a manifest, a compiler config — that no adapter owns.
-message SyncUnit {
-  // rift://file/<path>
-  string unit = 1;
-  bool auxiliary = 2;
-  // Set for a source file; empty for an auxiliary one.
-  string language = 3;
-  uint64 offset = 4;
-  string text = 5;
-  bool final = 6;
-}
-
-// One file was generated from another, so a position in the generated code can
-// be traced back to the line that was actually written.
-message SyncMap {
-  string unit = 1;
-  repeated rift.core.v1.SourceMapEntry items = 2;
-}
-
-message SyncRemove { string unit = 1; }
-
-// The committed mirror state, and the environment the content produced.
-message SyncResult {
-  MirrorState state = 1;
-  uint64 source_units = 2;
-  uint64 auxiliary_units = 3;
-}
+message CloseWorkspaceRequest { WorkspaceId workspace = 1; }
 
 // ── analyze ───────────────────────────────────────────────────────────────────
 
-// The pinned mirror, plus the files that changed since the snapshot it holds.
-message AnalyzeRequest {
-  MirrorState state = 1;
-  repeated string changed_inputs = 2;
-}
+message AnalyzeRequest { WorkspaceState state = 1; }
 
 // One event of an analyze stream, followed eventually by exactly one summary.
 message AnalyzeEvent {
@@ -362,7 +355,8 @@ message SourceUnit {
 }
 
 // Manifest for a file this adapter produced from another. Its text and source
-// map follow in their own events before the summary.
+// map follow in their own events before the summary. Rift writes the bytes into
+// the consuming adapter's workspace, so that adapter sees an ordinary file.
 message VirtualUnit {
   string unit = 1;
   // The language that will consume these bytes, selected by a VirtualClaim.
@@ -407,7 +401,7 @@ message UnitCoverage {
 // the same facts, and the digest is over their canonical bytes so Rift can say
 // so rather than assume it.
 message AnalyzeSummary {
-  MirrorState state = 1;
+  WorkspaceState state = 1;
   string digest = 2;
   // Files whose previously published facts no longer hold.
   repeated string invalidated = 3;
@@ -416,7 +410,7 @@ message AnalyzeSummary {
 // ── match ─────────────────────────────────────────────────────────────────────
 
 message MatchRequest {
-  MirrorState state = 1;
+  WorkspaceState state = 1;
   rift.core.v1.StructuralQuery query = 2;
 }
 
@@ -442,7 +436,7 @@ message StructuralMatch {
 }
 
 message MatchSummary {
-  MirrorState state = 1;
+  WorkspaceState state = 1;
   string digest = 2;
   rift.core.v1.Coverage coverage = 3;
 }
@@ -450,14 +444,14 @@ message MatchSummary {
 // ── actions ───────────────────────────────────────────────────────────────────
 
 message ActionsRequest {
-  MirrorState state = 1;
+  WorkspaceState state = 1;
   rift.core.v1.Address target = 2;
   // Hierarchical kind prefixes. Empty requests every action.
   repeated string only = 3;
 }
 
 message ActionsResponse {
-  MirrorState state = 1;
+  WorkspaceState state = 1;
   repeated CodeAction actions = 2;
   rift.core.v1.Coverage coverage = 3;
 }
@@ -467,6 +461,29 @@ message ActionsResponse {
 message CodeAction {
   string token = 1;
   rift.core.v1.CodeActionDescriptor descriptor = 2;
+}
+
+message ResolveRequest {
+  // The state the token was discovered in. A token resolved against anything
+  // else comes back as StaleState, because the offsets it computed no longer
+  // point where they did.
+  WorkspaceState state = 1;
+  string token = 2;
+  // Arguments, as RFC 8785 canonical JSON, validated against the descriptor's
+  // arguments_schema before the call.
+  string arguments = 3;
+}
+
+// What the action changes. Rift applies these to the worktree; the adapter's
+// own tree is untouched and will next hear about the change through Refresh.
+message ResolveResponse {
+  WorkspaceState state = 1;
+  repeated rift.core.v1.Edit edits = 2;
+  // Whether the edits are the whole change. Partial means the compiler could
+  // only rewrite part of what the action names — a rename it cannot follow into
+  // a macro, say — and the diagnostics say where it stopped.
+  rift.core.v1.Coverage coverage = 3;
+  repeated rift.core.v1.Diagnostic diagnostics = 4;
 }
 
 // ── failure ───────────────────────────────────────────────────────────────────
@@ -503,5 +520,5 @@ message Blocker {
 }
 
 // Carried in `google.rpc.Status.details` when a pinned call names a state the
-// mirror has moved past, so the caller can resync rather than guess.
-message StaleState { MirrorState actual = 1; }
+// workspace has moved past, so the caller can resync rather than guess.
+message StaleState { WorkspaceState actual = 1; }
