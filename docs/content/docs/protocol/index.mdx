@@ -23,7 +23,7 @@ That is the constraint the rest of the design follows from. Several agents can b
 workspace at once, and they need a central point behind them. That central point is the rift server.
 
 <IsoDiagram
-  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB and the git worktrees, drives the language adapters over gRPC, and checks out a separate tree that those adapters read."
+  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB, creates and integrates a git worktree per agent, and drives the language adapters over gRPC. The adapters read those worktrees straight off the filesystem."
   chart={`
     flowchart LR
       agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp"]:::rift
@@ -31,10 +31,9 @@ workspace at once, and they need a central point behind them. That central point
       mcp1 -- "Streamable HTTP<br/>over Unix socket" --> server["rift server"]:::rift
       mcp2 -- "Streamable HTTP<br/>over Unix socket" --> server
       server --> semantic["semantic DB"]:::store
-      server --> worktrees["git worktrees"]:::git
+      server -- "creates, writes,<br/>integrates" --> trees["git worktrees<br/>one per agent"]:::git
       server -- "gRPC<br/>over Unix socket" --> adapters["adapters"]:::adapter
-      server -- "checkout" --> trees["adapter trees"]:::git
-      adapters -- "read" --> trees
+      adapters -- "read off disk" --> trees
   `}
 />
 
@@ -46,6 +45,62 @@ identifier when a `rift mcp` process connects, and remembers which workspace tha
 
 When the rift server starts, it scans the repository and builds the semantic level using the language
 adapters.
+
+## A task gets a worktree
+
+An agent does not edit your working tree. The server cuts it a `git worktree` from a recorded base
+commit, on a branch of its own, and that tree belongs to it alone until the work is done:
+
+```
+base commit B
+  ├── .rift/worktrees/a1   branch rift/a1   agent 1, and every compiler driven for it
+  └── .rift/worktrees/a2   branch rift/a2   agent 2, and every compiler driven for it
+```
+
+The lifecycle of one of those:
+
+1. Record the base commit
+2. Create the branch and the worktree
+3. Assign the worktree to one agent, exclusively
+4. Point the adapters at its path
+5. Let the tools read and write there
+6. Compute the resulting git diff and validate it
+7. Run tests and checks
+8. Commit the result
+9. Integrate it with a three-way merge or a cherry-pick
+10. Remove the worktree
+
+Step 9 is where the base commit earns being recorded rather than assumed. A revision is immutable, so
+there is nothing to merge *into* it — the work merges into the branch that was based on it, and that
+branch has probably moved on:
+
+```
+B ── X ── Y      target, three commits further along
+ \
+  └── A          rift/a1, still based on B
+```
+
+Rift integrates `A` onto `Y`. Three-way, with `B` as the base — never a fast-forward assumption that
+`B` is still the tip.
+
+Integration goes through git objects, not through copied files. Committing the agent's result and
+merging that commit keeps renames, deletions, file modes, ancestry and conflict information; copying
+changed files out of the worktree throws all five away and leaves you diffing text.
+
+A tree moves through **preparing**, **active**, **validating**, **ready to integrate**, **integrating**
+and **integrated**, and leaves that line at **conflicted** when step 9 cannot resolve or **failed**
+when step 6 or 7 rejects the work. Either way the exit is the same: **disposed**, which is `git
+worktree remove`. Rollback is deleting a directory.
+
+<Callout>
+  One writer per worktree. Several adapters read one tree at once, but source mutation in it is one
+  party's at a time, which is what makes "what changed" answerable by `git diff` alone.
+</Callout>
+
+This is what buys the whole design out of filesystem virtualization. No mirroring source over gRPC,
+no FUSE, no per-compiler VFS integration: compilers open real files, and concurrent agents are kept
+apart by being in different trees. A virtual filesystem only becomes worth its cost if worktree
+creation, disk usage or the number of live speculative trees turns out to be a measured bottleneck.
 
 ## Seams
 
@@ -60,17 +115,15 @@ own contract, and neither knows the other exists.
 | audience | an agent choosing what to do next | a compiler being driven |
 
 **MCP knows nothing about adapters.** It sees what Rift can do for a language, not how the adapter
-recognises its files or what it reads from them. Checked-out trees and refresh calls never reach it:
+recognises its files or what it reads from them. Workspace paths and refresh calls never reach it:
 they are how the server keeps a compiler warm, which is the server's problem.
 
 **The adapter knows nothing about agents.** It has no notion of a tool call, a cursor, or a resource
 URI. It is handed a working tree and told what state that tree holds.
 
-That directory is not your worktree and it is not a `git worktree` either. The server checks the code
-out with `git checkout-index`, so what the adapter gets has no `.git` in it and no way to reach your
-branches, your remotes or the credentials in your git config. It reads that tree and never writes to
-it: `rustfmt` and its equivalents hand their changes back as data, and the server is what touches a
-file. Two agents working in the same repository therefore cannot land in each other's edits.
+Because the compiler reads that tree off the disk itself, gRPC here carries control and results only —
+what to analyze, and what was found. Source bytes cross it in one direction and one case: a file an
+adapter *generated*, which has no on-disk original for anyone else to read.
 
 <Callout>
   The adapter seam is gRPC over a Unix domain socket, one adapter per language, all owned by the

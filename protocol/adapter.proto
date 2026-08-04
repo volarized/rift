@@ -6,16 +6,15 @@
 // arbitrates nothing. One adapter still holds several workspaces at once,
 // because many agents work against one repository.
 //
-// What the adapter is handed is a working tree: every file the snapshot names,
-// laid out as the repository lays them out, at the path this seam calls
-// `workspace`. Real compilers want a real filesystem — rust-analyzer, gopls and
-// tsc all end up calling open(2) — so streaming bytes across this seam would
-// only pay for a second diff on top of the one git already computed.
+// What the adapter is handed is a `git worktree` — one per agent, at the path
+// this seam calls `workspace` — and every adapter driven for that agent reads
+// the same one. Compilers want a real filesystem, since rust-analyzer, gopls
+// and tsc all end up calling open(2), and the work in that tree is committed
+// and merged back when the run ends. Both want a tree git itself made.
 //
-// It is the content of a `git worktree` without the `.git` that would make it
-// one. Rift checks the base commit out with `git checkout-index` and overwrites
-// the files the snapshot says are dirty, so there is no gitdir link for the
-// adapter to walk into your branches, your remotes or your credentials.
+// So this service carries control and results, not source. The compiler opens
+// the files itself. Bytes cross in one case only: a file the adapter generated,
+// which has no on-disk original for anything else to read.
 //
 // The adapter never writes source. Fixes and refactors come back as
 // rift.core.v1.Edit and Rift applies them, so a change can be rejected
@@ -58,9 +57,9 @@ service Adapter {
   // adapter to exactly what it claims here and never probes or feature-tests.
   rpc Describe(google.protobuf.Empty) returns (Capabilities);
 
-  // Here is a working tree and here is the state it holds. Rift has already
-  // written every file before this call, so the adapter can start its compiler
-  // against a tree that is complete the moment it is named.
+  // Here is a worktree and here is the state it holds. The tree exists before
+  // this call, so the adapter can start its compiler against something complete
+  // the moment it is named.
   rpc OpenWorkspace(OpenWorkspaceRequest) returns (WorkspaceState);
 
   // The files on disk moved to a new state, and these are the paths that
@@ -359,9 +358,9 @@ message WorkspaceState {
 // written every file, so nothing here has to be fetched or waited for.
 message OpenWorkspaceRequest {
   option (section) = "Workspaces";
-  // Absolute path to a working tree Rift has already filled, and the identity
-  // both sides use for it from now on. Source only: no `.git`, and nothing the
-  // adapter is expected to write.
+  // Absolute path to the worktree, and the identity both sides use for it from
+  // now on. Read-only as far as this adapter is concerned: what it needs to
+  // write goes to `state_root` or is declared as a WriteClaim.
   string workspace = 1;
   // Absolute path to a directory the adapter owns and Rift never reads. Build
   // output belongs here — point CARGO_TARGET_DIR and friends at it. It outlives

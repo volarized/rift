@@ -29,14 +29,14 @@ side knows the other exists:
 
 ## Who owns the filesystem
 
-Rift materializes a working tree per adapter with `git checkout-index` and passes the path, which is
-also the workspace's identity. No `.git` lands in it, so an adapter cannot reach your branches, your
-remotes or the credentials in your git config — which a linked `git worktree` would have left one
-gitdir link away.
+An agent gets a `git worktree` on a branch of its own, cut from a recorded base commit, and every
+adapter driven for that agent is pointed at it. Its path is the workspace's identity across the seam.
+It is git's own tree because the compilers need a real filesystem and because the work in it is
+committed and integrated with a three-way merge when the run ends.
 
 Rift writes source and the adapter does not. A fix or a refactor comes back from `Resolve` as
-`Edit`, and Rift applies it. That makes a change reviewable before it lands, and it keeps one
-agent's `rustfmt` run out of the tree another agent is reading.
+`Edit`, and Rift applies it to that worktree. One writer per worktree is what leaves `git diff` as
+the whole answer to what the agent changed, and it makes a change reviewable before it lands.
 
 Compilers write regardless — `Cargo.lock` at the workspace root, `node_modules` beside its package —
 so an adapter declares those paths as `WriteClaim`s in `Describe` and Rift stops reading them as source.

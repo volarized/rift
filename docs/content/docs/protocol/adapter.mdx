@@ -25,36 +25,33 @@ request id, no operation name, no sequence number and no cancel call: an RPC met
 operation, a stream is ordered, and a cancelled context or an expired deadline ends the work. Failures
 are `google.rpc.Status`, carrying `Refusal` or `StaleState` in `status.details`.
 
-## The adapter gets a working tree
+## The adapter gets a worktree
 
-Rift materializes the code and passes the path:
+rust-analyzer, gopls and tsc all end up calling `open(2)`. Feed one a byte stream and its first act
+is writing that stream back to disk, so Rift hands over a path into a real `git worktree` — the one
+belonging to the agent this work is for:
 
 ```
-~/projects/charming-aurora            your worktree, Rift's to write
-  .rift/worktrees/8f21c4              the Rust adapter's working tree
+~/projects/charming-aurora            the main working tree — yours
+  .rift/worktrees/a1                  agent 1's worktree, branch rift/a1
   .rift/state/rust                    what the Rust adapter writes
 ```
 
-`.rift/` is Rift's own directory, inside your project. Nothing under it is read as source and it is
-ignored, so the trees Rift materializes never come back as changes to the repository they were cut
-from.
+Every adapter driven for that agent is pointed at the same tree, so the Svelte adapter and the
+TypeScript adapter reading one `.svelte` file are reading one copy of it. The tree is git's own
+because the work in it gets committed and merged back when it is done — see
+[the lifecycle](/docs/protocol#a-task-gets-a-worktree).
 
-The tree at `.rift/worktrees/8f21c4` holds every file the snapshot names, laid out the way the
-repository lays them out. It is a working tree in everything a compiler cares about, and Rift builds
-it with `git checkout-index` for the commit the snapshot sits on, then overwrites the files the
-snapshot reports dirty.
+Two consequences for this seam. gRPC carries control and results, not source: `Analyze` says what
+was found in files the compiler opened itself. And `Snapshot` names the tree in git's own spelling,
+`worktrees/a1`, so an answer says which tree it was computed against and in what state.
 
-What it does not have is the `.git` that would make it a `git worktree`. A linked worktree leaves a
-`.git` file pointing back at your real object store, and an adapter that wanted to could walk from
-there into every branch you have, your remotes, and whatever credentials your git config holds. There
-is no gitdir link here, so there is nothing to walk to.
+The exception is a file the adapter *generated*. Nothing else can open that, so its bytes do cross —
+`VirtualUnit` and `VirtualText`, in chunks, and Rift writes them into the consuming adapter's tree.
 
-rust-analyzer, gopls and tsc all want a filesystem. An adapter fed a byte stream would spend its first
-act writing that stream back to disk, and Rift would have spent its own computing a delta `git diff`
-already had. So Rift hands over a tree.
-
-The path is the workspace's identity. One tree, one workspace, and Rift never reuses a path once
-`CloseWorkspace` has taken it, so there is no minted handle to map back to a directory.
+The path of that tree is the workspace's identity across this seam. One tree, one workspace, and Rift
+never reuses a path once `CloseWorkspace` has taken it, so there is no minted handle to map back to a
+directory.
 
 <Callout>
   `state_root` is the adapter's, and Rift never reads it. Point `CARGO_TARGET_DIR`, `GOCACHE` and
@@ -66,30 +63,32 @@ The path is the workspace's identity. One tree, one workspace, and Rift never re
 
 **Rift writes source. The adapter never does.** When you ask for a fix or a refactor, the compiler
 computes the change and returns it — `Resolve` hands back a list of `Edit`, which is a byte
-range and what replaces it. Rift applies those to your worktree and tells the adapter about it on the
-next `Refresh`.
+range and what replaces it. Rift applies those to the agent's worktree and tells the adapter about it
+on the next `Refresh`.
 
-This is the model LSP settled on, and the reason holds here too. A change you can see before it lands
-is a change you can reject. And with several agents against one repository, an edit that arrived as a
-return value affects the caller who asked for it, where an edit written to a shared tree affects
-whoever reads next.
+Several adapters read that one tree, so an adapter writing into it would be writing under the others.
+Keeping mutation on Rift's side is what makes one writer per worktree true, and one writer is what
+lets `git diff` be the whole answer to what the agent changed — which is the thing validated and
+committed at the end of the run.
 
-Every formatter can already do this — `cargo fmt --emit=stdout`, `gofmt` without `-w`, `black --diff`,
+A change that arrives as a value is also a change you can reject before it lands. Every formatter can
+already work this way — `cargo fmt --emit=stdout`, `gofmt` without `-w`, `black --diff`,
 `ruff format --diff`. Writing in place is the default of the command-line tool, not a limit of the
 thing behind it.
 
 **Compilers write anyway, and that is fine.** `cargo` puts `Cargo.lock` at the workspace root, npm
 insists on `node_modules` beside the package it belongs to, and neither is redirectable. So the
 adapter declares those paths in `Describe` as `WriteClaim`s, and Rift stops treating anything under them
-as source: never analyzed, never diffed against the snapshot, never shown to an agent.
+as source: never analyzed, never diffed against the snapshot, never shown to an agent. That tree is
+the one that merges back, so a compiler's scratch output must not read as the agent's work.
 
 Declare only what will not move. Most build output redirects with an environment variable, and
 redirecting it is better than claiming it, because a claim is a hole in what Rift can see.
 
 ## What crosses this seam
 
-**A workspace is a cache.** Losing an adapter costs time: Rift checks a fresh tree out and opens it
-again.
+**A workspace is a cache; the worktree is not.** Losing an adapter costs a reopen and a cold compile.
+The tree survives it — that is the agent's work, not the adapter's.
 
 **The model is not defined here.** `Symbol`, `Leaf`, `File`, `Snapshot`, `Edit` and everything
 else about code is generated from `core.json` into `core.proto`, so the messages below are only what
