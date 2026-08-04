@@ -35,7 +35,7 @@ workspace at once, and they need a central point behind them. That central point
       mcp2 -- "Streamable HTTP<br/>over Unix socket" --> server
       server --> semantic["semantic DB"]:::store
       server --> worktrees["git worktrees"]:::git
-      server --> adapters["adapters"]:::adapter
+      server -- "gRPC<br/>over Unix socket" --> adapters["adapters"]:::adapter
   `}
 />
 
@@ -48,16 +48,52 @@ identifier when a `rift mcp` process connects, and remembers which workspace tha
 When the rift server starts, it scans the repository and builds the semantic level using the language
 adapters.
 
-## Definitions
+## Two seams, two contracts
 
-We've split the protocol definition into separate, logically aligned blocks:
+The server sits between an agent and a compiler, and they want different things. So the two sides are
+different contracts, and neither knows the other exists.
 
-- [Core model](/docs/protocol/core) — logical entities used by both MCP and adapters
-- [MCP](/docs/protocol/mcp) — tools and resources provided by Rift
-- [Adapter](/docs/protocol/adapter) — protocol between the Rift server and a compiler API
-- [Reference](/docs/protocol/reference) — every type, grouped by axis
+| | agent ↔ server | server ↔ adapter |
+| --- | --- | --- |
+| protocol | MCP, JSON-RPC | gRPC |
+| transport | stdio, then Streamable HTTP over a Unix socket | Unix socket |
+| described by | JSON Schema | Protobuf |
+| audience | an agent choosing what to do next | a compiler being driven |
+
+**MCP knows nothing about adapters.** It sees what Rift can do for a language, not how the adapter
+recognises its files or what it fingerprints. Mirrors, sync streams and environment digests never
+reach it — they are how the server keeps a compiler warm, which is the server's problem.
+
+**The adapter knows nothing about agents.** It has no notion of a tool call, a cursor, or a resource
+URI. It is told which mirror to make and which state that mirror holds.
 
 <Callout>
-  The adapter protocol is generalised so any language can be implemented. Rift itself is written in
-  Rust, so for languages with no native Rust API, IPC is required.
+  The adapter seam is gRPC over a Unix domain socket, one adapter per language, all owned by the
+  server that started them. Rift itself is written in Rust; for languages with no native Rust API,
+  the adapter is a subprocess speaking this service.
 </Callout>
+
+### One model, two spellings
+
+Both seams carry the same things — a symbol, a leaf, a file, a snapshot. Writing that model twice
+would guarantee it drifts, so it is written once:
+
+```
+core.json  ──generated──▶  core.proto
+    │                          │
+    ▼                          ▼
+ mcp.json                 adapter.proto
+ (JSON Schema)            (gRPC service)
+```
+
+`core.json` is the model. `core.proto` is generated from it, so a protobuf message and a JSON Schema
+definition of the same name describe the same thing by construction — there is no second place to
+edit. Each seam then adds only what is its own: `mcp.json` adds tools, resources and cursors;
+`adapter.proto` adds mirrors, sync and the service itself.
+
+## Definitions
+
+- [Core model](/docs/protocol/core) — the three axes, and what each addresses
+- [MCP](/docs/protocol/mcp) — tools and resources provided to an agent
+- [Adapter](/docs/protocol/adapter) — the gRPC service the server drives a compiler with
+- [Reference](/docs/protocol/reference) — every type in the model, grouped by axis

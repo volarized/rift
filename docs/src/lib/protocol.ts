@@ -4,10 +4,9 @@
  * contents, the search index — lives in `protocol-surface.ts`, which builds on
  * this. There is no generated file anywhere: the schemas are the only source.
  *
- * The contract is split across three documents that reference each other by
- * `$id`-relative `$ref` — `adapter.json` and `mcp.json` both point at
- * `core.json`, and nothing points back. Definition names are unique across all
- * three, which is what lets a cross-document reference resolve to one anchor;
+ * `mcp.json` points at `core.json` by `$id`-relative `$ref`, and nothing points
+ * back. Definition names are unique across both, which is what lets a
+ * cross-document reference resolve to one anchor;
  * `refName` accepts both the local and the cross-file form and is the only
  * place that knows a `$ref` can name a file at all.
  *
@@ -18,8 +17,7 @@
  * descends into it and starts reading example payloads as if they were schemas.
  *
  * The files are read with `fs` rather than imported. `resolveJsonModule` would
- * infer a literal type for all 421 definitions and make every typecheck pay
- * for it.
+ * infer a literal type for every definition and make each typecheck pay for it.
  */
 
 import { readFileSync } from "node:fs";
@@ -34,10 +32,10 @@ export type Schema = Exclude<JSONSchema, boolean>;
 export const PROTOCOL_PAGE_URL = "/docs/protocol";
 
 /**
- * Read order is dependency order: core first, then the two documents that
- * depend on it. The page presents them the same way.
+ * The JSON Schema half of the contract: the model, and the MCP surface written
+ * against it. The adapter seam is protobuf and is loaded by `proto.ts`.
  */
-export const PROTOCOL_FILES = ["core", "mcp", "adapter"] as const;
+export const PROTOCOL_FILES = ["core", "mcp"] as const;
 export type ProtocolFile = (typeof PROTOCOL_FILES)[number];
 
 interface EntryPointSeam {

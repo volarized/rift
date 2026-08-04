@@ -1,13 +1,12 @@
 /**
- * The protocol's *surface*, derived from the schemas: what you can call, what
- * you send, and what comes back.
+ * The MCP surface, derived from the schemas: what an agent can call, what it
+ * sends, and what comes back.
  *
  * `protocol.ts` loads the documents and knows about JSON Schema. This knows
- * about Rift: that `mcp.tools` has five members each with a params and a result
- * type, that every adapter request frame carries the `op` it belongs to as a
- * const, and that streaming operations answer with a chunk frame and an end
- * frame. Pairing operations by their `op` const rather than by name means the
- * catalogue cannot drift from the wire.
+ * about Rift: that `mcp.tools` and `mcp.resources` declare their members with a
+ * params and a result type, and that a resource's URI template is a const
+ * inside `ResourceTemplate`. The adapter seam is protobuf and is catalogued by
+ * `proto.ts` from its service definition.
  *
  * Each page also gets its own table of contents and search index here, because
  * fumadocs builds both from the MDX abstract syntax tree and these pages have
@@ -16,6 +15,7 @@
 
 import type { StructuredData } from "fumadocs-core/mdx-plugins";
 import type { TableOfContents } from "fumadocs-core/server";
+import { adapterOwned, protoMessages, protoServices } from "@/lib/proto";
 import {
   axisGroups,
   defNames,
@@ -110,72 +110,6 @@ export const mcpResources: ResourceEntry[] = seam("mcp", "mcp.resources").map(([
   if (!uri || !link) throw new Error(`resource \`${name}\` is missing a uri or link type`);
   return { name, description: member.description, uriTemplate: uriTemplateFor(name), uri, link };
 });
-
-// ---------------------------------------------------------------------------
-// Adapter surface
-// ---------------------------------------------------------------------------
-
-/** The value of a const-valued property, if the schema pins one. */
-function constOf(schema: Schema, property: string): string | undefined {
-  const value = Object.fromEntries(props(schema))[property]?.const;
-  return typeof value === "string" ? value : undefined;
-}
-
-export interface AdapterFrame {
-  /** The definition name, which is also its anchor. */
-  name: string;
-  /** The fully qualified `type` tag the frame carries on the wire. */
-  tag: string;
-}
-
-export interface AdapterOperation {
-  op: string;
-  description?: string;
-  request: AdapterFrame;
-  responses: AdapterFrame[];
-}
-
-export const adapterOperations: AdapterOperation[] = (() => {
-  const requests = new Map<string, { frame: AdapterFrame; description?: string }>();
-  const responses = new Map<string, AdapterFrame[]>();
-
-  for (const name of defNamesByFile.adapter) {
-    const schema = defs[name];
-    const op = constOf(schema, "op");
-    const tag = constOf(schema, "type");
-    if (!op || !tag) continue;
-
-    if (tag.startsWith("request.")) {
-      requests.set(op, { frame: { name, tag }, description: schema.description });
-    } else if (tag.startsWith("response.")) {
-      responses.set(op, [...(responses.get(op) ?? []), { name, tag }]);
-    }
-  }
-
-  // `AdapterOp` and the request frames are two lists of the same thing, and
-  // they drifted: five operations outlived the frames that sent them. Whichever
-  // side is edited, the other has to follow.
-  const declared = new Set(defs.AdapterOp?.enum ?? []);
-  for (const op of requests.keys()) {
-    if (!declared.has(op)) throw new Error(`\`${op}\` has a request frame but is not in AdapterOp`);
-  }
-  for (const op of declared) {
-    if (!requests.has(op)) throw new Error(`AdapterOp names \`${op}\`, which has no request frame`);
-  }
-
-  return [...requests.entries()]
-    .map(([op, { frame, description }]) => ({
-      op,
-      description,
-      request: frame,
-      // chunk before end, so a streaming operation reads in wire order
-      responses: (responses.get(op) ?? []).sort((a, b) => a.tag.localeCompare(b.tag)),
-    }))
-    .sort((a, b) => a.op.localeCompare(b.op));
-})();
-
-/** `hello` is a frame rather than an operation: no request, no `op`, sent once. */
-export const ADAPTER_HELLO = "AdapterHello";
 
 // ---------------------------------------------------------------------------
 // The reference, grouped by axis and nested by reference
@@ -355,35 +289,53 @@ function mcpPage(): PageData {
   };
 }
 
+/**
+ * The adapter page is protobuf, so its outline comes from the service and the
+ * messages the adapter file declares — not from `defs`, which holds only the
+ * JSON Schema half.
+ */
 function adapterPage(): PageData {
+  const service = protoServices[0];
+  const owned = protoMessages
+    .filter((message) => adapterOwned.has(message.name))
+    .map((message) => message.name);
+
   return {
     toc: [
-      { title: "Handshake", url: "#handshake", depth: 2 },
-      { title: "Operations", url: "#operations", depth: 2 },
-      ...adapterOperations.map((operation) => ({
-        title: operation.op,
-        url: `#op-${operation.op}`,
+      { title: "Transport", url: "#transport", depth: 2 },
+      { title: "Service", url: "#service", depth: 2 },
+      ...(service?.rpcs ?? []).map((rpc) => ({
+        title: rpc.name,
+        url: `#rpc-${rpc.name}`,
         depth: 3,
       })),
+      { title: "Messages", url: "#messages", depth: 2 },
+      ...owned.map((name) => ({ title: name, url: `#msg-${name}`, depth: 3 })),
     ],
     structuredData: {
       headings: [
-        { id: "handshake", content: "Handshake" },
-        { id: "operations", content: "Operations" },
-        ...adapterOperations.map((operation) => ({
-          id: `op-${operation.op}`,
-          content: operation.op,
-        })),
+        { id: "transport", content: "Transport" },
+        { id: "service", content: "Service" },
+        ...(service?.rpcs ?? []).map((rpc) => ({ id: `rpc-${rpc.name}`, content: rpc.name })),
+        { id: "messages", content: "Messages" },
+        ...owned.map((name) => ({ id: `msg-${name}`, content: name })),
       ],
       contents: [
-        ...prose(ADAPTER_HELLO),
-        ...adapterOperations.flatMap((operation) => [
-          ...(operation.description
-            ? [{ heading: `op-${operation.op}`, content: operation.description }]
-            : []),
-          ...prose(operation.request.name),
-          ...operation.responses.flatMap((response) => prose(response.name)),
-        ]),
+        ...(service?.rpcs ?? []).flatMap((rpc) =>
+          rpc.comment ? [{ heading: `rpc-${rpc.name}`, content: rpc.comment }] : [],
+        ),
+        ...protoMessages
+          .filter((message) => adapterOwned.has(message.name))
+          .flatMap((message) => [
+            ...(message.comment
+              ? [{ heading: `msg-${message.name}`, content: message.comment }]
+              : []),
+            ...message.fields.flatMap((field) =>
+              field.comment
+                ? [{ heading: `msg-${message.name}`, content: `${field.name}: ${field.comment}` }]
+                : [],
+            ),
+          ]),
       ],
     },
   };
@@ -432,7 +384,7 @@ function referencePage(): PageData {
 /** Page data by URL, for the docs page and the search route to look up. */
 export const pageData: Record<string, PageData> = {
   [pageUrl("mcp")]: mcpPage(),
-  [pageUrl("adapter")]: adapterPage(),
+  [`${PROTOCOL_ROOT}/adapter`]: adapterPage(),
   // No entry for `core`: it is prose and nothing else, so remark already sees
   // every heading it has. Its types are anchored on the reference page.
   [`${PROTOCOL_ROOT}/reference`]: referencePage(),

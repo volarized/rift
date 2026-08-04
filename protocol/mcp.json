@@ -99,25 +99,22 @@
       "maxLength": 4096
     },
     "SemanticEnvironment": {
-      "description": "Rift-composed identity of every adapter environment that can change semantic facts. adapters sort by owner, which is total because an owner is unique per adapter; fingerprint is the SHA-256 digest of the sorted adapters in RFC 8785 canonical JSON form. This is the one uniqueItems array not sorted by canonical bytes, because sorting by owner is what makes the fingerprint stable under a field addition.",
+      "description": "What gave a snapshot its meaning. The same bytes produce different facts under a different compiler or different installed dependencies, so an answer reports this beside the snapshot and a caller compares the fingerprint rather than guessing.",
       "type": "object",
       "required": [
         "fingerprint",
-        "ownership",
-        "adapters"
+        "languages"
       ],
       "properties": {
         "fingerprint": {
+          "description": "SHA-256 over `languages` sorted by `language`, in RFC 8785 canonical JSON. One value to compare when two calls have to agree.",
           "$ref": "core.json#/$defs/Sha256Digest"
         },
-        "ownership": {
-          "$ref": "core.json#/$defs/Sha256Digest"
-        },
-        "adapters": {
+        "languages": {
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "$ref": "core.json#/$defs/AdapterEnvironment"
+            "$ref": "#/$defs/LanguageEnvironment"
           }
         }
       },
@@ -624,7 +621,6 @@
         "contract",
         "limits",
         "languages",
-        "adapters",
         "coverage",
         "tools",
         "resources",
@@ -653,16 +649,11 @@
           "$ref": "#/$defs/DriverLimits"
         },
         "languages": {
+          "description": "The languages Rift understands here, and what it can do with each.",
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "$ref": "core.json#/$defs/LanguageId"
-          }
-        },
-        "adapters": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/LanguageSubstrate"
+            "$ref": "#/$defs/LanguageSupport"
           }
         },
         "coverage": {
@@ -1866,6 +1857,65 @@
               "type": "null"
             }
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "LanguageSupport": {
+      "description": "What Rift can do for one language in this workspace. An agent picks a query or an operation from this; how the adapter recognises its files, what it fingerprints, and what it advertises to the server are the server's business.",
+      "type": "object",
+      "required": [
+        "language",
+        "compiler",
+        "structural_matching",
+        "actions"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
+        },
+        "compiler": {
+          "description": "The compiler answering for this language, as it names itself.",
+          "type": "string",
+          "maxLength": 4096,
+          "examples": [
+            "tsc 5.6.2"
+          ]
+        },
+        "structural_matching": {
+          "description": "Whether the match tool accepts a structural query for this language. False where the adapter cannot parse the pattern grammar.",
+          "type": "boolean"
+        },
+        "actions": {
+          "description": "Whether compiler actions can be discovered, and where not, why.",
+          "$ref": "core.json#/$defs/Coverage"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LanguageEnvironment": {
+      "description": "The compiler context one language resolved to. Two answers at the same revision differ if this differs, which is what the fingerprint over all of them detects.",
+      "type": "object",
+      "required": [
+        "language",
+        "compiler",
+        "fingerprint"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
+        },
+        "compiler": {
+          "description": "The compiler and version that answered.",
+          "type": "string",
+          "maxLength": 4096,
+          "examples": [
+            "tsc 5.6.2"
+          ]
+        },
+        "fingerprint": {
+          "description": "Digest of everything that gave this language meaning here: compiler build, its configuration, and the resolved dependencies.",
+          "$ref": "core.json#/$defs/Sha256Digest"
         }
       },
       "additionalProperties": false

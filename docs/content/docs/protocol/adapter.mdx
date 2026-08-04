@@ -1,23 +1,43 @@
 ---
-title: Adapter wire
+title: Adapter
 ---
 
 import { AdapterReference } from "@/components/protocol/adapter";
 
-An adapter is how a language gets into Rift. It is a process that wraps that language's real compiler and
-answers questions about it, one JSON object per line, over stdin and stdout.
+An adapter is how a language gets into Rift: a process wrapping that language's real compiler, and
+answering questions about it. The Rift server drives it over **gRPC on a Unix domain socket**, and the
+contract is `protocol/adapter.proto`.
 
-Three things shape everything on this page.
+## Transport
+
+One Rift server starts its adapters, one per language, and owns them. Nothing else connects to them.
+That decides more of this page than anything else: a mirror has exactly one party opening, filling and
+releasing it, so the adapter arbitrates nothing. It is told which mirror to make and which state that
+mirror holds.
+
+One adapter still serves many mirrors at once, because many agents work against one workspace. So
+in-flight work is bounded per mirror rather than per process, and the adapter interleaves streams
+rather than draining one before starting the next — one agent's large analysis must not stall everyone
+else on the connection.
+
+Because the transport is gRPC, this contract carries no framing of its own. There is no envelope, no
+request id, no operation name, no sequence number and no cancel call: an RPC method *is* the
+operation, a stream is ordered, and a cancelled context or an expired deadline ends the work. Failures
+are `google.rpc.Status`, carrying `Refusal` or `StaleState` in `status.details`.
+
+## What crosses this seam
+
+Three things shape everything below.
 
 **The adapter never touches Git.** It cannot read your repository, and it is not trusted to. Rift reads
-the files and pushes them into the adapter's own copy — its *mirror* — which is why the mirror lifecycle
-comes before any question you might want to ask.
+the files and pushes them into the adapter's own copy — its *mirror* — which is why the mirror
+lifecycle comes before any question you might want to ask.
 
-**A mirror is a cache, never the source of truth.** Losing an adapter costs you time and nothing else.
-Rift rebuilds the mirror from Git objects and replays the sync.
+**A mirror is a cache, never the source of truth.** Losing an adapter costs time and nothing else: Rift
+reopens the mirror and replays the sync.
 
-**One process serves many callers.** That is what makes a second agent cheap instead of a second full
-compile, and it is also why an adapter must interleave its stream frames rather than draining one
-response before starting the next. One agent's large analysis must not stall everyone else on the pipe.
+**The model is not defined here.** `Symbol`, `Leaf`, `File`, `Snapshot` and everything else about code
+is generated from `core.json` into `core.proto`, so the messages below are only what the seam itself
+adds. The model is documented once, in the [reference](/docs/protocol/reference).
 
 <AdapterReference />

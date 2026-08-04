@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://volar.sh/rift/protocol/core.json",
   "title": "Rift core semantic model",
-  "description": "Vocabulary shared by every Rift seam: Symbols, Leaves, Types, Relationships, identity, source addressing, coverage, and diagnostics. The MCP surface and the adapter IPC are both defined in terms of these, so they belong to neither.",
+  "description": "The model every Rift seam is defined in terms of: versioning, files and their syntax trees, and symbols. The MCP surface is written against it directly; the adapter seam gets the same messages generated into core.proto, so neither side owns the model and neither can drift from it.",
   "rift:axes": {
-    "description": "How every definition in the protocol is filed. Each group names the definitions that identify it, and everything those reach belongs to the same group. Groups resolve in the order listed, so a definition two of them reach belongs to the earlier one. Identifying definitions are placed before any of that runs, because a group that walked past one on its way somewhere else would otherwise claim it: Leaf reaches SymbolId, and the identity of a symbol is not physical. A group with `holds` pins those definitions to itself outright. A group with `residualOf` takes whatever no group claimed and is defined in that document.",
+    "description": "How every definition in the protocol is filed. Each group names the definitions that identify it, and everything those reach belongs to the same group. Groups resolve in the order listed, so a definition two of them reach belongs to the earlier one. Identifying definitions are placed before any of that runs, because a group that walked past one on its way somewhere else would otherwise claim it: Leaf reaches SymbolId, and the identity of a symbol is not physical. A group with `holds` pins those definitions to itself outright. A group with `residualOf` takes whatever no group claimed and is defined in that document. Only the two JSON Schema documents are grouped here; the adapter seam is protobuf and is catalogued by its service.",
     "groups": [
       {
         "name": "Versioning",
@@ -55,8 +55,7 @@
         "holds": [
           "Extensions",
           "ExtensionKey",
-          "ExtensionValue",
-          "ExtensionValueDescriptor"
+          "ExtensionValue"
         ],
         "residualOf": "core"
       },
@@ -64,11 +63,6 @@
         "name": "MCP",
         "summary": "Shapes that exist only on the agent-facing surface: parameters, results, resource payloads.",
         "residualOf": "mcp"
-      },
-      {
-        "name": "Adapter",
-        "summary": "Shapes that exist only on the adapter wire: frames, mirror lifecycle, streamed analysis.",
-        "residualOf": "adapter"
       }
     ]
   },
@@ -324,64 +318,6 @@
         "rust",
         "python"
       ]
-    },
-    "AdapterEnvironment": {
-      "description": "Machine-independent identity of the non-source inputs owned by one adapter. No absolute path may contribute.",
-      "type": "object",
-      "required": [
-        "language",
-        "fingerprint",
-        "implementation",
-        "compiler",
-        "compiler_configuration",
-        "dependencies"
-      ],
-      "properties": {
-        "fingerprint": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "implementation": {
-          "type": "string",
-          "maxLength": 4096
-        },
-        "compiler": {
-          "type": "string",
-          "maxLength": 4096
-        },
-        "compiler_configuration": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "dependencies": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "language": {
-          "$ref": "#/$defs/LanguageId"
-        }
-      },
-      "additionalProperties": false
-    },
-    "MirrorState": {
-      "description": "Which adapter state a state-pinned request expects: the mirror, the snapshot it holds, and the fingerprint of the environment that content produced. A request carrying a snapshot the mirror has moved past is refused rather than answered against the wrong content. A MirrorState exists only after sync.commit, because the environment is derived from synced content rather than known in advance.",
-      "type": "object",
-      "required": [
-        "mirror",
-        "snapshot",
-        "environment"
-      ],
-      "properties": {
-        "mirror": {
-          "$ref": "#/$defs/MirrorId"
-        },
-        "snapshot": {
-          "description": "The state this mirror currently holds.",
-          "$ref": "#/$defs/Snapshot"
-        },
-        "environment": {
-          "description": "Fingerprint of the AdapterEnvironment that content produced.",
-          "$ref": "#/$defs/Sha256Digest"
-        }
-      },
-      "additionalProperties": false
     },
     "ExtensionValue": {
       "description": "Versioned extension value. data is validated against the schema advertised for its key and version.",
@@ -983,377 +919,6 @@
         "generates",
         "depends_on"
       ]
-    },
-    "KindDescriptor": {
-      "description": "One kind an adapter advertises, and the portable facets that kind carries. `entity` says what the kind describes, and that decides which facet vocabulary applies.",
-      "oneOf": [
-        {
-          "type": "object",
-          "required": [
-            "entity",
-            "kind",
-            "facets"
-          ],
-          "properties": {
-            "entity": {
-              "const": "symbol"
-            },
-            "kind": {
-              "$ref": "#/$defs/ExactKind"
-            },
-            "facets": {
-              "type": "array",
-              "uniqueItems": true,
-              "items": {
-                "$ref": "#/$defs/SymbolFacet"
-              }
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "entity",
-            "kind",
-            "facets"
-          ],
-          "properties": {
-            "entity": {
-              "const": "leaf"
-            },
-            "kind": {
-              "$ref": "#/$defs/ExactKind"
-            },
-            "facets": {
-              "type": "array",
-              "uniqueItems": true,
-              "items": {
-                "$ref": "#/$defs/LeafFacet"
-              }
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "entity",
-            "kind",
-            "facets"
-          ],
-          "properties": {
-            "entity": {
-              "const": "relationship"
-            },
-            "kind": {
-              "$ref": "#/$defs/ExactKind"
-            },
-            "facets": {
-              "type": "array",
-              "uniqueItems": true,
-              "items": {
-                "$ref": "#/$defs/RelationshipFacet"
-              }
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
-    },
-    "JsonSchemaDocument": {
-      "description": "A self-contained JSON Schema draft 2020-12 document. Remote references are forbidden.",
-      "type": "object"
-    },
-    "ExtensionValueDescriptor": {
-      "description": "Advertises one versioned extension value and every protocol location where it may appear. Rift validates each occurrence against schema.",
-      "type": "object",
-      "required": [
-        "key",
-        "version",
-        "targets",
-        "schema",
-        "indexed",
-        "semantic"
-      ],
-      "properties": {
-        "key": {
-          "$ref": "#/$defs/ExtensionKey"
-        },
-        "version": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "targets": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "enum": [
-              "source_unit",
-              "symbol",
-              "leaf",
-              "relationship",
-              "type",
-              "diagnostic",
-              "code_action",
-              "structural.query",
-              "structural.match",
-              "formatting",
-              "completion",
-              "context.request",
-              "context.response",
-              "frontier.request",
-              "frontier.response",
-              "check.request",
-              "check.response"
-            ]
-          }
-        },
-        "schema": {
-          "$ref": "#/$defs/JsonSchemaDocument"
-        },
-        "indexed": {
-          "type": "boolean"
-        },
-        "semantic": {
-          "description": "Whether this value contributes to semantic cache identity and deterministic comparison.",
-          "type": "boolean"
-        }
-      },
-      "additionalProperties": false
-    },
-    "SourceClaim": {
-      "description": "A deterministic physical-file ownership claim, reevaluated after every path or content change. Selectors are ORed and compare UTF-8 bytes: suffixes against the full path, names against the final component, and shebang prefixes against the first line. Highest priority wins; equal-priority matches from different owners are an error. Container claims may expose embedded languages and virtual units.",
-      "type": "object",
-      "required": [
-        "language",
-        "priority",
-        "container"
-      ],
-      "properties": {
-        "language": {
-          "$ref": "#/$defs/LanguageId"
-        },
-        "priority": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295
-        },
-        "path_suffixes": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "path_names": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "shebang_prefixes": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "minLength": 2,
-            "pattern": "^#!"
-          }
-        },
-        "container": {
-          "type": "boolean"
-        }
-      },
-      "anyOf": [
-        {
-          "required": [
-            "path_suffixes"
-          ]
-        },
-        {
-          "required": [
-            "path_names"
-          ]
-        },
-        {
-          "required": [
-            "shebang_prefixes"
-          ]
-        }
-      ],
-      "additionalProperties": false
-    },
-    "AuxiliaryClaim": {
-      "description": "A non-owning claim for project files needed to discover or configure compiler semantics. Selectors are ORed, use the same bytewise rules as SourceClaim, may overlap across adapters, and never make a file a SourceUnit.",
-      "type": "object",
-      "required": [
-        "purposes",
-        "environment_defining"
-      ],
-      "properties": {
-        "purposes": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "enum": [
-              "compiler_configuration",
-              "dependency_manifest",
-              "dependency_lock",
-              "workspace_manifest",
-              "generated_metadata",
-              "other"
-            ]
-          }
-        },
-        "path_suffixes": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "path_names": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "environment_defining": {
-          "description": "Whether editing a file matched by this claim changes this adapter's AdapterEnvironment. Declared by the adapter, never inferred from purpose: only the adapter knows whether its own compiler rereads a given file. True forces a fresh base rather than a child mirror.",
-          "type": "boolean"
-        }
-      },
-      "anyOf": [
-        {
-          "required": [
-            "path_suffixes"
-          ]
-        },
-        {
-          "required": [
-            "path_names"
-          ]
-        }
-      ],
-      "additionalProperties": false
-    },
-    "VirtualClaim": {
-      "description": "A deterministic claim to consume semantic facts for virtual sources of one language. Highest priority wins; equal-priority matches from different owners are an error. The producer retains authority for virtual bytes, regions, and source maps.",
-      "type": "object",
-      "required": [
-        "language",
-        "priority"
-      ],
-      "properties": {
-        "language": {
-          "$ref": "#/$defs/LanguageId"
-        },
-        "priority": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295
-        }
-      },
-      "additionalProperties": false
-    },
-    "LanguageSubstrate": {
-      "description": "A replaceable compiler-backed language adapter. Core operations are mandatory; generator operations and exact vocabularies are advertised.",
-      "type": "object",
-      "required": [
-        "language",
-        "implementation",
-        "compiler",
-        "claims",
-        "auxiliary_claims",
-        "virtual_claims",
-        "kinds",
-        "structural_matching",
-        "action_discovery",
-        "extension_values",
-        "features",
-        "extensions"
-      ],
-      "properties": {
-        "implementation": {
-          "type": "string",
-          "maxLength": 4096
-        },
-        "compiler": {
-          "type": "string",
-          "maxLength": 4096
-        },
-        "claims": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/SourceClaim"
-          }
-        },
-        "auxiliary_claims": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/AuxiliaryClaim"
-          }
-        },
-        "virtual_claims": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/VirtualClaim"
-          }
-        },
-        "kinds": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/KindDescriptor"
-          }
-        },
-        "structural_matching": {
-          "$ref": "#/$defs/StructuralMatchingSupport"
-        },
-        "action_discovery": {
-          "description": "Authoritative coverage for the actions IPC request. Unsupported is explicit; absence is never interpreted as no actions.",
-          "$ref": "#/$defs/Coverage"
-        },
-        "extension_values": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/ExtensionValueDescriptor"
-          }
-        },
-        "features": {
-          "description": "Open optional feature names; core operations never appear here.",
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "type": "string"
-          }
-        },
-        "extensions": {
-          "$ref": "#/$defs/Extensions"
-        },
-        "language": {
-          "$ref": "#/$defs/LanguageId"
-        }
-      },
-      "additionalProperties": false
     },
     "SymbolOrigin": {
       "description": "Where this symbol is defined. Six origins, and they answer different questions: whether you can edit it, whether it moves when you upgrade something, and whether anything can be read from it at all.",
@@ -2007,61 +1572,6 @@
         }
       ]
     },
-    "StructuralMatchingSupport": {
-      "description": "Exhaustive declaration for Rift pattern v1 over the adapter's claimed languages. An adapter declares only whether it can PARSE and match the pattern grammar. It declares nothing about transforms: every StructuralTransform reads from capture: or transform: sources, so all of them operate on text that has already been extracted — by this adapter for a structural query, by Rift itself for a text query. Rift applies them once captures are known and, on a rewrite, before handing the rendered replacement back for parsing. An adapter therefore ships no regex engine: rust-regex is the only dialect for a caller-supplied regex; structural patterns and git-glob path selectors are separate grammars, declared separately. JSON Schema pattern keywords are ECMA-262 and are validated by each ecosystem's own validator; those are authored in this schema rather than supplied by a caller, so they are neither a divergence risk nor an attack surface.",
-      "oneOf": [
-        {
-          "type": "object",
-          "required": [
-            "support",
-            "pattern_version"
-          ],
-          "properties": {
-            "support": {
-              "const": "full"
-            },
-            "pattern_version": {
-              "const": 1
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "support",
-            "reason"
-          ],
-          "properties": {
-            "support": {
-              "const": "unsupported"
-            },
-            "reason": {
-              "type": "string",
-              "maxLength": 4096
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "support",
-            "reason"
-          ],
-          "properties": {
-            "support": {
-              "const": "not_applicable"
-            },
-            "reason": {
-              "type": "string",
-              "maxLength": 4096
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
-    },
     "StructuralCaptureConstraint": {
       "type": "object",
       "required": [
@@ -2214,59 +1724,6 @@
       "type": "string",
       "pattern": "^(?:[A-Za-z][A-Za-z0-9_]*|[0-9]+)$"
     },
-    "RefusalBlocker": {
-      "oneOf": [
-        {
-          "type": "object",
-          "required": [
-            "kind",
-            "entity"
-          ],
-          "properties": {
-            "kind": {
-              "const": "entity"
-            },
-            "entity": {
-              "$ref": "#/$defs/SymbolId"
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "kind",
-            "span"
-          ],
-          "properties": {
-            "kind": {
-              "const": "span"
-            },
-            "span": {
-              "$ref": "#/$defs/SourceSpan"
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "kind",
-            "relationship"
-          ],
-          "properties": {
-            "kind": {
-              "const": "relationship"
-            },
-            "relationship": {
-              "$ref": "#/$defs/Relationship"
-            }
-          },
-          "additionalProperties": false
-        }
-      ],
-      "description": "What stopped an operation: a symbol in the way, the bytes in the way, or an edge that would break."
-    },
     "DiagnosticRelated": {
       "type": "object",
       "required": [
@@ -2408,7 +1865,8 @@
           "$ref": "#/$defs/Address"
         },
         "arguments_schema": {
-          "$ref": "#/$defs/JsonSchemaDocument"
+          "description": "JSON Schema draft 2020-12 for the arguments this action takes. Self-contained: remote references are forbidden, so a caller validates without fetching anything.",
+          "type": "object"
         },
         "disabled_reason": {
           "type": [
@@ -2438,11 +1896,6 @@
         "types",
         "diagnostics"
       ]
-    },
-    "MirrorId": {
-      "description": "Identity of one mirror inside an adapter process. A base mirror is immutable and shared; each same-environment candidate opens a child whose content map is complete in structure and delta in content, so every unchanged entry is a shared reference and parsed-source memory is one base plus the sum of the deltas rather than one base per agent. Per-mirror compiler state is not shared. A candidate that changes the environment cannot be a child and takes a base of its own, bounded by AdapterLimits.max_provisional_bases.",
-      "type": "string",
-      "pattern": "^[A-Za-z0-9._-]{1,128}$"
     },
     "MatchKey": {
       "description": "Identity of one match: the query that found it, and the exact state it was found in. Replaying a cursor or applying an action checks this first, because a match found in one state does not survive into another.",
