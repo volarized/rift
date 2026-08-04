@@ -1,0 +1,5317 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volar.sh/rift/protocol/core.json",
+  "title": "Rift core semantic model",
+  "description": "Vocabulary shared by every Rift seam: Symbols, Elements, Types, Relationships, identity, source addressing, coverage, and diagnostics. The MCP surface and the adapter IPC are both defined in terms of these, so they belong to neither.",
+  "$defs": {
+    "ProtocolVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "Generation": {
+      "description": "A process-local stale-mirror guard, not a durable revision.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "SemanticSnapshotDigest": {
+      "description": "SHA-256 of the SemanticSnapshotKey's tree and environment fields in RFC 8785 canonical JSON, used as the compact public pin for semantic reads and planning.",
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "GitOid": {
+      "description": "Opaque Git object ID. Commit OIDs are public causal/CAS handles; tree OIDs identify exact source content. SHA-1 repositories use 40 hex characters and SHA-256 repositories use 64.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "OwnerId": {
+      "description": "Derived owner identity for one adapter: its LanguageId, '.', and the first 16 hex characters of SHA-256 over the length-prefixed implementation and compiler strings. Both inputs are present in hello, so Rift can verify the value at startup. Compiler configuration and dependencies are deliberately excluded: they identify an environment, not an adapter, and they already move the SemanticSnapshotKey. Derived rather than allocated, so the same adapter build yields the same owner on every machine and across every restart, and cached facts that embed it stay valid.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
+      "maxLength": 96
+    },
+    "LanguageId": {
+      "description": "A stable language identifier advertised by an adapter and used to route virtual units.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
+      "maxLength": 64
+    },
+    "LocalId": {
+      "description": "Opaque adapter-minted identity, restricted to printable ASCII so that its character length and its UTF-8 byte length are the same number — JSON Schema maxLength counts code points, and a 192-code-point emoji id would occupy 768 bytes and encode past GlobalEntityId's bound. Entities never use it directly: Rift and adapters encode it with the owner into a GlobalEntityId. It survives only as the address component of a virtual source unit, which is a location rather than an entity.",
+      "type": "string",
+      "pattern": "^[\\x21-\\x7E]{1,192}$"
+    },
+    "AdapterEnvironment": {
+      "description": "Machine-independent identity of the non-source inputs owned by one adapter. No absolute path may contribute.",
+      "type": "object",
+      "required": [
+        "owner",
+        "fingerprint",
+        "implementation",
+        "compiler",
+        "compiler_configuration",
+        "dependencies"
+      ],
+      "properties": {
+        "owner": {
+          "$ref": "#/$defs/OwnerId"
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "implementation": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "compiler": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "compiler_configuration": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "dependencies": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorState": {
+      "description": "The exact adapter state a state-pinned request expects: which mirror, that mirror's generation, and the AdapterEnvironment fingerprint its content produced. Generation is per mirror, so concurrent work on distinct mirrors never invalidates a peer. A MirrorState exists only after sync.commit, because environment is derived from synced content rather than known in advance.",
+      "type": "object",
+      "required": [
+        "mirror",
+        "generation",
+        "environment"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "#/$defs/MirrorId"
+        },
+        "generation": {
+          "$ref": "#/$defs/Generation"
+        },
+        "environment": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExtensionValue": {
+      "description": "Versioned extension value. data is validated against the schema advertised for its key and version.",
+      "type": "object",
+      "required": [
+        "version",
+        "data"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "data": {}
+      },
+      "additionalProperties": false
+    },
+    "ExtensionKey": {
+      "description": "A reverse-domain namespaced extension or extension-operation identifier.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$"
+    },
+    "Extensions": {
+      "description": "Reverse-domain namespaced facts. Keys and values use RFC 8785 canonical JSON; every key/version is advertised in AdapterHello.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/ExtensionKey"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/ExtensionValue"
+      }
+    },
+    "ProjectPath": {
+      "description": "A non-empty project-relative UTF-8 path using '/' separators, with no backslash, control character, empty segment, '.' segment, or '..' segment.",
+      "type": "string",
+      "pattern": "^(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^/\\\\\\u0000-\\u001F\\u007F]+(?:/[^/\\\\\\u0000-\\u001F\\u007F]+)*$"
+    },
+    "PathPattern": {
+      "description": "Project-relative Git-style glob using *, ?, **, and character classes; absolute, backslash, control, and '..' segments are forbidden.",
+      "type": "string",
+      "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$"
+    },
+    "PathSelector": {
+      "type": "object",
+      "required": [
+        "include",
+        "exclude"
+      ],
+      "properties": {
+        "include": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          }
+        },
+        "exclude": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "TextRange": {
+      "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from its compiler's native offsets at the seam.",
+      "type": "object",
+      "required": [
+        "start",
+        "end"
+      ],
+      "properties": {
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "additionalProperties": false
+    },
+    "Severity": {
+      "enum": [
+        "error",
+        "warning",
+        "info",
+        "hint"
+      ]
+    },
+    "PhysicalUnitRef": {
+      "description": "A regular or executable Git file selected for semantic ownership.",
+      "type": "object",
+      "required": [
+        "kind",
+        "owner",
+        "path"
+      ],
+      "properties": {
+        "kind": {
+          "const": "physical"
+        },
+        "owner": {
+          "$ref": "#/$defs/OwnerId"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        }
+      },
+      "additionalProperties": false
+    },
+    "VirtualUnitRef": {
+      "description": "Address of one adapter-produced virtual source. Units are addressed by owner plus location — a path for physical units, an opaque local id for virtual ones — which is deliberately a different scheme from entity identity, because a unit is not an entity.",
+      "type": "object",
+      "required": [
+        "kind",
+        "owner",
+        "local_id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "virtual"
+        },
+        "owner": {
+          "$ref": "#/$defs/OwnerId"
+        },
+        "local_id": {
+          "$ref": "#/$defs/LocalId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceUnitRef": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PhysicalUnitRef"
+        },
+        {
+          "$ref": "#/$defs/VirtualUnitRef"
+        }
+      ]
+    },
+    "SourceSpan": {
+      "type": "object",
+      "required": [
+        "unit",
+        "range"
+      ],
+      "properties": {
+        "unit": {
+          "$ref": "#/$defs/SourceUnitRef"
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceMapEntry": {
+      "description": "Deterministic virtual-source provenance. exact means one affine byte-for-byte origin range; approximate preserves one or more origins without positional equivalence; synthetic has no source origin. The oneOf constrains cardinality only — exactly one origin for exact, at least one for approximate, none for synthetic — and never varies the shape.",
+      "type": "object",
+      "required": [
+        "generated",
+        "precision",
+        "originals"
+      ],
+      "properties": {
+        "generated": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "precision": {
+          "enum": [
+            "exact",
+            "approximate",
+            "synthetic"
+          ]
+        },
+        "originals": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SourceSpan"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "precision": {
+              "const": "exact"
+            },
+            "originals": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "precision": {
+              "const": "approximate"
+            },
+            "originals": {
+              "type": "array",
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "precision": {
+              "const": "synthetic"
+            },
+            "originals": {
+              "type": "array",
+              "maxItems": 0
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "CoverageScope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "request"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit"
+          ],
+          "properties": {
+            "kind": {
+              "const": "unit"
+            },
+            "unit": {
+              "$ref": "#/$defs/SourceUnitRef"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "project",
+                "dependencies",
+                "all"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Coverage": {
+      "description": "Explicit completeness for one semantic fact family. Absence is authoritative only when state is complete.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "scope"
+          ],
+          "properties": {
+            "state": {
+              "const": "complete"
+            },
+            "scope": {
+              "$ref": "#/$defs/CoverageScope"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "scope",
+            "reason"
+          ],
+          "properties": {
+            "state": {
+              "const": "partial"
+            },
+            "scope": {
+              "$ref": "#/$defs/CoverageScope"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "continuation": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "scope",
+            "reason"
+          ],
+          "properties": {
+            "state": {
+              "const": "unsupported"
+            },
+            "scope": {
+              "$ref": "#/$defs/CoverageScope"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "scope",
+            "reason"
+          ],
+          "properties": {
+            "state": {
+              "const": "not_applicable"
+            },
+            "scope": {
+              "$ref": "#/$defs/CoverageScope"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SemanticCoverage": {
+      "description": "Coverage for every fact family. Absence is authoritative only where state is complete.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/FactFamily"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/Coverage"
+      },
+      "minProperties": 6
+    },
+    "ExternalSymbolRef": {
+      "description": "Unresolved cross-owner symbol identity. Rift links it only by exact ExternalIdentity equality and otherwise preserves it as unresolved.",
+      "type": "object",
+      "required": [
+        "kind",
+        "identities"
+      ],
+      "properties": {
+        "kind": {
+          "const": "external_symbol"
+        },
+        "identities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ExternalIdentity"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RelationshipTargetRef": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        },
+        {
+          "$ref": "#/$defs/ExternalSymbolRef"
+        }
+      ]
+    },
+    "TypeComponent": {
+      "type": "object",
+      "required": [
+        "role",
+        "type"
+      ],
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/GlobalEntityId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Type": {
+      "description": "Opaque language-owned semantic type, named by the same GlobalEntityId as every other entity. Rift displays and routes it but never decides equality, assignability, members, or overload selection.",
+      "type": "object",
+      "required": [
+        "id",
+        "display",
+        "kind",
+        "facets",
+        "components",
+        "members",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/GlobalEntityId"
+        },
+        "display": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/TypeFacet"
+          }
+        },
+        "symbol": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        },
+        "components": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeComponent"
+          }
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeMember"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeMember": {
+      "description": "One member of a Type, including anonymous structural types whose members have no standalone Symbol.",
+      "type": "object",
+      "required": [
+        "name",
+        "display",
+        "types",
+        "signatures",
+        "extensions"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "display": {
+          "type": "string"
+        },
+        "symbol": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          }
+        },
+        "signatures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Signature"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeExpression": {
+      "description": "Language source spelling plus optional compiler-resolved Type identity. Edit intent may introduce an unresolved spelling; analyzed facts provide resolved when coverage permits.",
+      "type": "object",
+      "required": [
+        "language",
+        "source",
+        "resolved",
+        "extensions"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "source": {
+          "type": "string"
+        },
+        "resolved": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GlobalEntityId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeBinding": {
+      "type": "object",
+      "required": [
+        "role",
+        "type"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "declared",
+            "inferred",
+            "expected",
+            "receiver",
+            "parameter",
+            "return"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/TypeExpression"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Documentation": {
+      "type": "object",
+      "required": [
+        "format",
+        "text"
+      ],
+      "properties": {
+        "format": {
+          "enum": [
+            "plain",
+            "markdown"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Parameter": {
+      "type": "object",
+      "required": [
+        "name",
+        "types",
+        "optional",
+        "variadic",
+        "default",
+        "extensions"
+      ],
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "element": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          }
+        },
+        "optional": {
+          "type": "boolean"
+        },
+        "variadic": {
+          "type": "boolean"
+        },
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SignatureShape": {
+      "description": "Canonical structured callable shape shared by semantic facts, generator context, and signature-change intent.",
+      "type": "object",
+      "required": [
+        "language",
+        "receiver",
+        "parameters",
+        "returns",
+        "type_parameters",
+        "throws",
+        "effects",
+        "extensions"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "receiver": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Parameter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Parameter"
+          }
+        },
+        "returns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          }
+        },
+        "type_parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedEntityTarget"
+          }
+        },
+        "throws": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeExpression"
+          }
+        },
+        "effects": {
+          "description": "Ordered exact language effect names such as async, unsafe, pure, or throws; portable interpretation is never inferred from spelling.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Signature": {
+      "description": "One rendered callable signature plus canonical shape and links; overloads are separate Signature values.",
+      "type": "object",
+      "required": [
+        "display",
+        "links",
+        "shape"
+      ],
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "links": {
+          "description": "Symbol links whose ranges are relative to display, preserving referenced symbols for renderers and projections.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SignatureLink"
+          }
+        },
+        "shape": {
+          "$ref": "#/$defs/SignatureShape"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SignatureLink": {
+      "type": "object",
+      "required": [
+        "range",
+        "symbol"
+      ],
+      "properties": {
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        },
+        "symbol": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalIdentity": {
+      "description": "Portable identity in another symbol scheme, qualified by the scheme that defines it. Cross-owner identity uses exact advertised external identities or stays unresolved; Rift never derives one.",
+      "type": "object",
+      "required": [
+        "scheme",
+        "value"
+      ],
+      "properties": {
+        "scheme": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolFacet": {
+      "enum": [
+        "namespace",
+        "module",
+        "type",
+        "value",
+        "callable",
+        "member",
+        "member_container",
+        "parameter",
+        "type_parameter",
+        "constructible",
+        "extensible",
+        "implementable",
+        "macro",
+        "test"
+      ]
+    },
+    "TypeFacet": {
+      "enum": [
+        "named",
+        "anonymous",
+        "callable",
+        "union",
+        "intersection",
+        "tuple",
+        "record",
+        "literal",
+        "parameter",
+        "inferred",
+        "unknown"
+      ]
+    },
+    "ExactKind": {
+      "description": "An adapter-owned namespaced kind preserving exact language meaning.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*\\.[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "ElementFacet": {
+      "enum": [
+        "declaration",
+        "definition",
+        "body",
+        "block",
+        "statement",
+        "expression",
+        "type_expression",
+        "import",
+        "export",
+        "parameter",
+        "argument",
+        "annotation",
+        "comment",
+        "identifier",
+        "literal",
+        "pattern",
+        "generated",
+        "test"
+      ],
+      "description": "Portable structural facets. generated and test are load-bearing: destructive policy, reference policy, and refactor scope all gate on them."
+    },
+    "RelationshipFacet": {
+      "enum": [
+        "contains",
+        "declares",
+        "defines",
+        "references",
+        "calls",
+        "constructs",
+        "reads",
+        "writes",
+        "imports",
+        "exports",
+        "extends",
+        "implements",
+        "type_definition",
+        "overrides",
+        "aliases",
+        "generates",
+        "depends_on"
+      ]
+    },
+    "SymbolKindDescriptor": {
+      "type": "object",
+      "required": [
+        "entity",
+        "kind",
+        "facets"
+      ],
+      "properties": {
+        "entity": {
+          "const": "symbol"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SymbolFacet"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ElementKindDescriptor": {
+      "type": "object",
+      "required": [
+        "entity",
+        "kind",
+        "facets"
+      ],
+      "properties": {
+        "entity": {
+          "const": "element"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ElementFacet"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RelationshipKindDescriptor": {
+      "type": "object",
+      "required": [
+        "entity",
+        "kind",
+        "facets"
+      ],
+      "properties": {
+        "entity": {
+          "const": "relationship"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/RelationshipFacet"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeKindDescriptor": {
+      "type": "object",
+      "required": [
+        "entity",
+        "kind",
+        "facets"
+      ],
+      "properties": {
+        "entity": {
+          "const": "type"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/TypeFacet"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "KindDescriptor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SymbolKindDescriptor"
+        },
+        {
+          "$ref": "#/$defs/ElementKindDescriptor"
+        },
+        {
+          "$ref": "#/$defs/RelationshipKindDescriptor"
+        },
+        {
+          "$ref": "#/$defs/TypeKindDescriptor"
+        }
+      ]
+    },
+    "JsonSchemaDocument": {
+      "description": "A self-contained JSON Schema draft 2020-12 document. Remote references are forbidden.",
+      "type": "object"
+    },
+    "ExtensionValueDescriptor": {
+      "description": "Advertises one versioned extension value and every protocol location where it may appear. Rift validates each occurrence against schema.",
+      "type": "object",
+      "required": [
+        "key",
+        "version",
+        "targets",
+        "schema",
+        "indexed",
+        "semantic"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/ExtensionKey"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "source_unit",
+              "symbol",
+              "element",
+              "relationship",
+              "type",
+              "diagnostic",
+              "code_action",
+              "structural.query",
+              "structural.match",
+              "formatting",
+              "completion",
+              "context.request",
+              "context.response",
+              "frontier.request",
+              "frontier.response",
+              "check.request",
+              "check.response"
+            ]
+          }
+        },
+        "schema": {
+          "$ref": "#/$defs/JsonSchemaDocument"
+        },
+        "indexed": {
+          "type": "boolean"
+        },
+        "semantic": {
+          "description": "Whether this value contributes to semantic cache identity and deterministic comparison.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExtensionOperationDescriptor": {
+      "type": "object",
+      "required": [
+        "id",
+        "version",
+        "arguments_schema",
+        "guarantees"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ExtensionKey"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "arguments_schema": {
+          "$ref": "#/$defs/JsonSchemaDocument"
+        },
+        "guarantees": {
+          "$ref": "#/$defs/OperationGuarantees"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceClaim": {
+      "description": "A deterministic physical-file ownership claim, reevaluated after every path or content change. Selectors are ORed and compare UTF-8 bytes: suffixes against the full path, names against the final component, and shebang prefixes against the first line. Highest priority wins; equal-priority matches from different owners are an error. Container claims may expose embedded languages and virtual units.",
+      "type": "object",
+      "required": [
+        "language",
+        "priority",
+        "container"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "path_suffixes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "path_names": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "shebang_prefixes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 2,
+            "pattern": "^#!"
+          }
+        },
+        "container": {
+          "type": "boolean"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "path_suffixes"
+          ]
+        },
+        {
+          "required": [
+            "path_names"
+          ]
+        },
+        {
+          "required": [
+            "shebang_prefixes"
+          ]
+        }
+      ],
+      "additionalProperties": false
+    },
+    "AuxiliaryClaim": {
+      "description": "A non-owning claim for project files needed to discover or configure compiler semantics. Selectors are ORed, use the same bytewise rules as SourceClaim, may overlap across adapters, and never make a file a SourceUnit.",
+      "type": "object",
+      "required": [
+        "purposes",
+        "environment_defining"
+      ],
+      "properties": {
+        "purposes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "compiler_configuration",
+              "dependency_manifest",
+              "dependency_lock",
+              "workspace_manifest",
+              "generated_metadata",
+              "other"
+            ]
+          }
+        },
+        "path_suffixes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "path_names": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "environment_defining": {
+          "description": "Whether editing a file matched by this claim changes this adapter's AdapterEnvironment. Declared by the adapter, never inferred from purpose: only the adapter knows whether its own compiler rereads a given file. True forces a fresh base rather than a child mirror.",
+          "type": "boolean"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "path_suffixes"
+          ]
+        },
+        {
+          "required": [
+            "path_names"
+          ]
+        }
+      ],
+      "additionalProperties": false
+    },
+    "VirtualClaim": {
+      "description": "A deterministic claim to consume semantic facts for virtual sources of one language. Highest priority wins; equal-priority matches from different owners are an error. The producer retains authority for virtual bytes, regions, and source maps.",
+      "type": "object",
+      "required": [
+        "language",
+        "priority"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "additionalProperties": false
+    },
+    "LanguageSubstrate": {
+      "description": "A replaceable compiler-backed language adapter. Core operations are mandatory; generator operations and exact vocabularies are advertised.",
+      "type": "object",
+      "required": [
+        "owner",
+        "implementation",
+        "compiler",
+        "claims",
+        "auxiliary_claims",
+        "virtual_claims",
+        "kinds",
+        "operations",
+        "structural_matching",
+        "formatting",
+        "action_discovery",
+        "generator_operations",
+        "extension_values",
+        "extension_operations",
+        "features",
+        "extensions"
+      ],
+      "properties": {
+        "owner": {
+          "$ref": "#/$defs/OwnerId"
+        },
+        "implementation": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "compiler": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "claims": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SourceClaim"
+          }
+        },
+        "auxiliary_claims": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/AuxiliaryClaim"
+          }
+        },
+        "virtual_claims": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/VirtualClaim"
+          }
+        },
+        "kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/KindDescriptor"
+          }
+        },
+        "operations": {
+          "$ref": "#/$defs/StandardOperationSupport"
+        },
+        "structural_matching": {
+          "$ref": "#/$defs/StructuralMatchingSupport"
+        },
+        "formatting": {
+          "$ref": "#/$defs/FormattingSupport"
+        },
+        "action_discovery": {
+          "description": "Authoritative coverage for the actions IPC request. Unsupported is explicit; absence is never interpreted as no actions.",
+          "$ref": "#/$defs/Coverage"
+        },
+        "generator_operations": {
+          "$ref": "#/$defs/GeneratorOperationSupportSet"
+        },
+        "extension_values": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ExtensionValueDescriptor"
+          }
+        },
+        "extension_operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ExtensionOperationDescriptor"
+          }
+        },
+        "features": {
+          "description": "Open optional feature names; core operations never appear here.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolOrigin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "project"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "manager",
+            "name",
+            "version"
+          ],
+          "properties": {
+            "kind": {
+              "const": "package"
+            },
+            "manager": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "stdlib",
+                "generated",
+                "synthetic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Symbol": {
+      "description": "Compiler-resolved semantic identity. Source structure lives in Element and is connected through Relationship.",
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "display_name",
+        "kind",
+        "facets",
+        "origin",
+        "external_identities",
+        "modifiers",
+        "visibility",
+        "types",
+        "signatures",
+        "documentation",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/GlobalEntityId"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SymbolFacet"
+          }
+        },
+        "origin": {
+          "$ref": "#/$defs/SymbolOrigin"
+        },
+        "container": {
+          "$ref": "#/$defs/GlobalEntityId"
+        },
+        "external_identities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ExternalIdentity"
+          }
+        },
+        "modifiers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "visibility": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          }
+        },
+        "signatures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Signature"
+          }
+        },
+        "documentation": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Documentation"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ElementRegion": {
+      "type": "object",
+      "required": [
+        "role",
+        "range"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "selection",
+            "name",
+            "header",
+            "body",
+            "content",
+            "documentation",
+            "enclosing"
+          ]
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Element": {
+      "description": "Language-owned structural source region. Exact kind preserves language meaning; facets provide portable queries.",
+      "type": "object",
+      "required": [
+        "id",
+        "unit",
+        "language",
+        "kind",
+        "facets",
+        "range",
+        "regions",
+        "types",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/GlobalEntityId"
+        },
+        "unit": {
+          "$ref": "#/$defs/SourceUnitRef"
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ElementFacet"
+          }
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ElementRegion"
+          }
+        },
+        "parent": {
+          "$ref": "#/$defs/GlobalEntityId"
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Relationship": {
+      "description": "One directed connection between Symbols and/or Elements. This single model covers source bindings and graph edges.",
+      "type": "object",
+      "required": [
+        "from",
+        "kind",
+        "facets",
+        "to",
+        "evidence",
+        "provenance",
+        "extensions"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/RelationshipFacet"
+          }
+        },
+        "to": {
+          "$ref": "#/$defs/RelationshipTargetRef"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedEntityTarget"
+          }
+        },
+        "provenance": {
+          "enum": [
+            "compiler",
+            "adapter",
+            "inferred"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FieldFilter": {
+      "description": "A predicate over a standard, namespaced substrate, or diagnostic field. The regex op uses rust-regex and is evaluated by Rift, never by an adapter — including when this filter reaches an adapter inside StructuralCaptureConstraint.semantic. One regex engine and one dialect for every caller-supplied regex on the wire. Structural patterns and git-glob path selectors are separate grammars with their own declarations.",
+      "type": "object",
+      "required": [
+        "field",
+        "op"
+      ],
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "op": {
+          "enum": [
+            "eq",
+            "ne",
+            "in",
+            "contains",
+            "prefix",
+            "regex",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "exists"
+          ]
+        },
+        "value": {},
+        "values": {
+          "type": "array",
+          "items": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "RelationFilter": {
+      "description": "A predicate over an exact advertised relationship kind or portable facet.",
+      "type": "object",
+      "required": [
+        "direction"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "required": [
+            "facet"
+          ]
+        }
+      ],
+      "properties": {
+        "kind": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "facet": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RelationshipFacet"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RelationshipFacet"
+              }
+            }
+          ]
+        },
+        "direction": {
+          "enum": [
+            "outgoing",
+            "incoming",
+            "either"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/Filter"
+        },
+        "min_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "max_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 1
+        },
+        "quantifier": {
+          "enum": [
+            "exists",
+            "not_exists"
+          ],
+          "default": "exists"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Filter": {
+      "description": "A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "field"
+          ],
+          "properties": {
+            "kind": {
+              "const": "field"
+            },
+            "field": {
+              "$ref": "#/$defs/FieldFilter"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "relation"
+          ],
+          "properties": {
+            "kind": {
+              "const": "relation"
+            },
+            "relation": {
+              "$ref": "#/$defs/RelationFilter"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "all"
+          ],
+          "properties": {
+            "kind": {
+              "const": "all"
+            },
+            "all": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Filter"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "any"
+          ],
+          "properties": {
+            "kind": {
+              "const": "any"
+            },
+            "any": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Filter"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "not"
+          ],
+          "properties": {
+            "kind": {
+              "const": "not"
+            },
+            "not": {
+              "$ref": "#/$defs/Filter"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PublicCodeActionRef": {
+      "description": "Rift-minted deterministic action identity scoped to one snapshot. Rift rediscovers the adapter action and verifies the descriptor digest before application.",
+      "type": "object",
+      "required": [
+        "id",
+        "commit",
+        "semantic"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "commit": {
+          "$ref": "#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "#/$defs/SemanticSnapshotDigest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GlobalEntityId": {
+      "description": "The single canonical entity identity: the URL-safe encoding of the owning adapter and that adapter's local identity, global within one leaf and one SemanticSnapshotKey. Opaque to callers and a valid URI path segment as written, so no encoding rule can be disagreed about. Length is total by construction: OwnerId and LocalId are both ASCII-only, so 96 + 1 + 192 characters are exactly 289 bytes and encode to 386 base64url characters, inside the 512 bound. Future federation qualifies it with a ProjectPin rather than changing the ID.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,512}$"
+    },
+    "PublicSymbolTarget": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symbol"
+        },
+        "id": {
+          "$ref": "#/$defs/GlobalEntityId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicElementTarget": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "element"
+        },
+        "id": {
+          "$ref": "#/$defs/GlobalEntityId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PriorEffectTarget": {
+      "description": "A deterministic reference to a created entity reported by an earlier top-level change in the same transaction. effect indexes the selected groups flattened in returned group/effect order; change must precede the current change and the referenced effect must be created.",
+      "type": "object",
+      "required": [
+        "kind",
+        "change",
+        "effect"
+      ],
+      "properties": {
+        "kind": {
+          "const": "prior_effect"
+        },
+        "change": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "effect": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicMatchRef": {
+      "description": "Deterministic text or structural match identity scoped to one retained snapshot and canonical query.",
+      "type": "object",
+      "required": [
+        "id",
+        "commit",
+        "semantic",
+        "query"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "commit": {
+          "$ref": "#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "#/$defs/SemanticSnapshotDigest"
+        },
+        "query": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchEntityTarget": {
+      "description": "An entity-valued capture from a previously discovered structural match.",
+      "type": "object",
+      "required": [
+        "kind",
+        "match",
+        "capture"
+      ],
+      "properties": {
+        "kind": {
+          "const": "match_entity"
+        },
+        "match": {
+          "$ref": "#/$defs/PublicMatchRef"
+        },
+        "capture": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CurrentMatchEntityTarget": {
+      "description": "An entity-valued capture from the current deterministic foreach match; legal only inside EditProgram.",
+      "type": "object",
+      "required": [
+        "kind",
+        "capture"
+      ],
+      "properties": {
+        "kind": {
+          "const": "current_match_entity"
+        },
+        "capture": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProgramEffectTarget": {
+      "description": "A created entity bound by an earlier EditProgram operation step. Foreach bindings are per-current-match unless the adapter proves a unique aggregate.",
+      "type": "object",
+      "required": [
+        "kind",
+        "binding",
+        "effect"
+      ],
+      "properties": {
+        "kind": {
+          "const": "program_effect"
+        },
+        "binding": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        },
+        "effect": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "additionalProperties": false
+    },
+    "EntityTarget": {
+      "description": "An entity nameable in any position: a resolved entity, or an entity-valued capture from a previously discovered match.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PublicSymbolTarget"
+        },
+        {
+          "$ref": "#/$defs/PublicElementTarget"
+        },
+        {
+          "$ref": "#/$defs/MatchEntityTarget"
+        }
+      ]
+    },
+    "Address": {
+      "description": "A source region resolved by the owning adapter against the operation's current candidate.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "target",
+            "region"
+          ],
+          "properties": {
+            "kind": {
+              "const": "entity"
+            },
+            "target": {
+              "$ref": "#/$defs/ProgramEntityTarget"
+            },
+            "region": {
+              "enum": [
+                "full",
+                "selection",
+                "name",
+                "header",
+                "body",
+                "content",
+                "documentation"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "path",
+            "range"
+          ],
+          "properties": {
+            "kind": {
+              "const": "source"
+            },
+            "path": {
+              "$ref": "#/$defs/ProjectPath"
+            },
+            "range": {
+              "$ref": "#/$defs/TextRange"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "path",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "const": "anchor"
+            },
+            "path": {
+              "$ref": "#/$defs/ProjectPath"
+            },
+            "text": {
+              "type": "string"
+            },
+            "within": {
+              "$ref": "#/$defs/ProgramEntityTarget"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "match",
+            "capture"
+          ],
+          "properties": {
+            "kind": {
+              "const": "match"
+            },
+            "match": {
+              "$ref": "#/$defs/PublicMatchRef"
+            },
+            "capture": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The current foreach match or capture; legal only inside EditProgram.",
+          "type": "object",
+          "required": [
+            "kind",
+            "capture"
+          ],
+          "properties": {
+            "kind": {
+              "const": "current_match"
+            },
+            "capture": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TextEdit": {
+      "type": "object",
+      "required": [
+        "path",
+        "range",
+        "new_text"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        },
+        "new_text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MutableEntryContent": {
+      "description": "Complete content and Git mode for any mutable non-gitlink entry. Binary and non-UTF-8 symlink bytes use canonical RFC 4648 base64; symlinks are never followed. git_object must name a blob.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "entry",
+            "encoding",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "const": "text"
+            },
+            "entry": {
+              "enum": [
+                "regular",
+                "executable"
+              ]
+            },
+            "encoding": {
+              "const": "utf8"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "entry",
+            "encoding",
+            "base64",
+            "sha256"
+          ],
+          "properties": {
+            "kind": {
+              "const": "binary"
+            },
+            "entry": {
+              "enum": [
+                "regular",
+                "executable"
+              ]
+            },
+            "encoding": {
+              "const": "base64"
+            },
+            "base64": {
+              "type": "string",
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+            },
+            "sha256": {
+              "$ref": "#/$defs/Sha256Digest"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Reuse an existing blob already present in the repository common object store.",
+          "type": "object",
+          "required": [
+            "kind",
+            "entry",
+            "encoding",
+            "object"
+          ],
+          "properties": {
+            "kind": {
+              "const": "object"
+            },
+            "entry": {
+              "enum": [
+                "regular",
+                "executable"
+              ]
+            },
+            "encoding": {
+              "const": "git_object"
+            },
+            "object": {
+              "$ref": "#/$defs/GitOid"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "entry",
+            "encoding",
+            "target"
+          ],
+          "properties": {
+            "kind": {
+              "const": "symlink_text"
+            },
+            "entry": {
+              "const": "symlink"
+            },
+            "encoding": {
+              "const": "utf8"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "entry",
+            "encoding",
+            "base64",
+            "sha256"
+          ],
+          "properties": {
+            "kind": {
+              "const": "symlink_binary"
+            },
+            "entry": {
+              "const": "symlink"
+            },
+            "encoding": {
+              "const": "base64"
+            },
+            "base64": {
+              "type": "string",
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+            },
+            "sha256": {
+              "$ref": "#/$defs/Sha256Digest"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ExpectedMutableEntry": {
+      "description": "Exact Git entry precondition; blob identity alone is insufficient because regular and executable modes can share one object ID.",
+      "type": "object",
+      "required": [
+        "entry",
+        "object"
+      ],
+      "properties": {
+        "entry": {
+          "enum": [
+            "regular",
+            "executable",
+            "symlink"
+          ]
+        },
+        "object": {
+          "$ref": "#/$defs/GitOid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExpectedTextEntry": {
+      "type": "object",
+      "required": [
+        "entry",
+        "object"
+      ],
+      "properties": {
+        "entry": {
+          "enum": [
+            "regular",
+            "executable"
+          ]
+        },
+        "object": {
+          "$ref": "#/$defs/GitOid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileCreateOperation": {
+      "description": "Create a regular, executable, binary, or opaque symlink entry. expected is null and creation refuses an existing destination.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "content",
+        "expected"
+      ],
+      "properties": {
+        "kind": {
+          "const": "file.create"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "content": {
+          "$ref": "#/$defs/MutableEntryContent"
+        },
+        "expected": {
+          "type": "null"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileReplaceOperation": {
+      "description": "Replace complete content/mode of a mutable entry only when its current kind and object ID match expected.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "content",
+        "expected"
+      ],
+      "properties": {
+        "kind": {
+          "const": "file.replace"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "content": {
+          "$ref": "#/$defs/MutableEntryContent"
+        },
+        "expected": {
+          "$ref": "#/$defs/ExpectedMutableEntry"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileDeleteOperation": {
+      "description": "Delete a regular, executable, binary, or symlink entry only when its current kind and object ID match expected. Gitlinks are immutable.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "expected"
+      ],
+      "properties": {
+        "kind": {
+          "const": "file.delete"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "expected": {
+          "$ref": "#/$defs/ExpectedMutableEntry"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileMoveOperation": {
+      "description": "Move a mutable non-gitlink entry without following it. The source object must match expected and the destination must be absent.",
+      "type": "object",
+      "required": [
+        "kind",
+        "from",
+        "to",
+        "expected",
+        "destination_expected"
+      ],
+      "properties": {
+        "kind": {
+          "const": "file.move"
+        },
+        "from": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "to": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "expected": {
+          "$ref": "#/$defs/ExpectedMutableEntry"
+        },
+        "destination_expected": {
+          "type": "null"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileCopyOperation": {
+      "description": "Copy a mutable non-gitlink entry without following it. The source object must match expected and the destination must be absent.",
+      "type": "object",
+      "required": [
+        "kind",
+        "from",
+        "to",
+        "expected",
+        "destination_expected"
+      ],
+      "properties": {
+        "kind": {
+          "const": "file.copy"
+        },
+        "from": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "to": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "expected": {
+          "$ref": "#/$defs/ExpectedMutableEntry"
+        },
+        "destination_expected": {
+          "type": "null"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileSetExecutableOperation": {
+      "description": "Toggle the Git executable mode of a regular/executable file; other entry kinds are refused.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "executable",
+        "expected"
+      ],
+      "properties": {
+        "kind": {
+          "const": "file.set_executable"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "executable": {
+          "type": "boolean"
+        },
+        "expected": {
+          "$ref": "#/$defs/ExpectedTextEntry"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TextReplaceOperation": {
+      "description": "Replace UTF-8 text in a regular/executable file; other entry kinds are refused.",
+      "type": "object",
+      "required": [
+        "kind",
+        "edit",
+        "expected"
+      ],
+      "properties": {
+        "kind": {
+          "const": "text.replace"
+        },
+        "edit": {
+          "$ref": "#/$defs/TextEdit"
+        },
+        "expected": {
+          "$ref": "#/$defs/ExpectedTextEntry"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MechanicalOperation": {
+      "description": "Closed effect-complete mutation algebra. Every resolved operation reduces to these effects.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/FileCreateOperation"
+        },
+        {
+          "$ref": "#/$defs/FileReplaceOperation"
+        },
+        {
+          "$ref": "#/$defs/FileDeleteOperation"
+        },
+        {
+          "$ref": "#/$defs/FileMoveOperation"
+        },
+        {
+          "$ref": "#/$defs/FileCopyOperation"
+        },
+        {
+          "$ref": "#/$defs/FileSetExecutableOperation"
+        },
+        {
+          "$ref": "#/$defs/TextReplaceOperation"
+        }
+      ]
+    },
+    "SymbolCreateOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "at",
+        "position",
+        "declaration"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symbol.create"
+        },
+        "at": {
+          "$ref": "#/$defs/Address"
+        },
+        "position": {
+          "enum": [
+            "before",
+            "after",
+            "first_child",
+            "last_child"
+          ]
+        },
+        "declaration": {
+          "type": "string"
+        },
+        "expected_name": {
+          "type": "string"
+        },
+        "expected_kind": {
+          "$ref": "#/$defs/ExactKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceCreateOperation": {
+      "description": "Create a source through the unique owner selected from its prospective path and content. language is an assertion that must match the selected SourceClaim; no owner, a tie, or a mismatch is refused.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "language",
+        "text"
+      ],
+      "properties": {
+        "kind": {
+          "const": "source.create"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ReferencePolicy": {
+      "description": "Explicit deletion policy. refuse is safe deletion and requires complete relationship coverage; rewrite may remove or replace only the selected relationship facets and must report every effect; preserve is deliberately destructive and never carries a references-updated guarantee.",
+      "type": "object",
+      "required": [
+        "mode",
+        "facets",
+        "comments",
+        "strings",
+        "generated",
+        "unresolved"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "refuse",
+            "rewrite",
+            "preserve"
+          ]
+        },
+        "facets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/RelationshipFacet"
+          }
+        },
+        "comments": {
+          "enum": [
+            "ignore",
+            "search",
+            "rewrite"
+          ]
+        },
+        "strings": {
+          "enum": [
+            "ignore",
+            "search",
+            "rewrite"
+          ]
+        },
+        "generated": {
+          "enum": [
+            "refuse",
+            "include",
+            "exclude"
+          ]
+        },
+        "unresolved": {
+          "enum": [
+            "refuse",
+            "preserve"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceDeleteOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "references"
+      ],
+      "properties": {
+        "kind": {
+          "const": "source.delete"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "references": {
+          "$ref": "#/$defs/ReferencePolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceMoveOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "from",
+        "to"
+      ],
+      "properties": {
+        "kind": {
+          "const": "source.move"
+        },
+        "from": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "to": {
+          "$ref": "#/$defs/ProjectPath"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceCopyOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "from",
+        "to",
+        "update_declaration"
+      ],
+      "properties": {
+        "kind": {
+          "const": "source.copy"
+        },
+        "from": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "to": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "update_declaration": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolDeleteOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "references"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symbol.delete"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "references": {
+          "$ref": "#/$defs/ReferencePolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolRenameOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "new_name"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symbol.rename"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "new_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolMoveOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "destination",
+        "position"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symbol.move"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "destination": {
+          "$ref": "#/$defs/Address"
+        },
+        "position": {
+          "enum": [
+            "before",
+            "after",
+            "first_child",
+            "last_child"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolCopyOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "destination",
+        "position",
+        "new_name"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symbol.copy"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "destination": {
+          "$ref": "#/$defs/Address"
+        },
+        "position": {
+          "enum": [
+            "before",
+            "after",
+            "first_child",
+            "last_child"
+          ]
+        },
+        "new_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ElementReplaceOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "new_text"
+      ],
+      "properties": {
+        "kind": {
+          "const": "element.replace"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "new_text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ElementInsertOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "position",
+        "text"
+      ],
+      "properties": {
+        "kind": {
+          "const": "element.insert"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "position": {
+          "enum": [
+            "before",
+            "after",
+            "first_child",
+            "last_child"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ElementDeleteOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target"
+      ],
+      "properties": {
+        "kind": {
+          "const": "element.delete"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ElementMoveOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "destination",
+        "position"
+      ],
+      "properties": {
+        "kind": {
+          "const": "element.move"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "destination": {
+          "$ref": "#/$defs/Address"
+        },
+        "position": {
+          "enum": [
+            "before",
+            "after",
+            "first_child",
+            "last_child"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SignatureChangeOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "new_signature",
+        "propagation"
+      ],
+      "properties": {
+        "kind": {
+          "const": "signature.change"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "new_signature": {
+          "$ref": "#/$defs/SignatureShape"
+        },
+        "propagation": {
+          "description": "How far the adapter must propagate the structured signature through semantic relationships.",
+          "enum": [
+            "declaration_only",
+            "references",
+            "hierarchy",
+            "transitive_callers"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeChangeOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "new_type"
+      ],
+      "properties": {
+        "kind": {
+          "const": "type.change"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "new_type": {
+          "$ref": "#/$defs/TypeExpression"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModifiersChangeOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "add",
+        "remove"
+      ],
+      "properties": {
+        "kind": {
+          "const": "modifiers.change"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "add": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "remove": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DocumentationUpdateOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "documentation"
+      ],
+      "properties": {
+        "kind": {
+          "const": "documentation.update"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "documentation": {
+          "$ref": "#/$defs/Documentation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ImportedName": {
+      "type": "object",
+      "required": [
+        "name",
+        "alias"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "alias": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ImportAddOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "source",
+        "form",
+        "names"
+      ],
+      "properties": {
+        "kind": {
+          "const": "import.add"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "source": {
+          "type": "string"
+        },
+        "form": {
+          "enum": [
+            "side_effect",
+            "default",
+            "namespace",
+            "named",
+            "language_specific"
+          ]
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ImportedName"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ImportRemoveOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "source",
+        "form",
+        "names"
+      ],
+      "properties": {
+        "kind": {
+          "const": "import.remove"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        },
+        "source": {
+          "type": "string"
+        },
+        "form": {
+          "enum": [
+            "side_effect",
+            "default",
+            "namespace",
+            "named",
+            "language_specific"
+          ]
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ImportOrganizeOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "path"
+      ],
+      "properties": {
+        "kind": {
+          "const": "import.organize"
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorExtractOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "extraction",
+        "name"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.extract"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "extraction": {
+          "enum": [
+            "function",
+            "method",
+            "variable",
+            "constant",
+            "field",
+            "parameter",
+            "type",
+            "interface",
+            "supertype",
+            "delegate"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "destination": {
+          "$ref": "#/$defs/Address"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorInlineOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "remove_declaration"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.inline"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "remove_declaration": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorImplementOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "contract",
+        "in"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.implement"
+        },
+        "contract": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "in": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProgramEntityTarget"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorOverrideOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "member",
+        "in"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.override"
+        },
+        "member": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "in": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorEncapsulateOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "access"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.encapsulate"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "access": {
+          "enum": [
+            "read",
+            "write",
+            "read_write"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorIntroduceOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "introduction",
+        "name"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.introduce"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "introduction": {
+          "enum": [
+            "variable",
+            "constant",
+            "field",
+            "property",
+            "parameter",
+            "type_parameter",
+            "type_alias"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "destination": {
+          "$ref": "#/$defs/Address"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorPullUpOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "members",
+        "destination"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.pull_up"
+        },
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/ProgramEntityTarget"
+          }
+        },
+        "destination": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorPushDownOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "members",
+        "destinations"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.push_down"
+        },
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/ProgramEntityTarget"
+          }
+        },
+        "destinations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/ProgramEntityTarget"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorConvertOperation": {
+      "description": "A portable deterministic declaration conversion. Language-specific conversions use advertised code actions or extensions.",
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "conversion"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.convert"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "conversion": {
+          "enum": [
+            "declaration_kind",
+            "anonymous_to_named",
+            "inheritance_to_delegation",
+            "instance_to_static",
+            "static_to_instance",
+            "implementation_to_interface",
+            "mutable_to_immutable"
+          ]
+        },
+        "destination_kind": {
+          "$ref": "#/$defs/ExactKind"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "conversion": {
+                "const": "declaration_kind"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "destination_kind"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "RefactorGenerateOperation": {
+      "description": "Deterministic compiler-owned generation only; arbitrary bodies or model-authored content are outside this version.",
+      "type": "object",
+      "required": [
+        "kind",
+        "in",
+        "artifact",
+        "members"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.generate"
+        },
+        "in": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "artifact": {
+          "enum": [
+            "constructor",
+            "accessor",
+            "equality",
+            "hash",
+            "string_representation",
+            "delegate",
+            "implementation",
+            "override",
+            "missing_members"
+          ]
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProgramEntityTarget"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "NamespaceMoveOperation": {
+      "description": "Move a package, module, namespace, or equivalent declaration and update represented paths/references.",
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "destination"
+      ],
+      "properties": {
+        "kind": {
+          "const": "namespace.move"
+        },
+        "target": {
+          "$ref": "#/$defs/ProgramEntityTarget"
+        },
+        "destination": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorFixAllOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "target",
+        "action_kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "refactor.fix_all"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "action_kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CodeActionApplyOperation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "action",
+        "target",
+        "arguments"
+      ],
+      "properties": {
+        "kind": {
+          "const": "code_action.apply"
+        },
+        "action": {
+          "$ref": "#/$defs/PublicCodeActionRef"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "arguments": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExtensionOperation": {
+      "description": "Versioned namespaced operation. arguments is validated against the JSON Schema advertised for operation+version.",
+      "type": "object",
+      "required": [
+        "kind",
+        "operation",
+        "version",
+        "arguments"
+      ],
+      "properties": {
+        "kind": {
+          "const": "extension"
+        },
+        "operation": {
+          "$ref": "#/$defs/ExtensionKey"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "arguments": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StandardOperationKind": {
+      "enum": [
+        "source.create",
+        "source.delete",
+        "source.move",
+        "source.copy",
+        "symbol.create",
+        "symbol.delete",
+        "symbol.rename",
+        "symbol.move",
+        "symbol.copy",
+        "element.replace",
+        "element.insert",
+        "element.delete",
+        "element.move",
+        "signature.change",
+        "type.change",
+        "modifiers.change",
+        "documentation.update",
+        "import.add",
+        "import.remove",
+        "import.organize",
+        "refactor.extract",
+        "refactor.inline",
+        "refactor.implement",
+        "refactor.override",
+        "refactor.encapsulate",
+        "refactor.introduce",
+        "refactor.pull_up",
+        "refactor.push_down",
+        "refactor.convert",
+        "refactor.generate",
+        "namespace.move",
+        "refactor.fix_all",
+        "code_action.apply"
+      ]
+    },
+    "OperationSupport": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "guarantees",
+            "options"
+          ],
+          "properties": {
+            "support": {
+              "const": "full"
+            },
+            "guarantees": {
+              "$ref": "#/$defs/OperationGuarantees"
+            },
+            "options": {
+              "$ref": "#/$defs/OperationOptionsSupport"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "guarantees",
+            "options",
+            "reason",
+            "cases"
+          ],
+          "properties": {
+            "support": {
+              "const": "partial"
+            },
+            "guarantees": {
+              "$ref": "#/$defs/OperationGuarantees"
+            },
+            "options": {
+              "$ref": "#/$defs/OperationOptionsSupport"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "cases": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/OperationSupportCase"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "reason"
+          ],
+          "properties": {
+            "support": {
+              "enum": [
+                "unsupported",
+                "not_applicable"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OperationOptionsSupport": {
+      "description": "Machine-readable option surface for one operation; arrays are the exact accepted values.",
+      "type": "object",
+      "required": [
+        "resolution_roles",
+        "reach",
+        "hierarchy",
+        "generated",
+        "comments",
+        "strings",
+        "conflicts",
+        "formatting",
+        "effect_selection"
+      ],
+      "properties": {
+        "resolution_roles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "primary",
+              "propagation"
+            ]
+          }
+        },
+        "reach": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "target",
+              "file",
+              "project"
+            ]
+          }
+        },
+        "hierarchy": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "target_only",
+              "overrides",
+              "implementations",
+              "full"
+            ]
+          }
+        },
+        "generated": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "refuse",
+              "include",
+              "exclude"
+            ]
+          }
+        },
+        "comments": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "ignore",
+              "search",
+              "update"
+            ]
+          }
+        },
+        "strings": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "ignore",
+              "search",
+              "update"
+            ]
+          }
+        },
+        "conflicts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "refuse",
+              "require_confirmation"
+            ]
+          }
+        },
+        "formatting": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "preserve",
+              "changed_regions",
+              "affected_files"
+            ]
+          }
+        },
+        "effect_selection": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StructuralMatchingSupport": {
+      "description": "Exhaustive declaration for Rift pattern v1 over the adapter's claimed languages. An adapter declares only whether it can PARSE and match the pattern grammar. It declares nothing about transforms: every StructuralTransform reads from capture: or transform: sources, so all of them operate on text that has already been extracted — by this adapter for a structural query, by Rift itself for a text query. Rift applies them once captures are known and, on a rewrite, before handing the rendered replacement back for parsing. An adapter therefore ships no regex engine: rust-regex is the only dialect for a caller-supplied regex; structural patterns and git-glob path selectors are separate grammars, declared separately. JSON Schema pattern keywords are ECMA-262 and are validated by each ecosystem's own validator; those are authored in this schema rather than supplied by a caller, so they are neither a divergence risk nor an attack surface.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "pattern_version"
+          ],
+          "properties": {
+            "support": {
+              "const": "full"
+            },
+            "pattern_version": {
+              "const": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "reason"
+          ],
+          "properties": {
+            "support": {
+              "enum": [
+                "unsupported",
+                "not_applicable"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FormattingSupport": {
+      "description": "Exhaustive formatter support. preserve is always available mechanically; adapters advertise compiler formatting modes.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "modes"
+          ],
+          "properties": {
+            "support": {
+              "enum": [
+                "full",
+                "partial"
+              ]
+            },
+            "modes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "changed_regions",
+                  "affected_files"
+                ]
+              }
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "reason"
+          ],
+          "properties": {
+            "support": {
+              "enum": [
+                "unsupported",
+                "not_applicable"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OperationSupportCase": {
+      "description": "A machine-filterable supported subset. Exact language conditions use namespaced values advertised by the same adapter.",
+      "type": "object",
+      "required": [
+        "dimension",
+        "values"
+      ],
+      "properties": {
+        "dimension": {
+          "enum": [
+            "resolution_role",
+            "exact_kind",
+            "portable_facet",
+            "reference_mode",
+            "source_language",
+            "destination_language",
+            "language_condition"
+          ]
+        },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperationGuarantee": {
+      "description": "A scoped assertion, not a feature label. behavior_preserved requires proof or an explicitly identified test suite; complete compiler validation alone is insufficient.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "scope",
+            "verifier",
+            "evidence"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "syntax_validated",
+                "bindings_preserved",
+                "references_updated",
+                "formatting_preserved"
+              ]
+            },
+            "scope": {
+              "enum": [
+                "target",
+                "affected_files",
+                "affected_closure",
+                "project"
+              ]
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "evidence": {
+              "enum": [
+                "construction",
+                "complete_analysis",
+                "complete_validation"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "scope",
+            "verifier",
+            "evidence",
+            "reference"
+          ],
+          "properties": {
+            "kind": {
+              "const": "behavior_preserved"
+            },
+            "scope": {
+              "enum": [
+                "target",
+                "affected_files",
+                "affected_closure",
+                "project"
+              ]
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "evidence": {
+              "enum": [
+                "proof",
+                "test_suite"
+              ]
+            },
+            "reference": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OperationGuarantees": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/OperationGuarantee"
+      }
+    },
+    "StandardOperationSupport": {
+      "description": "Exactly one support declaration per standard operation. propertyNames plus minProperties makes the catalogue exhaustive without restating it.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/StandardOperationKind"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/OperationSupport"
+      },
+      "minProperties": 33
+    },
+    "GeneratorOperationKind": {
+      "enum": [
+        "context",
+        "frontier",
+        "check"
+      ]
+    },
+    "GeneratorOperationSupport": {
+      "description": "Exhaustive support declaration for one generator-adapter operation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "support"
+          ],
+          "properties": {
+            "support": {
+              "const": "full"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "reason"
+          ],
+          "properties": {
+            "support": {
+              "enum": [
+                "partial",
+                "unsupported",
+                "not_applicable"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GeneratorOperationSupportSet": {
+      "description": "Exactly one support declaration per generator operation.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/GeneratorOperationKind"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/GeneratorOperationSupport"
+      },
+      "minProperties": 3
+    },
+    "ResolvableOperation": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SourceCreateOperation"
+        },
+        {
+          "$ref": "#/$defs/SourceDeleteOperation"
+        },
+        {
+          "$ref": "#/$defs/SourceMoveOperation"
+        },
+        {
+          "$ref": "#/$defs/SourceCopyOperation"
+        },
+        {
+          "$ref": "#/$defs/SymbolCreateOperation"
+        },
+        {
+          "$ref": "#/$defs/SymbolDeleteOperation"
+        },
+        {
+          "$ref": "#/$defs/SymbolRenameOperation"
+        },
+        {
+          "$ref": "#/$defs/SymbolMoveOperation"
+        },
+        {
+          "$ref": "#/$defs/SymbolCopyOperation"
+        },
+        {
+          "$ref": "#/$defs/ElementReplaceOperation"
+        },
+        {
+          "$ref": "#/$defs/ElementInsertOperation"
+        },
+        {
+          "$ref": "#/$defs/ElementDeleteOperation"
+        },
+        {
+          "$ref": "#/$defs/ElementMoveOperation"
+        },
+        {
+          "$ref": "#/$defs/SignatureChangeOperation"
+        },
+        {
+          "$ref": "#/$defs/TypeChangeOperation"
+        },
+        {
+          "$ref": "#/$defs/ModifiersChangeOperation"
+        },
+        {
+          "$ref": "#/$defs/DocumentationUpdateOperation"
+        },
+        {
+          "$ref": "#/$defs/ImportAddOperation"
+        },
+        {
+          "$ref": "#/$defs/ImportRemoveOperation"
+        },
+        {
+          "$ref": "#/$defs/ImportOrganizeOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorExtractOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorInlineOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorImplementOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorOverrideOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorEncapsulateOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorIntroduceOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorPullUpOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorPushDownOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorConvertOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorGenerateOperation"
+        },
+        {
+          "$ref": "#/$defs/NamespaceMoveOperation"
+        },
+        {
+          "$ref": "#/$defs/RefactorFixAllOperation"
+        },
+        {
+          "$ref": "#/$defs/CodeActionApplyOperation"
+        },
+        {
+          "$ref": "#/$defs/ExtensionOperation"
+        }
+      ]
+    },
+    "StructuralCaptureConstraint": {
+      "type": "object",
+      "required": [
+        "capture",
+        "cardinality"
+      ],
+      "properties": {
+        "capture": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        },
+        "cardinality": {
+          "enum": [
+            "one",
+            "many"
+          ]
+        },
+        "exact_kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facet": {
+          "$ref": "#/$defs/ElementFacet"
+        },
+        "text_regex": {
+          "type": "string",
+          "description": "rust-regex filter on the capture's text. Evaluated by Rift over returned captures, never by the adapter: an adapter MUST NOT prune matches using this field. Two engines behind one wire field disagree silently — a JavaScript adapter's RegExp reads \\d as ASCII-only where rust-regex reads it as Unicode Nd — and a backtracking engine turns a caller-supplied pattern into a stall inside a process that is a shared fault domain. The cost is that the adapter returns candidate matches Rift then discards, bounded by pagination and AdapterLimits."
+        },
+        "semantic": {
+          "$ref": "#/$defs/Filter"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StructuralQuery": {
+      "description": "Language-parsed source pattern using Rift metavariables $NAME and $$$NAME. The pattern text is language-specific; capture identity, scoping, constraints, ordering, and result shape are portable.",
+      "type": "object",
+      "required": [
+        "kind",
+        "version",
+        "language",
+        "pattern",
+        "paths",
+        "constraints",
+        "overlap",
+        "extensions"
+      ],
+      "properties": {
+        "kind": {
+          "const": "structural"
+        },
+        "version": {
+          "const": 1
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "paths": {
+          "$ref": "#/$defs/PathSelector"
+        },
+        "within": {
+          "$ref": "#/$defs/Address"
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StructuralCaptureConstraint"
+          }
+        },
+        "overlap": {
+          "enum": [
+            "outermost",
+            "innermost",
+            "all_non_overlapping"
+          ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StructuralCapture": {
+      "description": "One named capture. entity is the resolved entity the capture denotes, or null when the capture is purely textual — as every text-regex capture is.",
+      "type": "object",
+      "required": [
+        "name",
+        "spans",
+        "text",
+        "entity"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CaptureName"
+        },
+        "spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/SourceSpan"
+          }
+        },
+        "text": {
+          "type": "string"
+        },
+        "entity": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ResolvedEntityTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "StructuralMatchRanges": {
+      "description": "Adapter-owned safe replacement envelopes around the matched syntax node.",
+      "type": "object",
+      "required": [
+        "exact",
+        "leading",
+        "trailing",
+        "both"
+      ],
+      "properties": {
+        "exact": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "leading": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "trailing": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "both": {
+          "$ref": "#/$defs/SourceSpan"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CaptureName": {
+      "description": "Structural captures use identifier names; text regex results may additionally use numeric capture indexes.",
+      "type": "string",
+      "pattern": "^(?:[A-Za-z][A-Za-z0-9_]*|[0-9]+)$"
+    },
+    "ProgramCardinality": {
+      "type": "object",
+      "required": [
+        "minimum",
+        "maximum"
+      ],
+      "properties": {
+        "minimum": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maximum": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefactorScope": {
+      "description": "Portable scope and propagation policy shared by every requested operation. Adapters refuse unsupported combinations rather than silently narrowing them.",
+      "type": "object",
+      "required": [
+        "reach",
+        "paths",
+        "relationships",
+        "hierarchy",
+        "generated",
+        "comments",
+        "strings",
+        "conflicts"
+      ],
+      "properties": {
+        "reach": {
+          "enum": [
+            "target",
+            "file",
+            "project"
+          ]
+        },
+        "paths": {
+          "$ref": "#/$defs/PathSelector"
+        },
+        "relationships": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/RelationshipFacet"
+          }
+        },
+        "hierarchy": {
+          "enum": [
+            "target_only",
+            "overrides",
+            "implementations",
+            "full"
+          ]
+        },
+        "generated": {
+          "enum": [
+            "refuse",
+            "include",
+            "exclude"
+          ]
+        },
+        "comments": {
+          "enum": [
+            "ignore",
+            "search",
+            "update"
+          ]
+        },
+        "strings": {
+          "enum": [
+            "ignore",
+            "search",
+            "update"
+          ]
+        },
+        "conflicts": {
+          "enum": [
+            "refuse",
+            "require_confirmation"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "FormattingPolicy": {
+      "description": "Explicit formatting intent. preserve keeps all untouched bytes; changed_regions is the normal mode; affected_files is opt-in.",
+      "type": "object",
+      "required": [
+        "mode",
+        "generated"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "preserve",
+            "changed_regions",
+            "affected_files"
+          ]
+        },
+        "generated": {
+          "enum": [
+            "format",
+            "preserve"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "EffectSelection": {
+      "description": "Selection over stable effect-group IDs from a prior preview. Required groups and dependency closure cannot be excluded.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "mode",
+            "ids"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "default",
+                "all"
+              ]
+            },
+            "ids": {
+              "type": "array",
+              "maxItems": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode",
+            "ids"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "only",
+                "except"
+              ]
+            },
+            "ids": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/Sha256Digest"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RefusalBlocker": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "entity"
+          ],
+          "properties": {
+            "kind": {
+              "const": "entity"
+            },
+            "entity": {
+              "$ref": "#/$defs/ResolvedEntityTarget"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "span"
+          ],
+          "properties": {
+            "kind": {
+              "const": "span"
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "relationship"
+          ],
+          "properties": {
+            "kind": {
+              "const": "relationship"
+            },
+            "relationship": {
+              "$ref": "#/$defs/Relationship"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "DiagnosticRelated": {
+      "type": "object",
+      "required": [
+        "message",
+        "span"
+      ],
+      "properties": {
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "span": {
+          "$ref": "#/$defs/SourceSpan"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Diagnostic": {
+      "description": "One language finding. reliability says whether surrounding facts came from recovered source; continuation says whether appending source can repair the finding.",
+      "type": "object",
+      "required": [
+        "severity",
+        "owner",
+        "code",
+        "message",
+        "span",
+        "related",
+        "tags",
+        "reliability",
+        "continuation",
+        "extensions"
+      ],
+      "properties": {
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "owner": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/OwnerId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "span": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticRelated"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "deprecated",
+              "unnecessary"
+            ]
+          }
+        },
+        "reliability": {
+          "enum": [
+            "reliable",
+            "recovered"
+          ]
+        },
+        "continuation": {
+          "enum": [
+            "repairable",
+            "unrepairable",
+            "unknown"
+          ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperationPrecondition": {
+      "description": "An executable predicate observed during resolution. phases declares exactly when the verifier must recheck it; false at either phase refuses the operation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "target",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "target_exists"
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "target": {
+              "$ref": "#/$defs/EntityTarget"
+            },
+            "expected": {
+              "const": true
+            },
+            "observed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "path",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "target_writable"
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "path": {
+              "$ref": "#/$defs/ProjectPath"
+            },
+            "expected": {
+              "const": true
+            },
+            "observed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "target",
+            "facets",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "references_complete"
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "target": {
+              "$ref": "#/$defs/EntityTarget"
+            },
+            "facets": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/RelationshipFacet"
+              }
+            },
+            "expected": {
+              "const": "complete"
+            },
+            "observed": {
+              "$ref": "#/$defs/Coverage"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "target",
+            "facets",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "no_remaining_usages"
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "target": {
+              "$ref": "#/$defs/EntityTarget"
+            },
+            "facets": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/RelationshipFacet"
+              }
+            },
+            "expected": {
+              "const": 0
+            },
+            "observed": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Relationship"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "destination",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "destination_legal"
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "destination": {
+              "$ref": "#/$defs/Address"
+            },
+            "expected": {
+              "const": true
+            },
+            "observed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "destination",
+            "name",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "name_available"
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "destination": {
+              "$ref": "#/$defs/Address"
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "expected": {
+              "const": true
+            },
+            "observed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "path",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "entry_matches"
+            },
+            "verifier": {
+              "const": "rift"
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "path": {
+              "$ref": "#/$defs/ProjectPath"
+            },
+            "expected": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/GitOid"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "observed": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/GitOid"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "query",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "match_cardinality"
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "query": {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            "expected": {
+              "$ref": "#/$defs/ProgramCardinality"
+            },
+            "observed": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "selection",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "effect_selection_closed"
+            },
+            "verifier": {
+              "const": "rift"
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "selection": {
+              "$ref": "#/$defs/EffectSelection"
+            },
+            "expected": {
+              "const": true
+            },
+            "observed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "revision",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "revision_applicable"
+            },
+            "verifier": {
+              "const": "rift"
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "revision": {
+              "$ref": "#/$defs/GitOid"
+            },
+            "expected": {
+              "const": true
+            },
+            "observed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "formatting",
+            "expected",
+            "observed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "formatter_available"
+            },
+            "verifier": {
+              "enum": [
+                "rift",
+                "adapter"
+              ]
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "formatting": {
+              "$ref": "#/$defs/FormattingPolicy"
+            },
+            "expected": {
+              "const": true
+            },
+            "observed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier",
+            "phases",
+            "condition",
+            "expected",
+            "observed",
+            "detail",
+            "extensions"
+          ],
+          "properties": {
+            "kind": {
+              "const": "language_condition"
+            },
+            "verifier": {
+              "const": "adapter"
+            },
+            "phases": {
+              "$ref": "#/$defs/PreconditionPhases"
+            },
+            "condition": {
+              "$ref": "#/$defs/ExtensionKey"
+            },
+            "expected": {
+              "const": true
+            },
+            "observed": {
+              "type": "boolean"
+            },
+            "detail": {
+              "type": "string"
+            },
+            "extensions": {
+              "$ref": "#/$defs/Extensions"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PreconditionPhases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "before_reduction",
+          "before_publication"
+        ]
+      }
+    },
+    "ConfirmationRequirement": {
+      "description": "An adapter-provided disclosure that requires explicit confirmation before publication. Rift derives the public id from operation index plus canonical body.",
+      "type": "object",
+      "required": [
+        "kind",
+        "title",
+        "detail",
+        "spans",
+        "extensions"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "destructive",
+            "large_scope",
+            "binary_change",
+            "generated_code",
+            "unresolved_reference",
+            "behavior_unknown",
+            "formatting_scope",
+            "external_validator",
+            "revert",
+            "language_specific"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceSpan"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperationEffect": {
+      "description": "One public semantic effect. Identical on IPC and MCP; no translation step exists.",
+      "type": "object",
+      "required": [
+        "kind",
+        "entity"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "created",
+            "updated",
+            "deleted",
+            "moved"
+          ]
+        },
+        "entity": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CodeActionDescriptor": {
+      "description": "Portable, digestible action metadata. kind is an open hierarchical identifier; extensions preserve exact language choices.",
+      "type": "object",
+      "required": [
+        "title",
+        "kind",
+        "preferred",
+        "applicability",
+        "rationale",
+        "target",
+        "guarantees",
+        "arguments_schema",
+        "disabled_reason",
+        "diagnostics",
+        "extensions"
+      ],
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]*$"
+        },
+        "preferred": {
+          "type": "boolean"
+        },
+        "applicability": {
+          "enum": [
+            "always",
+            "conditional",
+            "speculative"
+          ]
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "guarantees": {
+          "$ref": "#/$defs/OperationGuarantees"
+        },
+        "arguments_schema": {
+          "$ref": "#/$defs/JsonSchemaDocument"
+        },
+        "disabled_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Diagnostic"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResolvedEntityTarget": {
+      "description": "A resolved entity, named by the single canonical GlobalEntityId. This is the only entity vocabulary in the contract; there is no adapter-local alternative.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PublicSymbolTarget"
+        },
+        {
+          "$ref": "#/$defs/PublicElementTarget"
+        }
+      ]
+    },
+    "FactFamily": {
+      "description": "The canonical semantic fact families. Coverage, analysis streaming, and invalidation all key on this.",
+      "enum": [
+        "source_maps",
+        "symbols",
+        "elements",
+        "relationships",
+        "types",
+        "diagnostics"
+      ]
+    },
+    "MirrorId": {
+      "description": "Identity of one mirror inside an adapter process. A base mirror is shared and immutable; each same-environment candidate opens a child mirror whose content map is complete in structure and delta in content — every unchanged entry is a shared reference, so parsed-source memory is base plus the sum of deltas rather than one base per agent; per-mirror compiler state is not shared. An environment-changing candidate takes its own provisional base instead, bounded by AdapterLimits.max_provisional_bases.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$"
+    },
+    "SequenceEntityTarget": {
+      "description": "Additionally legal inside an ordered change list: an entity produced by an earlier effect.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/EntityTarget"
+        },
+        {
+          "$ref": "#/$defs/PriorEffectTarget"
+        }
+      ]
+    },
+    "ProgramEntityTarget": {
+      "description": "Additionally legal inside an EditProgram: the current foreach match and program-effect bindings. Position, not prose, decides which tier applies.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SequenceEntityTarget"
+        },
+        {
+          "$ref": "#/$defs/CurrentMatchEntityTarget"
+        },
+        {
+          "$ref": "#/$defs/ProgramEffectTarget"
+        }
+      ]
+    }
+  }
+}

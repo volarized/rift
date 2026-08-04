@@ -1,0 +1,4686 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volar.sh/rift/protocol/mcp.json",
+  "title": "Rift MCP tools, resources, and records",
+  "description": "Rift's first-party MCP surface — five tools, five resource templates, and the categorical error contract — together with the durable records a transaction writes.",
+  "rift:entryPoints": {
+    "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as GlobalEntityId and Address is deliberately reachable from several.",
+    "mcp.tools": {
+      "search": {
+        "params": {
+          "$ref": "#/$defs/SearchParams"
+        },
+        "result": {
+          "$ref": "#/$defs/SearchResult"
+        }
+      },
+      "match": {
+        "params": {
+          "$ref": "#/$defs/MatchParams"
+        },
+        "result": {
+          "$ref": "#/$defs/MatchResult"
+        }
+      },
+      "actions": {
+        "params": {
+          "$ref": "#/$defs/ActionsParams"
+        },
+        "result": {
+          "$ref": "#/$defs/ActionsResult"
+        }
+      },
+      "apply": {
+        "params": {
+          "$ref": "#/$defs/ApplyParams"
+        },
+        "result": {
+          "$ref": "#/$defs/ApplyResult"
+        }
+      },
+      "persist": {
+        "params": {
+          "$ref": "#/$defs/PersistParams"
+        },
+        "result": {
+          "$ref": "#/$defs/PersistResult"
+        }
+      }
+    },
+    "mcp.resources": {
+      "repository": {
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/RepositoryResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/RepositoryResourceLink"
+        }
+      },
+      "symbol": {
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/SymbolResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/SymbolResourceLink"
+        }
+      },
+      "preview": {
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/PreviewResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/PreviewResourceLink"
+        }
+      },
+      "diff": {
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/DiffResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/DiffResourceLink"
+        }
+      },
+      "blob": {
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/BlobResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/BlobResourceLink"
+        }
+      }
+    },
+    "mcp.error": {
+      "$ref": "#/$defs/RiftErrorData"
+    },
+    "storage": {
+      "records.entry": {
+        "$ref": "#/$defs/RecordEntry"
+      },
+      "records.transaction": {
+        "$ref": "#/$defs/TransactionEntry"
+      },
+      "worktree.materialization_ledger": {
+        "$ref": "#/$defs/MaterializationLedger"
+      }
+    },
+    "mcp.resources.read": {
+      "$ref": "#/$defs/ResourceReadResult"
+    }
+  },
+  "rift:targetTiers": {
+    "description": "Which entity-target tier each entry position admits. EntityTarget, SequenceEntityTarget, and ProgramEntityTarget nest, and the shared Address/StructuralQuery types carry the widest tier so the type graph does not bifurcate. Admission is therefore declared here and enforced by the server, which already owns cursor validity, precondition satisfaction, coverage completeness, snapshot freshness, and ownership. An out-of-tier target is refused with a typed RiftErrorData. The most specific matching pointer wins; '*' matches any array index or object key.",
+    "rules": [
+      {
+        "entry": "mcp.tools.search",
+        "pointer": "/*",
+        "tier": "EntityTarget"
+      },
+      {
+        "entry": "mcp.tools.match",
+        "pointer": "/query",
+        "tier": "EntityTarget"
+      },
+      {
+        "entry": "mcp.tools.actions",
+        "pointer": "/target",
+        "tier": "EntityTarget"
+      },
+      {
+        "entry": "mcp.tools.apply",
+        "pointer": "/changes/*",
+        "tier": "SequenceEntityTarget"
+      },
+      {
+        "entry": "mcp.tools.apply",
+        "pointer": "/changes/*/steps/*/request",
+        "tier": "ProgramEntityTarget"
+      },
+      {
+        "entry": "adapter.frame",
+        "pointer": "/*",
+        "tier": "ProgramEntityTarget"
+      }
+    ]
+  },
+  "$defs": {
+    "Cursor": {
+      "description": "Opaque immutable continuation bound to the canonical request, snapshot, ordering contract, engine version, and page size. Replaying it while the snapshot is retained returns the same page; mismatched or malformed cursors are typed errors.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "RevisionRef": {
+      "type": "object",
+      "required": [
+        "kind",
+        "commit"
+      ],
+      "properties": {
+        "kind": {
+          "const": "revision"
+        },
+        "commit": {
+          "$ref": "core.json#/$defs/GitOid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttemptRef": {
+      "type": "object",
+      "required": [
+        "kind",
+        "commit"
+      ],
+      "properties": {
+        "kind": {
+          "const": "attempt"
+        },
+        "commit": {
+          "$ref": "core.json#/$defs/GitOid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreviewRef": {
+      "description": "An immutable retained, non-head candidate snapshot produced by preview or refresh.",
+      "type": "object",
+      "required": [
+        "kind",
+        "commit"
+      ],
+      "properties": {
+        "kind": {
+          "const": "preview"
+        },
+        "commit": {
+          "$ref": "core.json#/$defs/GitOid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SnapshotRef": {
+      "description": "An accepted revision, rejected attempt, or retained non-head preview, identified by its Git commit OID.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        {
+          "$ref": "#/$defs/AttemptRef"
+        },
+        {
+          "$ref": "#/$defs/PreviewRef"
+        }
+      ]
+    },
+    "SemanticEnvironment": {
+      "description": "Rift-composed identity of every adapter environment that can change semantic facts. adapters sort by owner, which is total because an owner is unique per adapter; fingerprint is the SHA-256 digest of the sorted adapters in RFC 8785 canonical JSON form. This is the one uniqueItems array not sorted by canonical bytes, because sorting by owner is what makes the fingerprint stable under a field addition.",
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "ownership",
+        "adapters"
+      ],
+      "properties": {
+        "fingerprint": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "ownership": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "adapters": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/AdapterEnvironment"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SemanticSnapshotKey": {
+      "description": "Leaf-local cache identity for compiler-derived facts. digest is computed over tree and environment only. A tree OID identifies canonical Git source and content references; environment identifies the compiler context. Future federation qualifies this key with a ProjectPin.",
+      "type": "object",
+      "required": [
+        "digest",
+        "tree",
+        "environment"
+      ],
+      "properties": {
+        "digest": {
+          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
+        },
+        "tree": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "environment": {
+          "$ref": "#/$defs/SemanticEnvironment"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceExcerpt": {
+      "type": "object",
+      "required": [
+        "span",
+        "text"
+      ],
+      "properties": {
+        "span": {
+          "$ref": "core.json#/$defs/SourceSpan"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileEntryKind": {
+      "description": "Portable interpretation of the Git tree entry mode.",
+      "enum": [
+        "regular",
+        "executable",
+        "symlink",
+        "gitlink"
+      ]
+    },
+    "GitBlobPayload": {
+      "description": "The Git blob bytes are the canonical file payload.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "git_blob"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LfsPointerPayload": {
+      "description": "A valid Git LFS v1 pointer recognized from the canonical Git blob. Rift verifies pointer syntax but does not fetch or expose the referenced content.",
+      "type": "object",
+      "required": [
+        "kind",
+        "version",
+        "oid",
+        "size"
+      ],
+      "properties": {
+        "kind": {
+          "const": "lfs_pointer"
+        },
+        "version": {
+          "const": "https://git-lfs.github.com/spec/v1"
+        },
+        "oid": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymlinkPayload": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symlink"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitlinkPayload": {
+      "description": "The File.object commit is a repository link, not content in this leaf snapshot.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "gitlink"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FilePayload": {
+      "description": "Interpretation of a Git tree entry without changing its canonical object identity.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/GitBlobPayload"
+        },
+        {
+          "$ref": "#/$defs/LfsPointerPayload"
+        },
+        {
+          "$ref": "#/$defs/SymlinkPayload"
+        },
+        {
+          "$ref": "#/$defs/GitlinkPayload"
+        }
+      ]
+    },
+    "File": {
+      "description": "A Git tree entry from the complete leaf snapshot. object is the canonical Git blob for files/symlinks and commit for gitlinks. LFS pointers, symlinks, and gitlinks are semantically opaque and never followed or hydrated. The oneOf constrains which payload may accompany which entry kind; it never varies the entry's shape.",
+      "type": "object",
+      "required": [
+        "path",
+        "object",
+        "kind",
+        "payload",
+        "languages",
+        "semantic"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "core.json#/$defs/ProjectPath"
+        },
+        "object": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "kind": {
+          "$ref": "#/$defs/FileEntryKind"
+        },
+        "payload": {
+          "$ref": "#/$defs/FilePayload"
+        },
+        "languages": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "semantic": {
+          "type": "boolean"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "regular",
+                "executable"
+              ]
+            },
+            "payload": {
+              "$ref": "#/$defs/GitBlobPayload"
+            }
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "regular",
+                "executable"
+              ]
+            },
+            "payload": {
+              "$ref": "#/$defs/LfsPointerPayload"
+            },
+            "languages": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "semantic": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "symlink"
+            },
+            "payload": {
+              "$ref": "#/$defs/SymlinkPayload"
+            },
+            "languages": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "semantic": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "gitlink"
+            },
+            "payload": {
+              "$ref": "#/$defs/GitlinkPayload"
+            },
+            "languages": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "semantic": {
+              "const": false
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "QueryExecution": {
+      "description": "Result-set metadata analogous to a database execution plan identity, without exposing implementation internals or nondeterministic timing.",
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "engine",
+        "version",
+        "order"
+      ],
+      "properties": {
+        "fingerprint": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "engine": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "order": {
+          "$ref": "#/$defs/ResultOrder"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SearchParams": {
+      "description": "Query is lexical over file text and symbol names/signatures; compiler semantics enter through fields and relationship filters.",
+      "type": "object",
+      "required": [
+        "commit",
+        "semantic",
+        "target",
+        "order"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "query"
+          ]
+        },
+        {
+          "required": [
+            "filter"
+          ]
+        }
+      ],
+      "properties": {
+        "commit": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
+        },
+        "target": {
+          "description": "Which entity kinds may be returned. Types are not standalone hits: they are reached through the Symbol and Element views that bind them, and searched over by filter.",
+          "enum": [
+            "symbol",
+            "element",
+            "file",
+            "all"
+          ]
+        },
+        "order": {
+          "$ref": "#/$defs/ResultOrder"
+        },
+        "query": {
+          "type": "string"
+        },
+        "filter": {
+          "$ref": "core.json#/$defs/Filter"
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "source",
+              "signature",
+              "relationships",
+              "diagnostics"
+            ]
+          }
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 50
+        },
+        "cursor": {
+          "$ref": "#/$defs/Cursor"
+        },
+        "leaf": {
+          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
+          "$ref": "#/$defs/LeafId"
+        }
+      },
+      "additionalProperties": false,
+      "examples": [
+        {
+          "commit": "0000000000000000000000000000000000000000",
+          "semantic": "0000000000000000000000000000000000000000000000000000000000000000",
+          "target": "symbol",
+          "order": "relevance",
+          "filter": {
+            "kind": "relation",
+            "relation": {
+              "kind": "calls",
+              "direction": "outgoing",
+              "target": {
+                "kind": "field",
+                "field": {
+                  "field": "name",
+                  "op": "eq",
+                  "value": "render"
+                }
+              }
+            }
+          }
+        },
+        {
+          "commit": "0000000000000000000000000000000000000000",
+          "semantic": "0000000000000000000000000000000000000000000000000000000000000000",
+          "target": "symbol",
+          "order": "path",
+          "filter": {
+            "kind": "relation",
+            "relation": {
+              "kind": "calls",
+              "direction": "incoming",
+              "target": {
+                "kind": "field",
+                "field": {
+                  "field": "path",
+                  "op": "prefix",
+                  "value": "src/api/"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SearchHit": {
+      "description": "One search hit. Identity is carried by the hit payload itself; there is no separate id field.",
+      "type": "object",
+      "required": [
+        "hit",
+        "score",
+        "matched_by"
+      ],
+      "properties": {
+        "hit": {
+          "$ref": "#/$defs/SearchHitTarget"
+        },
+        "score": {
+          "type": "number"
+        },
+        "matched_by": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Relationship"
+          }
+        },
+        "source": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolResourceUri": {
+      "description": "Paginated Symbol URI. The GlobalEntityId alphabet is URL-safe, so the identity path segment needs no encoding rule. Code snapshot, semantic snapshot, leaf, and cursor are query arguments.",
+      "type": "string",
+      "pattern": "^rift://symbol/[A-Za-z0-9_-]{1,512}\\?(leaf=[A-Za-z0-9_-]{1,128}&)?commit=[0-9a-f]{40}([0-9a-f]{24})?&semantic=[0-9a-f]{64}(&cursor=[^&#]+)?$"
+    },
+    "SymbolResourceLink": {
+      "description": "A portable link to the symbol resource. Rift always emits the explicit leaf form.",
+      "type": "object",
+      "required": [
+        "type",
+        "uri",
+        "name",
+        "mimeType"
+      ],
+      "properties": {
+        "type": {
+          "const": "resource_link"
+        },
+        "uri": {
+          "$ref": "#/$defs/SymbolResourceUri"
+        },
+        "name": {
+          "const": "symbol"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.symbol+json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolResourcePayload": {
+      "description": "JSON payload for one symbol at one snapshot.",
+      "type": "object",
+      "required": [
+        "uri",
+        "at",
+        "semantic_key",
+        "symbol",
+        "source_maps",
+        "elements",
+        "relationships",
+        "types",
+        "source",
+        "diagnostics",
+        "coverage",
+        "next",
+        "execution"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/SymbolResourceUri"
+        },
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "symbol": {
+          "$ref": "core.json#/$defs/Symbol"
+        },
+        "source_maps": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/SourceMapEntry"
+          }
+        },
+        "elements": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Element"
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Relationship"
+          }
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Type"
+          }
+        },
+        "source": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceExcerpt"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/SemanticCoverage"
+        },
+        "next": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SymbolResourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution": {
+          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
+          "$ref": "#/$defs/QueryExecution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolResourceContents": {
+      "description": "MCP text resource whose text is the JSON serialization of SymbolResourcePayload.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "text"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/SymbolResourceUri"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.symbol+json"
+        },
+        "text": {
+          "type": "string",
+          "contentMediaType": "application/vnd.rift.symbol+json",
+          "contentSchema": {
+            "$ref": "#/$defs/SymbolResourcePayload"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DiffResourceUri": {
+      "description": "Paginated diff URI; both commits are query arguments, never path identity.",
+      "type": "string",
+      "pattern": "^rift://diff\\?(leaf=[A-Za-z0-9_-]{1,128}&)?from=[0-9a-f]{40}([0-9a-f]{24})?&to=[0-9a-f]{40}([0-9a-f]{24})?(&cursor=[^&#]+)?$"
+    },
+    "DiffResourcePayload": {
+      "type": "object",
+      "required": [
+        "uri",
+        "diff",
+        "next",
+        "execution"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/DiffResourceUri"
+        },
+        "diff": {
+          "$ref": "#/$defs/SnapshotDiff"
+        },
+        "next": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DiffResourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution": {
+          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
+          "$ref": "#/$defs/QueryExecution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DiffResourceContents": {
+      "description": "MCP text resource whose text is the JSON serialization of DiffResourcePayload.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "text"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/DiffResourceUri"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.diff+json"
+        },
+        "text": {
+          "type": "string",
+          "contentMediaType": "application/vnd.rift.diff+json",
+          "contentSchema": {
+            "$ref": "#/$defs/DiffResourcePayload"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "BlobResourceUri": {
+      "description": "Opaque Git blob resource addressed by object ID as a query argument, never by a traversable path.",
+      "type": "string",
+      "pattern": "^rift://blob\\?(leaf=[A-Za-z0-9_-]{1,128}&)?object=[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "BlobResourceContents": {
+      "description": "MCP blob resource; blob is canonical base64 of the exact Git object payload, returned whole. This resource does not paginate: it is exact bytes, not a result set. Objects larger than DriverLimits.max_blob_bytes fail with limit_exceeded rather than being truncated or chunked.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "blob"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/BlobResourceUri"
+        },
+        "mimeType": {
+          "const": "application/octet-stream"
+        },
+        "blob": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreviewResourceUri": {
+      "description": "Paginated retained-preview record. commit selects identity; cursor is opaque and bound to that preview.",
+      "type": "string",
+      "pattern": "^rift://preview\\?(leaf=[A-Za-z0-9_-]{1,128}&)?commit=[0-9a-f]{40}([0-9a-f]{24})?(&cursor=[^&#]+)?$"
+    },
+    "PreviewResourceLink": {
+      "description": "A portable link to the preview resource. Rift always emits the explicit leaf form.",
+      "type": "object",
+      "required": [
+        "type",
+        "uri",
+        "name",
+        "mimeType"
+      ],
+      "properties": {
+        "type": {
+          "const": "resource_link"
+        },
+        "uri": {
+          "$ref": "#/$defs/PreviewResourceUri"
+        },
+        "name": {
+          "const": "preview"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.preview+json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreviewResourcePayload": {
+      "description": "One deterministic page of the complete retained preview. Operations and diagnostics form one canonical page stream; diff follows its own resource when truncated.",
+      "type": "object",
+      "required": [
+        "uri",
+        "snapshot",
+        "base",
+        "source_attempt",
+        "changes",
+        "validators",
+        "payload_hash",
+        "semantic_key",
+        "operations",
+        "diff",
+        "diff_resource",
+        "validation",
+        "diagnostics",
+        "next",
+        "execution"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/PreviewResourceUri"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/PreviewRef"
+        },
+        "base": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "source_attempt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AttemptRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "changes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Change"
+          }
+        },
+        "validators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SandboxedValidator"
+          }
+        },
+        "payload_hash": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedOperationView"
+          }
+        },
+        "diff": {
+          "$ref": "#/$defs/SnapshotDiff"
+        },
+        "diff_resource": {
+          "$ref": "#/$defs/DiffResourceUri"
+        },
+        "validation": {
+          "$ref": "#/$defs/CandidateValidation"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        },
+        "next": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/PreviewResourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution": {
+          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
+          "$ref": "#/$defs/QueryExecution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreviewResourceContents": {
+      "description": "MCP text resource whose text is the JSON serialization of PreviewResourcePayload.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "text"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/PreviewResourceUri"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.preview+json"
+        },
+        "text": {
+          "type": "string",
+          "contentMediaType": "application/vnd.rift.preview+json",
+          "contentSchema": {
+            "$ref": "#/$defs/PreviewResourcePayload"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ValidatorSandboxCapability": {
+      "description": "The validator isolation this host can actually provide, detected at startup and advertised rather than assumed. Isolation is host-dependent: macOS sandbox_init is deprecated and App Sandbox is not a public API for narrowing an arbitrary child, while on Linux denying network needs a network namespace plus closed inherited descriptors, and unprivileged user namespaces are restricted by default on some distributions. A leaf whose backend is none refuses validators with a typed error rather than running them unsandboxed, and therefore cannot claim the full profile. Running a caller validator while claiming network_denied without denying it is the one outcome forbidden outright.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "backend",
+            "network_denied",
+            "filesystem_isolated",
+            "bounded_output",
+            "bounded_time"
+          ],
+          "properties": {
+            "backend": {
+              "enum": [
+                "seatbelt",
+                "linux_namespaces",
+                "container"
+              ]
+            },
+            "network_denied": {
+              "const": true
+            },
+            "filesystem_isolated": {
+              "const": true
+            },
+            "bounded_output": {
+              "const": true
+            },
+            "bounded_time": {
+              "const": true
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "backend",
+            "reason"
+          ],
+          "properties": {
+            "backend": {
+              "const": "none"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TransactionContract": {
+      "description": "The only transaction semantics. ACID applies to one Rift leaf's immutable state, not worktree materialization or future federation.",
+      "type": "object",
+      "required": [
+        "atomicity",
+        "consistency",
+        "read_isolation",
+        "write_isolation",
+        "durability",
+        "autocommit",
+        "savepoints",
+        "materialization",
+        "federation"
+      ],
+      "properties": {
+        "atomicity": {
+          "const": "single_leaf_ref_transaction"
+        },
+        "consistency": {
+          "const": "schema_preconditions_and_complete_validation"
+        },
+        "read_isolation": {
+          "const": "repeatable_snapshot"
+        },
+        "write_isolation": {
+          "const": "snapshot_first_committer_wins"
+        },
+        "durability": {
+          "const": "git_objects_then_ref"
+        },
+        "autocommit": {
+          "const": false
+        },
+        "savepoints": {
+          "const": false
+        },
+        "materialization": {
+          "const": "outside_transaction"
+        },
+        "federation": {
+          "const": "not_atomic"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ContractDescriptor": {
+      "type": "object",
+      "required": [
+        "protocol",
+        "schema",
+        "canonical_json"
+      ],
+      "properties": {
+        "protocol": {
+          "$ref": "core.json#/$defs/ProtocolVersion"
+        },
+        "schema": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "canonical_json": {
+          "const": "RFC8785"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DriverLimits": {
+      "description": "Effective caller-visible MCP limits supplied by launch/host policy. A request that exceeds one, or a response that would exceed max_blob_bytes, fails with limit_exceeded carrying LimitEvidence.",
+      "type": "object",
+      "required": [
+        "max_request_bytes",
+        "max_blob_bytes",
+        "max_page_items",
+        "max_relation_depth",
+        "max_changes",
+        "max_validators",
+        "max_program_expansions"
+      ],
+      "properties": {
+        "max_request_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 9007199254740991
+        },
+        "max_blob_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 9007199254740991,
+          "description": "Largest Git blob the blob resource will return. The blob resource is deliberately exempt from pagination — it delivers exact opaque bytes, and a cursor over raw bytes buys nothing a byte range would not do better — so it is bounded instead. A larger object fails with limit_exceeded carrying the object size, letting the caller fall back to the diff resource or wait for range reads in a later version. Without this bound the resource has no defined behaviour for a large object, since max_request_bytes bounds requests rather than responses."
+        },
+        "max_page_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "max_relation_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "max_changes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "max_validators": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "max_program_expansions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryResourceUri": {
+      "description": "Paginated leaf metadata/capability URI at one retained snapshot. leaf is optional on the wire and defaults to the session binding; Rift always emits the explicit form so links stay portable.",
+      "type": "string",
+      "pattern": "^rift://repository\\?(leaf=[A-Za-z0-9_-]{1,128}&)?commit=[0-9a-f]{40}([0-9a-f]{24})?(&cursor=[^&#]+)?$"
+    },
+    "RepositoryResourceLink": {
+      "description": "A portable link to the repository resource. Rift always emits the explicit leaf form.",
+      "type": "object",
+      "required": [
+        "type",
+        "uri",
+        "name",
+        "mimeType"
+      ],
+      "properties": {
+        "type": {
+          "const": "resource_link"
+        },
+        "uri": {
+          "$ref": "#/$defs/RepositoryResourceUri"
+        },
+        "name": {
+          "const": "repository"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.repository+json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryResourcePayload": {
+      "description": "Driver-style leaf metadata: effective contract, ACID semantics, semantic coverage, and installed adapter capabilities. Pages are deterministic and snapshot-bound.",
+      "type": "object",
+      "required": [
+        "uri",
+        "at",
+        "semantic_key",
+        "contract",
+        "transaction",
+        "validator_sandbox",
+        "limits",
+        "languages",
+        "adapters",
+        "coverage",
+        "tools",
+        "resources",
+        "next",
+        "leaf",
+        "object_format",
+        "retention",
+        "matching",
+        "profile",
+        "execution"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/RepositoryResourceUri"
+        },
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "contract": {
+          "$ref": "#/$defs/ContractDescriptor"
+        },
+        "transaction": {
+          "$ref": "#/$defs/TransactionContract"
+        },
+        "validator_sandbox": {
+          "$ref": "#/$defs/ValidatorSandboxCapability"
+        },
+        "limits": {
+          "$ref": "#/$defs/DriverLimits"
+        },
+        "languages": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/LanguageId"
+          }
+        },
+        "adapters": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/LanguageSubstrate"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/SemanticCoverage"
+        },
+        "tools": {
+          "description": "Effective MCP tools authorized for this caller at this leaf.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "search",
+              "match",
+              "actions",
+              "apply",
+              "persist"
+            ]
+          }
+        },
+        "resources": {
+          "description": "Effective MCP resource families authorized for this caller at this leaf.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "repository",
+              "symbol",
+              "preview",
+              "diff",
+              "blob"
+            ]
+          }
+        },
+        "next": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RepositoryResourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "leaf": {
+          "$ref": "#/$defs/LeafId"
+        },
+        "object_format": {
+          "enum": [
+            "sha1",
+            "sha256"
+          ]
+        },
+        "retention": {
+          "$ref": "#/$defs/RetentionPolicy"
+        },
+        "matching": {
+          "$ref": "#/$defs/MatchingDialects"
+        },
+        "profile": {
+          "$ref": "#/$defs/ConformanceProfile"
+        },
+        "execution": {
+          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
+          "$ref": "#/$defs/QueryExecution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryResourceContents": {
+      "description": "MCP text resource whose text is the JSON serialization of RepositoryResourcePayload.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "text"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/RepositoryResourceUri"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.repository+json"
+        },
+        "text": {
+          "type": "string",
+          "contentMediaType": "application/vnd.rift.repository+json",
+          "contentSchema": {
+            "$ref": "#/$defs/RepositoryResourcePayload"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SearchResult": {
+      "type": "object",
+      "required": [
+        "at",
+        "semantic_key",
+        "execution",
+        "coverage",
+        "results",
+        "next_cursor"
+      ],
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "execution": {
+          "$ref": "#/$defs/QueryExecution"
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SearchHit"
+          }
+        },
+        "next_cursor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicCodeAction": {
+      "type": "object",
+      "required": [
+        "ref",
+        "owner",
+        "descriptor"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "core.json#/$defs/PublicCodeActionRef"
+        },
+        "owner": {
+          "$ref": "core.json#/$defs/OwnerId"
+        },
+        "descriptor": {
+          "$ref": "core.json#/$defs/CodeActionDescriptor"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionsParams": {
+      "type": "object",
+      "required": [
+        "commit",
+        "semantic",
+        "target",
+        "only"
+      ],
+      "properties": {
+        "commit": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
+        },
+        "target": {
+          "$ref": "core.json#/$defs/Address"
+        },
+        "only": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]*$"
+          }
+        },
+        "leaf": {
+          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
+          "$ref": "#/$defs/LeafId"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "cursor": {
+          "$ref": "#/$defs/Cursor"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionsResult": {
+      "type": "object",
+      "required": [
+        "at",
+        "semantic_key",
+        "execution",
+        "actions",
+        "coverage",
+        "next_cursor"
+      ],
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicCodeAction"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        },
+        "next_cursor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution": {
+          "description": "Execution identity for this page. Actions have exactly one legal order.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/QueryExecution"
+            }
+          ],
+          "properties": {
+            "order": {
+              "const": "identity"
+            }
+          }
+        }
+      },
+      "additionalProperties": false,
+      "description": "Discovered actions for one pinned address. Paginated on the same contract as search and match: a declared total order and engine version, and a cursor bound to both. Without execution the cursor would be bound to an ordering contract the response never published, which is exactly how pagination duplicates or skips."
+    },
+    "Operation": {
+      "description": "One ordered mechanical, compiler-resolved, or Rift-core change.",
+      "oneOf": [
+        {
+          "$ref": "core.json#/$defs/MechanicalOperation"
+        },
+        {
+          "$ref": "core.json#/$defs/ResolvableOperation"
+        },
+        {
+          "$ref": "#/$defs/RevisionRevertOperation"
+        }
+      ]
+    },
+    "TextQuery": {
+      "description": "Rift-core UTF-8 literal or rust-regex regex matching for any regular/executable text file, independent of language ownership. The dialect is named and advertised through MatchingDialects; it is deliberately not RE2, which defines the Perl classes and word boundaries as ASCII where rust-regex defines them as Unicode. case_sensitive and multiline set the pattern's initial flag state; an inline flag group overrides them from its position onward, so the fields are defaults rather than an outer constraint. In literal mode the pattern is matched bytewise and no flag is interpreted.",
+      "type": "object",
+      "required": [
+        "kind",
+        "version",
+        "mode",
+        "pattern",
+        "case_sensitive",
+        "multiline",
+        "paths"
+      ],
+      "properties": {
+        "kind": {
+          "const": "text"
+        },
+        "version": {
+          "const": 1
+        },
+        "mode": {
+          "enum": [
+            "literal",
+            "regex"
+          ]
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "case_sensitive": {
+          "type": "boolean"
+        },
+        "multiline": {
+          "type": "boolean"
+        },
+        "paths": {
+          "$ref": "core.json#/$defs/PathSelector"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchQuery": {
+      "oneOf": [
+        {
+          "$ref": "core.json#/$defs/StructuralQuery"
+        },
+        {
+          "$ref": "#/$defs/TextQuery"
+        }
+      ],
+      "description": "One match request, tagged by the engine that must answer it."
+    },
+    "StructuralMatchHit": {
+      "description": "One explained deterministic match. Matches sort by physical path, range, then canonical capture bytes.",
+      "type": "object",
+      "required": [
+        "kind",
+        "ref",
+        "owner",
+        "span",
+        "replacement_ranges",
+        "captures",
+        "explanation",
+        "extensions"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "core.json#/$defs/PublicMatchRef"
+        },
+        "owner": {
+          "$ref": "core.json#/$defs/OwnerId"
+        },
+        "span": {
+          "$ref": "core.json#/$defs/SourceSpan"
+        },
+        "replacement_ranges": {
+          "$ref": "core.json#/$defs/StructuralMatchRanges"
+        },
+        "captures": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/StructuralCapture"
+          }
+        },
+        "explanation": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "extensions": {
+          "$ref": "core.json#/$defs/Extensions"
+        },
+        "kind": {
+          "const": "structural"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TextMatchHit": {
+      "type": "object",
+      "required": [
+        "kind",
+        "ref",
+        "span",
+        "captures",
+        "explanation"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "core.json#/$defs/PublicMatchRef"
+        },
+        "span": {
+          "$ref": "core.json#/$defs/SourceSpan"
+        },
+        "captures": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/StructuralCapture"
+          }
+        },
+        "explanation": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "kind": {
+          "const": "text"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchHit": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StructuralMatchHit"
+        },
+        {
+          "$ref": "#/$defs/TextMatchHit"
+        }
+      ],
+      "description": "One match, tagged by the engine that produced it."
+    },
+    "MatchParams": {
+      "type": "object",
+      "required": [
+        "commit",
+        "semantic",
+        "query",
+        "limit"
+      ],
+      "properties": {
+        "commit": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
+        },
+        "query": {
+          "$ref": "#/$defs/MatchQuery"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "cursor": {
+          "$ref": "#/$defs/Cursor"
+        },
+        "leaf": {
+          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
+          "$ref": "#/$defs/LeafId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchResult": {
+      "type": "object",
+      "required": [
+        "at",
+        "semantic_key",
+        "execution",
+        "matches",
+        "coverage",
+        "next_cursor"
+      ],
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "execution": {
+          "description": "The match aggregator uses canonical physical path/range/identity order.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/QueryExecution"
+            },
+            {
+              "properties": {
+                "order": {
+                  "const": "path"
+                }
+              }
+            }
+          ]
+        },
+        "matches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MatchHit"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        },
+        "next_cursor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchSelection": {
+      "description": "Match IDs are copied from match or preview results and interpreted against the request's pinned base/query. Unknown or stale IDs are refused.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "mode",
+            "matches"
+          ],
+          "properties": {
+            "mode": {
+              "const": "all"
+            },
+            "matches": {
+              "type": "array",
+              "maxItems": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode",
+            "matches"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "only",
+                "except"
+              ]
+            },
+            "matches": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "core.json#/$defs/Sha256Digest"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TransformName": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+    },
+    "TransformSource": {
+      "description": "Reference to one query capture or an earlier transform in the same ordered transform array.",
+      "type": "string",
+      "pattern": "^(?:capture:(?:[A-Za-z][A-Za-z0-9_]*|[0-9]+)|transform:[A-Za-z][A-Za-z0-9_]*)$"
+    },
+    "RenderTemplate": {
+      "description": "Portable template: {{capture:NAME}} inserts a capture and {{transform:NAME}} an earlier transform. Numeric regex captures use {{capture:N}}. Double opening or closing braces escape literal brace pairs. Missing, forward, or cardinality-incompatible references are refused.",
+      "type": "string"
+    },
+    "StructuralTransform": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "kind",
+            "source",
+            "pattern",
+            "replacement",
+            "all"
+          ],
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/TransformName"
+            },
+            "kind": {
+              "const": "regex_replace"
+            },
+            "source": {
+              "$ref": "#/$defs/TransformSource"
+            },
+            "pattern": {
+              "type": "string",
+              "description": "rust-regex, evaluated by Rift."
+            },
+            "replacement": {
+              "type": "string",
+              "description": "Expansion is $1 and ${name} for numbered and named groups; $$ is a literal dollar. A group that did not participate in the match expands to empty rather than refusing. No backslash escapes and no case-folding operators, so expansion cannot itself need a second grammar."
+            },
+            "all": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "kind",
+            "source",
+            "case"
+          ],
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/TransformName"
+            },
+            "kind": {
+              "const": "case"
+            },
+            "source": {
+              "$ref": "#/$defs/TransformSource"
+            },
+            "case": {
+              "enum": [
+                "upper",
+                "lower",
+                "snake",
+                "camel",
+                "pascal",
+                "kebab"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "kind",
+            "source",
+            "start",
+            "end"
+          ],
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/TransformName"
+            },
+            "kind": {
+              "const": "slice"
+            },
+            "source": {
+              "$ref": "#/$defs/TransformSource"
+            },
+            "start": {
+              "type": "integer"
+            },
+            "end": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "kind",
+            "source",
+            "separator"
+          ],
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/TransformName"
+            },
+            "kind": {
+              "const": "join"
+            },
+            "source": {
+              "$ref": "#/$defs/TransformSource"
+            },
+            "separator": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "StructuralTemplate": {
+      "description": "Template placeholders reference captures or named transforms. delete requires an empty template. Trivia envelopes apply to the main match; a target_capture requires trivia=exact. The adapter parses the rendered replacement before returning effects.",
+      "type": "object",
+      "required": [
+        "mode",
+        "target_capture",
+        "trivia",
+        "template",
+        "transforms",
+        "repeat",
+        "max_iterations",
+        "extensions"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "replace",
+            "delete",
+            "insert_before",
+            "insert_after"
+          ]
+        },
+        "target_capture": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trivia": {
+          "enum": [
+            "exact",
+            "leading",
+            "trailing",
+            "both"
+          ]
+        },
+        "template": {
+          "$ref": "#/$defs/RenderTemplate"
+        },
+        "transforms": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StructuralTransform"
+          }
+        },
+        "repeat": {
+          "enum": [
+            "once",
+            "fixpoint"
+          ]
+        },
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "extensions": {
+          "$ref": "core.json#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RewriteProgramStep": {
+      "type": "object",
+      "required": [
+        "kind",
+        "query",
+        "selection",
+        "replacement",
+        "formatting"
+      ],
+      "properties": {
+        "kind": {
+          "const": "rewrite"
+        },
+        "query": {
+          "$ref": "core.json#/$defs/StructuralQuery"
+        },
+        "selection": {
+          "$ref": "#/$defs/MatchSelection"
+        },
+        "replacement": {
+          "$ref": "#/$defs/StructuralTemplate"
+        },
+        "formatting": {
+          "$ref": "core.json#/$defs/FormattingPolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TextRewriteProgramStep": {
+      "description": "Rift-core deterministic literal/regex rewrite. Template references numbered or named regex captures; every result retains object-ID and match preconditions.",
+      "type": "object",
+      "required": [
+        "kind",
+        "query",
+        "selection",
+        "template",
+        "transforms",
+        "repeat",
+        "max_iterations",
+        "formatting"
+      ],
+      "properties": {
+        "kind": {
+          "const": "text_rewrite"
+        },
+        "query": {
+          "$ref": "#/$defs/TextQuery"
+        },
+        "selection": {
+          "$ref": "#/$defs/MatchSelection"
+        },
+        "template": {
+          "$ref": "#/$defs/RenderTemplate"
+        },
+        "transforms": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StructuralTransform"
+          }
+        },
+        "repeat": {
+          "enum": [
+            "once",
+            "fixpoint"
+          ]
+        },
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "formatting": {
+          "$ref": "core.json#/$defs/FormattingPolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperationProgramStep": {
+      "type": "object",
+      "required": [
+        "kind",
+        "request",
+        "bind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "operation"
+        },
+        "request": {
+          "$ref": "#/$defs/OperationChange"
+        },
+        "bind": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProgramSubstitution": {
+      "description": "Render a string from current-match captures into one RFC 6901 JSON Pointer of the operation request, then validate the rendered request against OperationRequest before resolution.",
+      "type": "object",
+      "required": [
+        "pointer",
+        "template",
+        "transforms"
+      ],
+      "properties": {
+        "pointer": {
+          "type": "string",
+          "pattern": "^(?:/(?:[^~/]|~0|~1)*)+$"
+        },
+        "template": {
+          "$ref": "#/$defs/RenderTemplate"
+        },
+        "transforms": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StructuralTransform"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ForEachProgramStep": {
+      "description": "Resolve one ordinary operation request per selected match in deterministic order. current_match targets are legal only in request.",
+      "type": "object",
+      "required": [
+        "kind",
+        "query",
+        "selection",
+        "request",
+        "substitutions",
+        "bind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "foreach"
+        },
+        "query": {
+          "$ref": "#/$defs/MatchQuery"
+        },
+        "selection": {
+          "$ref": "#/$defs/MatchSelection"
+        },
+        "request": {
+          "$ref": "#/$defs/OperationChange"
+        },
+        "substitutions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProgramSubstitution"
+          }
+        },
+        "bind": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AssertProgramStep": {
+      "type": "object",
+      "required": [
+        "kind",
+        "query",
+        "cardinality"
+      ],
+      "properties": {
+        "kind": {
+          "const": "assert"
+        },
+        "query": {
+          "$ref": "#/$defs/MatchQuery"
+        },
+        "cardinality": {
+          "$ref": "core.json#/$defs/ProgramCardinality"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConditionalProgramStep": {
+      "type": "object",
+      "required": [
+        "kind",
+        "query",
+        "cardinality",
+        "then",
+        "else"
+      ],
+      "properties": {
+        "kind": {
+          "const": "if"
+        },
+        "query": {
+          "$ref": "#/$defs/MatchQuery"
+        },
+        "cardinality": {
+          "$ref": "core.json#/$defs/ProgramCardinality"
+        },
+        "then": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProgramStep"
+          }
+        },
+        "else": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProgramStep"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProgramStep": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/RewriteProgramStep"
+        },
+        {
+          "$ref": "#/$defs/TextRewriteProgramStep"
+        },
+        {
+          "$ref": "#/$defs/OperationProgramStep"
+        },
+        {
+          "$ref": "#/$defs/ForEachProgramStep"
+        },
+        {
+          "$ref": "#/$defs/AssertProgramStep"
+        },
+        {
+          "$ref": "#/$defs/ConditionalProgramStep"
+        }
+      ]
+    },
+    "EditProgram": {
+      "description": "Inline deterministic composition only. Programs have no registry, dependency resolution, shell steps, network, or model-generated bodies.",
+      "type": "object",
+      "required": [
+        "kind",
+        "version",
+        "steps",
+        "max_expansions"
+      ],
+      "properties": {
+        "kind": {
+          "const": "program"
+        },
+        "version": {
+          "const": 1
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/ProgramStep"
+          }
+        },
+        "max_expansions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        }
+      },
+      "additionalProperties": false
+    },
+    "RevisionRevertOperation": {
+      "description": "Reverse one accepted Revision's parent diff onto the current base, producing a new validated Revision rather than rewinding a ref. Non-applicable or ambiguous hunks are typed conflicts.",
+      "type": "object",
+      "required": [
+        "kind",
+        "revision"
+      ],
+      "properties": {
+        "kind": {
+          "const": "revision.revert"
+        },
+        "revision": {
+          "$ref": "core.json#/$defs/GitOid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperationChange": {
+      "type": "object",
+      "required": [
+        "kind",
+        "operation",
+        "scope",
+        "formatting",
+        "effects"
+      ],
+      "properties": {
+        "kind": {
+          "const": "operation"
+        },
+        "operation": {
+          "$ref": "#/$defs/Operation"
+        },
+        "scope": {
+          "$ref": "core.json#/$defs/RefactorScope"
+        },
+        "formatting": {
+          "$ref": "core.json#/$defs/FormattingPolicy"
+        },
+        "effects": {
+          "$ref": "core.json#/$defs/EffectSelection"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PatchChange": {
+      "description": "A text-only unified diff. Absolute/traversing paths, binary patches, and context mismatches are rejected.",
+      "type": "object",
+      "required": [
+        "kind",
+        "patch",
+        "formatting"
+      ],
+      "properties": {
+        "kind": {
+          "const": "patch"
+        },
+        "patch": {
+          "type": "string"
+        },
+        "formatting": {
+          "$ref": "core.json#/$defs/FormattingPolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Change": {
+      "description": "One deterministic operation request, edit program, or text-only unified patch.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PatchChange"
+        },
+        {
+          "$ref": "#/$defs/OperationChange"
+        },
+        {
+          "$ref": "#/$defs/EditProgram"
+        }
+      ]
+    },
+    "MaterializedPath": {
+      "description": "The last Git entry Rift observed or wrote for one path in this worktree. Tagged rather than correlated, so absence and presence are separate shapes instead of a null-agreement rule. entry detects mode changes even when object bytes are unchanged.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "path"
+          ],
+          "properties": {
+            "kind": {
+              "const": "absent"
+            },
+            "path": {
+              "$ref": "core.json#/$defs/ProjectPath"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "path",
+            "entry",
+            "object"
+          ],
+          "properties": {
+            "kind": {
+              "const": "present"
+            },
+            "path": {
+              "$ref": "core.json#/$defs/ProjectPath"
+            },
+            "entry": {
+              "$ref": "#/$defs/FileEntryKind"
+            },
+            "object": {
+              "$ref": "core.json#/$defs/GitOid"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MaterializationLedger": {
+      "description": "Per-worktree drift baseline, seeded from the initial snapshot and advanced after each successful per-file write.",
+      "type": "object",
+      "required": [
+        "paths"
+      ],
+      "properties": {
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/MaterializedPath"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SandboxedValidator": {
+      "description": "Caller-authorized acceptance gate executed without a shell in a disposable candidate copy. Network is denied; declared dependencies are read-only; writes are confined to the disposable copy and private temp and never become edit effects.",
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "argv",
+        "changed_paths",
+        "working_directory",
+        "environment",
+        "timeout_ms",
+        "output_limit_bytes",
+        "inputs",
+        "determinism",
+        "network"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ValidatorId"
+        },
+        "kind": {
+          "enum": [
+            "test",
+            "lint",
+            "build",
+            "other"
+          ]
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "changed_paths": {
+          "description": "append expands the canonical changed ProjectPath set into individual argv entries after the literal argv.",
+          "enum": [
+            "none",
+            "append"
+          ]
+        },
+        "working_directory": {
+          "oneOf": [
+            {
+              "const": "."
+            },
+            {
+              "$ref": "core.json#/$defs/ProjectPath"
+            }
+          ]
+        },
+        "environment": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600000
+        },
+        "output_limit_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 10485760
+        },
+        "inputs": {
+          "enum": [
+            "changed_files",
+            "project"
+          ]
+        },
+        "determinism": {
+          "enum": [
+            "deterministic",
+            "best_effort"
+          ]
+        },
+        "network": {
+          "const": "denied"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CapturedValidatorOutput": {
+      "description": "Bounded UTF-8 decoding of one raw stream. Invalid byte sequences decode with U+FFFD; sha256 covers the complete raw stream, including bytes beyond the captured prefix.",
+      "type": "object",
+      "required": [
+        "text",
+        "captured_bytes",
+        "total_bytes",
+        "truncated",
+        "sha256"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "captured_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "sha256": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ValidatorResult": {
+      "description": "A completed validator result, linked to its declaration solely by declaration_digest. It does not echo the declaration's id, kind, or determinism: an echoed field can disagree with the declaration it claims to answer, and retained audit evidence that contradicts its own declaration is worse than none. status and exit_code are correlated, not independent: a gate is passed exactly when its process exited zero. There is no nonzero-success policy, because a gate whose meaning depends on interpreting its own exit codes is not a gate. Launch, sandbox, timeout, or capture failure is infrastructure failure and produces no CandidateValidation.",
+      "type": "object",
+      "required": [
+        "declaration_digest",
+        "status",
+        "exit_code",
+        "files",
+        "diagnostics",
+        "stdout",
+        "stderr"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "passed",
+            "failed"
+          ]
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/ProjectPath"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Diagnostic"
+          }
+        },
+        "stdout": {
+          "$ref": "#/$defs/CapturedValidatorOutput"
+        },
+        "stderr": {
+          "$ref": "#/$defs/CapturedValidatorOutput"
+        },
+        "declaration_digest": {
+          "description": "SHA-256 over the canonical SandboxedValidator this result answers. Ids alone are not identity: two declarations may share an id and differ in argv, and a coverage check on ids alone could be satisfied by the passing one while the failing one is simply omitted. The completeness invariant is a bijection on these digests.",
+          "$ref": "core.json#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "passed"
+            },
+            "exit_code": {
+              "const": 0
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "const": "failed"
+            },
+            "exit_code": {
+              "not": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CandidateValidation": {
+      "description": "Complete acceptance evidence. language is the mandatory deterministic adapter union; validators are optional caller-authorized gates. Acceptance is exactly 'language valid and every validator passed', derived from those two rather than restated, so no accepted outcome can disagree with the evidence it carries. Files and diagnostics likewise derive.",
+      "type": "object",
+      "required": [
+        "language",
+        "validators"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/Validation"
+        },
+        "validators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ValidatorResult"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreviewApplyParams": {
+      "type": "object",
+      "required": [
+        "mode",
+        "base",
+        "semantic",
+        "changes",
+        "validators"
+      ],
+      "properties": {
+        "mode": {
+          "const": "preview"
+        },
+        "base": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
+        },
+        "source_attempt": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "changes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Change"
+          }
+        },
+        "validators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SandboxedValidator"
+          },
+          "uniqueItems": true
+        },
+        "leaf": {
+          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
+          "$ref": "#/$defs/LeafId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublishApplyParams": {
+      "description": "Publish reuses the retained Preview's base, repair source, changes, and validators. Rift reruns that exact contract and refuses if its plan no longer matches.",
+      "type": "object",
+      "required": [
+        "mode",
+        "idempotency_key",
+        "preview",
+        "confirmations"
+      ],
+      "properties": {
+        "mode": {
+          "const": "publish"
+        },
+        "preview": {
+          "$ref": "#/$defs/PreviewRef"
+        },
+        "idempotency_key": {
+          "description": "Caller-chosen retry key, restricted to printable ASCII so its byte encoding is total and identical in every language — a lone surrogate is retained by one runtime, replaced by another, and rejected by a third, which would make two implementations probe different paths. Its durable location is transactions/<lowercase hex sha256 of those bytes>, never the key itself: a printable key may still contain a slash, so a raw key could collide with another key's tree prefix.",
+          "type": "string",
+          "pattern": "^[\\x21-\\x7E]{1,256}$"
+        },
+        "confirmations": {
+          "description": "Every currently required confirmation id, byte-sorted. The sort is normative, not cosmetic: payload_hash is taken over RFC 8785 canonical JSON, which preserves array order, so an unsorted set would make [A,B] and [B,A] hash differently and turn one implementation's exact retry into another's idempotency_key_reused. This is the same set_order rule DeterminismContract already fixes for adapter frames.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/Sha256Digest"
+          }
+        },
+        "leaf": {
+          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
+          "$ref": "#/$defs/LeafId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefreshApplyParams": {
+      "description": "Re-resolve the retained Preview's exact intent and validator contract on a new accepted base and compare targets/effects; it never publishes.",
+      "type": "object",
+      "required": [
+        "mode",
+        "previous",
+        "base",
+        "semantic"
+      ],
+      "properties": {
+        "mode": {
+          "const": "refresh"
+        },
+        "previous": {
+          "$ref": "#/$defs/PreviewRef"
+        },
+        "base": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
+        },
+        "leaf": {
+          "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
+          "$ref": "#/$defs/LeafId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ApplyParams": {
+      "description": "Preview records the complete canonical contract and durably retains it as a record entry. Refresh reuses it on a new base. Publish reruns it, requires every current confirmation id, then performs CAS publication. Neither preview nor refresh writes accepted head, Attempt, transaction outcome, or worktree materialization state.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PreviewApplyParams"
+        },
+        {
+          "$ref": "#/$defs/RefreshApplyParams"
+        },
+        {
+          "$ref": "#/$defs/PublishApplyParams"
+        }
+      ]
+    },
+    "DiagnosticView": {
+      "description": "A Diagnostic enriched for an MCP response without redefining the underlying fact.",
+      "type": "object",
+      "required": [
+        "source",
+        "at",
+        "diagnostic",
+        "line",
+        "column",
+        "excerpt"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "compiler",
+            "validator",
+            "apply"
+          ]
+        },
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "diagnostic": {
+          "$ref": "core.json#/$defs/Diagnostic"
+        },
+        "line": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "column": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "excerpt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DiffHunk": {
+      "description": "A bounded unified-diff hunk. Patch includes its @@ header and lines.",
+      "type": "object",
+      "required": [
+        "old_start",
+        "old_lines",
+        "new_start",
+        "new_lines",
+        "patch"
+      ],
+      "properties": {
+        "old_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "old_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "new_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "new_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "patch": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileDiff": {
+      "type": "object",
+      "required": [
+        "status",
+        "path",
+        "entry_before",
+        "entry_after",
+        "object_before",
+        "object_after",
+        "hunks",
+        "binary",
+        "truncated"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "created",
+            "modified",
+            "deleted",
+            "renamed",
+            "copied"
+          ]
+        },
+        "path": {
+          "$ref": "core.json#/$defs/ProjectPath"
+        },
+        "previous_path": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/ProjectPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hunks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffHunk"
+          }
+        },
+        "entry_before": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/FileEntryKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "entry_after": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/FileEntryKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "object_before": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/GitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "object_after": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/GitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "binary": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/BinaryDiffSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BinaryDiffSummary": {
+      "type": "object",
+      "required": [
+        "before_sha256",
+        "after_sha256",
+        "before_bytes",
+        "after_bytes"
+      ],
+      "properties": {
+        "before_sha256": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after_sha256": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "before_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "after_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SnapshotDiff": {
+      "type": "object",
+      "required": [
+        "from",
+        "to",
+        "files",
+        "truncated"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "to": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FileDiff"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PersistOutcome": {
+      "description": "Per-path materialization result. Sparse exclusions, nested repository roots, and external content references are safety skips, never implicit checkout expansion, traversal, or hydration.",
+      "type": "object",
+      "required": [
+        "path",
+        "outcome"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "core.json#/$defs/ProjectPath"
+        },
+        "outcome": {
+          "enum": [
+            "written",
+            "unchanged",
+            "skipped_drift",
+            "skipped_deletion",
+            "skipped_unsupported_kind",
+            "skipped_external_content",
+            "skipped_sparse",
+            "skipped_nested_repository",
+            "not_found"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConfirmationView": {
+      "type": "object",
+      "required": [
+        "id",
+        "requirement"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "requirement": {
+          "$ref": "core.json#/$defs/ConfirmationRequirement"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperationOrigin": {
+      "description": "Location of one expanded operation in the caller's top-level change/program tree.",
+      "type": "object",
+      "required": [
+        "change",
+        "steps",
+        "match"
+      ],
+      "properties": {
+        "change": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          }
+        },
+        "match": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExpandedEdit": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OperationChange"
+        },
+        {
+          "$ref": "#/$defs/PatchChange"
+        },
+        {
+          "$ref": "#/$defs/RewriteProgramStep"
+        },
+        {
+          "$ref": "#/$defs/TextRewriteProgramStep"
+        }
+      ]
+    },
+    "EffectGroupView": {
+      "description": "An independently selectable, dependency-aware effect group. Rift derives id from operation id plus canonical group body.",
+      "type": "object",
+      "required": [
+        "id",
+        "key",
+        "title",
+        "category",
+        "required",
+        "default_selected",
+        "requires",
+        "changes",
+        "effects",
+        "warnings",
+        "confirmations"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "primary",
+            "reference",
+            "hierarchy",
+            "import",
+            "generated",
+            "textual",
+            "file"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "default_selected": {
+          "type": "boolean"
+        },
+        "requires": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/Sha256Digest"
+          }
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/MechanicalOperation"
+          }
+        },
+        "effects": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/OperationEffect"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Diagnostic"
+          }
+        },
+        "confirmations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConfirmationView"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "FormattingResult": {
+      "description": "Formatting-only effects, separated from the semantic reduction. Untouched bytes are invariant under every policy.",
+      "type": "object",
+      "required": [
+        "policy",
+        "coverage",
+        "files",
+        "changes"
+      ],
+      "properties": {
+        "policy": {
+          "$ref": "core.json#/$defs/FormattingPolicy"
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        },
+        "files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/ProjectPath"
+          }
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/MechanicalOperation"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResolvedOperationView": {
+      "description": "Auditable correlation from one expanded edit to exact selectable groups, formatting, and semantic evidence. Arrays retain resolution order.",
+      "type": "object",
+      "required": [
+        "id",
+        "index",
+        "origin",
+        "requested",
+        "owner",
+        "groups",
+        "preconditions",
+        "warnings",
+        "guarantees",
+        "formatting"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "origin": {
+          "$ref": "#/$defs/OperationOrigin"
+        },
+        "requested": {
+          "$ref": "#/$defs/ExpandedEdit"
+        },
+        "owner": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/OwnerId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/EffectGroupView"
+          }
+        },
+        "preconditions": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/OperationPrecondition"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Diagnostic"
+          }
+        },
+        "guarantees": {
+          "$ref": "core.json#/$defs/OperationGuarantees"
+        },
+        "formatting": {
+          "$ref": "#/$defs/FormattingResult"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreviewApplyResult": {
+      "description": "A bounded first page of a retained, non-head result. resource exposes the complete plan. Preview does not advance head, create an Attempt/outcome, update the ledger, or materialize files.",
+      "type": "object",
+      "required": [
+        "status",
+        "base",
+        "snapshot",
+        "resource",
+        "semantic_key",
+        "operations",
+        "diff",
+        "validation",
+        "diagnostics"
+      ],
+      "properties": {
+        "status": {
+          "const": "preview"
+        },
+        "base": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/PreviewRef"
+        },
+        "resource": {
+          "$ref": "#/$defs/PreviewResourceLink"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedOperationView"
+          }
+        },
+        "diff": {
+          "$ref": "#/$defs/SnapshotDiff"
+        },
+        "validation": {
+          "$ref": "#/$defs/CandidateValidation"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefreshMapping": {
+      "description": "Evidence-backed mapping between prior and refreshed plan identities; ambiguous mappings refuse refresh and never appear here.",
+      "type": "object",
+      "required": [
+        "kind",
+        "from",
+        "to",
+        "evidence"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "operation",
+            "effect",
+            "confirmation",
+            "match",
+            "target"
+          ]
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "enum": [
+            "identical",
+            "external_identity",
+            "source_map",
+            "structural_anchor",
+            "adapter_semantics"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefreshDelta": {
+      "type": "object",
+      "required": [
+        "materially_changed",
+        "mappings",
+        "added_effects",
+        "removed_effects",
+        "changed_effects",
+        "added_confirmations",
+        "removed_confirmations"
+      ],
+      "properties": {
+        "materially_changed": {
+          "type": "boolean"
+        },
+        "mappings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RefreshMapping"
+          }
+        },
+        "added_effects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/Sha256Digest"
+          }
+        },
+        "removed_effects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/Sha256Digest"
+          }
+        },
+        "changed_effects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/Sha256Digest"
+          }
+        },
+        "added_confirmations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/Sha256Digest"
+          }
+        },
+        "removed_confirmations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/Sha256Digest"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefreshApplyResult": {
+      "type": "object",
+      "required": [
+        "status",
+        "previous",
+        "base",
+        "snapshot",
+        "resource",
+        "semantic_key",
+        "operations",
+        "diff",
+        "validation",
+        "diagnostics",
+        "delta"
+      ],
+      "properties": {
+        "status": {
+          "const": "refresh"
+        },
+        "previous": {
+          "$ref": "#/$defs/PreviewRef"
+        },
+        "base": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/PreviewRef"
+        },
+        "resource": {
+          "$ref": "#/$defs/PreviewResourceLink"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedOperationView"
+          }
+        },
+        "diff": {
+          "$ref": "#/$defs/SnapshotDiff"
+        },
+        "validation": {
+          "$ref": "#/$defs/CandidateValidation"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        },
+        "delta": {
+          "$ref": "#/$defs/RefreshDelta"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AcceptedApplyResult": {
+      "type": "object",
+      "required": [
+        "status",
+        "preview",
+        "preview_resource",
+        "base",
+        "snapshot",
+        "semantic_key",
+        "operations",
+        "diff",
+        "validation",
+        "diagnostics"
+      ],
+      "properties": {
+        "status": {
+          "const": "accepted"
+        },
+        "preview": {
+          "$ref": "#/$defs/PreviewRef"
+        },
+        "preview_resource": {
+          "$ref": "#/$defs/PreviewResourceLink"
+        },
+        "base": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedOperationView"
+          }
+        },
+        "diff": {
+          "$ref": "#/$defs/SnapshotDiff"
+        },
+        "validation": {
+          "description": "Acceptance evidence, structurally constrained to agree with the outcome: every adapter valid and every validator passed. An accepted Revision carrying a failed verdict is now unrepresentable, not merely forbidden.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/CandidateValidation"
+            }
+          ],
+          "properties": {
+            "language": {
+              "properties": {
+                "adapters": {
+                  "items": {
+                    "properties": {
+                      "valid": {
+                        "const": true
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "validators": {
+              "items": {
+                "properties": {
+                  "status": {
+                    "const": "passed"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "repair_diff": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SnapshotDiff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RejectedApplyResult": {
+      "type": "object",
+      "required": [
+        "status",
+        "preview",
+        "preview_resource",
+        "base",
+        "snapshot",
+        "semantic_key",
+        "operations",
+        "diff",
+        "validation",
+        "diagnostics"
+      ],
+      "properties": {
+        "status": {
+          "const": "rejected"
+        },
+        "preview": {
+          "$ref": "#/$defs/PreviewRef"
+        },
+        "preview_resource": {
+          "$ref": "#/$defs/PreviewResourceLink"
+        },
+        "base": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/AttemptRef"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedOperationView"
+          }
+        },
+        "diff": {
+          "$ref": "#/$defs/SnapshotDiff"
+        },
+        "validation": {
+          "description": "Rejection evidence, structurally constrained to justify the outcome: at least one adapter invalid or at least one validator failed. A rejected Attempt with clean evidence is unrepresentable.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/CandidateValidation"
+            }
+          ],
+          "anyOf": [
+            {
+              "required": [
+                "language"
+              ],
+              "properties": {
+                "language": {
+                  "required": [
+                    "adapters"
+                  ],
+                  "properties": {
+                    "adapters": {
+                      "contains": {
+                        "required": [
+                          "valid"
+                        ],
+                        "properties": {
+                          "valid": {
+                            "const": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "required": [
+                "validators"
+              ],
+              "properties": {
+                "validators": {
+                  "contains": {
+                    "required": [
+                      "status"
+                    ],
+                    "properties": {
+                      "status": {
+                        "const": "failed"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefusedApplyResult": {
+      "description": "A typed domain refusal before a complete candidate exists. It publishes neither Attempt nor Revision and is distinct from infrastructure failure.",
+      "type": "object",
+      "required": [
+        "status",
+        "base",
+        "operation",
+        "owner",
+        "reason",
+        "preconditions",
+        "blockers",
+        "diagnostics",
+        "suggestions"
+      ],
+      "properties": {
+        "status": {
+          "const": "refused"
+        },
+        "base": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "operation": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "owner": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/OwnerId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "enum": [
+            "unsupported",
+            "unmet_precondition",
+            "ambiguous_target",
+            "stale_preview",
+            "stale_action",
+            "stale_match",
+            "stale_effect_selection",
+            "confirmation_required",
+            "unsafe_effect",
+            "ownership_conflict",
+            "formatter_unsupported",
+            "validator_refused",
+            "revert_conflict",
+            "program_limit",
+            "language_refusal"
+          ]
+        },
+        "preconditions": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/OperationPrecondition"
+          }
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/RefusalBlocker"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        },
+        "suggestions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Change"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConflictApplyResult": {
+      "type": "object",
+      "required": [
+        "status",
+        "reason",
+        "base",
+        "current"
+      ],
+      "properties": {
+        "status": {
+          "const": "conflict"
+        },
+        "reason": {
+          "enum": [
+            "stale_base",
+            "source_attempt_base_mismatch",
+            "idempotency_key_reused"
+          ]
+        },
+        "base": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "current": {
+          "$ref": "#/$defs/RevisionRef"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ApplyResult": {
+      "description": "A domain outcome only. Malformed requests and adapter or storage failures are MCP errors. Preview retains only a non-head preview ref; refusal retains nothing; successful repairs may carry repair_diff.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PreviewApplyResult"
+        },
+        {
+          "$ref": "#/$defs/RefreshApplyResult"
+        },
+        {
+          "$ref": "#/$defs/AcceptedApplyResult"
+        },
+        {
+          "$ref": "#/$defs/RejectedApplyResult"
+        },
+        {
+          "$ref": "#/$defs/RefusedApplyResult"
+        },
+        {
+          "$ref": "#/$defs/ConflictApplyResult"
+        }
+      ]
+    },
+    "RiftErrorCode": {
+      "description": "Stable driver-facing infrastructure/request classification. The code is the class; no second category field may contradict it. Domain refusals, conflicts, rejected Attempts, and accepted Revisions remain ordinary typed outcomes.",
+      "enum": [
+        "invalid_request",
+        "unsupported_protocol",
+        "permission_denied",
+        "snapshot_not_found",
+        "semantic_snapshot_mismatch",
+        "semantic_snapshot_unavailable",
+        "resource_not_found",
+        "record_reclaimed",
+        "content_unavailable",
+        "cursor_invalid",
+        "cursor_snapshot_mismatch",
+        "cancelled",
+        "deadline_exceeded",
+        "limit_exceeded",
+        "worktree_busy",
+        "adapter_unavailable",
+        "adapter_protocol_error",
+        "adapter_timeout",
+        "storage_failure",
+        "sandbox_failure",
+        "internal_error"
+      ]
+    },
+    "RetryDirective": {
+      "enum": [
+        "never",
+        "same_request",
+        "same_idempotency_key",
+        "refresh_snapshot"
+      ]
+    },
+    "RiftErrorCause": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retry",
+        "causes"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/RiftErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryDirective"
+        },
+        "causes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RiftErrorCause"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RiftErrorData": {
+      "description": "Required JSON-RPC error data for every Rift MCP failure. It is the SQLException/SQLState analogue: stable code and retry direction plus human message and typed evidence.",
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retry",
+        "phase",
+        "at",
+        "operation",
+        "diagnostics",
+        "causes"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/RiftErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryDirective"
+        },
+        "phase": {
+          "enum": [
+            "discovery",
+            "read",
+            "resolve",
+            "validate",
+            "preview",
+            "publish",
+            "persist"
+          ]
+        },
+        "at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SnapshotRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        },
+        "limit": {
+          "$ref": "#/$defs/LimitEvidence"
+        },
+        "causes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RiftErrorCause"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "limit_exceeded"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "limit"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "limit"
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "LimitEvidence": {
+      "description": "Structured evidence for limit_exceeded: which advertised DriverLimits or AdapterLimits field was exceeded, its effective value, and the value that was required. Present exactly when code is limit_exceeded. Without it a caller can only reparse the human message to decide whether to retry differently, fall back to another resource, or give up — which is the difference between an actionable refusal and an opaque one.",
+      "type": "object",
+      "required": [
+        "field",
+        "limit",
+        "required"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "required": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublishApplyResult": {
+      "description": "The only outcomes eligible for idempotency retention.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AcceptedApplyResult"
+        },
+        {
+          "$ref": "#/$defs/RejectedApplyResult"
+        },
+        {
+          "$ref": "#/$defs/ConflictApplyResult"
+        }
+      ]
+    },
+    "TransactionRecord": {
+      "description": "Content stored behind a worktree transaction entry. payload_hash is defined on the PublishApplyParams object itself; see that field.",
+      "type": "object",
+      "required": [
+        "kind",
+        "idempotency_key",
+        "payload_hash",
+        "created_at",
+        "outcome"
+      ],
+      "properties": {
+        "idempotency_key": {
+          "description": "The caller's key verbatim, so a hash hit is confirmed by exact match rather than trusted.",
+          "type": "string",
+          "pattern": "^[\\x21-\\x7E]{1,256}$"
+        },
+        "payload_hash": {
+          "description": "SHA-256 over the RFC 8785 canonical JSON of the complete PublishApplyParams for this request, with leaf present in its resolved explicit form so a session-defaulted request and an explicitly-addressed one hash identically. The MCP envelope, transport framing, and session metadata are excluded. The domain is normative: two implementations hashing different objects would turn an exact lost-response retry into idempotency_key_reused.",
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "outcome": {
+          "$ref": "#/$defs/PublishApplyResult"
+        },
+        "kind": {
+          "const": "transaction"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PersistParams": {
+      "type": "object",
+      "required": [
+        "leaf",
+        "revision"
+      ],
+      "properties": {
+        "revision": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/ProjectPath"
+          }
+        },
+        "include_deletions": {
+          "type": "boolean",
+          "default": false
+        },
+        "leaf": {
+          "description": "Explicit target leaf. Required: persist writes worktree files, so it never resolves its target from ambient session state.",
+          "$ref": "#/$defs/LeafId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PersistResult": {
+      "type": "object",
+      "required": [
+        "revision",
+        "all_written",
+        "outcomes"
+      ],
+      "properties": {
+        "revision": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "all_written": {
+          "type": "boolean"
+        },
+        "outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PersistOutcome"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterValidation": {
+      "description": "The complete deterministic verdict reconstructed from one adapter validation stream.",
+      "type": "object",
+      "required": [
+        "owner",
+        "state",
+        "valid",
+        "files",
+        "diagnostics"
+      ],
+      "properties": {
+        "owner": {
+          "$ref": "core.json#/$defs/OwnerId"
+        },
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "valid": {
+          "type": "boolean"
+        },
+        "files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/ProjectPath"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/Diagnostic"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Validation": {
+      "description": "Rift's deterministic union of every active AdapterValidation. Validity is exactly 'every adapter is valid', and is derived rather than stored: a stored flag could contradict the adapters beside it, which is how an accepted result could otherwise carry a failed compiler verdict. Missing or incomplete adapters are infrastructure failure, never data.",
+      "type": "object",
+      "required": [
+        "adapters"
+      ],
+      "properties": {
+        "adapters": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/AdapterValidation"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "LeafId": {
+      "description": "Deterministic identity of one leaf, the pair of repository and selected worktree. Derived from the canonical worktree path, so it is stable across restarts and carries no host path in its value. A session binds one leaf; any request or URI may name a different leaf under the same server. That is intentional and is what makes a preview link portable between a supervisor and its subagents. There is no inter-agent isolation: every session on one server shares the invoking user's single trust domain, and host authorization is the only boundary.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,128}$"
+    },
+    "DiffResourceLink": {
+      "description": "A portable link to the diff resource. Rift always emits the explicit leaf form.",
+      "type": "object",
+      "required": [
+        "type",
+        "uri",
+        "name",
+        "mimeType"
+      ],
+      "properties": {
+        "type": {
+          "const": "resource_link"
+        },
+        "uri": {
+          "$ref": "#/$defs/DiffResourceUri"
+        },
+        "name": {
+          "const": "diff"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.diff+json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BlobResourceLink": {
+      "description": "A portable link to the blob resource. Rift always emits the explicit leaf form.",
+      "type": "object",
+      "required": [
+        "type",
+        "uri",
+        "name",
+        "mimeType"
+      ],
+      "properties": {
+        "type": {
+          "const": "resource_link"
+        },
+        "uri": {
+          "$ref": "#/$defs/BlobResourceUri"
+        },
+        "name": {
+          "const": "blob"
+        },
+        "mimeType": {
+          "const": "application/octet-stream"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RetentionPolicy": {
+      "description": "Effective record retention, expressed purely in elapsed time. Vacuum reclaims expired records by rewriting the state commit under the per-worktree lease and expired fact rows under a repository-wide lock, since the fact database is shared across worktrees and the lease is not; together those two scopes keep a second server started on a newer protocol socket from racing it. Retention deliberately does not consult live sessions: sessions are process-local and two servers may overlap during an upgrade drain, so a session pin could never be authoritative. A caller that reads a reclaimed record gets record_reclaimed. The outcome window is correctness-bound because idempotent recovery replays against it. Transaction tombstones are retained at least as long as the longest candidate horizon: if an outcome tombstone expired while its Preview was still publishable, the same key would read as a miss and step 9 would re-execute a transaction that already published — the exact failure tombstones exist to prevent.",
+      "type": "object",
+      "required": [
+        "accepted_revisions",
+        "transaction_outcomes_seconds",
+        "previews_seconds",
+        "attempts_seconds",
+        "transaction_tombstone_seconds"
+      ],
+      "properties": {
+        "accepted_revisions": {
+          "const": "never_reclaimed"
+        },
+        "transaction_outcomes_seconds": {
+          "type": "integer",
+          "minimum": 3600,
+          "maximum": 9007199254740991
+        },
+        "previews_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 9007199254740991
+        },
+        "attempts_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 9007199254740991
+        },
+        "transaction_tombstone_seconds": {
+          "description": "Must be >= max(previews_seconds, attempts_seconds). Checked at startup, not merely documented.",
+          "type": "integer",
+          "minimum": 3600,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchingDialects": {
+      "description": "The matching grammars this leaf accepts, advertised rather than assumed. rust-regex is the Rust regex crate grammar. The exact crate and Unicode versions are reported as the engine and version of every QueryExecution, so a result set always carries the identity of the engine that produced it, and the dialect name is bumped whenever either changes matching semantics: no backreferences or lookaround, linear match time, Unicode mode on by default with a pinned Unicode version, UTF-8 haystacks with byte offsets, leftmost-first alternation, greedy quantifiers, no implicit CRLF handling, dot excluding newline unless (?s), anchors matching only at haystack ends unless (?m), leftmost-longest capture disambiguation within a match, non-overlapping iteration advancing by one byte past a zero-width match, and inline (?-u) permitted. It is deliberately not RE2: RE2 defines the Perl classes and word boundaries as ASCII where this dialect defines them as Unicode. Structural pattern grammar is per adapter and advertised in its own capability record, but regex is not: rust-regex is the only dialect for a caller-supplied regex — structural patterns and git-glob path selectors are separate grammars, declared separately — is executed only by Rift, and covers text matching, capture text filters, FieldFilter regex ops, and regex_replace transforms alike. JSON Schema pattern keywords are ECMA-262 and validated by each ecosystem's own validator; they are authored here rather than supplied by a caller, so they are neither a divergence risk nor an attack surface.",
+      "type": "object",
+      "required": [
+        "text",
+        "path"
+      ],
+      "properties": {
+        "text": {
+          "const": "rust-regex"
+        },
+        "path": {
+          "const": "git-glob"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResourceTemplate": {
+      "description": "One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per family.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://repository{?leaf,commit,cursor}"
+            },
+            "name": {
+              "const": "repository"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.repository+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://symbol/{entity}{?leaf,commit,semantic,cursor}"
+            },
+            "name": {
+              "const": "symbol"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.symbol+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://preview{?leaf,commit,cursor}"
+            },
+            "name": {
+              "const": "preview"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.preview+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://diff{?leaf,from,to,cursor}"
+            },
+            "name": {
+              "const": "diff"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.diff+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://blob{?leaf,object}"
+            },
+            "name": {
+              "const": "blob"
+            },
+            "mimeType": {
+              "const": "application/octet-stream"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ResourceReadResult": {
+      "description": "The result of one MCP resource read. Contents are discriminated by mimeType.",
+      "type": "object",
+      "required": [
+        "contents"
+      ],
+      "properties": {
+        "contents": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/RepositoryResourceContents"
+              },
+              {
+                "$ref": "#/$defs/SymbolResourceContents"
+              },
+              {
+                "$ref": "#/$defs/PreviewResourceContents"
+              },
+              {
+                "$ref": "#/$defs/DiffResourceContents"
+              },
+              {
+                "$ref": "#/$defs/BlobResourceContents"
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SearchHitTarget": {
+      "description": "What a search hit is. Tagged, so the payload correlation survives code generation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "symbol",
+            "resource"
+          ],
+          "properties": {
+            "target": {
+              "const": "symbol"
+            },
+            "symbol": {
+              "$ref": "core.json#/$defs/Symbol"
+            },
+            "resource": {
+              "$ref": "#/$defs/SymbolResourceLink"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "element"
+          ],
+          "properties": {
+            "target": {
+              "const": "element"
+            },
+            "element": {
+              "$ref": "core.json#/$defs/Element"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "file"
+          ],
+          "properties": {
+            "target": {
+              "const": "file"
+            },
+            "file": {
+              "$ref": "#/$defs/File"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ValidatorId": {
+      "description": "Caller-chosen identity for one validator. It is NOT echoed in the result: a result links to its declaration solely by declaration_digest, because an echoed id can disagree with the declaration it claims to answer and two declarations may share an id while differing in argv.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "ConformanceProfile": {
+      "description": "What this leaf actually implements, advertised rather than assumed. Profiles are a ladder: each includes the one below it. A leaf must not advertise a profile whose full conformance suite it does not pass, and a caller must not infer capability from version or deployment.",
+      "enum": [
+        "read",
+        "edit",
+        "full"
+      ]
+    },
+    "CandidateRecord": {
+      "description": "Immutable content stored behind a worktree record entry: a candidate and its verdict. A Preview and an Attempt are the same content — the snapshot ref kind is the discriminator — so there is one record type rather than two identical ones. It is the sole source of truth for publish and refresh. payload_hash covers canonical base, semantic pin, repair source, changes, and validators. created_at is what retention measures; it is never part of identity.",
+      "type": "object",
+      "required": [
+        "kind",
+        "created_at",
+        "snapshot",
+        "base",
+        "source_attempt",
+        "changes",
+        "validators",
+        "payload_hash",
+        "semantic_key",
+        "operations",
+        "diff",
+        "validation",
+        "diagnostics"
+      ],
+      "properties": {
+        "kind": {
+          "const": "record"
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "snapshot": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/PreviewRef"
+            },
+            {
+              "$ref": "#/$defs/AttemptRef"
+            }
+          ]
+        },
+        "base": {
+          "$ref": "#/$defs/RevisionRef"
+        },
+        "source_attempt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AttemptRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "changes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Change"
+          }
+        },
+        "validators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SandboxedValidator"
+          },
+          "uniqueItems": true
+        },
+        "payload_hash": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "semantic_key": {
+          "$ref": "#/$defs/SemanticSnapshotKey"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedOperationView"
+          }
+        },
+        "diff": {
+          "$ref": "#/$defs/SnapshotDiff"
+        },
+        "validation": {
+          "$ref": "#/$defs/CandidateValidation"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RecordTombstone": {
+      "description": "What vacuum leaves behind. Without it a reclaimed record is byte-identical to one that never existed, and record_reclaimed could not be distinguished from resource_not_found. Tombstones are themselves reclaimed at an advertised multiple of the record horizon, ten times by default, after which the answer honestly degrades to resource_not_found.",
+      "type": "object",
+      "required": [
+        "kind",
+        "reclaimed_at"
+      ],
+      "properties": {
+        "kind": {
+          "const": "tombstone"
+        },
+        "reclaimed_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RecordEntry": {
+      "description": "One entry in the worktree records tree.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/CandidateRecord"
+        },
+        {
+          "$ref": "#/$defs/RecordTombstone"
+        }
+      ]
+    },
+    "TransactionEntry": {
+      "description": "One entry in the transactions subtree. Outcomes expire like every other record, so the same tombstone applies: an expired idempotency key must answer record_reclaimed, not a silent miss that would let a retry re-execute a published transaction.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TransactionRecord"
+        },
+        {
+          "$ref": "#/$defs/RecordTombstone"
+        }
+      ]
+    },
+    "ResultOrder": {
+      "description": "Total deterministic result order, shared by every paginated tool. relevance sorts by versioned score descending then canonical identity; path sorts by physical path and range then identity; identity sorts by the result's canonical opaque identity bytes — entity id, action descriptor digest, or path, according to what the result is. Action discovery has exactly one legal order, identity, because relevance and path are not defined over compiler actions.",
+      "enum": [
+        "relevance",
+        "path",
+        "identity"
+      ]
+    },
+    "Timestamp": {
+      "description": "RFC 3339 instant. The pattern is normative and range-bounded, not merely timestamp-shaped: draft 2020-12 treats `format` as an annotation, so a conforming validator would otherwise accept both 'not-a-date' and '2026-13-40T25:61:61+24:99' and leave retention arithmetic implementation-dependent. Leap second 60 is permitted; day-of-month against month length is the one check a regex cannot make.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:([0-5]\\d|60)(\\.\\d+)?(Z|[+-]([01]\\d|2[0-3]):[0-5]\\d)$"
+    }
+  }
+}
