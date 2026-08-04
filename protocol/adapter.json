@@ -46,15 +46,11 @@
       "type": "object",
       "required": [
         "mirror",
-        "generation",
         "reset"
       ],
       "properties": {
         "mirror": {
           "$ref": "core.json#/$defs/MirrorId"
-        },
-        "generation": {
-          "$ref": "core.json#/$defs/Generation"
         },
         "reset": {
           "type": "boolean"
@@ -219,17 +215,14 @@
       "additionalProperties": false
     },
     "SyncBeginOutput": {
+      "description": "The transaction is open. The mirror is named back so a recorded stream stays readable without request state.",
       "type": "object",
       "required": [
-        "mirror",
-        "accepted_generation"
+        "mirror"
       ],
       "properties": {
         "mirror": {
           "$ref": "core.json#/$defs/MirrorId"
-        },
-        "accepted_generation": {
-          "$ref": "core.json#/$defs/Generation"
         }
       },
       "additionalProperties": false
@@ -1792,7 +1785,8 @@
               "const": "admitted"
             },
             "handle": {
-              "$ref": "#/$defs/MirrorHandle"
+              "description": "A freshly opened, still-empty mirror. It has no environment yet: an AdapterEnvironment is derived from the configuration and dependency material in the synced content, so it cannot exist before the sync that supplies them. sync.commit is where the adapter first publishes one.",
+              "$ref": "core.json#/$defs/MirrorId"
             }
           },
           "additionalProperties": false
@@ -1845,7 +1839,7 @@
       "additionalProperties": false
     },
     "MirrorScopedInput": {
-      "description": "The pinned mirror plus the inputs changed since its last accepted generation.",
+      "description": "The pinned mirror plus the files that changed since the snapshot it holds.",
       "type": "object",
       "required": [
         "state",
@@ -2077,23 +2071,6 @@
         "sync.unit",
         "validate"
       ]
-    },
-    "MirrorHandle": {
-      "description": "A freshly opened, still-empty mirror. It has no environment yet: an AdapterEnvironment is derived from the synced tree's configuration and dependency material, so it cannot exist before the sync that supplies them. sync.commit is where the adapter first publishes it.",
-      "type": "object",
-      "required": [
-        "mirror",
-        "generation"
-      ],
-      "properties": {
-        "mirror": {
-          "$ref": "core.json#/$defs/MirrorId"
-        },
-        "generation": {
-          "$ref": "core.json#/$defs/Generation"
-        }
-      },
-      "additionalProperties": false
     },
     "MirrorPromoteInput": {
       "description": "Promote a child mirror whose content has been published as an accepted Revision into a base for that tree. Pinned to the exact expected MirrorState, because a child advances: promoting {mirror:C, tree:T1} after C has moved to T2 would label T2's content T1. The mirror must also be committed-idle — no open sync transaction — or the promoted base would pin content still in flight. Promotion re-roots rather than nests: depth remains one and the promoted mirror has no parent. Without it, publishing T1 from a T0 child would force the next edit to open a fresh base at T1 and full-sync it, making every sequential agent edit a compiler cold start.",
