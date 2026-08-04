@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
-import { Prose } from "@/components/protocol/prose";
 import { PropertyTable } from "@/components/protocol/property-table";
+import { Prose } from "@/components/protocol/prose";
 import { Constraints } from "@/components/protocol/type-expr";
 import { defs } from "@/lib/protocol";
 

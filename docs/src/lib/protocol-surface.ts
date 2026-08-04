@@ -21,8 +21,8 @@ import {
   defs,
   documents,
   homeOf,
-  type ProtocolFile,
   PROTOCOL_FILES,
+  type ProtocolFile,
   props,
   refName,
   type Schema,
@@ -189,7 +189,10 @@ const anchoredBySurface = new Set<string>([
 
 /** The definitions a page lists in its reference section, in document order. */
 export const referenceTypes = Object.fromEntries(
-  PROTOCOL_FILES.map((file) => [file, defNamesByFile[file].filter((name) => !anchoredBySurface.has(name))]),
+  PROTOCOL_FILES.map((file) => [
+    file,
+    defNamesByFile[file].filter((name) => !anchoredBySurface.has(name)),
+  ]),
 ) as Record<ProtocolFile, string[]>;
 
 // ---------------------------------------------------------------------------
@@ -244,12 +247,17 @@ function mcpPage(): PageData {
         { id: "tools", content: "Tools" },
         ...mcpTools.map((tool) => ({ id: `tool-${tool.name}`, content: tool.name })),
         { id: "resources", content: "Resources" },
-        ...mcpResources.map((resource) => ({ id: `resource-${resource.name}`, content: resource.name })),
+        ...mcpResources.map((resource) => ({
+          id: `resource-${resource.name}`,
+          content: resource.name,
+        })),
         ...reference.headings,
       ],
       contents: [
         ...mcpTools.flatMap((tool) => [
-          ...(tool.description ? [{ heading: `tool-${tool.name}`, content: tool.description }] : []),
+          ...(tool.description
+            ? [{ heading: `tool-${tool.name}`, content: tool.description }]
+            : []),
           ...prose(tool.params),
           ...prose(tool.result),
         ]),
@@ -283,13 +291,18 @@ function adapterPage(): PageData {
       headings: [
         { id: "handshake", content: "Handshake" },
         { id: "operations", content: "Operations" },
-        ...adapterOperations.map((operation) => ({ id: `op-${operation.op}`, content: operation.op })),
+        ...adapterOperations.map((operation) => ({
+          id: `op-${operation.op}`,
+          content: operation.op,
+        })),
         ...reference.headings,
       ],
       contents: [
         ...prose(ADAPTER_HELLO),
         ...adapterOperations.flatMap((operation) => [
-          ...(operation.description ? [{ heading: `op-${operation.op}`, content: operation.description }] : []),
+          ...(operation.description
+            ? [{ heading: `op-${operation.op}`, content: operation.description }]
+            : []),
           ...prose(operation.request.name),
           ...operation.responses.flatMap((response) => prose(response.name)),
         ]),
@@ -311,7 +324,10 @@ function corePage(): PageData {
         { id: "type-reference", content: "Type reference" },
         ...names.map((name) => ({ id: name, content: name })),
       ],
-      contents: [{ heading: undefined, content: documents.core.description }, ...names.flatMap(prose)],
+      contents: [
+        { heading: undefined, content: documents.core.description },
+        ...names.flatMap(prose),
+      ],
     },
   };
 }

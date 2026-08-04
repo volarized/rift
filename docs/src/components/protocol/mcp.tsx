@@ -19,9 +19,9 @@ export function McpReference(): ReactNode {
         Tools
       </h2>
       <p>
-        Five tools, and every one of them takes an explicit snapshot to work against. Nothing here reads
-        "the current state of the repository" — you say which commit you mean, and you get the same
-        answer every time you ask.
+        Five tools, and every one of them takes an explicit snapshot to work against. Nothing here
+        reads "the current state of the repository" — you say which commit you mean, and you get the
+        same answer every time you ask.
       </p>
 
       {mcpTools.map((tool) => (
@@ -43,9 +43,9 @@ export function McpReference(): ReactNode {
         Resources
       </h2>
       <p>
-        Resources are read by URI rather than called. Each one names its leaf and its snapshot in the URI
-        itself, which is what makes a link portable: a supervisor can hand a preview URI to a subagent and
-        both resolve it to exactly the same bytes.
+        Resources are read by URI rather than called. Each one names its leaf and its snapshot in
+        the URI itself, which is what makes a link portable: a supervisor can hand a preview URI to
+        a subagent and both resolve it to exactly the same bytes.
       </p>
 
       {mcpResources.map((resource) => (
@@ -72,8 +72,8 @@ export function McpReference(): ReactNode {
         Type reference
       </h2>
       <p>
-        The remaining {referenceTypes.mcp.length} types this document defines, in schema order. Types the
-        tools and resources above already showed are anchored there instead.
+        The remaining {referenceTypes.mcp.length} types this document defines, in schema order.
+        Types the tools and resources above already showed are anchored there instead.
       </p>
       {referenceTypes.mcp.map((name) => (
         <Definition key={name} name={name} />

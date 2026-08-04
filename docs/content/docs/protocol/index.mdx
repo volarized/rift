@@ -4,6 +4,7 @@ description: The protocol behind Rift, and how the processes that implement it r
 ---
 
 import { Callout } from "fumadocs-ui/components/callout";
+import { IsoDiagram } from "@/components/iso-diagram";
 
 At the core of Rift there is a protocol. It describes how the components of the system behave, and how
 they operate.
@@ -24,10 +25,19 @@ That process is launched in a workspace — a distinct path on the filesystem of
 That is the constraint the rest of the design follows from. Several agents can be working in the same
 workspace at once, and they need a central point behind them. That central point is the rift server.
 
-```
-agent 1 -> rift mcp -> |rift server| -> | semantic DB + git worktrees |
-agent 2 -> rift mcp -> |           |    | adapters                    |
-```
+<IsoDiagram
+  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB, the git worktrees and the language adapters."
+  chart={`
+    flowchart LR
+      agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp"]:::rift
+      agent2["agent 2"]:::agent -- "stdio" --> mcp2["rift mcp"]:::rift
+      mcp1 -- "Streamable HTTP<br/>over Unix socket" --> server["rift server"]:::rift
+      mcp2 -- "Streamable HTTP<br/>over Unix socket" --> server
+      server --> semantic["semantic DB"]:::store
+      server --> worktrees["git worktrees"]:::git
+      server --> adapters["adapters"]:::adapter
+  `}
+/>
 
 So `rift mcp` is a proxy. It holds no state of its own — it forwards what the agent asks, and returns
 what the server answers.

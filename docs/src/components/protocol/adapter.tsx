@@ -2,8 +2,8 @@ import type { ReactNode } from "react";
 import { Definition } from "@/components/protocol/definition";
 import { Prose } from "@/components/protocol/prose";
 import { Shape } from "@/components/protocol/shape";
-import { ADAPTER_HELLO, adapterOperations, referenceTypes } from "@/lib/protocol-surface";
 import { defs } from "@/lib/protocol";
+import { ADAPTER_HELLO, adapterOperations, referenceTypes } from "@/lib/protocol-surface";
 
 /**
  * The adapter wire: one operation at a time, request beside response.
@@ -22,8 +22,9 @@ export function AdapterReference(): ReactNode {
         Handshake
       </h2>
       <p>
-        Before anything else, the adapter says what it can do. Rift does not probe, guess, or feature-test
-        — it reads this frame once and holds every adapter to exactly what it claimed here.
+        Before anything else, the adapter says what it can do. Rift does not probe, guess, or
+        feature-test — it reads this frame once and holds every adapter to exactly what it claimed
+        here.
       </p>
       {hello?.description ? (
         <p>
@@ -36,9 +37,10 @@ export function AdapterReference(): ReactNode {
         Operations
       </h2>
       <p>
-        Every frame carries a fully qualified <code>type</code>, so a recorded stream can be read back
-        without knowing what was asked — which is what lets a captured session double as a conformance
-        fixture. The <code>op</code> beside it groups frames that belong to the same call.
+        Every frame carries a fully qualified <code>type</code>, so a recorded stream can be read
+        back without knowing what was asked — which is what lets a captured session double as a
+        conformance fixture. The <code>op</code> beside it groups frames that belong to the same
+        call.
       </p>
 
       {adapterOperations.map((operation) => (
@@ -55,7 +57,11 @@ export function AdapterReference(): ReactNode {
           {operation.responses.map((response) => (
             <Shape
               key={response.name}
-              label={operation.responses.length > 1 ? response.tag.split(".").pop() ?? "Response" : "Response"}
+              label={
+                operation.responses.length > 1
+                  ? (response.tag.split(".").pop() ?? "Response")
+                  : "Response"
+              }
               name={response.name}
             />
           ))}
@@ -66,8 +72,8 @@ export function AdapterReference(): ReactNode {
         Type reference
       </h2>
       <p>
-        The remaining {referenceTypes.adapter.length} types this document defines, in schema order. Frames
-        the operations above already showed are anchored there instead.
+        The remaining {referenceTypes.adapter.length} types this document defines, in schema order.
+        Frames the operations above already showed are anchored there instead.
       </p>
       {referenceTypes.adapter.map((name) => (
         <Definition key={name} name={name} />

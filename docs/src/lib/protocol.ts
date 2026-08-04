@@ -1,22 +1,15 @@
 /**
- * Reads the protocol schemas and derives everything the protocol page needs
- * from them. There is no generated file: the schemas are the only source, and
- * the page body, its table of contents, and its search index are three
- * projections of them, all built at compile time.
+ * Loads the protocol schemas and answers questions about JSON Schema. What the
+ * *documentation* makes of them — the tool catalogue, the per-page tables of
+ * contents, the search index — lives in `protocol-surface.ts`, which builds on
+ * this. There is no generated file anywhere: the schemas are the only source.
  *
  * The contract is split across three documents that reference each other by
  * `$id`-relative `$ref` — `adapter.json` and `mcp.json` both point at
  * `core.json`, and nothing points back. Definition names are unique across all
- * three, so a cross-file reference still renders as a plain `#Name` anchor on
- * this single page; `refName` resolves both forms and is the only place that
- * knows a `$ref` can name a file at all.
- *
- * The TOC and the search index need their own projections because fumadocs
- * builds both from the MDX abstract syntax tree, and a page whose body is a
- * React component has no headings or paragraphs in that tree. `protocolToc` is
- * handed to `DocsPage`, and `protocolStructuredData` to the search index's
- * `buildIndex` — see src/app/docs/[[...slug]]/page.tsx and
- * src/app/api/search/route.ts.
+ * three, which is what lets a cross-document reference resolve to one anchor;
+ * `refName` accepts both the local and the cross-file form and is the only
+ * place that knows a `$ref` can name a file at all.
  *
  * Subschema walking is `json-schema-traverse` (the walker Ajv uses), not a
  * hand-rolled one: it already knows which keywords hold schemas, which hold
@@ -31,8 +24,6 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { StructuredData } from "fumadocs-core/mdx-plugins";
-import type { TableOfContents } from "fumadocs-core/server";
 import traverse from "json-schema-traverse";
 import type { JSONSchema } from "json-schema-typed/draft-2020-12";
 
