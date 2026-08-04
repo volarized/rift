@@ -44,7 +44,7 @@
           "$ref": "#/$defs/RepositoryResourceUri"
         },
         "link": {
-          "$ref": "#/$defs/RepositoryResourceLink"
+          "$ref": "#/$defs/ResourceLink"
         }
       },
       "symbol": {
@@ -56,7 +56,7 @@
           "$ref": "#/$defs/SymbolResourceUri"
         },
         "link": {
-          "$ref": "#/$defs/SymbolResourceLink"
+          "$ref": "#/$defs/ResourceLink"
         }
       },
       "diff": {
@@ -68,7 +68,7 @@
           "$ref": "#/$defs/DiffResourceUri"
         },
         "link": {
-          "$ref": "#/$defs/DiffResourceLink"
+          "$ref": "#/$defs/ResourceLink"
         }
       },
       "blob": {
@@ -80,7 +80,7 @@
           "$ref": "#/$defs/BlobResourceUri"
         },
         "link": {
-          "$ref": "#/$defs/BlobResourceLink"
+          "$ref": "#/$defs/ResourceLink"
         }
       }
     },
@@ -542,32 +542,111 @@
     "SymbolResourceUri": {
       "description": "A Symbol-centred view of the semantic model. The revision and the cursor are query arguments; the symbol's identifier is the path.",
       "type": "string",
-      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$"
+      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
+      "examples": [
+        "rift://symbol/python/pkg/util.py:load_config~1?rev=HEAD~3"
+      ]
     },
-    "SymbolResourceLink": {
-      "description": "A portable link to the symbol resource.",
-      "type": "object",
-      "required": [
-        "type",
-        "uri",
-        "name",
-        "mimeType"
-      ],
-      "properties": {
-        "type": {
-          "const": "resource_link"
+    "ResourceLink": {
+      "description": "A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed per resource, and the URI is the one that resource accepts.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "uri",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "$ref": "#/$defs/SymbolResourceUri"
+            },
+            "name": {
+              "const": "symbol"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.symbol+json"
+            }
+          },
+          "additionalProperties": false
         },
-        "uri": {
-          "$ref": "#/$defs/SymbolResourceUri"
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "uri",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "$ref": "#/$defs/RepositoryResourceUri"
+            },
+            "name": {
+              "const": "repository"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.repository+json"
+            }
+          },
+          "additionalProperties": false
         },
-        "name": {
-          "const": "symbol"
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "uri",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "$ref": "#/$defs/DiffResourceUri"
+            },
+            "name": {
+              "const": "diff"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.diff+json"
+            }
+          },
+          "additionalProperties": false
         },
-        "mimeType": {
-          "const": "application/vnd.rift.symbol+json"
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "uri",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "$ref": "#/$defs/BlobResourceUri"
+            },
+            "name": {
+              "const": "blob"
+            },
+            "mimeType": {
+              "const": "application/octet-stream"
+            }
+          },
+          "additionalProperties": false
         }
-      },
-      "additionalProperties": false
+      ]
     },
     "SymbolResourcePayload": {
       "description": "JSON payload for one symbol at one snapshot.",
@@ -847,31 +926,6 @@
       "description": "Paginated workspace metadata and capabilities at one revision.",
       "type": "string",
       "pattern": "^rift://repository(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$"
-    },
-    "RepositoryResourceLink": {
-      "description": "A portable link to the repository resource.",
-      "type": "object",
-      "required": [
-        "type",
-        "uri",
-        "name",
-        "mimeType"
-      ],
-      "properties": {
-        "type": {
-          "const": "resource_link"
-        },
-        "uri": {
-          "$ref": "#/$defs/RepositoryResourceUri"
-        },
-        "name": {
-          "const": "repository"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.repository+json"
-        }
-      },
-      "additionalProperties": false
     },
     "RepositoryResourcePayload": {
       "description": "What Rift can do for this workspace right now: the languages it understands, what their adapters support, the snapshot it answered from, and the limits a request has to stay inside.",
@@ -1837,56 +1891,6 @@
       },
       "additionalProperties": false
     },
-    "DiffResourceLink": {
-      "description": "A portable link to the diff resource.",
-      "type": "object",
-      "required": [
-        "type",
-        "uri",
-        "name",
-        "mimeType"
-      ],
-      "properties": {
-        "type": {
-          "const": "resource_link"
-        },
-        "uri": {
-          "$ref": "#/$defs/DiffResourceUri"
-        },
-        "name": {
-          "const": "diff"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.diff+json"
-        }
-      },
-      "additionalProperties": false
-    },
-    "BlobResourceLink": {
-      "description": "A portable link to the blob resource.",
-      "type": "object",
-      "required": [
-        "type",
-        "uri",
-        "name",
-        "mimeType"
-      ],
-      "properties": {
-        "type": {
-          "const": "resource_link"
-        },
-        "uri": {
-          "$ref": "#/$defs/BlobResourceUri"
-        },
-        "name": {
-          "const": "blob"
-        },
-        "mimeType": {
-          "const": "application/octet-stream"
-        }
-      },
-      "additionalProperties": false
-    },
     "MatchingDialects": {
       "description": "The matching grammars this workspace accepts, advertised rather than assumed.",
       "type": "object",
@@ -2037,7 +2041,7 @@
               "$ref": "core.json#/$defs/Symbol"
             },
             "resource": {
-              "$ref": "#/$defs/SymbolResourceLink"
+              "$ref": "#/$defs/ResourceLink"
             }
           },
           "additionalProperties": false

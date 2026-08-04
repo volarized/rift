@@ -179,7 +179,7 @@ export const ADAPTER_HELLO = "AdapterHello";
  */
 const anchoredBySurface = new Set<string>([
   ...mcpTools.flatMap((tool) => [tool.params, tool.result]),
-  ...mcpResources.flatMap((resource) => [resource.uri, resource.link]),
+  ...mcpResources.map((resource) => resource.uri),
   ADAPTER_HELLO,
   ...adapterOperations.flatMap((operation) => [
     operation.request.name,
@@ -266,7 +266,6 @@ function mcpPage(): PageData {
             ? [{ heading: `resource-${resource.name}`, content: resource.description }]
             : []),
           ...prose(resource.uri),
-          ...prose(resource.link),
         ]),
         ...reference.contents,
       ],

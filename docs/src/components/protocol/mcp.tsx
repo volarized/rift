@@ -42,9 +42,8 @@ export function McpReference(): ReactNode {
         Resources
       </h2>
       <p>
-        Resources are read by URI rather than called. A URI can carry its workspace and its
-        revision, which is what makes a link portable — a supervisor hands a preview URI to a
-        subagent and both resolve it to the same bytes.
+        Resources are read by URI rather than called. A URI carries its own revision, so a link
+        keeps meaning the same thing when it is handed to someone else.
       </p>
 
       {mcpResources.map((resource) => (
@@ -63,7 +62,6 @@ export function McpReference(): ReactNode {
             </p>
           ) : null}
           <Shape label="URI" name={resource.uri} />
-          <Shape label="Link" name={resource.link} />
         </section>
       ))}
 

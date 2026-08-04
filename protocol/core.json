@@ -371,11 +371,31 @@
           ],
           "properties": {
             "kind": {
-              "enum": [
-                "project",
-                "dependencies",
-                "all"
-              ]
+              "const": "project"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "dependencies"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "all"
             }
           },
           "additionalProperties": false
@@ -1350,20 +1370,23 @@
       "additionalProperties": false
     },
     "SymbolOrigin": {
+      "description": "Where this symbol is defined. Five origins, and they answer different questions: whether you can edit it, whether it moves when you upgrade something, and whether it exists in any file at all.",
       "oneOf": [
         {
+          "description": "Declared in this workspace's own source. The code you can open and change.",
           "type": "object",
           "required": [
             "kind"
           ],
           "properties": {
             "kind": {
-              "const": "project"
+              "const": "workspace"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "Declared in a dependency. `manager` is the package manager that installed it, so `npm`, `cargo` or `pip`; `name` and `version` are that manager's own. Upgrading the dependency replaces these symbols.",
           "type": "object",
           "required": [
             "kind",
@@ -1376,36 +1399,74 @@
               "const": "package"
             },
             "manager": {
-              "type": "string"
+              "description": "The package manager that installed it.",
+              "type": "string",
+              "examples": [
+                "npm",
+                "cargo",
+                "pip"
+              ]
             },
             "name": {
+              "description": "The package name, as that manager spells it.",
               "type": "string",
-              "maxLength": 4096
+              "maxLength": 4096,
+              "examples": [
+                "zod",
+                "serde"
+              ]
             },
             "version": {
-              "type": "string"
+              "description": "The installed version.",
+              "type": "string",
+              "examples": [
+                "3.22.4",
+                "1.0.197"
+              ]
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "Declared in the language's standard library. It ships with the toolchain, so no package manager installed it and no manifest names it.",
           "type": "object",
           "required": [
             "kind"
           ],
           "properties": {
             "kind": {
-              "enum": [
-                "stdlib",
-                "generated",
-                "synthetic"
-              ]
+              "const": "stdlib"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Produced by a build step from something else in the workspace — a protobuf compiler, a schema generator. It exists in a file, and editing that file is undone by the next build.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "generated"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Invented by the compiler. No file declares it: an implicit constructor, a derived implementation, a synthesised accessor.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "synthetic"
             }
           },
           "additionalProperties": false
         }
-      ],
-      "description": "Where a symbol is defined: in this workspace's own code, or in a package it depends on."
+      ]
     },
     "Symbol": {
       "description": "Compiler-resolved semantic identity. Source structure lives in Element and is connected through Relationship.",
@@ -2150,10 +2211,24 @@
           ],
           "properties": {
             "support": {
-              "enum": [
-                "unsupported",
-                "not_applicable"
-              ]
+              "const": "unsupported"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "reason"
+          ],
+          "properties": {
+            "support": {
+              "const": "not_applicable"
             },
             "reason": {
               "type": "string",
