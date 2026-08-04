@@ -300,9 +300,10 @@ function adapterPage(): PageData {
     .filter((message) => adapterOwned.has(message.name))
     .map((message) => message.name);
 
+  // `Transport` and `What crosses this seam` are headings in the MDX, so remark
+  // already produced them. Only what the component renders belongs here.
   return {
     toc: [
-      { title: "Transport", url: "#transport", depth: 2 },
       { title: "Service", url: "#service", depth: 2 },
       ...(service?.rpcs ?? []).map((rpc) => ({
         title: rpc.name,
@@ -314,7 +315,6 @@ function adapterPage(): PageData {
     ],
     structuredData: {
       headings: [
-        { id: "transport", content: "Transport" },
         { id: "service", content: "Service" },
         ...(service?.rpcs ?? []).map((rpc) => ({ id: `rpc-${rpc.name}`, content: rpc.name })),
         { id: "messages", content: "Messages" },
