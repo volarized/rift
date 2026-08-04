@@ -671,7 +671,8 @@
           "$ref": "#/$defs/TypeExpression"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "description": "One type a symbol carries, together with the role it plays for that symbol."
     },
     "Documentation": {
       "type": "object",
@@ -690,7 +691,8 @@
           "type": "string"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "description": "One block of documentation attached to a declaration, in the markup it was written in."
     },
     "Parameter": {
       "type": "object",
@@ -874,7 +876,8 @@
         "implementable",
         "macro",
         "test"
-      ]
+      ],
+      "description": "One portable category a symbol falls into. Kinds are language-specific; facets are shared, so a filter written once applies to every language an adapter is installed for."
     },
     "TypeFacet": {
       "enum": [
@@ -1401,7 +1404,8 @@
           },
           "additionalProperties": false
         }
-      ]
+      ],
+      "description": "Where a symbol is defined: in this workspace's own code, or in a package it depends on."
     },
     "Symbol": {
       "description": "Compiler-resolved semantic identity. Source structure lives in Element and is connected through Relationship.",
@@ -1427,7 +1431,7 @@
           "examples": [
             "dHlwZXNjcmlwdC5hOWY0MmIxYy5wYXJzZUNvbmZpZw"
           ],
-          "description": "The technical identifier. Opaque, stable within one revision, and the value every other call takes when it means this symbol."
+          "description": "Unique identifier of this symbol across the whole workspace. Opaque, and the value every other call takes when it means this symbol."
         },
         "language": {
           "description": "The language this symbol belongs to.",
@@ -1443,14 +1447,15 @@
           "examples": [
             "parseConfig"
           ],
-          "description": "The human name, as written in the source: `parseConfig`. Rendered signatures live in `signatures`."
+          "description": "The human-readable name, as written in the source: `parseConfig`. Rendered signatures live in `signatures`."
         },
         "kind": {
           "$ref": "#/$defs/ExactKind",
           "examples": [
             "typescript.function",
             "rust.trait"
-          ]
+          ],
+          "description": "What this symbol is in its own language's words — `rust.trait`, `typescript.function`. The adapter owns this vocabulary, so each language keeps its own term."
         },
         "facets": {
           "type": "array",
@@ -1463,23 +1468,27 @@
               "value",
               "callable"
             ]
-          ]
+          ],
+          "description": "Portable classification, so one query can cross languages. `rust.trait` and `typescript.interface` are different kinds that share the `type` facet, which is what lets a search for types find both."
         },
         "origin": {
-          "$ref": "#/$defs/SymbolOrigin"
+          "$ref": "#/$defs/SymbolOrigin",
+          "description": "Where the symbol comes from: code in this workspace, or a package it depends on."
         },
         "container": {
           "$ref": "#/$defs/GlobalEntityId",
           "examples": [
             "dHlwZXNjcmlwdC5hOWY0MmIxYy5Db25maWdMb2FkZXI"
-          ]
+          ],
+          "description": "The symbol this one is declared inside — the class that owns a method, the module that owns a function. Absent at the top level."
         },
         "external_identities": {
           "type": "array",
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/ExternalIdentity"
-          }
+          },
+          "description": "This symbol's identity in other schemes, where the adapter can state one. Used to match the same symbol across tools; an adapter states it or leaves it out."
         },
         "modifiers": {
           "type": "array",
@@ -1492,7 +1501,8 @@
               "export",
               "async"
             ]
-          ]
+          ],
+          "description": "Language keywords qualifying the declaration: `export`, `async`, `const`."
         },
         "visibility": {
           "type": [
@@ -1501,28 +1511,33 @@
           ],
           "examples": [
             "public"
-          ]
+          ],
+          "description": "How widely the symbol is visible, in the language's own terms — `public`, `private`, `pub(crate)`. Null where the language has no such concept."
         },
         "types": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/TypeBinding"
-          }
+          },
+          "description": "The types this symbol carries, each tagged with the role it plays: a return type, a field type, a bound."
         },
         "signatures": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/Signature"
-          }
+          },
+          "description": "One entry per callable form. Overloads are separate entries."
         },
         "documentation": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/Documentation"
-          }
+          },
+          "description": "Doc comments attached to the declaration, with the markup format they were written in."
         },
         "extensions": {
-          "$ref": "#/$defs/Extensions"
+          "$ref": "#/$defs/Extensions",
+          "description": "Language-specific facts with no portable equivalent, namespaced by the adapter that emitted them."
         }
       },
       "additionalProperties": false
