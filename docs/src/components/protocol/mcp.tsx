@@ -19,9 +19,8 @@ export function McpReference(): ReactNode {
         Tools
       </h2>
       <p>
-        Five tools, and every one of them takes an explicit snapshot to work against. Nothing here
-        reads "the current state of the repository" — you say which commit you mean, and you get the
-        same answer every time you ask.
+        Five tools. Each answers against the default branch unless you pass a <code>rev</code>, and
+        each reports the revision it actually resolved to.
       </p>
 
       {mcpTools.map((tool) => (
@@ -43,9 +42,9 @@ export function McpReference(): ReactNode {
         Resources
       </h2>
       <p>
-        Resources are read by URI rather than called. Each one names its leaf and its snapshot in
-        the URI itself, which is what makes a link portable: a supervisor can hand a preview URI to
-        a subagent and both resolve it to exactly the same bytes.
+        Resources are read by URI rather than called. A URI can carry its workspace and its
+        revision, which is what makes a link portable — a supervisor hands a preview URI to a
+        subagent and both resolve it to the same bytes.
       </p>
 
       {mcpResources.map((resource) => (

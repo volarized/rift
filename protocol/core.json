@@ -27,6 +27,13 @@
       "type": "string",
       "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
     },
+    "GitRevision": {
+      "description": "A git revision parameter, as defined by gitrevisions(7): a string that names a commit, using git's extended SHA-1 syntax. Anything git accepts on a command line is accepted here — an object ID (`dae86e1`), a branch (`main`, `refs/heads/main`), a tag (`v1.2.0`, `tags/v1.2.0`), `HEAD` or `@`, a suffix form (`HEAD~3`, `main@{yesterday}`, `v1.0^{commit}`), or a per-worktree ref reached from another worktree (`worktrees/feature-x/HEAD`, `main-worktree/HEAD`). Ambiguity resolves in git's documented order: `$GIT_DIR/<refname>`, then `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, `refs/remotes/<refname>/HEAD`. Absent, the revision is the default branch at its latest commit. A revision names bytes and not meaning, so the resolved revision and the environment that gave it meaning are both reported back on every result.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    },
     "OwnerId": {
       "description": "Derived owner identity for one adapter: its LanguageId, '.', and the first 16 hex characters of SHA-256 over the length-prefixed implementation and compiler strings. Both inputs are present in hello, so Rift can verify the value at startup. Compiler configuration and dependencies are deliberately excluded: they identify an environment, not an adapter, and they already move the SemanticSnapshotKey. Derived rather than allocated, so the same adapter build yields the same owner on every machine and across every restart, and cached facts that embed it stay valid.",
       "type": "string",

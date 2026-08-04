@@ -528,8 +528,6 @@
       "description": "Query is lexical over file text and symbol names/signatures; compiler semantics enter through fields and relationship filters.",
       "type": "object",
       "required": [
-        "commit",
-        "semantic",
         "target",
         "order"
       ],
@@ -546,12 +544,6 @@
         }
       ],
       "properties": {
-        "commit": {
-          "$ref": "core.json#/$defs/GitOid"
-        },
-        "semantic": {
-          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
-        },
         "target": {
           "description": "Which entity kinds may be returned. Types are not standalone hits: they are reached through the Symbol and Element views that bind them, and searched over by filter.",
           "enum": [
@@ -593,6 +585,10 @@
         "leaf": {
           "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
           "$ref": "#/$defs/LeafId"
+        },
+        "rev": {
+          "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
+          "$ref": "core.json#/$defs/GitRevision"
         }
       },
       "additionalProperties": false,
@@ -684,7 +680,7 @@
     "SymbolResourceUri": {
       "description": "Paginated Symbol URI. The GlobalEntityId alphabet is URL-safe, so the identity path segment needs no encoding rule. Code snapshot, semantic snapshot, leaf, and cursor are query arguments.",
       "type": "string",
-      "pattern": "^rift://symbol/[A-Za-z0-9_-]{1,512}\\?(leaf=[A-Za-z0-9_-]{1,128}&)?commit=[0-9a-f]{40}([0-9a-f]{24})?&semantic=[0-9a-f]{64}(&cursor=[^&#]+)?$"
+      "pattern": "^rift://symbol/[A-Za-z0-9_-]{1,512}(\\?(leaf=[A-Za-z0-9_-]{1,128}&)?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?(&cursor=[^&#]+)?)?$"
     },
     "SymbolResourceLink": {
       "description": "A portable link to the symbol resource. Rift always emits the explicit leaf form.",
@@ -826,7 +822,7 @@
     "DiffResourceUri": {
       "description": "Paginated diff URI; both commits are query arguments, never path identity.",
       "type": "string",
-      "pattern": "^rift://diff\\?(leaf=[A-Za-z0-9_-]{1,128}&)?from=[0-9a-f]{40}([0-9a-f]{24})?&to=[0-9a-f]{40}([0-9a-f]{24})?(&cursor=[^&#]+)?$"
+      "pattern": "^rift://diff\\?(leaf=[A-Za-z0-9_-]{1,128}&)?from=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}&to=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?$"
     },
     "DiffResourcePayload": {
       "type": "object",
@@ -915,7 +911,7 @@
     "PreviewResourceUri": {
       "description": "Paginated retained-preview record. commit selects identity; cursor is opaque and bound to that preview.",
       "type": "string",
-      "pattern": "^rift://preview\\?(leaf=[A-Za-z0-9_-]{1,128}&)?commit=[0-9a-f]{40}([0-9a-f]{24})?(&cursor=[^&#]+)?$"
+      "pattern": "^rift://preview(\\?(leaf=[A-Za-z0-9_-]{1,128}&)?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?(&cursor=[^&#]+)?)?$"
     },
     "PreviewResourceLink": {
       "description": "A portable link to the preview resource. Rift always emits the explicit leaf form.",
@@ -1238,7 +1234,7 @@
     "RepositoryResourceUri": {
       "description": "Paginated leaf metadata/capability URI at one retained snapshot. leaf is optional on the wire and defaults to the session binding; Rift always emits the explicit form so links stay portable.",
       "type": "string",
-      "pattern": "^rift://repository\\?(leaf=[A-Za-z0-9_-]{1,128}&)?commit=[0-9a-f]{40}([0-9a-f]{24})?(&cursor=[^&#]+)?$"
+      "pattern": "^rift://repository(\\?(leaf=[A-Za-z0-9_-]{1,128}&)?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?(&cursor=[^&#]+)?)?$"
     },
     "RepositoryResourceLink": {
       "description": "A portable link to the repository resource. Rift always emits the explicit leaf form.",
@@ -1480,18 +1476,10 @@
     "ActionsParams": {
       "type": "object",
       "required": [
-        "commit",
-        "semantic",
         "target",
         "only"
       ],
       "properties": {
-        "commit": {
-          "$ref": "core.json#/$defs/GitOid"
-        },
-        "semantic": {
-          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
-        },
         "target": {
           "$ref": "core.json#/$defs/Address"
         },
@@ -1514,6 +1502,10 @@
         },
         "cursor": {
           "$ref": "#/$defs/Cursor"
+        },
+        "rev": {
+          "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
+          "$ref": "core.json#/$defs/GitRevision"
         }
       },
       "additionalProperties": false
@@ -1734,18 +1726,10 @@
     "MatchParams": {
       "type": "object",
       "required": [
-        "commit",
-        "semantic",
         "query",
         "limit"
       ],
       "properties": {
-        "commit": {
-          "$ref": "core.json#/$defs/GitOid"
-        },
-        "semantic": {
-          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
-        },
         "query": {
           "$ref": "#/$defs/MatchQuery"
         },
@@ -1760,6 +1744,10 @@
         "leaf": {
           "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
           "$ref": "#/$defs/LeafId"
+        },
+        "rev": {
+          "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
+          "$ref": "core.json#/$defs/GitRevision"
         }
       },
       "additionalProperties": false
@@ -2694,8 +2682,6 @@
       "type": "object",
       "required": [
         "mode",
-        "base",
-        "semantic",
         "changes",
         "validators"
       ],
@@ -2703,11 +2689,9 @@
         "mode": {
           "const": "preview"
         },
-        "base": {
-          "$ref": "core.json#/$defs/GitOid"
-        },
-        "semantic": {
-          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
+        "rev": {
+          "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
+          "$ref": "core.json#/$defs/GitRevision"
         },
         "source_attempt": {
           "$ref": "core.json#/$defs/GitOid"
@@ -2774,9 +2758,7 @@
       "type": "object",
       "required": [
         "mode",
-        "previous",
-        "base",
-        "semantic"
+        "previous"
       ],
       "properties": {
         "mode": {
@@ -2785,11 +2767,9 @@
         "previous": {
           "$ref": "#/$defs/PreviewRef"
         },
-        "base": {
-          "$ref": "core.json#/$defs/GitOid"
-        },
-        "semantic": {
-          "$ref": "core.json#/$defs/SemanticSnapshotDigest"
+        "rev": {
+          "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
+          "$ref": "core.json#/$defs/GitRevision"
         },
         "leaf": {
           "description": "Optional explicit leaf. Absent, the request resolves against the session binding.",
@@ -4353,7 +4333,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://repository{?leaf,commit,cursor}"
+              "const": "rift://repository{?leaf,rev,cursor}"
             },
             "name": {
               "const": "repository"
@@ -4373,7 +4353,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://symbol/{entity}{?leaf,commit,semantic,cursor}"
+              "const": "rift://symbol/{entity}{?leaf,rev,cursor}"
             },
             "name": {
               "const": "symbol"
@@ -4393,7 +4373,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://preview{?leaf,commit,cursor}"
+              "const": "rift://preview{?leaf,rev,cursor}"
             },
             "name": {
               "const": "preview"

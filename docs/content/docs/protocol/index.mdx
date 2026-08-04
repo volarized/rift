@@ -42,11 +42,8 @@ workspace at once, and they need a central point behind them. That central point
 So `rift mcp` is a proxy. It holds no state of its own — it forwards what the agent asks, and returns
 what the server answers.
 
-The hop behind it is Streamable HTTP over a Unix domain socket, and that is where the session lives. The
-server assigns an
-[`Mcp-Session-Id`](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#session-management)
-at initialisation and keeps a table from that ID to the workspace the connection belongs to. The agent's
-own stdio connection has no session ID, because MCP does not define one for stdio.
+MCP is stateless, so nothing in it identifies a connection across calls. The rift server assigns its own
+identifier when a `rift mcp` process connects, and remembers which workspace that connection belongs to.
 
 When the rift server starts, it scans the repository and builds the semantic level using the language
 adapters.
