@@ -1,0 +1,19 @@
+---
+title: MCP surface
+---
+
+import { McpReference } from "@/components/protocol/mcp";
+
+This is what an agent talks to: the tools it can call, the resources it can read, and the one error
+shape they all fail with.
+
+Two things run through all of them.
+
+**Everything answers against the default branch** unless you pass a `rev`. Every response reports the
+revision and the environment it resolved to, so when two calls have to agree you pass those back rather
+than hoping nothing moved.
+
+**Failure is a value.** When something cannot be done you get a typed refusal — a stable code, a retry
+direction, and the evidence behind it — not an exception you have to parse a sentence out of.
+
+<McpReference />

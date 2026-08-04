@@ -1,0 +1,2085 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volar.sh/rift/protocol/mcp.json",
+  "title": "Rift MCP tools, resources, and records",
+  "description": "Rift's first-party MCP surface — five tools, five resource templates, and the categorical error contract — together with the durable records a transaction writes.",
+  "rift:entryPoints": {
+    "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as SymbolId and Address is deliberately reachable from several.",
+    "mcp.tools": {
+      "search": {
+        "description": "Find things. You can search by text, or by what the compiler knows — every symbol that implements a given trait, every function carrying an error, everything a file imports. Filters nest, so \"callers of `parse_config` that live under `src/api`\" is one query rather than three. Results come back in a stated order with a cursor you can replay, and they tell you how much of the repository Rift could actually see.",
+        "params": {
+          "$ref": "#/$defs/SearchParams"
+        },
+        "result": {
+          "$ref": "#/$defs/SearchResult"
+        }
+      },
+      "match": {
+        "description": "Find exact places rather than whole files. Rift runs literal and regular-expression matching itself, over any text file, whether a language adapter owns it or not. Structural matching — \"every call to this method that passes two arguments\" — goes to the language's compiler instead, because only the compiler knows what a call really is. Either way every match gets a stable ID, so you can pick the ones you want and edit exactly those.",
+        "params": {
+          "$ref": "#/$defs/MatchParams"
+        },
+        "result": {
+          "$ref": "#/$defs/MatchResult"
+        }
+      },
+      "actions": {
+        "description": "Ask the compiler what it can offer at one spot in the code: the quick fixes and refactors an IDE would show you in a lightbulb menu. The list is pinned to a snapshot, so an action you found is still the same action when you apply it. If the code moved in between, applying it is refused rather than guessed at.",
+        "params": {
+          "$ref": "#/$defs/ActionsParams"
+        },
+        "result": {
+          "$ref": "#/$defs/ActionsResult"
+        }
+      }
+    },
+    "mcp.resources": {
+      "repository": {
+        "description": "Start here. This says what Rift can do for this repository right now: which languages have adapters, what those adapters actually support, which snapshot is current, what the size limits are, how long previews are kept. Every other call assumes you have read it, because this is where you find out what is worth asking for.",
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/RepositoryResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/ResourceLink"
+        }
+      },
+      "symbol": {
+        "description": "Everything Rift knows about one symbol, in one place — where it is declared, everywhere it appears, its type, what it connects to, and any errors on it. This is the view you want before renaming or deleting something.",
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "core.json#/$defs/SymbolId"
+        },
+        "link": {
+          "$ref": "#/$defs/ResourceLink"
+        }
+      },
+      "diff": {
+        "description": "What changed between two commits — text, binary, and the tree itself. This is plain Git information, so it needs no compiler and no semantic snapshot.",
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/DiffResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/ResourceLink"
+        }
+      },
+      "blob": {
+        "description": "The exact bytes of one file, as Git stored them. No formatting, no truncation, no interpretation. There is a size limit, because handing an agent a 200 MB file helps nobody.",
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/BlobResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/ResourceLink"
+        }
+      }
+    },
+    "mcp.error": {
+      "$ref": "#/$defs/RiftErrorData"
+    },
+    "mcp.resources.read": {
+      "$ref": "#/$defs/ResourceReadResult"
+    }
+  },
+  "$defs": {
+    "Cursor": {
+      "description": "Opaque immutable continuation bound to the canonical request, snapshot, ordering contract, engine version, and page size. Replaying it while the snapshot is retained returns the same page; mismatched or malformed cursors are typed errors.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "RevisionRef": {
+      "type": "object",
+      "required": [
+        "kind",
+        "commit"
+      ],
+      "properties": {
+        "kind": {
+          "const": "revision"
+        },
+        "commit": {
+          "$ref": "core.json#/$defs/GitOid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SnapshotRef": {
+      "description": "An accepted revision, rejected attempt, or retained non-head preview, identified by its Git commit OID.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/RevisionRef"
+        }
+      ]
+    },
+    "SemanticEnvironment": {
+      "description": "Rift-composed identity of every adapter environment that can change semantic facts. adapters sort by owner, which is total because an owner is unique per adapter; fingerprint is the SHA-256 digest of the sorted adapters in RFC 8785 canonical JSON form. This is the one uniqueItems array not sorted by canonical bytes, because sorting by owner is what makes the fingerprint stable under a field addition.",
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "ownership",
+        "adapters"
+      ],
+      "properties": {
+        "fingerprint": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "ownership": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "adapters": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/AdapterEnvironment"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceExcerpt": {
+      "type": "object",
+      "required": [
+        "span",
+        "text"
+      ],
+      "properties": {
+        "span": {
+          "$ref": "core.json#/$defs/SourceSpan"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileEntryKind": {
+      "description": "Portable interpretation of the Git tree entry mode.",
+      "enum": [
+        "regular",
+        "executable",
+        "symlink",
+        "gitlink"
+      ]
+    },
+    "GitBlobPayload": {
+      "description": "The Git blob bytes are the canonical file payload.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "git_blob"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LfsPointerPayload": {
+      "description": "A valid Git LFS v1 pointer recognized from the canonical Git blob. Rift verifies pointer syntax but does not fetch or expose the referenced content.",
+      "type": "object",
+      "required": [
+        "kind",
+        "version",
+        "oid",
+        "size"
+      ],
+      "properties": {
+        "kind": {
+          "const": "lfs_pointer"
+        },
+        "version": {
+          "const": "https://git-lfs.github.com/spec/v1"
+        },
+        "oid": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymlinkPayload": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symlink"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitlinkPayload": {
+      "description": "A link to another repository, recorded as the commit it points at. `File.object` holds that commit, and Rift neither follows it nor reads the linked repository's content.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "gitlink"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FilePayload": {
+      "description": "Interpretation of a Git tree entry without changing its canonical object identity.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/GitBlobPayload"
+        },
+        {
+          "$ref": "#/$defs/LfsPointerPayload"
+        },
+        {
+          "$ref": "#/$defs/SymlinkPayload"
+        },
+        {
+          "$ref": "#/$defs/GitlinkPayload"
+        }
+      ]
+    },
+    "File": {
+      "description": "A Git tree entry from the workspace's complete snapshot at one revision.",
+      "type": "object",
+      "required": [
+        "path",
+        "object",
+        "kind",
+        "payload",
+        "languages",
+        "semantic"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "core.json#/$defs/ProjectPath"
+        },
+        "object": {
+          "$ref": "core.json#/$defs/GitOid"
+        },
+        "kind": {
+          "$ref": "#/$defs/FileEntryKind"
+        },
+        "payload": {
+          "$ref": "#/$defs/FilePayload"
+        },
+        "languages": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "semantic": {
+          "type": "boolean"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "regular",
+                "executable"
+              ]
+            },
+            "payload": {
+              "$ref": "#/$defs/GitBlobPayload"
+            }
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "regular",
+                "executable"
+              ]
+            },
+            "payload": {
+              "$ref": "#/$defs/LfsPointerPayload"
+            },
+            "languages": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "semantic": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "symlink"
+            },
+            "payload": {
+              "$ref": "#/$defs/SymlinkPayload"
+            },
+            "languages": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "semantic": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "gitlink"
+            },
+            "payload": {
+              "$ref": "#/$defs/GitlinkPayload"
+            },
+            "languages": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "semantic": {
+              "const": false
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "QueryExecution": {
+      "description": "Result-set metadata analogous to a database execution plan identity, without exposing implementation internals or nondeterministic timing.",
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "engine",
+        "version",
+        "order"
+      ],
+      "properties": {
+        "fingerprint": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "engine": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "order": {
+          "$ref": "#/$defs/ResultOrder"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SearchParams": {
+      "description": "Query is lexical over file text and symbol names/signatures; compiler semantics enter through fields and relationship filters.",
+      "type": "object",
+      "required": [
+        "target",
+        "order"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "query"
+          ]
+        },
+        {
+          "required": [
+            "filter"
+          ]
+        }
+      ],
+      "properties": {
+        "target": {
+          "description": "Which entity kinds may be returned. Types are not standalone hits: they are reached through the Symbol and Leaf views that bind them, and searched over by filter.",
+          "enum": [
+            "symbol",
+            "leaf",
+            "file",
+            "all"
+          ]
+        },
+        "order": {
+          "$ref": "#/$defs/ResultOrder"
+        },
+        "query": {
+          "type": "string"
+        },
+        "filter": {
+          "$ref": "core.json#/$defs/Filter"
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "source",
+              "signature",
+              "relationships",
+              "diagnostics"
+            ]
+          },
+          "default": []
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 50
+        },
+        "cursor": {
+          "$ref": "#/$defs/Cursor"
+        },
+        "rev": {
+          "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
+          "$ref": "core.json#/$defs/GitRevision",
+          "default": "HEAD"
+        }
+      },
+      "additionalProperties": false,
+      "examples": [
+        {
+          "commit": "0000000000000000000000000000000000000000",
+          "semantic": "0000000000000000000000000000000000000000000000000000000000000000",
+          "target": "symbol",
+          "order": "relevance",
+          "filter": {
+            "kind": "relation",
+            "relation": {
+              "kind": "calls",
+              "direction": "outgoing",
+              "target": {
+                "kind": "field",
+                "field": {
+                  "field": "name",
+                  "op": "eq",
+                  "value": "render"
+                }
+              }
+            }
+          }
+        },
+        {
+          "commit": "0000000000000000000000000000000000000000",
+          "semantic": "0000000000000000000000000000000000000000000000000000000000000000",
+          "target": "symbol",
+          "order": "path",
+          "filter": {
+            "kind": "relation",
+            "relation": {
+              "kind": "calls",
+              "direction": "incoming",
+              "target": {
+                "kind": "field",
+                "field": {
+                  "field": "path",
+                  "op": "prefix",
+                  "value": "src/api/"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SearchHit": {
+      "description": "One search hit. Identity is carried by the hit payload itself; there is no separate id field.",
+      "type": "object",
+      "required": [
+        "hit",
+        "score",
+        "matched_by"
+      ],
+      "properties": {
+        "hit": {
+          "$ref": "#/$defs/SearchHitTarget"
+        },
+        "score": {
+          "type": "number"
+        },
+        "matched_by": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Relationship"
+          }
+        },
+        "source": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResourceLink": {
+      "description": "A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed per resource, and the URI is the one that resource accepts.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "uri",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "$ref": "core.json#/$defs/SymbolId"
+            },
+            "name": {
+              "const": "symbol"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.symbol+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "uri",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "$ref": "#/$defs/RepositoryResourceUri"
+            },
+            "name": {
+              "const": "repository"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.repository+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "uri",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "$ref": "#/$defs/DiffResourceUri"
+            },
+            "name": {
+              "const": "diff"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.diff+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "uri",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "$ref": "#/$defs/BlobResourceUri"
+            },
+            "name": {
+              "const": "blob"
+            },
+            "mimeType": {
+              "const": "application/octet-stream"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SymbolResourcePayload": {
+      "description": "JSON payload for one symbol at one snapshot.",
+      "type": "object",
+      "required": [
+        "uri",
+        "at",
+        "environment",
+        "symbol",
+        "source_maps",
+        "leaves",
+        "relationships",
+        "source",
+        "diagnostics",
+        "coverage",
+        "next",
+        "execution"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "core.json#/$defs/SymbolId"
+        },
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "environment": {
+          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
+          "$ref": "#/$defs/SemanticEnvironment"
+        },
+        "symbol": {
+          "$ref": "core.json#/$defs/Symbol"
+        },
+        "source_maps": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/SourceMapEntry"
+          }
+        },
+        "leaves": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Leaf"
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Relationship"
+          }
+        },
+        "source": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceExcerpt"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/SemanticCoverage"
+        },
+        "next": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/SymbolId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution": {
+          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
+          "$ref": "#/$defs/QueryExecution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolResourceContents": {
+      "description": "MCP text resource whose text is the JSON serialization of SymbolResourcePayload.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "text"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "core.json#/$defs/SymbolId"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.symbol+json"
+        },
+        "text": {
+          "type": "string",
+          "contentMediaType": "application/vnd.rift.symbol+json",
+          "contentSchema": {
+            "$ref": "#/$defs/SymbolResourcePayload"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DiffResourceUri": {
+      "description": "Paginated diff URI; both commits are query arguments, never path identity.",
+      "type": "string",
+      "pattern": "^rift://diff\\?from=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}&to=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?$"
+    },
+    "DiffResourcePayload": {
+      "type": "object",
+      "required": [
+        "uri",
+        "diff",
+        "next",
+        "execution"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/DiffResourceUri"
+        },
+        "diff": {
+          "$ref": "#/$defs/SnapshotDiff"
+        },
+        "next": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DiffResourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution": {
+          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
+          "$ref": "#/$defs/QueryExecution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DiffResourceContents": {
+      "description": "MCP text resource whose text is the JSON serialization of DiffResourcePayload.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "text"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/DiffResourceUri"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.diff+json"
+        },
+        "text": {
+          "type": "string",
+          "contentMediaType": "application/vnd.rift.diff+json",
+          "contentSchema": {
+            "$ref": "#/$defs/DiffResourcePayload"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "BlobResourceUri": {
+      "description": "Opaque Git blob resource addressed by object ID as a query argument, never by a traversable path.",
+      "type": "string",
+      "pattern": "^rift://blob\\?object=[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "BlobResourceContents": {
+      "description": "MCP blob resource; blob is canonical base64 of the exact Git object payload, returned whole. This resource does not paginate: it is exact bytes, not a result set. Objects larger than DriverLimits.max_blob_bytes fail with limit_exceeded rather than being truncated or chunked.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "blob"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/BlobResourceUri"
+        },
+        "mimeType": {
+          "const": "application/octet-stream"
+        },
+        "blob": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ContractDescriptor": {
+      "type": "object",
+      "required": [
+        "protocol",
+        "schema",
+        "canonical_json"
+      ],
+      "properties": {
+        "protocol": {
+          "$ref": "core.json#/$defs/ProtocolVersion"
+        },
+        "schema": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "canonical_json": {
+          "const": "RFC8785"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DriverLimits": {
+      "description": "Effective caller-visible MCP limits supplied by launch/host policy. A request that exceeds one, or a response that would exceed max_blob_bytes, fails with limit_exceeded carrying LimitEvidence.",
+      "type": "object",
+      "required": [
+        "max_request_bytes",
+        "max_blob_bytes",
+        "max_page_items",
+        "max_relation_depth",
+        "max_changes",
+        "max_validators",
+        "max_program_expansions"
+      ],
+      "properties": {
+        "max_request_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 9007199254740991
+        },
+        "max_blob_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 9007199254740991,
+          "description": "Largest Git blob the blob resource will return. The blob resource is deliberately exempt from pagination — it delivers exact opaque bytes, and a cursor over raw bytes buys nothing a byte range would not do better — so it is bounded instead. A larger object fails with limit_exceeded carrying the object size, letting the caller fall back to the diff resource or wait for range reads in a later version. Without this bound the resource has no defined behaviour for a large object, since max_request_bytes bounds requests rather than responses."
+        },
+        "max_page_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "max_relation_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "max_changes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "max_validators": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "max_program_expansions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryResourceUri": {
+      "description": "Paginated workspace metadata and capabilities at one revision.",
+      "type": "string",
+      "pattern": "^rift://repository(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$"
+    },
+    "RepositoryResourcePayload": {
+      "description": "What Rift can do for this workspace right now: the languages it understands, what their adapters support, the snapshot it answered from, and the limits a request has to stay inside.",
+      "type": "object",
+      "required": [
+        "uri",
+        "at",
+        "environment",
+        "contract",
+        "limits",
+        "languages",
+        "adapters",
+        "coverage",
+        "tools",
+        "resources",
+        "next",
+        "object_format",
+        "matching",
+        "profile",
+        "execution"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/RepositoryResourceUri"
+        },
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "environment": {
+          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
+          "$ref": "#/$defs/SemanticEnvironment"
+        },
+        "contract": {
+          "$ref": "#/$defs/ContractDescriptor"
+        },
+        "limits": {
+          "$ref": "#/$defs/DriverLimits"
+        },
+        "languages": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/LanguageId"
+          }
+        },
+        "adapters": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/LanguageSubstrate"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/SemanticCoverage"
+        },
+        "tools": {
+          "description": "The MCP tools this workspace serves.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "search",
+              "match",
+              "actions",
+              "apply",
+              "persist"
+            ]
+          }
+        },
+        "resources": {
+          "description": "The MCP resource families this workspace serves.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "repository",
+              "symbol",
+              "diff",
+              "blob"
+            ]
+          }
+        },
+        "next": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RepositoryResourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "object_format": {
+          "enum": [
+            "sha1",
+            "sha256"
+          ]
+        },
+        "matching": {
+          "$ref": "#/$defs/MatchingDialects"
+        },
+        "profile": {
+          "$ref": "#/$defs/ConformanceProfile"
+        },
+        "execution": {
+          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
+          "$ref": "#/$defs/QueryExecution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryResourceContents": {
+      "description": "MCP text resource whose text is the JSON serialization of RepositoryResourcePayload.",
+      "type": "object",
+      "required": [
+        "uri",
+        "mimeType",
+        "text"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/RepositoryResourceUri"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.repository+json"
+        },
+        "text": {
+          "type": "string",
+          "contentMediaType": "application/vnd.rift.repository+json",
+          "contentSchema": {
+            "$ref": "#/$defs/RepositoryResourcePayload"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SearchResult": {
+      "type": "object",
+      "required": [
+        "at",
+        "environment",
+        "execution",
+        "coverage",
+        "results",
+        "next_cursor"
+      ],
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "environment": {
+          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
+          "$ref": "#/$defs/SemanticEnvironment"
+        },
+        "execution": {
+          "$ref": "#/$defs/QueryExecution"
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SearchHit"
+          }
+        },
+        "next_cursor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicCodeAction": {
+      "type": "object",
+      "required": [
+        "ref",
+        "language",
+        "descriptor"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "core.json#/$defs/PublicCodeActionRef"
+        },
+        "descriptor": {
+          "$ref": "core.json#/$defs/CodeActionDescriptor"
+        },
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionsParams": {
+      "type": "object",
+      "required": [
+        "target",
+        "only"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "core.json#/$defs/Address"
+        },
+        "only": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]*$"
+          }
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 50
+        },
+        "cursor": {
+          "$ref": "#/$defs/Cursor"
+        },
+        "rev": {
+          "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
+          "$ref": "core.json#/$defs/GitRevision",
+          "default": "HEAD"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionsResult": {
+      "type": "object",
+      "required": [
+        "at",
+        "environment",
+        "execution",
+        "actions",
+        "coverage",
+        "next_cursor"
+      ],
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "environment": {
+          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
+          "$ref": "#/$defs/SemanticEnvironment"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicCodeAction"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        },
+        "next_cursor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution": {
+          "description": "Execution identity for this page. Actions have exactly one legal order.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/QueryExecution"
+            }
+          ],
+          "properties": {
+            "order": {
+              "const": "identity"
+            }
+          }
+        }
+      },
+      "additionalProperties": false,
+      "description": "Discovered actions for one pinned address. Paginated on the same contract as search and match: a declared total order and engine version, and a cursor bound to both. Without execution the cursor would be bound to an ordering contract the response never published, which is exactly how pagination duplicates or skips."
+    },
+    "TextQuery": {
+      "description": "Rift-core UTF-8 literal or rust-regex regex matching for any regular/executable text file, independent of language ownership. The dialect is named and advertised through MatchingDialects; it is deliberately not RE2, which defines the Perl classes and word boundaries as ASCII where rust-regex defines them as Unicode. case_sensitive and multiline set the pattern's initial flag state; an inline flag group overrides them from its position onward, so the fields are defaults rather than an outer constraint. In literal mode the pattern is matched bytewise and no flag is interpreted.",
+      "type": "object",
+      "required": [
+        "kind",
+        "version",
+        "mode",
+        "pattern",
+        "case_sensitive",
+        "multiline",
+        "paths"
+      ],
+      "properties": {
+        "kind": {
+          "const": "text"
+        },
+        "version": {
+          "const": 1
+        },
+        "mode": {
+          "enum": [
+            "literal",
+            "regex"
+          ]
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "case_sensitive": {
+          "type": "boolean"
+        },
+        "multiline": {
+          "type": "boolean"
+        },
+        "paths": {
+          "$ref": "core.json#/$defs/PathSelector"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchQuery": {
+      "oneOf": [
+        {
+          "$ref": "core.json#/$defs/StructuralQuery"
+        },
+        {
+          "$ref": "#/$defs/TextQuery"
+        }
+      ],
+      "description": "One match request, tagged by the engine that must answer it."
+    },
+    "StructuralMatchHit": {
+      "description": "One explained deterministic match. Matches sort by physical path, range, then canonical capture bytes.",
+      "type": "object",
+      "required": [
+        "kind",
+        "ref",
+        "language",
+        "span",
+        "replacement_ranges",
+        "captures",
+        "explanation",
+        "extensions"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "core.json#/$defs/PublicMatchRef"
+        },
+        "span": {
+          "$ref": "core.json#/$defs/SourceSpan"
+        },
+        "replacement_ranges": {
+          "$ref": "core.json#/$defs/StructuralMatchRanges"
+        },
+        "captures": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/StructuralCapture"
+          }
+        },
+        "explanation": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "extensions": {
+          "$ref": "core.json#/$defs/Extensions"
+        },
+        "kind": {
+          "const": "structural"
+        },
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TextMatchHit": {
+      "type": "object",
+      "required": [
+        "kind",
+        "ref",
+        "span",
+        "captures",
+        "explanation"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "core.json#/$defs/PublicMatchRef"
+        },
+        "span": {
+          "$ref": "core.json#/$defs/SourceSpan"
+        },
+        "captures": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/StructuralCapture"
+          }
+        },
+        "explanation": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "kind": {
+          "const": "text"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchHit": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StructuralMatchHit"
+        },
+        {
+          "$ref": "#/$defs/TextMatchHit"
+        }
+      ],
+      "description": "One match, tagged by the engine that produced it."
+    },
+    "MatchParams": {
+      "type": "object",
+      "required": [
+        "query",
+        "limit"
+      ],
+      "properties": {
+        "query": {
+          "$ref": "#/$defs/MatchQuery"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 50
+        },
+        "cursor": {
+          "$ref": "#/$defs/Cursor"
+        },
+        "rev": {
+          "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
+          "$ref": "core.json#/$defs/GitRevision",
+          "default": "HEAD"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchResult": {
+      "type": "object",
+      "required": [
+        "at",
+        "environment",
+        "execution",
+        "matches",
+        "coverage",
+        "next_cursor"
+      ],
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "environment": {
+          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
+          "$ref": "#/$defs/SemanticEnvironment"
+        },
+        "execution": {
+          "description": "The match aggregator uses canonical physical path/range/identity order.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/QueryExecution"
+            },
+            {
+              "properties": {
+                "order": {
+                  "const": "path"
+                }
+              }
+            }
+          ]
+        },
+        "matches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MatchHit"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        },
+        "next_cursor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DiagnosticView": {
+      "description": "A Diagnostic enriched for an MCP response without redefining the underlying fact.",
+      "type": "object",
+      "required": [
+        "source",
+        "at",
+        "diagnostic",
+        "line",
+        "column",
+        "excerpt"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "compiler",
+            "validator",
+            "apply"
+          ]
+        },
+        "at": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "diagnostic": {
+          "$ref": "core.json#/$defs/Diagnostic"
+        },
+        "line": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "column": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "excerpt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DiffHunk": {
+      "description": "A bounded unified-diff hunk. Patch includes its @@ header and lines.",
+      "type": "object",
+      "required": [
+        "old_start",
+        "old_lines",
+        "new_start",
+        "new_lines",
+        "patch"
+      ],
+      "properties": {
+        "old_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "old_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "new_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "new_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "patch": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileDiff": {
+      "type": "object",
+      "required": [
+        "status",
+        "path",
+        "entry_before",
+        "entry_after",
+        "object_before",
+        "object_after",
+        "hunks",
+        "binary",
+        "truncated"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "created",
+            "modified",
+            "deleted",
+            "renamed",
+            "copied"
+          ]
+        },
+        "path": {
+          "$ref": "core.json#/$defs/ProjectPath"
+        },
+        "previous_path": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/ProjectPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hunks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffHunk"
+          }
+        },
+        "entry_before": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/FileEntryKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "entry_after": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/FileEntryKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "object_before": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/GitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "object_after": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/GitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "binary": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/BinaryDiffSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BinaryDiffSummary": {
+      "type": "object",
+      "required": [
+        "before_sha256",
+        "after_sha256",
+        "before_bytes",
+        "after_bytes"
+      ],
+      "properties": {
+        "before_sha256": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after_sha256": {
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "before_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "after_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SnapshotDiff": {
+      "type": "object",
+      "required": [
+        "from",
+        "to",
+        "files",
+        "truncated"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "to": {
+          "$ref": "#/$defs/SnapshotRef"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FileDiff"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RiftErrorCode": {
+      "description": "Stable driver-facing infrastructure/request classification. The code is the class; no second category field may contradict it. Domain refusals, conflicts, rejected Attempts, and accepted Revisions remain ordinary typed outcomes.",
+      "enum": [
+        "invalid_request",
+        "unsupported_protocol",
+        "permission_denied",
+        "snapshot_not_found",
+        "semantic_snapshot_mismatch",
+        "semantic_snapshot_unavailable",
+        "resource_not_found",
+        "record_reclaimed",
+        "content_unavailable",
+        "cursor_invalid",
+        "cursor_snapshot_mismatch",
+        "cancelled",
+        "deadline_exceeded",
+        "limit_exceeded",
+        "worktree_busy",
+        "adapter_unavailable",
+        "adapter_protocol_error",
+        "adapter_timeout",
+        "storage_failure",
+        "sandbox_failure",
+        "internal_error"
+      ]
+    },
+    "RetryDirective": {
+      "enum": [
+        "never",
+        "same_request",
+        "same_idempotency_key",
+        "refresh_snapshot"
+      ]
+    },
+    "RiftErrorCause": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retry",
+        "causes"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/RiftErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryDirective"
+        },
+        "causes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RiftErrorCause"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RiftErrorData": {
+      "description": "Required JSON-RPC error data for every Rift MCP failure. It is the SQLException/SQLState analogue: stable code and retry direction plus human message and typed evidence.",
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retry",
+        "phase",
+        "at",
+        "operation",
+        "diagnostics",
+        "causes"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/RiftErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryDirective"
+        },
+        "phase": {
+          "enum": [
+            "discovery",
+            "read",
+            "resolve",
+            "validate",
+            "preview",
+            "publish",
+            "persist"
+          ]
+        },
+        "at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SnapshotRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticView"
+          }
+        },
+        "limit": {
+          "$ref": "#/$defs/LimitEvidence"
+        },
+        "causes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RiftErrorCause"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "limit_exceeded"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "limit"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "limit"
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "LimitEvidence": {
+      "description": "Structured evidence for limit_exceeded: which advertised DriverLimits or AdapterLimits field was exceeded, its effective value, and the value that was required. Present exactly when code is limit_exceeded. Without it a caller can only reparse the human message to decide whether to retry differently, fall back to another resource, or give up — which is the difference between an actionable refusal and an opaque one.",
+      "type": "object",
+      "required": [
+        "field",
+        "limit",
+        "required"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "required": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchingDialects": {
+      "description": "The matching grammars this workspace accepts, advertised rather than assumed.",
+      "type": "object",
+      "required": [
+        "text",
+        "path"
+      ],
+      "properties": {
+        "text": {
+          "const": "rust-regex"
+        },
+        "path": {
+          "const": "git-glob"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResourceTemplate": {
+      "description": "One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per family.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://repository{?rev,cursor}"
+            },
+            "name": {
+              "const": "repository"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.repository+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://symbol/{language}/{unit}:{path}{?rev,cursor}"
+            },
+            "name": {
+              "const": "symbol"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.symbol+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://diff{?from,to,cursor}"
+            },
+            "name": {
+              "const": "diff"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.diff+json"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://blob{?object}"
+            },
+            "name": {
+              "const": "blob"
+            },
+            "mimeType": {
+              "const": "application/octet-stream"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ResourceReadResult": {
+      "description": "The result of one MCP resource read. Contents are discriminated by mimeType.",
+      "type": "object",
+      "required": [
+        "contents"
+      ],
+      "properties": {
+        "contents": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/RepositoryResourceContents"
+              },
+              {
+                "$ref": "#/$defs/SymbolResourceContents"
+              },
+              {
+                "$ref": "#/$defs/DiffResourceContents"
+              },
+              {
+                "$ref": "#/$defs/BlobResourceContents"
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SearchHitTarget": {
+      "description": "What a search hit is. Tagged, so the payload correlation survives code generation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "symbol",
+            "resource"
+          ],
+          "properties": {
+            "target": {
+              "const": "symbol"
+            },
+            "symbol": {
+              "$ref": "core.json#/$defs/Symbol"
+            },
+            "resource": {
+              "$ref": "#/$defs/ResourceLink"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "leaf"
+          ],
+          "properties": {
+            "target": {
+              "const": "leaf"
+            },
+            "leaf": {
+              "$ref": "core.json#/$defs/Leaf"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "file"
+          ],
+          "properties": {
+            "target": {
+              "const": "file"
+            },
+            "file": {
+              "$ref": "#/$defs/File"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ConformanceProfile": {
+      "description": "What this workspace actually implements, advertised rather than assumed. Profiles are a ladder: each includes the one below it. A workspace must advertise only a profile whose full conformance suite it passes, and a caller reads capability from here rather than inferring it from a version number.",
+      "enum": [
+        "read",
+        "edit",
+        "full"
+      ]
+    },
+    "ResultOrder": {
+      "description": "Total deterministic result order, shared by every paginated tool. relevance sorts by versioned score descending then canonical identity; path sorts by physical path and range then identity; identity sorts by the result's canonical opaque identity bytes — entity id, action descriptor digest, or path, according to what the result is. Action discovery has exactly one legal order, identity, because relevance and path are not defined over compiler actions.",
+      "enum": [
+        "relevance",
+        "path",
+        "identity"
+      ]
+    }
+  }
+}

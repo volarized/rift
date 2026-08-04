@@ -1,0 +1,23 @@
+---
+title: Adapter wire
+---
+
+import { AdapterReference } from "@/components/protocol/adapter";
+
+An adapter is how a language gets into Rift. It is a process that wraps that language's real compiler and
+answers questions about it, one JSON object per line, over stdin and stdout.
+
+Three things shape everything on this page.
+
+**The adapter never touches Git.** It cannot read your repository, and it is not trusted to. Rift reads
+the files and pushes them into the adapter's own copy — its *mirror* — which is why the mirror lifecycle
+comes before any question you might want to ask.
+
+**A mirror is a cache, never the source of truth.** Losing an adapter costs you time and nothing else.
+Rift rebuilds the mirror from Git objects and replays the sync.
+
+**One process serves many callers.** That is what makes a second agent cheap instead of a second full
+compile, and it is also why an adapter must interleave its stream frames rather than draining one
+response before starting the next. One agent's large analysis must not stall everyone else on the pipe.
+
+<AdapterReference />

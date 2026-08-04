@@ -1,0 +1,2448 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volar.sh/rift/protocol/core.json",
+  "title": "Rift core semantic model",
+  "description": "Vocabulary shared by every Rift seam: Symbols, Leaves, Types, Relationships, identity, source addressing, coverage, and diagnostics. The MCP surface and the adapter IPC are both defined in terms of these, so they belong to neither.",
+  "$defs": {
+    "ProtocolVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "Generation": {
+      "description": "A process-local counter that detects a stale mirror. It advances on every committed sync of that mirror, and is scoped to the process rather than to the repository.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "SemanticSnapshotDigest": {
+      "description": "SHA-256 over the resolved revision's tree and the environment that gave it meaning, in RFC 8785 canonical JSON. A compact pin for the exact state an answer came from.",
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "GitOid": {
+      "description": "Opaque Git object ID. Commit OIDs are public causal/CAS handles; tree OIDs identify exact source content. SHA-1 repositories use 40 hex characters and SHA-256 repositories use 64.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "GitRevision": {
+      "description": "A git revision parameter, as defined by gitrevisions(7): a string that names a commit, using git's extended SHA-1 syntax. Anything git accepts on a command line is accepted here — an object ID (`dae86e1`), a branch (`main`, `refs/heads/main`), a tag (`v1.2.0`, `tags/v1.2.0`), `HEAD` or `@`, a suffix form (`HEAD~3`, `main@{yesterday}`, `v1.0^{commit}`), or a per-worktree ref reached from another worktree (`worktrees/feature-x/HEAD`, `main-worktree/HEAD`). Ambiguity resolves in git's documented order: `$GIT_DIR/<refname>`, then `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, `refs/remotes/<refname>/HEAD`. Absent, the revision is the default branch at its latest commit. A revision names bytes and not meaning, so the resolved revision and the environment that gave it meaning are both reported back on every result.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    },
+    "SymbolId": {
+      "description": "Identity of one symbol, and the URI that resolves it. The identifier you get back is the address you read, so there is nothing to assemble and no second form to convert to.\n\n`rift://symbol/<language>/<unit-path>:<symbol-path>` — for example `rift://symbol/python/pkg/util.py:load_config`. The symbol path is the chain of containers ending in the name, joined by `.`, so a method reads as its class and then itself. Where one unit declares two symbols that would otherwise write the same, the adapter appends `~` and an index.\n\nA revision can be attached as `?rev=`, pinning the identity to one state; without it the identity is the symbol itself, at whichever revision the request resolved. The language segment is what keeps two adapters apart, so one workspace runs one adapter per language.",
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 1024,
+      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
+      "examples": [
+        "rift://symbol/python/pkg/util.py:load_config~1?rev=HEAD~3",
+        "rift://symbol/typescript/src/config.ts:ConfigLoader.parse"
+      ]
+    },
+    "LeafId": {
+      "description": "Identity of one leaf of a file's syntax tree, and the URI that resolves it. `rift://leaf/<language>/<unit-path>@<start>-<end>`, where the offsets are the half-open UTF-8 byte range the leaf spans. A revision can be attached as `?rev=`.",
+      "type": "string",
+      "minLength": 18,
+      "maxLength": 1024,
+      "pattern": "^rift://leaf/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}@\\d+-\\d+(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+      "examples": [
+        "rift://leaf/python/pkg/util.py@1204-1266"
+      ]
+    },
+    "FileId": {
+      "description": "Identity of one source file, and the URI that resolves it. `rift://file/<language>/<path>` — the language whose adapter owns the file, then its project-relative path. A file an adapter produced rather than read from disk is addressed the same way, with the path the producer minted for it, and the source map says what it was generated from. A revision can be attached as `?rev=`.",
+      "type": "string",
+      "minLength": 14,
+      "maxLength": 1024,
+      "pattern": "^rift://file/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+      "examples": [
+        "rift://file/python/pkg/util.py",
+        "rift://file/typescript/src/config.ts?rev=main"
+      ]
+    },
+    "LanguageId": {
+      "description": "A language, as its adapter advertises it. One workspace runs one adapter per language, so this also identifies the adapter that owns a file or minted a fact. Which build of that adapter answered is reported by the environment on every result.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
+      "maxLength": 64,
+      "examples": [
+        "typescript",
+        "rust",
+        "python"
+      ]
+    },
+    "AdapterEnvironment": {
+      "description": "Machine-independent identity of the non-source inputs owned by one adapter. No absolute path may contribute.",
+      "type": "object",
+      "required": [
+        "language",
+        "fingerprint",
+        "implementation",
+        "compiler",
+        "compiler_configuration",
+        "dependencies"
+      ],
+      "properties": {
+        "fingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "implementation": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "compiler": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "compiler_configuration": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "dependencies": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorState": {
+      "description": "The exact adapter state a state-pinned request expects: which mirror, that mirror's generation, and the AdapterEnvironment fingerprint its content produced. Generation is per mirror, so concurrent work on distinct mirrors never invalidates a peer. A MirrorState exists only after sync.commit, because environment is derived from synced content rather than known in advance.",
+      "type": "object",
+      "required": [
+        "mirror",
+        "generation",
+        "environment"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "#/$defs/MirrorId"
+        },
+        "generation": {
+          "$ref": "#/$defs/Generation"
+        },
+        "environment": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExtensionValue": {
+      "description": "Versioned extension value. data is validated against the schema advertised for its key and version.",
+      "type": "object",
+      "required": [
+        "version",
+        "data"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "data": {}
+      },
+      "additionalProperties": false
+    },
+    "ExtensionKey": {
+      "description": "A reverse-domain namespaced extension or extension-operation identifier.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$"
+    },
+    "Extensions": {
+      "description": "Reverse-domain namespaced facts. Keys and values use RFC 8785 canonical JSON; every key/version is advertised in AdapterHello.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/ExtensionKey"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/ExtensionValue"
+      }
+    },
+    "ProjectPath": {
+      "description": "A non-empty project-relative UTF-8 path using '/' separators, with no backslash, control character, empty segment, '.' segment, or '..' segment.",
+      "type": "string",
+      "pattern": "^(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^/\\\\\\u0000-\\u001F\\u007F]+(?:/[^/\\\\\\u0000-\\u001F\\u007F]+)*$"
+    },
+    "PathPattern": {
+      "description": "Project-relative Git-style glob using *, ?, **, and character classes; absolute, backslash, control, and '..' segments are forbidden.",
+      "type": "string",
+      "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$"
+    },
+    "PathSelector": {
+      "type": "object",
+      "required": [
+        "include",
+        "exclude"
+      ],
+      "properties": {
+        "include": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          }
+        },
+        "exclude": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "TextRange": {
+      "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from its compiler's native offsets at the seam.",
+      "type": "object",
+      "required": [
+        "start",
+        "end"
+      ],
+      "properties": {
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "additionalProperties": false
+    },
+    "Severity": {
+      "enum": [
+        "error",
+        "warning",
+        "info",
+        "hint"
+      ]
+    },
+    "SourceSpan": {
+      "type": "object",
+      "required": [
+        "unit",
+        "range"
+      ],
+      "properties": {
+        "unit": {
+          "$ref": "#/$defs/FileId"
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceMapEntry": {
+      "description": "Deterministic virtual-source provenance. exact means one affine byte-for-byte origin range; approximate preserves one or more origins without positional equivalence; synthetic has no source origin. The oneOf constrains cardinality only — exactly one origin for exact, at least one for approximate, none for synthetic — and never varies the shape.",
+      "type": "object",
+      "required": [
+        "generated",
+        "precision",
+        "originals"
+      ],
+      "properties": {
+        "generated": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "precision": {
+          "enum": [
+            "exact",
+            "approximate",
+            "synthetic"
+          ]
+        },
+        "originals": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SourceSpan"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "precision": {
+              "const": "exact"
+            },
+            "originals": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "precision": {
+              "const": "approximate"
+            },
+            "originals": {
+              "type": "array",
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "precision": {
+              "const": "synthetic"
+            },
+            "originals": {
+              "type": "array",
+              "maxItems": 0
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "CoverageScope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "request"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "unit"
+          ],
+          "properties": {
+            "kind": {
+              "const": "unit"
+            },
+            "unit": {
+              "$ref": "#/$defs/FileId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "project"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "dependencies"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "all"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Coverage": {
+      "description": "Explicit completeness for one semantic fact family. Absence is authoritative only when state is complete.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "scope"
+          ],
+          "properties": {
+            "state": {
+              "const": "complete"
+            },
+            "scope": {
+              "$ref": "#/$defs/CoverageScope"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "scope",
+            "reason"
+          ],
+          "properties": {
+            "state": {
+              "const": "partial"
+            },
+            "scope": {
+              "$ref": "#/$defs/CoverageScope"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "continuation": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "scope",
+            "reason"
+          ],
+          "properties": {
+            "state": {
+              "const": "unsupported"
+            },
+            "scope": {
+              "$ref": "#/$defs/CoverageScope"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "scope",
+            "reason"
+          ],
+          "properties": {
+            "state": {
+              "const": "not_applicable"
+            },
+            "scope": {
+              "$ref": "#/$defs/CoverageScope"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SemanticCoverage": {
+      "description": "Coverage for every fact family. Absence is authoritative only where state is complete.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/FactFamily"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/Coverage"
+      },
+      "minProperties": 6
+    },
+    "ExternalSymbolRef": {
+      "description": "Unresolved cross-owner symbol identity. Rift links it only by exact ExternalIdentity equality and otherwise preserves it as unresolved.",
+      "type": "object",
+      "required": [
+        "kind",
+        "identities"
+      ],
+      "properties": {
+        "kind": {
+          "const": "external_symbol"
+        },
+        "identities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ExternalIdentity"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeExpression": {
+      "description": "How a type is written in the source, plus the symbol that declares it when one does. A type with a declaration resolves to that symbol; a structural type — `string | null`, `{ a: string }` — has the spelling and nothing to resolve to.",
+      "type": "object",
+      "required": [
+        "language",
+        "source",
+        "resolved",
+        "extensions"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "source": {
+          "type": "string"
+        },
+        "resolved": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SymbolId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeBinding": {
+      "type": "object",
+      "required": [
+        "role",
+        "type"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "declared",
+            "inferred",
+            "expected",
+            "receiver",
+            "parameter",
+            "return"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/TypeExpression"
+        }
+      },
+      "additionalProperties": false,
+      "description": "One type a symbol carries, together with the role it plays for that symbol."
+    },
+    "Documentation": {
+      "type": "object",
+      "required": [
+        "format",
+        "text"
+      ],
+      "properties": {
+        "format": {
+          "enum": [
+            "plain",
+            "markdown"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "One block of documentation attached to a declaration, in the markup it was written in."
+    },
+    "Parameter": {
+      "type": "object",
+      "required": [
+        "name",
+        "types",
+        "optional",
+        "variadic",
+        "default",
+        "extensions"
+      ],
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "leaf": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          }
+        },
+        "optional": {
+          "type": "boolean"
+        },
+        "variadic": {
+          "type": "boolean"
+        },
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SignatureShape": {
+      "description": "Canonical structured callable shape shared by semantic facts, generator context, and signature-change intent.",
+      "type": "object",
+      "required": [
+        "language",
+        "receiver",
+        "parameters",
+        "returns",
+        "type_parameters",
+        "throws",
+        "effects",
+        "extensions"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "receiver": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Parameter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Parameter"
+          }
+        },
+        "returns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          }
+        },
+        "type_parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedEntityTarget"
+          }
+        },
+        "throws": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeExpression"
+          }
+        },
+        "effects": {
+          "description": "Ordered exact language effect names such as async, unsafe, pure, or throws; portable interpretation is never inferred from spelling.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Signature": {
+      "description": "One rendered callable signature plus canonical shape and links; overloads are separate Signature values.",
+      "type": "object",
+      "required": [
+        "display",
+        "links",
+        "shape"
+      ],
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "links": {
+          "description": "Symbol links whose ranges are relative to display, preserving referenced symbols for renderers and projections.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SignatureLink"
+          }
+        },
+        "shape": {
+          "$ref": "#/$defs/SignatureShape"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SignatureLink": {
+      "type": "object",
+      "required": [
+        "range",
+        "symbol"
+      ],
+      "properties": {
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        },
+        "symbol": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalIdentity": {
+      "description": "Portable identity in another symbol scheme, qualified by the scheme that defines it. Cross-owner identity uses exact advertised external identities or stays unresolved; Rift never derives one.",
+      "type": "object",
+      "required": [
+        "scheme",
+        "value"
+      ],
+      "properties": {
+        "scheme": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolFacet": {
+      "enum": [
+        "namespace",
+        "module",
+        "type",
+        "value",
+        "callable",
+        "member",
+        "member_container",
+        "parameter",
+        "type_parameter",
+        "constructible",
+        "extensible",
+        "implementable",
+        "macro",
+        "test"
+      ],
+      "description": "One portable category a symbol falls into. Kinds are language-specific; facets are shared, so a filter written once applies to every language an adapter is installed for."
+    },
+    "ExactKind": {
+      "description": "An adapter-owned namespaced kind preserving exact language meaning.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*\\.[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "LeafFacet": {
+      "enum": [
+        "declaration",
+        "definition",
+        "body",
+        "block",
+        "statement",
+        "expression",
+        "type_expression",
+        "import",
+        "export",
+        "parameter",
+        "argument",
+        "annotation",
+        "comment",
+        "identifier",
+        "literal",
+        "pattern",
+        "generated",
+        "test"
+      ],
+      "description": "Portable structural facets. generated and test are load-bearing: destructive policy, reference policy, and refactor scope all gate on them."
+    },
+    "RelationshipFacet": {
+      "enum": [
+        "contains",
+        "declares",
+        "defines",
+        "references",
+        "calls",
+        "constructs",
+        "reads",
+        "writes",
+        "imports",
+        "exports",
+        "extends",
+        "implements",
+        "type_definition",
+        "overrides",
+        "aliases",
+        "generates",
+        "depends_on"
+      ]
+    },
+    "SymbolKindDescriptor": {
+      "type": "object",
+      "required": [
+        "entity",
+        "kind",
+        "facets"
+      ],
+      "properties": {
+        "entity": {
+          "const": "symbol"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SymbolFacet"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "LeafKindDescriptor": {
+      "type": "object",
+      "required": [
+        "entity",
+        "kind",
+        "facets"
+      ],
+      "properties": {
+        "entity": {
+          "const": "leaf"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/LeafFacet"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RelationshipKindDescriptor": {
+      "type": "object",
+      "required": [
+        "entity",
+        "kind",
+        "facets"
+      ],
+      "properties": {
+        "entity": {
+          "const": "relationship"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/RelationshipFacet"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "JsonSchemaDocument": {
+      "description": "A self-contained JSON Schema draft 2020-12 document. Remote references are forbidden.",
+      "type": "object"
+    },
+    "ExtensionValueDescriptor": {
+      "description": "Advertises one versioned extension value and every protocol location where it may appear. Rift validates each occurrence against schema.",
+      "type": "object",
+      "required": [
+        "key",
+        "version",
+        "targets",
+        "schema",
+        "indexed",
+        "semantic"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/ExtensionKey"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "source_unit",
+              "symbol",
+              "leaf",
+              "relationship",
+              "type",
+              "diagnostic",
+              "code_action",
+              "structural.query",
+              "structural.match",
+              "formatting",
+              "completion",
+              "context.request",
+              "context.response",
+              "frontier.request",
+              "frontier.response",
+              "check.request",
+              "check.response"
+            ]
+          }
+        },
+        "schema": {
+          "$ref": "#/$defs/JsonSchemaDocument"
+        },
+        "indexed": {
+          "type": "boolean"
+        },
+        "semantic": {
+          "description": "Whether this value contributes to semantic cache identity and deterministic comparison.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceClaim": {
+      "description": "A deterministic physical-file ownership claim, reevaluated after every path or content change. Selectors are ORed and compare UTF-8 bytes: suffixes against the full path, names against the final component, and shebang prefixes against the first line. Highest priority wins; equal-priority matches from different owners are an error. Container claims may expose embedded languages and virtual units.",
+      "type": "object",
+      "required": [
+        "language",
+        "priority",
+        "container"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "path_suffixes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "path_names": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "shebang_prefixes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 2,
+            "pattern": "^#!"
+          }
+        },
+        "container": {
+          "type": "boolean"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "path_suffixes"
+          ]
+        },
+        {
+          "required": [
+            "path_names"
+          ]
+        },
+        {
+          "required": [
+            "shebang_prefixes"
+          ]
+        }
+      ],
+      "additionalProperties": false
+    },
+    "AuxiliaryClaim": {
+      "description": "A non-owning claim for project files needed to discover or configure compiler semantics. Selectors are ORed, use the same bytewise rules as SourceClaim, may overlap across adapters, and never make a file a SourceUnit.",
+      "type": "object",
+      "required": [
+        "purposes",
+        "environment_defining"
+      ],
+      "properties": {
+        "purposes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "compiler_configuration",
+              "dependency_manifest",
+              "dependency_lock",
+              "workspace_manifest",
+              "generated_metadata",
+              "other"
+            ]
+          }
+        },
+        "path_suffixes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "path_names": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "environment_defining": {
+          "description": "Whether editing a file matched by this claim changes this adapter's AdapterEnvironment. Declared by the adapter, never inferred from purpose: only the adapter knows whether its own compiler rereads a given file. True forces a fresh base rather than a child mirror.",
+          "type": "boolean"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "path_suffixes"
+          ]
+        },
+        {
+          "required": [
+            "path_names"
+          ]
+        }
+      ],
+      "additionalProperties": false
+    },
+    "VirtualClaim": {
+      "description": "A deterministic claim to consume semantic facts for virtual sources of one language. Highest priority wins; equal-priority matches from different owners are an error. The producer retains authority for virtual bytes, regions, and source maps.",
+      "type": "object",
+      "required": [
+        "language",
+        "priority"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "additionalProperties": false
+    },
+    "LanguageSubstrate": {
+      "description": "A replaceable compiler-backed language adapter. Core operations are mandatory; generator operations and exact vocabularies are advertised.",
+      "type": "object",
+      "required": [
+        "language",
+        "implementation",
+        "compiler",
+        "claims",
+        "auxiliary_claims",
+        "virtual_claims",
+        "kinds",
+        "structural_matching",
+        "action_discovery",
+        "extension_values",
+        "features",
+        "extensions"
+      ],
+      "properties": {
+        "implementation": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "compiler": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "claims": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SourceClaim"
+          }
+        },
+        "auxiliary_claims": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/AuxiliaryClaim"
+          }
+        },
+        "virtual_claims": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/VirtualClaim"
+          }
+        },
+        "kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/SymbolKindDescriptor"
+              },
+              {
+                "$ref": "#/$defs/LeafKindDescriptor"
+              },
+              {
+                "$ref": "#/$defs/RelationshipKindDescriptor"
+              }
+            ]
+          }
+        },
+        "structural_matching": {
+          "$ref": "#/$defs/StructuralMatchingSupport"
+        },
+        "action_discovery": {
+          "description": "Authoritative coverage for the actions IPC request. Unsupported is explicit; absence is never interpreted as no actions.",
+          "$ref": "#/$defs/Coverage"
+        },
+        "extension_values": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ExtensionValueDescriptor"
+          }
+        },
+        "features": {
+          "description": "Open optional feature names; core operations never appear here.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolOrigin": {
+      "description": "Where this symbol is defined. Five origins, and they answer different questions: whether you can edit it, whether it moves when you upgrade something, and whether it exists in any file at all.",
+      "oneOf": [
+        {
+          "description": "Declared in this workspace's own source. The code you can open and change.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "workspace"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Declared in a dependency. `manager` is the package manager that installed it, so `npm`, `cargo` or `pip`; `name` and `version` are that manager's own. Upgrading the dependency replaces these symbols.",
+          "type": "object",
+          "required": [
+            "kind",
+            "manager",
+            "name",
+            "version"
+          ],
+          "properties": {
+            "kind": {
+              "const": "package"
+            },
+            "manager": {
+              "description": "The package manager that installed it.",
+              "type": "string",
+              "examples": [
+                "npm",
+                "cargo",
+                "pip"
+              ]
+            },
+            "name": {
+              "description": "The package name, as that manager spells it.",
+              "type": "string",
+              "maxLength": 4096,
+              "examples": [
+                "zod",
+                "serde"
+              ]
+            },
+            "version": {
+              "description": "The installed version.",
+              "type": "string",
+              "examples": [
+                "3.22.4",
+                "1.0.197"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Declared in the language's standard library. It ships with the toolchain, so no package manager installed it and no manifest names it.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "stdlib"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Produced by a build step from something else in the workspace — a protobuf compiler, a schema generator. It exists in a file, and editing that file is undone by the next build.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "generated"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Invented by the compiler. No file declares it: an implicit constructor, a derived implementation, a synthesised accessor.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "synthetic"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Symbol": {
+      "description": "Compiler-resolved semantic identity. Source structure lives in Leaf and is connected through Relationship.",
+      "type": "object",
+      "required": [
+        "id",
+        "language",
+        "name",
+        "kind",
+        "facets",
+        "origin",
+        "external_identities",
+        "modifiers",
+        "visibility",
+        "types",
+        "signatures",
+        "documentation",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/SymbolId",
+          "examples": [
+            "rift://symbol/python/pkg/util.py:load_config~1?rev=HEAD~3"
+          ],
+          "description": "Unique identifier of this symbol across the whole workspace, and the URI that resolves it. Hand it to the symbol resource as it stands."
+        },
+        "language": {
+          "description": "The language this symbol belongs to.",
+          "$ref": "#/$defs/LanguageId",
+          "examples": [
+            "typescript",
+            "rust"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 4096,
+          "examples": [
+            "parseConfig"
+          ],
+          "description": "The human-readable name, as written in the source: `parseConfig`. Rendered signatures live in `signatures`."
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind",
+          "examples": [
+            "typescript.function",
+            "rust.trait"
+          ],
+          "description": "What this symbol is in its own language's words — `rust.trait`, `typescript.function`. The adapter owns this vocabulary, so each language keeps its own term."
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SymbolFacet"
+          },
+          "examples": [
+            [
+              "value",
+              "callable"
+            ]
+          ],
+          "description": "Portable classification, so one query can cross languages. `rust.trait` and `typescript.interface` are different kinds that share the `type` facet, which is what lets a search for types find both."
+        },
+        "origin": {
+          "$ref": "#/$defs/SymbolOrigin",
+          "description": "Where the symbol comes from: code in this workspace, or a package it depends on."
+        },
+        "container": {
+          "$ref": "#/$defs/SymbolId",
+          "examples": [
+            "rift://symbol/typescript/src/config.ts:ConfigLoader"
+          ],
+          "description": "The symbol this one is declared inside — the class that owns a method, the module that owns a function. Absent at the top level."
+        },
+        "external_identities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ExternalIdentity"
+          },
+          "description": "This symbol's identity in other schemes, where the adapter can state one. Used to match the same symbol across tools; an adapter states it or leaves it out."
+        },
+        "modifiers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          },
+          "examples": [
+            [
+              "export",
+              "async"
+            ]
+          ],
+          "description": "Language keywords qualifying the declaration: `export`, `async`, `const`."
+        },
+        "visibility": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "examples": [
+            "public"
+          ],
+          "description": "How widely the symbol is visible, in the language's own terms — `public`, `private`, `pub(crate)`. Null where the language has no such concept."
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          },
+          "description": "The types this symbol carries, each tagged with the role it plays: a return type, a field type, a bound."
+        },
+        "signatures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Signature"
+          },
+          "description": "One entry per callable form. Overloads are separate entries."
+        },
+        "documentation": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Documentation"
+          },
+          "description": "Doc comments attached to the declaration, with the markup format they were written in."
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions",
+          "description": "Language-specific facts with no portable equivalent, namespaced by the adapter that emitted them."
+        }
+      },
+      "additionalProperties": false
+    },
+    "LeafRegion": {
+      "type": "object",
+      "required": [
+        "role",
+        "range"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "selection",
+            "name",
+            "header",
+            "body",
+            "content",
+            "documentation",
+            "enclosing"
+          ]
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Leaf": {
+      "description": "One leaf of a file's concrete syntax tree: the place where a symbol is physically written. It carries where it is — the unit, the byte range, the syntax kind — and the symbol it writes. Everything semantic about that symbol is read from the symbol.",
+      "type": "object",
+      "required": [
+        "id",
+        "unit",
+        "language",
+        "kind",
+        "facets",
+        "range",
+        "regions",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "description": "Unique identifier of this source region, and the URI that resolves it.",
+          "$ref": "#/$defs/LeafId"
+        },
+        "symbol": {
+          "description": "The symbol written at this leaf. Absent where a leaf writes no symbol — punctuation, a keyword, a comment.",
+          "$ref": "#/$defs/SymbolId"
+        },
+        "unit": {
+          "$ref": "#/$defs/FileId"
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/LeafFacet"
+          }
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LeafRegion"
+          }
+        },
+        "parent": {
+          "description": "The region this one is nested inside. Absent at the top level of a unit.",
+          "$ref": "#/$defs/LeafId"
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Relationship": {
+      "description": "One directed connection between Symbols and/or Leaves. This single model covers source bindings and graph edges.",
+      "type": "object",
+      "required": [
+        "from",
+        "kind",
+        "facets",
+        "to",
+        "evidence",
+        "provenance",
+        "extensions"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/ResolvedEntityTarget"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/RelationshipFacet"
+          }
+        },
+        "to": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ResolvedEntityTarget"
+            },
+            {
+              "$ref": "#/$defs/ExternalSymbolRef"
+            }
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolvedEntityTarget"
+          }
+        },
+        "provenance": {
+          "enum": [
+            "compiler",
+            "adapter",
+            "inferred"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FieldFilter": {
+      "description": "A predicate over a standard, namespaced substrate, or diagnostic field. The regex op uses rust-regex and is evaluated by Rift, never by an adapter — including when this filter reaches an adapter inside StructuralCaptureConstraint.semantic. One regex engine and one dialect for every caller-supplied regex on the wire. Structural patterns and git-glob path selectors are separate grammars with their own declarations.",
+      "type": "object",
+      "required": [
+        "field",
+        "op"
+      ],
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "op": {
+          "enum": [
+            "eq",
+            "ne",
+            "in",
+            "contains",
+            "prefix",
+            "regex",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "exists"
+          ]
+        },
+        "value": {},
+        "values": {
+          "type": "array",
+          "items": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "RelationFilter": {
+      "description": "A predicate over an exact advertised relationship kind or portable facet.",
+      "type": "object",
+      "required": [
+        "direction"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "required": [
+            "facet"
+          ]
+        }
+      ],
+      "properties": {
+        "kind": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "facet": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RelationshipFacet"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RelationshipFacet"
+              }
+            }
+          ]
+        },
+        "direction": {
+          "enum": [
+            "outgoing",
+            "incoming",
+            "either"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/Filter"
+        },
+        "min_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "max_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 1
+        },
+        "quantifier": {
+          "enum": [
+            "exists",
+            "not_exists"
+          ],
+          "default": "exists"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Filter": {
+      "description": "A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "field"
+          ],
+          "properties": {
+            "kind": {
+              "const": "field"
+            },
+            "field": {
+              "$ref": "#/$defs/FieldFilter"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "relation"
+          ],
+          "properties": {
+            "kind": {
+              "const": "relation"
+            },
+            "relation": {
+              "$ref": "#/$defs/RelationFilter"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "all"
+          ],
+          "properties": {
+            "kind": {
+              "const": "all"
+            },
+            "all": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Filter"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "any"
+          ],
+          "properties": {
+            "kind": {
+              "const": "any"
+            },
+            "any": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Filter"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "not"
+          ],
+          "properties": {
+            "kind": {
+              "const": "not"
+            },
+            "not": {
+              "$ref": "#/$defs/Filter"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PublicCodeActionRef": {
+      "description": "Rift-minted deterministic action identity scoped to one snapshot. Rift rediscovers the adapter action and verifies the descriptor digest before application.",
+      "type": "object",
+      "required": [
+        "id",
+        "commit",
+        "semantic"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "commit": {
+          "$ref": "#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "#/$defs/SemanticSnapshotDigest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicSymbolTarget": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symbol"
+        },
+        "id": {
+          "$ref": "#/$defs/SymbolId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicLeafTarget": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "leaf"
+        },
+        "id": {
+          "$ref": "#/$defs/SymbolId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicMatchRef": {
+      "description": "Deterministic text or structural match identity scoped to one retained snapshot and canonical query.",
+      "type": "object",
+      "required": [
+        "id",
+        "commit",
+        "semantic",
+        "query"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "commit": {
+          "$ref": "#/$defs/GitOid"
+        },
+        "semantic": {
+          "$ref": "#/$defs/SemanticSnapshotDigest"
+        },
+        "query": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchEntityTarget": {
+      "description": "An entity-valued capture from a previously discovered structural match.",
+      "type": "object",
+      "required": [
+        "kind",
+        "match",
+        "capture"
+      ],
+      "properties": {
+        "kind": {
+          "const": "match_entity"
+        },
+        "match": {
+          "$ref": "#/$defs/PublicMatchRef"
+        },
+        "capture": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Address": {
+      "description": "A source region resolved by the owning adapter against the operation's current candidate.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "target",
+            "region"
+          ],
+          "properties": {
+            "kind": {
+              "const": "entity"
+            },
+            "target": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/PublicSymbolTarget"
+                },
+                {
+                  "$ref": "#/$defs/PublicLeafTarget"
+                },
+                {
+                  "$ref": "#/$defs/MatchEntityTarget"
+                }
+              ]
+            },
+            "region": {
+              "enum": [
+                "full",
+                "selection",
+                "name",
+                "header",
+                "body",
+                "content",
+                "documentation"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "path",
+            "range"
+          ],
+          "properties": {
+            "kind": {
+              "const": "source"
+            },
+            "path": {
+              "$ref": "#/$defs/ProjectPath"
+            },
+            "range": {
+              "$ref": "#/$defs/TextRange"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "path",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "const": "anchor"
+            },
+            "path": {
+              "$ref": "#/$defs/ProjectPath"
+            },
+            "text": {
+              "type": "string"
+            },
+            "within": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/PublicSymbolTarget"
+                },
+                {
+                  "$ref": "#/$defs/PublicLeafTarget"
+                },
+                {
+                  "$ref": "#/$defs/MatchEntityTarget"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "match",
+            "capture"
+          ],
+          "properties": {
+            "kind": {
+              "const": "match"
+            },
+            "match": {
+              "$ref": "#/$defs/PublicMatchRef"
+            },
+            "capture": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The current foreach match or capture; legal only inside EditProgram.",
+          "type": "object",
+          "required": [
+            "kind",
+            "capture"
+          ],
+          "properties": {
+            "kind": {
+              "const": "current_match"
+            },
+            "capture": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "StructuralMatchingSupport": {
+      "description": "Exhaustive declaration for Rift pattern v1 over the adapter's claimed languages. An adapter declares only whether it can PARSE and match the pattern grammar. It declares nothing about transforms: every StructuralTransform reads from capture: or transform: sources, so all of them operate on text that has already been extracted — by this adapter for a structural query, by Rift itself for a text query. Rift applies them once captures are known and, on a rewrite, before handing the rendered replacement back for parsing. An adapter therefore ships no regex engine: rust-regex is the only dialect for a caller-supplied regex; structural patterns and git-glob path selectors are separate grammars, declared separately. JSON Schema pattern keywords are ECMA-262 and are validated by each ecosystem's own validator; those are authored in this schema rather than supplied by a caller, so they are neither a divergence risk nor an attack surface.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "pattern_version"
+          ],
+          "properties": {
+            "support": {
+              "const": "full"
+            },
+            "pattern_version": {
+              "const": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "reason"
+          ],
+          "properties": {
+            "support": {
+              "const": "unsupported"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "support",
+            "reason"
+          ],
+          "properties": {
+            "support": {
+              "const": "not_applicable"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "StructuralCaptureConstraint": {
+      "type": "object",
+      "required": [
+        "capture",
+        "cardinality"
+      ],
+      "properties": {
+        "capture": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        },
+        "cardinality": {
+          "enum": [
+            "one",
+            "many"
+          ]
+        },
+        "exact_kind": {
+          "$ref": "#/$defs/ExactKind"
+        },
+        "facet": {
+          "$ref": "#/$defs/LeafFacet"
+        },
+        "text_regex": {
+          "type": "string",
+          "description": "rust-regex filter on the capture's text. Evaluated by Rift over returned captures, never by the adapter: an adapter MUST NOT prune matches using this field. Two engines behind one wire field disagree silently — a JavaScript adapter's RegExp reads \\d as ASCII-only where rust-regex reads it as Unicode Nd — and a backtracking engine turns a caller-supplied pattern into a stall inside a process that is a shared fault domain. The cost is that the adapter returns candidate matches Rift then discards, bounded by pagination and AdapterLimits."
+        },
+        "semantic": {
+          "$ref": "#/$defs/Filter"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StructuralQuery": {
+      "description": "Language-parsed source pattern using Rift metavariables $NAME and $$$NAME. The pattern text is language-specific; capture identity, scoping, constraints, ordering, and result shape are portable.",
+      "type": "object",
+      "required": [
+        "kind",
+        "version",
+        "language",
+        "pattern",
+        "paths",
+        "constraints",
+        "overlap",
+        "extensions"
+      ],
+      "properties": {
+        "kind": {
+          "const": "structural"
+        },
+        "version": {
+          "const": 1
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "paths": {
+          "$ref": "#/$defs/PathSelector"
+        },
+        "within": {
+          "$ref": "#/$defs/Address"
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StructuralCaptureConstraint"
+          }
+        },
+        "overlap": {
+          "enum": [
+            "outermost",
+            "innermost",
+            "all_non_overlapping"
+          ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StructuralCapture": {
+      "description": "One named capture. entity is the resolved entity the capture denotes, or null when the capture is purely textual — as every text-regex capture is.",
+      "type": "object",
+      "required": [
+        "name",
+        "spans",
+        "text",
+        "entity"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CaptureName"
+        },
+        "spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/SourceSpan"
+          }
+        },
+        "text": {
+          "type": "string"
+        },
+        "entity": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ResolvedEntityTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "StructuralMatchRanges": {
+      "description": "Adapter-owned safe replacement envelopes around the matched syntax node.",
+      "type": "object",
+      "required": [
+        "exact",
+        "leading",
+        "trailing",
+        "both"
+      ],
+      "properties": {
+        "exact": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "leading": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "trailing": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "both": {
+          "$ref": "#/$defs/SourceSpan"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CaptureName": {
+      "description": "Structural captures use identifier names; text regex results may additionally use numeric capture indexes.",
+      "type": "string",
+      "pattern": "^(?:[A-Za-z][A-Za-z0-9_]*|[0-9]+)$"
+    },
+    "RefusalBlocker": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "entity"
+          ],
+          "properties": {
+            "kind": {
+              "const": "entity"
+            },
+            "entity": {
+              "$ref": "#/$defs/ResolvedEntityTarget"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "span"
+          ],
+          "properties": {
+            "kind": {
+              "const": "span"
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "relationship"
+          ],
+          "properties": {
+            "kind": {
+              "const": "relationship"
+            },
+            "relationship": {
+              "$ref": "#/$defs/Relationship"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "DiagnosticRelated": {
+      "type": "object",
+      "required": [
+        "message",
+        "span"
+      ],
+      "properties": {
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "span": {
+          "$ref": "#/$defs/SourceSpan"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Diagnostic": {
+      "description": "One language finding. reliability says whether surrounding facts came from recovered source; continuation says whether appending source can repair the finding.",
+      "type": "object",
+      "required": [
+        "severity",
+        "language",
+        "code",
+        "message",
+        "span",
+        "related",
+        "tags",
+        "reliability",
+        "continuation",
+        "extensions"
+      ],
+      "properties": {
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "span": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticRelated"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "deprecated",
+              "unnecessary"
+            ]
+          }
+        },
+        "reliability": {
+          "enum": [
+            "reliable",
+            "recovered"
+          ]
+        },
+        "continuation": {
+          "enum": [
+            "repairable",
+            "unrepairable",
+            "unknown"
+          ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        },
+        "language": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/LanguageId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CodeActionDescriptor": {
+      "description": "Portable, digestible action metadata. kind is an open hierarchical identifier; extensions preserve exact language choices.",
+      "type": "object",
+      "required": [
+        "title",
+        "kind",
+        "preferred",
+        "applicability",
+        "rationale",
+        "target",
+        "arguments_schema",
+        "disabled_reason",
+        "diagnostics",
+        "extensions"
+      ],
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]*$"
+        },
+        "preferred": {
+          "type": "boolean"
+        },
+        "applicability": {
+          "enum": [
+            "always",
+            "conditional",
+            "speculative"
+          ]
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/Address"
+        },
+        "arguments_schema": {
+          "$ref": "#/$defs/JsonSchemaDocument"
+        },
+        "disabled_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Diagnostic"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResolvedEntityTarget": {
+      "description": "A resolved entity, named by the single canonical SymbolId. This is the only entity vocabulary in the contract; there is no adapter-local alternative.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PublicSymbolTarget"
+        },
+        {
+          "$ref": "#/$defs/PublicLeafTarget"
+        }
+      ]
+    },
+    "FactFamily": {
+      "description": "The canonical semantic fact families. Coverage, analysis streaming, and invalidation all key on this.",
+      "enum": [
+        "source_maps",
+        "symbols",
+        "leaves",
+        "relationships",
+        "types",
+        "diagnostics"
+      ]
+    },
+    "MirrorId": {
+      "description": "Identity of one mirror inside an adapter process. A base mirror is shared and immutable; each same-environment candidate opens a child mirror whose content map is complete in structure and delta in content — every unchanged entry is a shared reference, so parsed-source memory is base plus the sum of deltas rather than one base per agent; per-mirror compiler state is not shared. An environment-changing candidate takes its own provisional base instead, bounded by AdapterLimits.max_provisional_bases.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$"
+    }
+  }
+}

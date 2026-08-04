@@ -54,7 +54,23 @@ export default function Layout({ children }: LayoutProps<"/">) {
   return (
     <html lang="en" className={cn(inter.variable, geistMono.variable)} suppressHydrationWarning>
       <body className="flex flex-col min-h-screen">
-        <RootProvider search={{ enabled: false }}>{children}</RootProvider>
+        {/*
+          `type: "static"` because `output: "export"` has no server to answer a
+          search request: app/api/search pre-renders the Orama index to a file
+          and the client downloads it once and queries it in the browser.
+          `api` is the download URL, and it needs the basePath spelled out —
+          it defaults to a bare "/api/search", which 404s under /rift.
+        */}
+        <RootProvider
+          search={{
+            options: {
+              type: "static",
+              api: `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/search`,
+            },
+          }}
+        >
+          {children}
+        </RootProvider>
       </body>
     </html>
   );

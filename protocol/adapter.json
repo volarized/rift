@@ -1,0 +1,2303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volar.sh/rift/protocol/adapter.json",
+  "title": "Rift language-adapter IPC",
+  "description": "The newline-delimited JSON contract between the Rift server and one language adapter: hello, mirror lifecycle, sync, and the streaming analysis, matching, resolution, and validation operations.",
+  "rift:entryPoints": {
+    "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as SymbolId and Address is deliberately reachable from several.",
+    "adapter.frame": {
+      "$ref": "#/$defs/AdapterFrame"
+    }
+  },
+  "$defs": {
+    "RequestId": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "AuxiliaryUnitRef": {
+      "description": "A regular or executable Git-tracked, read-only project input mirrored to an adapter without granting semantic source ownership. Multiple adapters may receive the same path.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path"
+      ],
+      "properties": {
+        "kind": {
+          "const": "auxiliary"
+        },
+        "path": {
+          "$ref": "core.json#/$defs/ProjectPath"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorUnitRef": {
+      "description": "Any source or auxiliary input addressable inside an adapter mirror.",
+      "oneOf": [
+        {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        {
+          "$ref": "#/$defs/AuxiliaryUnitRef"
+        }
+      ]
+    },
+    "LanguageRegion": {
+      "description": "One language-owned region inside a physical or virtual source unit.",
+      "type": "object",
+      "required": [
+        "language",
+        "range",
+        "extensions"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
+        },
+        "range": {
+          "$ref": "core.json#/$defs/TextRange"
+        },
+        "extensions": {
+          "$ref": "core.json#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PhysicalSourceUnit": {
+      "description": "Metadata for one physical source owned by its selected physical adapter.",
+      "type": "object",
+      "required": [
+        "kind",
+        "ref",
+        "regions",
+        "extensions"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LanguageRegion"
+          }
+        },
+        "extensions": {
+          "$ref": "core.json#/$defs/Extensions"
+        },
+        "kind": {
+          "const": "physical"
+        }
+      },
+      "additionalProperties": false
+    },
+    "VirtualSourceUnit": {
+      "description": "Manifest for an adapter-produced virtual source. The ref owner produces bytes and maps; language selects a separate semantic consumer through VirtualClaim.",
+      "type": "object",
+      "required": [
+        "kind",
+        "ref",
+        "language",
+        "regions",
+        "extensions"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LanguageRegion"
+          }
+        },
+        "extensions": {
+          "$ref": "core.json#/$defs/Extensions"
+        },
+        "kind": {
+          "const": "virtual"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TargetBinding": {
+      "description": "Exact cross-owner identity supplied to a propagation participant that cannot resolve a target from its own mirror. Entity and match identity need no binding: SymbolId is canonical on both seams. Bindings are request-local and never appear through MCP.",
+      "oneOf": [
+        {
+          "description": "Exact cross-owner identity supplied to a propagation participant that does not own the target declaration.",
+          "type": "object",
+          "required": [
+            "kind",
+            "id",
+            "external"
+          ],
+          "properties": {
+            "kind": {
+              "const": "external"
+            },
+            "id": {
+              "$ref": "core.json#/$defs/SymbolId"
+            },
+            "external": {
+              "$ref": "core.json#/$defs/ExternalSymbolRef"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TargetBindings": {
+      "description": "Canonical, duplicate-free binding table sorted by canonical public target bytes.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/TargetBinding"
+      }
+    },
+    "Sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "SyncBeginInput": {
+      "description": "Begin the atomic update of one mirror. Only one uncommitted transaction may exist per mirror, so the mirror identifies the transaction and no separate transaction id exists. reset returns the mirror to its base rather than clearing the process. Concurrent transactions on distinct mirrors are legal. The update remains invisible until sync.commit.",
+      "type": "object",
+      "required": [
+        "mirror",
+        "generation",
+        "reset"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "generation": {
+          "$ref": "core.json#/$defs/Generation"
+        },
+        "reset": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncSourceUnitInput": {
+      "description": "One contiguous UTF-8 text chunk for a physical or routed virtual unit. Chunks for a unit are contiguous by offset and exactly one has final=true.",
+      "type": "object",
+      "required": [
+        "kind",
+        "mirror",
+        "unit",
+        "language",
+        "offset",
+        "text",
+        "final"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "text": {
+          "type": "string"
+        },
+        "final": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "source"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncAuxiliaryUnitInput": {
+      "description": "One contiguous UTF-8 text chunk for a non-owning auxiliary project input. Chunks for a unit are contiguous by offset and exactly one has final=true.",
+      "type": "object",
+      "required": [
+        "kind",
+        "mirror",
+        "unit",
+        "offset",
+        "text",
+        "final"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "unit": {
+          "$ref": "#/$defs/AuxiliaryUnitRef"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "text": {
+          "type": "string"
+        },
+        "final": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "auxiliary"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncUnitInput": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SyncSourceUnitInput"
+        },
+        {
+          "$ref": "#/$defs/SyncAuxiliaryUnitInput"
+        }
+      ]
+    },
+    "SyncMapInput": {
+      "description": "A bounded source-map chunk for one routed virtual unit. Every generated span names unit; maps for a unit are sent in canonical order.",
+      "type": "object",
+      "required": [
+        "transaction",
+        "unit",
+        "items"
+      ],
+      "properties": {
+        "transaction": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "core.json#/$defs/SourceMapEntry"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncRemoveInput": {
+      "type": "object",
+      "required": [
+        "transaction",
+        "unit"
+      ],
+      "properties": {
+        "transaction": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "unit": {
+          "$ref": "#/$defs/MirrorUnitRef"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncCommitInput": {
+      "description": "Commit the typed sync chunks. digest covers their canonical JSON bodies in sequence order.",
+      "type": "object",
+      "required": [
+        "mirror",
+        "chunks",
+        "digest"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "chunks": {
+          "$ref": "#/$defs/Sequence"
+        },
+        "digest": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncAbortInput": {
+      "description": "Discard the uncommitted update of one mirror. Aborting an idle mirror fails.",
+      "type": "object",
+      "required": [
+        "mirror"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncBeginOutput": {
+      "type": "object",
+      "required": [
+        "mirror",
+        "accepted_generation"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "accepted_generation": {
+          "$ref": "core.json#/$defs/Generation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncChunkOutput": {
+      "type": "object",
+      "required": [
+        "mirror",
+        "accepted_sequence"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "accepted_sequence": {
+          "$ref": "#/$defs/Sequence"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncAbortOutput": {
+      "type": "object",
+      "required": [
+        "mirror",
+        "discarded"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "discarded": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncCommitOutput": {
+      "description": "The committed mirror state plus the environment that content produced. The mirror is not restated beside state.mirror — one fact, one home. state.environment is the fingerprint of the published environment; that equality is a named runtime invariant, since JSON Schema cannot tie one field's value to a digest of another.",
+      "type": "object",
+      "required": [
+        "state",
+        "source_units",
+        "auxiliary_units",
+        "environment"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "source_units": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "auxiliary_units": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "environment": {
+          "$ref": "core.json#/$defs/AdapterEnvironment"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceUnitAnalysisChunk": {
+      "description": "Authoritative metadata for one physical source unit.",
+      "type": "object",
+      "required": [
+        "kind",
+        "unit"
+      ],
+      "properties": {
+        "kind": {
+          "const": "source_unit"
+        },
+        "unit": {
+          "$ref": "#/$defs/PhysicalSourceUnit"
+        }
+      },
+      "additionalProperties": false
+    },
+    "VirtualUnitAnalysisChunk": {
+      "description": "Manifest for a virtual source published by a container adapter. Text arrives through VirtualTextAnalysisChunk and maps through SourceMapAnalysisChunk before AnalyzeEnd.",
+      "type": "object",
+      "required": [
+        "kind",
+        "unit"
+      ],
+      "properties": {
+        "kind": {
+          "const": "virtual_unit"
+        },
+        "unit": {
+          "$ref": "#/$defs/VirtualSourceUnit"
+        }
+      },
+      "additionalProperties": false
+    },
+    "VirtualTextAnalysisChunk": {
+      "description": "One contiguous UTF-8 chunk of a published virtual source. Chunks for a unit are contiguous by offset and exactly one has final=true.",
+      "type": "object",
+      "required": [
+        "kind",
+        "unit",
+        "offset",
+        "text",
+        "final"
+      ],
+      "properties": {
+        "kind": {
+          "const": "virtual_text"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "text": {
+          "type": "string"
+        },
+        "final": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SymbolAnalysisChunk": {
+      "type": "object",
+      "required": [
+        "kind",
+        "unit",
+        "items"
+      ],
+      "properties": {
+        "kind": {
+          "const": "symbols"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Symbol"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceMapAnalysisChunk": {
+      "type": "object",
+      "required": [
+        "kind",
+        "unit",
+        "items"
+      ],
+      "properties": {
+        "kind": {
+          "const": "source_maps"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/SourceMapEntry"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "LeafAnalysisChunk": {
+      "type": "object",
+      "required": [
+        "kind",
+        "unit",
+        "items"
+      ],
+      "properties": {
+        "kind": {
+          "const": "leaves"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Leaf"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RelationshipAnalysisChunk": {
+      "type": "object",
+      "required": [
+        "kind",
+        "unit",
+        "items"
+      ],
+      "properties": {
+        "kind": {
+          "const": "relationships"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Relationship"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DiagnosticAnalysisChunk": {
+      "type": "object",
+      "required": [
+        "kind",
+        "unit",
+        "items"
+      ],
+      "properties": {
+        "kind": {
+          "const": "diagnostics"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Diagnostic"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "CoverageAnalysisChunk": {
+      "description": "Completes one unit's buffered replacement. present=false clears all prior facts for the unit.",
+      "type": "object",
+      "required": [
+        "kind",
+        "unit",
+        "present",
+        "coverage"
+      ],
+      "properties": {
+        "kind": {
+          "const": "coverage"
+        },
+        "unit": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "present": {
+          "type": "boolean"
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/SemanticCoverage"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnalysisShard": {
+      "description": "One strongly typed bounded chunk. Rift buffers semantic facts by stream-owner and unit until CoverageAnalysisChunk and AnalyzeEnd; complete virtual manifests, text, and maps are then routed to their claimed consumer.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SourceUnitAnalysisChunk"
+        },
+        {
+          "$ref": "#/$defs/VirtualUnitAnalysisChunk"
+        },
+        {
+          "$ref": "#/$defs/VirtualTextAnalysisChunk"
+        },
+        {
+          "$ref": "#/$defs/SourceMapAnalysisChunk"
+        },
+        {
+          "$ref": "#/$defs/SymbolAnalysisChunk"
+        },
+        {
+          "$ref": "#/$defs/LeafAnalysisChunk"
+        },
+        {
+          "$ref": "#/$defs/RelationshipAnalysisChunk"
+        },
+        {
+          "$ref": "#/$defs/DiagnosticAnalysisChunk"
+        },
+        {
+          "$ref": "#/$defs/CoverageAnalysisChunk"
+        }
+      ]
+    },
+    "AnalyzeEnd": {
+      "description": "Analyze is rerun-equal: the same revision under the same environment yields the same facts, the same coverage and the same digest, which is what makes the fact store a rebuildable cache rather than a second source of truth.",
+      "type": "object",
+      "required": [
+        "state",
+        "chunks",
+        "digest",
+        "invalidated"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "chunks": {
+          "$ref": "#/$defs/Sequence"
+        },
+        "digest": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "invalidated": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "core.json#/$defs/FileId"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterStructuralMatch": {
+      "type": "object",
+      "required": [
+        "key",
+        "span",
+        "replacement_ranges",
+        "captures",
+        "explanation",
+        "extensions"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "span": {
+          "$ref": "core.json#/$defs/SourceSpan"
+        },
+        "replacement_ranges": {
+          "$ref": "core.json#/$defs/StructuralMatchRanges"
+        },
+        "captures": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/StructuralCapture"
+          }
+        },
+        "explanation": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "extensions": {
+          "$ref": "core.json#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchInput": {
+      "type": "object",
+      "required": [
+        "state",
+        "query",
+        "targets"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "query": {
+          "$ref": "core.json#/$defs/StructuralQuery"
+        },
+        "targets": {
+          "$ref": "#/$defs/TargetBindings"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchChunk": {
+      "type": "object",
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AdapterStructuralMatch"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchEnd": {
+      "type": "object",
+      "required": [
+        "state",
+        "chunks",
+        "digest",
+        "coverage"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "chunks": {
+          "$ref": "#/$defs/Sequence"
+        },
+        "digest": {
+          "$ref": "core.json#/$defs/Sha256Digest"
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionsInput": {
+      "description": "Discover compiler actions for one address in the pinned mirror. only matches hierarchical kind prefixes; an empty array requests every action.",
+      "type": "object",
+      "required": [
+        "state",
+        "target",
+        "only",
+        "targets"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "target": {
+          "$ref": "core.json#/$defs/Address"
+        },
+        "targets": {
+          "$ref": "#/$defs/TargetBindings"
+        },
+        "only": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]*$"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionsOutput": {
+      "type": "object",
+      "required": [
+        "state",
+        "actions",
+        "coverage",
+        "extensions"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CodeAction"
+          }
+        },
+        "coverage": {
+          "$ref": "core.json#/$defs/Coverage"
+        },
+        "extensions": {
+          "$ref": "core.json#/$defs/Extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CodeAction": {
+      "description": "Adapter action token and canonical descriptor. token is opaque and valid only for the pinned MirrorState; Rift never exposes it directly.",
+      "type": "object",
+      "required": [
+        "token",
+        "descriptor"
+      ],
+      "properties": {
+        "token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "descriptor": {
+          "$ref": "core.json#/$defs/CodeActionDescriptor"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CancelInput": {
+      "description": "Best-effort cancellation of one in-flight non-sync request. Sync transactions use sync.abort.",
+      "type": "object",
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CancelOutput": {
+      "description": "If cancelled=true, the target terminates with a cancelled AdapterFailure; false means it was unknown or already terminal.",
+      "type": "object",
+      "required": [
+        "target",
+        "cancelled"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "cancelled": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterRefusal": {
+      "type": "object",
+      "required": [
+        "reason",
+        "message",
+        "blockers",
+        "diagnostics"
+      ],
+      "properties": {
+        "reason": {
+          "enum": [
+            "unsupported",
+            "unmet_precondition",
+            "ambiguous_target",
+            "stale_action",
+            "stale_match",
+            "unsafe_effect",
+            "formatter_unsupported",
+            "program_limit",
+            "language_refusal"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/RefusalBlocker"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/Diagnostic"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterRefusalError": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retryable",
+        "refusal"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "refused",
+            "operation_unsupported"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "retryable": {
+          "const": false
+        },
+        "refusal": {
+          "$ref": "#/$defs/AdapterRefusal"
+        },
+        "actual_state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterGeneralError": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request",
+            "unknown_op",
+            "mirror_depth_exceeded",
+            "mirror_in_use",
+            "stale_state",
+            "coverage_incomplete",
+            "incomplete_validation",
+            "sequence_error",
+            "digest_mismatch",
+            "frame_too_large",
+            "cancelled",
+            "handler_failed"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "actual_state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterError": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AdapterRefusalError"
+        },
+        {
+          "$ref": "#/$defs/AdapterGeneralError"
+        }
+      ]
+    },
+    "DeterminismContract": {
+      "description": "Constants every adapter must echo. Paths are project-relative UTF-8 with '/', no empty/'.'/'..' segments, and no normalization. Path sets sort by UTF-8 bytes; other arrays marked uniqueItems sort by each item's RFC 8785 bytes; remaining arrays preserve semantic order. owner_id pins how LanguageId is derived: the adapter's LanguageId, a '.', and the first 16 hex characters of the SHA-256 over its implementation and compiler strings, each prefixed by its little-endian u32 byte length so no separator can be forged across fields. Both inputs appear in hello, so Rift recomputes and refuses a mismatch at startup, before any fact is minted.",
+      "type": "object",
+      "required": [
+        "canonical_json",
+        "source_encoding",
+        "offsets",
+        "path_order",
+        "set_order",
+        "unicode_normalization",
+        "owner_id"
+      ],
+      "properties": {
+        "canonical_json": {
+          "const": "RFC8785"
+        },
+        "source_encoding": {
+          "const": "UTF-8"
+        },
+        "offsets": {
+          "const": "UTF-8-bytes"
+        },
+        "path_order": {
+          "const": "UTF-8-bytewise"
+        },
+        "set_order": {
+          "const": "RFC8785-bytewise"
+        },
+        "unicode_normalization": {
+          "const": "none"
+        },
+        "owner_id": {
+          "const": "language '.' sha256(u32le(len(implementation)) implementation u32le(len(compiler)) compiler)[0:16]"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterLimits": {
+      "type": "object",
+      "required": [
+        "max_frame_bytes",
+        "max_in_flight",
+        "max_in_flight_per_mirror",
+        "max_provisional_bases"
+      ],
+      "properties": {
+        "max_frame_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 9007199254740991
+        },
+        "max_in_flight": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "max_in_flight_per_mirror": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Concurrent non-sync requests accepted for any single mirror. Prevents one agent from consuming the process."
+        },
+        "max_provisional_bases": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Concurrent provisional bases this adapter will hold. A candidate that edits a file matched by an environment_defining auxiliary claim cannot be a child of the accepted base, so it takes a full base of its own. That is the one legitimate route to N x base memory, and without a bound it is unbounded."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Bounds one adapter advertises. Because a pooled adapter serves many mirrors over one stdio pipe, in-flight work is bounded per mirror rather than per process, and the adapter must interleave stream frames across concurrent requests rather than draining one stream to completion. Sequence numbers are per request, so interleaving is always safe; draining is not, because it lets one mirror's large analyze starve every other agent on that pipe."
+    },
+    "AdapterRuntimeRequirements": {
+      "description": "Host-enforced requirements for running this adapter on an untrusted selected repository. An adapter is never granted network access or writes outside private temporary state; startup fails when the launcher cannot enforce a required sandbox.",
+      "type": "object",
+      "required": [
+        "repository_code",
+        "subprocesses",
+        "network",
+        "filesystem",
+        "writes"
+      ],
+      "properties": {
+        "repository_code": {
+          "enum": [
+            "never",
+            "sandboxed_optional",
+            "sandboxed_required"
+          ]
+        },
+        "subprocesses": {
+          "enum": [
+            "none",
+            "toolchain_only",
+            "sandboxed_repository_tools"
+          ]
+        },
+        "network": {
+          "const": "denied"
+        },
+        "filesystem": {
+          "const": "mirror_and_declared_dependencies"
+        },
+        "writes": {
+          "const": "private_temp_only"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterHello": {
+      "description": "The adapter's first stdout frame. A version mismatch is a hard startup failure.",
+      "type": "object",
+      "required": [
+        "type",
+        "protocol_version",
+        "substrate",
+        "runtime",
+        "determinism",
+        "limits"
+      ],
+      "properties": {
+        "type": {
+          "const": "hello"
+        },
+        "protocol_version": {
+          "$ref": "core.json#/$defs/ProtocolVersion"
+        },
+        "substrate": {
+          "$ref": "core.json#/$defs/LanguageSubstrate"
+        },
+        "runtime": {
+          "$ref": "#/$defs/AdapterRuntimeRequirements"
+        },
+        "determinism": {
+          "$ref": "#/$defs/DeterminismContract"
+        },
+        "limits": {
+          "$ref": "#/$defs/AdapterLimits"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncBeginRequest": {
+      "description": "Open an update. Only one can be open per mirror at a time, which is why the mirror itself identifies the transaction and there is no separate transaction ID to keep track of.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.sync.begin"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.begin"
+        },
+        "body": {
+          "$ref": "#/$defs/SyncBeginInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncUnitRequest": {
+      "description": "Send one chunk of one file's text. Large files arrive as several of these, in order.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "sequence",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.sync.unit"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.unit"
+        },
+        "body": {
+          "$ref": "#/$defs/SyncUnitInput"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Sequence"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncMapRequest": {
+      "description": "Tell the adapter that one file was generated from another, so a position in the generated code can be traced back to the line you actually wrote.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "sequence",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.sync.map"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.map"
+        },
+        "body": {
+          "$ref": "#/$defs/SyncMapInput"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Sequence"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncRemoveRequest": {
+      "description": "Drop a file from the mirror as part of the open update.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "sequence",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.sync.remove"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.remove"
+        },
+        "body": {
+          "$ref": "#/$defs/SyncRemoveInput"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Sequence"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncCommitRequest": {
+      "description": "Close the update, and report the environment it produced — compiler version, dependencies, configuration. Rift checks that against what it expected rather than taking it on trust, which is how a change that alters the build gets confirmed instead of guessed at.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.sync.commit"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.commit"
+        },
+        "body": {
+          "$ref": "#/$defs/SyncCommitInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncAbortRequest": {
+      "description": "Throw the open update away. The mirror stays exactly as it was before it started.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.sync.abort"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.abort"
+        },
+        "body": {
+          "$ref": "#/$defs/SyncAbortInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnalyzeRequest": {
+      "description": "Read the code and tell us what is in it: symbols, where they appear, how they connect, and where the compiler could not see. Answers stream, because a large repository produces more than fits comfortably in one message. The important property is that this is repeatable — same snapshot, same answers, byte for byte. That is what lets Rift treat its own fact store as a cache it can throw away and rebuild rather than a second source of truth.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.analyze"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "analyze"
+        },
+        "body": {
+          "$ref": "#/$defs/MirrorScopedInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchRequest": {
+      "description": "Find code by shape rather than by text — a call with two arguments, a function with a particular return type. Only the compiler can answer this, because only the compiler knows what those things are. Results stream back with their captures and the ranges an edit would replace.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.match"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "match"
+        },
+        "body": {
+          "$ref": "#/$defs/MatchInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionsRequest": {
+      "description": "List the fixes and refactors the compiler can offer at one spot. Rift passes the description on to callers but keeps the adapter's internal handle to itself, so nobody outside can hold a reference into the compiler's state.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.actions"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "actions"
+        },
+        "body": {
+          "$ref": "#/$defs/ActionsInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CancelRequest": {
+      "description": "Stop a request that is still running. Sync transactions are not cancelled this way; they use `sync.abort`.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.cancel"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "cancel"
+        },
+        "body": {
+          "$ref": "#/$defs/CancelInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterRequest": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/MirrorOpenRequest"
+        },
+        {
+          "$ref": "#/$defs/MirrorReleaseRequest"
+        },
+        {
+          "$ref": "#/$defs/MirrorPromoteRequest"
+        },
+        {
+          "$ref": "#/$defs/SyncBeginRequest"
+        },
+        {
+          "$ref": "#/$defs/SyncUnitRequest"
+        },
+        {
+          "$ref": "#/$defs/SyncMapRequest"
+        },
+        {
+          "$ref": "#/$defs/SyncRemoveRequest"
+        },
+        {
+          "$ref": "#/$defs/SyncCommitRequest"
+        },
+        {
+          "$ref": "#/$defs/SyncAbortRequest"
+        },
+        {
+          "$ref": "#/$defs/AnalyzeRequest"
+        },
+        {
+          "$ref": "#/$defs/MatchRequest"
+        },
+        {
+          "$ref": "#/$defs/ActionsRequest"
+        },
+        {
+          "$ref": "#/$defs/CancelRequest"
+        }
+      ]
+    },
+    "SyncBeginResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.sync.begin"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.begin"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/SyncBeginOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncCommitResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.sync.commit"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.commit"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/SyncCommitOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncAbortResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.sync.abort"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.abort"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/SyncAbortOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnalyzeShardResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "stream",
+        "sequence",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.analyze.chunk"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "analyze"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/AnalysisShard"
+        },
+        "stream": {
+          "const": "chunk"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Sequence"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnalyzeEndResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "stream",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.analyze.end"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "analyze"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/AnalyzeEnd"
+        },
+        "stream": {
+          "const": "end"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchChunkResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "stream",
+        "sequence",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.match.chunk"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "match"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/MatchChunk"
+        },
+        "stream": {
+          "const": "chunk"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Sequence"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MatchEndResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "stream",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.match.end"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "match"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/MatchEnd"
+        },
+        "stream": {
+          "const": "end"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionsResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.actions"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "actions"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/ActionsOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CancelResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.cancel"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "cancel"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/CancelOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterFailure": {
+      "description": "A failed response. It carries op so a recorded stream stays attributable without the request table.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.failure"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "$ref": "#/$defs/AdapterOp"
+        },
+        "ok": {
+          "const": false
+        },
+        "error": {
+          "$ref": "#/$defs/AdapterError"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterResponse": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/MirrorOpenResponse"
+        },
+        {
+          "$ref": "#/$defs/MirrorReleaseResponse"
+        },
+        {
+          "$ref": "#/$defs/MirrorPromoteResponse"
+        },
+        {
+          "$ref": "#/$defs/SyncBeginResponse"
+        },
+        {
+          "$ref": "#/$defs/SyncUnitResponse"
+        },
+        {
+          "$ref": "#/$defs/SyncMapResponse"
+        },
+        {
+          "$ref": "#/$defs/SyncRemoveResponse"
+        },
+        {
+          "$ref": "#/$defs/SyncCommitResponse"
+        },
+        {
+          "$ref": "#/$defs/SyncAbortResponse"
+        },
+        {
+          "$ref": "#/$defs/AnalyzeShardResponse"
+        },
+        {
+          "$ref": "#/$defs/AnalyzeEndResponse"
+        },
+        {
+          "$ref": "#/$defs/MatchChunkResponse"
+        },
+        {
+          "$ref": "#/$defs/MatchEndResponse"
+        },
+        {
+          "$ref": "#/$defs/ActionsResponse"
+        },
+        {
+          "$ref": "#/$defs/CancelResponse"
+        },
+        {
+          "$ref": "#/$defs/AdapterFailure"
+        }
+      ]
+    },
+    "AdapterFrame": {
+      "description": "One newline-delimited JSON frame on adapter stdin/stdout. `type` is fully qualified and unique across the whole wire, so every frame dispatches in one pass with no request state; `op` remains for attribution and grouping. Stdout carries protocol only; logs use stderr.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AdapterHello"
+        },
+        {
+          "$ref": "#/$defs/AdapterRequest"
+        },
+        {
+          "$ref": "#/$defs/AdapterResponse"
+        }
+      ]
+    },
+    "MirrorBase": {
+      "description": "What a new mirror is opened against. A tree base creates an EMPTY mirror pinned to that tree identity, which Rift then fills with one full sync (reset=true); this is how a cold base materializes, since an adapter can never read Git itself. A mirror base creates a child sharing the parent's committed content, which Rift fills with the candidate delta only. Depth is one: a child may not itself be a base. A process holds one base per tree it currently serves — promotion adds a base rather than replacing one, so a base with live sibling children is never invalidated — and a base is released once it has no live children, no in-flight requests pinned to it, and is not the accepted head tree of any workspace this server currently serves. It is deliberately not 'newest for its owner': worktrees advance independently, so newest is not a single global ordering, and evicting a base because another worktree moved on would cold-sync a tree that is still someone's head. A child may only be opened when the candidate leaves the owning adapter's AdapterEnvironment unchanged. Whether it does is decided solely by the adapter's own AuxiliaryClaim.environment_defining flags — never inferred from purpose, path, or file type — and a candidate touching any environment-defining claimed file gets a fresh base at the new environment instead of a child. Base admission is atomic per (owner, tree): an adapter serves at most one base for any tree, so a cold mirror.open racing a mirror.promote for the same tree does not produce two. The loser of that race receives the existing base's state rather than a second base.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "tree"
+          ],
+          "properties": {
+            "kind": {
+              "const": "tree"
+            },
+            "tree": {
+              "$ref": "core.json#/$defs/GitOid"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "mirror"
+          ],
+          "properties": {
+            "kind": {
+              "const": "mirror"
+            },
+            "mirror": {
+              "$ref": "core.json#/$defs/MirrorId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MirrorOpenInput": {
+      "description": "Open a mirror against a base tree or a parent mirror. Against a tree this creates an EMPTY base pinned to that tree identity and returns a handle only, because no environment exists until content is synced; Rift then fills it with one full sync, which is how a cold base materializes, since an adapter can never read Git itself. Against a parent mirror this creates a depth-one child sharing the parent's committed content, which Rift fills with the candidate delta only.",
+      "type": "object",
+      "required": [
+        "base"
+      ],
+      "properties": {
+        "base": {
+          "$ref": "#/$defs/MirrorBase"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorOpenOutput": {
+      "description": "The result of admitting a base or child. Admission is atomic per (owner, tree): the winner gets a fresh empty handle to sync; a racing open or promote for the same tree waits for that first sync.commit and then receives the winner's state rather than creating a second base. If the winner fails or aborts before committing, its reservation is released and the next waiter is promoted to winner.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "handle"
+          ],
+          "properties": {
+            "kind": {
+              "const": "admitted"
+            },
+            "handle": {
+              "$ref": "#/$defs/MirrorHandle"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "state"
+          ],
+          "properties": {
+            "kind": {
+              "const": "existing"
+            },
+            "state": {
+              "$ref": "core.json#/$defs/MirrorState"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MirrorReleaseInput": {
+      "description": "Drop one mirror and every resource it holds. Mirrors are never reclaimed implicitly. Release is refused with mirror_in_use while the mirror has live children OR any in-flight request pinned to it — an analyze stream against a base that has just stopped being the newest is still a valid pinned read, and terminating it would turn a correct snapshot read into an infrastructure failure.",
+      "type": "object",
+      "required": [
+        "mirror"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorReleaseOutput": {
+      "type": "object",
+      "required": [
+        "mirror",
+        "released"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "released": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorScopedInput": {
+      "description": "The pinned mirror plus the inputs changed since its last accepted generation.",
+      "type": "object",
+      "required": [
+        "state",
+        "changed_inputs"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "changed_inputs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/MirrorUnitRef"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorOpenRequest": {
+      "description": "Give me somewhere to put the code. An adapter cannot read your repository — that is the point — so Rift opens a mirror and fills it. Opening returns an empty handle: until content is synced there is no environment, and so nothing to answer questions about. Opening against an existing mirror instead gives you a cheap child that shares its parent's content and holds only the difference.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.mirror.open"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "mirror.open"
+        },
+        "body": {
+          "$ref": "#/$defs/MirrorOpenInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorReleaseRequest": {
+      "description": "Throw a mirror away. Nothing is reclaimed automatically, so this has to be called, and it has to go bottom-up — releasing a base that still has children hanging off it is refused.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.mirror.release"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "mirror.release"
+        },
+        "body": {
+          "$ref": "#/$defs/MirrorReleaseInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorOpenResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.mirror.open"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "mirror.open"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/MirrorOpenOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorReleaseResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.mirror.release"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "mirror.release"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/MirrorReleaseOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncUnitResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.sync.unit"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.unit"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/SyncChunkOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncMapResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.sync.map"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.map"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/SyncChunkOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyncRemoveResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.sync.remove"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "sync.remove"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/SyncChunkOutput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterOp": {
+      "description": "Every operation name on the adapter wire.",
+      "enum": [
+        "actions",
+        "analyze",
+        "cancel",
+        "check",
+        "context",
+        "frontier",
+        "match",
+        "mirror.open",
+        "mirror.promote",
+        "mirror.release",
+        "resolve",
+        "sync.abort",
+        "sync.begin",
+        "sync.commit",
+        "sync.map",
+        "sync.remove",
+        "sync.unit",
+        "validate"
+      ]
+    },
+    "MirrorHandle": {
+      "description": "A freshly opened, still-empty mirror. It has no environment yet: an AdapterEnvironment is derived from the synced tree's configuration and dependency material, so it cannot exist before the sync that supplies them. sync.commit is where the adapter first publishes it.",
+      "type": "object",
+      "required": [
+        "mirror",
+        "generation"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
+        },
+        "generation": {
+          "$ref": "core.json#/$defs/Generation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorPromoteInput": {
+      "description": "Promote a child mirror whose content has been published as an accepted Revision into a base for that tree. Pinned to the exact expected MirrorState, because a child advances: promoting {mirror:C, tree:T1} after C has moved to T2 would label T2's content T1. The mirror must also be committed-idle — no open sync transaction — or the promoted base would pin content still in flight. Promotion re-roots rather than nests: depth remains one and the promoted mirror has no parent. Without it, publishing T1 from a T0 child would force the next edit to open a fresh base at T1 and full-sync it, making every sequential agent edit a compiler cold start.",
+      "type": "object",
+      "required": [
+        "state",
+        "tree"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
+        },
+        "tree": {
+          "$ref": "core.json#/$defs/GitOid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorPromoteOutput": {
+      "description": "The result of promotion. Promotion competes for the same atomic per-(owner, tree) admission as a cold open, so it has the same two outcomes. Promoted: the base is this mirror re-rooted in place — same mirror, same environment, generation advanced by exactly one. Existing: another base already won admission for this tree, and the caller releases the child it tried to promote rather than creating a second base for the tree.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "state"
+          ],
+          "properties": {
+            "kind": {
+              "const": "promoted"
+            },
+            "state": {
+              "$ref": "core.json#/$defs/MirrorState"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "state"
+          ],
+          "properties": {
+            "kind": {
+              "const": "existing"
+            },
+            "state": {
+              "$ref": "core.json#/$defs/MirrorState"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MirrorPromoteRequest": {
+      "description": "A change was published, so the child that held it is now the truth. Promote re-roots it as the base for that tree. Skip this and every sequential edit starts with a cold compile — which is the most likely way a correct implementation still ends up unusably slow.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.mirror.promote"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "mirror.promote"
+        },
+        "body": {
+          "$ref": "#/$defs/MirrorPromoteInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MirrorPromoteResponse": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "op",
+        "ok",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "response.mirror.promote"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "op": {
+          "const": "mirror.promote"
+        },
+        "ok": {
+          "const": true
+        },
+        "body": {
+          "$ref": "#/$defs/MirrorPromoteOutput"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

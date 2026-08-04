@@ -1,0 +1,62 @@
+---
+title: Protocol
+description: The protocol behind Rift, and how the processes that implement it run.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+import { IsoDiagram } from "@/components/iso-diagram";
+
+At the core of Rift there is a protocol. It describes how the components of the system behave, and how
+they operate.
+
+Rift reaches agents through MCP. Each agent talks to its own `rift mcp` process, over stdio.
+
+That process is launched in a workspace — a distinct path on the filesystem of your machine:
+
+```
+~/projects/charming-aurora  ->  running rift mcp here
+```
+
+<Callout>
+  An MCP server on the stdio transport is a subprocess of the client that launched it. Two agents means
+  two `rift mcp` processes, and neither can see what the other is doing.
+</Callout>
+
+That is the constraint the rest of the design follows from. Several agents can be working in the same
+workspace at once, and they need a central point behind them. That central point is the rift server.
+
+<IsoDiagram
+  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB, the git worktrees and the language adapters."
+  chart={`
+    flowchart LR
+      agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp"]:::rift
+      agent2["agent 2"]:::agent -- "stdio" --> mcp2["rift mcp"]:::rift
+      mcp1 -- "Streamable HTTP<br/>over Unix socket" --> server["rift server"]:::rift
+      mcp2 -- "Streamable HTTP<br/>over Unix socket" --> server
+      server --> semantic["semantic DB"]:::store
+      server --> worktrees["git worktrees"]:::git
+      server --> adapters["adapters"]:::adapter
+  `}
+/>
+
+So `rift mcp` is a proxy. It holds no state of its own — it forwards what the agent asks, and returns
+what the server answers.
+
+MCP is stateless, so nothing in it identifies a connection across calls. The rift server assigns its own
+identifier when a `rift mcp` process connects, and remembers which workspace that connection belongs to.
+
+When the rift server starts, it scans the repository and builds the semantic level using the language
+adapters.
+
+## Definitions
+
+We've split the protocol definition into separate, logically aligned blocks:
+
+- [Core model](/docs/protocol/core) — logical entities used by both MCP and adapters
+- [MCP](/docs/protocol/mcp) — tools and resources provided by Rift
+- [Adapter](/docs/protocol/adapter) — protocol between the Rift server and a compiler API
+
+<Callout>
+  The adapter protocol is generalised so any language can be implemented. Rift itself is written in
+  Rust, so for languages with no native Rust API, IPC is required.
+</Callout>
