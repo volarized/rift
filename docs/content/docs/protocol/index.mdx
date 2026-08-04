@@ -1,32 +1,51 @@
 ---
 title: Protocol
-description: The contract Rift implements — one shared model, one agent-facing surface, one language-adapter wire.
+description: The protocol behind Rift, and how the processes that implement it run.
 ---
 
-import { Card, Cards } from "fumadocs-ui/components/card";
+import { Callout } from "fumadocs-ui/components/callout";
 
-The protocol is three documents, and the split is not filing: it is the shape of the system.
+At the core of Rift there is a protocol. It describes how the components of the system behave, and how
+they operate.
 
-`core.json` is the model — what Rift reads and what it can say about it. Both of the other two are
-defined in terms of it, and neither is defined in terms of the other. `mcp.json` is the surface an agent
-calls. `adapter.json` is the wire a language's compiler answers on.
+Rift reaches agents through MCP. Each agent talks to its own `rift mcp` process, over stdio.
 
-If you are reading this for the first time, read them in that order. The model page is a chain: each idea
-exists because the one before it left a question open, and once you have that chain, the other two pages
-are mostly a matter of looking things up.
+That process is launched in a workspace — a distinct path on the filesystem of your machine:
 
-<Cards>
-  <Card title="Core model" href="/docs/protocol/core" description="What Rift reads, in the order it reads it. Start here." />
-  <Card title="MCP surface" href="/docs/protocol/mcp" description="The five tools and five resources an agent calls." />
-  <Card title="Adapter wire" href="/docs/protocol/adapter" description="How the server talks to one language's compiler." />
-</Cards>
+```
+~/projects/charming-aurora  ->  running rift mcp here
+```
 
-## Why the schemas are the source
+<Callout>
+  An MCP server on the stdio transport is a subprocess of the client that launched it. Two agents means
+  two `rift mcp` processes, and neither can see what the other is doing.
+</Callout>
 
-The three JSON Schema documents are normative, and these pages render them directly. There is no
-generated file in between and no step that could be skipped: change a schema and the page changes with
-it, or the build fails.
+That is the constraint the rest of the design follows from. Several agents can be working in the same
+workspace at once, and they need a central point behind them. That central point is the rift server.
 
-That matters more than it sounds. A protocol reference that drifts from the protocol is worse than no
-reference, because it is confidently wrong. The only prose written by hand here is the part the schema
-genuinely cannot state about itself — why a concept exists, and what it looks like in practice.
+```
+agent 1 -> rift mcp -> |rift server| -> | semantic DB + git worktrees |
+agent 2 -> rift mcp -> |           |    | adapters                    |
+```
+
+So `rift mcp` is a proxy. It holds no state of its own — it forwards what the agent asks, and returns
+what the server answers.
+
+The hop behind it is Streamable HTTP over a Unix domain socket, and that is where the session lives. The
+server assigns an
+[`Mcp-Session-Id`](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#session-management)
+at initialisation and keeps a table from that ID to the workspace the connection belongs to. The agent's
+own stdio connection has no session ID, because MCP does not define one for stdio.
+
+When the rift server starts, it scans the repository and builds the semantic level using the language
+adapters.
+
+## Where the protocol is written down
+
+Three JSON Schema documents. Each page here renders one of them directly.
+
+- [Core model](/docs/protocol/core) — what Rift reads, and what it can say about it. Read this one
+  first; the other two are defined in terms of it.
+- [MCP surface](/docs/protocol/mcp) — the tools and resources an agent calls.
+- [Adapter wire](/docs/protocol/adapter) — how the server talks to one language's compiler.
