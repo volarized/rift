@@ -230,9 +230,38 @@ for (const name of defNames) {
         `unhandled JSON Schema keyword \`${key}\` in ${name}. Teach src/components/protocol to render it before it reaches the page.`,
       );
     }
-    // Fails the build on a ref that names a document we do not load.
-    refName(node);
   }
+}
+
+/**
+ * Every `$ref` in all three documents resolves to a definition that exists.
+ *
+ * Whole documents rather than `$defs`, and a plain walk rather than the schema
+ * traverser: `rift:entryPoints` is not a schema, so the traverser does not
+ * reach it, and it is where the tool and resource catalogue is declared. A
+ * `$ref` there naming a definition that was renamed out from under it produces
+ * a page with a link to nothing, and nothing else says so.
+ */
+for (const file of PROTOCOL_FILES) {
+  const walk = (node: unknown, path: string): void => {
+    if (Array.isArray(node)) {
+      for (const [index, value] of node.entries()) walk(value, `${path}[${index}]`);
+      return;
+    }
+    if (!node || typeof node !== "object") return;
+    const ref = (node as { $ref?: unknown }).$ref;
+    if (typeof ref === "string") {
+      const target = refName(node as Schema);
+      if (target && !(target in defs)) {
+        throw new Error(`${file}.json ${path} refers to \`${target}\`, which is not defined`);
+      }
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key === "examples" || key === "default") continue;
+      walk(value, `${path}.${key}`);
+    }
+  };
+  walk(documents[file], file);
 }
 
 /**

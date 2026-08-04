@@ -77,7 +77,7 @@
           "$ref": "#/$defs/ResourceTemplate"
         },
         "uri": {
-          "$ref": "#/$defs/BlobResourceUri"
+          "$ref": "#/$defs/BlobId"
         },
         "link": {
           "$ref": "#/$defs/ResourceLink"
@@ -214,7 +214,8 @@
           "$ref": "core.json#/$defs/ProjectPath"
         },
         "object": {
-          "$ref": "core.json#/$defs/GitOid"
+          "description": "The blob this entry points at. Read it through the blob resource; the identifier is the address.",
+          "$ref": "#/$defs/BlobId"
         },
         "kind": {
           "$ref": "#/$defs/FileEntryKind"
@@ -501,7 +502,7 @@
               "const": "resource_link"
             },
             "uri": {
-              "$ref": "#/$defs/BlobResourceUri"
+              "$ref": "#/$defs/BlobId"
             },
             "name": {
               "const": "blob"
@@ -537,7 +538,7 @@
         },
         "at": {
           "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "core.json#/$defs/Commit"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -633,10 +634,13 @@
       },
       "additionalProperties": false
     },
-    "BlobResourceUri": {
-      "description": "Opaque Git blob resource addressed by object ID as a query argument, never by a traversable path.",
+    "BlobId": {
+      "description": "Identity of one Git blob, and the URI that resolves it. The object ID is a query argument rather than a path segment, so nothing about the URI invites walking a tree of them. Rift returns the exact bytes and never interprets them.",
       "type": "string",
-      "pattern": "^rift://blob\\?object=[0-9a-f]{40}([0-9a-f]{24})?$"
+      "pattern": "^rift://blob\\?object=[0-9a-f]{40}([0-9a-f]{24})?$",
+      "examples": [
+        "rift://blob?object=dae86e1950b1277e545cee180551750029cfe735"
+      ]
     },
     "ContractDescriptor": {
       "type": "object",
@@ -741,7 +745,7 @@
         },
         "at": {
           "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "core.json#/$defs/Commit"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -838,7 +842,7 @@
       "properties": {
         "at": {
           "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "core.json#/$defs/Commit"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -937,7 +941,7 @@
       "properties": {
         "at": {
           "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "core.json#/$defs/Commit"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -1162,7 +1166,7 @@
       "properties": {
         "at": {
           "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "core.json#/$defs/Commit"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -1226,7 +1230,7 @@
         },
         "at": {
           "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "core.json#/$defs/Commit"
         },
         "diagnostic": {
           "$ref": "core.json#/$defs/Diagnostic"
@@ -1358,9 +1362,10 @@
           ]
         },
         "object_before": {
+          "description": "The blob before the change. Null where the file did not exist.",
           "oneOf": [
             {
-              "$ref": "core.json#/$defs/GitOid"
+              "$ref": "#/$defs/BlobId"
             },
             {
               "type": "null"
@@ -1368,9 +1373,10 @@
           ]
         },
         "object_after": {
+          "description": "The blob after the change. Null where the file was deleted.",
           "oneOf": [
             {
-              "$ref": "core.json#/$defs/GitOid"
+              "$ref": "#/$defs/BlobId"
             },
             {
               "type": "null"
@@ -1450,11 +1456,11 @@
       "properties": {
         "from": {
           "description": "The old side of the comparison.",
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "core.json#/$defs/Commit"
         },
         "to": {
           "description": "The new side of the comparison.",
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "core.json#/$defs/Commit"
         },
         "files": {
           "type": "array",
@@ -1569,7 +1575,7 @@
           "description": "The commit this answer was resolved against. Null where the failure happened before one was resolved.",
           "oneOf": [
             {
-              "$ref": "core.json#/$defs/GitOid"
+              "$ref": "core.json#/$defs/Commit"
             },
             {
               "type": "null"
@@ -1855,7 +1861,7 @@
                 ],
                 "properties": {
                   "uri": {
-                    "$ref": "#/$defs/BlobResourceUri"
+                    "$ref": "#/$defs/BlobId"
                   },
                   "mimeType": {
                     "const": "application/octet-stream"

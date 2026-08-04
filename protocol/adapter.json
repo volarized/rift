@@ -1755,6 +1755,11 @@
         }
       ]
     },
+    "TreeOid": {
+      "description": "Identity of the exact source content a mirror is pinned to, as a Git tree object ID. An adapter compares it for equality and never reads Git itself. Two commits whose content is identical name the same tree, which is why base admission keys on this and not on the commit.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
     "MirrorBase": {
       "description": "What a new mirror is opened against. A tree base creates an EMPTY mirror pinned to that tree identity, which Rift then fills with one full sync (reset=true); this is how a cold base materializes, since an adapter can never read Git itself. A mirror base creates a child sharing the parent's committed content, which Rift fills with the candidate delta only. Depth is one: a child may not itself be a base. A process holds one base per tree it currently serves — promotion adds a base rather than replacing one, so a base with live sibling children is never invalidated — and a base is released once it has no live children, no in-flight requests pinned to it, and is not the accepted head tree of any workspace this server currently serves. It is deliberately not 'newest for its owner': worktrees advance independently, so newest is not a single global ordering, and evicting a base because another worktree moved on would cold-sync a tree that is still someone's head. A child may only be opened when the candidate leaves the owning adapter's AdapterEnvironment unchanged. Whether it does is decided solely by the adapter's own AuxiliaryClaim.environment_defining flags — never inferred from purpose, path, or file type — and a candidate touching any environment-defining claimed file gets a fresh base at the new environment instead of a child. Base admission is atomic per (owner, tree): an adapter serves at most one base for any tree, so a cold mirror.open racing a mirror.promote for the same tree does not produce two. The loser of that race receives the existing base's state rather than a second base.",
       "oneOf": [
@@ -1769,7 +1774,7 @@
               "const": "tree"
             },
             "tree": {
-              "$ref": "core.json#/$defs/GitOid"
+              "$ref": "#/$defs/TreeOid"
             }
           },
           "additionalProperties": false
@@ -2134,7 +2139,7 @@
           "$ref": "core.json#/$defs/MirrorState"
         },
         "tree": {
-          "$ref": "core.json#/$defs/GitOid"
+          "$ref": "#/$defs/TreeOid"
         }
       },
       "additionalProperties": false

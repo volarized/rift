@@ -11,7 +11,7 @@
         "summary": "Which state you are looking at: revisions, and the objects git names them by.",
         "identifiedBy": [
           "GitRevision",
-          "GitOid"
+          "Commit"
         ]
       },
       {
@@ -85,17 +85,20 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
-    "GitOid": {
-      "description": "Opaque Git object ID. Commit OIDs are public causal/CAS handles; tree OIDs identify exact source content. SHA-1 repositories use 40 hex characters and SHA-256 repositories use 64.",
-      "type": "string",
-      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
-    },
     "GitRevision": {
       "description": "A git revision parameter, as defined by gitrevisions(7): a string that names a commit, using git's extended SHA-1 syntax. Anything git accepts on a command line is accepted here — an object ID (`dae86e1`), a branch (`main`, `refs/heads/main`), a tag (`v1.2.0`, `tags/v1.2.0`), `HEAD` or `@`, a suffix form (`HEAD~3`, `main@{yesterday}`, `v1.0^{commit}`), or a per-worktree ref reached from another worktree (`worktrees/feature-x/HEAD`, `main-worktree/HEAD`). Ambiguity resolves in git's documented order: `$GIT_DIR/<refname>`, then `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, `refs/remotes/<refname>/HEAD`. Absent, the revision is the default branch at its latest commit. A revision names bytes and not meaning, so the resolved revision and the environment that gave it meaning are both reported back on every result.",
       "type": "string",
       "minLength": 1,
       "maxLength": 256,
       "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    },
+    "Commit": {
+      "description": "The commit a revision resolved to, as its full object ID. A GitRevision is what you asked for and `main` names a different commit tomorrow; this is what answered. SHA-1 repositories write 40 hex characters and SHA-256 repositories 64.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+      "examples": [
+        "dae86e1950b1277e545cee180551750029cfe735"
+      ]
     },
     "SymbolId": {
       "description": "Identity of one symbol, and the URI that resolves it. The identifier you get back is the address you read, so there is nothing to assemble and no second form to convert to.\n\n`rift://symbol/<language>/<qualified-name>`, where the qualified name is how the language itself names the declaration: `pkg.util.load_config` in Python, `serde::de::Deserialize` in Rust, `src/config.ts:ConfigLoader.parse` in TypeScript, where a module is a file and so the path is the namespace. Where one namespace declares two symbols that would otherwise write the same, the adapter appends `~` and an index.\n\nA file appears here only where the language puts one there. Which file a symbol is written in is read from its leaves, so moving a file leaves every symbol in it addressable by the same URI. A symbol the compiler invented, and one whose declaration Rift cannot read, are both named this way; `Symbol.origin` says which.\n\nA revision can be attached as `?rev=`, pinning the identity to one state; without it the identity is the symbol itself, at whichever revision the request resolved. The language segment is what keeps two adapters apart, so one workspace runs one adapter per language.",
@@ -1758,7 +1761,8 @@
           "$ref": "#/$defs/Sha256Digest"
         },
         "commit": {
-          "$ref": "#/$defs/GitOid"
+          "description": "The commit this action was discovered against.",
+          "$ref": "#/$defs/Commit"
         },
         "environment": {
           "description": "Fingerprint of the environment that gave the commit its meaning — the same value the answer reports as `SemanticEnvironment.fingerprint`. A commit names bytes; two environments make different facts out of them.",
@@ -1781,7 +1785,8 @@
           "$ref": "#/$defs/Sha256Digest"
         },
         "commit": {
-          "$ref": "#/$defs/GitOid"
+          "description": "The commit this match was found in.",
+          "$ref": "#/$defs/Commit"
         },
         "query": {
           "$ref": "#/$defs/Sha256Digest"
