@@ -1,9 +1,8 @@
 import type { ReactNode } from "react";
-import { Definition } from "@/components/protocol/definition";
 import { Prose } from "@/components/protocol/prose";
 import { Shape } from "@/components/protocol/shape";
 import { defs } from "@/lib/protocol";
-import { ADAPTER_HELLO, adapterOperations, referenceTypes } from "@/lib/protocol-surface";
+import { ADAPTER_HELLO, adapterOperations } from "@/lib/protocol-surface";
 
 /**
  * The adapter wire: one operation at a time, request beside response.
@@ -66,17 +65,6 @@ export function AdapterReference(): ReactNode {
             />
           ))}
         </section>
-      ))}
-
-      <h2 id="type-reference" className="scroll-m-20">
-        Type reference
-      </h2>
-      <p>
-        The remaining {referenceTypes.adapter.length} types this document defines, in schema order.
-        Frames the operations above already showed are anchored there instead.
-      </p>
-      {referenceTypes.adapter.map((name) => (
-        <Definition key={name} name={name} />
       ))}
     </>
   );

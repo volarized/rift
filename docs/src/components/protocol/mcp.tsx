@@ -1,8 +1,7 @@
 import type { ReactNode } from "react";
-import { Definition } from "@/components/protocol/definition";
 import { Prose } from "@/components/protocol/prose";
 import { Shape } from "@/components/protocol/shape";
-import { mcpResources, mcpTools, referenceTypes } from "@/lib/protocol-surface";
+import { mcpResources, mcpTools } from "@/lib/protocol-surface";
 
 /**
  * The MCP surface: what an agent can call, and what it gets back.
@@ -63,17 +62,6 @@ export function McpReference(): ReactNode {
           ) : null}
           <Shape label="URI" name={resource.uri} />
         </section>
-      ))}
-
-      <h2 id="type-reference" className="scroll-m-20">
-        Type reference
-      </h2>
-      <p>
-        The remaining {referenceTypes.mcp.length} types this document defines, in schema order.
-        Types the tools and resources above already showed are anchored there instead.
-      </p>
-      {referenceTypes.mcp.map((name) => (
-        <Definition key={name} name={name} />
       ))}
     </>
   );

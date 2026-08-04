@@ -256,7 +256,7 @@
       ]
     },
     "File": {
-      "description": "A Git tree entry from the workspace's complete snapshot at one revision.",
+      "description": "A Git tree entry from the workspace's complete snapshot at one revision. `kind` is what Git records for the entry and `payload` is what it points at, and the two agree: a regular or executable entry carries a blob or an LFS pointer, a symlink carries its target, a gitlink carries the commit of another repository. An entry Rift cannot read semantically — an LFS pointer, a symlink, a gitlink — reports `semantic: false` and no languages.",
       "type": "object",
       "required": [
         "path",
@@ -290,75 +290,6 @@
           "type": "boolean"
         }
       },
-      "oneOf": [
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "regular",
-                "executable"
-              ]
-            },
-            "payload": {
-              "$ref": "#/$defs/GitBlobPayload"
-            }
-          }
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "regular",
-                "executable"
-              ]
-            },
-            "payload": {
-              "$ref": "#/$defs/LfsPointerPayload"
-            },
-            "languages": {
-              "type": "array",
-              "maxItems": 0
-            },
-            "semantic": {
-              "const": false
-            }
-          }
-        },
-        {
-          "properties": {
-            "kind": {
-              "const": "symlink"
-            },
-            "payload": {
-              "$ref": "#/$defs/SymlinkPayload"
-            },
-            "languages": {
-              "type": "array",
-              "maxItems": 0
-            },
-            "semantic": {
-              "const": false
-            }
-          }
-        },
-        {
-          "properties": {
-            "kind": {
-              "const": "gitlink"
-            },
-            "payload": {
-              "$ref": "#/$defs/GitlinkPayload"
-            },
-            "languages": {
-              "type": "array",
-              "maxItems": 0
-            },
-            "semantic": {
-              "const": false
-            }
-          }
-        }
-      ],
       "additionalProperties": false
     },
     "QueryExecution": {

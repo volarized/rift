@@ -1,5 +1,4 @@
 import type { ReactNode } from "react";
-import { Definition } from "@/components/protocol/definition";
 import { defNamesByFile } from "@/lib/protocol";
 
 /**
@@ -11,18 +10,5 @@ import { defNamesByFile } from "@/lib/protocol";
  * schema does not tell about itself.
  */
 export function CoreReference(): ReactNode {
-  return (
-    <>
-      <h2 id="type-reference" className="scroll-m-20">
-        Type reference
-      </h2>
-      <p>
-        All {defNamesByFile.core.length} types this document defines, in schema order. Related types
-        sit next to each other, so reading top to bottom follows the model rather than the alphabet.
-      </p>
-      {defNamesByFile.core.map((name) => (
-        <Definition key={name} name={name} />
-      ))}
-    </>
-  );
+  return <></>;
 }
