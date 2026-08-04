@@ -1708,7 +1708,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://symbol/{language}/{unit}:{path}{?rev,cursor}"
+              "const": "rift://symbol/{language}/{name}{?rev,cursor}"
             },
             "name": {
               "const": "symbol"

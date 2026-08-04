@@ -49,17 +49,24 @@ compiler-driven facts — for instance the list of dependants and dependencies.
 A declared type is a symbol as well. `struct Config` and `interface Props` are declarations like any
 other, and they carry the `type` facet. Languages without types still have symbols.
 
-A symbol is identified by the URI that resolves it:
+A symbol is identified by the URI that resolves it: the language, then the name the language itself
+gives the declaration.
 
 ```
-rift://symbol/python/pkg/util.py:load_config
+rift://symbol/python/pkg.util.load_config
+rift://symbol/rust/serde::de::Deserialize
 ```
+
+No file appears there unless the language puts one there — a TypeScript module *is* a file, a Rust
+one is not. Where a symbol is written is read from its leaves, so moving a file leaves every symbol
+in it addressable by the same URI. The same spelling names a symbol the compiler invented, and one
+whose declaration Rift cannot read; `origin` says which.
 
 Symbols live across revisions. That identity is the symbol itself, at whichever revision the request
 resolved; attach `?rev=` to pin it to one:
 
 ```
-rift://symbol/python/pkg/util.py:load_config?rev=v1.2.0
+rift://symbol/python/pkg.util.load_config?rev=v1.2.0
 ```
 
 Its fields are listed under [`Symbol`](/docs/protocol/reference#Symbol).

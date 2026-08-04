@@ -98,18 +98,19 @@
       "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
     },
     "SymbolId": {
-      "description": "Identity of one symbol, and the URI that resolves it. The identifier you get back is the address you read, so there is nothing to assemble and no second form to convert to.\n\n`rift://symbol/<language>/<unit-path>:<symbol-path>` — for example `rift://symbol/python/pkg/util.py:load_config`. The symbol path is the chain of containers ending in the name, joined by `.`, so a method reads as its class and then itself. Where one unit declares two symbols that would otherwise write the same, the adapter appends `~` and an index.\n\nA revision can be attached as `?rev=`, pinning the identity to one state; without it the identity is the symbol itself, at whichever revision the request resolved. The language segment is what keeps two adapters apart, so one workspace runs one adapter per language.",
+      "description": "Identity of one symbol, and the URI that resolves it. The identifier you get back is the address you read, so there is nothing to assemble and no second form to convert to.\n\n`rift://symbol/<language>/<qualified-name>`, where the qualified name is how the language itself names the declaration: `pkg.util.load_config` in Python, `serde::de::Deserialize` in Rust, `src/config.ts:ConfigLoader.parse` in TypeScript, where a module is a file and so the path is the namespace. Where one namespace declares two symbols that would otherwise write the same, the adapter appends `~` and an index.\n\nA file appears here only where the language puts one there. Which file a symbol is written in is read from its leaves, so moving a file leaves every symbol in it addressable by the same URI. A symbol the compiler invented, and one whose declaration Rift cannot read, are both named this way; `Symbol.origin` says which.\n\nA revision can be attached as `?rev=`, pinning the identity to one state; without it the identity is the symbol itself, at whichever revision the request resolved. The language segment is what keeps two adapters apart, so one workspace runs one adapter per language.",
       "type": "string",
-      "minLength": 16,
+      "minLength": 17,
       "maxLength": 1024,
-      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
+      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/@-]{1,1000}(\\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
       "examples": [
-        "rift://symbol/python/pkg/util.py:load_config~1?rev=HEAD~3",
+        "rift://symbol/python/pkg.util.load_config~1?rev=HEAD~3",
+        "rift://symbol/rust/serde::de::Deserialize",
         "rift://symbol/typescript/src/config.ts:ConfigLoader.parse"
       ]
     },
     "LeafId": {
-      "description": "Identity of one leaf of a file's syntax tree, and the URI that resolves it. `rift://leaf/<language>/<unit-path>@<start>-<end>`, where the offsets are the half-open UTF-8 byte range the leaf spans. A revision can be attached as `?rev=`.",
+      "description": "Identity of one leaf of a file's syntax tree, and the URI that resolves it. `rift://leaf/<language>/<path>@<start>-<end>` — the project-relative path of the file, then the half-open UTF-8 byte range the leaf spans. A revision can be attached as `?rev=`.",
       "type": "string",
       "minLength": 18,
       "maxLength": 1024,
@@ -1306,7 +1307,7 @@
         "id": {
           "$ref": "#/$defs/SymbolId",
           "examples": [
-            "rift://symbol/python/pkg/util.py:load_config~1?rev=HEAD~3"
+            "rift://symbol/python/pkg.util.load_config~1?rev=HEAD~3"
           ],
           "description": "Unique identifier of this symbol across the whole workspace, and the URI that resolves it. Hand it to the symbol resource as it stands."
         },
