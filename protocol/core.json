@@ -4,7 +4,7 @@
   "title": "Rift core semantic model",
   "description": "The model every Rift seam is defined in terms of: versioning, files and their syntax trees, and symbols. The MCP surface is written against it directly; the adapter seam gets the same messages generated into core.proto, so neither side owns the model and neither can drift from it.",
   "rift:axes": {
-    "description": "How every definition in the protocol is filed. Each group names the definitions that identify it, and everything those reach belongs to the same group. Groups resolve in the order listed, so a definition two of them reach belongs to the earlier one. Identifying definitions are placed before any of that runs, because a group that walked past one on its way somewhere else would otherwise claim it: Leaf reaches SymbolId, and the identity of a symbol is not physical. A group with `holds` pins those definitions to itself outright. A group with `residualOf` takes whatever no group claimed and is defined in that document. Only the two JSON Schema documents are grouped here; the adapter seam is protobuf and is catalogued by its service.",
+    "description": "How every definition is filed. A group names the definitions that identify it, and everything those reach joins it; groups resolve in the order listed. Identifying definitions are pinned before any of that runs, because a group walking past one would otherwise claim it — `Leaf` reaches `SymbolId`, and a symbol is not identified by where it sits on disk. `holds` pins outright, `residualOf` takes whatever is left in that document. Only the JSON Schema documents are grouped here; the adapter seam is catalogued by its service.",
     "groups": [
       {
         "name": "Versioning",
@@ -13,11 +13,12 @@
           "Revision",
           "Snapshot",
           "Commit",
-          "Worktree"
+          "Worktree",
+          "DiffId"
         ]
       },
       {
-        "name": "Physical",
+        "name": "Filesystem",
         "summary": "Where it is written: files, the leaves of their syntax trees, ranges of bytes, and the changes proposed to them.",
         "identifiedBy": [
           "FileId",
@@ -25,15 +26,17 @@
           "Leaf",
           "LeafId",
           "TextRange",
-          "ProjectPath",
           "SourceSpan",
           "Edit",
-          "PathSelector",
+          "TextEdit",
           "LeafFacet",
           "LeafRegion",
           "RegionRole",
-          "DiffId",
-          "FileChange"
+          "FileChange",
+          "SourceMapEntry",
+          "StructuralCapture",
+          "StructuralMatchRanges",
+          "LanguageRegion"
         ]
       },
       {
@@ -53,9 +56,49 @@
         ]
       },
       {
+        "name": "Discovery",
+        "summary": "How you go looking. None of it is a fact about the code; all of it is written by the caller before there is an answer.",
+        "identifiedBy": [
+          "Filter",
+          "FieldFilter",
+          "RelationFilter",
+          "PathSelector",
+          "PathPattern",
+          "StructuralQuery",
+          "StructuralCaptureConstraint",
+          "CaptureName"
+        ]
+      },
+      {
+        "name": "Reachability",
+        "summary": "How much of the answer Rift could actually see, and what the compiler said on the way.",
+        "identifiedBy": [
+          "Coverage",
+          "CoverageScope",
+          "SemanticCoverage",
+          "FactFamily",
+          "Diagnostic",
+          "DiagnosticRelated",
+          "Severity"
+        ]
+      },
+      {
+        "name": "Operations",
+        "summary": "What you can do to the code, and the identities that pin a discovery to the state it was made in.",
+        "identifiedBy": [
+          "Address",
+          "CodeActionDescriptor",
+          "ActionKind",
+          "MatchKey",
+          "ActionKey"
+        ]
+      },
+      {
         "name": "Protocol",
-        "summary": "Machinery every axis carries and none owns: extensions, coverage, diagnostics, kinds.",
+        "summary": "Machinery every axis carries and none owns: the contract's own version, the digests that identify state, and the extension namespace.",
         "holds": [
+          "ProtocolVersion",
+          "Digest",
           "Extensions",
           "ExtensionKey",
           "ExtensionValue"
@@ -71,6 +114,7 @@
   },
   "$defs": {
     "ProtocolVersion": {
+      "description": "Which revision of this contract a message speaks. A single integer, bumped when a change would break a reader, so two sides that disagree find out at the handshake instead of three fields into a response.",
       "type": "integer",
       "const": 1
     },
@@ -80,7 +124,7 @@
       "pattern": "^[0-9a-f]{64}$"
     },
     "Revision": {
-      "description": "Which state to answer against. Absent, the default branch at its latest commit.\n\nA git revision parameter, as defined by gitrevisions(7): an object ID (`dae86e1`), a branch (`main`, `refs/heads/main`), a tag (`v1.2.0`), `HEAD` or `@`, a suffix form (`HEAD~3`, `main@{yesterday}`), or a per-worktree ref reached from another worktree (`worktrees/feature-x/HEAD`, `main-worktree/HEAD`). Ambiguity resolves in git's documented order: `$GIT_DIR/<refname>`, then `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, `refs/remotes/<refname>/HEAD`.\n\nDropping the `/HEAD` addresses the working tree instead of the commit it sits on: `worktrees/feature-x` and `main-worktree` mean what is on disk there, uncommitted edits included. gitrevisions has no spelling for that, and it is the state an agent editing code is usually asking about.\n\nThis is the question. What it resolved to comes back as a Snapshot, because `main` names a different commit tomorrow and a working tree changes under you.",
+      "description": "Which state to answer against. Absent, the default branch at its latest commit.\n\nA git revision parameter, as gitrevisions(7) defines one: `main`, `v1.2.0`, `dae86e1`, `HEAD~3`. Dropping the `/HEAD` from a worktree ref addresses what is on disk there, uncommitted edits included, which gitrevisions cannot spell and is what an agent editing code usually means.",
       "type": "string",
       "minLength": 1,
       "maxLength": 256,
@@ -111,9 +155,10 @@
       ]
     },
     "Snapshot": {
-      "description": "What a Revision resolved to, reported beside every answer so a second call can ask the same question again and get the same state.\n\nA commit is immutable and names itself. A working tree is not, so it names the commit it sits on and digests what differs from it. The workspace is never restated: a snapshot of a working tree is a base and a delta, so editing one file leaves every other file's state — and the answers derived from it — untouched.",
+      "description": "What a `Revision` resolved to, reported beside every answer so a second call can ask the same question again and get the same state.\n\nA commit is immutable and names itself. A working tree is not, so it names the commit it sits on and digests only what differs, leaving every unedited file's state untouched.",
       "oneOf": [
         {
+          "description": "A commit. Nothing about it can change, so the object ID is the whole of the state.",
           "type": "object",
           "required": [
             "kind",
@@ -124,12 +169,14 @@
               "const": "commit"
             },
             "commit": {
+              "description": "The object ID the revision resolved to.",
               "$ref": "#/$defs/Commit"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A working tree, which changes under you while you read it. It is reported as the commit it sits on plus a digest of what differs, so a second call can tell whether the disk moved.",
           "type": "object",
           "required": [
             "kind",
@@ -142,6 +189,7 @@
               "const": "worktree"
             },
             "worktree": {
+              "description": "Which working tree on disk, in the spelling git uses to reach one from another.",
               "$ref": "#/$defs/Worktree"
             },
             "base": {
@@ -149,7 +197,7 @@
               "$ref": "#/$defs/Commit"
             },
             "changes": {
-              "description": "SHA-256 over the files that differ from `base` — each path with the digest of its content, in RFC 8785 canonical JSON, the same digest each file reports. A clean working tree digests the empty set.\n\nThis detects that a working tree moved; what moved is a diff, read through `DiffId`.",
+              "description": "What makes this snapshot an identity: two reads of one dirty tree on the same `base` are otherwise indistinguishable. The changed set has no bound, so it is addressed rather than listed — SHA-256 over each differing path with the digest of its content, in RFC 8785 canonical JSON. A clean tree digests the empty set.",
               "$ref": "#/$defs/Digest"
             }
           },
@@ -157,13 +205,27 @@
         }
       ]
     },
-    "ProjectPath": {
-      "description": "A non-empty project-relative UTF-8 path using '/' separators, with no backslash, control character, empty segment, '.' segment, or '..' segment.",
-      "type": "string",
-      "pattern": "^(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^/\\\\\\u0000-\\u001F\\u007F]+(?:/[^/\\\\\\u0000-\\u001F\\u007F]+)*$"
+    "LanguageRegion": {
+      "description": "A byte range of one file, and the language that owns it. One grammar cannot parse a whole `.svelte` file, so the adapters that claim it split it between them and each parses only its own regions.",
+      "type": "object",
+      "required": [
+        "language",
+        "range"
+      ],
+      "properties": {
+        "language": {
+          "description": "The language whose adapter parses these bytes.",
+          "$ref": "#/$defs/LanguageId"
+        },
+        "range": {
+          "description": "The bytes it owns, as offsets into the file.",
+          "$ref": "#/$defs/TextRange"
+        }
+      },
+      "additionalProperties": false
     },
     "FileId": {
-      "description": "Identity of one file, and the URI that resolves it. `rift://file/<path>` — path to the file, relative to the project root. A path is a path whether three adapters claim it or none do, so the language belongs to what is parsed from the file. A file an adapter produced rather than read from disk is addressed the same way, with the path its producer minted, and the source map says what it was generated from. A revision can be attached as `?rev=`.",
+      "description": "Identity of one file, and the URI that resolves it. `rift://file/<path>` — path to the file, relative to the project root. No language appears in it, because a path is a path whether three adapters claim it or none do. A revision can be attached as `?rev=`.",
       "type": "string",
       "minLength": 13,
       "maxLength": 1024,
@@ -180,16 +242,19 @@
         "id",
         "content",
         "languages",
+        "regions",
         "semantic"
       ],
       "properties": {
         "id": {
+          "description": "Where the entry sits in the tree, and the URI both this record and the bytes are read from.",
           "$ref": "#/$defs/FileId"
         },
         "content": {
           "description": "What the entry holds. Only a regular entry has source in it; the other three are paths that point elsewhere and carry no leaves.",
           "oneOf": [
             {
+              "description": "A file with bytes in it. Only this kind holds source, so every leaf and every symbol in the workspace is read from one of these.",
               "type": "object",
               "required": [
                 "kind",
@@ -219,6 +284,7 @@
               "additionalProperties": false
             },
             {
+              "description": "A Git LFS pointer: a stub committed in place of a large file. Rift reads the stub and never fetches what it names, so the size and hash below are the only facts available.",
               "type": "object",
               "required": [
                 "kind",
@@ -244,6 +310,7 @@
               "additionalProperties": false
             },
             {
+              "description": "A symbolic link. The entry is the path it points at, reported as git recorded it, because the target may not exist in this checkout at all.",
               "type": "object",
               "required": [
                 "kind",
@@ -262,6 +329,7 @@
               "additionalProperties": false
             },
             {
+              "description": "A submodule: another repository's commit, recorded at this path. Its files belong to that repository's own workspace, so nothing here is read from them.",
               "type": "object",
               "required": [
                 "kind",
@@ -281,7 +349,7 @@
           ]
         },
         "languages": {
-          "description": "The languages whose adapters claim this path. More than one where a file embeds another language — a script block in a template, a query string in a host language.",
+          "description": "The languages whose adapters claim this path, without saying where each one starts. Read `regions` for that.",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -294,6 +362,13 @@
               "css"
             ]
           ]
+        },
+        "regions": {
+          "description": "Which bytes each language owns. A file that embeds another language has more than one — a script block in a template, a query string in a host language — and without the ranges an agent knows `App.svelte` holds TypeScript but not where.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LanguageRegion"
+          }
         },
         "semantic": {
           "description": "Whether Rift produced facts from this file. False where there is nothing to read, and where no adapter claims the path.",
@@ -313,7 +388,7 @@
       ]
     },
     "SymbolId": {
-      "description": "Identity of one symbol, and the URI that resolves it. The identifier you get back is the address you read, so there is nothing to assemble and no second form to convert to.\n\n`rift://symbol/<language>/<qualified-name>`, where the qualified name is how the language itself names the declaration: `pkg.util.load_config` in Python, `serde::de::Deserialize` in Rust, `src/config.ts:ConfigLoader.parse` in TypeScript, where a module is a file and so the path is the namespace. Where one namespace declares two symbols that would otherwise write the same, the adapter appends `~` and an index.\n\nA file appears here only where the language puts one there. Which file a symbol is written in is read from its leaves, so moving a file leaves every symbol in it addressable by the same URI. A symbol the compiler invented, and one whose declaration Rift cannot read, are both named this way; `Symbol.origin` says which.\n\nA revision can be attached as `?rev=`, pinning the identity to one state; without it the identity is the symbol itself, at whichever revision the request resolved. The language segment is what keeps two adapters apart, so one workspace runs one adapter per language.",
+      "description": "Identity of one symbol, and the URI that resolves it: `rift://symbol/<language>/<qualified-name>`, where the qualified name is the one the language itself gives the declaration. Where a namespace declares two symbols that would otherwise write the same, the adapter appends `~` and an index. A revision can be attached as `?rev=`.",
       "type": "string",
       "minLength": 17,
       "maxLength": 1024,
@@ -325,7 +400,7 @@
       ]
     },
     "LanguageId": {
-      "description": "A language, as its adapter advertises it. One workspace runs one adapter per language, so this also identifies the adapter that owns a file or minted a fact. Which build of that adapter answered is reported by the environment on every result.",
+      "description": "A language, as its adapter advertises it. One workspace runs one adapter per language, so this also identifies the adapter that owns a file or minted a fact. Which build of that adapter is answering is on the repository resource, beside the compiler it drives.",
       "type": "string",
       "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
       "maxLength": 64,
@@ -344,10 +419,13 @@
       ],
       "properties": {
         "version": {
+          "description": "Which version of the key's advertised schema `data` was written against. A consumer that knows the key but not the version skips the value instead of misreading it.",
           "type": "integer",
           "minimum": 1
         },
-        "data": {}
+        "data": {
+          "description": "The value itself, shaped by whatever that key and version advertise. Rift carries it and never interprets it."
+        }
       },
       "additionalProperties": false
     },
@@ -357,7 +435,7 @@
       "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$"
     },
     "Extensions": {
-      "description": "Reverse-domain namespaced facts. Keys and values use RFC 8785 canonical JSON; every key/version is advertised in AdapterHello.",
+      "description": "Facts an adapter carries that the model has no field for, under a reverse-domain key. Keys and values use RFC 8785 canonical JSON, and every key and version is advertised in `Capabilities.extension_values`, so a consumer that does not recognise one can skip it rather than guess at it.",
       "type": "object",
       "propertyNames": {
         "$ref": "#/$defs/ExtensionKey"
@@ -372,6 +450,7 @@
       "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$"
     },
     "PathSelector": {
+      "description": "Which files a query runs over, as two lists of globs matched against the project-relative path. `exclude` is applied after `include`, so sweeping `src/**` while skipping generated output is two patterns rather than an enumeration of what is left.",
       "type": "object",
       "required": [
         "include",
@@ -379,6 +458,7 @@
       ],
       "properties": {
         "include": {
+          "description": "Globs a path has to match to be searched at all.",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -386,6 +466,7 @@
           }
         },
         "exclude": {
+          "description": "Globs that drop a path `include` already matched.",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -396,7 +477,7 @@
       "additionalProperties": false
     },
     "TextRange": {
-      "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from its compiler's native offsets at the seam.",
+      "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from its compiler's native offsets at the seam. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead.",
       "type": "object",
       "required": [
         "start",
@@ -404,11 +485,13 @@
       ],
       "properties": {
         "start": {
+          "description": "First byte of the range, counted from the start of the file.",
           "type": "integer",
           "minimum": 0,
           "maximum": 4294967295
         },
         "end": {
+          "description": "One past the last byte. Equal to `start` for an empty range, which is how a position between two bytes is spelled.",
           "type": "integer",
           "minimum": 0,
           "maximum": 4294967295
@@ -417,12 +500,19 @@
       "additionalProperties": false
     },
     "Severity": {
+      "description": "How much a `Diagnostic` matters, in the compiler's own judgement. Adapters map their compiler's levels onto these four, so a caller can drop everything below `warning` without knowing which language produced it.",
       "enum": [
         "error",
         "warning",
         "info",
         "hint"
-      ]
+      ],
+      "rift:enumDescriptions": {
+        "error": "The compiler would not accept the code. Facts read from around it may be missing.",
+        "warning": "The code compiles and the compiler thinks it is wrong anyway.",
+        "info": "Something worth knowing that is not a defect.",
+        "hint": "A suggestion, usually with a code action behind it."
+      }
     },
     "SourceSpan": {
       "type": "object",
@@ -432,40 +522,49 @@
       ],
       "properties": {
         "unit": {
+          "description": "Which file the offsets are into.",
           "$ref": "#/$defs/FileId"
         },
         "range": {
+          "description": "The bytes, as offsets into that file.",
           "$ref": "#/$defs/TextRange"
         }
       },
       "additionalProperties": false,
       "description": "A byte range of one file."
     },
+    "TextEdit": {
+      "description": "One byte range of one file, and what replaces it. Offsets are into the file as it stands at the pinned snapshot, so edits in a set never observe each other, and two of them may not overlap.",
+      "type": "object",
+      "required": [
+        "kind",
+        "span",
+        "text"
+      ],
+      "properties": {
+        "kind": {
+          "const": "replace"
+        },
+        "span": {
+          "description": "The file, and the byte range being replaced.",
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "text": {
+          "description": "What the range becomes. Empty deletes it.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "Edit": {
-      "description": "A change to the code, described rather than performed. An adapter never writes to the tree Rift gave it, so a fix or a refactor its compiler offers comes back in this shape and Rift is the one that touches the file.\n\nA change that arrives as data can be read and rejected before it lands, and it cannot leak: an agent asking `rustfmt` for its edits leaves every other agent's files alone.\n\nRanges are byte offsets into the file as it stands at the pinned snapshot, so edits in a set never observe each other. Edits in a set may not overlap, and a set that touches a file it also deletes is malformed.",
+      "description": "A change to the code, described rather than performed. An adapter never writes to the tree Rift gave it, so a fix or a refactor its compiler offers comes back in this shape and Rift is the one that touches the file.",
       "oneOf": [
         {
-          "type": "object",
-          "required": [
-            "kind",
-            "span",
-            "text"
-          ],
-          "properties": {
-            "kind": {
-              "const": "replace"
-            },
-            "span": {
-              "$ref": "#/$defs/SourceSpan"
-            },
-            "text": {
-              "description": "What the range becomes. Empty deletes it.",
-              "type": "string"
-            }
-          },
-          "additionalProperties": false
+          "description": "Replacing a range of bytes in a file that already exists. Every change to code already on disk is one of these.",
+          "$ref": "#/$defs/TextEdit"
         },
         {
+          "description": "A file that does not exist yet, with all of its content, since there is no range to replace.",
           "type": "object",
           "required": [
             "kind",
@@ -481,12 +580,14 @@
               "$ref": "#/$defs/FileId"
             },
             "text": {
+              "description": "Everything the new file contains.",
               "type": "string"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "Removing a file. What it held is not restated, because the pinned snapshot already says.",
           "type": "object",
           "required": [
             "kind",
@@ -497,6 +598,7 @@
               "const": "delete"
             },
             "file": {
+              "description": "The file to remove, as it stands at the pinned snapshot.",
               "$ref": "#/$defs/FileId"
             }
           },
@@ -514,9 +616,11 @@
               "const": "rename"
             },
             "file": {
+              "description": "The path the file has now.",
               "$ref": "#/$defs/FileId"
             },
             "destination": {
+              "description": "The path it moves to.",
               "$ref": "#/$defs/FileId"
             }
           },
@@ -526,6 +630,7 @@
       ]
     },
     "FileChange": {
+      "description": "Everything that happened to one file between two states. `before` and `after` are the entry on each side, so a created file has no `before`, a deleted one has no `after`, and a rename shows as two different paths. The path is never restated as a field of its own: it is `after.id`, or `before.id` where the file is gone.",
       "type": "object",
       "required": [
         "before",
@@ -557,10 +662,10 @@
           ]
         },
         "edits": {
-          "description": "What to apply to `before` to get `after`.",
+          "description": "What to apply to `before` to get `after`. Replacements only: whether the file was created, deleted or renamed is already `before` and `after`, and an edit restating it could contradict them.",
           "type": "array",
           "items": {
-            "$ref": "#/$defs/Edit"
+            "$ref": "#/$defs/TextEdit"
           }
         },
         "truncated": {
@@ -568,8 +673,7 @@
           "description": "Whether edits were dropped to stay inside the size limit."
         }
       },
-      "additionalProperties": false,
-      "description": "Everything that happened to one file between two states. `before` and `after` are the entry on each side, so a created file has no `before`, a deleted one has no `after`, and a rename shows as two different paths. The path is not restated as a field of its own: it is `after.id`, or `before.id` where the file is gone.\n\n`edits` gets you from one side to the other, in the same shape a refactor proposes, so reading a change and applying one speak a single vocabulary. A file whose bytes are not text carries no edits: its digest and size on each side are in `before` and `after`."
+      "additionalProperties": false
     },
     "DiffId": {
       "description": "Identity of one comparison, and the URI that resolves it. `rift://diff/<from>..<to>` — two revisions in git's own range spelling, so `main..feature` and `HEAD~3..HEAD` mean here what they mean on the command line. Git forbids `..` inside a ref name, so the separator is unambiguous.\n\nA cursor can be attached as `?cursor=` to continue a paged read.",
@@ -583,7 +687,7 @@
       ]
     },
     "SourceMapEntry": {
-      "description": "Deterministic virtual-source provenance. exact means one affine byte-for-byte origin range; approximate preserves one or more origins without positional equivalence; synthetic has no source origin. The oneOf constrains cardinality only — exactly one origin for exact, at least one for approximate, none for synthetic — and never varies the shape.",
+      "description": "Where one range of a generated file's bytes came from. Only a file an adapter produced has any, and without them a finding about compiled output lands on bytes nobody wrote.",
       "type": "object",
       "required": [
         "generated",
@@ -592,16 +696,24 @@
       ],
       "properties": {
         "generated": {
+          "description": "The bytes of the produced file this entry accounts for.",
           "$ref": "#/$defs/SourceSpan"
         },
         "precision": {
+          "description": "How closely the produced bytes track their origins, which decides whether an offset can be mapped back or only attributed.",
           "enum": [
             "exact",
             "approximate",
             "synthetic"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "exact": "One origin range, byte for byte, so an offset maps back by arithmetic.",
+            "approximate": "The origins are known, the position inside them is not. A macro expansion is the usual case.",
+            "synthetic": "The generator invented these bytes and no source corresponds to them."
+          }
         },
         "originals": {
+          "description": "Where those bytes came from. How many there are follows `precision`: one for `exact`, at least one for `approximate`, none for `synthetic`.",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -611,6 +723,7 @@
       },
       "oneOf": [
         {
+          "description": "One origin, byte for byte. An offset in the generated file maps back to an offset in the source arithmetically.",
           "properties": {
             "precision": {
               "const": "exact"
@@ -623,6 +736,7 @@
           }
         },
         {
+          "description": "One or more origins, without a position inside them. A macro expansion knows which source it came from and cannot say which byte of it.",
           "properties": {
             "precision": {
               "const": "approximate"
@@ -634,6 +748,7 @@
           }
         },
         {
+          "description": "No origin. The generator invented these bytes, so there is nothing in the workspace to jump to.",
           "properties": {
             "precision": {
               "const": "synthetic"
@@ -651,23 +766,32 @@
       "description": "What a completeness statement covers — everything the request asked for, one file, or a standing scope the answer holds over.",
       "oneOf": [
         {
+          "description": "A standing scope, named rather than listed out.",
           "type": "object",
           "required": [
             "kind"
           ],
           "properties": {
             "kind": {
+              "description": "How far the claim reaches.",
               "enum": [
                 "request",
                 "project",
                 "dependencies",
                 "all"
-              ]
+              ],
+              "rift:enumDescriptions": {
+                "request": "Only what this request asked for. The adapter answered the question put to it and claims nothing past it.",
+                "project": "Every file in the workspace, dependencies left out.",
+                "dependencies": "The installed packages, and not the workspace's own source.",
+                "all": "Everything the compiler could see: the workspace, its dependencies, and the standard library."
+              }
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "One file. The claim holds for that path and says nothing about any other.",
           "type": "object",
           "required": [
             "kind",
@@ -678,6 +802,7 @@
               "const": "unit"
             },
             "unit": {
+              "description": "The file the claim is about.",
               "$ref": "#/$defs/FileId"
             }
           },
@@ -686,9 +811,10 @@
       ]
     },
     "Coverage": {
-      "description": "Explicit completeness for one semantic fact family. Absence of a fact means the fact does not exist only where state is complete.",
+      "description": "How much of one `FactFamily` an answer actually covers. Absence of a fact means the fact does not exist only where the state is `complete`; anywhere else it means Rift did not get that far.",
       "oneOf": [
         {
+          "description": "Everything in scope is here, so a fact that is missing is a fact that does not exist.",
           "type": "object",
           "required": [
             "state",
@@ -699,12 +825,14 @@
               "const": "complete"
             },
             "scope": {
+              "description": "What the claim covers.",
               "$ref": "#/$defs/CoverageScope"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "Some of what is in scope is missing. `reason` is required here because a caller that reads absence as proof would be wrong.",
           "type": "object",
           "required": [
             "state",
@@ -716,9 +844,11 @@
               "const": "partial"
             },
             "scope": {
+              "description": "What the claim covers.",
               "$ref": "#/$defs/CoverageScope"
             },
             "reason": {
+              "description": "Why the answer stops short — a limit hit, a file that would not parse, a page boundary. Prose for a reader; nothing keys on it.",
               "type": "string",
               "maxLength": 4096
             },
@@ -731,6 +861,7 @@
           "additionalProperties": false
         },
         {
+          "description": "The family was never produced at all, so there is nothing here to be complete about.",
           "type": "object",
           "required": [
             "state",
@@ -743,12 +874,18 @@
               "enum": [
                 "unsupported",
                 "not_applicable"
-              ]
+              ],
+              "rift:enumDescriptions": {
+                "unsupported": "The adapter does not produce this family, though the language has the concept. A later build of it might.",
+                "not_applicable": "The language has no such concept — source maps for a language nothing generates."
+              }
             },
             "scope": {
+              "description": "What the claim covers.",
               "$ref": "#/$defs/CoverageScope"
             },
             "reason": {
+              "description": "Which of the two this is, in words: the feature the adapter lacks, or the concept the language lacks.",
               "type": "string",
               "maxLength": 4096
             }
@@ -779,12 +916,15 @@
       ],
       "properties": {
         "language": {
+          "description": "The language the spelling is in, and so the adapter that produced it.",
           "$ref": "#/$defs/LanguageId"
         },
         "source": {
+          "description": "The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.",
           "type": "string"
         },
         "resolved": {
+          "description": "The symbol that declares this type, where one does. Null for a structural type, which has a spelling and nothing to open.",
           "oneOf": [
             {
               "$ref": "#/$defs/SymbolId"
@@ -795,6 +935,7 @@
           ]
         },
         "extensions": {
+          "description": "Type facts the model has no field for, namespaced by the adapter that emitted them.",
           "$ref": "#/$defs/Extensions"
         }
       },
@@ -808,6 +949,7 @@
       ],
       "properties": {
         "role": {
+          "description": "Why the symbol carries this type. A declared type and an inferred one can both be present and disagree, which is the interesting case.",
           "enum": [
             "declared",
             "inferred",
@@ -815,9 +957,18 @@
             "receiver",
             "parameter",
             "return"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "declared": "Written in the source by the author.",
+            "inferred": "The compiler worked it out; nothing in the source says it.",
+            "expected": "What the surrounding context demands here. A mismatch is reported against this one.",
+            "receiver": "The type of the implicit first argument — `self`, `this`.",
+            "parameter": "The type of an argument the callable takes.",
+            "return": "The type the call yields."
+          }
         },
         "type": {
+          "description": "The type itself.",
           "$ref": "#/$defs/TypeExpression"
         }
       },
@@ -832,12 +983,18 @@
       ],
       "properties": {
         "format": {
+          "description": "Which markup the text is written in, since whoever displays a doc comment is the one that renders it.",
           "enum": [
             "plain",
             "markdown"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "plain": "No markup. Show the text as it is.",
+            "markdown": "Markdown, as the language's own doc tooling writes it."
+          }
         },
         "text": {
+          "description": "The body of the comment, with the comment syntax stripped.",
           "type": "string"
         }
       },
@@ -845,6 +1002,7 @@
       "description": "One block of documentation attached to a declaration, in the markup it was written in."
     },
     "Parameter": {
+      "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call may pass it. A receiver is one of these too, held in its own field because it has no position in the parameter list.",
       "type": "object",
       "required": [
         "name",
@@ -856,6 +1014,7 @@
       ],
       "properties": {
         "name": {
+          "description": "What the parameter is called. Null where the language allows an unnamed one, as a positional parameter in a function type.",
           "type": [
             "string",
             "null"
@@ -866,24 +1025,29 @@
           "$ref": "#/$defs/LeafId"
         },
         "types": {
+          "description": "What it accepts. An array because a declared type and an inferred one are separate bindings.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/TypeBinding"
           }
         },
         "optional": {
+          "description": "Whether a call may leave it out.",
           "type": "boolean"
         },
         "variadic": {
+          "description": "Whether it absorbs the arguments that follow — `*args`, `...rest`.",
           "type": "boolean"
         },
         "default": {
+          "description": "The default value as written in the source. Null where there is none.",
           "type": [
             "string",
             "null"
           ]
         },
         "extensions": {
+          "description": "Parameter facts the model has no field for, namespaced by the adapter that emitted them.",
           "$ref": "#/$defs/Extensions"
         }
       },
@@ -920,6 +1084,7 @@
           }
         },
         "language": {
+          "description": "The language whose syntax `display` is written in.",
           "$ref": "#/$defs/LanguageId"
         },
         "receiver": {
@@ -974,6 +1139,7 @@
           ]
         },
         "extensions": {
+          "description": "Signature facts the model has no field for, namespaced by the adapter that emitted them.",
           "$ref": "#/$defs/Extensions"
         }
       },
@@ -991,6 +1157,7 @@
           "$ref": "#/$defs/TextRange"
         },
         "symbol": {
+          "description": "The symbol that stretch of text names.",
           "$ref": "#/$defs/SymbolId"
         }
       },
@@ -1014,6 +1181,22 @@
         "macro",
         "test"
       ],
+      "rift:enumDescriptions": {
+        "namespace": "Groups names without being a unit the language loads — a C++ `namespace`, a Rust `mod`.",
+        "module": "A unit the language imports whole. A TypeScript file is one; a Rust file is not.",
+        "type": "Declares a type. `struct Config` and `interface Props` both qualify, which is what makes one search for types find both.",
+        "value": "Names something that exists while the program runs: a variable, a constant, a function object.",
+        "callable": "Can be called, and so carries at least one `Signature`.",
+        "member": "Declared inside another symbol — a method, a field, an enum variant.",
+        "member_container": "Can hold members: a class, a struct, an interface.",
+        "parameter": "A parameter of a callable, declared as a symbol of its own so it can be renamed and referred to.",
+        "type_parameter": "A generic parameter — the `T` in `Vec<T>`.",
+        "constructible": "Can be instantiated — `new Foo()`, `Foo { .. }`.",
+        "extensible": "Can be inherited from. A `final` class is not.",
+        "implementable": "Names a contract another type can satisfy: an interface, a trait, a protocol.",
+        "macro": "Expands into code at compile time rather than running — `macro_rules!`, a preprocessor define.",
+        "test": "The language's test tooling collects it as a test: a `#[test]` function, a `describe` block."
+      },
       "description": "One portable category a symbol falls into. Kinds are language-specific; facets are shared, so a filter written once applies to every language an adapter is installed for."
     },
     "ExactKind": {
@@ -1042,6 +1225,26 @@
         "generated",
         "test"
       ],
+      "rift:enumDescriptions": {
+        "declaration": "Introduces a name without necessarily giving it a body — a prototype, an `extern` line.",
+        "definition": "Gives a name its body. Where jump-to-definition lands.",
+        "body": "The implementation part of a declaration, after its header.",
+        "block": "A run of statements that opens a scope, however the language delimits one.",
+        "statement": "One step of execution.",
+        "expression": "Something that evaluates to a value.",
+        "type_expression": "A type as written, in a position where the language expects one.",
+        "import": "Brings a name in from another unit.",
+        "export": "Makes a name visible outside this unit.",
+        "parameter": "A parameter as written in a declaration.",
+        "argument": "A value as written at a call site.",
+        "annotation": "Metadata attached to a declaration: a decorator, an attribute, a Java annotation.",
+        "comment": "Text the compiler ignores. A doc comment carries this too; `RegionRole.documentation` is what ties one to the declaration it describes.",
+        "identifier": "A name as written, whether it declares or refers.",
+        "literal": "A value written straight into the source — `42`, `true`.",
+        "pattern": "A destructuring or matching form: a `match` arm, a binding that pulls fields apart.",
+        "generated": "Produced by a tool from something else in the workspace. Destructive policy gates on this, because the next build overwrites whatever you write here.",
+        "test": "Part of the test suite. Refactor scope gates on this, so a change can be confined to production code or carried across both."
+      },
       "description": "Portable structural facets. generated and test are load-bearing: destructive policy, reference policy, and refactor scope all gate on them."
     },
     "RegionRole": {
@@ -1054,9 +1257,19 @@
         "content",
         "documentation",
         "enclosing"
-      ]
+      ],
+      "rift:enumDescriptions": {
+        "selection": "What an editor should select on arriving here: the name for a declaration, the whole node otherwise.",
+        "name": "The identifier alone. What a rename rewrites.",
+        "header": "Everything before the body — the keyword, the name, the parameters, the return type.",
+        "body": "The implementation. Replacing it leaves the signature and the documentation standing.",
+        "content": "What the node holds where its interior is not code: the text of a comment, the characters inside a string.",
+        "documentation": "The doc comment for this declaration. In most languages it sits outside the declaration, which is why the leaf has to point at it.",
+        "enclosing": "The node with everything that belongs to it, documentation and annotations included. What a delete should take."
+      }
     },
     "RelationshipFacet": {
+      "description": "One portable category an edge falls into. Kinds are language-specific, so `typescript.import` and `rust.use` are different kinds that share the `imports` facet, which is what lets one query cross languages.",
       "enum": [
         "contains",
         "declares",
@@ -1075,7 +1288,26 @@
         "aliases",
         "generates",
         "depends_on"
-      ]
+      ],
+      "rift:enumDescriptions": {
+        "contains": "`from` lexically holds `to` — a module and the functions written in it.",
+        "declares": "`from` introduces `to` as a name.",
+        "defines": "`from` gives `to` its body.",
+        "references": "`from` mentions `to` and nothing narrower fits. The fallback edge.",
+        "calls": "`from` invokes `to`.",
+        "constructs": "`from` creates an instance of `to`.",
+        "reads": "`from` takes the value of `to`.",
+        "writes": "`from` assigns to `to`.",
+        "imports": "`from` brings `to` in from another unit.",
+        "exports": "`from` makes `to` visible outside its unit.",
+        "extends": "`from` inherits from `to`.",
+        "implements": "`from` satisfies the contract `to` declares.",
+        "type_definition": "`to` is the type of `from`. What jump-to-type-definition follows.",
+        "overrides": "`from` replaces an inherited `to`.",
+        "aliases": "`from` is another name for `to` — a type alias, a re-export, an `as` rename.",
+        "generates": "`to` was produced from `from` by a build step, so editing `to` lasts until the next build.",
+        "depends_on": "`from` needs `to` and the compiler did not say how. The coarsest edge there is."
+      }
     },
     "SymbolOrigin": {
       "description": "Where this symbol is defined. The origins answer different questions: whether you can edit it, whether it moves when you upgrade something, and whether anything can be read from it at all.",
@@ -1323,6 +1555,7 @@
       ],
       "properties": {
         "role": {
+          "description": "Which part of the leaf this is.",
           "$ref": "#/$defs/RegionRole"
         },
         "range": {
@@ -1356,15 +1589,19 @@
           "$ref": "#/$defs/SymbolId"
         },
         "unit": {
+          "description": "The file the leaf is written in.",
           "$ref": "#/$defs/FileId"
         },
         "language": {
+          "description": "The grammar that produced this leaf. Part of its identity rather than a fact about it, because two adapters reading one file produce two trees over the same bytes.",
           "$ref": "#/$defs/LanguageId"
         },
         "kind": {
+          "description": "What the node is in its own grammar's words — `rust.fn_item`, `python.call`.",
           "$ref": "#/$defs/ExactKind"
         },
         "facets": {
+          "description": "Portable structural classification, so a query can ask for bodies or imports without knowing the grammar that produced them.",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -1372,9 +1609,11 @@
           }
         },
         "range": {
+          "description": "The bytes it spans, as offsets into the file.",
           "$ref": "#/$defs/TextRange"
         },
         "regions": {
+          "description": "The leaf's named parts, so an operation can rewrite a function body without touching the documentation above it.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/LeafRegion"
@@ -1385,6 +1624,7 @@
           "$ref": "#/$defs/LeafId"
         },
         "extensions": {
+          "description": "Syntax facts the model has no field for, namespaced by the adapter that emitted them.",
           "$ref": "#/$defs/Extensions"
         }
       },
@@ -1408,9 +1648,11 @@
           "$ref": "#/$defs/SymbolId"
         },
         "kind": {
+          "description": "What the edge is in its own language's words — `typescript.import`, `rust.impl`.",
           "$ref": "#/$defs/ExactKind"
         },
         "facets": {
+          "description": "Portable classification, so a query for `imports` finds `typescript.import` and `rust.use` alike.",
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
@@ -1430,12 +1672,17 @@
           }
         },
         "derivation": {
-          "description": "How this edge was established. Every edge reaches Rift from an adapter, so who sent it says nothing; what differs is how much the compiler actually knew.\n\n`resolution` — the compiler's own name resolution or type checker produced it. It is a fact about the program.\n\n`syntax` — the adapter read it off the syntax tree because the compiler did not resolve it: a call on an untyped receiver matched by name, a component matched to a tag. Deterministic and repeatable, and still capable of being wrong.\n\n`heuristic` — a guess. `confidence` is required here and meaningless elsewhere.\n\nA refactor can act on `resolution` unchecked. Anything below it is a candidate to show, not a fact to rewrite from.",
+          "description": "How this edge was established. Every edge reaches Rift from an adapter, so who sent it says nothing; what differs is how much the compiler actually knew. A refactor can act on `resolution` unchecked, and anything below it is a candidate to show rather than a fact to rewrite from.",
           "enum": [
             "resolution",
             "syntax",
             "heuristic"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "resolution": "The compiler's own name resolution or type checker produced the edge. It is a fact about the program.",
+            "syntax": "Read off the syntax tree because the compiler did not resolve it — a call on an untyped receiver matched by name. Repeatable, and still capable of being wrong.",
+            "heuristic": "A guess, with `confidence` saying how good a one. Required there and meaningless elsewhere."
+          }
         },
         "confidence": {
           "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other derivation.",
@@ -1444,6 +1691,7 @@
           "maximum": 1
         },
         "extensions": {
+          "description": "Edge facts the model has no field for, namespaced by the adapter that emitted them.",
           "$ref": "#/$defs/Extensions"
         }
       },
@@ -1458,9 +1706,11 @@
       ],
       "properties": {
         "field": {
+          "description": "Which field to test, by its name in this model: `facets`, `origin.kind`, `severity`. Extension keys and diagnostic fields are addressed the same way.",
           "type": "string"
         },
         "op": {
+          "description": "How the operand is compared against the field. What a comparison means follows the field's type, so ordering ops apply only where the values are ordered.",
           "enum": [
             "eq",
             "ne",
@@ -1473,10 +1723,26 @@
             "lt",
             "lte",
             "exists"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "eq": "The field equals the operand.",
+            "ne": "The field does not equal the operand.",
+            "in": "The field equals one of `values`.",
+            "contains": "The field holds the operand: a substring of a string, a member of an array such as `facets`.",
+            "prefix": "The field is a string starting with the operand.",
+            "regex": "The field matches the rust-regex in the operand. Rift runs it, never an adapter.",
+            "gt": "The field is greater than the operand.",
+            "gte": "The field is greater than or equal to the operand.",
+            "lt": "The field is less than the operand.",
+            "lte": "The field is less than or equal to the operand.",
+            "exists": "The field is present at all. No operand is read."
+          }
         },
-        "value": {},
+        "value": {
+          "description": "The operand, for every op except `in` and `exists`."
+        },
         "values": {
+          "description": "The operands for `in`.",
           "type": "array",
           "items": {}
         }
@@ -1491,11 +1757,13 @@
       ],
       "anyOf": [
         {
+          "description": "Matching by exact kind, in one language's vocabulary.",
           "required": [
             "kind"
           ]
         },
         {
+          "description": "Matching by portable facet, which reaches every language an adapter is installed for.",
           "required": [
             "facet"
           ]
@@ -1503,6 +1771,7 @@
       ],
       "properties": {
         "kind": {
+          "description": "One exact relationship kind an adapter advertises, or several. Any of them matches.",
           "oneOf": [
             {
               "type": "string"
@@ -1516,6 +1785,7 @@
           ]
         },
         "facet": {
+          "description": "One portable facet, or several. Any of them matches.",
           "oneOf": [
             {
               "$ref": "#/$defs/RelationshipFacet"
@@ -1529,31 +1799,45 @@
           ]
         },
         "direction": {
+          "description": "Which way the edge runs, seen from the entity being filtered.",
           "enum": [
             "outgoing",
             "incoming",
             "either"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "outgoing": "Edges that start at the entity — what it calls, imports, extends.",
+            "incoming": "Edges that point at it — its callers, its implementors.",
+            "either": "Edges in both directions."
+          }
         },
         "target": {
+          "description": "What has to be true of the entity at the other end. Nesting a filter here is how \"callers that are tests\" becomes one query.",
           "$ref": "#/$defs/Filter"
         },
         "min_depth": {
+          "description": "How many edges to walk before a hit counts. Above 1 this asks about indirect neighbours and skips the direct ones.",
           "type": "integer",
           "minimum": 1,
           "default": 1
         },
         "max_depth": {
+          "description": "How far to walk before giving up. A call graph has cycles and a workspace has no natural end, so traversal is bounded rather than exhaustive.",
           "type": "integer",
           "minimum": 1,
           "maximum": 100,
           "default": 1
         },
         "quantifier": {
+          "description": "Whether a match needs such an edge, or needs there to be none.",
           "enum": [
             "exists",
             "not_exists"
           ],
+          "rift:enumDescriptions": {
+            "exists": "At least one edge matches.",
+            "not_exists": "No edge matches. How \"a symbol nothing calls\" is written."
+          },
           "default": "exists"
         }
       },
@@ -1563,6 +1847,7 @@
       "description": "A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass.",
       "oneOf": [
         {
+          "description": "A test on one field of the entity.",
           "type": "object",
           "required": [
             "kind",
@@ -1573,12 +1858,14 @@
               "const": "field"
             },
             "field": {
+              "description": "The field and the comparison.",
               "$ref": "#/$defs/FieldFilter"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A test on the edges the entity has.",
           "type": "object",
           "required": [
             "kind",
@@ -1589,12 +1876,14 @@
               "const": "relation"
             },
             "relation": {
+              "description": "The edges to look for, and what they must reach.",
               "$ref": "#/$defs/RelationFilter"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "Conjunction: every member has to hold.",
           "type": "object",
           "required": [
             "kind",
@@ -1605,6 +1894,7 @@
               "const": "all"
             },
             "all": {
+              "description": "The filters that must all hold.",
               "type": "array",
               "items": {
                 "$ref": "#/$defs/Filter"
@@ -1614,6 +1904,7 @@
           "additionalProperties": false
         },
         {
+          "description": "Disjunction: at least one member has to hold.",
           "type": "object",
           "required": [
             "kind",
@@ -1624,6 +1915,7 @@
               "const": "any"
             },
             "any": {
+              "description": "The filters, of which one is enough.",
               "type": "array",
               "items": {
                 "$ref": "#/$defs/Filter"
@@ -1633,6 +1925,7 @@
           "additionalProperties": false
         },
         {
+          "description": "Negation of what it holds.",
           "type": "object",
           "required": [
             "kind",
@@ -1643,6 +1936,7 @@
               "const": "not"
             },
             "not": {
+              "description": "The filter being negated.",
               "$ref": "#/$defs/Filter"
             }
           },
@@ -1654,6 +1948,7 @@
       "description": "Where an operation applies. A symbol addresses meaning and a leaf addresses syntax, so the two are separate branches rather than one field that could be either.",
       "oneOf": [
         {
+          "description": "A symbol, wherever it happens to be written. Addressed this way, a rename reaches every leaf the compiler knows about.",
           "type": "object",
           "required": [
             "kind",
@@ -1664,12 +1959,14 @@
               "const": "symbol"
             },
             "symbol": {
+              "description": "The symbol the operation applies to.",
               "$ref": "#/$defs/SymbolId"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "One node of one file's syntax tree, optionally narrowed to one of its named parts.",
           "type": "object",
           "required": [
             "kind",
@@ -1680,6 +1977,7 @@
               "const": "leaf"
             },
             "leaf": {
+              "description": "The node the operation applies to.",
               "$ref": "#/$defs/LeafId"
             },
             "region": {
@@ -1690,6 +1988,7 @@
           "additionalProperties": false
         },
         {
+          "description": "A byte range, whether or not anything was parsed there. This is what addresses a `LICENSE` file, or a region of a file no adapter claims.",
           "type": "object",
           "required": [
             "kind",
@@ -1700,12 +1999,14 @@
               "const": "source"
             },
             "span": {
+              "description": "The file, and the bytes in it.",
               "$ref": "#/$defs/SourceSpan"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A result of a `StructuralQuery`, by the identity it came back with. That identity carries the state it was found in, so an edit refuses rather than landing on moved bytes.",
           "type": "object",
           "required": [
             "kind",
@@ -1717,6 +2018,7 @@
               "const": "match"
             },
             "match": {
+              "description": "The match, and the state it was found in.",
               "$ref": "#/$defs/MatchKey"
             },
             "capture": {
@@ -1732,6 +2034,7 @@
       ]
     },
     "StructuralCaptureConstraint": {
+      "description": "A condition one capture of a `StructuralQuery` has to meet. Constraints are where a pattern over syntax reaches the compiler's knowledge: match every call, then keep only the ones whose target carries the `test` facet.",
       "type": "object",
       "required": [
         "capture",
@@ -1739,33 +2042,42 @@
       ],
       "properties": {
         "capture": {
+          "description": "Which metavariable of the pattern this constrains, written without the `$`.",
           "type": "string",
           "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
         },
         "cardinality": {
+          "description": "How many nodes the capture binds, which follows the sigil used in the pattern.",
           "enum": [
             "one",
             "many"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "one": "Exactly one node, as `$NAME` binds.",
+            "many": "A run of nodes, as `$$$NAME` binds."
+          }
         },
         "exact_kind": {
+          "description": "The syntax kind the captured node has to be, in its grammar's own words.",
           "$ref": "#/$defs/ExactKind"
         },
         "facet": {
+          "description": "A portable structural facet the captured node has to carry.",
           "$ref": "#/$defs/LeafFacet"
         },
         "text_regex": {
-          "type": "string",
-          "description": "rust-regex filter on the capture's text. Evaluated by Rift over returned captures, never by the adapter: an adapter MUST NOT prune matches using this field. Two engines behind one wire field disagree silently — a JavaScript adapter's RegExp reads \\d as ASCII-only where rust-regex reads it as Unicode Nd — and a backtracking engine turns a caller-supplied pattern into a stall inside a process that is a shared fault domain. The cost is that the adapter returns candidate matches Rift then discards, bounded by pagination and AdapterLimits."
+          "description": "A rust-regex the capture's text must match. Rift evaluates it and an adapter must not: two engines behind one wire field disagree silently — a JavaScript `RegExp` reads `\\d` as ASCII where rust-regex reads it as Unicode — and a backtracking engine turns a caller's pattern into a stall inside a process every workspace shares.",
+          "type": "string"
         },
         "semantic": {
+          "description": "What has to be true of the symbol written at the capture. The adapter matches syntax; Rift applies this, because only Rift holds the resolved facts.",
           "$ref": "#/$defs/Filter"
         }
       },
       "additionalProperties": false
     },
     "StructuralQuery": {
-      "description": "Language-parsed source pattern using Rift metavariables $NAME and $$$NAME. The pattern text is language-specific; capture identity, scoping, constraints, ordering, and result shape are portable.",
+      "description": "A search over syntax rather than text: a pattern written in the target language's own grammar, with `$NAME` standing for one node and `$$$NAME` for a run of them. The pattern is language-specific; captures, constraints and the shape of a result are the same whichever adapter runs it.",
       "type": "object",
       "required": [
         "kind",
@@ -1782,35 +2094,48 @@
           "const": "structural"
         },
         "version": {
+          "description": "Which revision of the metavariable grammar the pattern is written in.",
           "const": 1
         },
         "language": {
+          "description": "Which grammar parses `pattern`, and so which adapter runs the search.",
           "$ref": "#/$defs/LanguageId"
         },
         "pattern": {
+          "description": "The pattern, in the target language's own syntax, with metavariables where the shape matters and the text does not.",
           "type": "string",
           "minLength": 1
         },
         "paths": {
+          "description": "Which files to search.",
           "$ref": "#/$defs/PathSelector"
         },
         "within": {
+          "description": "Search only inside this — a symbol's leaves, one node's subtree. Absent, everything `paths` selects.",
           "$ref": "#/$defs/Address"
         },
         "constraints": {
+          "description": "Conditions the captures have to meet. The pattern finds a shape; these narrow it to the occurrences you meant.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/StructuralCaptureConstraint"
           }
         },
         "overlap": {
+          "description": "Which match to keep when one encloses another, as a nested call chain does.",
           "enum": [
             "outermost",
             "innermost",
             "all_non_overlapping"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "outermost": "Keep the enclosing match. A chain of nested calls reports once, at the top.",
+            "innermost": "Keep the enclosed match, and report the chain at its deepest point.",
+            "all_non_overlapping": "Keep every match that does not overlap one already kept."
+          }
         },
         "extensions": {
+          "description": "Query fields the model has no place for, namespaced by the adapter that reads them.",
           "$ref": "#/$defs/Extensions"
         }
       },
@@ -1827,9 +2152,11 @@
       ],
       "properties": {
         "name": {
+          "description": "Which metavariable of the pattern bound these bytes.",
           "$ref": "#/$defs/CaptureName"
         },
         "spans": {
+          "description": "Where it bound. A capture that matched a run of nodes has one span per node.",
           "type": "array",
           "minItems": 1,
           "items": {
@@ -1837,6 +2164,7 @@
           }
         },
         "text": {
+          "description": "The source it bound, as written.",
           "type": "string"
         },
         "entity": {
@@ -1854,7 +2182,7 @@
       "additionalProperties": false
     },
     "StructuralMatchRanges": {
-      "description": "Adapter-owned safe replacement envelopes around the matched syntax node.",
+      "description": "The ranges a replacement can be written over, computed by the adapter that parsed the match. Whether the trivia around a node belongs to the edit depends on what you are doing — deleting a list element has to take a separator with it — and only the grammar knows where that trivia ends.",
       "type": "object",
       "required": [
         "exact",
@@ -1864,15 +2192,19 @@
       ],
       "properties": {
         "exact": {
+          "description": "The node itself, with nothing around it. What a replacement in place writes over.",
           "$ref": "#/$defs/SourceSpan"
         },
         "leading": {
+          "description": "The node with the trivia in front of it: the indentation on its line, a separator that precedes it.",
           "$ref": "#/$defs/SourceSpan"
         },
         "trailing": {
+          "description": "The node with what follows it: a trailing comma, the newline that ends its line.",
           "$ref": "#/$defs/SourceSpan"
         },
         "both": {
+          "description": "The node with the trivia on either side. Deleting this leaves no blank line and no orphaned separator.",
           "$ref": "#/$defs/SourceSpan"
         }
       },
@@ -1884,6 +2216,7 @@
       "pattern": "^(?:[A-Za-z][A-Za-z0-9_]*|[0-9]+)$"
     },
     "DiagnosticRelated": {
+      "description": "A second place the compiler wants you to look — the earlier declaration a redefinition conflicts with, the bound that failed. It carries a message and a location, and never a severity of its own, because it is part of one finding.",
       "type": "object",
       "required": [
         "message",
@@ -1891,17 +2224,19 @@
       ],
       "properties": {
         "message": {
+          "description": "What to notice there — \"first defined here\", \"required by this bound\".",
           "type": "string",
           "maxLength": 4096
         },
         "span": {
+          "description": "Where to look.",
           "$ref": "#/$defs/SourceSpan"
         }
       },
       "additionalProperties": false
     },
     "Diagnostic": {
-      "description": "One language finding. reliability says whether surrounding facts came from recovered source; continuation says whether appending source can repair the finding.",
+      "description": "One thing a compiler said about the source. The message and the code are passed through in the compiler's own words, because a normalised message loses the detail that makes it actionable.",
       "type": "object",
       "required": [
         "severity",
@@ -1917,19 +2252,23 @@
       ],
       "properties": {
         "severity": {
+          "description": "How much it matters.",
           "$ref": "#/$defs/Severity"
         },
         "code": {
+          "description": "The compiler's own identifier for this finding — `TS2345`, `E0308`. Null where the compiler issues none.",
           "type": [
             "string",
             "null"
           ]
         },
         "message": {
+          "description": "What the compiler said, in its own words.",
           "type": "string",
           "maxLength": 4096
         },
         "span": {
+          "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
           "oneOf": [
             {
               "$ref": "#/$defs/SourceSpan"
@@ -1940,38 +2279,57 @@
           ]
         },
         "related": {
+          "description": "Other places the compiler pointed at while explaining this one.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/DiagnosticRelated"
           }
         },
         "tags": {
+          "description": "What the compiler is flagging about the code beyond how much it matters. An editor renders these as strikethrough or grey rather than as a squiggle.",
           "type": "array",
           "uniqueItems": true,
           "items": {
             "enum": [
               "deprecated",
               "unnecessary"
-            ]
+            ],
+            "rift:enumDescriptions": {
+              "deprecated": "The code still works and is marked for removal.",
+              "unnecessary": "The code has no effect — an unused import, an unreachable branch."
+            }
           }
         },
         "reliability": {
+          "description": "Whether the facts around this finding came off a clean parse.",
           "enum": [
             "reliable",
             "recovered"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "reliable": "The compiler parsed the file. Facts around this finding stand.",
+            "recovered": "The parser repaired the source to keep going, so the tree here is a guess and so is anything read from it."
+          }
         },
         "continuation": {
+          "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal state of a file an agent is halfway through writing.",
           "enum": [
             "repairable",
             "unrepairable",
             "unknown"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "repairable": "Appending source can make it go away: an unclosed brace, a statement cut off at the end of the file.",
+            "unrepairable": "It stands whatever follows.",
+            "unknown": "The compiler does not say."
+          }
         },
         "extensions": {
+          "description": "Diagnostic fields the model has no place for, namespaced by the adapter that emitted them.",
           "$ref": "#/$defs/Extensions"
         },
         "language": {
+          "description": "Which adapter produced this. Null for a finding Rift itself raised.",
           "oneOf": [
             {
               "$ref": "#/$defs/LanguageId"
@@ -1985,7 +2343,7 @@
       "additionalProperties": false
     },
     "CodeActionDescriptor": {
-      "description": "Portable, digestible action metadata. kind is an open hierarchical identifier; extensions preserve exact language choices.",
+      "description": "One thing a compiler offers to do here — add an import, extract a function. It describes the action without carrying its edits, so a caller can list what is on offer and pay for computing only the one it picks.",
       "type": "object",
       "required": [
         "title",
@@ -2001,26 +2359,36 @@
       ],
       "properties": {
         "title": {
+          "description": "What the action is called, in the words the compiler would show a person.",
           "type": "string"
         },
         "kind": {
-          "type": "string",
-          "pattern": "^[a-z][a-z0-9_.-]*$"
+          "description": "What this action does. Filtering by prefix is what makes it useful: an agent that wants a fix asks for `quickfix` and never sees a refactor.",
+          "$ref": "#/$defs/ActionKind"
         },
         "preferred": {
+          "description": "Whether the compiler considers this the obvious action here. At most one action in a list is preferred.",
           "type": "boolean"
         },
         "applicability": {
+          "description": "How much has to be checked before applying it.",
           "enum": [
             "always",
             "conditional",
             "speculative"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "always": "The edits hold wherever the action is offered. Safe to apply unread.",
+            "conditional": "Correct only under something the compiler cannot check — that a name is unused elsewhere, that a cast is sound.",
+            "speculative": "A guess at what you meant. Read the edits."
+          }
         },
         "rationale": {
+          "description": "Why the compiler is offering it here.",
           "type": "string"
         },
         "target": {
+          "description": "What the action applies to.",
           "$ref": "#/$defs/Address"
         },
         "arguments_schema": {
@@ -2028,25 +2396,28 @@
           "type": "object"
         },
         "disabled_reason": {
+          "description": "Why the action cannot run right now, where the compiler lists it but refuses it. Null when it can run.",
           "type": [
             "string",
             "null"
           ]
         },
         "diagnostics": {
+          "description": "The findings this action would clear. Empty for an action nothing reported.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/Diagnostic"
           }
         },
         "extensions": {
+          "description": "Action fields the model has no place for, namespaced by the adapter that emitted them.",
           "$ref": "#/$defs/Extensions"
         }
       },
       "additionalProperties": false
     },
     "FactFamily": {
-      "description": "The canonical semantic fact families. Coverage, analysis streaming, and invalidation all key on this.",
+      "description": "One kind of thing a compiler can tell Rift about a file. Coverage, analysis streaming and invalidation all key on this, so a family is the unit in which an answer can be complete, partial or missing.",
       "enum": [
         "source_maps",
         "symbols",
@@ -2054,57 +2425,68 @@
         "relationships",
         "types",
         "diagnostics"
-      ]
+      ],
+      "rift:enumDescriptions": {
+        "source_maps": "Where a generated file's bytes came from. Only a file an adapter produced has any.",
+        "symbols": "The declarations the compiler resolved in the file.",
+        "leaves": "The nodes of the file's syntax tree, and which symbol each writes.",
+        "relationships": "The edges between symbols the compiler read out of this file.",
+        "types": "The types carried by those symbols. Type facts ride inside `Symbol.types` and `Signature` rather than streaming as a batch of their own, so this family is how an adapter says it resolved none.",
+        "diagnostics": "What the compiler complained about while reading the file."
+      }
+    },
+    "ActionKind": {
+      "description": "What a compiler action does, as a dotted name its adapter owns: `quickfix.import.add`, `refactor.extract.function`. Prefixes nest, so asking for `refactor` asks for everything under it.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]*$",
+      "maxLength": 128
     },
     "MatchKey": {
-      "description": "Identity of one match: the query that found it, and the exact state it was found in. Replaying a cursor or applying an action checks this first, because a match found in one state does not survive into another.",
+      "description": "Identity of one match: the query that found it, and where it landed. A query and a byte range pin it exactly — one query cannot match the same span twice — so there is nothing to hash and nothing a caller has to assemble.",
       "type": "object",
       "required": [
-        "id",
         "snapshot",
-        "environment",
+        "span",
         "query"
       ],
       "properties": {
-        "id": {
-          "description": "Digest of the match itself.",
-          "$ref": "#/$defs/Digest"
-        },
         "snapshot": {
-          "description": "The state it was found in.",
+          "description": "The snapshot it was found in. A match does not survive into another one, because the bytes its span points at have moved.",
           "$ref": "#/$defs/Snapshot"
         },
-        "environment": {
-          "description": "Fingerprint of the environment that gave that state its meaning — the same value the answer reports as `environment`.",
-          "$ref": "#/$defs/Digest"
+        "span": {
+          "description": "The file and byte range that matched.",
+          "$ref": "#/$defs/SourceSpan"
         },
         "query": {
-          "description": "Digest of the canonical query.",
+          "description": "Digest of the canonical query. Part of the identity because one span found by two queries is two matches, and a digest rather than the query itself because the caller wrote it and every hit would otherwise repeat it.",
           "$ref": "#/$defs/Digest"
         }
       },
       "additionalProperties": false
     },
     "ActionKey": {
-      "description": "Identity of one discovered compiler action, and the exact state it was discovered in. Rift rediscovers the adapter's action and checks this digest before applying anything.",
+      "description": "Identity of one discovered compiler action: where it was offered, and which of the offers there it is. Two actions can sit at one address — `quickfix.import.add` for two different imports — and only the adapter that minted them can tell those apart, so its own handle is what distinguishes them.",
       "type": "object",
       "required": [
-        "id",
         "snapshot",
-        "environment"
+        "target",
+        "token"
       ],
       "properties": {
-        "id": {
-          "description": "Digest of the action's descriptor.",
-          "$ref": "#/$defs/Digest"
-        },
         "snapshot": {
-          "description": "The state it was discovered in.",
+          "description": "The snapshot it was discovered in. Rift rediscovers the adapter's action and checks this before applying anything, because an action is only meaningful against the code it was computed from.",
           "$ref": "#/$defs/Snapshot"
         },
-        "environment": {
-          "description": "Fingerprint of the environment that gave that state its meaning — the same value the answer reports as `environment`.",
-          "$ref": "#/$defs/Digest"
+        "target": {
+          "description": "What the action applies to, copied from its descriptor. That can be wider than the address you asked at — ask on a leaf and a refactor may target the symbol around it — so the descriptor's target is what pins the offer.",
+          "$ref": "#/$defs/Address"
+        },
+        "token": {
+          "description": "The adapter's own handle on this action, passed through unread. Rift does not derive it and does not parse it: what makes two offers at one address different is a fact only the compiler behind them has.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
         }
       },
       "additionalProperties": false

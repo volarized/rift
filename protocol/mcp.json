@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://volar.sh/rift/protocol/mcp.json",
-  "title": "Rift MCP tools, resources, and records",
-  "description": "Rift's first-party MCP surface — five tools, five resource templates, and the categorical error contract — together with the durable records a transaction writes.",
+  "title": "Rift MCP surface",
+  "description": "What an agent reaches over MCP. Tools take parameters and return a result, resources are read by URI, and every failure carries `RiftErrorData`. The model itself is not defined here: this document `$ref`s `core.json` and adds only what the MCP seam owns.",
   "rift:entryPoints": {
     "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as SymbolId and Address is deliberately reachable from several.",
     "mcp.tools": {
       "search": {
-        "description": "Find things. You can search by text, or by what the compiler knows — every symbol that implements a given trait, every function carrying an error, everything a file imports. Filters nest, so \"callers of `parse_config` that live under `src/api`\" is one query rather than three. Results come back in a stated order with a cursor you can replay, and they tell you how much of the repository Rift could actually see.",
+        "description": "Ranked lookup of symbols, leaves and files. At least one of a lexical `query` and a structured `filter` is required, and filters nest, so callers of `parse_config` under `src/api` is one call rather than three. Every page carries the order it was sorted in, a cursor to continue from, and how much Rift could see.",
         "params": {
           "$ref": "#/$defs/SearchParams"
         },
@@ -16,7 +16,7 @@
         }
       },
       "match": {
-        "description": "Find exact places rather than whole files. Rift runs literal and regular-expression matching itself, over any text file, whether a language adapter owns it or not. Structural matching — \"every call to this method that passes two arguments\" — goes to the language's compiler instead, because only the compiler knows what a call really is. Either way every match gets a stable ID, so you can pick the ones you want and edit exactly those.",
+        "description": "Finds byte ranges rather than whole entities. Rift runs literal and regular-expression matching itself over any text file, claimed by an adapter or not; a structural pattern goes to the language's compiler, because only the compiler knows what a call is. Every hit carries a key an edit can be addressed at.",
         "params": {
           "$ref": "#/$defs/MatchParams"
         },
@@ -25,7 +25,7 @@
         }
       },
       "actions": {
-        "description": "Ask the compiler what it can offer at one spot in the code: the quick fixes and refactors an IDE would show you in a lightbulb menu. The list is pinned to a snapshot, so an action you found is still the same action when you apply it. If the code moved in between, applying it is refused rather than guessed at.",
+        "description": "Asks a compiler what it can offer at one address: the fixes and refactors it would suggest there. Each one comes back with a key digesting both the action and the state it was found in, so applying it after the code moved is refused instead of guessed at. Call it after a diagnostic, or before a refactor.",
         "params": {
           "$ref": "#/$defs/ActionsParams"
         },
@@ -36,7 +36,7 @@
     },
     "mcp.resources": {
       "repository": {
-        "description": "Start here. This says what Rift can do for this repository right now: which languages have adapters, what those adapters actually support, which snapshot is current, what the size limits are, how long previews are kept. Every other call assumes you have read it, because this is where you find out what is worth asking for.",
+        "description": "What this workspace can do: which languages have adapters and what each supports, the state answers resolve against, the limits a request has to stay inside, and which conformance tier is in force. Read it before the first call — the tools and resources listed here are the ones this workspace actually serves.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -48,7 +48,7 @@
         }
       },
       "symbol": {
-        "description": "Everything Rift knows about one symbol, in one place — where it is declared, everywhere it appears, its type, what it connects to, and any errors on it. This is the view you want before renaming or deleting something.",
+        "description": "Everything Rift holds about one symbol at one state: the declaration, every leaf that writes it, its types, its edges and its diagnostics. Read it before a rename or a delete, where the references matter as much as the declaration.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -60,7 +60,7 @@
         }
       },
       "diff": {
-        "description": "What changed between two revisions — text, binary, and the tree itself. Git answers this without a compiler, so it works for a language Rift has no adapter for.",
+        "description": "What changed between two revisions, a page of files at a time: the entry on each side and the edits between them. Git answers it without a compiler, so it works for a language Rift has no adapter for.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -72,7 +72,7 @@
         }
       },
       "file": {
-        "description": "One file at one revision: what Git records for the entry, which languages read it, and its bytes. A file no adapter claims is still a file, and still readable.",
+        "description": "One file at one revision: the entry git records, which languages parse it, and its bytes. A path no adapter claims is still readable, so a `LICENSE` or a lockfile comes back the same way source does.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -93,7 +93,7 @@
   },
   "$defs": {
     "Cursor": {
-      "description": "Opaque immutable continuation bound to the canonical request, snapshot, ordering contract, engine version, and page size. Replaying it while the snapshot is retained returns the same page; mismatched or malformed cursors are typed errors.",
+      "description": "An opaque string that continues a paginated answer from where the last page ended. It is bound to the request, the state, the order and the page size it was minted for; change any of those and it fails with `cursor_invalid` rather than quietly answering a different question.",
       "type": "string",
       "minLength": 1,
       "maxLength": 4096
@@ -106,43 +106,19 @@
       ],
       "properties": {
         "span": {
-          "$ref": "core.json#/$defs/SourceSpan"
+          "$ref": "core.json#/$defs/SourceSpan",
+          "description": "The file and byte range the text was taken from."
         },
         "text": {
-          "type": "string"
+          "type": "string",
+          "description": "The source itself, as it stood at the answer's snapshot."
         }
       },
-      "additionalProperties": false
-    },
-    "QueryExecution": {
-      "description": "Result-set metadata analogous to a database execution plan identity, without exposing implementation internals or nondeterministic timing.",
-      "type": "object",
-      "required": [
-        "fingerprint",
-        "engine",
-        "version",
-        "order"
-      ],
-      "properties": {
-        "fingerprint": {
-          "$ref": "core.json#/$defs/Digest"
-        },
-        "engine": {
-          "type": "string",
-          "minLength": 1
-        },
-        "version": {
-          "type": "string",
-          "minLength": 1
-        },
-        "order": {
-          "$ref": "#/$defs/ResultOrder"
-        }
-      },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "description": "A copy of some source, and where it was copied from. A span points into a file that may change under you; an excerpt is the bytes as they were when the answer was produced."
     },
     "SearchParams": {
-      "description": "Query is lexical over file text and symbol names/signatures; compiler semantics enter through fields and relationship filters.",
+      "description": "What to search for. At least one of `query` and `filter` is required: `query` is lexical, matched against file text, symbol names and rendered signatures, while `filter` is a predicate over what the compiler resolved. Passing both narrows a text search with structure.",
       "type": "object",
       "required": [
         "target",
@@ -150,11 +126,13 @@
       ],
       "anyOf": [
         {
+          "description": "Satisfied by a text query, with or without a filter alongside it.",
           "required": [
             "query"
           ]
         },
         {
+          "description": "Satisfied by a filter alone, for a search with no text to match.",
           "required": [
             "filter"
           ]
@@ -168,18 +146,28 @@
             "leaf",
             "file",
             "all"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "symbol": "Declarations the compiler resolved — a function, a class, a trait.",
+            "leaf": "Places in a syntax tree where a symbol is written. One symbol has many.",
+            "file": "Entries of the workspace tree. The only target that answers with no adapter installed.",
+            "all": "Every kind above, in one ranked list."
+          }
         },
         "order": {
+          "description": "Which total order the page comes back in. The cursor is bound to it, so it cannot change between pages of one query.",
           "$ref": "#/$defs/ResultOrder"
         },
         "query": {
+          "description": "Text to match against file contents, symbol names and rendered signatures. Its meaning is lexical: `parse` finds the word, not the callers of `parse`.",
           "type": "string"
         },
         "filter": {
+          "description": "A predicate over resolved fields and relationships. This is where compiler knowledge enters a search — implements this trait, called by that function, declared under `src/api`.",
           "$ref": "core.json#/$defs/Filter"
         },
         "include": {
+          "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so ask for what you will read.",
           "type": "array",
           "items": {
             "enum": [
@@ -187,17 +175,25 @@
               "signature",
               "relationships",
               "diagnostics"
-            ]
+            ],
+            "rift:enumDescriptions": {
+              "source": "The source around the hit, with the span it was copied from.",
+              "signature": "The rendered signatures of a symbol hit, filled into `Symbol.signatures`. Nothing to add for a leaf or a file.",
+              "relationships": "The edges leading out of the hit.",
+              "diagnostics": "What the compiler reported at the hit."
+            }
           },
           "default": []
         },
         "limit": {
+          "description": "Most hits to return in one page. `max_page_items` from the repository resource caps it, and fewer may come back.",
           "type": "integer",
           "minimum": 1,
           "maximum": 10000,
           "default": 50
         },
         "cursor": {
+          "description": "Continues a previous search where its last page ended. Omit it for the first page; everything else in the request has to match what the cursor was minted for.",
           "$ref": "#/$defs/Cursor"
         },
         "rev": {
@@ -209,8 +205,6 @@
       "additionalProperties": false,
       "examples": [
         {
-          "commit": "0000000000000000000000000000000000000000",
-          "semantic": "0000000000000000000000000000000000000000000000000000000000000000",
           "target": "symbol",
           "order": "relevance",
           "filter": {
@@ -230,8 +224,6 @@
           }
         },
         {
-          "commit": "0000000000000000000000000000000000000000",
-          "semantic": "0000000000000000000000000000000000000000000000000000000000000000",
           "target": "symbol",
           "order": "path",
           "filter": {
@@ -262,32 +254,38 @@
       ],
       "properties": {
         "hit": {
-          "$ref": "#/$defs/SearchHitTarget"
+          "$ref": "#/$defs/SearchHitTarget",
+          "description": "What was found. A symbol, a leaf, or a file — whichever `target` allowed."
         },
         "score": {
-          "type": "number"
+          "type": "number",
+          "description": "How well this hit matched, on the scale the `relevance` order sorts by. Comparable inside one result page and nowhere else."
         },
         "matched_by": {
           "type": "array",
           "items": {
             "type": "string",
             "maxLength": 4096
-          }
+          },
+          "description": "Which fields produced the match — `name`, `signature`, the text of the file."
         },
         "relationships": {
           "type": "array",
           "items": {
             "$ref": "core.json#/$defs/Relationship"
-          }
+          },
+          "description": "Edges from this hit, requested with `include: [\"relationships\"]`."
         },
         "source": {
-          "type": "string"
+          "description": "The source around the hit, requested with `include: [\"source\"]`. Carries its span, so an agent can act on what it read without searching for it again.",
+          "$ref": "#/$defs/SourceExcerpt"
         },
         "diagnostics": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/DiagnosticView"
-          }
+          },
+          "description": "What the compiler reported here, requested with `include: [\"diagnostics\"]`."
         }
       },
       "additionalProperties": false
@@ -296,6 +294,7 @@
       "description": "A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed per resource, and the URI is the one that resource accepts.",
       "oneOf": [
         {
+          "description": "A link to the symbol resource, carrying the symbol's own URI.",
           "type": "object",
           "required": [
             "type",
@@ -305,21 +304,26 @@
           ],
           "properties": {
             "type": {
+              "description": "MCP's tag for a link to a resource inside tool output.",
               "const": "resource_link"
             },
             "uri": {
+              "description": "The symbol to read. Hand it to `resources/read` unchanged.",
               "$ref": "core.json#/$defs/SymbolId"
             },
             "name": {
+              "description": "The resource family this link belongs to.",
               "const": "symbol"
             },
             "mimeType": {
+              "description": "What a read of this URI returns: `SymbolResourcePayload` as JSON.",
               "const": "application/vnd.rift.symbol+json"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A link to the repository resource.",
           "type": "object",
           "required": [
             "type",
@@ -329,21 +333,26 @@
           ],
           "properties": {
             "type": {
+              "description": "MCP's tag for a link to a resource inside tool output.",
               "const": "resource_link"
             },
             "uri": {
+              "description": "The repository resource, optionally pinned to a revision and continued by a cursor.",
               "$ref": "#/$defs/RepositoryResourceUri"
             },
             "name": {
+              "description": "The resource family this link belongs to.",
               "const": "repository"
             },
             "mimeType": {
+              "description": "What a read of this URI returns: `RepositoryResourcePayload` as JSON.",
               "const": "application/vnd.rift.repository+json"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A link to the comparison between two revisions.",
           "type": "object",
           "required": [
             "type",
@@ -353,21 +362,26 @@
           ],
           "properties": {
             "type": {
+              "description": "MCP's tag for a link to a resource inside tool output.",
               "const": "resource_link"
             },
             "uri": {
+              "description": "The comparison to read, optionally continued by a cursor.",
               "$ref": "core.json#/$defs/DiffId"
             },
             "name": {
+              "description": "The resource family this link belongs to.",
               "const": "diff"
             },
             "mimeType": {
+              "description": "What a read of this URI returns: `DiffResourcePayload` as JSON.",
               "const": "application/vnd.rift.diff+json"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A link to one file at one revision.",
           "type": "object",
           "required": [
             "type",
@@ -377,15 +391,19 @@
           ],
           "properties": {
             "type": {
+              "description": "MCP's tag for a link to a resource inside tool output.",
               "const": "resource_link"
             },
             "uri": {
+              "description": "The file to read, optionally pinned to a revision.",
               "$ref": "core.json#/$defs/FileId"
             },
             "name": {
+              "description": "The resource family this link belongs to.",
               "const": "file"
             },
             "mimeType": {
+              "description": "What a read of this URI returns: `FileResourcePayload` as JSON.",
               "const": "application/vnd.rift.file+json"
             }
           },
@@ -399,7 +417,6 @@
       "required": [
         "uri",
         "at",
-        "environment",
         "symbol",
         "source_maps",
         "leaves",
@@ -407,58 +424,62 @@
         "source",
         "diagnostics",
         "coverage",
-        "next",
-        "execution"
+        "next"
       ],
       "properties": {
         "uri": {
+          "description": "The symbol this payload answers for, echoed back so a link and its content carry the same address.",
           "$ref": "core.json#/$defs/SymbolId"
         },
         "at": {
-          "description": "The state this answer was resolved against.",
+          "description": "The snapshot this answer was resolved against. Pass it back as `rev` when a later call has to agree with this one.",
           "$ref": "core.json#/$defs/Snapshot"
         },
-        "environment": {
-          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
-          "$ref": "core.json#/$defs/Digest"
-        },
         "symbol": {
+          "description": "The declaration itself: its name, its kind in the language's own words, its origin, its types and its signatures.",
           "$ref": "core.json#/$defs/Symbol"
         },
         "source_maps": {
+          "description": "Where the bytes came from, for a symbol declared in a file some build step produced. Empty for a file someone wrote.",
           "type": "array",
           "items": {
             "$ref": "core.json#/$defs/SourceMapEntry"
           }
         },
         "leaves": {
+          "description": "Every place this symbol is written — the declaration and each mention. This is the list a rename has to rewrite.",
           "type": "array",
           "items": {
             "$ref": "core.json#/$defs/Leaf"
           }
         },
         "relationships": {
+          "description": "Edges into and out of this symbol, each carrying the leaves the compiler read it from.",
           "type": "array",
           "items": {
             "$ref": "core.json#/$defs/Relationship"
           }
         },
         "source": {
+          "description": "The source at each leaf, so the declaration and its call sites can be read without a second round trip.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/SourceExcerpt"
           }
         },
         "diagnostics": {
+          "description": "What the compiler reported at this symbol's leaves.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/DiagnosticView"
           }
         },
         "coverage": {
+          "description": "How complete each fact family is for this symbol. An empty `relationships` means the symbol has no edges only where that family is complete.",
           "$ref": "core.json#/$defs/SemanticCoverage"
         },
         "next": {
+          "description": "The same symbol URI carrying the cursor for the next page, or null on the last one. Leaves, edges and diagnostics are what page.",
           "oneOf": [
             {
               "$ref": "core.json#/$defs/SymbolId"
@@ -467,10 +488,6 @@
               "type": "null"
             }
           ]
-        },
-        "execution": {
-          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
-          "$ref": "#/$defs/QueryExecution"
         }
       },
       "additionalProperties": false
@@ -483,11 +500,11 @@
         "to",
         "files",
         "truncated",
-        "next",
-        "execution"
+        "next"
       ],
       "properties": {
         "uri": {
+          "description": "The comparison this payload answers for, echoed back with the cursor that produced this page.",
           "$ref": "core.json#/$defs/DiffId"
         },
         "from": {
@@ -510,6 +527,7 @@
           "type": "boolean"
         },
         "next": {
+          "description": "The same comparison carrying the cursor for the next page, or null on the last one.",
           "oneOf": [
             {
               "$ref": "core.json#/$defs/DiffId"
@@ -518,16 +536,13 @@
               "type": "null"
             }
           ]
-        },
-        "execution": {
-          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
-          "$ref": "#/$defs/QueryExecution"
         }
       },
       "additionalProperties": false,
       "description": "One page of a comparison. `from` and `to` are what the URI's revisions resolved to, so a diff taken against a moving branch records which commits it actually compared. Git answers this without a compiler, so it works for a language Rift has no adapter for."
     },
     "ContractDescriptor": {
+      "description": "Which version of the protocol this server speaks, and the exact schema it speaks it from. A client that pins both knows the shapes it validates against are the ones on the wire.",
       "type": "object",
       "required": [
         "protocol",
@@ -536,19 +551,22 @@
       ],
       "properties": {
         "protocol": {
+          "description": "The protocol version both sides have to agree on before any other field is meaningful.",
           "$ref": "core.json#/$defs/ProtocolVersion"
         },
         "schema": {
+          "description": "Digest of the schema documents this server was built from. Generated client types that hash differently were generated from something else.",
           "$ref": "core.json#/$defs/Digest"
         },
         "canonical_json": {
+          "description": "How a value is serialized before it is digested. Every digest in the protocol is taken over RFC 8785 canonical JSON, so two implementations hash the same value identically.",
           "const": "RFC8785"
         }
       },
       "additionalProperties": false
     },
     "DriverLimits": {
-      "description": "Effective caller-visible MCP limits supplied by launch/host policy. A request that exceeds one, or a response that would exceed max_blob_bytes, fails with limit_exceeded carrying LimitEvidence.",
+      "description": "The ceilings this server enforces on MCP requests and responses. They come from host policy at launch, so two workspaces running the same Rift can differ. A request over one of them, or a response that would be, fails with `limit_exceeded` carrying `LimitEvidence`.",
       "type": "object",
       "required": [
         "max_request_bytes",
@@ -561,6 +579,7 @@
       ],
       "properties": {
         "max_request_bytes": {
+          "description": "Largest request body the server accepts, in bytes. A deep filter tree or a long structural pattern is the usual way to exceed it.",
           "type": "integer",
           "minimum": 1024,
           "maximum": 9007199254740991
@@ -569,29 +588,34 @@
           "type": "integer",
           "minimum": 1024,
           "maximum": 9007199254740991,
-          "description": "Largest Git blob the blob resource will return. The blob resource is deliberately exempt from pagination — it delivers exact opaque bytes, and a cursor over raw bytes buys nothing a byte range would not do better — so it is bounded instead. A larger object fails with limit_exceeded carrying the object size, letting the caller fall back to the diff resource or wait for range reads in a later version. Without this bound the resource has no defined behaviour for a large object, since max_request_bytes bounds requests rather than responses."
+          "description": "Largest Git blob the file resource will return, in bytes. That resource does not paginate — a cursor over opaque bytes buys nothing a byte range would not do better — so it is bounded instead, and a larger object fails with `limit_exceeded` carrying its size. `max_request_bytes` bounds requests, so without this one nothing bounds the response."
         },
         "max_page_items": {
+          "description": "Ceiling on `limit` for every paginated tool. Asking for more is `invalid_request`; asking for less than this still permits a shorter page.",
           "type": "integer",
           "minimum": 1,
           "maximum": 10000
         },
         "max_relation_depth": {
+          "description": "How far a relationship filter may walk. Transitive callers of a widely used function fan out fast, and this is what stops one query from touching the whole graph.",
           "type": "integer",
           "minimum": 1,
           "maximum": 100
         },
         "max_changes": {
+          "description": "Most file changes one answer or one operation may carry. It bounds a page of a diff, and the change set the `apply` tool accepts.",
           "type": "integer",
           "minimum": 1,
           "maximum": 4294967295
         },
         "max_validators": {
+          "description": "How many caller-supplied checks may run over one proposed change. Zero where this workspace runs none, which is every profile below `full`.",
           "type": "integer",
           "minimum": 0,
           "maximum": 4294967295
         },
         "max_program_expansions": {
+          "description": "How many concrete edits a change written as a rule over matches may expand into. The rule is short and its expansion is not, so the bound is on what it produces.",
           "type": "integer",
           "minimum": 1,
           "maximum": 100000
@@ -610,7 +634,6 @@
       "required": [
         "uri",
         "at",
-        "environment",
         "contract",
         "limits",
         "languages",
@@ -620,25 +643,23 @@
         "next",
         "object_format",
         "matching",
-        "profile",
-        "execution"
+        "profile"
       ],
       "properties": {
         "uri": {
+          "description": "The URI this payload answers for, echoed back with the revision and cursor it resolved.",
           "$ref": "#/$defs/RepositoryResourceUri"
         },
         "at": {
-          "description": "The state this answer was resolved against.",
+          "description": "The snapshot this answer was resolved against. Pass it back as `rev` when a later call has to agree with this one.",
           "$ref": "core.json#/$defs/Snapshot"
         },
-        "environment": {
-          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
-          "$ref": "core.json#/$defs/Digest"
-        },
         "contract": {
+          "description": "Which protocol version and schema this server speaks. Check it before trusting the shape of anything else.",
           "$ref": "#/$defs/ContractDescriptor"
         },
         "limits": {
+          "description": "The ceilings a request has to stay inside here.",
           "$ref": "#/$defs/DriverLimits"
         },
         "languages": {
@@ -650,10 +671,11 @@
           }
         },
         "coverage": {
+          "description": "How complete each fact family is across the workspace. A family reported `unsupported` here will be unsupported in every answer, so there is no point asking for it.",
           "$ref": "core.json#/$defs/SemanticCoverage"
         },
         "tools": {
-          "description": "The MCP tools this workspace serves.",
+          "description": "The MCP tools this workspace serves. A tool the profile does not reach is absent from this list and from `tools/list`.",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -663,7 +685,14 @@
               "actions",
               "apply",
               "persist"
-            ]
+            ],
+            "rift:enumDescriptions": {
+              "search": "Ranked lookup of symbols, leaves and files.",
+              "match": "Literal, regular-expression and structural matching, with a key per hit.",
+              "actions": "The fixes and refactors a compiler offers at one address.",
+              "apply": "Turns a proposed change into a readable preview and publishes it. Reached from the `edit` profile up; its parameters and result are not defined in this document.",
+              "persist": "Writes a published change into a working tree. Reached from the `full` profile; its parameters and result are not defined in this document."
+            }
           }
         },
         "resources": {
@@ -676,10 +705,17 @@
               "symbol",
               "diff",
               "file"
-            ]
+            ],
+            "rift:enumDescriptions": {
+              "repository": "This resource: what the workspace can do, and the limits on asking.",
+              "symbol": "One symbol, its leaves, its edges and its diagnostics.",
+              "diff": "What changed between two revisions.",
+              "file": "One file's tree entry and its bytes."
+            }
           }
         },
         "next": {
+          "description": "The same resource carrying the cursor for the next page, or null on the last one.",
           "oneOf": [
             {
               "$ref": "#/$defs/RepositoryResourceUri"
@@ -690,56 +726,54 @@
           ]
         },
         "object_format": {
+          "description": "Which hash git uses for object IDs in this repository. It decides how long a `Commit` is, so a client that validates one has to read this first.",
           "enum": [
             "sha1",
             "sha256"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "sha1": "Object IDs are 40 hex characters. Still git's default.",
+            "sha256": "Object IDs are 64 hex characters. A repository created with `--object-format=sha256`."
+          }
         },
         "matching": {
+          "description": "The pattern grammars the `match` tool accepts here.",
           "$ref": "#/$defs/MatchingDialects"
         },
         "profile": {
+          "description": "The tier this workspace passes the conformance suite for. It is what says whether `apply` and `persist` are real here.",
           "$ref": "#/$defs/ConformanceProfile"
-        },
-        "execution": {
-          "description": "Declared total order and engine identity for this page, so two implementations cannot page the same resource in different orders behind equally valid `next` URIs.",
-          "$ref": "#/$defs/QueryExecution"
         }
       },
       "additionalProperties": false
     },
     "SearchResult": {
+      "description": "One page of search hits, and what the page is worth. `coverage` is what makes an empty page readable: nothing matched, or Rift could not see far enough to know.",
       "type": "object",
       "required": [
         "at",
-        "environment",
-        "execution",
         "coverage",
         "results",
         "next_cursor"
       ],
       "properties": {
         "at": {
-          "description": "The state this answer was resolved against.",
+          "description": "The snapshot this answer was resolved against. Pass it back as `rev` when a later call has to agree with this one.",
           "$ref": "core.json#/$defs/Snapshot"
         },
-        "environment": {
-          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
-          "$ref": "core.json#/$defs/Digest"
-        },
-        "execution": {
-          "$ref": "#/$defs/QueryExecution"
-        },
         "coverage": {
+          "description": "How much Rift could see while answering. An empty page means nothing matched only where this is complete.",
           "$ref": "core.json#/$defs/Coverage"
         },
         "results": {
+          "description": "The hits on this page, in the order the request asked for.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/SearchHit"
           }
         },
         "next_cursor": {
+          "description": "Pass this back to get the next page. Null on the last one.",
           "oneOf": [
             {
               "$ref": "#/$defs/Cursor"
@@ -753,6 +787,7 @@
       "additionalProperties": false
     },
     "PublicCodeAction": {
+      "description": "One action a compiler offers, as an agent sees it: what it does, which language offered it, and the key that pins it to the code it was computed from.",
       "type": "object",
       "required": [
         "key",
@@ -761,18 +796,22 @@
       ],
       "properties": {
         "descriptor": {
+          "description": "What the action does, what it applies to, and the schema of the arguments it takes.",
           "$ref": "core.json#/$defs/CodeActionDescriptor"
         },
         "language": {
+          "description": "The language whose compiler offered it. Two adapters that both claim a file can both offer actions at one address.",
           "$ref": "core.json#/$defs/LanguageId"
         },
         "key": {
+          "description": "Identity of this action and the state it was discovered in. Rift rediscovers the action and compares this digest before applying anything.",
           "$ref": "core.json#/$defs/ActionKey"
         }
       },
       "additionalProperties": false
     },
     "ActionsParams": {
+      "description": "What to ask a compiler for, and where. `target` picks the place, `only` narrows the kinds, and `rev` decides which state the question is asked against.",
       "type": "object",
       "required": [
         "target",
@@ -780,23 +819,26 @@
       ],
       "properties": {
         "target": {
+          "description": "Where in the code to ask. A symbol, a leaf, a byte range, or a match you already have.",
           "$ref": "core.json#/$defs/Address"
         },
         "only": {
+          "description": "Kind prefixes to keep. `refactor` returns everything under it; an empty list returns every action the compiler offers.",
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "type": "string",
-            "pattern": "^[a-z][a-z0-9_.-]*$"
+            "$ref": "core.json#/$defs/ActionKind"
           }
         },
         "limit": {
+          "description": "Most actions to return in one page.",
           "type": "integer",
           "minimum": 1,
           "maximum": 4294967295,
           "default": 50
         },
         "cursor": {
+          "description": "Continues a previous call. Omit for the first page.",
           "$ref": "#/$defs/Cursor"
         },
         "rev": {
@@ -811,31 +853,28 @@
       "type": "object",
       "required": [
         "at",
-        "environment",
-        "execution",
         "actions",
         "coverage",
         "next_cursor"
       ],
       "properties": {
         "at": {
-          "description": "The state this answer was resolved against.",
+          "description": "The snapshot this answer was resolved against. Pass it back as `rev` when a later call has to agree with this one.",
           "$ref": "core.json#/$defs/Snapshot"
         },
-        "environment": {
-          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
-          "$ref": "core.json#/$defs/Digest"
-        },
         "actions": {
+          "description": "The actions on this page.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/PublicCodeAction"
           }
         },
         "coverage": {
+          "description": "Whether the compiler could answer here at all. A language with no action support returns an empty list under `unsupported` with a reason, rather than failing.",
           "$ref": "core.json#/$defs/Coverage"
         },
         "next_cursor": {
+          "description": "Pass this back to get the next page. Null on the last one.",
           "oneOf": [
             {
               "$ref": "#/$defs/Cursor"
@@ -844,26 +883,13 @@
               "type": "null"
             }
           ]
-        },
-        "execution": {
-          "description": "Execution identity for this page. Actions have exactly one legal order.",
-          "allOf": [
-            {
-              "$ref": "#/$defs/QueryExecution"
-            }
-          ],
-          "properties": {
-            "order": {
-              "const": "identity"
-            }
-          }
         }
       },
       "additionalProperties": false,
       "description": "Discovered actions for one pinned address. Paginated on the same contract as search and match: a declared total order and engine version, and a cursor bound to both. Without execution the cursor would be bound to an ordering contract the response never published, which is exactly how pagination duplicates or skips."
     },
     "TextQuery": {
-      "description": "Rift-core UTF-8 literal or rust-regex regex matching for any regular/executable text file, independent of language ownership. The dialect is named and advertised through MatchingDialects; it is deliberately not RE2, which defines the Perl classes and word boundaries as ASCII where rust-regex defines them as Unicode. case_sensitive and multiline set the pattern's initial flag state; an inline flag group overrides them from its position onward, so the fields are defaults rather than an outer constraint. In literal mode the pattern is matched bytewise and no flag is interpreted.",
+      "description": "Literal or regular-expression matching over any text file, whether an adapter claims the path or not. Rift runs it, so one engine answers every caller; the grammar is named in `MatchingDialects`, and `\\d` is Unicode here where RE2 reads it as ASCII.",
       "type": "object",
       "required": [
         "kind",
@@ -876,28 +902,39 @@
       ],
       "properties": {
         "kind": {
+          "description": "Tags this as the text engine's query, the one Rift answers itself.",
           "const": "text"
         },
         "version": {
+          "description": "Version of this query shape. A change to what a pattern means gets a new number, so a server that predates it refuses rather than misreads.",
           "const": 1
         },
         "mode": {
+          "description": "How `pattern` is read.",
           "enum": [
             "literal",
             "regex"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "literal": "The pattern is matched bytewise. No character is special and no flag is read, so a path or a regex can be searched for as itself.",
+            "regex": "The pattern is a `rust-regex`, opening in the flag state `case_sensitive` and `multiline` describe."
+          }
         },
         "pattern": {
+          "description": "What to look for, in whichever grammar `mode` selects.",
           "type": "string",
           "minLength": 1
         },
         "case_sensitive": {
+          "description": "Whether the pattern starts case-sensitive. An inline `(?i)` overrides it from that point on, so a pattern can turn it back off part-way through. Ignored in literal mode.",
           "type": "boolean"
         },
         "multiline": {
+          "description": "Whether `^` and `$` match at line boundaries as well as at the ends of the file. Overridable inline like `case_sensitive`, and ignored in literal mode.",
           "type": "boolean"
         },
         "paths": {
+          "description": "Which files to search, as git-style globs. An empty `include` is the whole workspace.",
           "$ref": "core.json#/$defs/PathSelector"
         }
       },
@@ -906,9 +943,11 @@
     "MatchQuery": {
       "oneOf": [
         {
+          "description": "A pattern parsed by the language's own grammar, answered by that language's adapter.",
           "$ref": "core.json#/$defs/StructuralQuery"
         },
         {
+          "description": "A literal or regular-expression pattern over raw text, answered by Rift.",
           "$ref": "#/$defs/TextQuery"
         }
       ],
@@ -918,12 +957,12 @@
       "description": "One match, tagged by the engine that produced it. A structural match knows the language it parsed and the syntax node it landed on, so it can also say which surrounding ranges are safe to replace; a text match knows neither.",
       "oneOf": [
         {
+          "description": "A structural match. The file was parsed, so the hit knows the language and which ranges around the node are safe to replace.",
           "type": "object",
           "required": [
             "kind",
             "key",
             "language",
-            "span",
             "replacement_ranges",
             "captures",
             "explanation",
@@ -931,10 +970,8 @@
           ],
           "properties": {
             "kind": {
+              "description": "Tags this as a structural match.",
               "const": "structural"
-            },
-            "span": {
-              "$ref": "core.json#/$defs/SourceSpan"
             },
             "captures": {
               "description": "The named captures this match bound, in the order the pattern declares them.",
@@ -952,35 +989,37 @@
               }
             },
             "language": {
+              "description": "The language whose adapter parsed the file and produced this match.",
               "$ref": "core.json#/$defs/LanguageId"
             },
             "replacement_ranges": {
+              "description": "Ranges the adapter says can be replaced whole: the matched node alone, or with the whitespace and punctuation on either side. Rewriting `foo(a, b)` out of a list needs one of the wider ones to avoid leaving a comma behind.",
               "$ref": "core.json#/$defs/StructuralMatchRanges"
             },
             "extensions": {
+              "description": "Facts the adapter carries that this model has no field for, under a reverse-domain key.",
               "$ref": "core.json#/$defs/Extensions"
             },
             "key": {
+              "description": "Identity of this match and the state it was found in. An edit addressed at it is checked against this before it lands.",
               "$ref": "core.json#/$defs/MatchKey"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A text match. Bytes matched bytes, with no tree behind them and nothing to say about what is safe to replace.",
           "type": "object",
           "required": [
             "kind",
             "key",
-            "span",
             "captures",
             "explanation"
           ],
           "properties": {
             "kind": {
+              "description": "Tags this as a text match.",
               "const": "text"
-            },
-            "span": {
-              "$ref": "core.json#/$defs/SourceSpan"
             },
             "captures": {
               "description": "The named captures this match bound, in the order the pattern declares them.",
@@ -998,6 +1037,7 @@
               }
             },
             "key": {
+              "description": "Identity of this match and the state it was found in. An edit addressed at it is checked against this before it lands.",
               "$ref": "core.json#/$defs/MatchKey"
             }
           },
@@ -1006,6 +1046,7 @@
       ]
     },
     "MatchParams": {
+      "description": "A match request: the query, a page size, and the revision to run it against. The query travels as one value, so every page and every match key is bound to the same digest of it.",
       "type": "object",
       "required": [
         "query",
@@ -1013,15 +1054,18 @@
       ],
       "properties": {
         "query": {
+          "description": "What to look for, and which engine answers it.",
           "$ref": "#/$defs/MatchQuery"
         },
         "limit": {
+          "description": "Most matches to return in one page, capped by `max_page_items`.",
           "type": "integer",
           "minimum": 1,
           "maximum": 10000,
           "default": 50
         },
         "cursor": {
+          "description": "Continues a previous match where its last page ended. Omit it for the first page.",
           "$ref": "#/$defs/Cursor"
         },
         "rev": {
@@ -1033,49 +1077,32 @@
       "additionalProperties": false
     },
     "MatchResult": {
+      "description": "One page of matches, and the state they were found in. A match does not survive into another state, so an edit addressed at one of these keys is checked against `state` before it lands.",
       "type": "object",
       "required": [
         "at",
-        "environment",
-        "execution",
         "matches",
         "coverage",
         "next_cursor"
       ],
       "properties": {
         "at": {
-          "description": "The state this answer was resolved against.",
+          "description": "The snapshot this answer was resolved against. Pass it back as `rev` when a later call has to agree with this one.",
           "$ref": "core.json#/$defs/Snapshot"
         },
-        "environment": {
-          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
-          "$ref": "core.json#/$defs/Digest"
-        },
-        "execution": {
-          "description": "The match aggregator uses canonical physical path/range/identity order.",
-          "allOf": [
-            {
-              "$ref": "#/$defs/QueryExecution"
-            },
-            {
-              "properties": {
-                "order": {
-                  "const": "path"
-                }
-              }
-            }
-          ]
-        },
         "matches": {
+          "description": "The matches on this page.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/MatchHit"
           }
         },
         "coverage": {
+          "description": "How much of the selected path set was actually searched. A file too large to read leaves this partial with a reason.",
           "$ref": "core.json#/$defs/Coverage"
         },
         "next_cursor": {
+          "description": "Pass this back to get the next page. Null on the last one.",
           "oneOf": [
             {
               "$ref": "#/$defs/Cursor"
@@ -1089,7 +1116,7 @@
       "additionalProperties": false
     },
     "DiagnosticView": {
-      "description": "A Diagnostic enriched for an MCP response without redefining the underlying fact.",
+      "description": "One `Diagnostic` as an MCP answer carries it: the fact the compiler minted, plus what Rift can add without the compiler — where it lands in a line and column, and the source around it.",
       "type": "object",
       "required": [
         "source",
@@ -1105,14 +1132,21 @@
             "compiler",
             "validator",
             "apply"
-          ]
+          ],
+          "description": "Who produced it. The adapter's compiler never knows which of these ran, so the field is Rift's to set.",
+          "rift:enumDescriptions": {
+            "compiler": "The language's own analysis.",
+            "validator": "A check Rift ran over a proposed change.",
+            "apply": "Reported while applying edits to the workspace."
+          }
         },
         "at": {
           "description": "The state this answer was resolved against.",
           "$ref": "core.json#/$defs/Snapshot"
         },
         "diagnostic": {
-          "$ref": "core.json#/$defs/Diagnostic"
+          "$ref": "core.json#/$defs/Diagnostic",
+          "description": "The finding itself, exactly as the adapter minted it."
         },
         "line": {
           "oneOf": [
@@ -1123,7 +1157,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "One-based line the finding starts on. Null where the diagnostic has no span — a whole-project error has nowhere to point."
         },
         "column": {
           "oneOf": [
@@ -1134,19 +1169,25 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "One-based column within that line, counted in UTF-8 bytes. Null for the same reason as `line`."
         },
         "excerpt": {
-          "type": [
-            "string",
-            "null"
+          "description": "The source the finding points at. Null where there is no span to copy from.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceExcerpt"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
       "additionalProperties": false
     },
     "RiftErrorCode": {
-      "description": "Stable driver-facing infrastructure/request classification. The code is the class; no second category field may contradict it. Domain refusals, conflicts, rejected Attempts, and accepted Revisions remain ordinary typed outcomes.",
+      "description": "Why a request failed, as a stable code a caller branches on. The code is the whole classification; no other field narrows or contradicts it. A refusal the model has a value for — coverage a language cannot provide — is answered rather than raised, so it never appears here.",
       "enum": [
         "invalid_request",
         "unsupported_protocol",
@@ -1169,17 +1210,48 @@
         "storage_failure",
         "sandbox_failure",
         "internal_error"
-      ]
+      ],
+      "rift:enumDescriptions": {
+        "invalid_request": "The request does not satisfy the schema, or names something the schema forbids: a `limit` above the advertised maximum, a filter field that does not exist. The same bytes fail identically.",
+        "unsupported_protocol": "The client and the server do not speak the same protocol version, so no request can be understood. Retrying cannot help; compare `ContractDescriptor` against what the client was built for.",
+        "permission_denied": "Host policy refused — a path outside the workspace, a revision this deployment does not expose. The same request fails the same way.",
+        "snapshot_not_found": "The revision does not resolve here: a deleted branch, a commit never fetched, a working tree that has been removed. Retrying helps only once the revision exists.",
+        "semantic_snapshot_mismatch": "The snapshot passed back is no longer one the server can answer from — the working tree moved under it, or the adapter that held its facts was restarted. Re-read the current snapshot and rebuild whatever was pinned to the old one.",
+        "semantic_snapshot_unavailable": "The revision resolves, but Rift has no index for it yet: the adapters are still analysing, or that state's facts were dropped. Retrying once indexing catches up succeeds.",
+        "resource_not_found": "The URI is well-formed and resolves to nothing — no such symbol, no such file at that revision. Retrying does not help.",
+        "record_reclaimed": "The record existed and has been vacuumed away after its retention window. It stays distinct from `resource_not_found` because a retry that read a silent miss would re-run work that already happened. Nothing brings it back.",
+        "content_unavailable": "The entry is known but its bytes cannot be produced: an LFS pointer Rift does not fetch, a submodule it does not enter, a blob the object store cannot read. Retrying does not help.",
+        "cursor_invalid": "The cursor is malformed, or it was minted for a different request, order or page size. Start the query again from its first page.",
+        "cursor_snapshot_mismatch": "The cursor is well-formed but the state it was minted against has moved, so continuing it would splice two different answers together. Start again against the current state.",
+        "cancelled": "The caller cancelled, or the connection went away before the request finished. Sending it again is fine.",
+        "deadline_exceeded": "The request ran past its time budget. A smaller one may succeed — a lower `limit`, a narrower path selector — and so may the same one once a cold compiler has warmed up.",
+        "limit_exceeded": "A request or a response crossed an advertised limit. `limit` says which one and by how much, so the request can be resized and sent again.",
+        "worktree_busy": "Another Rift process holds the lease on the working tree this request has to touch. Contention is transient, so the same request retries.",
+        "adapter_unavailable": "No adapter is running for the language the request names: none is installed, or the one that was has died. A structural query against a language with no adapter lands here.",
+        "adapter_protocol_error": "The adapter answered with something the seam does not allow — a malformed message, a field outside its stated range. That is a bug in the adapter, so retrying reproduces it.",
+        "adapter_timeout": "The adapter took the call and did not answer inside its budget. Retrying can work: a cold compiler on a large workspace is slow once and fast afterwards.",
+        "storage_failure": "Rift could not read or write its own state — the semantic database, the git object store, the socket directory. Worth retrying only if the cause was transient, such as a disk that has since been cleared.",
+        "sandbox_failure": "The sandbox a caller-supplied check runs in could not be created, or died mid-run. One retry is reasonable; a repeat means the host cannot provide the sandbox this profile promised.",
+        "internal_error": "A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected to answer differently."
+      }
     },
     "RetryDirective": {
+      "description": "What a caller may do with a failed request. Without it every failure looks alike: `deadline_exceeded` and `invalid_request` are both errors, and only one of them is worth sending again.",
       "enum": [
         "never",
         "same_request",
         "same_idempotency_key",
         "refresh_snapshot"
-      ]
+      ],
+      "rift:enumDescriptions": {
+        "never": "The request fails the same way every time. Change it or give up.",
+        "same_request": "Send the same bytes again. The cause was transient — a busy working tree, an adapter still starting.",
+        "same_idempotency_key": "Retry under the key the operation already carries, so a call that may have succeeded before its response was lost is recovered rather than executed twice.",
+        "refresh_snapshot": "The state moved under the request. Re-read the current state, rebuild whatever was pinned to the old one, then ask again."
+      }
     },
     "RiftErrorCause": {
+      "description": "One link in the chain behind a failure. The chain is what distinguishes a `storage_failure` caused by a full disk from one caused by a corrupt object, and each link carries its own code and retry direction.",
       "type": "object",
       "required": [
         "code",
@@ -1189,16 +1261,20 @@
       ],
       "properties": {
         "code": {
+          "description": "How this link classifies on its own.",
           "$ref": "#/$defs/RiftErrorCode"
         },
         "message": {
+          "description": "What happened, for a human reading a log.",
           "type": "string",
           "maxLength": 4096
         },
         "retry": {
+          "description": "What could be done about this link. The outermost directive is the one that governs the request.",
           "$ref": "#/$defs/RetryDirective"
         },
         "causes": {
+          "description": "What caused this link, recursively. The innermost one is usually the concrete failure.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/RiftErrorCause"
@@ -1208,7 +1284,7 @@
       "additionalProperties": false
     },
     "RiftErrorData": {
-      "description": "Required JSON-RPC error data for every Rift MCP failure. It is the SQLException/SQLState analogue: stable code and retry direction plus human message and typed evidence.",
+      "description": "The `data` object on every Rift MCP failure. `code` and `retry` are what a caller branches on, `message` is for a human, and `phase`, `diagnostics`, `limit` and `causes` are the evidence behind the code.",
       "type": "object",
       "required": [
         "code",
@@ -1222,16 +1298,20 @@
       ],
       "properties": {
         "code": {
+          "description": "Why the request failed.",
           "$ref": "#/$defs/RiftErrorCode"
         },
         "message": {
+          "description": "What happened, in words. Nothing about the failure is knowable only by parsing this.",
           "type": "string",
           "maxLength": 4096
         },
         "retry": {
+          "description": "What the caller may do next.",
           "$ref": "#/$defs/RetryDirective"
         },
         "phase": {
+          "description": "How far the request got before it failed. The same code means different things at different phases: `limit_exceeded` while reading is a response too big, and while validating it is a change set too large.",
           "enum": [
             "discovery",
             "read",
@@ -1240,7 +1320,16 @@
             "preview",
             "publish",
             "persist"
-          ]
+          ],
+          "rift:enumDescriptions": {
+            "discovery": "Working out what the workspace can do: capabilities, limits, which languages have adapters.",
+            "read": "Fetching what was asked for, from the index, the object store or an adapter.",
+            "resolve": "Turning an address, a cursor or an action key into the concrete thing it names at a state.",
+            "validate": "Checking a proposed change against the schema, the state it was pinned to, and any checks the caller supplied.",
+            "preview": "Building a change into something readable without publishing it.",
+            "publish": "Recording a change as accepted. Reached through `apply`, whose parameters and result are not defined in this document.",
+            "persist": "Writing an accepted change into a working tree. Reached through `persist`, whose parameters and result are not defined in this document."
+          }
         },
         "at": {
           "description": "The state this answer was resolved against. Null where the failure happened before one was resolved.",
@@ -1254,6 +1343,7 @@
           ]
         },
         "operation": {
+          "description": "Which operation of a multi-operation request failed, as its zero-based index. Null where the request carried one, or failed before any of them ran.",
           "oneOf": [
             {
               "type": "integer",
@@ -1266,15 +1356,18 @@
           ]
         },
         "diagnostics": {
+          "description": "What a compiler or a caller-supplied check reported while the request was failing. Empty where neither ran.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/DiagnosticView"
           }
         },
         "limit": {
+          "description": "Which advertised limit was hit, and by how much. Present exactly when `code` is `limit_exceeded`, and forbidden otherwise.",
           "$ref": "#/$defs/LimitEvidence"
         },
         "causes": {
+          "description": "What led to this failure, outermost first. A code alone rarely says whether the cause is worth waiting out.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/RiftErrorCause"
@@ -1310,25 +1403,40 @@
       "additionalProperties": false
     },
     "LimitEvidence": {
-      "description": "Structured evidence for limit_exceeded: which advertised DriverLimits or AdapterLimits field was exceeded, its effective value, and the value that was required. Present exactly when code is limit_exceeded. Without it a caller can only reparse the human message to decide whether to retry differently, fall back to another resource, or give up — which is the difference between an actionable refusal and an opaque one.",
+      "description": "Which advertised limit a `limit_exceeded` failure hit, and by how much. It is present exactly when the code is `limit_exceeded`; without it, choosing between retrying smaller, falling back to another resource and giving up means reparsing the human message.",
       "type": "object",
       "required": [
+        "scope",
         "field",
         "limit",
         "required"
       ],
       "properties": {
+        "scope": {
+          "description": "Which side of the server the limit belongs to. The two fail at different seams: a `driver` limit is host policy the caller can work within, an `adapter` limit is one compiler process running out of room.",
+          "enum": [
+            "driver",
+            "adapter"
+          ],
+          "rift:enumDescriptions": {
+            "driver": "A field of `DriverLimits`, advertised by the repository resource.",
+            "adapter": "A field of the adapter's `AdapterLimits`, advertised in `Describe`."
+          }
+        },
         "field": {
+          "description": "The limit's field name in whichever message `scope` names — `max_page_items`, `max_in_flight_per_workspace`.",
           "type": "string",
           "minLength": 1,
           "maxLength": 128
         },
         "limit": {
+          "description": "The value in force when the request was rejected.",
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991
         },
         "required": {
+          "description": "What the request would have needed. Larger than `limit`, and the difference is what the caller has to close.",
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991
@@ -1337,7 +1445,7 @@
       "additionalProperties": false
     },
     "MatchingDialects": {
-      "description": "The matching grammars this workspace accepts, advertised rather than assumed.",
+      "description": "The two pattern grammars this workspace accepts: one for text patterns, one for path globs. Both are Rift's own and neither needs an adapter. A pattern written for a different engine can still parse here and mean something else, so a caller reads the names before writing one.",
       "type": "object",
       "required": [
         "text",
@@ -1345,9 +1453,11 @@
       ],
       "properties": {
         "text": {
+          "description": "The grammar a `TextQuery` pattern is read in: Rust's `regex` crate, where `\\d` and `\\b` are Unicode-aware and there is no backtracking.",
           "const": "rust-regex"
         },
         "path": {
+          "description": "The grammar a path selector is read in: git's own globs, so `src/**/*.ts` means here what it means in `.gitignore`.",
           "const": "git-glob"
         }
       },
@@ -1357,6 +1467,7 @@
       "description": "One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per family.",
       "oneOf": [
         {
+          "description": "The repository resource. It takes no path, only an optional revision and cursor.",
           "type": "object",
           "required": [
             "uriTemplate",
@@ -1365,18 +1476,22 @@
           ],
           "properties": {
             "uriTemplate": {
+              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
               "const": "rift://repository{?rev,cursor}"
             },
             "name": {
+              "description": "The resource family, as `resources/templates/list` advertises it.",
               "const": "repository"
             },
             "mimeType": {
+              "description": "What a read of a URI from this template returns: `RepositoryResourcePayload` as JSON.",
               "const": "application/vnd.rift.repository+json"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "The symbol resource, addressed by language and the name that language gives the declaration.",
           "type": "object",
           "required": [
             "uriTemplate",
@@ -1385,18 +1500,22 @@
           ],
           "properties": {
             "uriTemplate": {
+              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
               "const": "rift://symbol/{language}/{name}{?rev,cursor}"
             },
             "name": {
+              "description": "The resource family, as `resources/templates/list` advertises it.",
               "const": "symbol"
             },
             "mimeType": {
+              "description": "What a read of a URI from this template returns: `SymbolResourcePayload` as JSON.",
               "const": "application/vnd.rift.symbol+json"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "The diff resource, addressed by two revisions in git's own range spelling.",
           "type": "object",
           "required": [
             "uriTemplate",
@@ -1405,18 +1524,22 @@
           ],
           "properties": {
             "uriTemplate": {
+              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
               "const": "rift://diff/{from}..{to}{?cursor}"
             },
             "name": {
+              "description": "The resource family, as `resources/templates/list` advertises it.",
               "const": "diff"
             },
             "mimeType": {
+              "description": "What a read of a URI from this template returns: `DiffResourcePayload` as JSON.",
               "const": "application/vnd.rift.diff+json"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "The file resource, addressed by a path relative to the project root.",
           "type": "object",
           "required": [
             "uriTemplate",
@@ -1425,12 +1548,15 @@
           ],
           "properties": {
             "uriTemplate": {
+              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
               "const": "rift://file/{path}{?rev}"
             },
             "name": {
+              "description": "The resource family, as `resources/templates/list` advertises it.",
               "const": "file"
             },
             "mimeType": {
+              "description": "What a read of a URI from this template returns: `FileResourcePayload` as JSON.",
               "const": "application/vnd.rift.file+json"
             }
           },
@@ -1439,18 +1565,20 @@
       ]
     },
     "ResourceReadResult": {
-      "description": "The result of one MCP resource read. `mimeType` says which payload `text` holds, and the three payload resources serialize their JSON into it. The blob resource returns bytes instead.",
+      "description": "The result of one MCP resource read. `mimeType` says which payload `text` holds, and each resource serializes its JSON into it; a file read carries the file's bytes instead.",
       "type": "object",
       "required": [
         "contents"
       ],
       "properties": {
         "contents": {
+          "description": "The blocks this read produced. MCP allows several per read; each Rift resource returns one.",
           "type": "array",
           "minItems": 1,
           "items": {
             "oneOf": [
               {
+                "description": "What a read of `rift://repository` returns.",
                 "type": "object",
                 "required": [
                   "uri",
@@ -1459,12 +1587,15 @@
                 ],
                 "properties": {
                   "uri": {
+                    "description": "The URI that was read, as it resolved.",
                     "$ref": "#/$defs/RepositoryResourceUri"
                   },
                   "mimeType": {
+                    "description": "Which payload `text` holds.",
                     "const": "application/vnd.rift.repository+json"
                   },
                   "text": {
+                    "description": "A `RepositoryResourcePayload`, serialized as JSON.",
                     "type": "string",
                     "contentMediaType": "application/vnd.rift.repository+json",
                     "contentSchema": {
@@ -1475,6 +1606,7 @@
                 "additionalProperties": false
               },
               {
+                "description": "What a read of a `rift://symbol/…` URI returns.",
                 "type": "object",
                 "required": [
                   "uri",
@@ -1483,12 +1615,15 @@
                 ],
                 "properties": {
                   "uri": {
+                    "description": "The URI that was read, as it resolved.",
                     "$ref": "core.json#/$defs/SymbolId"
                   },
                   "mimeType": {
+                    "description": "Which payload `text` holds.",
                     "const": "application/vnd.rift.symbol+json"
                   },
                   "text": {
+                    "description": "A `SymbolResourcePayload`, serialized as JSON.",
                     "type": "string",
                     "contentMediaType": "application/vnd.rift.symbol+json",
                     "contentSchema": {
@@ -1499,6 +1634,7 @@
                 "additionalProperties": false
               },
               {
+                "description": "What a read of a `rift://diff/…` URI returns.",
                 "type": "object",
                 "required": [
                   "uri",
@@ -1507,12 +1643,15 @@
                 ],
                 "properties": {
                   "uri": {
+                    "description": "The URI that was read, as it resolved.",
                     "$ref": "core.json#/$defs/DiffId"
                   },
                   "mimeType": {
+                    "description": "Which payload `text` holds.",
                     "const": "application/vnd.rift.diff+json"
                   },
                   "text": {
+                    "description": "A `DiffResourcePayload`, serialized as JSON.",
                     "type": "string",
                     "contentMediaType": "application/vnd.rift.diff+json",
                     "contentSchema": {
@@ -1523,6 +1662,7 @@
                 "additionalProperties": false
               },
               {
+                "description": "What a read of a `rift://file/…` URI returns.",
                 "type": "object",
                 "required": [
                   "uri",
@@ -1531,12 +1671,15 @@
                 ],
                 "properties": {
                   "uri": {
+                    "description": "The URI that was read, as it resolved.",
                     "$ref": "core.json#/$defs/FileId"
                   },
                   "mimeType": {
+                    "description": "Which payload `text` holds.",
                     "const": "application/vnd.rift.file+json"
                   },
                   "text": {
+                    "description": "A `FileResourcePayload`, serialized as JSON.",
                     "type": "string",
                     "contentMediaType": "application/vnd.rift.file+json",
                     "contentSchema": {
@@ -1556,6 +1699,7 @@
       "description": "What a search hit is. Tagged, so the payload correlation survives code generation.",
       "oneOf": [
         {
+          "description": "A symbol hit: the declaration the compiler resolved, and a link to read the rest of what Rift knows about it.",
           "type": "object",
           "required": [
             "target",
@@ -1564,18 +1708,22 @@
           ],
           "properties": {
             "target": {
+              "description": "Tags this as a symbol hit.",
               "const": "symbol"
             },
             "symbol": {
+              "description": "The declaration that matched.",
               "$ref": "core.json#/$defs/Symbol"
             },
             "resource": {
+              "description": "Link to the symbol resource, so the leaves and edges are one read away instead of another search.",
               "$ref": "#/$defs/ResourceLink"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A leaf hit: one place in a syntax tree, without the symbol view around it.",
           "type": "object",
           "required": [
             "target",
@@ -1583,15 +1731,18 @@
           ],
           "properties": {
             "target": {
+              "description": "Tags this as a leaf hit.",
               "const": "leaf"
             },
             "leaf": {
+              "description": "The syntax-tree node that matched, and the symbol written at it where there is one.",
               "$ref": "core.json#/$defs/Leaf"
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "A file hit: one entry of the workspace tree. The only hit that needs no adapter.",
           "type": "object",
           "required": [
             "target",
@@ -1599,9 +1750,11 @@
           ],
           "properties": {
             "target": {
+              "description": "Tags this as a file hit.",
               "const": "file"
             },
             "file": {
+              "description": "The tree entry that matched: what it holds, and which languages read it.",
               "$ref": "core.json#/$defs/File"
             }
           },
@@ -1610,20 +1763,30 @@
       ]
     },
     "ConformanceProfile": {
-      "description": "What this workspace actually implements, advertised rather than assumed. Profiles are a ladder: each includes the one below it. A workspace must advertise only a profile whose full conformance suite it passes, and a caller reads capability from here rather than inferring it from a version number.",
+      "description": "How much of the protocol this workspace implements. The tiers form a ladder, each including everything below it, and a workspace may claim one only by passing that tier's conformance suite — the executable test set the protocol ships for it. A version number says nothing about which tier is in force.",
       "enum": [
         "read",
         "edit",
         "full"
-      ]
+      ],
+      "rift:enumDescriptions": {
+        "read": "Answering questions: `search`, `match`, `actions`, and all four resources. Nothing here writes.",
+        "edit": "Adds the `apply` tool, which turns a proposed change into a readable preview and publishes it. `apply` has no parameters or result defined in this document.",
+        "full": "Adds the `persist` tool, which writes a published change into a working tree, and lets a caller supply checks that run in a sandbox. `persist` has no parameters or result defined in this document."
+      }
     },
     "ResultOrder": {
-      "description": "Total deterministic result order, shared by every paginated tool. relevance sorts by versioned score descending then canonical identity; path sorts by physical path and range then identity; identity sorts by the result's canonical opaque identity bytes — entity id, action descriptor digest, or path, according to what the result is. Action discovery has exactly one legal order, identity, because relevance and path are not defined over compiler actions.",
+      "description": "The total order a paginated answer comes back in, named in the request so a cursor can be bound to it. Every order ends in the result's own identity, so two results that tie never swap places between pages.",
       "enum": [
         "relevance",
         "path",
         "identity"
-      ]
+      ],
+      "rift:enumDescriptions": {
+        "relevance": "Highest `score` first, then identity. Scores are comparable inside one page and nowhere else, so this order says nothing across pages beyond the sequence itself.",
+        "path": "By the file a result is written in, then its byte range, then identity. Two hits in one file come back in source order.",
+        "identity": "By the result's own canonical bytes — a symbol URI, a file path, the digest of an action descriptor. The only order `actions` accepts, because relevance and path are not defined over compiler actions."
+      }
     },
     "FileResourcePayload": {
       "description": "One file at one state: what the tree entry holds, and its bytes where there are any. Bytes over DriverLimits.max_blob_bytes fail with limit_exceeded rather than being truncated — this resource does not paginate, because a cursor over bytes buys nothing a byte range would not do better.",
@@ -1637,6 +1800,7 @@
       ],
       "properties": {
         "uri": {
+          "description": "The file this payload answers for, echoed back with the revision it resolved.",
           "$ref": "core.json#/$defs/FileId"
         },
         "at": {
@@ -1644,6 +1808,7 @@
           "$ref": "core.json#/$defs/Snapshot"
         },
         "file": {
+          "description": "The tree entry: what git records for it, and which languages parse it.",
           "$ref": "core.json#/$defs/File"
         },
         "text": {
@@ -1669,34 +1834,39 @@
       "additionalProperties": false
     },
     "LanguageSupport": {
-      "description": "What Rift can do for one language in this workspace. An agent picks a query or an operation from this; how the adapter recognises its files, what it fingerprints, and what it advertises to the server are the server's business.",
+      "description": "What Rift can do for one language in this workspace, and which compiler is doing it. An agent picks a query or an operation from this; how the adapter recognises its files and what it reads from the tree are the server's business.",
       "type": "object",
       "required": [
         "language",
         "compiler",
-        "fingerprint",
+        "adapter",
         "structural_matching",
         "actions"
       ],
       "properties": {
         "language": {
+          "description": "Which language this entry answers for. It is the adapter's identity too, since one workspace runs one adapter per language.",
           "$ref": "core.json#/$defs/LanguageId"
         },
         "compiler": {
-          "description": "The compiler answering for this language, as it names itself.",
+          "description": "What the compiler behind this language calls itself, version included. It is fixed for the life of the adapter process, so it is a fact about the workspace rather than a coordinate on every answer.",
           "type": "string",
           "maxLength": 4096,
           "examples": [
             "tsc 5.6.2"
           ]
         },
-        "fingerprint": {
-          "description": "Digest of what gives this language meaning here: the compiler build, its configuration, and the resolved dependencies. The workspace `environment` is taken over these.",
-          "$ref": "core.json#/$defs/Digest"
+        "adapter": {
+          "description": "What the adapter build driving that compiler calls itself. Two adapter versions can read one compiler differently, so the pair is what a bug report needs.",
+          "type": "string",
+          "maxLength": 4096,
+          "examples": [
+            "rift-adapter-typescript 0.4.1"
+          ]
         },
         "structural_matching": {
-          "description": "Whether the match tool accepts a structural query for this language. False where the adapter cannot parse the pattern grammar.",
-          "type": "boolean"
+          "description": "Whether the match tool accepts a structural query for this language, and where not, why. The adapter states its reason — it cannot parse the pattern grammar, or the grammar has no meaning here — and a bare `false` would throw that away, leaving an agent to guess whether to try a text query instead.",
+          "$ref": "core.json#/$defs/Coverage"
         },
         "actions": {
           "description": "Whether compiler actions can be discovered, and where not, why.",

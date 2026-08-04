@@ -25,6 +25,18 @@ const out = [];
 const emitted = new Set();
 /** Messages produced for inline objects, appended after their parent. */
 let pending = [];
+/**
+ * Enums produced for inline properties, nested inside the message that owns
+ * them. Protobuf scopes an enum's values to the enclosing namespace rather than
+ * to the enum, so a top-level `Kind` and a top-level `State` cannot both spell
+ * their zero value `UNSPECIFIED`. Nesting moves that namespace to the message,
+ * which is what lets `CoverageScope.Kind.REQUEST` be written without repeating
+ * the message name in every value.
+ *
+ * A stack, because a message minted for a union branch is built while its
+ * parent is still open.
+ */
+const nesting = [];
 
 function refName(node) {
   const ref = node?.$ref;
@@ -38,8 +50,12 @@ function unwrap(node) {
   return node;
 }
 
-/** The proto type for a schema, minting a nested message where the schema is inline. */
-function typeOf(node, hint) {
+/**
+ * The proto type for a schema, minting a nested message where the schema is
+ * inline. `field` is the property this type is being read for, and names an
+ * enum nested into the message rather than one hoisted beside it.
+ */
+function typeOf(node, hint, field = hint) {
   const ref = refName(node);
   if (ref) {
     const target = defs[ref];
@@ -50,15 +66,23 @@ function typeOf(node, hint) {
     return ref;
   }
   if (node.enum) {
-    const name = hint;
-    pending.push(enumBlock(name, node));
-    return name;
+    // Inside a message, the property's own name is enough: `Kind` reads as
+    // `CoverageScope.Kind` from anywhere else. Only an enum with nowhere to
+    // nest keeps the long name.
+    const nested = nesting[nesting.length - 1];
+    if (nested) {
+      const name = field.replace(/(^|_)([a-z])/g, (_, __, ch) => ch.toUpperCase());
+      nested.push({ name, schema: node });
+      return name;
+    }
+    pending.push(enumBlock(hint, node));
+    return hint;
   }
   if (node.const !== undefined) return typeof node.const === "string" ? "string" : "int64";
-  if (node.type === "array") return `repeated ${typeOf(node.items ?? {}, hint)}`;
+  if (node.type === "array") return `repeated ${typeOf(node.items ?? {}, hint, field)}`;
   if (node.properties || node.type === "object") {
     if (node.additionalProperties && typeof node.additionalProperties === "object") {
-      return `map<string, ${typeOf(node.additionalProperties, `${hint}Value`)}>`;
+      return `map<string, ${typeOf(node.additionalProperties, `${hint}Value`, field)}>`;
     }
     if (node.properties) {
       pending.push(messageBlock(hint, node));
@@ -74,7 +98,7 @@ function typeOf(node, hint) {
   if (typeof node.type === "string") return SCALAR[node.type] ?? "string";
   if (node.oneOf) {
     const arms = node.oneOf.filter((b) => b.type !== "null");
-    if (arms.length === 1) return typeOf(arms[0], hint);
+    if (arms.length === 1) return typeOf(arms[0], hint, field);
     pending.push(unionBlock(hint, { oneOf: arms }));
     return hint;
   }
@@ -104,13 +128,24 @@ function wrap(text, width) {
   return lines;
 }
 
-function enumBlock(name, schema) {
-  const lines = [...comment(schema.description), `enum ${name} {`];
-  lines.push(`  ${SCREAM(name)}_UNSPECIFIED = 0;`);
+/**
+ * `prefixed` spells every value with the enum's name in front of it, which is
+ * what protobuf's scoping forces on a top-level enum. A nested enum owns the
+ * message's namespace and can use the bare value — until a second enum nests
+ * into the same message, at which point both would claim `UNSPECIFIED` and both
+ * go back to prefixes.
+ */
+function enumBlock(name, schema, { indent = "", prefixed = true } = {}) {
+  const prefix = prefixed ? `${SCREAM(name)}_` : "";
+  const described = schema["rift:enumDescriptions"] ?? {};
+  const lines = [...comment(schema.description, indent), `${indent}enum ${name} {`];
+  lines.push(`${indent}  // Not set. Every value below is one the adapter chose.`);
+  lines.push(`${indent}  ${prefix}UNSPECIFIED = 0;`);
   schema.enum.forEach((value, index) => {
-    lines.push(`  ${SCREAM(name)}_${SCREAM(String(value))} = ${index + 1};`);
+    for (const line of comment(described[value], `${indent}  `)) lines.push(line);
+    lines.push(`${indent}  ${prefix}${SCREAM(String(value))} = ${index + 1};`);
   });
-  lines.push("}");
+  lines.push(`${indent}}`);
   return lines.join("\n");
 }
 
@@ -173,20 +208,28 @@ function unionBlock(name, schema) {
 function messageBlock(name, schema) {
   const entries = Object.entries(schema.properties ?? {});
   const required = new Set(schema.required ?? []);
-  const lines = [...comment(schema.description), `message ${name} {`];
+  const fields = [];
+  nesting.push([]);
   entries.forEach(([field, property], index) => {
     const hint = `${name}${field.replace(/(^|_)([a-z])/g, (_, __, ch) => ch.toUpperCase())}`;
-    const type = typeOf(property, hint);
+    const type = typeOf(property, hint, field);
     const nullable =
       Array.isArray(property.type)
         ? property.type.includes("null")
         : (property.oneOf ?? []).some((b) => b.type === "null");
     const optional = !required.has(field) || nullable;
     const prefix = type.startsWith("repeated ") || type.startsWith("map<") ? "" : optional ? "optional " : "";
-    for (const line of comment(property.description, "  ")) lines.push(line);
-    lines.push(`  ${prefix}${type} ${field} = ${index + 1};`);
+    for (const line of comment(property.description, "  ")) fields.push(line);
+    fields.push(`  ${prefix}${type} ${field} = ${index + 1};`);
   });
-  lines.push("}");
+  const nested = nesting.pop();
+  const prefixed = nested.length > 1;
+
+  const lines = [...comment(schema.description), `message ${name} {`];
+  for (const declared of nested) {
+    lines.push(enumBlock(declared.name, declared.schema, { indent: "  ", prefixed }), "");
+  }
+  lines.push(...fields, "}");
   return lines.join("\n");
 }
 
