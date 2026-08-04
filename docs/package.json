@@ -24,7 +24,7 @@
     "@react-three/fiber": "^9.7.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "fumadocs-core": "15.7.5",
+    "fumadocs-core": "16.14.0",
     "fumadocs-mdx": "11.8.1",
     "fumadocs-ui": "15.7.5",
     "lucide-react": "^1.28.0",
