@@ -18,7 +18,7 @@
       },
       {
         "name": "Physical",
-        "summary": "Where it is written: files, the leaves of their syntax trees, and ranges of bytes.",
+        "summary": "Where it is written: files, the leaves of their syntax trees, ranges of bytes, and the changes proposed to them.",
         "identifiedBy": [
           "FileId",
           "File",
@@ -27,10 +27,13 @@
           "TextRange",
           "ProjectPath",
           "SourceSpan",
+          "Edit",
           "PathSelector",
           "LeafFacet",
           "LeafRegion",
-          "RegionRole"
+          "RegionRole",
+          "DiffId",
+          "FileChange"
         ]
       },
       {
@@ -71,7 +74,8 @@
       "type": "integer",
       "const": 1
     },
-    "Sha256Digest": {
+    "Digest": {
+      "description": "SHA-256 of the value being identified, lowercase hex, 64 characters. Rift and its adapters have to produce byte-identical digests for the same input, so the algorithm is part of the contract rather than a choice an implementation makes.",
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
@@ -145,8 +149,8 @@
               "$ref": "#/$defs/Commit"
             },
             "changes": {
-              "description": "SHA-256 over the files that differ from `base` — each path with the digest of its content, in RFC 8785 canonical JSON. A clean working tree digests the empty set.",
-              "$ref": "#/$defs/Sha256Digest"
+              "description": "SHA-256 over the files that differ from `base` — each path with the digest of its content, in RFC 8785 canonical JSON, the same digest each file reports. A clean working tree digests the empty set.\n\nThis detects that a working tree moved; what moved is a diff, read through `DiffId`.",
+              "$ref": "#/$defs/Digest"
             }
           },
           "additionalProperties": false
@@ -159,7 +163,7 @@
       "pattern": "^(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^/\\\\\\u0000-\\u001F\\u007F]+(?:/[^/\\\\\\u0000-\\u001F\\u007F]+)*$"
     },
     "FileId": {
-      "description": "Identity of one file, and the URI that resolves it. `rift://file/<path>` — the project-relative path, and nothing else. A path is a path whether three adapters claim it or none do, so the language belongs to what is parsed from the file rather than to the file. A file an adapter produced rather than read from disk is addressed the same way, with the path its producer minted, and the source map says what it was generated from. A revision can be attached as `?rev=`.",
+      "description": "Identity of one file, and the URI that resolves it. `rift://file/<path>` — path to the file, relative to the project root. A path is a path whether three adapters claim it or none do, so the language belongs to what is parsed from the file. A file an adapter produced rather than read from disk is addressed the same way, with the path its producer minted, and the source map says what it was generated from. A revision can be attached as `?rev=`.",
       "type": "string",
       "minLength": 13,
       "maxLength": 1024,
@@ -189,11 +193,23 @@
               "type": "object",
               "required": [
                 "kind",
+                "digest",
+                "size",
                 "executable"
               ],
               "properties": {
                 "kind": {
                   "const": "regular"
+                },
+                "digest": {
+                  "description": "SHA-256 of the bytes. The same value `Snapshot.changes` digests for a file that differs from its base.",
+                  "$ref": "#/$defs/Digest"
+                },
+                "size": {
+                  "description": "Size in bytes.",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
                 },
                 "executable": {
                   "description": "Whether Git records the executable bit.",
@@ -424,6 +440,147 @@
       },
       "additionalProperties": false,
       "description": "A byte range of one file."
+    },
+    "Edit": {
+      "description": "A change to the code, described rather than performed. An adapter never writes to the tree Rift gave it, so a fix or a refactor its compiler offers comes back in this shape and Rift is the one that touches the file.\n\nA change that arrives as data can be read and rejected before it lands, and it cannot leak: an agent asking `rustfmt` for its edits leaves every other agent's files alone.\n\nRanges are byte offsets into the file as it stands at the pinned snapshot, so edits in a set never observe each other. Edits in a set may not overlap, and a set that touches a file it also deletes is malformed.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "span",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "const": "replace"
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            },
+            "text": {
+              "description": "What the range becomes. Empty deletes it.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "file",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "const": "create"
+            },
+            "file": {
+              "description": "A path that does not exist at the pinned snapshot. Extracting a module is the usual reason.",
+              "$ref": "#/$defs/FileId"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "file"
+          ],
+          "properties": {
+            "kind": {
+              "const": "delete"
+            },
+            "file": {
+              "$ref": "#/$defs/FileId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "file",
+            "destination"
+          ],
+          "properties": {
+            "kind": {
+              "const": "rename"
+            },
+            "file": {
+              "$ref": "#/$defs/FileId"
+            },
+            "destination": {
+              "$ref": "#/$defs/FileId"
+            }
+          },
+          "additionalProperties": false,
+          "description": "Moving a file rather than deleting and recreating it keeps the content out of the edit and lets git see the move for what it is."
+        }
+      ]
+    },
+    "FileChange": {
+      "type": "object",
+      "required": [
+        "before",
+        "after",
+        "edits",
+        "truncated"
+      ],
+      "properties": {
+        "before": {
+          "description": "The entry before the change. Null where the file did not exist.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/File"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after": {
+          "description": "The entry after the change. Null where the file was deleted.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/File"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "edits": {
+          "description": "What to apply to `before` to get `after`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Edit"
+          }
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Whether edits were dropped to stay inside the size limit."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Everything that happened to one file between two states. `before` and `after` are the entry on each side, so a created file has no `before`, a deleted one has no `after`, and a rename shows as two different paths. The path is not restated as a field of its own: it is `after.id`, or `before.id` where the file is gone.\n\n`edits` gets you from one side to the other, in the same shape a refactor proposes, so reading a change and applying one speak a single vocabulary. A file whose bytes are not text carries no edits: its digest and size on each side are in `before` and `after`."
+    },
+    "DiffId": {
+      "description": "Identity of one comparison, and the URI that resolves it. `rift://diff/<from>..<to>` — two revisions in git's own range spelling, so `main..feature` and `HEAD~3..HEAD` mean here what they mean on the command line. Git forbids `..` inside a ref name, so the separator is unambiguous.\n\nA cursor can be attached as `?cursor=` to continue a paged read.",
+      "type": "string",
+      "minLength": 15,
+      "maxLength": 1024,
+      "pattern": "^rift://diff/(?:[A-Za-z0-9_~%!$&'()*+,;:@/-]|\\.(?!\\.)){1,256}\\.\\.(?:[A-Za-z0-9_~%!$&'()*+,;:@/-]|\\.(?!\\.)){1,256}(\\?cursor=[^&#]+)?$",
+      "examples": [
+        "rift://diff/main..feature-x",
+        "rift://diff/HEAD~3..HEAD"
+      ]
     },
     "SourceMapEntry": {
       "description": "Deterministic virtual-source provenance. exact means one affine byte-for-byte origin range; approximate preserves one or more origins without positional equivalence; synthetic has no source origin. The oneOf constrains cardinality only — exactly one origin for exact, at least one for approximate, none for synthetic — and never varies the shape.",
@@ -921,7 +1078,7 @@
       ]
     },
     "SymbolOrigin": {
-      "description": "Where this symbol is defined. Six origins, and they answer different questions: whether you can edit it, whether it moves when you upgrade something, and whether anything can be read from it at all.",
+      "description": "Where this symbol is defined. The origins answer different questions: whether you can edit it, whether it moves when you upgrade something, and whether anything can be read from it at all.",
       "oneOf": [
         {
           "description": "Declared in this workspace's own source. The code you can open and change.",
@@ -1234,7 +1391,7 @@
       "additionalProperties": false
     },
     "Relationship": {
-      "description": "One directed edge between two symbols. The leaves that witness the edge are its evidence — the physical places the compiler read it from.",
+      "description": "One directed edge between two symbols. Its evidence is the leaves it was read from, and its derivation is how much the compiler knew when it was read.",
       "type": "object",
       "required": [
         "from",
@@ -1242,7 +1399,7 @@
         "facets",
         "to",
         "evidence",
-        "provenance",
+        "derivation",
         "extensions"
       ],
       "properties": {
@@ -1272,14 +1429,16 @@
             "$ref": "#/$defs/LeafId"
           }
         },
-        "provenance": {
+        "derivation": {
+          "description": "How this edge was established. Every edge reaches Rift from an adapter, so who sent it says nothing; what differs is how much the compiler actually knew.\n\n`resolution` — the compiler's own name resolution or type checker produced it. It is a fact about the program.\n\n`syntax` — the adapter read it off the syntax tree because the compiler did not resolve it: a call on an untyped receiver matched by name, a component matched to a tag. Deterministic and repeatable, and still capable of being wrong.\n\n`heuristic` — a guess. `confidence` is required here and meaningless elsewhere.\n\nA refactor can act on `resolution` unchecked. Anything below it is a candidate to show, not a fact to rewrite from.",
           "enum": [
-            "compiler",
-            "adapter",
-            "inferred"
+            "resolution",
+            "syntax",
+            "heuristic"
           ]
         },
         "confidence": {
+          "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other derivation.",
           "type": "number",
           "minimum": 0,
           "maximum": 1
@@ -1909,19 +2068,19 @@
       "properties": {
         "id": {
           "description": "Digest of the match itself.",
-          "$ref": "#/$defs/Sha256Digest"
+          "$ref": "#/$defs/Digest"
         },
         "snapshot": {
           "description": "The state it was found in.",
           "$ref": "#/$defs/Snapshot"
         },
         "environment": {
-          "description": "Fingerprint of the environment that gave that state its meaning — the same value the answer reports as `SemanticEnvironment.fingerprint`.",
-          "$ref": "#/$defs/Sha256Digest"
+          "description": "Fingerprint of the environment that gave that state its meaning — the same value the answer reports as `environment`.",
+          "$ref": "#/$defs/Digest"
         },
         "query": {
           "description": "Digest of the canonical query.",
-          "$ref": "#/$defs/Sha256Digest"
+          "$ref": "#/$defs/Digest"
         }
       },
       "additionalProperties": false
@@ -1937,15 +2096,15 @@
       "properties": {
         "id": {
           "description": "Digest of the action's descriptor.",
-          "$ref": "#/$defs/Sha256Digest"
+          "$ref": "#/$defs/Digest"
         },
         "snapshot": {
           "description": "The state it was discovered in.",
           "$ref": "#/$defs/Snapshot"
         },
         "environment": {
-          "description": "Fingerprint of the environment that gave that state its meaning — the same value the answer reports as `SemanticEnvironment.fingerprint`.",
-          "$ref": "#/$defs/Sha256Digest"
+          "description": "Fingerprint of the environment that gave that state its meaning — the same value the answer reports as `environment`.",
+          "$ref": "#/$defs/Digest"
         }
       },
       "additionalProperties": false

@@ -60,12 +60,12 @@
         }
       },
       "diff": {
-        "description": "What changed between two commits — text, binary, and the tree itself. This is plain Git information, so it needs no compiler and no semantic snapshot.",
+        "description": "What changed between two revisions — text, binary, and the tree itself. Git answers this without a compiler, so it works for a language Rift has no adapter for.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
         "uri": {
-          "$ref": "#/$defs/DiffResourceUri"
+          "$ref": "core.json#/$defs/DiffId"
         },
         "link": {
           "$ref": "#/$defs/ResourceLink"
@@ -98,28 +98,6 @@
       "minLength": 1,
       "maxLength": 4096
     },
-    "SemanticEnvironment": {
-      "description": "What gave a snapshot its meaning. The same bytes produce different facts under a different compiler or different installed dependencies, so an answer reports this beside the snapshot and a caller compares the fingerprint rather than guessing.",
-      "type": "object",
-      "required": [
-        "fingerprint",
-        "languages"
-      ],
-      "properties": {
-        "fingerprint": {
-          "description": "SHA-256 over `languages` sorted by `language`, in RFC 8785 canonical JSON. One value to compare when two calls have to agree.",
-          "$ref": "core.json#/$defs/Sha256Digest"
-        },
-        "languages": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/LanguageEnvironment"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
     "SourceExcerpt": {
       "type": "object",
       "required": [
@@ -147,7 +125,7 @@
       ],
       "properties": {
         "fingerprint": {
-          "$ref": "core.json#/$defs/Sha256Digest"
+          "$ref": "core.json#/$defs/Digest"
         },
         "engine": {
           "type": "string",
@@ -378,7 +356,7 @@
               "const": "resource_link"
             },
             "uri": {
-              "$ref": "#/$defs/DiffResourceUri"
+              "$ref": "core.json#/$defs/DiffId"
             },
             "name": {
               "const": "diff"
@@ -441,8 +419,8 @@
           "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
-          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
-          "$ref": "#/$defs/SemanticEnvironment"
+          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
+          "$ref": "core.json#/$defs/Digest"
         },
         "symbol": {
           "$ref": "core.json#/$defs/Symbol"
@@ -497,30 +475,44 @@
       },
       "additionalProperties": false
     },
-    "DiffResourceUri": {
-      "description": "Paginated diff URI; both commits are query arguments, never path identity.",
-      "type": "string",
-      "pattern": "^rift://diff\\?from=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}&to=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?$"
-    },
     "DiffResourcePayload": {
       "type": "object",
       "required": [
         "uri",
-        "diff",
+        "from",
+        "to",
+        "files",
+        "truncated",
         "next",
         "execution"
       ],
       "properties": {
         "uri": {
-          "$ref": "#/$defs/DiffResourceUri"
+          "$ref": "core.json#/$defs/DiffId"
         },
-        "diff": {
-          "$ref": "#/$defs/SnapshotDiff"
+        "from": {
+          "description": "The old side, as it resolved.",
+          "$ref": "core.json#/$defs/Snapshot"
+        },
+        "to": {
+          "description": "The new side, as it resolved.",
+          "$ref": "core.json#/$defs/Snapshot"
+        },
+        "files": {
+          "description": "The files this page covers.",
+          "type": "array",
+          "items": {
+            "$ref": "core.json#/$defs/FileChange"
+          }
+        },
+        "truncated": {
+          "description": "Whether files were dropped to stay inside the size limit. Paging past the limit uses `next`.",
+          "type": "boolean"
         },
         "next": {
           "oneOf": [
             {
-              "$ref": "#/$defs/DiffResourceUri"
+              "$ref": "core.json#/$defs/DiffId"
             },
             {
               "type": "null"
@@ -532,7 +524,8 @@
           "$ref": "#/$defs/QueryExecution"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "description": "One page of a comparison. `from` and `to` are what the URI's revisions resolved to, so a diff taken against a moving branch records which commits it actually compared. Git answers this without a compiler, so it works for a language Rift has no adapter for."
     },
     "ContractDescriptor": {
       "type": "object",
@@ -546,7 +539,7 @@
           "$ref": "core.json#/$defs/ProtocolVersion"
         },
         "schema": {
-          "$ref": "core.json#/$defs/Sha256Digest"
+          "$ref": "core.json#/$defs/Digest"
         },
         "canonical_json": {
           "const": "RFC8785"
@@ -639,8 +632,8 @@
           "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
-          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
-          "$ref": "#/$defs/SemanticEnvironment"
+          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
+          "$ref": "core.json#/$defs/Digest"
         },
         "contract": {
           "$ref": "#/$defs/ContractDescriptor"
@@ -731,8 +724,8 @@
           "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
-          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
-          "$ref": "#/$defs/SemanticEnvironment"
+          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
+          "$ref": "core.json#/$defs/Digest"
         },
         "execution": {
           "$ref": "#/$defs/QueryExecution"
@@ -830,8 +823,8 @@
           "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
-          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
-          "$ref": "#/$defs/SemanticEnvironment"
+          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
+          "$ref": "core.json#/$defs/Digest"
         },
         "actions": {
           "type": "array",
@@ -1055,8 +1048,8 @@
           "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
-          "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
-          "$ref": "#/$defs/SemanticEnvironment"
+          "description": "Fingerprint of the compiler context that gave this answer its meaning: the compiler builds, their configuration, and the resolved dependencies. The same revision under a different environment answers differently.\n\nTaken over each language's `language` and `fingerprint` from the repository resource, sorted by `language`, in RFC 8785 canonical JSON. `MatchKey` and `ActionKey` carry this same value, so a key that went stale is caught by comparing two strings.",
+          "$ref": "core.json#/$defs/Digest"
         },
         "execution": {
           "description": "The match aggregator uses canonical physical path/range/identity order.",
@@ -1148,192 +1141,6 @@
             "string",
             "null"
           ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "DiffHunk": {
-      "description": "A bounded unified-diff hunk. Patch includes its @@ header and lines.",
-      "type": "object",
-      "required": [
-        "old_start",
-        "old_lines",
-        "new_start",
-        "new_lines",
-        "patch"
-      ],
-      "properties": {
-        "old_start": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "old_lines": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "new_start": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "new_lines": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "patch": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false
-    },
-    "FileDiff": {
-      "type": "object",
-      "required": [
-        "status",
-        "path",
-        "before",
-        "after",
-        "hunks",
-        "binary",
-        "truncated"
-      ],
-      "properties": {
-        "status": {
-          "enum": [
-            "created",
-            "modified",
-            "deleted",
-            "renamed",
-            "copied"
-          ]
-        },
-        "path": {
-          "$ref": "core.json#/$defs/ProjectPath"
-        },
-        "previous_path": {
-          "oneOf": [
-            {
-              "$ref": "core.json#/$defs/ProjectPath"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "hunks": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/DiffHunk"
-          }
-        },
-        "binary": {
-          "oneOf": [
-            {
-              "$ref": "#/$defs/BinaryDiffSummary"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "before": {
-          "description": "The entry before the change. Null where the file did not exist.",
-          "oneOf": [
-            {
-              "$ref": "core.json#/$defs/File"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "after": {
-          "description": "The entry after the change. Null where the file was deleted.",
-          "oneOf": [
-            {
-              "$ref": "core.json#/$defs/File"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "BinaryDiffSummary": {
-      "type": "object",
-      "required": [
-        "before_sha256",
-        "after_sha256",
-        "before_bytes",
-        "after_bytes"
-      ],
-      "properties": {
-        "before_sha256": {
-          "oneOf": [
-            {
-              "$ref": "core.json#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "after_sha256": {
-          "oneOf": [
-            {
-              "$ref": "core.json#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "before_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "minimum": 0
-        },
-        "after_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false
-    },
-    "SnapshotDiff": {
-      "type": "object",
-      "required": [
-        "from",
-        "to",
-        "files",
-        "truncated"
-      ],
-      "properties": {
-        "from": {
-          "description": "The old side of the comparison.",
-          "$ref": "core.json#/$defs/Snapshot"
-        },
-        "to": {
-          "description": "The new side of the comparison.",
-          "$ref": "core.json#/$defs/Snapshot"
-        },
-        "files": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/FileDiff"
-          }
-        },
-        "truncated": {
-          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -1598,7 +1405,7 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://diff{?from,to,cursor}"
+              "const": "rift://diff/{from}..{to}{?cursor}"
             },
             "name": {
               "const": "diff"
@@ -1700,7 +1507,7 @@
                 ],
                 "properties": {
                   "uri": {
-                    "$ref": "#/$defs/DiffResourceUri"
+                    "$ref": "core.json#/$defs/DiffId"
                   },
                   "mimeType": {
                     "const": "application/vnd.rift.diff+json"
@@ -1867,6 +1674,7 @@
       "required": [
         "language",
         "compiler",
+        "fingerprint",
         "structural_matching",
         "actions"
       ],
@@ -1882,6 +1690,10 @@
             "tsc 5.6.2"
           ]
         },
+        "fingerprint": {
+          "description": "Digest of what gives this language meaning here: the compiler build, its configuration, and the resolved dependencies. The workspace `environment` is taken over these.",
+          "$ref": "core.json#/$defs/Digest"
+        },
         "structural_matching": {
           "description": "Whether the match tool accepts a structural query for this language. False where the adapter cannot parse the pattern grammar.",
           "type": "boolean"
@@ -1889,33 +1701,6 @@
         "actions": {
           "description": "Whether compiler actions can be discovered, and where not, why.",
           "$ref": "core.json#/$defs/Coverage"
-        }
-      },
-      "additionalProperties": false
-    },
-    "LanguageEnvironment": {
-      "description": "The compiler context one language resolved to. Two answers at the same revision differ if this differs, which is what the fingerprint over all of them detects.",
-      "type": "object",
-      "required": [
-        "language",
-        "compiler",
-        "fingerprint"
-      ],
-      "properties": {
-        "language": {
-          "$ref": "core.json#/$defs/LanguageId"
-        },
-        "compiler": {
-          "description": "The compiler and version that answered.",
-          "type": "string",
-          "maxLength": 4096,
-          "examples": [
-            "tsc 5.6.2"
-          ]
-        },
-        "fingerprint": {
-          "description": "Digest of everything that gave this language meaning here: compiler build, its configuration, and the resolved dependencies.",
-          "$ref": "core.json#/$defs/Sha256Digest"
         }
       },
       "additionalProperties": false

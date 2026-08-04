@@ -7,7 +7,7 @@
 //
 // Scalar aliases — an identity that is a string with a pattern — inline as
 // their scalar. Protobuf has no newtype, and a one-field wrapper message would
-// buy nothing but indirection. The pattern stays normative in core.json.
+// would only add indirection. The pattern stays normative in core.json.
 
 syntax = "proto3";
 
@@ -39,7 +39,10 @@ message SnapshotWorktree {
   // The commit this working tree sits on.
   string base = 2;
   // SHA-256 over the files that differ from `base` — each path with the digest of its
-  // content, in RFC 8785 canonical JSON. A clean working tree digests the empty set.
+  // content, in RFC 8785 canonical JSON, the same digest each file reports. A clean
+  // working tree digests the empty set.
+  //
+  // This detects that a working tree moved; what moved is a diff, read through `DiffId`.
   string changes = 3;
 }
 
@@ -59,8 +62,13 @@ message File {
 }
 
 message FileContentRegular {
+  // SHA-256 of the bytes. The same value `Snapshot.changes` digests for a file that
+  // differs from its base.
+  string digest = 1;
+  // Size in bytes.
+  int64 size = 2;
   // Whether Git records the executable bit.
-  bool executable = 1;
+  bool executable = 3;
 }
 
 message FileContentLfsPointer {
@@ -128,6 +136,70 @@ enum Severity {
 message SourceSpan {
   string unit = 1;
   TextRange range = 2;
+}
+
+// A change to the code, described rather than performed. An adapter never writes to the
+// tree Rift gave it, so a fix or a refactor its compiler offers comes back in this shape
+// and Rift is the one that touches the file.
+//
+// A change that arrives as data can be read and rejected before it lands, and it cannot
+// leak: an agent asking `rustfmt` for its edits leaves every other agent's files alone.
+//
+// Ranges are byte offsets into the file as it stands at the pinned snapshot, so edits in a
+// set never observe each other. Edits in a set may not overlap, and a set that touches a
+// file it also deletes is malformed.
+message Edit {
+  oneof variant {
+    EditReplace replace = 1;
+    EditCreate create = 2;
+    EditDelete delete = 3;
+    // Moving a file rather than deleting and recreating it keeps the content out of the
+    // edit and lets git see the move for what it is.
+    EditRename rename = 4;
+  }
+}
+
+message EditReplace {
+  SourceSpan span = 1;
+  // What the range becomes. Empty deletes it.
+  string text = 2;
+}
+
+message EditCreate {
+  // A path that does not exist at the pinned snapshot. Extracting a module is the usual
+  // reason.
+  string file = 1;
+  string text = 2;
+}
+
+message EditDelete {
+  string file = 1;
+}
+
+// Moving a file rather than deleting and recreating it keeps the content out of the edit
+// and lets git see the move for what it is.
+message EditRename {
+  string file = 1;
+  string destination = 2;
+}
+
+// Everything that happened to one file between two states. `before` and `after` are the
+// entry on each side, so a created file has no `before`, a deleted one has no `after`, and
+// a rename shows as two different paths. The path is not restated as a field of its own:
+// it is `after.id`, or `before.id` where the file is gone.
+//
+// `edits` gets you from one side to the other, in the same shape a refactor proposes, so
+// reading a change and applying one speak a single vocabulary. A file whose bytes are not
+// text carries no edits: its digest and size on each side are in `before` and `after`.
+message FileChange {
+  // The entry before the change. Null where the file did not exist.
+  optional File before = 1;
+  // The entry after the change. Null where the file was deleted.
+  optional File after = 2;
+  // What to apply to `before` to get `after`.
+  repeated Edit edits = 3;
+  // Whether edits were dropped to stay inside the size limit.
+  bool truncated = 4;
 }
 
 // Deterministic virtual-source provenance. exact means one affine byte-for-byte origin
@@ -384,9 +456,9 @@ enum RelationshipFacet {
   RELATIONSHIP_FACET_DEPENDS_ON = 17;
 }
 
-// Where this symbol is defined. Six origins, and they answer different questions: whether
-// you can edit it, whether it moves when you upgrade something, and whether anything can
-// be read from it at all.
+// Where this symbol is defined. The origins answer different questions: whether you can
+// edit it, whether it moves when you upgrade something, and whether anything can be read
+// from it at all.
 message SymbolOrigin {
   oneof variant {
     // Declared in this workspace's own source. The code you can open and change.
@@ -491,8 +563,8 @@ message Leaf {
   Extensions extensions = 10;
 }
 
-// One directed edge between two symbols. The leaves that witness the edge are its evidence
-// — the physical places the compiler read it from.
+// One directed edge between two symbols. Its evidence is the leaves it was read from, and
+// its derivation is how much the compiler knew when it was read.
 message Relationship {
   // The symbol the edge starts at.
   string from = 1;
@@ -503,16 +575,46 @@ message Relationship {
   string to = 4;
   // The leaves this edge was read from.
   repeated string evidence = 5;
-  RelationshipProvenance provenance = 6;
+  // How this edge was established. Every edge reaches Rift from an adapter, so who sent it
+  // says nothing; what differs is how much the compiler actually knew.
+  //
+  // `resolution` — the compiler's own name resolution or type checker produced it. It is a
+  // fact about the program.
+  //
+  // `syntax` — the adapter read it off the syntax tree because the compiler did not
+  // resolve it: a call on an untyped receiver matched by name, a component matched to a
+  // tag. Deterministic and repeatable, and still capable of being wrong.
+  //
+  // `heuristic` — a guess. `confidence` is required here and meaningless elsewhere.
+  //
+  // A refactor can act on `resolution` unchecked. Anything below it is a candidate to
+  // show, not a fact to rewrite from.
+  RelationshipDerivation derivation = 6;
+  // How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
+  // derivation.
   optional double confidence = 7;
   Extensions extensions = 8;
 }
 
-enum RelationshipProvenance {
-  RELATIONSHIP_PROVENANCE_UNSPECIFIED = 0;
-  RELATIONSHIP_PROVENANCE_COMPILER = 1;
-  RELATIONSHIP_PROVENANCE_ADAPTER = 2;
-  RELATIONSHIP_PROVENANCE_INFERRED = 3;
+// How this edge was established. Every edge reaches Rift from an adapter, so who sent it
+// says nothing; what differs is how much the compiler actually knew.
+//
+// `resolution` — the compiler's own name resolution or type checker produced it. It is a
+// fact about the program.
+//
+// `syntax` — the adapter read it off the syntax tree because the compiler did not resolve
+// it: a call on an untyped receiver matched by name, a component matched to a tag.
+// Deterministic and repeatable, and still capable of being wrong.
+//
+// `heuristic` — a guess. `confidence` is required here and meaningless elsewhere.
+//
+// A refactor can act on `resolution` unchecked. Anything below it is a candidate to show,
+// not a fact to rewrite from.
+enum RelationshipDerivation {
+  RELATIONSHIP_DERIVATION_UNSPECIFIED = 0;
+  RELATIONSHIP_DERIVATION_RESOLUTION = 1;
+  RELATIONSHIP_DERIVATION_SYNTAX = 2;
+  RELATIONSHIP_DERIVATION_HEURISTIC = 3;
 }
 
 // A predicate over a standard, namespaced substrate, or diagnostic field. The regex op
@@ -790,7 +892,7 @@ message MatchKey {
   // The state it was found in.
   Snapshot snapshot = 2;
   // Fingerprint of the environment that gave that state its meaning — the same value the
-  // answer reports as `SemanticEnvironment.fingerprint`.
+  // answer reports as `environment`.
   string environment = 3;
   // Digest of the canonical query.
   string query = 4;
@@ -804,6 +906,6 @@ message ActionKey {
   // The state it was discovered in.
   Snapshot snapshot = 2;
   // Fingerprint of the environment that gave that state its meaning — the same value the
-  // answer reports as `SemanticEnvironment.fingerprint`.
+  // answer reports as `environment`.
   string environment = 3;
 }

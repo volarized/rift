@@ -233,7 +233,7 @@ const header = `// Generated from core.json. Do not edit.
 //
 // Scalar aliases — an identity that is a string with a pattern — inline as
 // their scalar. Protobuf has no newtype, and a one-field wrapper message would
-// buy nothing but indirection. The pattern stays normative in core.json.
+// would only add indirection. The pattern stays normative in core.json.
 
 syntax = "proto3";
 
