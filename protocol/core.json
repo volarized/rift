@@ -3,6 +3,73 @@
   "$id": "https://volar.sh/rift/protocol/core.json",
   "title": "Rift core semantic model",
   "description": "Vocabulary shared by every Rift seam: Symbols, Leaves, Types, Relationships, identity, source addressing, coverage, and diagnostics. The MCP surface and the adapter IPC are both defined in terms of these, so they belong to neither.",
+  "rift:axes": {
+    "description": "How every definition in the protocol is filed. Each group names the definitions that identify it, and everything those reach belongs to the same group. Groups resolve in the order listed, so a definition two of them reach belongs to the earlier one. Identifying definitions are placed before any of that runs, because a group that walked past one on its way somewhere else would otherwise claim it: Leaf reaches SymbolId, and the identity of a symbol is not physical. A group with `holds` pins those definitions to itself outright. A group with `residualOf` takes whatever no group claimed and is defined in that document.",
+    "groups": [
+      {
+        "name": "Temporal",
+        "summary": "Which state you are looking at: revisions, and the objects git names them by.",
+        "identifiedBy": [
+          "GitRevision",
+          "GitOid"
+        ]
+      },
+      {
+        "name": "Physical",
+        "summary": "Where it is written: files, the leaves of their syntax trees, and ranges of bytes.",
+        "identifiedBy": [
+          "FileId",
+          "File",
+          "Leaf",
+          "LeafId",
+          "TextRange",
+          "ProjectPath",
+          "SourceSpan",
+          "PathSelector",
+          "LeafFacet",
+          "LeafRegion",
+          "RegionRole"
+        ]
+      },
+      {
+        "name": "Semantic",
+        "summary": "What the compiler knows: symbols, what they carry, and how they connect.",
+        "identifiedBy": [
+          "SymbolId",
+          "Symbol",
+          "Relationship",
+          "Signature",
+          "TypeExpression",
+          "Documentation",
+          "ExactKind",
+          "SymbolFacet",
+          "SymbolOrigin",
+          "LanguageId"
+        ]
+      },
+      {
+        "name": "Protocol",
+        "summary": "Machinery every axis carries and none owns: extensions, coverage, diagnostics, kinds.",
+        "holds": [
+          "Extensions",
+          "ExtensionKey",
+          "ExtensionValue",
+          "ExtensionValueDescriptor"
+        ],
+        "residualOf": "core"
+      },
+      {
+        "name": "MCP",
+        "summary": "Shapes that exist only on the agent-facing surface: parameters, results, resource payloads.",
+        "residualOf": "mcp"
+      },
+      {
+        "name": "Adapter",
+        "summary": "Shapes that exist only on the adapter wire: frames, mirror lifecycle, streamed analysis.",
+        "residualOf": "adapter"
+      }
+    ]
+  },
   "$defs": {
     "ProtocolVersion": {
       "type": "integer",

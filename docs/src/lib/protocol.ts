@@ -45,12 +45,29 @@ interface EntryPointSeam {
   [member: string]: unknown;
 }
 
+/**
+ * One group in the reference, as `core.json` declares it. Which definitions
+ * belong to which axis is part of the model, so it is stated in the schema
+ * rather than kept as a list in the code that renders it.
+ */
+export interface AxisGroup {
+  name: string;
+  summary: string;
+  /** Definitions that identify this group. Everything they reach joins it. */
+  identifiedBy?: string[];
+  /** Definitions pinned here outright, before any group closes over anything. */
+  holds?: string[];
+  /** Takes whatever no group claimed and is defined in this document. */
+  residualOf?: ProtocolFile;
+}
+
 interface ProtocolDocument extends Schema {
   $id: string;
   title: string;
   description: string;
   $defs: Record<string, Schema>;
   "rift:entryPoints"?: Record<string, EntryPointSeam | string>;
+  "rift:axes"?: { description: string; groups: AxisGroup[] };
   "rift:targetTiers"?: {
     description: string;
     rules: { entry: string; pointer: string; tier: string }[];
@@ -217,6 +234,30 @@ for (const name of defNames) {
     refName(node);
   }
 }
+
+/**
+ * The reference's grouping, declared by `core.json`. Every name it mentions is
+ * checked here: a group seeded by a definition that no longer exists silently
+ * files its whole subtree somewhere else, which is the kind of drift a rename
+ * causes and nothing catches.
+ */
+export const axisGroups: AxisGroup[] = (() => {
+  const declared = documents.core["rift:axes"];
+  if (!declared) throw new Error("core.json is missing `rift:axes`");
+  for (const group of declared.groups) {
+    for (const name of [...(group.identifiedBy ?? []), ...(group.holds ?? [])]) {
+      if (!(name in defs)) {
+        throw new Error(
+          `\`rift:axes\` group \`${group.name}\` names \`${name}\`, which is not defined`,
+        );
+      }
+    }
+    if (group.residualOf && !PROTOCOL_FILES.includes(group.residualOf)) {
+      throw new Error(`\`rift:axes\` group \`${group.name}\` is residual of an unknown document`);
+    }
+  }
+  return declared.groups;
+})();
 
 /** Which definitions refer to a given one, across all three documents. */
 export const backlinks: Record<string, string[]> = (() => {

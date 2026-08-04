@@ -17,11 +17,11 @@
 import type { StructuredData } from "fumadocs-core/mdx-plugins";
 import type { TableOfContents } from "fumadocs-core/server";
 import {
+  axisGroups,
   defNames,
   defNamesByFile,
   defs,
   documents,
-  homeOf,
   type ProtocolFile,
   props,
   refName,
@@ -170,51 +170,12 @@ export const ADAPTER_HELLO = "AdapterHello";
 // The reference, grouped by axis and nested by reference
 // ---------------------------------------------------------------------------
 
-/**
- * Which axis a type belongs to.
- *
- * Seeded from the identifiers, then closed over what each seed reaches. Order
- * matters: a type reachable from more than one axis is filed under the first
- * that claims it, and the axes are tried narrowest-first. What no axis reaches
- * is wire machinery — cursors, coverage, error shapes, adapter frames — and is
- * grouped as such rather than filed somewhere it does not belong.
- */
-const AXIS_SEEDS: [string, string[]][] = [
-  ["Temporal", ["GitRevision", "GitOid", "SemanticSnapshotDigest"]],
-  [
-    "Physical",
-    [
-      "FileId",
-      "File",
-      "Leaf",
-      "LeafId",
-      "TextRange",
-      "ProjectPath",
-      "SourceSpan",
-      "PathSelector",
-      "LeafFacet",
-      "LeafRegion",
-      "RegionRole",
-    ],
-  ],
-  [
-    "Semantic",
-    [
-      "SymbolId",
-      "Symbol",
-      "Relationship",
-      "Signature",
-      "TypeExpression",
-      "Documentation",
-      "ExactKind",
-      "SymbolFacet",
-      "SymbolOrigin",
-      "LanguageId",
-    ],
-  ],
-];
+export const AXES: string[] = axisGroups.map((group) => group.name);
 
-export const AXES = [...AXIS_SEEDS.map(([name]) => name), "Protocol", "MCP", "Adapter"] as const;
+/** A group's one-line summary, for the page to print under its heading. */
+export const axisSummary: Record<string, string> = Object.fromEntries(
+  axisGroups.map((group) => [group.name, group.summary]),
+);
 
 function outgoing(name: string): string[] {
   const schema = defs[name];
@@ -235,34 +196,39 @@ function outgoing(name: string): string[] {
   return [...out];
 }
 
-/** Carried by all three axes, owned by none. Whichever walks past it first would otherwise adopt it. */
-const SHARED = ["Extensions", "ExtensionKey", "ExtensionValue", "ExtensionValueDescriptor"];
-
+/**
+ * Which group a definition belongs to, run exactly as `rift:axes` describes it:
+ * pin what is held, place every identifying definition, close each group over
+ * what its own reach, then hand the remainder to the group that claims its
+ * document. This function is the declaration's interpreter and holds no list of
+ * its own — if the grouping looks wrong, `core.json` is where it is wrong.
+ */
 export const axisOf: Record<string, string> = (() => {
   const assigned: Record<string, string> = {};
-  for (const name of SHARED) if (name in defs) assigned[name] = "Protocol";
 
-  // Every seed is placed before any closure runs. Closing one axis at a time
-  // would let it claim another axis's seed on the way past: `Leaf` reaches
-  // `SymbolId`, so Physical would file the identity of a symbol under itself.
-  for (const [axis, seeds] of AXIS_SEEDS) {
-    for (const seed of seeds) if (seed in defs) assigned[seed] = axis;
+  for (const group of axisGroups) {
+    for (const name of group.holds ?? []) assigned[name] = group.name;
   }
-  for (const [axis, seeds] of AXIS_SEEDS) {
-    const stack = seeds.filter((s) => s in defs);
+  // Before any closure, so a group cannot claim another's identifier on the way
+  // past: `Leaf` reaches `SymbolId`, and the identity of a symbol is semantic.
+  for (const group of axisGroups) {
+    for (const name of group.identifiedBy ?? []) assigned[name] ??= group.name;
+  }
+  for (const group of axisGroups) {
+    const stack = [...(group.identifiedBy ?? [])];
     while (stack.length > 0) {
       const name = stack.pop() as string;
       for (const target of outgoing(name)) {
         if (assigned[target]) continue;
-        assigned[target] = axis;
+        assigned[target] = group.name;
         stack.push(target);
       }
     }
   }
-  // What no axis reaches is the wire itself. Grouping that by the document
-  // that defines it says more than one bucket of everything left over.
-  const BY_HOME: Record<string, string> = { core: "Protocol", mcp: "MCP", adapter: "Adapter" };
-  for (const name of defNames) assigned[name] ??= BY_HOME[homeOf[name]] ?? "Protocol";
+  for (const group of axisGroups) {
+    if (!group.residualOf) continue;
+    for (const name of defNamesByFile[group.residualOf]) assigned[name] ??= group.name;
+  }
   return assigned;
 })();
 
