@@ -64,35 +64,6 @@
       },
       "additionalProperties": false
     },
-    "TargetBinding": {
-      "description": "Exact cross-owner identity handed to a propagation participant that cannot resolve the target from its own mirror. A symbol or leaf needs no binding, because SymbolId and LeafId are canonical on both seams. Bindings are request-local and never appear through MCP.",
-      "type": "object",
-      "required": [
-        "kind",
-        "id",
-        "external"
-      ],
-      "properties": {
-        "kind": {
-          "const": "external"
-        },
-        "id": {
-          "$ref": "core.json#/$defs/SymbolId"
-        },
-        "external": {
-          "$ref": "core.json#/$defs/ExternalSymbolRef"
-        }
-      },
-      "additionalProperties": false
-    },
-    "TargetBindings": {
-      "description": "Canonical, duplicate-free binding table sorted by canonical public target bytes.",
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "$ref": "#/$defs/TargetBinding"
-      }
-    },
     "Sequence": {
       "type": "integer",
       "minimum": 0,
@@ -698,8 +669,7 @@
       "type": "object",
       "required": [
         "state",
-        "query",
-        "targets"
+        "query"
       ],
       "properties": {
         "state": {
@@ -707,9 +677,6 @@
         },
         "query": {
           "$ref": "core.json#/$defs/StructuralQuery"
-        },
-        "targets": {
-          "$ref": "#/$defs/TargetBindings"
         }
       },
       "additionalProperties": false
@@ -759,8 +726,7 @@
       "required": [
         "state",
         "target",
-        "only",
-        "targets"
+        "only"
       ],
       "properties": {
         "state": {
@@ -768,9 +734,6 @@
         },
         "target": {
           "$ref": "core.json#/$defs/Address"
-        },
-        "targets": {
-          "$ref": "#/$defs/TargetBindings"
         },
         "only": {
           "type": "array",

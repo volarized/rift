@@ -493,28 +493,6 @@
       },
       "minProperties": 6
     },
-    "ExternalSymbolRef": {
-      "description": "Unresolved cross-owner symbol identity. Rift links it only by exact ExternalIdentity equality and otherwise preserves it as unresolved.",
-      "type": "object",
-      "required": [
-        "kind",
-        "identities"
-      ],
-      "properties": {
-        "kind": {
-          "const": "external_symbol"
-        },
-        "identities": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/ExternalIdentity"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
     "TypeExpression": {
       "description": "How a type is written in the source, plus the symbol that declares it when one does. A type with a declaration resolves to that symbol; a structural type — `string | null`, `{ a: string }` — has the spelling and nothing to resolve to.",
       "type": "object",
@@ -743,23 +721,6 @@
       },
       "additionalProperties": false,
       "description": "One symbol named inside a rendered signature, with the byte range of that rendering which names it."
-    },
-    "ExternalIdentity": {
-      "description": "Portable identity in another symbol scheme, qualified by the scheme that defines it. Cross-owner identity uses exact advertised external identities or stays unresolved; Rift never derives one.",
-      "type": "object",
-      "required": [
-        "scheme",
-        "value"
-      ],
-      "properties": {
-        "scheme": {
-          "type": "string"
-        },
-        "value": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false
     },
     "SymbolFacet": {
       "enum": [
@@ -1213,7 +1174,7 @@
       "additionalProperties": false
     },
     "SymbolOrigin": {
-      "description": "Where this symbol is defined. Five origins, and they answer different questions: whether you can edit it, whether it moves when you upgrade something, and whether it exists in any file at all.",
+      "description": "Where this symbol is defined. Six origins, and they answer different questions: whether you can edit it, whether it moves when you upgrade something, and whether anything can be read from it at all.",
       "oneOf": [
         {
           "description": "Declared in this workspace's own source. The code you can open and change.",
@@ -1284,6 +1245,19 @@
           "additionalProperties": false
         },
         {
+          "description": "Declared where Rift cannot read it — a language whose adapter is not installed, or code that only exists behind a name this workspace refers to. Relationships still point at it, and every field an adapter would have filled is empty.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "external"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Produced by a build step from something else in the workspace — a protobuf compiler, a schema generator. It exists in a file, and editing that file is undone by the next build.",
           "type": "object",
           "required": [
@@ -1321,7 +1295,6 @@
         "kind",
         "facets",
         "origin",
-        "external_identities",
         "modifiers",
         "visibility",
         "types",
@@ -1385,14 +1358,6 @@
             "rift://symbol/typescript/src/config.ts:ConfigLoader"
           ],
           "description": "The symbol this one is declared inside — the class that owns a method, the module that owns a function. Absent at the top level."
-        },
-        "external_identities": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/ExternalIdentity"
-          },
-          "description": "This symbol's identity in other schemes, where the adapter can state one. Used to match the same symbol across tools; an adapter states it or leaves it out."
         },
         "modifiers": {
           "type": "array",
@@ -1550,15 +1515,8 @@
           }
         },
         "to": {
-          "description": "The symbol the edge points at. A symbol in another workspace that Rift cannot resolve is preserved as the identities its owner advertises.",
-          "oneOf": [
-            {
-              "$ref": "#/$defs/SymbolId"
-            },
-            {
-              "$ref": "#/$defs/ExternalSymbolRef"
-            }
-          ]
+          "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin; the edge is the same either way.",
+          "$ref": "#/$defs/SymbolId"
         },
         "evidence": {
           "description": "The leaves this edge was read from.",
