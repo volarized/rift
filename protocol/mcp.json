@@ -71,13 +71,13 @@
           "$ref": "#/$defs/ResourceLink"
         }
       },
-      "blob": {
-        "description": "The exact bytes of one file, as Git stored them. No formatting, no truncation, no interpretation. There is a size limit, because handing an agent a 200 MB file helps nobody.",
+      "file": {
+        "description": "One file at one revision: what Git records for the entry, which languages read it, and its bytes. A file no adapter claims is still a file, and still readable.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
         "uri": {
-          "$ref": "#/$defs/BlobId"
+          "$ref": "core.json#/$defs/FileId"
         },
         "link": {
           "$ref": "#/$defs/ResourceLink"
@@ -135,103 +135,6 @@
         },
         "text": {
           "type": "string"
-        }
-      },
-      "additionalProperties": false
-    },
-    "FileEntryKind": {
-      "description": "Portable interpretation of the Git tree entry mode.",
-      "enum": [
-        "regular",
-        "executable",
-        "symlink",
-        "gitlink"
-      ]
-    },
-    "FilePayload": {
-      "description": "What a Git tree entry points at. A regular or executable entry holds the blob's own bytes unless those bytes are an LFS pointer, in which case Rift checks the pointer's syntax and stops there; a symlink holds its target; a gitlink holds the commit of another repository, and `File.object` is that commit.",
-      "oneOf": [
-        {
-          "type": "object",
-          "required": [
-            "kind"
-          ],
-          "properties": {
-            "kind": {
-              "enum": [
-                "git_blob",
-                "symlink",
-                "gitlink"
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "kind",
-            "version",
-            "oid",
-            "size"
-          ],
-          "properties": {
-            "kind": {
-              "const": "lfs_pointer"
-            },
-            "version": {
-              "const": "https://git-lfs.github.com/spec/v1"
-            },
-            "oid": {
-              "description": "The content hash the pointer names. Rift does not fetch it.",
-              "type": "string",
-              "pattern": "^sha256:[0-9a-f]{64}$"
-            },
-            "size": {
-              "description": "Size in bytes of the content the pointer names.",
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
-    },
-    "File": {
-      "description": "A Git tree entry from the workspace's complete snapshot at one revision. `kind` is what Git records for the entry and `payload` is what it points at, and the two agree: a regular or executable entry carries a blob or an LFS pointer, a symlink carries its target, a gitlink carries the commit of another repository. An entry Rift cannot read semantically — an LFS pointer, a symlink, a gitlink — reports `semantic: false` and no languages.",
-      "type": "object",
-      "required": [
-        "path",
-        "object",
-        "kind",
-        "payload",
-        "languages",
-        "semantic"
-      ],
-      "properties": {
-        "path": {
-          "$ref": "core.json#/$defs/ProjectPath"
-        },
-        "object": {
-          "description": "The blob this entry points at. Read it through the blob resource; the identifier is the address.",
-          "$ref": "#/$defs/BlobId"
-        },
-        "kind": {
-          "$ref": "#/$defs/FileEntryKind"
-        },
-        "payload": {
-          "$ref": "#/$defs/FilePayload"
-        },
-        "languages": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "type": "string"
-          }
-        },
-        "semantic": {
-          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -324,7 +227,7 @@
         },
         "rev": {
           "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
-          "$ref": "core.json#/$defs/GitRevision",
+          "$ref": "core.json#/$defs/Revision",
           "default": "HEAD"
         }
       },
@@ -502,13 +405,13 @@
               "const": "resource_link"
             },
             "uri": {
-              "$ref": "#/$defs/BlobId"
+              "$ref": "core.json#/$defs/FileId"
             },
             "name": {
-              "const": "blob"
+              "const": "file"
             },
             "mimeType": {
-              "const": "application/octet-stream"
+              "const": "application/vnd.rift.file+json"
             }
           },
           "additionalProperties": false
@@ -537,8 +440,8 @@
           "$ref": "core.json#/$defs/SymbolId"
         },
         "at": {
-          "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/Commit"
+          "description": "The state this answer was resolved against.",
+          "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -633,14 +536,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "BlobId": {
-      "description": "Identity of one Git blob, and the URI that resolves it. The object ID is a query argument rather than a path segment, so nothing about the URI invites walking a tree of them. Rift returns the exact bytes and never interprets them.",
-      "type": "string",
-      "pattern": "^rift://blob\\?object=[0-9a-f]{40}([0-9a-f]{24})?$",
-      "examples": [
-        "rift://blob?object=dae86e1950b1277e545cee180551750029cfe735"
-      ]
     },
     "ContractDescriptor": {
       "type": "object",
@@ -744,8 +639,8 @@
           "$ref": "#/$defs/RepositoryResourceUri"
         },
         "at": {
-          "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/Commit"
+          "description": "The state this answer was resolved against.",
+          "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -796,7 +691,7 @@
               "repository",
               "symbol",
               "diff",
-              "blob"
+              "file"
             ]
           }
         },
@@ -841,8 +736,8 @@
       ],
       "properties": {
         "at": {
-          "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/Commit"
+          "description": "The state this answer was resolved against.",
+          "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -876,19 +771,19 @@
     "PublicCodeAction": {
       "type": "object",
       "required": [
-        "ref",
+        "key",
         "language",
         "descriptor"
       ],
       "properties": {
-        "ref": {
-          "$ref": "core.json#/$defs/PublicCodeActionRef"
-        },
         "descriptor": {
           "$ref": "core.json#/$defs/CodeActionDescriptor"
         },
         "language": {
           "$ref": "core.json#/$defs/LanguageId"
+        },
+        "key": {
+          "$ref": "core.json#/$defs/ActionKey"
         }
       },
       "additionalProperties": false
@@ -922,7 +817,7 @@
         },
         "rev": {
           "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
-          "$ref": "core.json#/$defs/GitRevision",
+          "$ref": "core.json#/$defs/Revision",
           "default": "HEAD"
         }
       },
@@ -940,8 +835,8 @@
       ],
       "properties": {
         "at": {
-          "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/Commit"
+          "description": "The state this answer was resolved against.",
+          "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -1042,7 +937,7 @@
           "type": "object",
           "required": [
             "kind",
-            "ref",
+            "key",
             "language",
             "span",
             "replacement_ranges",
@@ -1053,9 +948,6 @@
           "properties": {
             "kind": {
               "const": "structural"
-            },
-            "ref": {
-              "$ref": "core.json#/$defs/PublicMatchRef"
             },
             "span": {
               "$ref": "core.json#/$defs/SourceSpan"
@@ -1083,6 +975,9 @@
             },
             "extensions": {
               "$ref": "core.json#/$defs/Extensions"
+            },
+            "key": {
+              "$ref": "core.json#/$defs/MatchKey"
             }
           },
           "additionalProperties": false
@@ -1091,7 +986,7 @@
           "type": "object",
           "required": [
             "kind",
-            "ref",
+            "key",
             "span",
             "captures",
             "explanation"
@@ -1099,9 +994,6 @@
           "properties": {
             "kind": {
               "const": "text"
-            },
-            "ref": {
-              "$ref": "core.json#/$defs/PublicMatchRef"
             },
             "span": {
               "$ref": "core.json#/$defs/SourceSpan"
@@ -1120,6 +1012,9 @@
                 "type": "string",
                 "maxLength": 4096
               }
+            },
+            "key": {
+              "$ref": "core.json#/$defs/MatchKey"
             }
           },
           "additionalProperties": false
@@ -1147,7 +1042,7 @@
         },
         "rev": {
           "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
-          "$ref": "core.json#/$defs/GitRevision",
+          "$ref": "core.json#/$defs/Revision",
           "default": "HEAD"
         }
       },
@@ -1165,8 +1060,8 @@
       ],
       "properties": {
         "at": {
-          "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/Commit"
+          "description": "The state this answer was resolved against.",
+          "$ref": "core.json#/$defs/Snapshot"
         },
         "environment": {
           "description": "The compiler context that gave this revision meaning. Same revision under a different environment is a different answer, and this is how you can tell.",
@@ -1229,8 +1124,8 @@
           ]
         },
         "at": {
-          "description": "The commit this answer was resolved against.",
-          "$ref": "core.json#/$defs/Commit"
+          "description": "The state this answer was resolved against.",
+          "$ref": "core.json#/$defs/Snapshot"
         },
         "diagnostic": {
           "$ref": "core.json#/$defs/Diagnostic"
@@ -1304,10 +1199,8 @@
       "required": [
         "status",
         "path",
-        "entry_before",
-        "entry_after",
-        "object_before",
-        "object_after",
+        "before",
+        "after",
         "hunks",
         "binary",
         "truncated"
@@ -1341,48 +1234,6 @@
             "$ref": "#/$defs/DiffHunk"
           }
         },
-        "entry_before": {
-          "oneOf": [
-            {
-              "$ref": "#/$defs/FileEntryKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "entry_after": {
-          "oneOf": [
-            {
-              "$ref": "#/$defs/FileEntryKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "object_before": {
-          "description": "The blob before the change. Null where the file did not exist.",
-          "oneOf": [
-            {
-              "$ref": "#/$defs/BlobId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "object_after": {
-          "description": "The blob after the change. Null where the file was deleted.",
-          "oneOf": [
-            {
-              "$ref": "#/$defs/BlobId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "binary": {
           "oneOf": [
             {
@@ -1395,6 +1246,28 @@
         },
         "truncated": {
           "type": "boolean"
+        },
+        "before": {
+          "description": "The entry before the change. Null where the file did not exist.",
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/File"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after": {
+          "description": "The entry after the change. Null where the file was deleted.",
+          "oneOf": [
+            {
+              "$ref": "core.json#/$defs/File"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -1456,11 +1329,11 @@
       "properties": {
         "from": {
           "description": "The old side of the comparison.",
-          "$ref": "core.json#/$defs/Commit"
+          "$ref": "core.json#/$defs/Snapshot"
         },
         "to": {
           "description": "The new side of the comparison.",
-          "$ref": "core.json#/$defs/Commit"
+          "$ref": "core.json#/$defs/Snapshot"
         },
         "files": {
           "type": "array",
@@ -1572,10 +1445,10 @@
           ]
         },
         "at": {
-          "description": "The commit this answer was resolved against. Null where the failure happened before one was resolved.",
+          "description": "The state this answer was resolved against. Null where the failure happened before one was resolved.",
           "oneOf": [
             {
-              "$ref": "core.json#/$defs/Commit"
+              "$ref": "core.json#/$defs/Snapshot"
             },
             {
               "type": "null"
@@ -1754,13 +1627,13 @@
           ],
           "properties": {
             "uriTemplate": {
-              "const": "rift://blob{?object}"
+              "const": "rift://file/{path}{?rev}"
             },
             "name": {
-              "const": "blob"
+              "const": "file"
             },
             "mimeType": {
-              "const": "application/octet-stream"
+              "const": "application/vnd.rift.file+json"
             }
           },
           "additionalProperties": false
@@ -1852,23 +1725,25 @@
                 "additionalProperties": false
               },
               {
-                "description": "The exact Git object payload, base64-encoded, returned whole. This resource does not paginate — it is opaque bytes, and a cursor over bytes buys nothing a byte range would not do better — so an object over DriverLimits.max_blob_bytes fails with limit_exceeded instead of being truncated.",
                 "type": "object",
                 "required": [
                   "uri",
                   "mimeType",
-                  "blob"
+                  "text"
                 ],
                 "properties": {
                   "uri": {
-                    "$ref": "#/$defs/BlobId"
+                    "$ref": "core.json#/$defs/FileId"
                   },
                   "mimeType": {
-                    "const": "application/octet-stream"
+                    "const": "application/vnd.rift.file+json"
                   },
-                  "blob": {
+                  "text": {
                     "type": "string",
-                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+                    "contentMediaType": "application/vnd.rift.file+json",
+                    "contentSchema": {
+                      "$ref": "#/$defs/FileResourcePayload"
+                    }
                   }
                 },
                 "additionalProperties": false
@@ -1929,7 +1804,7 @@
               "const": "file"
             },
             "file": {
-              "$ref": "#/$defs/File"
+              "$ref": "core.json#/$defs/File"
             }
           },
           "additionalProperties": false
@@ -1951,6 +1826,49 @@
         "path",
         "identity"
       ]
+    },
+    "FileResourcePayload": {
+      "description": "One file at one state: what the tree entry holds, and its bytes where there are any. Bytes over DriverLimits.max_blob_bytes fail with limit_exceeded rather than being truncated — this resource does not paginate, because a cursor over bytes buys nothing a byte range would not do better.",
+      "type": "object",
+      "required": [
+        "uri",
+        "at",
+        "file",
+        "text",
+        "bytes"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "core.json#/$defs/FileId"
+        },
+        "at": {
+          "description": "The state this answer was resolved against.",
+          "$ref": "core.json#/$defs/Snapshot"
+        },
+        "file": {
+          "$ref": "core.json#/$defs/File"
+        },
+        "text": {
+          "description": "The file as UTF-8, where it is valid UTF-8 and within the size limit. Null otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bytes": {
+          "description": "The exact bytes, base64-encoded, where the file is not valid UTF-8. Null where `text` carries them.",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

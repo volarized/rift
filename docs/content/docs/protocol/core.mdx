@@ -7,17 +7,21 @@ it isn't, run `git init` in the workspace. Requiring it enforces a practice you 
 
 The model has three axes:
 
-- **temporal** — revisions
-- **semantic** — symbols
+- **versioning** — which state you are asking about
 - **physical** — files, as syntax trees, with leaves
+- **semantic** — symbols
 
-## Revision
+Each is addressed by a URI that resolves it, and a versioning coordinate narrows the other two. Nothing
+else crosses between them: a file never mentions a symbol, a symbol never mentions a path.
 
-By default Rift indexes and works with the current revision: the default branch, at its latest commit.
+## Revision and Snapshot
 
-Every tool and every resource also takes an optional `rev` argument that points somewhere else. It is a
-git revision parameter — [`gitrevisions(7)`](https://git-scm.com/docs/gitrevisions) — so anything git
-accepts on a command line works here:
+A revision is the question. A snapshot is the answer.
+
+By default Rift works with the default branch at its latest commit. Every tool and every resource also
+takes an optional `rev` that points somewhere else. It is a git revision parameter —
+[`gitrevisions(7)`](https://git-scm.com/docs/gitrevisions) — so anything git accepts on a command line
+works here:
 
 | `rev` | Points at |
 | --- | --- |
@@ -25,17 +29,32 @@ accepts on a command line works here:
 | `main`, `refs/heads/main` | a branch |
 | `v1.2.0`, `tags/v1.2.0` | a tag |
 | `dae86e1` | a commit |
-| `worktrees/feature-x/HEAD` | a linked worktree |
-| `main-worktree/HEAD` | the main worktree |
 | `HEAD~3`, `main@{yesterday}` | anything else the syntax allows |
+| `worktrees/feature-x/HEAD` | the commit a linked worktree sits on |
+| `worktrees/feature-x` | that worktree's **working** tree, uncommitted edits included |
+| `main-worktree` | the main working tree, uncommitted edits included |
 
-The worktree spellings are git's own: per-worktree refs are reachable from any other worktree as
-`worktrees/<id>/HEAD` and `main-worktree/HEAD`. Incremental work lands in a worktree, so naming one is
-how you ask about a change that isn't on a branch yet.
+The worktree spellings are git's own — per-worktree refs are reachable from any other worktree as
+`worktrees/<id>/HEAD` and `main-worktree/HEAD`. Dropping the `/HEAD` is Rift's one addition, because
+gitrevisions has no way to name work that isn't committed yet, and that is usually what you are editing.
 
-A `rev` names bytes, not meaning. The same commit means different things to a compiler depending on which
-dependencies are installed, so every response reports the revision *and* the environment it resolved to.
-Pass those back when two calls have to agree.
+Because `main` names a different commit tomorrow, and a working tree changes under you, the answer says
+what it actually resolved to. A [`Snapshot`](/docs/protocol/reference#Snapshot) comes back with every
+response:
+
+```
+{ "kind": "commit",   "commit": "dae86e1…" }
+{ "kind": "worktree", "worktree": "worktrees/feature-x",
+                      "base": "dae86e1…", "changes": "9f2c…" }
+```
+
+A working tree is derived state, so it is never restated in full: it names the commit it sits on and
+digests only the files that differ. Editing one file leaves every other file's state, and the answers
+derived from it, untouched.
+
+A snapshot names bytes. The same bytes mean different things to a compiler depending on which
+dependencies are installed, so every response reports the snapshot *and* the environment. Pass both back
+when two calls have to agree.
 
 ## Symbol
 
@@ -71,19 +90,33 @@ rift://symbol/python/pkg.util.load_config?rev=v1.2.0
 
 Its fields are listed under [`Symbol`](/docs/protocol/reference#Symbol).
 
-## Leaf
+## File and Leaf
 
-Physically, a codebase is files, and each file is a
-[concrete syntax tree](https://en.wikipedia.org/wiki/Parse_tree) — every token the source contains, in
-the shape the grammar gives it. A leaf of that tree is where a symbol is physically written.
+Physically, a codebase is files. A file is identified by its path and nothing else:
 
-So a symbol is a semantic object, and its leaves are the places it is defined and mentioned. One symbol,
-many leaves.
+```
+rift://file/pkg/util.py
+```
 
-A leaf is identified by where it sits: the file, and the byte range it spans.
+No language appears there. Bytes are bytes whether three adapters claim the path or none do, and the
+same URI resolves to the entry — what Git records for it, which languages read it — and to its content.
+A `LICENSE` file is as addressable as a source file.
+
+Parsing turns those bytes into a
+[concrete syntax tree](https://en.wikipedia.org/wiki/Parse_tree): every token the source contains, in
+the shape the grammar gives it. A leaf of that tree is where a symbol is physically written, so a symbol
+is a semantic object and its leaves are the places it is defined and mentioned. One symbol, many leaves.
+
+A leaf is identified by the grammar that produced it, the file, and the byte range it spans:
 
 ```
 rift://leaf/python/pkg/util.py@1204-1266
 ```
 
-Its fields are listed under [`Leaf`](/docs/protocol/reference#Leaf).
+The language is part of a leaf's identity rather than a fact about it, because there is no parse tree
+without a grammar. One file can hold several: JavaScript inside Svelte, CSS inside Vue, SQL inside
+Python. Two adapters reading the same bytes produce two trees, and `rift://leaf/svelte/App.svelte@100-200`
+and `rift://leaf/typescript/App.svelte@100-200` are different nodes.
+
+Its fields are listed under [`File`](/docs/protocol/reference#File) and
+[`Leaf`](/docs/protocol/reference#Leaf).

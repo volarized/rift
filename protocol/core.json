@@ -7,11 +7,13 @@
     "description": "How every definition in the protocol is filed. Each group names the definitions that identify it, and everything those reach belongs to the same group. Groups resolve in the order listed, so a definition two of them reach belongs to the earlier one. Identifying definitions are placed before any of that runs, because a group that walked past one on its way somewhere else would otherwise claim it: Leaf reaches SymbolId, and the identity of a symbol is not physical. A group with `holds` pins those definitions to itself outright. A group with `residualOf` takes whatever no group claimed and is defined in that document.",
     "groups": [
       {
-        "name": "Temporal",
-        "summary": "Which state you are looking at: revisions, and the objects git names them by.",
+        "name": "Versioning",
+        "summary": "Which state you are looking at: what you asked for, and what it resolved to.",
         "identifiedBy": [
-          "GitRevision",
-          "Commit"
+          "Revision",
+          "Snapshot",
+          "Commit",
+          "Worktree"
         ]
       },
       {
@@ -85,19 +87,225 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
-    "GitRevision": {
-      "description": "A git revision parameter, as defined by gitrevisions(7): a string that names a commit, using git's extended SHA-1 syntax. Anything git accepts on a command line is accepted here — an object ID (`dae86e1`), a branch (`main`, `refs/heads/main`), a tag (`v1.2.0`, `tags/v1.2.0`), `HEAD` or `@`, a suffix form (`HEAD~3`, `main@{yesterday}`, `v1.0^{commit}`), or a per-worktree ref reached from another worktree (`worktrees/feature-x/HEAD`, `main-worktree/HEAD`). Ambiguity resolves in git's documented order: `$GIT_DIR/<refname>`, then `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, `refs/remotes/<refname>/HEAD`. Absent, the revision is the default branch at its latest commit. A revision names bytes and not meaning, so the resolved revision and the environment that gave it meaning are both reported back on every result.",
+    "Revision": {
+      "description": "Which state to answer against. Absent, the default branch at its latest commit.\n\nA git revision parameter, as defined by gitrevisions(7): an object ID (`dae86e1`), a branch (`main`, `refs/heads/main`), a tag (`v1.2.0`), `HEAD` or `@`, a suffix form (`HEAD~3`, `main@{yesterday}`), or a per-worktree ref reached from another worktree (`worktrees/feature-x/HEAD`, `main-worktree/HEAD`). Ambiguity resolves in git's documented order: `$GIT_DIR/<refname>`, then `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, `refs/remotes/<refname>/HEAD`.\n\nDropping the `/HEAD` addresses the working tree instead of the commit it sits on: `worktrees/feature-x` and `main-worktree` mean what is on disk there, uncommitted edits included. gitrevisions has no spelling for that, and it is the state an agent editing code is usually asking about.\n\nThis is the question. What it resolved to comes back as a Snapshot, because `main` names a different commit tomorrow and a working tree changes under you.",
       "type": "string",
       "minLength": 1,
       "maxLength": 256,
-      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+      "default": "HEAD",
+      "examples": [
+        "main",
+        "v1.2.0",
+        "HEAD~3",
+        "worktrees/feature-x"
+      ]
     },
     "Commit": {
-      "description": "The commit a revision resolved to, as its full object ID. A GitRevision is what you asked for and `main` names a different commit tomorrow; this is what answered. SHA-1 repositories write 40 hex characters and SHA-256 repositories 64.",
+      "description": "One committed state, as its full object ID. SHA-1 repositories write 40 hex characters and SHA-256 repositories 64.",
       "type": "string",
       "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
       "examples": [
         "dae86e1950b1277e545cee180551750029cfe735"
+      ]
+    },
+    "Worktree": {
+      "description": "A working tree, spelled the way git reaches one from any other: `main-worktree` for the repository's own, and `worktrees/<name>` for a linked one.",
+      "type": "string",
+      "pattern": "^(main-worktree|worktrees/[A-Za-z0-9._-]{1,100})$",
+      "examples": [
+        "main-worktree",
+        "worktrees/feature-x"
+      ]
+    },
+    "Snapshot": {
+      "description": "What a Revision resolved to, reported beside every answer so a second call can ask the same question again and get the same state.\n\nA commit is immutable and names itself. A working tree is not, so it names the commit it sits on and digests what differs from it. The workspace is never restated: a snapshot of a working tree is a base and a delta, so editing one file leaves every other file's state — and the answers derived from it — untouched.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "commit"
+          ],
+          "properties": {
+            "kind": {
+              "const": "commit"
+            },
+            "commit": {
+              "$ref": "#/$defs/Commit"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "worktree",
+            "base",
+            "changes"
+          ],
+          "properties": {
+            "kind": {
+              "const": "worktree"
+            },
+            "worktree": {
+              "$ref": "#/$defs/Worktree"
+            },
+            "base": {
+              "description": "The commit this working tree sits on.",
+              "$ref": "#/$defs/Commit"
+            },
+            "changes": {
+              "description": "SHA-256 over the files that differ from `base` — each path with the digest of its content, in RFC 8785 canonical JSON. A clean working tree digests the empty set.",
+              "$ref": "#/$defs/Sha256Digest"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ProjectPath": {
+      "description": "A non-empty project-relative UTF-8 path using '/' separators, with no backslash, control character, empty segment, '.' segment, or '..' segment.",
+      "type": "string",
+      "pattern": "^(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^/\\\\\\u0000-\\u001F\\u007F]+(?:/[^/\\\\\\u0000-\\u001F\\u007F]+)*$"
+    },
+    "FileId": {
+      "description": "Identity of one file, and the URI that resolves it. `rift://file/<path>` — the project-relative path, and nothing else. A path is a path whether three adapters claim it or none do, so the language belongs to what is parsed from the file rather than to the file. A file an adapter produced rather than read from disk is addressed the same way, with the path its producer minted, and the source map says what it was generated from. A revision can be attached as `?rev=`.",
+      "type": "string",
+      "minLength": 13,
+      "maxLength": 1024,
+      "pattern": "^rift://file/[A-Za-z0-9._~:/-]{1,1000}(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+      "examples": [
+        "rift://file/pkg/util.py",
+        "rift://file/src/config.ts?rev=main"
+      ]
+    },
+    "File": {
+      "description": "One entry of the workspace tree at a revision: what it is called, what it holds, and which languages read it. Bytes are read from the same URI that identifies it.",
+      "type": "object",
+      "required": [
+        "id",
+        "content",
+        "languages",
+        "semantic"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/FileId"
+        },
+        "content": {
+          "description": "What the entry holds. Only a regular entry has source in it; the other three are paths that point elsewhere and carry no leaves.",
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "executable"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "regular"
+                },
+                "executable": {
+                  "description": "Whether Git records the executable bit.",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "oid",
+                "size"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "lfs_pointer"
+                },
+                "oid": {
+                  "description": "The content hash the pointer names. Rift checks the pointer's syntax and never fetches what it points at.",
+                  "type": "string",
+                  "pattern": "^sha256:[0-9a-f]{64}$"
+                },
+                "size": {
+                  "description": "Size in bytes of the content the pointer names.",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "target"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "symlink"
+                },
+                "target": {
+                  "description": "The path the link points at, as recorded. Rift does not follow it.",
+                  "type": "string",
+                  "maxLength": 4096
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "commit"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "gitlink"
+                },
+                "commit": {
+                  "description": "The commit of the linked repository. Rift neither follows it nor reads that repository's content.",
+                  "$ref": "#/$defs/Commit"
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "languages": {
+          "description": "The languages whose adapters claim this path. More than one where a file embeds another language — a script block in a template, a query string in a host language.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/LanguageId"
+          },
+          "examples": [
+            [
+              "svelte",
+              "typescript",
+              "css"
+            ]
+          ]
+        },
+        "semantic": {
+          "description": "Whether Rift produced facts from this file. False where there is nothing to read, and where no adapter claims the path.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LeafId": {
+      "description": "Identity of one leaf of a file's syntax tree, and the URI that resolves it. `rift://leaf/<language>/<path>@<start>-<end>` — the project-relative path of the file, then the half-open UTF-8 byte range the leaf spans. A revision can be attached as `?rev=`.",
+      "type": "string",
+      "minLength": 18,
+      "maxLength": 1024,
+      "pattern": "^rift://leaf/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}@\\d+-\\d+(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+      "examples": [
+        "rift://leaf/python/pkg/util.py@1204-1266"
       ]
     },
     "SymbolId": {
@@ -110,27 +318,6 @@
         "rift://symbol/python/pkg.util.load_config~1?rev=HEAD~3",
         "rift://symbol/rust/serde::de::Deserialize",
         "rift://symbol/typescript/src/config.ts:ConfigLoader.parse"
-      ]
-    },
-    "LeafId": {
-      "description": "Identity of one leaf of a file's syntax tree, and the URI that resolves it. `rift://leaf/<language>/<path>@<start>-<end>` — the project-relative path of the file, then the half-open UTF-8 byte range the leaf spans. A revision can be attached as `?rev=`.",
-      "type": "string",
-      "minLength": 18,
-      "maxLength": 1024,
-      "pattern": "^rift://leaf/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}@\\d+-\\d+(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
-      "examples": [
-        "rift://leaf/python/pkg/util.py@1204-1266"
-      ]
-    },
-    "FileId": {
-      "description": "Identity of one source file, and the URI that resolves it. `rift://file/<language>/<path>` — the language whose adapter owns the file, then its project-relative path. A file an adapter produced rather than read from disk is addressed the same way, with the path the producer minted for it, and the source map says what it was generated from. A revision can be attached as `?rev=`.",
-      "type": "string",
-      "minLength": 14,
-      "maxLength": 1024,
-      "pattern": "^rift://file/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
-      "examples": [
-        "rift://file/python/pkg/util.py",
-        "rift://file/typescript/src/config.ts?rev=main"
       ]
     },
     "LanguageId": {
@@ -230,11 +417,6 @@
       "additionalProperties": {
         "$ref": "#/$defs/ExtensionValue"
       }
-    },
-    "ProjectPath": {
-      "description": "A non-empty project-relative UTF-8 path using '/' separators, with no backslash, control character, empty segment, '.' segment, or '..' segment.",
-      "type": "string",
-      "pattern": "^(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^/\\\\\\u0000-\\u001F\\u007F]+(?:/[^/\\\\\\u0000-\\u001F\\u007F]+)*$"
     },
     "PathPattern": {
       "description": "Project-relative Git-style glob using *, ?, **, and character classes; absolute, backslash, control, and '..' segments are forbidden.",
@@ -1748,56 +1930,6 @@
         }
       ]
     },
-    "PublicCodeActionRef": {
-      "description": "Rift-minted deterministic action identity scoped to one snapshot. Rift rediscovers the adapter action and verifies the descriptor digest before application.",
-      "type": "object",
-      "required": [
-        "id",
-        "commit",
-        "environment"
-      ],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "commit": {
-          "description": "The commit this action was discovered against.",
-          "$ref": "#/$defs/Commit"
-        },
-        "environment": {
-          "description": "Fingerprint of the environment that gave the commit its meaning — the same value the answer reports as `SemanticEnvironment.fingerprint`. A commit names bytes; two environments make different facts out of them.",
-          "$ref": "#/$defs/Sha256Digest"
-        }
-      },
-      "additionalProperties": false
-    },
-    "PublicMatchRef": {
-      "description": "Deterministic text or structural match identity scoped to one retained snapshot and canonical query.",
-      "type": "object",
-      "required": [
-        "id",
-        "commit",
-        "environment",
-        "query"
-      ],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "commit": {
-          "description": "The commit this match was found in.",
-          "$ref": "#/$defs/Commit"
-        },
-        "query": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "environment": {
-          "description": "Fingerprint of the environment that gave the commit its meaning — the same value the answer reports as `SemanticEnvironment.fingerprint`. A commit names bytes; two environments make different facts out of them.",
-          "$ref": "#/$defs/Sha256Digest"
-        }
-      },
-      "additionalProperties": false
-    },
     "Address": {
       "description": "Where an operation applies. A symbol addresses meaning and a leaf addresses syntax, so the two are separate branches rather than one field that could be either.",
       "oneOf": [
@@ -1865,7 +1997,7 @@
               "const": "match"
             },
             "match": {
-              "$ref": "#/$defs/PublicMatchRef"
+              "$ref": "#/$defs/MatchKey"
             },
             "capture": {
               "description": "Which named capture of the match. Null addresses the match itself.",
@@ -2315,6 +2447,59 @@
       "description": "Identity of one mirror inside an adapter process. A base mirror is shared and immutable; each same-environment candidate opens a child mirror whose content map is complete in structure and delta in content — every unchanged entry is a shared reference, so parsed-source memory is base plus the sum of deltas rather than one base per agent; per-mirror compiler state is not shared. An environment-changing candidate takes its own provisional base instead, bounded by AdapterLimits.max_provisional_bases.",
       "type": "string",
       "pattern": "^[A-Za-z0-9._-]{1,128}$"
+    },
+    "MatchKey": {
+      "description": "Identity of one match: the query that found it, and the exact state it was found in. Replaying a cursor or applying an action checks this first, because a match found in one state does not survive into another.",
+      "type": "object",
+      "required": [
+        "id",
+        "snapshot",
+        "environment",
+        "query"
+      ],
+      "properties": {
+        "id": {
+          "description": "Digest of the match itself.",
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "snapshot": {
+          "description": "The state it was found in.",
+          "$ref": "#/$defs/Snapshot"
+        },
+        "environment": {
+          "description": "Fingerprint of the environment that gave that state its meaning — the same value the answer reports as `SemanticEnvironment.fingerprint`.",
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "query": {
+          "description": "Digest of the canonical query.",
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ActionKey": {
+      "description": "Identity of one discovered compiler action, and the exact state it was discovered in. Rift rediscovers the adapter's action and checks this digest before applying anything.",
+      "type": "object",
+      "required": [
+        "id",
+        "snapshot",
+        "environment"
+      ],
+      "properties": {
+        "id": {
+          "description": "Digest of the action's descriptor.",
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "snapshot": {
+          "description": "The state it was discovered in.",
+          "$ref": "#/$defs/Snapshot"
+        },
+        "environment": {
+          "description": "Fingerprint of the environment that gave that state its meaning — the same value the answer reports as `SemanticEnvironment.fingerprint`.",
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }
