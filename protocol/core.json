@@ -2440,7 +2440,7 @@
       ]
     },
     "MirrorId": {
-      "description": "Identity of one mirror inside an adapter process. A base mirror is shared and immutable; each same-environment candidate opens a child mirror whose content map is complete in structure and delta in content — every unchanged entry is a shared reference, so parsed-source memory is base plus the sum of deltas rather than one base per agent; per-mirror compiler state is not shared. An environment-changing candidate takes its own provisional base instead, bounded by AdapterLimits.max_provisional_bases.",
+      "description": "Identity of one mirror inside an adapter process. A base mirror is immutable and shared; each same-environment candidate opens a child whose content map is complete in structure and delta in content, so every unchanged entry is a shared reference and parsed-source memory is one base plus the sum of the deltas rather than one base per agent. Per-mirror compiler state is not shared. A candidate that changes the environment cannot be a child and takes a base of its own, bounded by AdapterLimits.max_provisional_bases.",
       "type": "string",
       "pattern": "^[A-Za-z0-9._-]{1,128}$"
     },

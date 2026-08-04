@@ -152,6 +152,17 @@ export const adapterOperations: AdapterOperation[] = (() => {
     }
   }
 
+  // `AdapterOp` and the request frames are two lists of the same thing, and
+  // they drifted: five operations outlived the frames that sent them. Whichever
+  // side is edited, the other has to follow.
+  const declared = new Set(defs.AdapterOp?.enum ?? []);
+  for (const op of requests.keys()) {
+    if (!declared.has(op)) throw new Error(`\`${op}\` has a request frame but is not in AdapterOp`);
+  }
+  for (const op of declared) {
+    if (!requests.has(op)) throw new Error(`AdapterOp names \`${op}\`, which has no request frame`);
+  }
+
   return [...requests.entries()]
     .map(([op, { frame, description }]) => ({
       op,

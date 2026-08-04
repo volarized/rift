@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://volar.sh/rift/protocol/adapter.json",
   "title": "Rift language-adapter IPC",
-  "description": "The newline-delimited JSON contract between the Rift server and one language adapter: hello, mirror lifecycle, sync, and the streaming analysis, matching, resolution, and validation operations.",
+  "description": "The newline-delimited JSON contract between the Rift server and one language adapter: hello, mirror lifecycle, sync, and the streaming analysis, matching, resolution, and validation operations.\n\nOne Rift server starts and owns its adapters, one per language, and no other server shares them. So a mirror has exactly one party opening, filling and releasing it, and the adapter arbitrates nothing: it is told which mirror to make and which state that mirror holds. One adapter still serves many mirrors at once over one pipe, because many agents work against one workspace, which is what the per-mirror bounds and frame interleaving in AdapterLimits are for.",
   "rift:entryPoints": {
     "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as SymbolId and Address is deliberately reachable from several.",
     "adapter.frame": {
@@ -972,7 +972,7 @@
         }
       },
       "additionalProperties": false,
-      "description": "Bounds one adapter advertises. Because a pooled adapter serves many mirrors over one stdio pipe, in-flight work is bounded per mirror rather than per process, and the adapter must interleave stream frames across concurrent requests rather than draining one stream to completion. Sequence numbers are per request, so interleaving is always safe; draining is not, because it lets one mirror's large analyze starve every other agent on that pipe."
+      "description": "Bounds one adapter advertises. One adapter serves many mirrors over one stdio pipe, so in-flight work is bounded per mirror rather than per process, and the adapter interleaves stream frames across concurrent requests rather than draining one stream to completion. Sequence numbers are per request, so interleaving is always safe; draining is not, because it lets one mirror's large analyze starve every other agent on that pipe."
     },
     "AdapterRuntimeRequirements": {
       "description": "Host-enforced requirements for running this adapter on an untrusted selected repository. An adapter is never granted network access or writes outside private temporary state; startup fails when the launcher cannot enforce a required sandbox.",
@@ -1721,7 +1721,7 @@
       ]
     },
     "MirrorBase": {
-      "description": "What a new mirror is opened against. A tree base creates an EMPTY mirror pinned to that tree identity, which Rift then fills with one full sync (reset=true); this is how a cold base materializes, since an adapter can never read Git itself. A mirror base creates a child sharing the parent's committed content, which Rift fills with the candidate delta only. Depth is one: a child may not itself be a base. A process holds one base per tree it currently serves — promotion adds a base rather than replacing one, so a base with live sibling children is never invalidated — and a base is released once it has no live children, no in-flight requests pinned to it, and is not the accepted head tree of any workspace this server currently serves. It is deliberately not 'newest for its owner': worktrees advance independently, so newest is not a single global ordering, and evicting a base because another worktree moved on would cold-sync a tree that is still someone's head. A child may only be opened when the candidate leaves the owning adapter's AdapterEnvironment unchanged. Whether it does is decided solely by the adapter's own AuxiliaryClaim.environment_defining flags — never inferred from purpose, path, or file type — and a candidate touching any environment-defining claimed file gets a fresh base at the new environment instead of a child. Base admission is atomic per (owner, tree): an adapter serves at most one base for any tree, so a cold mirror.open racing a mirror.promote for the same tree does not produce two. The loser of that race receives the existing base's state rather than a second base.",
+      "description": "What a new mirror starts from. From a snapshot it is empty and pinned to that state, which Rift then fills with one full sync — an adapter cannot read Git, so a cold mirror can only be materialized by being sent its content. From another mirror it starts as a depth-one child sharing that mirror's committed content, and Rift sends only what differs. Depth is one: a child may not itself be a base.",
       "oneOf": [
         {
           "type": "object",
@@ -1734,7 +1734,7 @@
               "const": "snapshot"
             },
             "snapshot": {
-              "description": "The state this base holds. Rift decides when two revisions share one base; the adapter compares this token and nothing else.",
+              "description": "The state this mirror will hold once filled.",
               "$ref": "core.json#/$defs/Snapshot"
             }
           },
@@ -1751,6 +1751,7 @@
               "const": "mirror"
             },
             "mirror": {
+              "description": "The mirror to share committed content with.",
               "$ref": "core.json#/$defs/MirrorId"
             }
           },
@@ -1772,42 +1773,17 @@
       "additionalProperties": false
     },
     "MirrorOpenOutput": {
-      "description": "The result of admitting a base or child. Admission is atomic per (owner, tree): the winner gets a fresh empty handle to sync; a racing open or promote for the same tree waits for that first sync.commit and then receives the winner's state rather than creating a second base. If the winner fails or aborts before committing, its reservation is released and the next waiter is promoted to winner.",
-      "oneOf": [
-        {
-          "type": "object",
-          "required": [
-            "kind",
-            "handle"
-          ],
-          "properties": {
-            "kind": {
-              "const": "admitted"
-            },
-            "handle": {
-              "description": "A freshly opened, still-empty mirror. It has no environment yet: an AdapterEnvironment is derived from the configuration and dependency material in the synced content, so it cannot exist before the sync that supplies them. sync.commit is where the adapter first publishes one.",
-              "$ref": "core.json#/$defs/MirrorId"
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "kind",
-            "state"
-          ],
-          "properties": {
-            "kind": {
-              "const": "existing"
-            },
-            "state": {
-              "$ref": "core.json#/$defs/MirrorState"
-            }
-          },
-          "additionalProperties": false
+      "description": "A freshly opened, still-empty mirror. It has no environment yet: an AdapterEnvironment is derived from the configuration and dependency material in the synced content, so it cannot exist before the sync that supplies it. sync.commit is where the adapter first publishes one.",
+      "type": "object",
+      "required": [
+        "mirror"
+      ],
+      "properties": {
+        "mirror": {
+          "$ref": "core.json#/$defs/MirrorId"
         }
-      ]
+      },
+      "additionalProperties": false
     },
     "MirrorReleaseInput": {
       "description": "Drop one mirror and every resource it holds. Mirrors are never reclaimed implicitly. Release is refused with mirror_in_use while the mirror has live children OR any in-flight request pinned to it — an analyze stream against a base that has just stopped being the newest is still a valid pinned read, and terminating it would turn a correct snapshot read into an infrastructure failure.",
@@ -1860,7 +1836,7 @@
       "additionalProperties": false
     },
     "MirrorOpenRequest": {
-      "description": "Give me somewhere to put the code. An adapter cannot read your repository — that is the point — so Rift opens a mirror and fills it. Opening returns an empty handle: until content is synced there is no environment, and so nothing to answer questions about. Opening against an existing mirror instead gives you a cheap child that shares its parent's content and holds only the difference.",
+      "description": "Give me somewhere to put the code. An adapter cannot read your repository, so Rift opens a mirror and sends the content into it.",
       "type": "object",
       "required": [
         "type",
@@ -2050,85 +2026,52 @@
       "additionalProperties": false
     },
     "AdapterOp": {
-      "description": "Every operation name on the adapter wire.",
+      "description": "Every operation name on the adapter wire. Exactly the ops that have a request frame; nothing is named here that cannot be sent.",
       "enum": [
         "actions",
         "analyze",
         "cancel",
-        "check",
-        "context",
-        "frontier",
         "match",
         "mirror.open",
         "mirror.promote",
         "mirror.release",
-        "resolve",
         "sync.abort",
         "sync.begin",
         "sync.commit",
         "sync.map",
         "sync.remove",
-        "sync.unit",
-        "validate"
+        "sync.unit"
       ]
     },
     "MirrorPromoteInput": {
-      "description": "Promote a child mirror whose content has been published as an accepted Revision into a base for that tree. Pinned to the exact expected MirrorState, because a child advances: promoting {mirror:C, tree:T1} after C has moved to T2 would label T2's content T1. The mirror must also be committed-idle — no open sync transaction — or the promoted base would pin content still in flight. Promotion re-roots rather than nests: depth remains one and the promoted mirror has no parent. Without it, publishing T1 from a T0 child would force the next edit to open a fresh base at T1 and full-sync it, making every sequential agent edit a compiler cold start.",
+      "description": "Re-root a child mirror as a base of its own. Pinned to the state the caller expects, because a child advances: promoting one that has moved on would label the wrong content. The mirror must also be committed-idle — no open sync transaction — or the promoted base would hold content still in flight.\n\nWithout this, publishing a change from a child would leave the next edit to open a fresh mirror and full-sync it, making every sequential agent edit a compiler cold start. Re-rooting also lets the old base go: while a child holds it, release is refused.",
       "type": "object",
       "required": [
-        "state",
-        "snapshot"
+        "state"
       ],
       "properties": {
         "state": {
+          "description": "The state the mirror is expected to hold.",
           "$ref": "core.json#/$defs/MirrorState"
-        },
-        "snapshot": {
-          "description": "The state the promoted child now holds.",
-          "$ref": "core.json#/$defs/Snapshot"
         }
       },
       "additionalProperties": false
     },
     "MirrorPromoteOutput": {
-      "description": "The result of promotion. Promotion competes for the same atomic per-(owner, tree) admission as a cold open, so it has the same two outcomes. Promoted: the base is this mirror re-rooted in place — same mirror, same environment, generation advanced by exactly one. Existing: another base already won admission for this tree, and the caller releases the child it tried to promote rather than creating a second base for the tree.",
-      "oneOf": [
-        {
-          "type": "object",
-          "required": [
-            "kind",
-            "state"
-          ],
-          "properties": {
-            "kind": {
-              "const": "promoted"
-            },
-            "state": {
-              "$ref": "core.json#/$defs/MirrorState"
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "kind",
-            "state"
-          ],
-          "properties": {
-            "kind": {
-              "const": "existing"
-            },
-            "state": {
-              "$ref": "core.json#/$defs/MirrorState"
-            }
-          },
-          "additionalProperties": false
+      "description": "The mirror, re-rooted in place. Same mirror, same content, same environment, and no parent.",
+      "type": "object",
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "core.json#/$defs/MirrorState"
         }
-      ]
+      },
+      "additionalProperties": false
     },
     "MirrorPromoteRequest": {
-      "description": "A change was published, so the child that held it is now the truth. Promote re-roots it as the base for that tree. Skip this and every sequential edit starts with a cold compile — which is the most likely way a correct implementation still ends up unusably slow.",
+      "description": "A change was published, so the child that held it becomes a base in its own right. This is what keeps the next edit off a cold compiler.",
       "type": "object",
       "required": [
         "type",
