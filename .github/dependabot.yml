@@ -1,0 +1,34 @@
+version: 2
+
+updates:
+  # docs/ JavaScript. NOTE: Dependabot supports *version* updates for bun but
+  # NOT security updates — that gap is why ci.yml also runs `bun audit` as a
+  # blocking gate. Requires the text-based bun.lock (>=1.1.39), which we have.
+  - package-ecosystem: bun
+    directory: /docs
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR per week for the routine churn instead of a dozen.
+      docs-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  # Keeps the action pins current — notably `rustsec/audit-check`, which
+  # publishes no floating major tag and so is pinned exactly.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]

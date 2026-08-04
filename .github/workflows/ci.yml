@@ -72,8 +72,22 @@ jobs:
 
       - run: bun run build
 
+      # Dependabot supports version updates for bun but NOT security updates,
+      # so nothing else would *block* a vulnerable JS dependency from landing.
+      # Baseline is clean as of the dependency upgrade PR; `--audit-level=high`
+      # keeps moderates visible in the log without failing the build.
+      - run: bun audit --audit-level=high
+
   rust:
     runs-on: ubuntu-latest
+
+    # rustsec/audit-check needs these to publish its check run; the workflow's
+    # top-level grant is contents:read only.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+
     steps:
       - uses: actions/checkout@v7
 
@@ -87,3 +101,10 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
       - run: cargo test --all-features
+
+      # RustSec advisory DB. Overlaps Dependabot's cargo security updates, but
+      # blocks at PR time rather than filing a PR after the fact.
+      # Pinned exactly: rustsec/audit-check publishes no floating major tag.
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
