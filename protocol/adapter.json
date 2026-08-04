@@ -575,29 +575,6 @@
       },
       "additionalProperties": false
     },
-    "TypeAnalysisChunk": {
-      "type": "object",
-      "required": [
-        "kind",
-        "unit",
-        "items"
-      ],
-      "properties": {
-        "kind": {
-          "const": "types"
-        },
-        "unit": {
-          "$ref": "core.json#/$defs/SourceUnitRef"
-        },
-        "items": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/Type"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
     "DiagnosticAnalysisChunk": {
       "type": "object",
       "required": [
@@ -669,9 +646,6 @@
         },
         {
           "$ref": "#/$defs/RelationshipAnalysisChunk"
-        },
-        {
-          "$ref": "#/$defs/TypeAnalysisChunk"
         },
         {
           "$ref": "#/$defs/DiagnosticAnalysisChunk"

@@ -45,6 +45,16 @@
         "rift://symbol/typescript/src/config.ts:ConfigLoader.parse"
       ]
     },
+    "ElementId": {
+      "description": "Identity of one source region, and the URI that resolves it. `rift://element/<language>/<unit-path>@<start>-<end>`, where the offsets are the half-open UTF-8 byte range the element spans — which is what makes it unique, since a region is a place rather than a thing. A revision can be attached as `?rev=`.",
+      "type": "string",
+      "minLength": 18,
+      "maxLength": 1024,
+      "pattern": "^rift://element/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}@\\d+-\\d+(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+      "examples": [
+        "rift://element/python/pkg/util.py@1204-1266"
+      ]
+    },
     "OwnerId": {
       "description": "Identity of one adapter: its LanguageId, '.', and the first 16 hex characters of SHA-256 over the length-prefixed implementation and compiler strings. Both inputs arrive in `hello`, so Rift verifies the value at startup. Compiler configuration and dependencies are excluded because they identify an environment, and the environment is reported separately on every result. Deriving it rather than allocating it means the same adapter build yields the same owner on every machine and across every restart, so cached facts that embed it stay valid.",
       "type": "string",
@@ -544,113 +554,8 @@
         }
       ]
     },
-    "TypeComponent": {
-      "type": "object",
-      "required": [
-        "role",
-        "type"
-      ],
-      "properties": {
-        "role": {
-          "type": "string"
-        },
-        "type": {
-          "$ref": "#/$defs/SymbolId"
-        }
-      },
-      "additionalProperties": false
-    },
-    "Type": {
-      "description": "Opaque language-owned semantic type, named by the same SymbolId as every other entity. Rift displays and routes it but never decides equality, assignability, members, or overload selection.",
-      "type": "object",
-      "required": [
-        "id",
-        "display",
-        "kind",
-        "facets",
-        "components",
-        "members",
-        "extensions"
-      ],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/SymbolId"
-        },
-        "display": {
-          "type": "string"
-        },
-        "kind": {
-          "$ref": "#/$defs/ExactKind"
-        },
-        "facets": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/TypeFacet"
-          }
-        },
-        "symbol": {
-          "$ref": "#/$defs/ResolvedEntityTarget"
-        },
-        "components": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TypeComponent"
-          }
-        },
-        "members": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TypeMember"
-          }
-        },
-        "extensions": {
-          "$ref": "#/$defs/Extensions"
-        }
-      },
-      "additionalProperties": false
-    },
-    "TypeMember": {
-      "description": "One member of a Type, including anonymous structural types whose members have no standalone Symbol.",
-      "type": "object",
-      "required": [
-        "name",
-        "display",
-        "types",
-        "signatures",
-        "extensions"
-      ],
-      "properties": {
-        "name": {
-          "type": "string",
-          "maxLength": 4096
-        },
-        "display": {
-          "type": "string"
-        },
-        "symbol": {
-          "$ref": "#/$defs/ResolvedEntityTarget"
-        },
-        "types": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TypeBinding"
-          }
-        },
-        "signatures": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Signature"
-          }
-        },
-        "extensions": {
-          "$ref": "#/$defs/Extensions"
-        }
-      },
-      "additionalProperties": false
-    },
     "TypeExpression": {
-      "description": "Language source spelling plus optional compiler-resolved Type identity. Edit intent may introduce an unresolved spelling; analyzed facts provide resolved when coverage permits.",
+      "description": "How a type is written in the source, plus the symbol that declares it when one does. A type with a declaration resolves to that symbol; a structural type — `string | null`, `{ a: string }` — has the spelling and nothing to resolve to.",
       "type": "object",
       "required": [
         "language",
@@ -910,21 +815,6 @@
       ],
       "description": "One portable category a symbol falls into. Kinds are language-specific; facets are shared, so a filter written once applies to every language an adapter is installed for."
     },
-    "TypeFacet": {
-      "enum": [
-        "named",
-        "anonymous",
-        "callable",
-        "union",
-        "intersection",
-        "tuple",
-        "record",
-        "literal",
-        "parameter",
-        "inferred",
-        "unknown"
-      ]
-    },
     "ExactKind": {
       "description": "An adapter-owned namespaced kind preserving exact language meaning.",
       "type": "string",
@@ -1046,30 +936,6 @@
       },
       "additionalProperties": false
     },
-    "TypeKindDescriptor": {
-      "type": "object",
-      "required": [
-        "entity",
-        "kind",
-        "facets"
-      ],
-      "properties": {
-        "entity": {
-          "const": "type"
-        },
-        "kind": {
-          "$ref": "#/$defs/ExactKind"
-        },
-        "facets": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/TypeFacet"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
     "KindDescriptor": {
       "oneOf": [
         {
@@ -1080,9 +946,6 @@
         },
         {
           "$ref": "#/$defs/RelationshipKindDescriptor"
-        },
-        {
-          "$ref": "#/$defs/TypeKindDescriptor"
         }
       ]
     },
@@ -1639,7 +1502,7 @@
       "additionalProperties": false
     },
     "Element": {
-      "description": "Language-owned structural source region. Exact kind preserves language meaning; facets provide portable queries.",
+      "description": "One region of source text, owned by the language that produced it. A symbol is a thing; an element is a place where that thing is written. One symbol has one identity and as many elements as it has occurrences.",
       "type": "object",
       "required": [
         "id",
@@ -1654,7 +1517,8 @@
       ],
       "properties": {
         "id": {
-          "$ref": "#/$defs/SymbolId"
+          "description": "Unique identifier of this source region, and the URI that resolves it.",
+          "$ref": "#/$defs/ElementId"
         },
         "unit": {
           "$ref": "#/$defs/SourceUnitRef"
@@ -1682,7 +1546,8 @@
           }
         },
         "parent": {
-          "$ref": "#/$defs/SymbolId"
+          "description": "The region this one is nested inside. Absent at the top level of a unit.",
+          "$ref": "#/$defs/ElementId"
         },
         "types": {
           "type": "array",

@@ -651,7 +651,6 @@
         "source_maps",
         "elements",
         "relationships",
-        "types",
         "source",
         "diagnostics",
         "coverage",
@@ -688,12 +687,6 @@
           "type": "array",
           "items": {
             "$ref": "core.json#/$defs/Relationship"
-          }
-        },
-        "types": {
-          "type": "array",
-          "items": {
-            "$ref": "core.json#/$defs/Type"
           }
         },
         "source": {
