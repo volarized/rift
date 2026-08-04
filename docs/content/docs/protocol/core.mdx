@@ -1,0 +1,197 @@
+---
+title: Core model
+description: What Rift reads, in the order it reads it — and why each piece exists.
+---
+
+import { CoreReference } from "@/components/protocol/core";
+
+Rift answers questions about code, and it changes code on request. Before it can do either, it has to
+agree with you on what "your code" even means right now: which files, at which moment, understood by
+which compiler.
+
+That agreement is this document. Everything below is one link in a chain, and each link exists because
+the one before it left a question open. Read it top to bottom once, and the type reference at the end
+stops looking like 158 unrelated names.
+
+## The chain, in one paragraph
+
+You point Rift at **one checkout of one repository**. It pins **one commit**, so nothing shifts under you
+mid-question. It reads the **files** in that commit. It hands them to a **language adapter** — a real
+compiler, wrapped — which reports what it found: the **symbols** in your code, the **places** each one
+appears, the **types** they carry, and the **relationships** between them. Every one of those gets **one
+ID**. And because a compiler cannot always see everything, each answer carries its **coverage**: how much
+of it Rift actually knows.
+
+## One checkout, called a leaf
+
+Rift needs to know which repository you mean, and which working copy of it. Two people can have the same
+repository checked out twice, on different branches, and those are genuinely different worlds — a symbol
+that exists in one may not exist in the other.
+
+So Rift binds a session to exactly one of them. The schema calls it a `LeafId`. The name is not
+especially descriptive; the idea is: *this repository, this checkout, nothing else*.
+
+**Why it exists.** Without it, "where is `parse_config` defined?" has no single answer. With it, the
+question is always asked of one specific world.
+
+**Example.** You open two terminals on the same repository — one on `main`, one on a feature branch.
+Those are two leaves. A preview built in one is meaningless in the other, and Rift will tell you so
+rather than guess.
+
+## One moment, called a revision
+
+Code changes while you are reading it. If Rift answered one question against Tuesday's code and the next
+against Wednesday's, you could not trust either answer, and you would not be told.
+
+So every read pins a commit. Ask the same question twice against the same commit and you get byte-identical
+answers, forever.
+
+**Why it exists.** An agent that asks "what calls this?" and then "rename it everywhere" needs both
+operations to see the same code. Otherwise it renames things it never looked at.
+
+**Example.** You pin commit `a1b2c3`. Someone else pushes twenty commits. Your next `search` still answers
+about `a1b2c3`, because that is what you asked about.
+
+## A commit is not enough, though
+
+Here is the part that surprises people. Pinning a commit pins your *bytes*. It does not pin what those
+bytes *mean*.
+
+The same file means different things to a compiler depending on which dependencies are installed, which
+compiler version is running, and which feature flags are on. Upgrade a dependency without touching a
+single line, and the set of symbols in your project genuinely changes.
+
+So Rift pins a second thing alongside the commit: the **semantic snapshot**, which identifies the
+environment that produced the meaning. The pair is what makes an answer reproducible.
+
+**Why it exists.** So "no results" never quietly means "I was looking at a different world than you were."
+
+**Example.** `import pandas` resolves to a real library on Monday. On Tuesday the virtual environment is
+gone. Same commit, same bytes — different meaning, and Rift says so instead of reporting that the symbol
+vanished.
+
+## The files, and what Rift refuses to do with them
+
+Rift reads the complete tree of the pinned commit, not just the files that happen to be on disk. A sparse
+checkout still gets the whole picture.
+
+Some entries are deliberately opaque. A symlink is an entry with a target, not a door Rift walks through.
+A submodule pointer is a reference to another repository, not that repository's contents. A Git LFS file
+is a pointer, and Rift reports the pointer rather than pretending to have fetched the real bytes.
+
+**Why it exists.** Every one of those is a place where a tool could silently give you the wrong file. Rift
+would rather hand you a typed "this is a pointer" than a plausible-looking answer about content it never
+read.
+
+**Example.** Ask for a 2 GB model checkpoint tracked in LFS. You get the pointer, its object ID, and its
+size. You do not get 2 GB of text that was never downloaded.
+
+## The adapter: a real compiler, wrapped
+
+Rift does not parse your code. Parsing gets you shapes; it does not get you meaning. Whether `save()` on
+line 40 is the same `save()` as the one on line 900 is a question only a type checker can answer.
+
+So each language gets an adapter: a small process that wraps that language's actual compiler and reports
+what it found in a fixed JSON shape. TypeScript's adapter runs the TypeScript compiler. Rust's runs
+`rust-analyzer`. Rift itself stays language-agnostic and never learns what a trait is.
+
+**Why it exists.** It is the difference between "there are twelve things called `save` in this repository"
+and "there is one `save` you meant, and here are its nine call sites."
+
+**Example.** Two classes both define `close()`. A text search finds both. The adapter knows which one your
+cursor is on, and only that one gets renamed.
+
+## Symbol: a thing in your code that has an identity
+
+A symbol is a thing your code names and can refer to elsewhere — a function, a class, a constant, a
+method. The important word is *identity*. A symbol stays itself when you rename it, move it to another
+file, or change its body.
+
+**Why it exists.** Because "the same thing" and "the same text" are not the same question, and almost every
+useful operation needs the first one.
+
+**Example.** You move `parse_config` from `utils.py` to `config.py` and rename it to `load_config`. Same
+symbol throughout. Its call sites followed it because they were bound to the symbol, not to the string.
+
+## Element: where that thing appears
+
+If a symbol is *what*, an element is *where*. One symbol has one identity and many elements: the line that
+declares it, and every line that mentions it.
+
+**Why it exists.** Editing happens at places, not at identities. To rename something you need every
+location that names it — including the ones you would never have grepped for.
+
+**Example.** `load_config` has one declaring element in `config.py` and eleven referring elements across
+six files. Rename touches twelve places, and Rift can tell you all twelve before you commit to anything.
+
+## Type: what the compiler knows about shape
+
+Types are reported as the language defines them, not flattened into a common denominator. A Rust trait, a
+Go interface, a Python protocol, and a Java interface are related ideas, and they are not the same idea.
+Rift keeps each language's own word for it.
+
+**Why it exists.** The moment you flatten `trait` and `interface` into "interface-like thing", you have
+quietly made every answer about either one slightly wrong.
+
+**Example.** Ask what `Display` is in a Rust project. You get "trait", because that is what it is — not
+"interface (approximately)".
+
+## Relationship: how two things connect
+
+Calls. Implements. Imports. Reads. Writes. A relationship is a typed edge between two things, and it is
+what turns a list of symbols into something you can actually navigate.
+
+**Why it exists.** "Find usages" and "what breaks if I delete this" are both relationship questions. So is
+every safe refactor.
+
+**Example.** Before deleting `LegacyClient`, ask what points at it. Three call sites and one subclass. Now
+deleting it is a decision instead of a gamble.
+
+## One ID for all of it
+
+Symbols, elements, types — each gets a single identifier, the `GlobalEntityId`. One scheme, everywhere: in
+facts, in edit targets, in resource URIs.
+
+**Why it exists.** A second ID scheme means a translation table, and a translation table is a place where
+two names for one thing can drift apart. There is no second scheme.
+
+**Example.** The ID you got back from `search` is the ID you pass to `apply`, and it is the ID in the URI
+you hand to another agent. No conversion, no lookup.
+
+## Coverage: how much of this we actually know
+
+This is the part most tools leave out, and it is the part that decides whether you can trust anything
+above.
+
+Compilers do not always see everything. A dependency might be missing. A file might use a language feature
+the adapter does not support yet. Dynamic dispatch might make a call site genuinely unknowable.
+
+So every answer says which of four things it is: **complete** — I looked everywhere and this is all of it;
+**partial** — I looked, and some of it I could not read; **unsupported** — I do not do this for this
+language; **inapplicable** — this question does not mean anything here.
+
+**Why it exists.** An empty list is a fine answer when coverage is complete, and a dangerous one otherwise.
+"No usages found" and "no usages exist" are different sentences, and only one of them makes it safe to
+delete the function.
+
+**Example.** You ask for usages of `handle_event`. You get none, and coverage says *partial* — one file
+failed to compile. Rift is telling you not to delete it yet.
+
+## Then: changing code
+
+Reading is half the model. The other half is that every change goes down one path, whether it came from a
+person, an agent, or a generator.
+
+You describe the change you want. Rift resolves it against the compiler into an exact list of edits and
+hands you a **preview** — the plan, the diff, the warnings, and the compiler's verdict, with nothing
+written anywhere yet. If you publish it, Rift reruns the entire check and commits the result in a single
+atomic step. If the code moved underneath you in the meantime, publishing is refused rather than applied
+to something you never previewed.
+
+**Why it exists.** So "the compiler was happy with this" is a fact recorded next to the change, rather than
+something you hope was true a minute ago.
+
+**Example.** Rename a widely used method. The preview shows 340 edits across 52 files, one warning about a
+string that mentions the old name, and a clean compile. You publish, and all 340 land together or none do.
+
+<CoreReference />

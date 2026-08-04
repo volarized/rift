@@ -1,0 +1,21 @@
+---
+title: MCP surface
+description: The five tools and five resources an agent calls, with the exact shape of what goes in and what comes back.
+---
+
+import { McpReference } from "@/components/protocol/mcp";
+
+This is what an agent actually talks to. Five tools it can call, five resources it can read, and one
+error shape they all fail with.
+
+Two habits run through every one of them, and they are worth knowing before you read any single tool.
+
+**Nothing is implicit.** Every read names the commit it is asking about and the semantic snapshot that
+gives those bytes meaning. There is no "current state" to race against — if you did not say which moment
+you meant, the request is not answerable, and Rift says so rather than picking one for you.
+
+**Nothing is lossy about failure.** When something cannot be done, you get a typed refusal with a stable
+code, a retry direction, and the evidence behind it. A refusal is a value you can act on, not an exception
+you have to parse a sentence out of.
+
+<McpReference />

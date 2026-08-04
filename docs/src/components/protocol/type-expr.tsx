@@ -1,10 +1,15 @@
 import { Fragment, type ReactNode } from "react";
 import { branches, refName, type Schema, sub } from "@/lib/protocol";
+import { hrefFor } from "@/lib/protocol-surface";
 
-/** An in-page link to a definition's heading. */
+/**
+ * A link to wherever a definition's heading lives. Each definition is rendered
+ * once, on the page for the document that owns it, so a type used by both the
+ * MCP surface and the adapter wire resolves to the same anchor from either.
+ */
 export function TypeLink({ name }: { name: string }): ReactNode {
   return (
-    <a href={`#${name}`} className="font-mono text-[0.875em] no-underline hover:underline">
+    <a href={hrefFor(name)} className="font-mono text-[0.875em] no-underline hover:underline">
       {name}
     </a>
   );

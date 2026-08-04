@@ -7,6 +7,7 @@
     "description": "The schema's entry points. Every other definition is reachable from at least one of these seams; shared vocabulary such as GlobalEntityId and Address is deliberately reachable from several.",
     "mcp.tools": {
       "search": {
+        "description": "Find things. You can search by text, or by what the compiler knows — every symbol that implements a given trait, every function carrying an error, everything a file imports. Filters nest, so \"callers of `parse_config` that live under `src/api`\" is one query rather than three. Results come back in a stated order with a cursor you can replay, and they tell you how much of the repository Rift could actually see.",
         "params": {
           "$ref": "#/$defs/SearchParams"
         },
@@ -15,6 +16,7 @@
         }
       },
       "match": {
+        "description": "Find exact places rather than whole files. Rift runs literal and regular-expression matching itself, over any text file, whether a language adapter owns it or not. Structural matching — \"every call to this method that passes two arguments\" — goes to the language's compiler instead, because only the compiler knows what a call really is. Either way every match gets a stable ID, so you can pick the ones you want and edit exactly those.",
         "params": {
           "$ref": "#/$defs/MatchParams"
         },
@@ -23,6 +25,7 @@
         }
       },
       "actions": {
+        "description": "Ask the compiler what it can offer at one spot in the code: the quick fixes and refactors an IDE would show you in a lightbulb menu. The list is pinned to a snapshot, so an action you found is still the same action when you apply it. If the code moved in between, applying it is refused rather than guessed at.",
         "params": {
           "$ref": "#/$defs/ActionsParams"
         },
@@ -31,6 +34,7 @@
         }
       },
       "apply": {
+        "description": "The only way anything changes. You describe the edit you want; Rift works it out against the compiler and hands back a preview — the exact list of edits, the diff, the warnings, and whether it still compiles — with nothing written anywhere yet. Publishing reruns the entire check and commits in one atomic step. If the code moved while you were deciding, publishing is refused instead of applied to something you never looked at.",
         "params": {
           "$ref": "#/$defs/ApplyParams"
         },
@@ -39,6 +43,7 @@
         }
       },
       "persist": {
+        "description": "Write an accepted change out to the files on disk. This is deliberately a separate step from publishing: Rift records the change first and touches your working copy second, so a crash between the two costs you a file copy rather than a transaction. It is also the one call that will not infer which checkout you meant — you have to say.",
         "params": {
           "$ref": "#/$defs/PersistParams"
         },
@@ -49,6 +54,7 @@
     },
     "mcp.resources": {
       "repository": {
+        "description": "Start here. This says what Rift can do for this repository right now: which languages have adapters, what those adapters actually support, which snapshot is current, what the size limits are, how long previews are kept. Every other call assumes you have read it, because this is where you find out what is worth asking for.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -60,6 +66,7 @@
         }
       },
       "symbol": {
+        "description": "Everything Rift knows about one symbol, in one place — where it is declared, everywhere it appears, its type, what it connects to, and any errors on it. This is the view you want before renaming or deleting something.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -71,6 +78,7 @@
         }
       },
       "preview": {
+        "description": "A change that has been fully worked out but not applied: the plan, the exact edits, the diff, the warnings, and the compiler's verdict. It has a URI, so you can hand it to a colleague or to another agent and they see precisely what you saw.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -82,6 +90,7 @@
         }
       },
       "diff": {
+        "description": "What changed between two commits — text, binary, and the tree itself. This is plain Git information, so it needs no compiler and no semantic snapshot.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -93,6 +102,7 @@
         }
       },
       "blob": {
+        "description": "The exact bytes of one file, as Git stored them. No formatting, no truncation, no interpretation. There is a size limit, because handing an agent a 200 MB file helps nobody.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },

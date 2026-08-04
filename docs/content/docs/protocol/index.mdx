@@ -1,0 +1,32 @@
+---
+title: Protocol
+description: The contract Rift implements — one shared model, one agent-facing surface, one language-adapter wire.
+---
+
+import { Card, Cards } from "fumadocs-ui/components/card";
+
+The protocol is three documents, and the split is not filing: it is the shape of the system.
+
+`core.json` is the model — what Rift reads and what it can say about it. Both of the other two are
+defined in terms of it, and neither is defined in terms of the other. `mcp.json` is the surface an agent
+calls. `adapter.json` is the wire a language's compiler answers on.
+
+If you are reading this for the first time, read them in that order. The model page is a chain: each idea
+exists because the one before it left a question open, and once you have that chain, the other two pages
+are mostly a matter of looking things up.
+
+<Cards>
+  <Card title="Core model" href="/docs/protocol/core" description="What Rift reads, in the order it reads it. Start here." />
+  <Card title="MCP surface" href="/docs/protocol/mcp" description="The five tools and five resources an agent calls." />
+  <Card title="Adapter wire" href="/docs/protocol/adapter" description="How the server talks to one language's compiler." />
+</Cards>
+
+## Why the schemas are the source
+
+The three JSON Schema documents are normative, and these pages render them directly. There is no
+generated file in between and no step that could be skipped: change a schema and the page changes with
+it, or the build fails.
+
+That matters more than it sounds. A protocol reference that drifts from the protocol is worse than no
+reference, because it is confidently wrong. The only prose written by hand here is the part the schema
+genuinely cannot state about itself — why a concept exists, and what it looks like in practice.

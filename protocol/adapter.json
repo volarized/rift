@@ -2201,6 +2201,7 @@
       "additionalProperties": false
     },
     "SyncBeginRequest": {
+      "description": "Open an update. Only one can be open per mirror at a time, which is why the mirror itself identifies the transaction and there is no separate transaction ID to keep track of.",
       "type": "object",
       "required": [
         "type",
@@ -2225,6 +2226,7 @@
       "additionalProperties": false
     },
     "SyncUnitRequest": {
+      "description": "Send one chunk of one file's text. Large files arrive as several of these, in order.",
       "type": "object",
       "required": [
         "type",
@@ -2253,6 +2255,7 @@
       "additionalProperties": false
     },
     "SyncMapRequest": {
+      "description": "Tell the adapter that one file was generated from another, so a position in the generated code can be traced back to the line you actually wrote.",
       "type": "object",
       "required": [
         "type",
@@ -2281,6 +2284,7 @@
       "additionalProperties": false
     },
     "SyncRemoveRequest": {
+      "description": "Drop a file from the mirror as part of the open update.",
       "type": "object",
       "required": [
         "type",
@@ -2309,6 +2313,7 @@
       "additionalProperties": false
     },
     "SyncCommitRequest": {
+      "description": "Close the update, and report the environment it produced — compiler version, dependencies, configuration. Rift checks that against what it expected rather than taking it on trust, which is how a change that alters the build gets confirmed instead of guessed at.",
       "type": "object",
       "required": [
         "type",
@@ -2333,6 +2338,7 @@
       "additionalProperties": false
     },
     "SyncAbortRequest": {
+      "description": "Throw the open update away. The mirror stays exactly as it was before it started.",
       "type": "object",
       "required": [
         "type",
@@ -2357,6 +2363,7 @@
       "additionalProperties": false
     },
     "AnalyzeRequest": {
+      "description": "Read the code and tell us what is in it: symbols, where they appear, how they connect, and where the compiler could not see. Answers stream, because a large repository produces more than fits comfortably in one message. The important property is that this is repeatable — same snapshot, same answers, byte for byte. That is what lets Rift treat its own fact store as a cache it can throw away and rebuild rather than a second source of truth.",
       "type": "object",
       "required": [
         "type",
@@ -2381,6 +2388,7 @@
       "additionalProperties": false
     },
     "MatchRequest": {
+      "description": "Find code by shape rather than by text — a call with two arguments, a function with a particular return type. Only the compiler can answer this, because only the compiler knows what those things are. Results stream back with their captures and the ranges an edit would replace.",
       "type": "object",
       "required": [
         "type",
@@ -2405,6 +2413,7 @@
       "additionalProperties": false
     },
     "ResolveRequest": {
+      "description": "Turn an intent — rename this, extract that — into the exact edits it implies, including the ones in other languages. A change in TypeScript can require an edit in generated code owned by somebody else, and this is where that gets worked out rather than assumed.",
       "type": "object",
       "required": [
         "type",
@@ -2429,6 +2438,7 @@
       "additionalProperties": false
     },
     "ActionsRequest": {
+      "description": "List the fixes and refactors the compiler can offer at one spot. Rift passes the description on to callers but keeps the adapter's internal handle to itself, so nobody outside can hold a reference into the compiler's state.",
       "type": "object",
       "required": [
         "type",
@@ -2453,6 +2463,7 @@
       "additionalProperties": false
     },
     "ValidateRequest": {
+      "description": "Compile it and tell us honestly whether it worked: every file checked, every diagnostic found. A partial answer here is treated as a broken adapter, not as a passing result — a change that cannot be verified is never recorded as verified.",
       "type": "object",
       "required": [
         "type",
@@ -2477,6 +2488,7 @@
       "additionalProperties": false
     },
     "ContextRequest": {
+      "description": "Gather what a code generator needs to know about one location: what is in scope, what the surrounding types are, what the compiler already understands about the spot.",
       "type": "object",
       "required": [
         "type",
@@ -2501,6 +2513,7 @@
       "additionalProperties": false
     },
     "FrontierRequest": {
+      "description": "Ask what could legally come next at a cursor position. Useful when something is generating code and you would rather constrain it up front than reject it afterwards.",
       "type": "object",
       "required": [
         "type",
@@ -2525,6 +2538,7 @@
       "additionalProperties": false
     },
     "CheckRequest": {
+      "description": "Check a draft that is not a real change yet. Errors and suggested fixes come back, nothing is recorded, and no transaction is opened — this is the fast loop for something still being written.",
       "type": "object",
       "required": [
         "type",
@@ -2549,6 +2563,7 @@
       "additionalProperties": false
     },
     "CancelRequest": {
+      "description": "Stop a request that is still running. Sync transactions are not cancelled this way; they use `sync.abort`.",
       "type": "object",
       "required": [
         "type",
@@ -3380,6 +3395,7 @@
       "additionalProperties": false
     },
     "MirrorOpenRequest": {
+      "description": "Give me somewhere to put the code. An adapter cannot read your repository — that is the point — so Rift opens a mirror and fills it. Opening returns an empty handle: until content is synced there is no environment, and so nothing to answer questions about. Opening against an existing mirror instead gives you a cheap child that shares its parent's content and holds only the difference.",
       "type": "object",
       "required": [
         "type",
@@ -3404,6 +3420,7 @@
       "additionalProperties": false
     },
     "MirrorReleaseRequest": {
+      "description": "Throw a mirror away. Nothing is reclaimed automatically, so this has to be called, and it has to go bottom-up — releasing a base that still has children hanging off it is refused.",
       "type": "object",
       "required": [
         "type",
@@ -3662,6 +3679,7 @@
       ]
     },
     "MirrorPromoteRequest": {
+      "description": "A change was published, so the child that held it is now the truth. Promote re-roots it as the base for that tree. Skip this and every sequential edit starts with a cold compile — which is the most likely way a correct implementation still ends up unusably slow.",
       "type": "object",
       "required": [
         "type",
