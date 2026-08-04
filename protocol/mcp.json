@@ -546,7 +546,7 @@
     "SymbolResourceUri": {
       "description": "Paginated Symbol URI. The GlobalEntityId alphabet is URL-safe, so the identity path segment needs no encoding rule. Code snapshot, semantic snapshot, leaf, and cursor are query arguments.",
       "type": "string",
-      "pattern": "^rift://symbol/[A-Za-z0-9_-]{1,512}(\\?(leaf=[A-Za-z0-9_-]{1,128}&)?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?(&cursor=[^&#]+)?)?$"
+      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?(leaf=[A-Za-z0-9_-]{1,128}&)?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?(&cursor=[^&#]+)?)?$"
     },
     "SymbolResourceLink": {
       "description": "A portable link to the symbol resource. Rift always emits the explicit leaf form.",

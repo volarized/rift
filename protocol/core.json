@@ -19,7 +19,7 @@
       "pattern": "^[0-9a-f]{64}$"
     },
     "SemanticSnapshotDigest": {
-      "description": "SHA-256 of the SemanticSnapshotKey's tree and environment fields in RFC 8785 canonical JSON, used as the compact public pin for semantic reads and planning.",
+      "description": "SHA-256 over the resolved revision's tree and the environment that gave it meaning, in RFC 8785 canonical JSON. A compact pin for the exact state an answer came from.",
       "$ref": "#/$defs/Sha256Digest"
     },
     "GitOid": {
@@ -35,7 +35,7 @@
       "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
     },
     "OwnerId": {
-      "description": "Derived owner identity for one adapter: its LanguageId, '.', and the first 16 hex characters of SHA-256 over the length-prefixed implementation and compiler strings. Both inputs are present in hello, so Rift can verify the value at startup. Compiler configuration and dependencies are deliberately excluded: they identify an environment, not an adapter, and they already move the SemanticSnapshotKey. Derived rather than allocated, so the same adapter build yields the same owner on every machine and across every restart, and cached facts that embed it stay valid.",
+      "description": "Identity of one adapter: its LanguageId, '.', and the first 16 hex characters of SHA-256 over the length-prefixed implementation and compiler strings. Both inputs arrive in `hello`, so Rift verifies the value at startup. Compiler configuration and dependencies are excluded because they identify an environment, and the environment is reported separately on every result. Deriving it rather than allocating it means the same adapter build yields the same owner on every machine and across every restart, so cached facts that embed it stay valid.",
       "type": "string",
       "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
       "maxLength": 96
@@ -47,7 +47,7 @@
       "maxLength": 64
     },
     "LocalId": {
-      "description": "Opaque adapter-minted identity, restricted to printable ASCII so that its character length and its UTF-8 byte length are the same number — JSON Schema maxLength counts code points, and a 192-code-point emoji id would occupy 768 bytes and encode past GlobalEntityId's bound. Entities never use it directly: Rift and adapters encode it with the owner into a GlobalEntityId. It survives only as the address component of a virtual source unit, which is a location rather than an entity.",
+      "description": "An adapter-minted address for one virtual source unit — a location the adapter produced rather than read from disk. Restricted to printable ASCII so its character length and its UTF-8 byte length are the same number, since JSON Schema counts code points. Entities are addressed by GlobalEntityId; this addresses a unit.",
       "type": "string",
       "pattern": "^[\\x21-\\x7E]{1,192}$"
     },
@@ -1429,9 +1429,9 @@
         "id": {
           "$ref": "#/$defs/GlobalEntityId",
           "examples": [
-            "dHlwZXNjcmlwdC5hOWY0MmIxYy5wYXJzZUNvbmZpZw"
+            "typescript/src/config.ts:ConfigLoader.parse"
           ],
-          "description": "Unique identifier of this symbol across the whole workspace. Opaque, and the value every other call takes when it means this symbol."
+          "description": "Unique identifier of this symbol across the whole workspace, readable as `<language>/<unit-path>:<symbol-path>`. Every other call takes this value when it means this symbol."
         },
         "language": {
           "description": "The language this symbol belongs to.",
@@ -1478,7 +1478,7 @@
         "container": {
           "$ref": "#/$defs/GlobalEntityId",
           "examples": [
-            "dHlwZXNjcmlwdC5hOWY0MmIxYy5Db25maWdMb2FkZXI"
+            "typescript/src/config.ts:ConfigLoader"
           ],
           "description": "The symbol this one is declared inside — the class that owns a method, the module that owns a function. Absent at the top level."
         },
@@ -1901,9 +1901,16 @@
       "additionalProperties": false
     },
     "GlobalEntityId": {
-      "description": "The single canonical entity identity: the URL-safe encoding of the owning adapter and that adapter's local identity, global within one leaf and one SemanticSnapshotKey. Opaque to callers and a valid URI path segment as written, so no encoding rule can be disagreed about. Length is total by construction: OwnerId and LocalId are both ASCII-only, so 96 + 1 + 192 characters are exactly 289 bytes and encode to 386 base64url characters, inside the 512 bound. Future federation qualifies it with a ProjectPin rather than changing the ID.",
+      "description": "Identity of one entity, unique across the workspace, and composed so that reading it tells you where the entity is: the language, the unit it is declared in, and its path inside that unit.\n\n`<language>/<unit-path>:<symbol-path>` — for example `typescript/src/config.ts:ConfigLoader.parse`. The symbol path is the chain of containers ending in the name, joined by `.`, so a method reads as its class then itself. Where one unit declares two entities that would otherwise write the same, the adapter appends `~` and an index: `python/pkg/util.py:load_config~1`.\n\nThe language prefix is what keeps two adapters apart, so one workspace runs one adapter per language. The value contains `/` and is therefore the whole path remainder of a symbol resource URI rather than a single segment; `?` and `#` are excluded so the query and fragment delimiters stay unambiguous.",
       "type": "string",
-      "pattern": "^[A-Za-z0-9_-]{1,512}$"
+      "minLength": 3,
+      "maxLength": 1024,
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}$",
+      "examples": [
+        "typescript/src/config.ts:ConfigLoader.parse",
+        "rust/src/lib.rs:Config",
+        "python/pkg/util.py:load_config~1"
+      ]
     },
     "PublicSymbolTarget": {
       "type": "object",

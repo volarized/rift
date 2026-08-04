@@ -685,7 +685,7 @@
       "$ref": "#/$defs/MirrorScopedInput"
     },
     "AnalyzeEnd": {
-      "description": "Terminates an analyze stream. digest covers canonical AnalysisShard bodies in sequence order. Analyze is rerun-equal: the same SemanticSnapshotKey yields the same facts, coverage and digest, which is what makes the fact store a rebuildable cache rather than a second source of truth. Two runs at one key that disagree are adapter nonconformance.",
+      "description": "Analyze is rerun-equal: the same revision under the same environment yields the same facts, the same coverage and the same digest, which is what makes the fact store a rebuildable cache rather than a second source of truth.",
       "type": "object",
       "required": [
         "state",
