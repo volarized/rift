@@ -1093,18 +1093,18 @@
       "type": "object",
       "required": [
         "ref",
-        "owner",
+        "language",
         "descriptor"
       ],
       "properties": {
         "ref": {
           "$ref": "core.json#/$defs/PublicCodeActionRef"
         },
-        "owner": {
-          "$ref": "core.json#/$defs/OwnerId"
-        },
         "descriptor": {
           "$ref": "core.json#/$defs/CodeActionDescriptor"
+        },
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
         }
       },
       "additionalProperties": false
@@ -1256,7 +1256,7 @@
       "required": [
         "kind",
         "ref",
-        "owner",
+        "language",
         "span",
         "replacement_ranges",
         "captures",
@@ -1266,9 +1266,6 @@
       "properties": {
         "ref": {
           "$ref": "core.json#/$defs/PublicMatchRef"
-        },
-        "owner": {
-          "$ref": "core.json#/$defs/OwnerId"
         },
         "span": {
           "$ref": "core.json#/$defs/SourceSpan"
@@ -1294,6 +1291,9 @@
         },
         "kind": {
           "const": "structural"
+        },
+        "language": {
+          "$ref": "core.json#/$defs/LanguageId"
         }
       },
       "additionalProperties": false

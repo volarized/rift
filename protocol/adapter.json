@@ -36,7 +36,7 @@
       "description": "Any source or auxiliary input addressable inside an adapter mirror.",
       "oneOf": [
         {
-          "$ref": "core.json#/$defs/SourceUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         {
           "$ref": "#/$defs/AuxiliaryUnitRef"
@@ -75,7 +75,7 @@
       ],
       "properties": {
         "ref": {
-          "$ref": "core.json#/$defs/PhysicalUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "regions": {
           "type": "array",
@@ -104,7 +104,7 @@
       ],
       "properties": {
         "ref": {
-          "$ref": "core.json#/$defs/VirtualUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "language": {
           "$ref": "core.json#/$defs/LanguageId"
@@ -201,7 +201,7 @@
           "$ref": "core.json#/$defs/MirrorId"
         },
         "unit": {
-          "$ref": "core.json#/$defs/SourceUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "language": {
           "$ref": "core.json#/$defs/LanguageId"
@@ -281,7 +281,7 @@
           "$ref": "core.json#/$defs/MirrorId"
         },
         "unit": {
-          "$ref": "core.json#/$defs/VirtualUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "items": {
           "type": "array",
@@ -467,7 +467,7 @@
           "const": "virtual_text"
         },
         "unit": {
-          "$ref": "core.json#/$defs/VirtualUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "offset": {
           "type": "integer",
@@ -495,7 +495,7 @@
           "const": "symbols"
         },
         "unit": {
-          "$ref": "core.json#/$defs/SourceUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "items": {
           "type": "array",
@@ -518,7 +518,7 @@
           "const": "source_maps"
         },
         "unit": {
-          "$ref": "core.json#/$defs/SourceUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "items": {
           "type": "array",
@@ -541,7 +541,7 @@
           "const": "leaves"
         },
         "unit": {
-          "$ref": "core.json#/$defs/SourceUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "items": {
           "type": "array",
@@ -564,7 +564,7 @@
           "const": "relationships"
         },
         "unit": {
-          "$ref": "core.json#/$defs/SourceUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "items": {
           "type": "array",
@@ -587,7 +587,7 @@
           "const": "diagnostics"
         },
         "unit": {
-          "$ref": "core.json#/$defs/SourceUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "items": {
           "type": "array",
@@ -612,7 +612,7 @@
           "const": "coverage"
         },
         "unit": {
-          "$ref": "core.json#/$defs/SourceUnitRef"
+          "$ref": "core.json#/$defs/FileId"
         },
         "present": {
           "type": "boolean"
@@ -678,7 +678,7 @@
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "$ref": "core.json#/$defs/SourceUnitRef"
+            "$ref": "core.json#/$defs/FileId"
           }
         }
       },
@@ -1008,7 +1008,7 @@
       ]
     },
     "DeterminismContract": {
-      "description": "Constants every adapter must echo. Paths are project-relative UTF-8 with '/', no empty/'.'/'..' segments, and no normalization. Path sets sort by UTF-8 bytes; other arrays marked uniqueItems sort by each item's RFC 8785 bytes; remaining arrays preserve semantic order. owner_id pins how OwnerId is derived: the adapter's LanguageId, a '.', and the first 16 hex characters of the SHA-256 over its implementation and compiler strings, each prefixed by its little-endian u32 byte length so no separator can be forged across fields. Both inputs appear in hello, so Rift recomputes and refuses a mismatch at startup, before any fact is minted.",
+      "description": "Constants every adapter must echo. Paths are project-relative UTF-8 with '/', no empty/'.'/'..' segments, and no normalization. Path sets sort by UTF-8 bytes; other arrays marked uniqueItems sort by each item's RFC 8785 bytes; remaining arrays preserve semantic order. owner_id pins how LanguageId is derived: the adapter's LanguageId, a '.', and the first 16 hex characters of the SHA-256 over its implementation and compiler strings, each prefixed by its little-endian u32 byte length so no separator can be forged across fields. Both inputs appear in hello, so Rift recomputes and refuses a mismatch at startup, before any fact is minted.",
       "type": "object",
       "required": [
         "canonical_json",

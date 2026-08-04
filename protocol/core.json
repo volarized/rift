@@ -55,28 +55,33 @@
         "rift://leaf/python/pkg/util.py@1204-1266"
       ]
     },
-    "OwnerId": {
-      "description": "Identity of one adapter: its LanguageId, '.', and the first 16 hex characters of SHA-256 over the length-prefixed implementation and compiler strings. Both inputs arrive in `hello`, so Rift verifies the value at startup. Compiler configuration and dependencies are excluded because they identify an environment, and the environment is reported separately on every result. Deriving it rather than allocating it means the same adapter build yields the same owner on every machine and across every restart, so cached facts that embed it stay valid.",
+    "FileId": {
+      "description": "Identity of one source file, and the URI that resolves it. `rift://file/<language>/<path>` — the language whose adapter owns the file, then its project-relative path. A file an adapter produced rather than read from disk is addressed the same way, with the path the producer minted for it, and the source map says what it was generated from. A revision can be attached as `?rev=`.",
       "type": "string",
-      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
-      "maxLength": 96
+      "minLength": 14,
+      "maxLength": 1024,
+      "pattern": "^rift://file/[A-Za-z][A-Za-z0-9._-]*/[A-Za-z0-9._~:/-]{1,1000}(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+      "examples": [
+        "rift://file/python/pkg/util.py",
+        "rift://file/typescript/src/config.ts?rev=main"
+      ]
     },
     "LanguageId": {
-      "description": "A stable language identifier advertised by an adapter and used to route virtual units.",
+      "description": "A language, as its adapter advertises it. One workspace runs one adapter per language, so this also identifies the adapter that owns a file or minted a fact. Which build of that adapter answered is reported by the environment on every result.",
       "type": "string",
       "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
-      "maxLength": 64
-    },
-    "LocalId": {
-      "description": "An adapter-minted address for one virtual source unit — a location the adapter produced rather than read from disk. Restricted to printable ASCII so its character length and its UTF-8 byte length are the same number, since JSON Schema counts code points. Entities are addressed by SymbolId; this addresses a unit.",
-      "type": "string",
-      "pattern": "^[\\x21-\\x7E]{1,192}$"
+      "maxLength": 64,
+      "examples": [
+        "typescript",
+        "rust",
+        "python"
+      ]
     },
     "AdapterEnvironment": {
       "description": "Machine-independent identity of the non-source inputs owned by one adapter. No absolute path may contribute.",
       "type": "object",
       "required": [
-        "owner",
+        "language",
         "fingerprint",
         "implementation",
         "compiler",
@@ -84,9 +89,6 @@
         "dependencies"
       ],
       "properties": {
-        "owner": {
-          "$ref": "#/$defs/OwnerId"
-        },
         "fingerprint": {
           "$ref": "#/$defs/Sha256Digest"
         },
@@ -103,6 +105,9 @@
         },
         "dependencies": {
           "$ref": "#/$defs/Sha256Digest"
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
         }
       },
       "additionalProperties": false
@@ -222,58 +227,6 @@
         "hint"
       ]
     },
-    "PhysicalUnitRef": {
-      "description": "A regular or executable Git file selected for semantic ownership.",
-      "type": "object",
-      "required": [
-        "kind",
-        "owner",
-        "path"
-      ],
-      "properties": {
-        "kind": {
-          "const": "physical"
-        },
-        "owner": {
-          "$ref": "#/$defs/OwnerId"
-        },
-        "path": {
-          "$ref": "#/$defs/ProjectPath"
-        }
-      },
-      "additionalProperties": false
-    },
-    "VirtualUnitRef": {
-      "description": "Address of one adapter-produced virtual source. Units are addressed by owner plus location — a path for physical units, an opaque local id for virtual ones — which is deliberately a different scheme from entity identity, because a unit is not an entity.",
-      "type": "object",
-      "required": [
-        "kind",
-        "owner",
-        "local_id"
-      ],
-      "properties": {
-        "kind": {
-          "const": "virtual"
-        },
-        "owner": {
-          "$ref": "#/$defs/OwnerId"
-        },
-        "local_id": {
-          "$ref": "#/$defs/LocalId"
-        }
-      },
-      "additionalProperties": false
-    },
-    "SourceUnitRef": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/PhysicalUnitRef"
-        },
-        {
-          "$ref": "#/$defs/VirtualUnitRef"
-        }
-      ]
-    },
     "SourceSpan": {
       "type": "object",
       "required": [
@@ -282,7 +235,7 @@
       ],
       "properties": {
         "unit": {
-          "$ref": "#/$defs/SourceUnitRef"
+          "$ref": "#/$defs/FileId"
         },
         "range": {
           "$ref": "#/$defs/TextRange"
@@ -380,7 +333,7 @@
               "const": "unit"
             },
             "unit": {
-              "$ref": "#/$defs/SourceUnitRef"
+              "$ref": "#/$defs/FileId"
             }
           },
           "additionalProperties": false
@@ -1138,7 +1091,7 @@
       "description": "A replaceable compiler-backed language adapter. Core operations are mandatory; generator operations and exact vocabularies are advertised.",
       "type": "object",
       "required": [
-        "owner",
+        "language",
         "implementation",
         "compiler",
         "claims",
@@ -1152,9 +1105,6 @@
         "extensions"
       ],
       "properties": {
-        "owner": {
-          "$ref": "#/$defs/OwnerId"
-        },
         "implementation": {
           "type": "string",
           "maxLength": 4096
@@ -1226,6 +1176,9 @@
         },
         "extensions": {
           "$ref": "#/$defs/Extensions"
+        },
+        "language": {
+          "$ref": "#/$defs/LanguageId"
         }
       },
       "additionalProperties": false
@@ -1511,7 +1464,7 @@
           "$ref": "#/$defs/SymbolId"
         },
         "unit": {
-          "$ref": "#/$defs/SourceUnitRef"
+          "$ref": "#/$defs/FileId"
         },
         "language": {
           "$ref": "#/$defs/LanguageId"
@@ -2325,7 +2278,7 @@
       "type": "object",
       "required": [
         "severity",
-        "owner",
+        "language",
         "code",
         "message",
         "span",
@@ -2338,16 +2291,6 @@
       "properties": {
         "severity": {
           "$ref": "#/$defs/Severity"
-        },
-        "owner": {
-          "oneOf": [
-            {
-              "$ref": "#/$defs/OwnerId"
-            },
-            {
-              "type": "null"
-            }
-          ]
         },
         "code": {
           "type": [
@@ -2400,6 +2343,16 @@
         },
         "extensions": {
           "$ref": "#/$defs/Extensions"
+        },
+        "language": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/LanguageId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
