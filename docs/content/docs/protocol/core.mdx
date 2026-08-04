@@ -36,9 +36,11 @@ Pass those back when two calls have to agree.
 ## Symbol
 
 A symbol is any entity of a given language that carries compiler-provided metadata, at a given revision.
-A function, a class, a constant, a method. A workspace has thousands of them.
+Think of classes, functions or methods as examples of symbols. An arbitrarily large codebase can have
+thousands of them.
 
-Adapters collect that metadata from the codebase, and the rift server keeps it in sync.
+What the rift server does well is indexing those symbols, the relationships between them, and other
+compiler-driven facts — for instance the list of dependants and dependencies.
 
 The full shape is [`Symbol`](#Symbol) in the reference below.
 

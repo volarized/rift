@@ -24,6 +24,11 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
 
   const required = new Set(schema.required ?? []);
 
+  // The column appears only where the schema has something to put in it.
+  // Carrying an empty one across every table would cost width that the type
+  // and description columns need more.
+  const hasExamples = properties.some(([, property]) => (property.examples ?? []).length > 0);
+
   return (
     <div className="my-4 overflow-x-auto">
       <table className="my-0 w-full text-sm">
@@ -31,6 +36,7 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
           <tr>
             <th className="text-left">Property</th>
             <th className="text-left">Type</th>
+            {hasExamples ? <th className="text-left">Examples</th> : null}
             <th className="text-left">Description</th>
           </tr>
         </thead>
@@ -51,6 +57,21 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
                 <td>
                   <TypeExpr schema={property} />
                 </td>
+                {hasExamples ? (
+                  <td>
+                    {(property.examples ?? []).length > 0 ? (
+                      <span className="grid gap-1">
+                        {(property.examples ?? []).map((example) => (
+                          <code key={JSON.stringify(example)} className="text-[0.8em]">
+                            {typeof example === "string" ? example : JSON.stringify(example)}
+                          </code>
+                        ))}
+                      </span>
+                    ) : (
+                      <span className="text-fd-muted-foreground">—</span>
+                    )}
+                  </td>
+                ) : null}
                 <td>
                   {property.description ? <Prose text={property.description} /> : null}
                   {property.description && constraints ? <br /> : null}

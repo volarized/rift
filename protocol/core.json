@@ -9,7 +9,7 @@
       "const": 1
     },
     "Generation": {
-      "description": "A process-local stale-mirror guard, not a durable revision.",
+      "description": "A process-local counter that detects a stale mirror. It advances on every committed sync of that mirror, and is scoped to the process rather than to the repository.",
       "type": "integer",
       "minimum": 0,
       "maximum": 9007199254740991
@@ -1410,7 +1410,6 @@
         "id",
         "language",
         "name",
-        "display_name",
         "kind",
         "facets",
         "origin",
@@ -1424,35 +1423,56 @@
       ],
       "properties": {
         "id": {
-          "$ref": "#/$defs/GlobalEntityId"
+          "$ref": "#/$defs/GlobalEntityId",
+          "examples": [
+            "dHlwZXNjcmlwdC5hOWY0MmIxYy5wYXJzZUNvbmZpZw"
+          ],
+          "description": "The technical identifier. Opaque, stable within one revision, and the value every other call takes when it means this symbol."
         },
         "language": {
           "description": "The language this symbol belongs to.",
-          "$ref": "#/$defs/LanguageId"
+          "$ref": "#/$defs/LanguageId",
+          "examples": [
+            "typescript",
+            "rust"
+          ]
         },
         "name": {
           "type": "string",
-          "maxLength": 4096
-        },
-        "display_name": {
-          "type": "string",
-          "maxLength": 4096
+          "maxLength": 4096,
+          "examples": [
+            "parseConfig"
+          ],
+          "description": "The human name, as written in the source: `parseConfig`. Rendered signatures live in `signatures`."
         },
         "kind": {
-          "$ref": "#/$defs/ExactKind"
+          "$ref": "#/$defs/ExactKind",
+          "examples": [
+            "typescript.function",
+            "rust.trait"
+          ]
         },
         "facets": {
           "type": "array",
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/SymbolFacet"
-          }
+          },
+          "examples": [
+            [
+              "value",
+              "callable"
+            ]
+          ]
         },
         "origin": {
           "$ref": "#/$defs/SymbolOrigin"
         },
         "container": {
-          "$ref": "#/$defs/GlobalEntityId"
+          "$ref": "#/$defs/GlobalEntityId",
+          "examples": [
+            "dHlwZXNjcmlwdC5hOWY0MmIxYy5Db25maWdMb2FkZXI"
+          ]
         },
         "external_identities": {
           "type": "array",
@@ -1466,12 +1486,21 @@
           "uniqueItems": true,
           "items": {
             "type": "string"
-          }
+          },
+          "examples": [
+            [
+              "export",
+              "async"
+            ]
+          ]
         },
         "visibility": {
           "type": [
             "string",
             "null"
+          ],
+          "examples": [
+            "public"
           ]
         },
         "types": {

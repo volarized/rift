@@ -226,7 +226,7 @@
       "additionalProperties": false
     },
     "GitlinkPayload": {
-      "description": "The File.object commit is a repository link, not content in this leaf snapshot.",
+      "description": "A link to another repository, recorded as the commit it points at. `File.object` holds that commit, and Rift neither follows it nor reads the linked repository's content.",
       "type": "object",
       "required": [
         "kind"
