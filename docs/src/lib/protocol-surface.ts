@@ -196,6 +196,147 @@ export const referenceTypes = Object.fromEntries(
 ) as Record<ProtocolFile, string[]>;
 
 // ---------------------------------------------------------------------------
+// The reference, grouped by axis and nested by reference
+// ---------------------------------------------------------------------------
+
+/**
+ * Which axis a type belongs to.
+ *
+ * Seeded from the identifiers, then closed over what each seed reaches. Order
+ * matters: a type reachable from more than one axis is filed under the first
+ * that claims it, and the axes are tried narrowest-first. What no axis reaches
+ * is wire machinery — cursors, coverage, error shapes, adapter frames — and is
+ * grouped as such rather than filed somewhere it does not belong.
+ */
+const AXIS_SEEDS: [string, string[]][] = [
+  [
+    "Temporal",
+    ["GitRevision", "GitOid", "SnapshotRef", "RevisionRef", "SemanticSnapshotDigest", "Timestamp"],
+  ],
+  [
+    "Physical",
+    [
+      "FileId",
+      "File",
+      "Leaf",
+      "LeafId",
+      "TextRange",
+      "ProjectPath",
+      "SourceSpan",
+      "PathSelector",
+      "LeafFacet",
+      "LeafRegion",
+    ],
+  ],
+  [
+    "Semantic",
+    [
+      "SymbolId",
+      "Symbol",
+      "Relationship",
+      "Signature",
+      "TypeExpression",
+      "Documentation",
+      "ExactKind",
+      "SymbolFacet",
+      "SymbolOrigin",
+      "LanguageId",
+    ],
+  ],
+];
+
+export const AXES = [...AXIS_SEEDS.map(([name]) => name), "Protocol", "MCP", "Adapter"] as const;
+
+function outgoing(name: string): string[] {
+  const schema = defs[name];
+  if (!schema) return [];
+  const out = new Set<string>();
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const value of node) walk(value);
+      return;
+    }
+    if (!node || typeof node !== "object") return;
+    const target = refName(node as Schema);
+    if (target) out.add(target);
+    for (const value of Object.values(node)) walk(value);
+  };
+  walk(schema);
+  out.delete(name);
+  return [...out];
+}
+
+export const axisOf: Record<string, string> = (() => {
+  const assigned: Record<string, string> = {};
+  for (const [axis, seeds] of AXIS_SEEDS) {
+    const stack = seeds.filter((s) => s in defs);
+    while (stack.length > 0) {
+      const name = stack.pop() as string;
+      if (assigned[name]) continue;
+      assigned[name] = axis;
+      stack.push(...outgoing(name));
+    }
+  }
+  // What no axis reaches is the wire itself. Grouping that by the document
+  // that defines it says more than one bucket of everything left over.
+  const BY_HOME: Record<string, string> = { core: "Protocol", mcp: "MCP", adapter: "Adapter" };
+  for (const name of defNames) assigned[name] ??= BY_HOME[homeOf[name]] ?? "Protocol";
+  return assigned;
+})();
+
+export interface ReferenceNode {
+  name: string;
+  children: ReferenceNode[];
+}
+
+/**
+ * One tree per axis. A type hangs under the first type that references it, so
+ * reading down a branch follows the model; a flat list of 220 names does not
+ * say which type reaches which.
+ */
+export const referenceTree: Record<string, ReferenceNode[]> = (() => {
+  const trees: Record<string, ReferenceNode[]> = {};
+  for (const axis of AXES) {
+    const members = defNames.filter((n) => axisOf[n] === axis);
+    const inbound = new Map<string, number>(members.map((m) => [m, 0]));
+    for (const name of members) {
+      for (const target of outgoing(name)) {
+        if (inbound.has(target) && target !== name)
+          inbound.set(target, (inbound.get(target) ?? 0) + 1);
+      }
+    }
+    const placed = new Set<string>();
+    const build = (name: string, depth: number): ReferenceNode => {
+      placed.add(name);
+      // Checked inside the loop, not by filtering first: two siblings can both
+      // reference the same type, and a filter that ran to completion would let
+      // each of them claim it.
+      const children: ReferenceNode[] = [];
+      if (depth < 3) {
+        for (const target of outgoing(name)) {
+          if (axisOf[target] === axis && !placed.has(target))
+            children.push(build(target, depth + 1));
+        }
+      }
+      return { name, children };
+    };
+
+    // Roots first, then whatever a root never reached — a cycle has no member
+    // with no inbound edge, so without the second pass those types vanish.
+    // Built one at a time: `placed` has to be current when the next root is
+    // considered, or every type is chosen as a root before any nesting happens.
+    const roots = members.filter((m) => (inbound.get(m) ?? 0) === 0);
+    const order = [...roots, ...members.filter((m) => !roots.includes(m))];
+    const built: ReferenceNode[] = [];
+    for (const name of order) {
+      if (!placed.has(name)) built.push(build(name, 0));
+    }
+    trees[axis] = built;
+  }
+  return trees;
+})();
+
+// ---------------------------------------------------------------------------
 // Per-page table of contents and search index
 // ---------------------------------------------------------------------------
 
@@ -360,131 +501,3 @@ export const pageData: Record<string, PageData> = {
   [pageUrl("core")]: corePage(),
   [`${PROTOCOL_ROOT}/reference`]: referencePage(),
 };
-
-// ---------------------------------------------------------------------------
-// The reference, grouped by axis and nested by reference
-// ---------------------------------------------------------------------------
-
-/**
- * Which axis a type belongs to.
- *
- * Seeded from the identifiers, then closed over what each seed reaches. Order
- * matters: a type reachable from more than one axis is filed under the first
- * that claims it, and the axes are tried narrowest-first. What no axis reaches
- * is wire machinery — cursors, coverage, error shapes, adapter frames — and is
- * grouped as such rather than filed somewhere it does not belong.
- */
-const AXIS_SEEDS: [string, string[]][] = [
-  [
-    "Temporal",
-    ["GitRevision", "GitOid", "SnapshotRef", "RevisionRef", "SemanticSnapshotDigest", "Timestamp"],
-  ],
-  [
-    "Physical",
-    [
-      "FileId",
-      "File",
-      "Leaf",
-      "LeafId",
-      "TextRange",
-      "ProjectPath",
-      "SourceSpan",
-      "PathSelector",
-      "LeafFacet",
-      "LeafRegion",
-    ],
-  ],
-  [
-    "Semantic",
-    [
-      "SymbolId",
-      "Symbol",
-      "Relationship",
-      "Signature",
-      "TypeExpression",
-      "Documentation",
-      "ExactKind",
-      "SymbolFacet",
-      "SymbolOrigin",
-      "LanguageId",
-    ],
-  ],
-];
-
-export const AXES = [...AXIS_SEEDS.map(([name]) => name), "Protocol", "MCP", "Adapter"] as const;
-
-function outgoing(name: string): string[] {
-  const schema = defs[name];
-  if (!schema) return [];
-  const out = new Set<string>();
-  const walk = (node: unknown): void => {
-    if (Array.isArray(node)) {
-      for (const value of node) walk(value);
-      return;
-    }
-    if (!node || typeof node !== "object") return;
-    const target = refName(node as Schema);
-    if (target) out.add(target);
-    for (const value of Object.values(node)) walk(value);
-  };
-  walk(schema);
-  out.delete(name);
-  return [...out];
-}
-
-export const axisOf: Record<string, string> = (() => {
-  const assigned: Record<string, string> = {};
-  for (const [axis, seeds] of AXIS_SEEDS) {
-    const stack = seeds.filter((s) => s in defs);
-    while (stack.length > 0) {
-      const name = stack.pop() as string;
-      if (assigned[name]) continue;
-      assigned[name] = axis;
-      stack.push(...outgoing(name));
-    }
-  }
-  // What no axis reaches is the wire itself. Grouping that by the document
-  // that defines it says more than one bucket of everything left over.
-  const BY_HOME: Record<string, string> = { core: "Protocol", mcp: "MCP", adapter: "Adapter" };
-  for (const name of defNames) assigned[name] ??= BY_HOME[homeOf[name]] ?? "Protocol";
-  return assigned;
-})();
-
-export interface ReferenceNode {
-  name: string;
-  children: ReferenceNode[];
-}
-
-/**
- * One tree per axis. A type hangs under the first type that references it, so
- * reading down a branch follows the model; a flat list of 220 names does not
- * say which type reaches which.
- */
-export const referenceTree: Record<string, ReferenceNode[]> = (() => {
-  const trees: Record<string, ReferenceNode[]> = {};
-  for (const axis of AXES) {
-    const members = defNames.filter((n) => axisOf[n] === axis);
-    const inbound = new Map<string, number>(members.map((m) => [m, 0]));
-    for (const name of members) {
-      for (const target of outgoing(name)) {
-        if (inbound.has(target) && target !== name)
-          inbound.set(target, (inbound.get(target) ?? 0) + 1);
-      }
-    }
-    const placed = new Set<string>();
-    const build = (name: string, depth: number): ReferenceNode => {
-      placed.add(name);
-      const children =
-        depth >= 3
-          ? []
-          : outgoing(name)
-              .filter((t) => axisOf[t] === axis && !placed.has(t))
-              .map((t) => build(t, depth + 1));
-      return { name, children };
-    };
-    const roots = members.filter((m) => (inbound.get(m) ?? 0) === 0);
-    const ordered = [...roots, ...members.filter((m) => !roots.includes(m))];
-    trees[axis] = ordered.filter((m) => !placed.has(m)).map((m) => build(m, 0));
-  }
-  return trees;
-})();
