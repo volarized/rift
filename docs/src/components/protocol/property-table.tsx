@@ -113,11 +113,6 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
           })}
         </tbody>
       </table>
-      {schema.additionalProperties === false ? (
-        <p className="mt-2 text-fd-muted-foreground text-sm">
-          Closed: no properties beyond those listed.
-        </p>
-      ) : null}
     </div>
   );
 }

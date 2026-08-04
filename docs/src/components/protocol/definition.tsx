@@ -6,6 +6,7 @@ import {
   backlinks,
   branches,
   defs,
+  homeOf,
   isLossy,
   props,
   refName,
@@ -163,6 +164,13 @@ export function Definition({ name }: { name: string }): ReactNode {
     <section>
       <h3 id={name} className="scroll-m-20 font-mono">
         {name}
+        {/* Core is the shared vocabulary and the default; the other two are
+            where a type exists on one seam only, which is worth saying. */}
+        {homeOf[name] === "core" ? null : (
+          <span className="ml-2 rounded bg-fd-muted px-1.5 py-0.5 align-middle font-mono font-normal text-[0.6em] text-fd-muted-foreground uppercase tracking-wide">
+            {homeOf[name]}
+          </span>
+        )}
       </h3>
 
       {schema.description ? (

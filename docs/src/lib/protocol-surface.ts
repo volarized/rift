@@ -235,15 +235,28 @@ function outgoing(name: string): string[] {
   return [...out];
 }
 
+/** Carried by all three axes, owned by none. Whichever walks past it first would otherwise adopt it. */
+const SHARED = ["Extensions", "ExtensionKey", "ExtensionValue", "ExtensionValueDescriptor"];
+
 export const axisOf: Record<string, string> = (() => {
   const assigned: Record<string, string> = {};
+  for (const name of SHARED) if (name in defs) assigned[name] = "Protocol";
+
+  // Every seed is placed before any closure runs. Closing one axis at a time
+  // would let it claim another axis's seed on the way past: `Leaf` reaches
+  // `SymbolId`, so Physical would file the identity of a symbol under itself.
+  for (const [axis, seeds] of AXIS_SEEDS) {
+    for (const seed of seeds) if (seed in defs) assigned[seed] = axis;
+  }
   for (const [axis, seeds] of AXIS_SEEDS) {
     const stack = seeds.filter((s) => s in defs);
     while (stack.length > 0) {
       const name = stack.pop() as string;
-      if (assigned[name]) continue;
-      assigned[name] = axis;
-      stack.push(...outgoing(name));
+      for (const target of outgoing(name)) {
+        if (assigned[target]) continue;
+        assigned[target] = axis;
+        stack.push(target);
+      }
     }
   }
   // What no axis reaches is the wire itself. Grouping that by the document
@@ -399,33 +412,42 @@ function adapterPage(): PageData {
   };
 }
 
+/**
+ * The reference tree, flattened depth-first with each name's depth kept.
+ *
+ * The nesting is the table of contents, not page furniture: an outline printed
+ * above two hundred definitions is a second copy of the sidebar that scrolls
+ * away. Axes sit at depth 2, a root type at 3, and each level below it one
+ * deeper — `build` stops at three levels, so nothing exceeds depth 6.
+ */
+function outlineOf(axis: string): { name: string; depth: number }[] {
+  const out: { name: string; depth: number }[] = [];
+  const walk = (nodes: ReferenceNode[], depth: number) => {
+    for (const node of nodes) {
+      out.push({ name: node.name, depth });
+      walk(node.children, depth + 1);
+    }
+  };
+  walk(referenceTree[axis] ?? [], 3);
+  return out;
+}
+
 function referencePage(): PageData {
-  const outline = AXES.map((axis) => ({
-    axis,
-    names: (() => {
-      const out: string[] = [];
-      const walk = (nodes: ReferenceNode[]) => {
-        for (const n of nodes) {
-          out.push(n.name);
-          walk(n.children);
-        }
-      };
-      walk(referenceTree[axis] ?? []);
-      return out;
-    })(),
-  })).filter((e) => e.names.length > 0);
+  const outline = AXES.map((axis) => ({ axis, entries: outlineOf(axis) })).filter(
+    (entry) => entry.entries.length > 0,
+  );
 
   return {
-    toc: outline.flatMap(({ axis, names }) => [
+    toc: outline.flatMap(({ axis, entries }) => [
       { title: axis, url: `#axis-${axis.toLowerCase()}`, depth: 2 },
-      ...names.map((name) => ({ title: name, url: `#${name}`, depth: 3 })),
+      ...entries.map(({ name, depth }) => ({ title: name, url: `#${name}`, depth })),
     ]),
     structuredData: {
-      headings: outline.flatMap(({ axis, names }) => [
+      headings: outline.flatMap(({ axis, entries }) => [
         { id: `axis-${axis.toLowerCase()}`, content: axis },
-        ...names.map((name) => ({ id: name, content: name })),
+        ...entries.map(({ name }) => ({ id: name, content: name })),
       ]),
-      contents: outline.flatMap(({ names }) => names.flatMap(prose)),
+      contents: outline.flatMap(({ entries }) => entries.flatMap(({ name }) => prose(name))),
     },
   };
 }
