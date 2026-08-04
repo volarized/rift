@@ -1,13 +1,8 @@
 name: codeql
 
 on:
-  # Weekly only. Deep static analysis is not worth blocking every PR on when
-  # the two things that actually gate merges (docs, rust) already run there,
-  # and CodeQL's value is finding issues that survive review rather than
-  # catching them mid-typing. Monday 06:00 UTC.
   schedule:
     - cron: "0 6 * * 1"
-  # So a fix can be validated without waiting a week.
   workflow_dispatch:
 
 concurrency:
@@ -22,18 +17,13 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      security-events: write # upload SARIF to the Security tab
+      security-events: write
       contents: read
       actions: read
 
     strategy:
       fail-fast: false
       matrix:
-        # `rust` went GA in Oct 2025 and needs no build step, so all three
-        # languages run build-free.
-        #   javascript-typescript -> docs/
-        #   rust                  -> crates/
-        #   actions               -> these workflows (workflow-injection class)
         language: [javascript-typescript, rust, actions]
 
     steps:
@@ -41,11 +31,6 @@ jobs:
 
       - uses: github/codeql-action/init@v4.37.4
         with:
-          # `languages`, PLURAL. The singular form is not a valid input; the
-          # action ignores unknown inputs and falls back to auto-detection,
-          # which made all three matrix jobs analyse `rust` and left
-          # javascript-typescript and actions entirely unscanned — while
-          # still reporting green.
           languages: ${{ matrix.language }}
 
       - uses: github/codeql-action/analyze@v4.37.4
