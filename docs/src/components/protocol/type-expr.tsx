@@ -139,7 +139,7 @@ export function Constraints({ schema }: { schema: Schema }): ReactNode {
   push("min properties", schema.minProperties);
   push("encoding", schema.contentEncoding);
   push("media type", schema.contentMediaType);
-  push("default", schema.default);
+  // `default` is a column of its own in the property table.
 
   if (parts.length === 0 && !schema.uniqueItems) return null;
 

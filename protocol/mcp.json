@@ -435,7 +435,8 @@
               "relationships",
               "diagnostics"
             ]
-          }
+          },
+          "default": []
         },
         "limit": {
           "type": "integer",
@@ -452,7 +453,8 @@
         },
         "rev": {
           "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
-          "$ref": "core.json#/$defs/GitRevision"
+          "$ref": "core.json#/$defs/GitRevision",
+          "default": "HEAD"
         }
       },
       "additionalProperties": false,
@@ -1102,14 +1104,16 @@
         "limit": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 4294967295
+          "maximum": 4294967295,
+          "default": 50
         },
         "cursor": {
           "$ref": "#/$defs/Cursor"
         },
         "rev": {
           "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
-          "$ref": "core.json#/$defs/GitRevision"
+          "$ref": "core.json#/$defs/GitRevision",
+          "default": "HEAD"
         }
       },
       "additionalProperties": false
@@ -1327,7 +1331,8 @@
         "limit": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 10000
+          "maximum": 10000,
+          "default": 50
         },
         "cursor": {
           "$ref": "#/$defs/Cursor"
@@ -1338,7 +1343,8 @@
         },
         "rev": {
           "description": "Which revision to answer against. Absent, the default branch at its latest commit.",
-          "$ref": "core.json#/$defs/GitRevision"
+          "$ref": "core.json#/$defs/GitRevision",
+          "default": "HEAD"
         }
       },
       "additionalProperties": false

@@ -28,6 +28,7 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
   // Carrying an empty one across every table would cost width that the type
   // and description columns need more.
   const hasExamples = properties.some(([, property]) => (property.examples ?? []).length > 0);
+  const hasDefaults = properties.some(([, property]) => property.default !== undefined);
 
   return (
     <div className="my-4 overflow-x-auto">
@@ -36,6 +37,7 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
           <tr>
             <th className="text-left">Property</th>
             <th className="text-left">Type</th>
+            {hasDefaults ? <th className="text-left">Default</th> : null}
             {hasExamples ? <th className="text-left">Examples</th> : null}
             <th className="text-left">Description</th>
           </tr>
@@ -57,6 +59,19 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
                 <td>
                   <TypeExpr schema={property} />
                 </td>
+                {hasDefaults ? (
+                  <td>
+                    {property.default !== undefined ? (
+                      <code className="text-[0.8em]">
+                        {typeof property.default === "string"
+                          ? property.default
+                          : JSON.stringify(property.default)}
+                      </code>
+                    ) : (
+                      <span className="text-fd-muted-foreground">—</span>
+                    )}
+                  </td>
+                ) : null}
                 {hasExamples ? (
                   <td>
                     {(property.examples ?? []).length > 0 ? (
