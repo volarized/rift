@@ -23,7 +23,7 @@ That is the constraint the rest of the design follows from. Several agents can b
 workspace at once, and they need a central point behind them. That central point is the rift server.
 
 <IsoDiagram
-  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB, creates and integrates a git worktree per agent, and drives the language adapters over gRPC. The adapters read those worktrees straight off the filesystem."
+  alt="Two agents. Each talks to its own rift mcp process over stdio. Both rift mcp processes talk to a single rift server over Streamable HTTP on a Unix domain socket. The server owns the semantic DB, creates and integrates at least one git worktree per MCP client, and drives the language adapters over gRPC. The adapters read those worktrees straight off the filesystem."
   chart={`
     flowchart LR
       agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp"]:::rift
@@ -31,7 +31,7 @@ workspace at once, and they need a central point behind them. That central point
       mcp1 -- "Streamable HTTP<br/>over Unix socket" --> server["rift server"]:::rift
       mcp2 -- "Streamable HTTP<br/>over Unix socket" --> server
       server --> semantic["semantic DB"]:::store
-      server -- "creates, writes,<br/>integrates" --> trees["git worktrees<br/>one per agent"]:::git
+      server -- "creates, writes,<br/>integrates" --> trees["git worktrees<br/>≥1 per MCP client"]:::git
       server -- "gRPC<br/>over Unix socket" --> adapters["adapters"]:::adapter
       adapters -- "read off disk" --> trees
   `}
@@ -48,20 +48,21 @@ adapters.
 
 ## A task gets a worktree
 
-An agent does not edit your working tree. The server cuts it a `git worktree` from a recorded base
-commit, on a branch of its own, and that tree belongs to it alone until the work is done:
+An agent does not edit your working tree. Each task gets a `git worktree` of its own, cut from a
+recorded base commit onto a branch of its own — so there is at least one per MCP client connected to
+the server, and more when a client is running more than one task at a time:
 
 ```
 base commit B
-  ├── .rift/worktrees/a1   branch rift/a1   agent 1, and every compiler driven for it
-  └── .rift/worktrees/a2   branch rift/a2   agent 2, and every compiler driven for it
+  ├── .rift/worktrees/a1   branch rift/a1   one task, and every compiler driven for it
+  └── .rift/worktrees/a2   branch rift/a2   another task, possibly the same client
 ```
 
 The lifecycle of one of those:
 
 1. Record the base commit
 2. Create the branch and the worktree
-3. Assign the worktree to one agent, exclusively
+3. Assign the worktree to that one task, exclusively
 4. Point the adapters at its path
 5. Let the tools read and write there
 6. Compute the resulting git diff and validate it

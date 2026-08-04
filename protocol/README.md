@@ -29,8 +29,8 @@ side knows the other exists:
 
 ## Who owns the filesystem
 
-An agent gets a `git worktree` on a branch of its own, cut from a recorded base commit, and every
-adapter driven for that agent is pointed at it. Its path is the workspace's identity across the seam.
+Each task gets a `git worktree` on a branch of its own, cut from a recorded base commit — at least
+one per MCP client of the server — and every adapter driven for that task is pointed at it. Its path is the workspace's identity across the seam.
 It is git's own tree because the compilers need a real filesystem and because the work in it is
 committed and integrated with a three-way merge when the run ends.
 

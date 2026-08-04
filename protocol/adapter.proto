@@ -4,13 +4,14 @@
 // one per language, and no other server shares them — so a workspace has
 // exactly one party creating, refreshing and closing it, and the adapter
 // arbitrates nothing. One adapter still holds several workspaces at once,
-// because many agents work against one repository.
+// because a workspace is one task's tree and many tasks run at once.
 //
-// What the adapter is handed is a `git worktree` — one per agent, at the path
-// this seam calls `workspace` — and every adapter driven for that agent reads
-// the same one. Compilers want a real filesystem, since rust-analyzer, gopls
-// and tsc all end up calling open(2), and the work in that tree is committed
-// and merged back when the run ends. Both want a tree git itself made.
+// What the adapter is handed is a `git worktree` — one per task, at the path
+// this seam calls `workspace`, and at least one per MCP client the server has —
+// which every adapter driven for that task reads. Compilers want a real
+// filesystem, since rust-analyzer, gopls and tsc all end up calling open(2),
+// and the work in that tree is committed and merged back when the run ends.
+// Both want a tree git itself made.
 //
 // So this service carries control and results, not source. The compiler opens
 // the files itself. Bytes cross in one case only: a file the adapter generated,
