@@ -136,7 +136,15 @@ function Plate({
 }) {
   const thickness = metrics.thickness * PX;
 
+  // A flat plate is a plane, not a box of zero height. A degenerate box gives
+  // `EdgesGeometry` two coplanar rectangles to find, which draws every edge
+  // twice at the same depth and z-fights.
   const geometry = useMemo(() => {
+    if (thickness <= 0) {
+      const plane = new THREE.PlaneGeometry(plate.width * PX, plate.depth * PX);
+      plane.rotateX(-Math.PI / 2); // PlaneGeometry stands up in XY; lay it on the floor
+      return { box: plane, edges: new THREE.EdgesGeometry(plane) };
+    }
     const box = new THREE.BoxGeometry(plate.width * PX, thickness, plate.depth * PX);
     return { box, edges: new THREE.EdgesGeometry(box) };
   }, [plate.width, plate.depth, thickness]);
@@ -155,10 +163,17 @@ function Plate({
     <group position={[plate.x * PX, 0, plate.z * PX]}>
       {/* A solid in the page's own colour: the plate occludes what is behind
           it without ever reading as a filled shape. */}
-      <mesh geometry={geometry.box} position={[0, thickness / 2, 0]}>
+      {/* A box sits on the floor, so its centre is half its height. A flat
+          plate has no height to halve, and would land in the floor's own
+          plane — so it takes half the clearance the connectors use, which
+          stacks it above the grid and below them. */}
+      <mesh geometry={geometry.box} position={[0, thickness > 0 ? thickness / 2 : EPS / 2, 0]}>
         <meshBasicMaterial color={surface} />
       </mesh>
-      <lineSegments geometry={geometry.edges} position={[0, thickness / 2, 0]}>
+      <lineSegments
+        geometry={geometry.edges}
+        position={[0, thickness > 0 ? thickness / 2 : EPS / 2, 0]}
+      >
         <lineBasicMaterial color={ink} transparent opacity={alpha} />
       </lineSegments>
 

@@ -19,8 +19,8 @@ export function McpReference(): ReactNode {
         Tools
       </h2>
       <p>
-        Five tools. Each answers against the default branch unless you pass a <code>rev</code>, and
-        each reports the revision it actually resolved to.
+        {mcpTools.length} tools. Each answers against the default branch unless you pass a{" "}
+        <code>rev</code>, and each reports the revision it actually resolved to.
       </p>
 
       {mcpTools.map((tool) => (

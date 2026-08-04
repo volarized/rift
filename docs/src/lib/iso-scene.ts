@@ -55,7 +55,12 @@ export type IsoMetrics = {
    * reading as a slab.
    */
   minDepth: number;
-  /** How far a plate stands off the floor. */
+  /**
+   * How far a plate stands off the floor. Zero draws it flat.
+   *
+   * Height buys nothing here: a plate is read from its drawn edges and its
+   * caption, and the extra two faces only add ink and z-order to reason about.
+   */
   thickness: number;
   /**
    * Dagre's separation between ranks, and within one.
@@ -87,7 +92,7 @@ export const DEFAULT_METRICS: IsoMetrics = {
   gutter: 7,
   margin: 15,
   minDepth: 60,
-  thickness: 9,
+  thickness: 0,
   rankSep: 74,
   nodeSep: 54,
   floor: 24,
@@ -158,11 +163,11 @@ export function frameSpan(scene: IsoScene): { width: number; height: number } {
  * in one monospaced family, so its advance width is a constant — which is the
  * whole reason the design's display face can be relied on here.
  */
-export function textWidth(lines: string[], size: number): number {
+function textWidth(lines: string[], size: number): number {
   return lines.reduce((widest, line) => Math.max(widest, line.length), 0) * size * ADVANCE;
 }
 
-export function textHeight(lines: string[], size: number): number {
+function textHeight(lines: string[], size: number): number {
   return lines.length === 0 ? 0 : size + (lines.length - 1) * size * LEADING;
 }
 
