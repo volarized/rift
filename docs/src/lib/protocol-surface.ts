@@ -16,7 +16,15 @@
 import type { StructuredData } from "fumadocs-core/mdx-plugins";
 import type { TableOfContents } from "fumadocs-core/server";
 import { sectionId } from "@/components/protocol/adapter";
-import { adapterOwned, protoMessages, protoSections, protoServices } from "@/lib/proto";
+import {
+  adapterOwned,
+  adapterServices,
+  protoMessages,
+  protoSections,
+  scipEnums,
+  scipMessages,
+  scipServices,
+} from "@/lib/proto";
 import {
   axisGroups,
   defNames,
@@ -66,6 +74,13 @@ function role(member: SeamMember, key: string): string | null {
   return refName(sub(member[key] as Schema | undefined));
 }
 
+/** Resolve one local definition reference and leave inline schemas unchanged. */
+function shape(node: unknown): Schema | undefined {
+  const direct = sub(node as Schema | undefined);
+  const target = refName(direct);
+  return target ? defs[target] : direct;
+}
+
 export interface ToolEntry {
   name: string;
   description?: string;
@@ -94,9 +109,9 @@ export interface ResourceEntry {
  */
 function uriTemplateFor(resource: string): string | undefined {
   for (const branch of defs.ResourceTemplate?.oneOf ?? []) {
-    const shape = sub(branch);
-    if (!shape) continue;
-    const properties = Object.fromEntries(props(shape));
+    const resolved = shape(branch);
+    if (!resolved) continue;
+    const properties = Object.fromEntries(props(resolved));
     if (properties.name?.const === resource) {
       const template = properties.uriTemplate?.const;
       return typeof template === "string" ? template : undefined;
@@ -109,8 +124,61 @@ export const mcpResources: ResourceEntry[] = seam("mcp", "mcp.resources").map(([
   const uri = role(member, "uri");
   const link = role(member, "link");
   if (!uri || !link) throw new Error(`resource \`${name}\` is missing a uri or link type`);
-  return { name, description: member.description, uriTemplate: uriTemplateFor(name), uri, link };
+  const uriTemplate = uriTemplateFor(name);
+  if (!uriTemplate) throw new Error(`resource \`${name}\` is missing a ResourceTemplate branch`);
+  return { name, description: member.description, uriTemplate, uri, link };
 });
+
+function branchNames(name: string): string[] {
+  return (defs[name]?.oneOf ?? []).flatMap((branch) => {
+    const resolved = shape(branch);
+    const value = resolved ? Object.fromEntries(props(resolved)).name?.const : undefined;
+    return typeof value === "string" ? [value] : [];
+  });
+}
+
+function assertSameFamilies(label: string, actual: string[]): void {
+  const expected = mcpResources.map((resource) => resource.name).sort();
+  const found = [...new Set(actual)].sort();
+  if (expected.join("\0") !== found.join("\0")) {
+    throw new Error(
+      `${label} resource families are [${found.join(", ")}], expected [${expected.join(", ")}]`,
+    );
+  }
+}
+
+assertSameFamilies("ResourceTemplate", branchNames("ResourceTemplate"));
+assertSameFamilies("ResourceLink", branchNames("ResourceLink"));
+
+const repositoryProperties = Object.fromEntries(props(defs.RepositoryResourcePayload));
+const advertisedResources =
+  shape(repositoryProperties.resources?.items)?.enum?.filter(
+    (value): value is string => typeof value === "string",
+  ) ?? [];
+assertSameFamilies("RepositoryResourcePayload.resources", advertisedResources);
+
+const readContents = Object.fromEntries(props(defs.ResourceReadResult)).contents;
+const readItems = shape(readContents?.items);
+const readFamilies = (readItems?.oneOf ?? []).flatMap((branch) => {
+  const resolved = shape(branch);
+  if (!resolved) return [];
+  const mime = Object.fromEntries(props(resolved)).mimeType?.const;
+  const match =
+    typeof mime === "string" ? /^application\/vnd\.rift\.([a-z_]+)\+json$/.exec(mime) : null;
+  return match ? [match[1]] : [];
+});
+assertSameFamilies("ResourceReadResult", readFamilies);
+
+const advertisedTools =
+  shape(repositoryProperties.tools?.items)?.enum?.filter(
+    (value): value is string => typeof value === "string",
+  ) ?? [];
+const toolNames = mcpTools.map((tool) => tool.name).sort();
+if (toolNames.join("\0") !== [...advertisedTools].sort().join("\0")) {
+  throw new Error(
+    `RepositoryResourcePayload.tools are [${advertisedTools.join(", ")}], expected [${toolNames.join(", ")}]`,
+  );
+}
 
 // ---------------------------------------------------------------------------
 // The reference, grouped by axis and nested by reference
@@ -147,7 +215,7 @@ function outgoing(name: string): string[] {
  * pin what is held, place every identifying definition, close each group over
  * what its own reach, then hand the remainder to the group that claims its
  * document. This function is the declaration's interpreter and holds no list of
- * its own — if the grouping looks wrong, `core.json` is where it is wrong.
+ * its own — if the grouping looks wrong, `mcp.json` is where it is wrong.
  */
 export const axisOf: Record<string, string> = (() => {
   const assigned: Record<string, string> = {};
@@ -177,6 +245,11 @@ export const axisOf: Record<string, string> = (() => {
   }
   return assigned;
 })();
+
+const unassignedDefinitions = defNames.filter((name) => !axisOf[name]);
+if (unassignedDefinitions.length > 0) {
+  throw new Error(`protocol definitions have no axis: ${unassignedDefinitions.join(", ")}`);
+}
 
 export interface ReferenceNode {
   name: string;
@@ -208,8 +281,7 @@ export const referenceTree: Record<string, ReferenceNode[]> = (() => {
       const children: ReferenceNode[] = [];
       if (depth < 3) {
         for (const target of outgoing(name)) {
-          if (axisOf[target] === axis && !placed.has(target))
-            children.push(build(target, depth + 1));
+          if (inbound.has(target) && !placed.has(target)) children.push(build(target, depth + 1));
         }
       }
       return { name, children };
@@ -296,7 +368,7 @@ function mcpPage(): PageData {
  * JSON Schema half.
  */
 function adapterPage(): PageData {
-  const service = protoServices[0];
+  const service = adapterServices[0];
   // The file's own section banners decide the grouping, so a message that moves
   // between sections moves on the page without anything here changing.
   const grouped = protoSections.flatMap((section) => [
@@ -383,9 +455,46 @@ function referencePage(): PageData {
   };
 }
 
+function scipPage(): PageData {
+  const declarations = [...scipMessages, ...scipEnums];
+  const rpcs = scipServices.flatMap((service) => service.rpcs);
+  return {
+    toc: [
+      ...rpcs.map((rpc) => ({
+        title: rpc.name,
+        url: `#scip-rpc-${rpc.name}`,
+        depth: 3,
+      })),
+      ...declarations.map((value) => ({
+        title: value.name,
+        url: `#scip-${value.name}`,
+        depth: 3,
+      })),
+    ],
+    structuredData: {
+      headings: [
+        ...rpcs.map((rpc) => ({ id: `scip-rpc-${rpc.name}`, content: rpc.name })),
+        ...declarations.map((value) => ({ id: `scip-${value.name}`, content: value.name })),
+      ],
+      contents: [
+        ...rpcs.flatMap((rpc) =>
+          rpc.comment ? [{ heading: `scip-rpc-${rpc.name}`, content: rpc.comment }] : [],
+        ),
+        ...declarations.flatMap((value) => [
+          { heading: `scip-${value.name}`, content: value.name },
+          ...(value.comment
+            ? [{ heading: `scip-${value.name}`, content: value.comment }]
+            : []),
+        ]),
+      ],
+    },
+  };
+}
+
 /** Page data by URL, for the docs page and the search route to look up. */
 export const pageData: Record<string, PageData> = {
   [pageUrl("mcp")]: mcpPage(),
+  [`${PROTOCOL_ROOT}/scip`]: scipPage(),
   [`${PROTOCOL_ROOT}/adapter`]: adapterPage(),
   // No entry for `core`: it is plain prose, so remark already sees every
   // heading it has. Its types are anchored on the reference page.

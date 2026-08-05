@@ -6,16 +6,21 @@ import { Callout } from "fumadocs-ui/components/callout";
 import { AdapterReference } from "@/components/protocol/adapter";
 
 A language adapter is a process that drives the language's compiler. The Rift server calls it over
-gRPC on a Unix domain socket, using the service in `protocol/adapter.proto`.
+gRPC on a Unix domain socket, using the generated `rift.adapter` service.
 
 ## Transport
 
 The Rift server starts one adapter per language and is its only client. The server issues every
 workspace lifecycle call. The adapter updates the workspace state named by each request.
 
-One adapter holds a workspace for each concurrent task in its language. Limits apply to each
-workspace, and interleaved RPC streams let `worktrees/a2` make progress while `worktrees/a1` runs a
-long analysis.
+One adapter holds a workspace for each active MCP session that uses its language. One MCP session owns
+one worktree. Different-language adapters for that session receive the same worktree path. Each has
+independent compiler state and a distinct `state_root`. Limits apply to each adapter workspace, and
+interleaved RPC streams let `worktrees/a2` make progress while `worktrees/a1` runs a long analysis.
+
+Each returned `WorkspaceState` combines the shared Git `Snapshot` with an adapter-local `generation`.
+`Refresh` advances it after a physical source change. `SyncVirtual` advances it after a private virtual
+overlay changes, even though the Git snapshot remains the same.
 
 gRPC supplies the transport mechanics. The RPC method identifies the operation. A stream preserves
 event order. The request context carries cancellation and deadlines. Failures use `google.rpc.Status`,
@@ -23,60 +28,145 @@ with `Refusal` or `StaleState` in `status.details`.
 
 ## Worktree
 
-rust-analyzer reads source through `open(2)`, so Rift gives the adapter the path of the task's real
+rust-analyzer reads source through `open(2)`, so Rift gives every adapter in the session the path of
+the session's real
 `git worktree`:
 
 ```
 ~/projects/charming-aurora            the main working tree — yours
-  .rift/worktrees/a1                  one task's worktree, branch rift/a1
-  .rift/state/rust                    what the Rust adapter writes
+  .rift/worktrees/a1                  one MCP session's worktree, branch rift/a1
 ```
 
-Every adapter used by a task reads the same tree. For example, the Svelte and TypeScript adapters read
-one copy of `App.svelte`. The server later commits and integrates that tree through the
-[task lifecycle](/docs/protocol#task-worktrees).
+Adapters do not receive separate source trees. They read this path, and declared compiler writes land
+in it. `state_root` holds disposable compiler caches and private virtual overlays. It is not repository
+state or another worktree.
+
+Every adapter used by the session opens `.rift/worktrees/a1`. For example, Rust and TypeScript
+adapters in one monorepo open the same worktree while their source claims select different files.
+A container adapter owns a physical file such as `App.svelte` and publishes its embedded TypeScript
+as virtual source for the TypeScript adapter. The server later commits and integrates the shared tree
+through the [session lifecycle](/docs/protocol#session-worktree).
 
 The `Analyze` RPC returns facts about files the compiler opened from the worktree. Each response also
 names the tree and state it used. That coordinate is a `Snapshot`; its worktree value uses Git's
 spelling, such as `worktrees/a1`.
 
-For generated source, the adapter sends a `VirtualUnit` manifest followed by `VirtualText` chunks.
-Rift writes those bytes into the consuming adapter's tree.
+For generated source, the producer sends a `VirtualUnit` manifest and `VirtualText` chunks. Rift
+validates the complete publication. It then calls `SyncVirtual` on the selected consumer.
+
+The consumer stores the bytes in a private overlay under `state_root`. Generated inputs stay outside
+the shared worktree and session diff.
+
+Rift drains calls for that consumer before synchronization. New calls begin after the atomic overlay
+replacement returns.
 
 The tree path identifies the compiler workspace across this service. After `CloseWorkspace`, Rift
 retires the path and creates future workspaces at new paths.
 
 <Callout>
   The adapter also receives a private cache directory named `state_root`. Point compiler caches such
-  as `CARGO_TARGET_DIR` at it. The directory outlives a task workspace, so later compiles can reuse it.
+  as `CARGO_TARGET_DIR` at it. Each open workspace receives a distinct path, which prevents concurrent
+  compiler processes from locking or overwriting one another's state. An adapter can maintain a shared
+  read-only cache separately when its compiler supports one.
 </Callout>
 
 ## Source ownership
 
-Rift is the source writer for each task worktree. When the compiler computes a fix, `Resolve` returns
-each replacement as a byte range and new text. The protocol calls that value an `Edit`. Rift applies
-the edits and reports the changed paths on the next `Refresh`.
+Rift is the source writer for each session worktree. When the compiler computes a fix, `Resolve` returns
+an atomic set of `Edit` values. The set can replace byte ranges, change paths, create or remove files,
+copy files, and change executable bits. Rift applies the set and reports the changed paths on the next
+`Refresh`.
+
+State-pinned calls from different adapters may read the worktree concurrently.
+
+Before a source write, Rift blocks new calls and drains current calls across every adapter holding the
+session path. It writes once and calls `Refresh` on each adapter.
+
+Rift then analyzes virtual-source producers. It applies `SyncVirtual` in producer-to-consumer order.
+The barrier opens after every adapter acknowledges the physical and virtual state.
 
 Several adapters can read the same tree. Routing source changes through Rift gives the tree one writer,
-so `git diff` contains the task's complete source change for validation and commit.
+so `git diff` contains the session's complete source change for validation and commit.
 
 Returning the change as a value lets Rift inspect it before writing. For example, `gofmt` writes the
 formatted source to stdout when invoked without `-w`.
 
 Some compiler processes create files while analyzing. For example, npm creates `node_modules` beside
 its package. The adapter reports each compiler-owned path from `Describe`; the protocol calls the
-record a `WriteClaim`. Rift excludes claimed paths from source analysis and from the task diff.
+record a `WriteClaim`. Rift excludes claimed paths from source analysis and from the session diff.
+
+Write claims are exclusive among adapters sharing a worktree. If two adapters can write the same path,
+Rift refuses workspace admission. One adapter must redirect that output to its private `state_root`.
+Source claims can overlap, and priority selects one physical owner. A winning container adapter records
+embedded language regions and publishes the generated input consumed by another language adapter.
 
 A claim must cover a stable path. Redirectable build output belongs under `state_root`, which keeps
 the corresponding source path visible to Rift.
 
+## Analysis and cached reads
+
+`Analyze` streams symbols, leaves, relationships, origin mappings, diagnostics, and coverage into Rift's
+fact store. MCP outline, search, symbol, and relationship reads use those retained facts. Once a
+snapshot has been analyzed, Rift serves warm reads from the fact store while the adapter is stopped.
+It starts or refreshes an adapter when the requested snapshot or fact family is absent.
+
+Virtual publications form an acyclic producer-to-consumer graph. `VirtualClaim.priority` selects one
+consumer for a produced language. Equal-priority consumers, duplicate produced paths, physical-path
+collisions, write-claim collisions, paths below a gitlink, and routing cycles fail as
+`adapter_protocol_error` before Rift commits a consumer overlay.
+
+Mechanical tree, file, diff, and text-match reads use Git objects and Rift's matcher. Rift serves them
+locally for every language.
+
+A submodule gitlink is an opaque source boundary. `Analyze` accepts source units from regular entries
+in the parent tree and rejects a unit below a gitlink as an adapter protocol error. A separate adapter
+workspace rooted at the child repository analyzes the child files.
+
+## Actions and resolution evidence
+
+`Capabilities.action_kinds` advertises compiler action families before any target-specific query. Each
+entry states its kind prefix, coverage, and available guarantee kinds. `Actions`
+then lists the actions applicable at one pinned address. `Resolve` accepts the selected state-bound
+token and validated canonical JSON arguments.
+
+A successful `ResolveResponse` returns exact edits and their evidence. Every advertised guarantee has
+one scoped evidence record.
+
+A refusal returns failed preconditions and concrete blockers. The retained MCP preview uses the same
+shared operation types.
+
+Portable argument contracts cover rename, move, safe delete, and structured signature change. Other
+action families keep their self-contained advertised JSON Schema. The adapter remains responsible for
+language legality, complete reference analysis where claimed, and semantic effect reconstruction.
+
+## Formatting
+
+Each public change declares a `FormattingPolicy`. `preserve` leaves bytes outside the resolved edit
+set untouched. For `changed_regions` or `affected_files`, Rift refreshes the candidate workspace and
+calls `Format` on every adapter that owns the selected source. The adapter returns atomic `TextEdit`
+values and coverage for the requested scope.
+
+Rift applies the formatter edits and refreshes every adapter sharing the worktree. It then resolves the
+next change. A later action or rewrite therefore observes the formatted source.
+
+## Candidate validation
+
+After Rift applies a candidate to an isolated worktree, it calls `Refresh` so the adapter acknowledges
+the new `WorkspaceState`. `Validate` then asks the compiler to check the closure affected by the changed
+paths. The stream carries diagnostic batches followed by one `ValidationSummary`.
+
+The summary reports the state checked, its coverage, the compiler verdict, and the files in the
+affected closure. Rift combines it with the adapter's language and the streamed diagnostics to produce
+the shared `ValidationReport`. Publication requires complete coverage and a valid report from every
+adapter that owns an affected file.
+
 ## Service boundary
 
 The adapter's compiler workspace is a cache. If the adapter exits, the server opens a replacement and
-recompiles. The task worktree remains on disk throughout that recovery.
+recompiles. The session worktree remains on disk throughout that recovery.
 
-Code entities use Protobuf messages generated from `core.json`. The service below adds the workspace
-and RPC messages needed to drive a compiler. The [reference](/docs/protocol/reference) documents the
-shared model.
+Code entities use the generated `rift.core` messages. The service below adds the workspace and RPC
+messages needed to drive a compiler. The [reference](/docs/protocol/reference) documents the shared
+model.
 
 <AdapterReference />

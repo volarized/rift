@@ -2,13 +2,13 @@ import type { ReactNode } from "react";
 import { Prose } from "@/components/protocol/prose";
 import {
   adapterOwned,
+  adapterServices,
   type ProtoEnum,
   type ProtoField,
   type ProtoMessage,
   protoEnumOwner,
   protoMessages,
   protoSections,
-  protoServices,
   protoWrappers,
 } from "@/lib/proto";
 import { homeOf } from "@/lib/protocol";
@@ -19,7 +19,7 @@ import { hrefFor } from "@/lib/protocol-surface";
  *
  * Two destinations, because this page holds only half of what it renders. A
  * type the adapter file declares is on this page. A type generated from
- * `core.json` is documented once, on the reference page, and linking it here to
+ * `mcp.json` is documented once, on the reference page, and linking it here to
  * `#msg-…` would point at an anchor that does not exist. The plumbing wrappers
  * get no heading, so they get no link either, and a nested enum resolves to the
  * message it is declared in, which is the heading it is rendered under.
@@ -182,7 +182,7 @@ function Declaration({ name }: { name: string }): ReactNode {
  * reader and an editor see the same shape.
  */
 export function AdapterReference(): ReactNode {
-  const service = protoServices[0];
+  const service = adapterServices[0];
 
   return (
     <>
@@ -190,10 +190,13 @@ export function AdapterReference(): ReactNode {
         Service
       </h2>
       <p>
-        <code>Describe</code> runs at startup. <code>OpenWorkspace</code>, <code>Refresh</code> and{" "}
-        <code>CloseWorkspace</code> manage the directory Rift checked out. <code>Analyze</code>,{" "}
-        <code>Match</code> and <code>Actions</code> ask what is in it, and <code>Resolve</code>{" "}
-        turns one of those answers into edits.
+        <code>Describe</code> runs at startup. <code>OpenWorkspace</code>, <code>Refresh</code>,{" "}
+        <code>SyncVirtual</code>, and <code>CloseWorkspace</code> maintain compiler state.
+      </p>
+      <p>
+        <code>Analyze</code>, <code>Match</code>, and <code>Actions</code> read that state.{" "}
+        <code>Resolve</code> and <code>Format</code> return edits. <code>Validate</code> checks a
+        candidate.
       </p>
 
       {(service?.rpcs ?? []).map((rpc) => (

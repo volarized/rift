@@ -1,17 +1,9 @@
 /**
- * Loads the adapter seam, which is protobuf rather than JSON Schema.
- *
- * The two seams are deliberately different artifacts. MCP is JSON-RPC, so its
- * surface is JSON Schema; the adapter is gRPC over a Unix socket, so its
- * surface is a `.proto` and a service definition. `protocol.ts` reads the
- * first, this reads the second, and the pages render both.
- *
- * `core.proto` is generated from `core.json`, so the model appears here as the
- * same messages the MCP surface describes as definitions. That is the mapping
- * the adapter page shows: one model, two spellings, one source.
+ * Loads the generated Protobuf packages. MCP uses JSON at the agent boundary.
+ * The server, adapters, and SCIP export use the packages loaded here.
  */
 
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import protobuf from "protobufjs";
 
 const PROTOCOL_DIR = join(process.cwd(), "..", "protocol");
@@ -28,25 +20,32 @@ const DESCRIPTOR_PROTO = join(
 
 const root = (() => {
   const loaded = new protobuf.Root();
-  // Imports are written bare (`import "core.proto"`), because a .proto is
-  // compiled with an include path rather than resolved relative to a URL.
   loaded.resolvePath = (_origin, target) => {
+    if (isAbsolute(target)) return target;
     if (target === "google/protobuf/descriptor.proto") return DESCRIPTOR_PROTO;
     return target.startsWith("google/")
       ? (protobuf.util.path.resolve("", target) as string)
-      : join(PROTOCOL_DIR, target.split("/").pop() ?? target);
+      : join(PROTOCOL_DIR, target);
   };
   // `alternateCommentMode` reads `//` comments as documentation. Without it
   // protobufjs only picks up `/** */`, and every comment in these files is `//`.
-  loaded.loadSync([join(PROTOCOL_DIR, "core.proto"), join(PROTOCOL_DIR, "adapter.proto")], {
-    alternateCommentMode: true,
-  });
+  loaded.loadSync(
+    [
+      join(PROTOCOL_DIR, "rift/core.proto"),
+      join(PROTOCOL_DIR, "rift/mcp.proto"),
+      join(PROTOCOL_DIR, "rift/adapter.proto"),
+      join(PROTOCOL_DIR, "rift/scip.proto"),
+      join(PROTOCOL_DIR, "scip/scip.proto"),
+    ],
+    { alternateCommentMode: true },
+  );
   loaded.resolveAll();
   return loaded;
 })();
 
 export interface ProtoField {
   name: string;
+  number: number;
   type: string;
   repeated: boolean;
   map: boolean;
@@ -60,6 +59,8 @@ export interface ProtoField {
 
 export interface ProtoMessage {
   name: string;
+  fullName: string;
+  package: string;
   comment?: string;
   fields: ProtoField[];
   /** Declared `oneof` names, in declaration order. */
@@ -70,6 +71,8 @@ export interface ProtoMessage {
 
 export interface ProtoEnum {
   name: string;
+  fullName: string;
+  package: string;
   comment?: string;
   values: { name: string; number: number; comment?: string }[];
 }
@@ -85,11 +88,12 @@ export interface ProtoRpc {
 
 export interface ProtoService {
   name: string;
+  package: string;
   comment?: string;
   rpcs: ProtoRpc[];
 }
 
-/** Everything declared in the two files, by fully qualified name. */
+/** Everything declared in the generated Rift and SCIP packages. */
 const types = new Map<string, protobuf.Type | protobuf.Enum>();
 const services: ProtoService[] = [];
 
@@ -98,6 +102,7 @@ const services: ProtoService[] = [];
     if (child instanceof protobuf.Service) {
       services.push({
         name: child.name,
+        package: child.parent?.fullName.slice(1) ?? "",
         comment: child.comment ?? undefined,
         rpcs: child.methodsArray.map((method) => ({
           name: method.name,
@@ -110,21 +115,23 @@ const services: ProtoService[] = [];
       });
     }
     if (child instanceof protobuf.Type || child instanceof protobuf.Enum) {
-      types.set(child.name, child);
+      types.set(child.fullName.slice(1), child);
     }
     if (child instanceof protobuf.Namespace) collect(child);
   }
 })(root);
 
-/** `rift.core.v1.Symbol` reads as `Symbol`; the package adds nothing on a page. */
+/** `rift.core.Symbol` reads as `Symbol`; the package adds nothing on a page. */
 function short(name: string): string {
   return name.split(".").pop() ?? name;
 }
 
 function describe(field: protobuf.Field): ProtoField {
   const type = short(field.type);
+  const target = field.resolvedType?.fullName.slice(1);
   return {
     name: field.name,
+    number: field.id,
     type,
     repeated: field.repeated,
     map: field instanceof protobuf.MapField,
@@ -133,15 +140,19 @@ function describe(field: protobuf.Field): ProtoField {
     optional: field.optional === true && !field.repeated && !field.partOf,
     oneof: field.partOf?.name,
     comment: field.comment ?? undefined,
-    link: types.has(type) ? type : undefined,
+    link: target && types.has(target) ? target : undefined,
   };
 }
 
-export const protoServices: ProtoService[] = services;
+export const adapterServices = services.filter((service) => service.package === "rift.adapter");
+export const scipServices = services.filter((service) => service.package === "rift.scip");
 
 function describeEnum(declared: protobuf.Enum): ProtoEnum {
+  const fullName = declared.fullName.slice(1);
   return {
     name: declared.name,
+    fullName,
+    package: fullName.split(".").slice(0, -1).join("."),
     comment: declared.comment ?? undefined,
     values: Object.entries(declared.values).map(([name, number]) => ({
       name,
@@ -155,6 +166,8 @@ export const protoMessages: ProtoMessage[] = [...types.values()]
   .filter((t): t is protobuf.Type => t instanceof protobuf.Type)
   .map((type) => ({
     name: type.name,
+    fullName: type.fullName.slice(1),
+    package: type.fullName.slice(1).split(".").slice(0, -1).join("."),
     comment: type.comment ?? undefined,
     fields: type.fieldsArray.map(describe),
     oneofs: type.oneofsArray.map((oneof) => oneof.name),
@@ -186,7 +199,7 @@ export const protoEnumOwner: Record<string, string> = Object.fromEntries(
  */
 export const adapterOwned: Set<string> = (() => {
   const owned = new Set<string>();
-  const namespace = root.lookup("rift.adapter.v1");
+  const namespace = root.lookup("rift.adapter");
   if (namespace instanceof protobuf.Namespace) {
     for (const child of namespace.nestedArray) {
       if (child instanceof protobuf.Type || child instanceof protobuf.Enum) owned.add(child.name);
@@ -202,7 +215,7 @@ export const adapterOwned: Set<string> = (() => {
  *
  * Recognised by shape rather than by name, so a new one costs nothing, and
  * scoped to the adapter file for the same reason: `FilterAll` and
- * `SourceMapEntryExact` are shaped alike but are model types with meaning of
+ * `OriginMappingExact` are shaped alike but are model types with meaning of
  * their own. A leading comment is disqualifying — a wrapper someone found worth
  * explaining is no longer plumbing.
  */
@@ -221,6 +234,13 @@ export const protoWrappers: Set<string> = new Set(
 
 export const protoTypeNames: string[] = [...types.keys()];
 
+export const scipMessages = protoMessages.filter(
+  (message) => message.package === "scip" || message.package === "rift.scip",
+);
+export const scipEnums = protoEnums.filter(
+  (declared) => declared.package === "scip" || declared.package === "rift.scip",
+);
+
 export interface ProtoSection {
   name: string;
   /** Message and enum names, in declaration order. */
@@ -236,13 +256,13 @@ export interface ProtoSection {
  *   option (section) = "Workspaces";
  * ```
  *
- * Declaring it in the file is the same reason `core.json` carries `rift:axes`:
+ * Declaring it in the file is the same reason `mcp.json` carries `rift:axes`:
  * a grouping kept in the documentation code is a second place to edit, and it
  * drifts silently when a message moves. Sections appear in the order they are
  * first declared, so the page reads in file order.
  */
 export const protoSections: ProtoSection[] = (() => {
-  const namespace = root.lookup("rift.adapter.v1");
+  const namespace = root.lookup("rift.adapter");
   if (!(namespace instanceof protobuf.Namespace)) return [];
   const byName = new Map<string, ProtoSection>();
   for (const child of namespace.nestedArray) {

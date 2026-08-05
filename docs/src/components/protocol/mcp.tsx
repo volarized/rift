@@ -18,8 +18,8 @@ export function McpReference(): ReactNode {
         Tools
       </h2>
       <p>
-        {mcpTools.length} tools. Each answers against the default branch unless you pass a{" "}
-        <code>rev</code>, and each reports the revision it actually resolved to.
+        Tools work on the default branch unless you pass a <code>rev</code>, and each reports the
+        revision it actually resolved to.
       </p>
 
       {mcpTools.map((tool) => (
@@ -40,10 +40,7 @@ export function McpReference(): ReactNode {
       <h2 id="resources" className="scroll-m-20">
         Resources
       </h2>
-      <p>
-        Resources are read by URI rather than called. A URI carries its own revision, so a link
-        keeps meaning the same thing when it is handed to someone else.
-      </p>
+      <p>Read a resource by URI. The URI carries its revision, so a copied link keeps its state.</p>
 
       {mcpResources.map((resource) => (
         <section key={resource.name}>

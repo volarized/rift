@@ -1,14 +1,9 @@
 /**
- * Loads the protocol schemas and answers questions about JSON Schema. What the
+ * Loads the MCP schema and answers questions about JSON Schema. What the
  * *documentation* makes of them — the tool catalogue, the per-page tables of
  * contents, the search index — lives in `protocol-surface.ts`, which builds on
- * this. There is no generated file anywhere: the schemas are the only source.
- *
- * `mcp.json` points at `core.json` by `$id`-relative `$ref`, and nothing points
- * back. Definition names are unique across both, which is what lets a
- * cross-document reference resolve to one anchor;
- * `refName` accepts both the local and the cross-file form and is the only
- * place that knows a `$ref` can name a file at all.
+ * this. `mcp.json` is the only JSON artifact. Its `rift:package` annotations
+ * identify definitions that also cross the internal Protobuf seam.
  *
  * Subschema walking is `json-schema-traverse` (the walker Ajv uses), not a
  * hand-rolled one: it already knows which keywords hold schemas, which hold
@@ -32,8 +27,8 @@ export type Schema = Exclude<JSONSchema, boolean>;
 export const PROTOCOL_PAGE_URL = "/docs/protocol";
 
 /**
- * The JSON Schema half of the contract: the model, and the MCP surface written
- * against it. The adapter seam is protobuf and is loaded by `proto.ts`.
+ * Documentation pages still split shared values from MCP envelopes. The split
+ * follows each definition's generated package annotation.
  */
 export const PROTOCOL_FILES = ["core", "mcp"] as const;
 export type ProtocolFile = (typeof PROTOCOL_FILES)[number];
@@ -44,7 +39,7 @@ interface EntryPointSeam {
 }
 
 /**
- * One group in the reference, as `core.json` declares it. Which definitions
+ * One group in the reference, as `mcp.json` declares it. Which definitions
  * belong to which axis is part of the model, so it is stated in the schema
  * rather than kept as a list in the code that renders it.
  */
@@ -74,39 +69,37 @@ interface ProtocolDocument extends Schema {
 
 const PROTOCOL_DIR = join(process.cwd(), "..", "protocol");
 
-export const documents = Object.fromEntries(
-  PROTOCOL_FILES.map((file) => [
-    file,
-    JSON.parse(readFileSync(join(PROTOCOL_DIR, `${file}.json`), "utf8")) as ProtocolDocument,
-  ]),
-) as Record<ProtocolFile, ProtocolDocument>;
+const document = JSON.parse(
+  readFileSync(join(PROTOCOL_DIR, "mcp.json"), "utf8"),
+) as ProtocolDocument;
+
+export const documents: Record<ProtocolFile, ProtocolDocument> = {
+  core: document,
+  mcp: document,
+};
 
 /** Definition names per file, in each document's own `$defs` order. */
 export const defNamesByFile = Object.fromEntries(
-  PROTOCOL_FILES.map((file) => [file, Object.keys(documents[file].$defs)]),
+  PROTOCOL_FILES.map((file) => [
+    file,
+    Object.entries(document.$defs)
+      .filter(([, schema]) => (schema as Schema & { "rift:package"?: string })["rift:package"] === `rift.${file}`)
+      .map(([name]) => name),
+  ]),
 ) as Record<ProtocolFile, string[]>;
 
 export const defNames: string[] = PROTOCOL_FILES.flatMap((file) => defNamesByFile[file]);
 
 /**
- * Every definition, merged. Names are unique across the three documents — the
+ * Every definition, merged. Names are unique across the two documents — the
  * split was a partition of one namespace, not a rename — and the assertion
  * below keeps it that way, because a collision would silently make two
  * definitions share one anchor.
  */
-export const defs: Record<string, Schema> = {};
-export const homeOf: Record<string, ProtocolFile> = {};
-for (const file of PROTOCOL_FILES) {
-  for (const [name, schema] of Object.entries(documents[file].$defs)) {
-    if (name in defs) {
-      throw new Error(
-        `definition \`${name}\` is defined in both ${homeOf[name]}.json and ${file}.json`,
-      );
-    }
-    defs[name] = schema;
-    homeOf[name] = file;
-  }
-}
+export const defs: Record<string, Schema> = document.$defs;
+export const homeOf: Record<string, ProtocolFile> = Object.fromEntries(
+  PROTOCOL_FILES.flatMap((file) => defNamesByFile[file].map((name) => [name, file] as const)),
+);
 
 /** `allKeys` so keywords outside the walker's own table are still visited. */
 const TRAVERSE_OPTIONS = { allKeys: true } as const;
@@ -122,7 +115,12 @@ const TRAVERSE_OPTIONS = { allKeys: true } as const;
 function nodes(root: Schema): Schema[] {
   const found: Schema[] = [];
   traverse(root as traverse.SchemaObject, TRAVERSE_OPTIONS, (node, pointer) => {
-    if (pointer.split("/").some((segment) => segment.startsWith("rift:"))) return;
+    if (
+      pointer
+        .split("/")
+        .some((segment) => segment.startsWith("rift:") || segment === "discriminator")
+    )
+      return;
     found.push(node as Schema);
   });
   return found;
@@ -165,6 +163,9 @@ const KNOWN_KEYWORDS = new Set([
   "multipleOf",
   "oneOf",
   "anyOf",
+  // Pydantic emits this beside a tagged oneOf. The branch schemas carry the
+  // const tags that the reference renders.
+  "discriminator",
   "allOf",
   "not",
   "if",
@@ -206,20 +207,15 @@ export function branches(node: Schema): { keyword: "oneOf" | "anyOf"; list: Sche
 }
 
 /**
- * The definition a `$ref` names, whether it is local (`#/$defs/X`) or
- * cross-file (`core.json#/$defs/X`). Both resolve to a bare name because the
- * page renders all three documents together and names are unique across them.
+ * The definition a local `$ref` names.
  */
 export function refName(node: Schema | undefined): string | null {
   const ref = node?.$ref;
   if (typeof ref !== "string") return null;
 
   const [file, pointer] = ref.split("#");
-  if (pointer === undefined || !pointer.startsWith("/$defs/")) {
+  if (file !== "" || pointer === undefined || !pointer.startsWith("/$defs/")) {
     throw new Error(`unsupported $ref target: ${ref}`);
-  }
-  if (file !== "" && !PROTOCOL_FILES.includes(file.replace(/\.json$/, "") as ProtocolFile)) {
-    throw new Error(`$ref names an unknown protocol document: ${ref}`);
   }
   return pointer.slice("/$defs/".length);
 }
@@ -258,7 +254,15 @@ for (const name of defNames) {
   for (const node of nodes(defs[name])) {
     const described = enumDescriptions(node);
     if (!described) continue;
-    const values = new Set((node.enum ?? []).filter((value) => typeof value === "string"));
+    const values = new Set(
+      [node, ...(branches(node)?.list ?? [])]
+        .flatMap((candidate) => {
+          const target = refName(candidate);
+          return (target ? defs[target]?.enum : candidate.enum) ?? [];
+        })
+        .filter((value) => typeof value === "string" || typeof value === "number")
+        .map(String),
+    );
     for (const value of Object.keys(described)) {
       if (!values.has(value)) {
         throw new Error(
@@ -270,7 +274,7 @@ for (const name of defNames) {
 }
 
 /**
- * Every `$ref` in all three documents resolves to a definition that exists.
+ * Every `$ref` in both documents resolves to a definition that exists.
  *
  * Whole documents rather than `$defs`, and a plain walk rather than the schema
  * traverser: `rift:entryPoints` is not a schema, so the traverser does not
@@ -278,7 +282,7 @@ for (const name of defNames) {
  * `$ref` there naming a definition that was renamed out from under it produces
  * a page with a link to nothing, and no other check catches it.
  */
-for (const file of PROTOCOL_FILES) {
+for (const file of ["mcp"] as const) {
   const walk = (node: unknown, path: string): void => {
     if (Array.isArray(node)) {
       for (const [index, value] of node.entries()) walk(value, `${path}[${index}]`);
@@ -300,15 +304,112 @@ for (const file of PROTOCOL_FILES) {
   walk(documents[file], file);
 }
 
+/** Definition references found in schema and Rift annotation objects. */
+function references(value: unknown, found = new Set<string>()): Set<string> {
+  if (Array.isArray(value)) {
+    for (const item of value) references(item, found);
+    return found;
+  }
+  if (!value || typeof value !== "object") return found;
+
+  const node = value as Record<string, unknown>;
+  if (typeof node.$ref === "string") {
+    const target = refName(node as Schema);
+    if (target) found.add(target);
+  }
+  for (const [key, child] of Object.entries(node)) {
+    if (
+      (key === "rift:contentType" || key === "rift:arguments") &&
+      typeof child === "string" &&
+      child in defs
+    ) {
+      found.add(child);
+      continue;
+    }
+    if (key !== "examples" && key !== "default") references(child, found);
+  }
+  return found;
+}
+
+const definitionEdges = new Map(
+  defNames.map((name) => [name, [...references(defs[name])].filter((target) => target in defs)]),
+);
+
+/** Every definition must contribute to a seam or a declared external projection. */
+const reachable = new Set<string>();
+const pending = [...references(documents.mcp["rift:entryPoints"])];
+while (pending.length > 0) {
+  const name = pending.pop() as string;
+  if (reachable.has(name) || !(name in defs)) continue;
+  reachable.add(name);
+  pending.push(...(definitionEdges.get(name) ?? []));
+}
+const unreachable = defNames.filter((name) => !reachable.has(name));
+if (unreachable.length > 0) {
+  throw new Error(`protocol definitions do not reach a seam or projection: ${unreachable.join(", ")}`);
+}
+
 /**
- * The reference's grouping, declared by `core.json`. Every name it mentions is
+ * Recursive filters are the protocol's only definition cycle. Request bytes
+ * bound filter nesting. RelationFilter.max_depth bounds graph traversal.
+ */
+const EXPECTED_CYCLES = new Set([
+  "Filter,FilterAll,FilterAny,FilterNot,FilterRelation,RelationFilter",
+]);
+let nextIndex = 0;
+const indices = new Map<string, number>();
+const lowlinks = new Map<string, number>();
+const componentStack: string[] = [];
+const stacked = new Set<string>();
+const cycles: string[] = [];
+
+function connect(name: string): void {
+  indices.set(name, nextIndex);
+  lowlinks.set(name, nextIndex);
+  nextIndex += 1;
+  componentStack.push(name);
+  stacked.add(name);
+
+  for (const target of definitionEdges.get(name) ?? []) {
+    if (!indices.has(target)) {
+      connect(target);
+      lowlinks.set(name, Math.min(lowlinks.get(name) as number, lowlinks.get(target) as number));
+    } else if (stacked.has(target)) {
+      lowlinks.set(name, Math.min(lowlinks.get(name) as number, indices.get(target) as number));
+    }
+  }
+
+  if (lowlinks.get(name) !== indices.get(name)) return;
+  const component: string[] = [];
+  let current: string;
+  do {
+    current = componentStack.pop() as string;
+    stacked.delete(current);
+    component.push(current);
+  } while (current !== name);
+
+  const selfCycle = component.length === 1 && definitionEdges.get(name)?.includes(name);
+  if (component.length > 1 || selfCycle) cycles.push(component.sort().join(","));
+}
+
+for (const name of defNames) if (!indices.has(name)) connect(name);
+const unexpectedCycles = cycles.filter((cycle) => !EXPECTED_CYCLES.has(cycle));
+const missingCycles = [...EXPECTED_CYCLES].filter((cycle) => !cycles.includes(cycle));
+if (unexpectedCycles.length > 0 || missingCycles.length > 0) {
+  throw new Error(
+    `protocol definition cycles changed: found [${cycles.join("; ")}], expected [${[...EXPECTED_CYCLES].join("; ")}]`,
+  );
+}
+
+/**
+ * The reference's grouping, declared by `mcp.json`. Every name it mentions is
  * checked here: a group seeded by a definition that no longer exists silently
  * files its whole subtree somewhere else, which is the kind of drift a rename
  * causes and nothing catches.
  */
 export const axisGroups: AxisGroup[] = (() => {
-  const declared = documents.core["rift:axes"];
-  if (!declared) throw new Error("core.json is missing `rift:axes`");
+  const declared = documents.mcp["rift:axes"];
+  if (!declared) throw new Error("mcp.json is missing `rift:axes`");
   for (const group of declared.groups) {
     for (const name of [...(group.identifiedBy ?? []), ...(group.holds ?? [])]) {
       if (!(name in defs)) {
@@ -324,7 +425,7 @@ export const axisGroups: AxisGroup[] = (() => {
   return declared.groups;
 })();
 
-/** Which definitions refer to a given one, across all three documents. */
+/** Which definitions refer to a given one, across both documents. */
 export const backlinks: Record<string, string[]> = (() => {
   const edges = new Map<string, Set<string>>(defNames.map((name) => [name, new Set<string>()]));
   for (const from of defNames) {

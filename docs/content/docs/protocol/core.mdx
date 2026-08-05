@@ -8,9 +8,9 @@ Rift resolves every request against a Git revision, so the workspace must be a G
     If it isn't already enabled, run `git init` in the workspace.
 </Callout>
 
-`core.json` assigns each definition to a group under `rift:axes`. That assignment is part of the
-contract. This page explains the groups that describe code; the [reference](/docs/protocol/reference)
-also includes protocol machinery and MCP-specific shapes.
+The MCP schema assigns each definition to a group under `rift:axes`. That assignment is part of the
+contract. This page explains the groups that describe code. The
+[reference](/docs/protocol/reference) also includes protocol machinery and MCP-specific shapes.
 
 ## Versioning
 
@@ -73,8 +73,30 @@ rift://file/pkg/util.py
 The URI contains the path. The resource returns the Git entry and file content. It also reports which
 languages read the file. The same resource reads `LICENSE` and compiler-owned source.
 
-Where more than one language claims a file, the entry says which bytes each one owns. In `App.svelte`,
-the `regions` field can record that TypeScript starts at byte 412.
+An adapter's retained virtual publication also resolves as a regular, non-executable `File`. Its bytes
+come from the adapter overlay and do not create a `ProjectEntry` in the Git tree listing.
+
+A submodule path is a Git `gitlink`. The parent tree stores one child commit at that path. Rift returns
+the gitlink as one `File` with `content.kind: "gitlink"`; `tree` does not list descendants, the file
+resource returns no content, and adapters cannot report source below it. Open the child repository as a
+separate Rift workspace to read or edit its files.
+
+The parent repository can create a gitlink with `create_gitlink` or change its child commit with
+`set_gitlink`. Adding or moving a submodule also changes the parent repository's `.gitmodules` file, so
+the caller places that text edit in the same atomic `DirectChange`. These edits change Git tree entries;
+they do not fetch, check out, or mutate the child repository.
+
+Paths remain raw UTF-8 at filesystem and adapter seams. In a `rift://` URI, unreserved characters and
+segment separators remain literal; every other UTF-8 byte uses uppercase percent-encoding. For example,
+`src/☃.ts` becomes `rift://file/src/%E2%98%83.ts`.
+
+The physical owner records every grammar present in a file. In `App.svelte`, `regions` can record that
+TypeScript starts at byte 412. The `languages` field is the sorted, distinct projection of those regions.
+
+Git stores file entries without storing their parent directories. `ProjectEntry` adds the derived
+directory branch needed by the MCP `tree` call. Its file branch carries the complete `File`; its
+directory branch carries only a `ProjectPath`. A directory therefore has no second resource identity
+and disappears when the selected snapshot contains no visible descendant.
 
 ### Leaf
 
@@ -87,14 +109,18 @@ file, followed by the byte range it spans:
 rift://leaf/python/pkg/util.py@1204-1266
 ```
 
-The grammar determines the tree, so the language is part of the leaf identity. One file can contain
-several grammars. For example, Svelte and TypeScript adapters can parse the same byte range into
-different nodes:
+The grammar determines the tree, so the language is part of the leaf identity. One physical file can
+contain several grammars.
+
+A container adapter owns `App.svelte`. It can publish the script block as a virtual TypeScript file.
+The two leaves then use different source units:
 
 ```
 rift://leaf/svelte/App.svelte@100-200
-rift://leaf/typescript/App.svelte@100-200
+rift://leaf/typescript/__virtual__/App.svelte.ts@0-100
 ```
+
+An exact `OriginMapping` links the virtual range back to `App.svelte`.
 
 A leaf also marks named regions. For a function, an operation can address its `body` independently
 from its `documentation`.
@@ -105,8 +131,8 @@ and every place it is mentioned.
 ### Edit
 
 A change to the code is a value before it is a write to disk. An
-[`Edit`](/docs/protocol/reference#Edit) can replace a byte range with new text. Other variants create
-or delete a file. A rename changes its path:
+[`Edit`](/docs/protocol/reference#Edit) can replace a byte range with new text. Other variants create,
+delete, rename, or copy a file, change its executable bit, and create or update a gitlink:
 
 ```
 { "kind": "replace",
@@ -116,8 +142,16 @@ or delete a file. A rename changes its path:
 ```
 
 An adapter returns proposed source changes to Rift as `Edit` values. Rift can inspect the values before
-writing them to the task worktree. The [adapter contract](/docs/protocol/adapter#source-ownership)
+writing them to the session worktree. The [adapter contract](/docs/protocol/adapter#source-ownership)
 defines that ownership boundary.
+
+An edit set is atomic. Every text range addresses the input state, and ranges in one set cannot
+overlap. Rift orders the set by file and range before it crosses a seam. A sequence of `Change`
+values provides ordered composition when a later change must observe an earlier one.
+
+Gitlink creation and update use `create_gitlink` and `set_gitlink`. Delete and rename also apply to a
+gitlink entry. Copy and executable-bit changes apply to regular files. The pinned snapshot supplies the
+old entry for every operation.
 
 The same shape reads a change that already happened. A
 [`FileChange`](/docs/protocol/reference#FileChange) is the file entry on each side of a comparison and
@@ -193,8 +227,8 @@ guess with a confidence value.
 
 ## Discovery
 
-Callers use a `Filter` to test compiler facts. A `StructuralQuery` parses a source-shaped pattern with
-the target language's grammar.
+Callers use a `Filter` to test compiler facts. A `MatchQuery` selects text matching in Rift or
+structural matching in a language adapter.
 
 ### Filter
 
@@ -213,6 +247,13 @@ the query.
 
 A `relation` node can traverse a cyclic graph, so `max_depth` bounds the walk. The
 `quantifier: "not_exists"` form selects symbols with no matching edge.
+
+### MatchQuery
+
+A [`MatchQuery`](/docs/protocol/reference#MatchQuery) selects one of two engines. A `TextQuery` asks
+Rift to match a literal or regular expression over UTF-8 source. A `StructuralQuery` asks a language
+adapter to parse a source-shaped pattern. Keeping the union in the core model lets a match key carry
+the complete query that produced it.
 
 ### StructuralQuery
 
@@ -259,13 +300,13 @@ analysis state:
 { "state": "partial",     "scope": { "kind": "unit", "unit": "rift://file/src/app.ts" },
                           "reason": "parse stopped at byte 4180" }
 { "state": "unsupported", "scope": { "kind": "request" },
-                          "reason": "this adapter emits no source maps" }
+                          "reason": "this adapter emits no origin mappings" }
 ```
 
 Absence proves absence only under `complete`. Under `partial` the `reason` says what stopped it, and a
 `continuation` says how to ask for the rest where there is a way to. `unsupported` means the adapter
-cannot produce this at all; `not_applicable` means the language has no such concept, like source maps
-for a language nothing generates.
+cannot produce this at all; `not_applicable` means the compiler consumes physical source and has no
+produced ranges to map.
 
 Coverage is recorded separately for each fact family. An adapter can resolve every symbol in a file
 while failing to type one of them, so one combined value would hide the incomplete type analysis.
@@ -278,6 +319,16 @@ such as `TS2345`. Rift forwards the compiler's message unchanged.
 The `reliability` field is `recovered` when the parser repaired invalid source to continue, so facts in
 that region may be approximate. The `continuation` field marks a diagnostic caused by source that ends
 mid-construct, as it can while an agent is writing a file.
+
+### ValidationReport
+
+A [`ValidationReport`](/docs/protocol/reference#ValidationReport) records one adapter's verdict over a
+candidate commit. It names the language, the files checked, the compiler diagnostics, and the coverage
+of the affected program. Publication requires complete coverage and a valid verdict from every adapter
+that owns a changed file.
+
+The MCP surface combines those compiler reports with results from caller-supplied sandboxed validators.
+The candidate retains the complete evidence, so an accepted result can be audited after publication.
 
 ## Operations
 
@@ -298,24 +349,73 @@ A symbol address lets a rename reach every leaf known to the compiler. A leaf ad
 syntax-tree node. A source address selects raw bytes, including bytes in `LICENSE` or in an unclaimed
 file.
 
-### CodeActionDescriptor
+### ActionDescriptor
 
-A [`CodeActionDescriptor`](/docs/protocol/reference#CodeActionDescriptor) is one thing the compiler
-offers to do here — add an import, extract a function. It carries no edits:
+A compiler describes a discovered operation before it computes the edits. An
+[`ActionDescriptor`](/docs/protocol/reference#ActionDescriptor) carries that description:
 
 ```
 kind:          quickfix.import.add
 title:         Import `Config` from `pkg.config`
 applicability: always
 target:        rift://leaf/python/pkg/api.py@88-94
+guarantees:    [syntax_validated, bindings_preserved]
 ```
 
 Computing an action's edits costs about as much as performing it, and only one of the actions offered
 gets picked, so listing and resolving are two calls.
 
-`kind` is a dotted name whose prefixes nest. An agent can request `quickfix` to select that branch.
-`applicability` records the checks still required. `always` records compiler-complete preconditions.
-`conditional` records a condition the caller must verify. `speculative` records inferred intent.
+`kind` is a dotted name whose prefixes nest. Rift defines portable families for quick fixes, source
+organization, rename, move, safe delete, signature changes, extraction, inline, introduction,
+conversion, and generation. An adapter can refine a portable family or advertise a reverse-domain
+family. An agent can request a prefix such as `quickfix` or `refactor.extract`.
+
+`applicability` records how the action was selected. `always` needs no caller-supplied fact before
+resolution. `conditional` exposes a condition outside the compiler's knowledge.
+`speculative` records inferred intent. Every branch still passes preview validation.
+
+The descriptor lists the guarantees resolution must establish. `syntax_validated` covers parsing;
+`bindings_preserved` covers unchanged references; `references_updated` covers references that should
+follow the action. `behavior_checked` names a specific static analysis or sandbox validator and never
+claims general behavioral equivalence.
+
+### Portable action arguments
+
+Four common refactors have shared argument contracts. `RenameArguments` combines the new name with an
+`OperationScope`. `MoveArguments` selects a semantic container or project path. `SafeDeleteArguments`
+defines the disposition of reads, writes, imports, overrides, generated references, classified string
+references, and other resolved uses. Safe delete requires complete reference coverage and refuses an
+unresolved use.
+
+`ChangeSignatureArguments` carries a `SignatureChange`. Existing parameters retain identity through
+their source leaves, so reordering preserves the same parameter identities. The desired shape includes
+receiver, parameter order and defaults, return types, generic parameters, declared errors, language
+effects, and propagation through callers or overrides. Advertised extensions carry constructs that
+the portable shape cannot express.
+
+An action descriptor can carry an `ArgumentContract` with separate `name` and `version` fields.
+
+It also supplies a self-contained JSON Schema. The schema can impose language rules such as identifier
+spelling. Extract, inline, introduce, convert, generate, and language-specific actions use that schema
+without a portable contract.
+
+### Resolution evidence
+
+An `OperationPrecondition` records the expected and observed values for a check, the component that
+verified it, and the addresses or paths it covered. State equality, target existence, writability,
+reference completeness, remaining usages, destination legality, and name availability have portable
+kinds. A compiler-specific condition retains its diagnostics.
+
+An `OperationEffect` explains the semantic consequence of exact edits: a declaration was created,
+removed, moved, or changed; references or imports were updated; source was rewritten; or formatting
+ran. `GuaranteeEvidence` then states the scope, verifier, method, and diagnostics for one advertised
+guarantee. These records let a preview show why an action is admissible without replacing the concrete
+`Edit` values that determine the candidate tree.
+
+Commit reversion stays on the MCP seam because it is a request envelope over versioning and edits. A
+`RevertChange` selects an exact commit, its parent, and eligible paths. Rift computes a three-way
+inverse and returns the same preconditions, effects, edits, and validation evidence as every other
+change.
 
 ### Action and match keys
 
@@ -323,9 +423,11 @@ An action or match points into one snapshot. After the source moves, its byte of
 Each result therefore carries a key bound to the snapshot, which Rift checks before applying it.
 
 A [`MatchKey`](/docs/protocol/reference#MatchKey) contains the snapshot and matched span. It also
-contains a digest of the query. One query produces at most one match for a given span, so these fields
-identify the match.
+contains the complete `MatchQuery`. One query produces at most one match for a given span, so these
+fields identify the match and provide enough information to run it again.
 
-An [`ActionKey`](/docs/protocol/reference#ActionKey) contains the snapshot and address. It also carries
-the adapter's token. Two import actions can share one address, so the compiler uses that token to
-distinguish them. Rift returns it unchanged.
+An [`ActionKey`](/docs/protocol/reference#ActionKey) contains the snapshot, language, and an opaque Rift
+token. The language selects the adapter. The token binds its handle and adapter generation.
+
+The `ActionDescriptor` carries the target once. Keeping it out of the key prevents two target fields
+from disagreeing.

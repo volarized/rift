@@ -17,7 +17,7 @@ function flatten(nodes: ReferenceNode[], out: string[] = []): string[] {
 }
 
 /**
- * Every type, in the groups `core.json` declares under `rift:axes` — heading,
+ * Every type, in the groups `mcp.json` declares under `rift:axes` — heading,
  * summary and membership all come from there, so the page cannot describe a
  * grouping the schema does not have.
  *
