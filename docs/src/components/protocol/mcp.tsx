@@ -14,7 +14,7 @@ import { mcpResources, mcpTools } from "@/lib/protocol-surface";
 export function McpReference(): ReactNode {
   return (
     <>
-      <h2 id="tools" className="scroll-m-20">
+      <h2 id="tools" className="scroll-m-28">
         Tools
       </h2>
       <p>
@@ -24,7 +24,7 @@ export function McpReference(): ReactNode {
 
       {mcpTools.map((tool) => (
         <section key={tool.name}>
-          <h3 id={`tool-${tool.name}`} className="scroll-m-20 font-mono">
+          <h3 id={`tool-${tool.name}`} className="scroll-m-28 font-mono">
             {tool.name}
           </h3>
           {tool.description ? (
@@ -37,14 +37,14 @@ export function McpReference(): ReactNode {
         </section>
       ))}
 
-      <h2 id="resources" className="scroll-m-20">
+      <h2 id="resources" className="scroll-m-28">
         Resources
       </h2>
       <p>Read a resource by URI. The URI carries its revision, so a copied link keeps its state.</p>
 
       {mcpResources.map((resource) => (
         <section key={resource.name}>
-          <h3 id={`resource-${resource.name}`} className="scroll-m-20 font-mono">
+          <h3 id={`resource-${resource.name}`} className="scroll-m-28 font-mono">
             {resource.name}
           </h3>
           {resource.uriTemplate ? (

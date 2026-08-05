@@ -33,7 +33,7 @@ export function Reference(): ReactNode {
         if (names.length === 0) return null;
         return (
           <section key={axis}>
-            <h2 id={`axis-${axis.toLowerCase()}`} className="scroll-m-20">
+            <h2 id={`axis-${axis.toLowerCase()}`} className="scroll-m-28">
               {axis}
             </h2>
             <p>{axisSummary[axis]}</p>

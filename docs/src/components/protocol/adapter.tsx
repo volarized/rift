@@ -150,7 +150,7 @@ function Declaration({ name }: { name: string }): ReactNode {
   if (!message) return null;
   return (
     <section>
-      <h3 id={`msg-${name}`} className="scroll-m-20 font-mono">
+      <h3 id={`msg-${name}`} className="scroll-m-28 font-mono">
         {name}
       </h3>
       {message.comment ? (
@@ -186,7 +186,7 @@ export function AdapterReference(): ReactNode {
 
   return (
     <>
-      <h2 id="service" className="scroll-m-20">
+      <h2 id="service" className="scroll-m-28">
         Service
       </h2>
       <p>
@@ -201,7 +201,7 @@ export function AdapterReference(): ReactNode {
 
       {(service?.rpcs ?? []).map((rpc) => (
         <section key={rpc.name}>
-          <h3 id={`rpc-${rpc.name}`} className="scroll-m-20 font-mono">
+          <h3 id={`rpc-${rpc.name}`} className="scroll-m-28 font-mono">
             {rpc.name}
           </h3>
           <pre>
@@ -220,7 +220,7 @@ export function AdapterReference(): ReactNode {
 
       {protoSections.map((section) => (
         <div key={section.name}>
-          <h2 id={sectionId(section.name)} className="scroll-m-20">
+          <h2 id={sectionId(section.name)} className="scroll-m-28">
             {section.name}
           </h2>
           {section.types.map((name) => (

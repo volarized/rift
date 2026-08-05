@@ -114,7 +114,7 @@ function MessageFields({ message }: { message: ProtoMessage }): ReactNode {
 function MessageBlock({ message }: { message: ProtoMessage }): ReactNode {
   return (
     <section>
-      <h3 id={`scip-${message.name}`} className="scroll-m-20 font-mono">
+      <h3 id={`scip-${message.name}`} className="scroll-m-28 font-mono">
         {message.name}
       </h3>
       {message.comment ? (
@@ -141,7 +141,7 @@ export function ScipReference(): ReactNode {
       {scipServices.flatMap((service) =>
         service.rpcs.map((rpc) => (
           <section key={`${service.name}.${rpc.name}`}>
-            <h3 id={`scip-rpc-${rpc.name}`} className="scroll-m-20 font-mono">
+            <h3 id={`scip-rpc-${rpc.name}`} className="scroll-m-28 font-mono">
               {`${service.name}.${rpc.name}`}
             </h3>
             <pre>
@@ -159,7 +159,7 @@ export function ScipReference(): ReactNode {
       ))}
       {scipEnums.map((value) => (
         <section key={value.fullName}>
-          <h3 id={`scip-${value.name}`} className="scroll-m-20 font-mono">
+          <h3 id={`scip-${value.name}`} className="scroll-m-28 font-mono">
             {value.name}
           </h3>
           {value.comment ? <Prose text={value.comment} resolve={resolveScip} /> : null}

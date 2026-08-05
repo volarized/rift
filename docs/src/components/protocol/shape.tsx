@@ -19,7 +19,7 @@ export function Shape({ label, name }: { label: string; name: string }): ReactNo
 
   return (
     <div className="my-6">
-      <h4 id={name} className="scroll-m-20 font-mono text-base">
+      <h4 id={name} className="scroll-m-28 font-mono text-base">
         <span className="mr-2 font-sans font-normal text-fd-muted-foreground text-sm uppercase tracking-wide">
           {label}
         </span>

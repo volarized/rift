@@ -195,7 +195,7 @@ export function Definition({ name }: { name: string }): ReactNode {
 
   return (
     <section>
-      <h3 id={name} className="scroll-m-20 font-mono">
+      <h3 id={name} className="scroll-m-28 font-mono">
         {name}
         {/* Core is the shared vocabulary and the default; the other two are
             where a type exists on one seam only, which is worth saying. */}
