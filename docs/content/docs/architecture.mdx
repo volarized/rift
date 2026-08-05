@@ -1,0 +1,310 @@
+---
+title: Architecture
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+import { IsoDiagram } from "@/components/iso-diagram";
+
+An agent launches `rift mcp`. That process talks to a `rift server`, which owns the repository. The
+server drives one adapter process per language.
+
+<IsoDiagram
+  alt="Two agents each talk to a separate rift mcp process over stdio. Both processes call one Rift server over gRPC on a Unix domain socket. rift.toml supplies the server with its adapters, limits and profile cap. The server retains analysis results in .rift/facts, creates and writes the Git worktrees under .rift/worktrees, runs declared validators in a candidate sandbox, and drives one adapter process per language over gRPC. The adapters open the worktrees with open(2) and keep their compiler caches in .rift/state."
+  chart={`
+    flowchart LR
+      agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp"]:::rift
+      agent2["agent 2"]:::agent -- "stdio" --> mcp2["rift mcp"]:::rift
+      mcp1 -- "gRPC over<br/>Unix socket" --> server["rift server<br/>one per repository"]:::rift
+      mcp2 -- "gRPC over<br/>Unix socket" --> server
+      config["rift.toml"]:::config -- "adapters, limits,<br/>profile cap" --> server
+      server -- "retains<br/>Analyze results" --> facts[".rift/facts"]:::store
+      server -- "creates, writes,<br/>integrates" --> trees[".rift/worktrees"]:::git
+      server -- "runs declared<br/>validators" --> sandbox["candidate<br/>sandbox"]:::sandbox
+      server -- "gRPC over<br/>Unix socket" --> adapters["adapters<br/>one per language"]:::adapter
+      adapters -- "open(2)" --> trees
+      adapters -- "compiler caches" --> state[".rift/state"]:::store
+  `}
+/>
+
+On MCP's stdio transport the client launches the server as a subprocess, so two agents working in one
+directory get two `rift mcp` processes with no memory between them. Compilers, worktrees and analysis
+results are expensive and shared, and neither of those processes can hold them. That's what the
+`rift server` is for.
+
+`rift mcp` holds no state of its own. It validates the agent's JSON against `mcp.json`, converts it to
+the Protobuf message the schema names, calls the mapped gRPC method, and converts the response back.
+Restarting it costs a process launch.
+
+## Starting the server
+
+You don't. The first `rift mcp` to run in a workspace starts it:
+
+```
+~/projects/charming-aurora        the workspace — a directory with a .git in it
+  .rift/run/v1.sock               the server listens here
+```
+
+The converter connects to that socket. If nothing is listening, it takes an exclusive `flock` on
+`.rift/run/v1.lock`, looks again in case another `rift mcp` won the race, and spawns the server in a
+new session so that the agent exiting later doesn't take the server with it. When the socket accepts,
+the lock goes. A socket that exists but refuses a connection is a server that died; the same path
+unlinks it and starts a new one.
+
+The socket name carries the protocol's major version. A `rift mcp` built against protocol 2 therefore
+never reaches a server speaking protocol 1 — it finds no `v2.sock` and starts its own. Within one
+protocol version the wire is compatible, so a client uses whatever server is already listening; run
+`rift server restart` when you want a newer build to take over.
+
+The server exits on its own after `server.idle-timeout` with no open session, because the adapters it
+holds are compiler processes measured in gigabytes.
+
+<Callout>
+  On Windows the socket is a named pipe, `\\.\pipe\rift.v1.<digest of the workspace path>`. Nothing
+  else in this page changes.
+</Callout>
+
+## The `.rift` directory
+
+Everything the server owns on disk lives in one directory next to your source:
+
+```
+.rift/
+  run/
+    v1.sock                 the gRPC socket
+    v1.lock                 held while a server is starting
+    v1.json                 pid, build version, start time
+  worktrees/
+    a1/                     session a1, on branch rift/a1
+    cand-a1-7/              a candidate under validation
+    read-dae86e1/           a detached checkout, for reading an older revision
+  state/
+    a1/rust/                one adapter's state_root for session a1
+  facts/                    the semantic database
+  log/
+```
+
+The first run appends `.rift/` to `.git/info/exclude`, so none of it shows up in `git status` and you
+don't have to commit a rule for a directory that only exists on your machine.
+
+## Sessions
+
+A session is one agent's connection and everything the server keeps for it. The server creates one
+when a `rift mcp` process makes its first call and binds it to that connection.
+
+No tool takes a session parameter. The connection already says which session is calling, and a session
+identifier on the wire would let one agent name another's session while adding a handshake in front of
+every call. What a session owns:
+
+```
+id              a1
+base            B, the workspace's HEAD when the session opened
+branch          rift/a1
+worktree        .rift/worktrees/a1
+accepted ref    refs/rift/a1/accepted, starting at B
+```
+
+The repository resource reports all five, which is how an agent finds its own worktree path without
+being told.
+
+A session starts from the last commit, so uncommitted changes in your own working tree aren't in it.
+Reads still reach them — `rev: main-worktree` names your working tree, uncommitted edits included. If
+you'd rather the agent start from what you have open, `session.base = "worktree"` records that diff as
+the first commit on the session branch.
+
+### Closing
+
+The session ends when the connection closes, which covers the agent exiting and the agent crashing.
+The server closes every adapter workspace and removes the session's candidate worktrees.
+
+What happens to the session worktree depends on whether it holds work. A session branch still sitting
+at `B` with a clean tree is removed. A branch with commits on it is kept, because a crashed agent
+losing an hour of accepted work to a cleanup routine is worse than a stale branch. Nothing prunes a
+commit that no other ref contains.
+
+Retained previews go with the session, since the server holds them in memory. The candidate commits
+they point at are commits, so they survive and can still be read, previewed against, or integrated.
+
+A server that dies takes every open session with it and leaves the worktrees and branches where they
+are. The next one to start finds them and lists them as retained.
+
+```
+rift sessions                 id, branch, base, accepted head, whether it's merged
+rift sessions remove a1       drops the worktree and the branch
+```
+
+`RIFT_SESSION=a1` in the environment of a new `rift mcp` adopts a retained session instead of opening
+a new one.
+
+### Reading across sessions
+
+Any session can read any revision the repository has, including another session's worktree:
+
+```
+rift://file/src/api.rs?rev=worktrees/a2
+```
+
+Sessions isolate writes. Reading `a2` while `a2` is being written returns a working-tree snapshot with
+`a2`'s base and change digest in it, so the answer says exactly which state it saw. This is how one
+agent reviews another's work before integrating it.
+
+## Worktrees
+
+A worktree's lifetime depends on what made it:
+
+| worktree | created by | removed | written by |
+| --- | --- | --- | --- |
+| session `a1` | opening a session | session close, if it holds no commits | `persist` |
+| candidate `cand-a1-7` | `apply` in `preview` mode | when validation finishes | the preview's resolved edits |
+| read `read-dae86e1` | a semantic read at a revision nothing has checked out | idle timeout, or the LRU cap | nobody |
+
+Compilers open source with `open(2)`, so a real tree on disk is the interface, and source bytes never
+cross the gRPC connection. Adapters don't write source into it — they return `Edit` values and Rift
+applies them. That single writer is what makes `git diff` the complete answer to what a session
+changed.
+
+## Reads
+
+Where a read resolves decides what it costs:
+
+1. **Git objects.** `tree`, the file and diff resources, and text `match`. No adapter, no compiler, any
+   revision Git can resolve, every language.
+2. **Retained facts.** `outline`, `search`, symbol and relationship reads at a snapshot already
+   analyzed. The adapter can be stopped.
+3. **A compiler.** The snapshot or the fact family isn't in the store. The server starts the adapter if
+   it isn't running, opens a workspace on the tree, and runs `Analyze`.
+
+An agent doesn't pick between them, so a question asked of a repository nobody has indexed still gets
+an answer. Indexing a large repository takes minutes, though, and the request has a deadline. When analysis won't finish inside it, the answer comes back with
+`Coverage.state: partial`, a reason naming the indexing state, and a continuation to ask again — the
+same shape as any other incomplete analysis, so no client needs a special case for a cold start.
+
+### Reading an older revision
+
+An adapter opens files by path, and a commit is not a path. A semantic read at a revision that nothing
+has checked out therefore gets a tree:
+
+```
+rift://symbol/python/pkg.util.load_config?rev=v1.2.0
+  ->  .rift/worktrees/read-dae86e1        v1.2.0 is dae86e1
+```
+
+It's a detached checkout, shared by every session asking about that commit, reference-counted, and
+removed after `reads.worktree-idle-timeout`. `reads.max-worktrees` caps how many exist at once —
+default 2, because each one is a full checkout of your source.
+
+A revision that already has a tree is read where it is: `main-worktree`, `worktrees/a2`, the session's
+own. Mechanical reads never materialize anything, because Git objects don't need a checkout.
+
+## Writes
+
+`apply` resolves an ordered array of changes into a fresh candidate worktree, validates the result, and
+retains the plan. `publish` replays that plan and advances the session's accepted ref. `persist`
+materializes selected paths from an accepted commit into the session worktree.
+
+<IsoDiagram
+  alt="A base commit B becomes a candidate commit through apply in preview mode. Adapters refresh onto that candidate and validate it, and sandboxed validators run against it and return an exit status and bounded output. Publish advances refs slash rift slash a1 slash accepted to the candidate by compare-and-swap. From the accepted ref, persist materializes paths into the session worktree and integrate merges into main by compare-and-swap."
+  chart={`
+    flowchart LR
+      base["base commit B"]:::commit -- "apply<br/>preview" --> candidate["candidate<br/>commit"]:::commit
+      adapters["adapters"]:::adapter -- "Refresh<br/>+ Validate" --> candidate
+      validators["sandboxed<br/>validators"]:::sandbox -- "exit status<br/>+ output" --> candidate
+      candidate -- "publish<br/>compare-and-swap" --> accepted["refs/rift/a1/accepted"]:::git
+      accepted -- "persist" --> session[".rift/worktrees/a1"]:::git
+      accepted -- "integrate<br/>three-way from B<br/>compare-and-swap" --> target["main"]:::git
+  `}
+/>
+
+The [MCP page](/docs/protocol/mcp) has the surface; what matters here is what waits on what:
+
+- **Previews don't block each other.** Each one builds its own candidate worktree from a base commit,
+  so two in flight in one session run in parallel and neither touches the session tree.
+- **`publish` takes the accepted ref by compare-and-swap.** Every session has its own accepted ref, so
+  this guards one thing: an agent with two `publish` calls in flight against the same base. The loser
+  gets a conflict result and can re-preview against the new head.
+- **`persist` takes the session's write lock**, because it's the only operation that writes to the
+  session worktree.
+
+Cross-session contention doesn't happen here at all. It happens at integration, where the refs stop
+being per-session.
+
+## Integration
+
+An accepted session commit is a commit on a branch nobody has merged. `integrate` merges it into a
+target ref. The base recorded at session open is what makes that a three-way merge, and the target
+having moved since is the ordinary case:
+
+```
+B ── X ── Y      main
+ \
+  └── A          refs/rift/a1/accepted
+```
+
+Rift merges `A` into `Y` using `B`, in a candidate worktree. The merge result is a candidate like any
+other: adapters refresh onto it, `Validate` runs over the closure the merge touched, and any declared
+validators run. Two commits that are each valid can produce a broken tree together — `Y` renames a
+function that `A` added a call to — so the merge is what gets validated, not either side of it.
+
+| result | what happened |
+| --- | --- |
+| `merged` | the target advanced to the merge commit by compare-and-swap |
+| `conflicted` | Git couldn't merge some paths. Nothing moved. |
+| `rejected` | the target moved between the merge and the swap. Its new head comes back; merge again |
+| `invalid` | the merged tree failed validation. The merge commit stays readable |
+
+Compare-and-swap on the target is where two sessions actually contend. Both integrating into `main`
+serialize, and the loser re-merges against the head that won.
+
+### Conflicts
+
+A conflicted result returns the conflicting paths as base, ours and theirs entries, and a merge
+candidate commit with the non-conflicting resolutions already in it. No conflict markers are written
+into any tree, because a tree full of `<<<<<<<` is a tree no compiler can parse and therefore a tree
+Rift can't validate or ask an adapter about.
+
+Resolving one is an ordinary `apply` against that candidate as base — `edits`, `patch`, or a compiler
+action, whichever fits. `integrate` then continues from the published repair. The editing surface an
+agent already has is the conflict-resolution surface.
+
+### Targets
+
+Git won't move a branch that a working tree has checked out, and neither will Rift. Integrating into
+`main` while you have `main` open needs a clean working tree and `session.integration = "auto"`. The
+default is `manual`: Rift merges, validates, moves nothing, and reports the merge commit for you to
+fast-forward onto yourself.
+
+A ref that nothing has checked out — a feature branch, or another session's accepted ref — moves under
+the `edit` profile. Integrating one session into another is the same operation with a different target,
+and it works because both sessions recorded a base.
+
+<Callout>
+  `integrate` isn't in `mcp.json` yet; the schema stops at `persist`. This section is the design it has
+  to satisfy, along with the `session` record the repository resource still needs to carry.
+</Callout>
+
+## Facts
+
+`.rift/facts` holds what adapters returned from `Analyze`, keyed by the snapshot it was computed at. A
+commit's facts stay valid forever, since a commit can't change. A working tree's facts are keyed by its
+base plus a digest of what differs from it, so editing one file invalidates that snapshot and leaves
+every other one alone.
+
+Nothing is analyzed when the server starts. Indexing a monorepo costs minutes and gigabytes, and a
+session that reads three files shouldn't pay for it, so the first semantic read of a snapshot triggers
+exactly the analysis it needs. `rift index` warms the store ahead of time when you'd rather wait once.
+
+The store is a cache. `facts.max-size` evicts least-recently-used snapshots when it's reached, and
+deleting `.rift/facts` costs you the re-analysis.
+
+## Paths Git doesn't track
+
+Candidate commits are built from the base tree plus the resolved edits, with Git plumbing. There's no
+index and no `git add` involved, so a file an `Edit` creates is in the candidate tree, and a file a
+compiler process creates beside it is not.
+
+An `Edit` on a path matched by `.gitignore` fails the `writable` precondition, and the refusal carries
+the path and the rule that matched it. The commit would otherwise carry a file that your own
+`git status` hides from you, which puts what Rift validated and what you can see out of step.
+
+Sandboxed validators run in a copy of the candidate, which contains tracked files only. A test suite
+that needs an untracked `.env.test` gets it through `sandbox.carry` in
+[`rift.toml`](/docs/configuration#sandbox), an explicit list of ignored paths copied into the sandbox.

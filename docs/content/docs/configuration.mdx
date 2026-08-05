@@ -1,0 +1,147 @@
+---
+title: Configuration
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+`rift.toml` sits in the workspace root, next to `.git`, and is meant to be committed. It's where the
+server learns which adapters exist, and where you bound what an agent may do with them:
+
+```toml
+[server]
+idle-timeout = "10m"
+
+[session]
+base = "head"
+branch-prefix = "rift/"
+integration = "manual"
+
+[reads]
+max-worktrees = 2
+worktree-idle-timeout = "5m"
+
+[facts]
+max-size = "4GiB"
+
+[profile]
+max = "edit"
+
+[sandbox]
+allow = [["cargo", "test"]]
+carry = [".env.test"]
+network = "deny"
+max-timeout = "5m"
+
+[adapters.rust]
+command = ["rift-adapter-rust"]
+env = { RUSTUP_TOOLCHAIN = "stable" }
+max-workspaces = 4
+startup-timeout = "60s"
+```
+
+Every value above is its default except `sandbox.allow`, `sandbox.carry` and the adapter table, which
+have none.
+
+`.rift/config.toml` overrides it and is already excluded from Git, for the paths and toolchains that
+are yours rather than the project's. Environment variables named `RIFT_SESSION`, `RIFT_PROFILE_MAX`
+and so on win over both, which is how an agent launcher sets something for one run without editing a
+file.
+
+A workspace with no `rift.toml` gets the defaults and no adapters, which means `tree`, `match` and the
+file and diff resources work and nothing semantic does. The repository resource reports no languages,
+so an agent can tell the difference between a language Rift can't analyze and one nobody configured.
+
+## server
+
+`idle-timeout` is how long the server stays up with no session open. It holds compiler processes, so
+leaving it running forever costs you gigabytes of resident memory for a repository you closed at
+lunchtime.
+
+## session
+
+`base` decides what a new session starts from. `head` uses the workspace's last commit. `worktree`
+records your uncommitted changes as the session branch's first commit, so an agent starts from what
+you have open instead of from what you last committed.
+
+`branch-prefix` names the branch namespace. Session `a1` gets `rift/a1`.
+
+`integration` is whether [`integrate`](/docs/architecture#targets) may move a branch that a working
+tree has checked out. Under `manual` it merges, validates, and reports the commit without moving
+anything. Under `auto` it advances the branch and updates the tree, which requires that tree to be
+clean.
+
+## reads
+
+A semantic read at a revision nothing has checked out needs a
+[read worktree](/docs/architecture#reading-an-older-revision). `max-worktrees` caps how many exist at
+once and `worktree-idle-timeout` is how long an unreferenced one survives. Each is a full checkout of
+your source, which is why the default is 2 rather than something generous.
+
+## facts
+
+`max-size` bounds `.rift/facts`. At the cap the server evicts least-recently-used snapshots. The store
+is a cache, so the price of a small cap is paying for the same analysis more than once.
+
+## profile
+
+`max` caps what the repository resource may advertise: `read`, `edit`, or `full`. A workspace only
+claims a profile after that profile's conformance suite passes on this host, so what an agent sees is
+the lower of the two. Setting `max = "read"` on a repository nobody should be editing is enough to
+make every write tool absent from the schema an agent reads.
+
+## adapters
+
+Each `[adapters.<name>]` table says how to start one language adapter process:
+
+```toml
+[adapters.rust]
+command = ["rift-adapter-rust"]
+env = { RUSTUP_TOOLCHAIN = "stable" }
+max-workspaces = 4
+startup-timeout = "60s"
+```
+
+The server passes a socket path on the command line, starts the process, and calls `Describe`. That
+call is where the languages, capabilities and write claims come from — the config file never states
+them. Putting them in both places would let a file and a running compiler disagree about what the
+compiler can do, and the file would be the one that's wrong.
+
+`max-workspaces` bounds how many sessions this adapter serves at once. One process holds a workspace
+per session that uses its language, plus one per candidate under validation, and each carries a
+compiler's index. Past the bound, a session opening a workspace waits.
+
+## sandbox
+
+Under the `full` profile a caller declares a `SandboxedValidator` with an `apply` — an argv, a
+timeout, a network policy, and the guarantees a pass is meant to establish. The `[sandbox]` table is
+what bounds that:
+
+```toml
+[sandbox]
+allow = [["cargo", "test"], ["pytest"]]
+carry = [".env.test"]
+network = "deny"
+max-timeout = "5m"
+```
+
+`allow` lists permitted argv prefixes. `["cargo", "test"]` admits
+`cargo test --no-run --test-threads=1` and refuses `cargo publish`. The file says which programs may
+run and the caller says how to run them, which leaves the choice of binary with whoever has commit
+access rather than with the agent.
+
+`network` and `max-timeout` cap what a validator may ask for. A declaration exceeding either is
+refused before anything executes.
+
+`carry` lists ignored paths to copy into the sandbox. The sandbox is a copy of the candidate tree,
+which holds tracked files only, so a suite that reads `.env.test` otherwise fails there for a reason
+that has nothing to do with the change under test.
+
+A pass turns each declared guarantee into `GuaranteeEvidence` on the preview. The exit status and
+bounded output are retained with the candidate, so an accepted result can be read back after
+publication.
+
+<Callout>
+  Validators run on every preview and again on publish. A suite that takes four minutes makes every
+  edit take four minutes, which is why the example allows `cargo test` and leaves `--no-run` to the
+  caller.
+</Callout>

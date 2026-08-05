@@ -45,7 +45,7 @@ Every adapter used by the session opens `.rift/worktrees/a1`. For example, Rust 
 adapters in one monorepo open the same worktree while their source claims select different files.
 A container adapter owns a physical file such as `App.svelte` and publishes its embedded TypeScript
 as virtual source for the TypeScript adapter. The server later commits and integrates the shared tree
-through the [session lifecycle](/docs/protocol#session-worktree).
+through the [session lifecycle](/docs/architecture#writes).
 
 The `Analyze` RPC returns facts about files the compiler opened from the worktree. Each response also
 names the tree and state it used. That coordinate is a `Snapshot`; its worktree value uses Git's

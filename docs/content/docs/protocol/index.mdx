@@ -2,188 +2,60 @@
 title: Protocol
 ---
 
-import { Callout } from "fumadocs-ui/components/callout";
-import { IsoDiagram } from "@/components/iso-diagram";
+At the core of Rift there's a protocol. It fixes what crosses each process boundary — the JSON an
+agent validates against, and the Protobuf every process behind that agent exchanges.
 
-Agents reach Rift via the [Model Context Protocol](https://modelcontextprotocol.io/specification/latest).
-Each agent talks to its own `rift mcp` process over stdio.
+Which processes exist and how they find each other is on the
+[architecture page](/docs/architecture). This page is about what they say to each other:
 
-That process is launched in a workspace — a distinct path on the filesystem of your machine:
+| caller | callee | interface | transport | definition |
+| --- | --- | --- | --- | --- |
+| agent | `rift mcp` | MCP tools and resources | JSON-RPC over stdio | `mcp.json` |
+| `rift mcp` | `rift server` | `rift.mcp.Rift` | gRPC over a Unix socket | `rift/mcp.proto` |
+| SCIP client | `rift server` | `rift.scip.Projection` | gRPC | `rift/scip.proto`, `scip/scip.proto` |
+| `rift server` | adapter | `rift.adapter.Adapter` | gRPC over a Unix socket | `rift/adapter.proto` |
 
-```
-~/projects/charming-aurora  ->  running rift mcp here
-```
+The Rift server speaks gRPC. JSON ends at `rift mcp`, the only participant that ever sees it.
 
-<Callout>
-  On the stdio transport, the client launches the MCP server as a subprocess. Two agents therefore
-  launch two `rift mcp` processes, each with its own client connection.
-</Callout>
+## Conversion
 
-Several agents can work in the same workspace, but their MCP subprocesses cannot share memory. They
-connect to one Rift server, which owns the shared repository state.
+`rift mcp` validates the agent's JSON against `mcp.json`, converts the value to the Protobuf type the
+schema names, and calls the gRPC method the same entry names. The response makes the return trip.
 
-<IsoDiagram
-  alt="Two agents each talk to a separate stateless rift mcp process over stdio. Both processes call one Rift server over gRPC on a Unix domain socket. A SCIP client calls a separate gRPC service on the same server. The server owns the semantic database and Git worktrees. It drives language adapters over gRPC, and the adapters read the worktrees from disk."
-  chart={`
-    flowchart LR
-      agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp<br/>stateless converter"]:::rift
-      agent2["agent 2"]:::agent -- "stdio" --> mcp2["rift mcp<br/>stateless converter"]:::rift
-      mcp1 -- "gRPC + Protobuf<br/>over Unix socket" --> server["rift server"]:::rift
-      mcp2 -- "gRPC + Protobuf<br/>over Unix socket" --> server
-      scip["SCIP client"]:::agent -- "gRPC + Protobuf<br/>Projection.Read" --> server
-      server --> semantic["semantic DB"]:::store
-      server -- "creates, writes,<br/>integrates" --> trees["git worktrees<br/>1 per MCP session"]:::git
-      server -- "gRPC<br/>over Unix socket" --> adapters["adapters"]:::adapter
-      adapters -- "read off disk" --> trees
-  `}
-/>
-
-`rift mcp` is a stateless protocol converter. It validates MCP JSON with `mcp.json`, converts the value
-to the Protobuf type named by the schema, and calls the gRPC method named by the same entry-point
-metadata. It converts the Protobuf response back to the JSON shape the agent expects.
-
-Repository and session state stay in the Rift server. The server also owns caches and adapter lifetimes.
-Restarting `rift mcp` creates another converter process and does not move that state.
-
-The Rift server exposes gRPC services only. Every request and response crossing its process boundary
-is a Protobuf message. `rift.mcp.Rift` serves the operations mapped from MCP. `rift.scip.Projection`
-serves the separate read-only SCIP projection. Language adapters implement `rift.adapter.Adapter`.
-
-When the server starts, it asks each language adapter to analyze the repository and stores the returned
-symbols and relationships in the semantic database.
-
-## Codebase research
-
-The read profile begins with repository facts Rift can answer directly. `tree` lists a snapshot's
-paths, the file resource reads content, the diff resource compares revisions, and text `match` finds
-ranges in UTF-8 source. These operations cover directory listing, recursive tree, glob, file find,
-content search, reads, and change inspection without a compiler process.
-
-Compiler-backed facts add file outlines, symbol search, signatures, types, documentation, diagnostics,
-references, callers, dependencies, implementations, overrides, and call or type hierarchy traversal.
-Each answer reports coverage. Retained facts serve warm semantic reads while adapters are stopped.
-
-Rift keeps exact records as the source of truth. A client can rank them into a token-budgeted code map,
-compute frequently changed files from diffs, or coordinate several project connections. Those derived
-views carry the identities of their underlying records. The repository resource reports the current
-snapshot, index coverage, language capabilities, response limits, and active rollout profile.
-
-## Session worktree
-
-Each MCP session owns one `git worktree`, created from a recorded base commit on a session branch.
-Concurrent sessions use separate worktrees:
-
-```
-base commit B
-  ├── .rift/worktrees/a1   branch rift/a1   one MCP session and all its adapters
-  └── .rift/worktrees/a2   branch rift/a2   another MCP session
+```json
+"tree": { "rpc": "rift.mcp.Rift/Tree", "params": … , "result": … }
 ```
 
-For session `a1`, the server records base commit `B`, creates the session branch, and assigns the
-worktree to that session. Read tools resolve against its accepted state. Editing uses a retained candidate
-lifecycle:
+Every JSON definition carries its Protobuf identity in `rift:proto` metadata, so the converter reads
+the mapping out of the schema it already loaded. There's no operation table anywhere else to keep in
+step with it.
 
-1. `preview` creates an isolated candidate worktree from the selected base.
-2. Rift resolves the ordered changes and applies their concrete `Edit` sets there.
-3. The adapters refresh to the candidate state and validate the affected compiler closure.
-4. Rift runs any caller-authorized sandboxed validators and records their results.
-5. The resulting tree becomes an immutable candidate commit; the session worktree stays unchanged.
-6. `publish` reruns the retained contract and advances the session's accepted ref through compare-and-swap.
-7. `persist` materializes selected paths from the accepted commit into the session worktree.
+The tools defined this way are `tree`, `outline`, `search`, `match`, `actions`, `apply` and `persist`.
+The resources are repository, symbol, diff, file and preview.
 
-The preview resource retains the requested changes, their resolved edits, semantic effects, checked
-preconditions, guarantee evidence, file diff, validation evidence, and required confirmations.
-Refreshing a preview repeats that contract on a selected base and counts changed resolutions; the two
-paginated preview resources expose the exact differences. A compiler-invalid candidate remains an
-immutable readable commit and becomes the stable base for a repair preview.
+## The SCIP seam
 
-The recorded base remains available when an accepted session commit is integrated into a target branch.
-If the target has advanced from `B` to `Y`, Git can use `B` to merge the session commit `A`:
+A SCIP client calls `rift.scip.Projection.Read` on the server directly. The server-streaming method
+returns a header followed by official SCIP records. It has no MCP URI and no JSON envelope, and MCP
+tools neither advertise it nor carry its records.
 
-```
-B ── X ── Y      target
- \
-  └── A          accepted session commit
-```
+Protocol version 1 pins
+[SCIP v0.9.0](https://github.com/scip-code/scip/blob/v0.9.0/scip.proto), whose schema fixes every
+field number, alias and oneof membership those records use.
 
-The commit retains the tree metadata and ancestry used for rename and conflict detection. Candidate
-worktrees are removed after validation; the session worktree remains until the session closes.
+## The adapter seam
 
-One session transaction belongs to one repository. Future federation composes independent repository
-previews and publishes, preserves each compare-and-swap boundary, reports partial failure, and applies
-explicit compensation where policy allows it. For a submodule update, the child publishes first and
-the parent then previews a `set_gitlink` edit to that child commit. Each repository keeps its own atomic
-publish boundary.
+The server calls each compiler process through `rift.adapter.Adapter`. A request names a worktree path;
+the reply carries compiler facts as Protobuf messages. Source bytes stay on disk, because the compiler
+opens that same tree.
 
-<Callout>
-  One writer per worktree. Several adapters read one tree at once, but source mutation in it is one
-  party's at a time, which is what makes "what changed" answerable by `git diff` alone.
-</Callout>
-
-Compilers open files directly in the session worktree. Separate worktrees isolate concurrent sessions and
-keep source bytes off the gRPC connection. A virtual filesystem becomes relevant only if measurements
-show that creating or retaining worktrees is the bottleneck.
-
-Different-language adapters share one session worktree. Each keeps its own compiler state and private
-cache directory.
-
-For `App.svelte`, the Svelte adapter owns the physical file. It publishes virtual inputs for the
-TypeScript and CSS adapters.
-
-Rift sends every adapter the same accepted tree state. Reads run concurrently. A source write drains
-state-pinned calls, updates the tree once, and refreshes every adapter.
-
-## Seams
-
-An agent sends MCP JSON-RPC over stdio. `rift mcp` converts that JSON into a `rift.mcp` message and
-calls the mapped method on `rift.mcp.Rift`.
-
-A SCIP client calls `rift.scip.Projection.Read` directly. That server-streaming method returns a
-header followed by official SCIP records. It has no MCP URI or JSON envelope.
-
-The server calls each compiler process through `rift.adapter.Adapter`. The adapter receives a
-worktree path and returns compiler facts as Protobuf messages.
-
-| caller | server service | transport | definition |
-| --- | --- | --- | --- |
-| `rift mcp` | `rift.mcp.Rift` | gRPC over a Unix socket | `mcp.json`, `rift/mcp.proto` |
-| SCIP client | `rift.scip.Projection` | gRPC | `rift/scip.proto`, `scip/scip.proto` |
-| Rift server | `rift.adapter.Adapter` | gRPC over a Unix socket | `rift/adapter.proto` |
-
-`mcp.json` contains each MCP entry point, its JSON parameter and result shapes, and the gRPC method it
-maps to. Every JSON definition names its Protobuf identity through `rift:proto` metadata. The
-converter therefore needs no operation table outside the schema.
-
-The compiler reads source from the worktree, so gRPC carries requests and compiler results. For a file
-generated by an adapter, the adapter sends the bytes because the file has no source entry on disk.
-
-<Callout>
-  The server owns one adapter per language and calls it through gRPC on a Unix domain socket. Rift is
-  written in Rust. A compiler without a native Rust API runs in a subprocess that implements this
-  service.
-</Callout>
-
-### Model
-
-These services refer to the same code entities. Their shared model has one source:
-
-```
-Pydantic models
-  ├── core + MCP      ──▶ mcp.json
-  ├── core            ──▶ rift/core.proto
-  ├── MCP service     ──▶ rift/mcp.proto
-  ├── adapter service ──▶ rift/adapter.proto
-  ├── SCIP service    ──▶ rift/scip.proto
-  └── SCIP v0.9.0     ──▶ scip/scip.proto
-```
-
-The Pydantic classes define fields and constraints. Their descriptions feed the reference pages, and
-their metadata fixes Protobuf identities. Pydantic emits the MCP JSON Schema. The generator builds
-typed Protobuf syntax trees for every gRPC package.
-
-JSON ends at `rift mcp`. The Rift server and every adapter accept and return Protobuf messages.
+The exception is source no compiler could open. An adapter that generates input for another language —
+the TypeScript inside a `.svelte` file — sends those bytes over the wire, since there's no path to read
+them from.
 
 ## Definitions
+
+We've split the protocol definition into separate, logically aligned blocks:
 
 - [Core model](/docs/protocol/core) — entities shared by server services and adapters
 - [MCP](/docs/protocol/mcp) — tools and resources provided to an agent

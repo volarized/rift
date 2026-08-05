@@ -141,8 +141,11 @@ Every affected language adapter validates the candidate commit. Publication requ
 and a valid `ValidationReport` from each adapter that owns a changed file.
 
 Under the `full` profile, callers can add `SandboxedValidator` declarations. Rift runs each executable
-directly in a disposable candidate copy. The sandbox denies network access. The result retains the exit
-status and bounded output.
+directly in a disposable candidate copy. The result retains the exit status and bounded output.
+
+A declaration is refused unless its argv, timeout and network policy fall inside what
+[`sandbox` in `rift.toml`](/docs/configuration#sandbox) permits, so which binaries can run is decided
+by the repository rather than by the caller.
 
 A validator can name the changes and guarantee it checks. A pass creates `GuaranteeEvidence` linked by
 the validator's position.
