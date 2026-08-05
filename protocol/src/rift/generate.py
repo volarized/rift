@@ -458,9 +458,130 @@ def file_from_package(package: ProtoPackage) -> FileSpec:
     )
 
 
+def union_parents(definitions: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Every tagged union in the schema, mapped to the branch list it holds."""
+    parents: dict[str, list[dict[str, Any]]] = {}
+    for name, body in definitions.items():
+        if "oneof" not in body.get("rift:proto", {}):
+            continue
+        for keyword in ["oneOf", "anyOf"]:
+            branches = body.get(keyword)
+            if isinstance(branches, list):
+                parents[name] = branches
+                break
+    return parents
+
+
+def named_in_axes(document: dict[str, Any]) -> set[str]:
+    """
+    Definitions the axis declaration names. `rift:axes` carries them as bare
+    strings rather than references, so nothing else in this module would see
+    them, and a group that identifies itself by a type Rift had folded away
+    would identify itself by nothing.
+    """
+    groups = document.get("rift:axes", {}).get("groups", [])
+    return {
+        name
+        for group in groups
+        for key in ["identifiedBy", "holds"]
+        for name in group.get(key, [])
+    }
+
+
+def external_uses(document: dict[str, Any], parents: dict[str, Any]) -> set[str]:
+    """
+    Definitions reached from somewhere other than the union branch that declares
+    them. A union's own branch list and its `discriminator` mapping both point at
+    every variant by construction, so counting either would make every variant
+    look shared and inline nothing.
+    """
+    used: set[str] = set()
+
+    def walk(node: Any, owner: str | None) -> None:
+        if isinstance(node, list):
+            for value in node:
+                walk(value, owner)
+            return
+        if not isinstance(node, dict):
+            return
+        target = node.get("$ref")
+        if isinstance(target, str) and target.startswith("#/$defs/"):
+            used.add(target[len("#/$defs/") :])
+        for key, value in node.items():
+            if key == "discriminator":
+                continue
+            if owner in parents and key in {"oneOf", "anyOf"} and isinstance(value, list):
+                for branch in value:
+                    # A bare `$ref` here is the variant's declaration; anything
+                    # else in the branch is an ordinary reference.
+                    if isinstance(branch, dict) and set(branch) == {"$ref"}:
+                        continue
+                    walk(branch, owner)
+                continue
+            walk(value, owner)
+
+    for name, body in document["$defs"].items():
+        walk(body, name)
+    for key, value in document.items():
+        if key != "$defs":
+            walk(value, None)
+    return used
+
+
+def inline_variants(document: dict[str, Any]) -> None:
+    """
+    Fold each single-use union variant into the union that declares it.
+
+    Pydantic emits one model per branch of a discriminated union, and every one
+    of those lands in `$defs` under a name it invented — `FileContentRegular`,
+    `EditSetGitlink`. Nothing outside the union refers to most of them, so the
+    names are surface a client has to learn for no reading of the protocol they
+    make possible: the branch is already identified by its own tag. Folding them
+    in leaves the union as the one named type, with a tag and the fields that
+    tag carries.
+
+    A variant something else refers to keeps its name, because inlining it would
+    delete a reference target. `FileChange` holds `TextEdit` values, so `TextEdit`
+    stays a definition even though it is also a branch of `Edit`. So does a
+    variant two unions both declare, such as the empty branch `SymbolOrigin` and
+    `OperationVerifier` share: folding it into the first would leave the second
+    pointing at a definition that no longer exists.
+    """
+    definitions = document["$defs"]
+    parents = union_parents(definitions)
+
+    declared: dict[str, int] = {}
+    for branches in parents.values():
+        for branch in branches:
+            if isinstance(branch, dict) and set(branch) == {"$ref"}:
+                target = ref_name(branch)
+                if target is not None:
+                    declared[target] = declared.get(target, 0) + 1
+
+    shared = external_uses(document, parents) | named_in_axes(document)
+    shared |= {name for name, count in declared.items() if count > 1}
+
+    for name, branches in parents.items():
+        inlined = False
+        for index, branch in enumerate(branches):
+            if not isinstance(branch, dict) or set(branch) != {"$ref"}:
+                continue
+            target = ref_name(branch)
+            if target is None or target in shared or target not in definitions:
+                continue
+            branches[index] = definitions.pop(target)
+            inlined = True
+        # The mapping names every branch by `$ref`, so it cannot survive one of
+        # them losing its address. Each branch keeps the `const` tag the mapping
+        # was built from, which is what a validator reads anyway.
+        if inlined:
+            definitions[name].pop("discriminator", None)
+
+
 def schema_output() -> dict[str, Any]:
     result = copy.deepcopy(DOCUMENT_METADATA)
-    result["$defs"] = PYDANTIC_SCHEMA["$defs"]
+    result["$defs"] = copy.deepcopy(PYDANTIC_SCHEMA["$defs"])
+    inline_variants(result)
     return result
 
 
@@ -613,14 +734,28 @@ def validate_proto(files: dict[str, str], schema: dict[str, Any]) -> None:
         names.update(
             f"{descriptor.package}.{enum.name}" for enum in descriptor.enum_type
         )
-    for name, definition in schema["$defs"].items():
-        mapped = definition["rift:proto"].get("type")
+    # Every mapping in the document, not only the ones at the top of a
+    # definition: an inlined union branch keeps the Protobuf type it compiles to,
+    # and dropping it out of this check is how the two drift apart unnoticed.
+    def mappings(node: Any, name: str) -> None:
+        if isinstance(node, list):
+            for value in node:
+                mappings(value, name)
+            return
+        if not isinstance(node, dict):
+            return
+        mapped = node.get("rift:proto", {}).get("type")
         if (
             isinstance(mapped, str)
             and mapped.startswith("rift.")
             and mapped not in names
         ):
             raise ValueError(f"$defs/{name} maps to missing Protobuf type {mapped}")
+        for value in node.values():
+            mappings(value, name)
+
+    for name, definition in schema["$defs"].items():
+        mappings(definition, name)
 
 
 def write_or_check(path: Path, content: str, check: bool) -> bool:

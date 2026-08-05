@@ -353,9 +353,7 @@ if (unreachable.length > 0) {
  * Recursive filters are the protocol's only definition cycle. Request bytes
  * bound filter nesting. RelationFilter.max_depth bounds graph traversal.
  */
-const EXPECTED_CYCLES = new Set([
-  "Filter,FilterAll,FilterAny,FilterNot,FilterRelation,RelationFilter",
-]);
+const EXPECTED_CYCLES = new Set(["Filter,RelationFilter"]);
 let nextIndex = 0;
 const indices = new Map<string, number>();
 const lowlinks = new Map<string, number>();
