@@ -1,0 +1,1679 @@
+syntax = "proto3";
+// Generated from the Pydantic models under protocol/src/rift/models. Do not edit.
+// Shared messages used by the MCP server and language adapters.
+package rift.core;
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+// How much a `Diagnostic` matters, in the compiler's own judgement. Adapters map their
+// compiler's levels onto these four, so a caller can drop everything below `warning` without
+// knowing which language produced it.
+enum Severity {
+  // The caller did not set a value.
+  SEVERITY_UNSPECIFIED = 0;
+  // The compiler would not accept the code. Facts read from around it may be missing.
+  SEVERITY_ERROR = 1;
+  // The code compiles and the compiler thinks it is wrong anyway.
+  SEVERITY_WARNING = 2;
+  // Something worth knowing that is not a defect.
+  SEVERITY_INFO = 3;
+  // A suggestion, usually with a code action behind it.
+  SEVERITY_HINT = 4;
+}
+// One portable category a symbol falls into. Kinds are language-specific; facets are shared, so
+// a filter written once applies to every language an adapter is installed for.
+enum SymbolFacet {
+  // The caller did not set a value.
+  SYMBOL_FACET_UNSPECIFIED = 0;
+  // Groups names without being a unit the language loads — a C++ `namespace`, a Rust `mod`.
+  SYMBOL_FACET_NAMESPACE = 1;
+  // A unit the language imports whole. A TypeScript file carries this facet; a Rust module can
+  // span several files.
+  SYMBOL_FACET_MODULE = 2;
+  // Declares a type. `struct Config` and `interface Props` both qualify, which is what makes
+  // one search for types find both.
+  SYMBOL_FACET_TYPE = 3;
+  // Names something that exists while the program runs: a variable, a constant, a function
+  // object.
+  SYMBOL_FACET_VALUE = 4;
+  // Can be called, and so carries at least one `Signature`.
+  SYMBOL_FACET_CALLABLE = 5;
+  // Declared inside another symbol — a method, a field, an enum variant.
+  SYMBOL_FACET_MEMBER = 6;
+  // Can hold members: a class, a struct, an interface.
+  SYMBOL_FACET_MEMBER_CONTAINER = 7;
+  // A parameter of a callable, declared as a symbol of its own so it can be renamed and
+  // referred to.
+  SYMBOL_FACET_PARAMETER = 8;
+  // A generic parameter — the `T` in `Vec<T>`.
+  SYMBOL_FACET_TYPE_PARAMETER = 9;
+  // Can be instantiated — `new Foo()`, `Foo { .. }`.
+  SYMBOL_FACET_CONSTRUCTIBLE = 10;
+  // Can be inherited from. A `final` class omits this facet.
+  SYMBOL_FACET_EXTENSIBLE = 11;
+  // Names a contract another type can satisfy: an interface, a trait, a protocol.
+  SYMBOL_FACET_IMPLEMENTABLE = 12;
+  // Expands source at compile time, as `macro_rules!` and preprocessor definitions do.
+  SYMBOL_FACET_MACRO = 13;
+  // The language's test tooling collects it as a test: a `#[test]` function, a `describe`
+  // block.
+  SYMBOL_FACET_TEST = 14;
+}
+// Portable structural facets. generated and test are load-bearing: destructive policy,
+// reference policy, and refactor scope all gate on them.
+enum LeafFacet {
+  // The caller did not set a value.
+  LEAF_FACET_UNSPECIFIED = 0;
+  // Introduces a name without necessarily giving it a body — a prototype, an `extern` line.
+  LEAF_FACET_DECLARATION = 1;
+  // Gives a name its body. Where jump-to-definition lands.
+  LEAF_FACET_DEFINITION = 2;
+  // The implementation part of a declaration, after its header.
+  LEAF_FACET_BODY = 3;
+  // A run of statements that opens a scope, however the language delimits one.
+  LEAF_FACET_BLOCK = 4;
+  // One step of execution.
+  LEAF_FACET_STATEMENT = 5;
+  // Something that evaluates to a value.
+  LEAF_FACET_EXPRESSION = 6;
+  // A type as written, in a position where the language expects one.
+  LEAF_FACET_TYPE_EXPRESSION = 7;
+  // Brings a name in from another unit.
+  LEAF_FACET_IMPORT = 8;
+  // Makes a name visible outside this unit.
+  LEAF_FACET_EXPORT = 9;
+  // A parameter as written in a declaration.
+  LEAF_FACET_PARAMETER = 10;
+  // A value as written at a call site.
+  LEAF_FACET_ARGUMENT = 11;
+  // Metadata attached to a declaration: a decorator, an attribute, a Java annotation.
+  LEAF_FACET_ANNOTATION = 12;
+  // Text the compiler ignores. A doc comment carries this too; `RegionRole.documentation` is
+  // what ties one to the declaration it describes.
+  LEAF_FACET_COMMENT = 13;
+  // A name as written, whether it declares or refers.
+  LEAF_FACET_IDENTIFIER = 14;
+  // A value written straight into the source — `42`, `true`.
+  LEAF_FACET_LITERAL = 15;
+  // A destructuring or matching form: a `match` arm, a binding that pulls fields apart.
+  LEAF_FACET_PATTERN = 16;
+  // Produced by a tool from something else in the workspace. Destructive policy gates on this,
+  // because the next build overwrites whatever you write here.
+  LEAF_FACET_GENERATED = 17;
+  // Part of the test suite. Refactor scope gates on this, so a change can be confined to
+  // production code or carried across both.
+  LEAF_FACET_TEST = 18;
+}
+// One named part of a leaf. A language marks these out inside a declaration, so an operation
+// can address the body of a function without addressing its documentation.
+enum RegionRole {
+  // The caller did not set a value.
+  REGION_ROLE_UNSPECIFIED = 0;
+  // What an editor should select on arriving here: the name for a declaration, the whole node
+  // otherwise.
+  REGION_ROLE_SELECTION = 1;
+  // The identifier alone. What a rename rewrites.
+  REGION_ROLE_NAME = 2;
+  // Everything before the body — the keyword, the name, the parameters, the return type.
+  REGION_ROLE_HEADER = 3;
+  // The implementation. Replacing it leaves the signature and the documentation standing.
+  REGION_ROLE_BODY = 4;
+  // What the node holds where its interior is not code: the text of a comment, the characters
+  // inside a string.
+  REGION_ROLE_CONTENT = 5;
+  // The doc comment for this declaration. In most languages it sits outside the declaration,
+  // which is why the leaf has to point at it.
+  REGION_ROLE_DOCUMENTATION = 6;
+  // The node with everything that belongs to it, documentation and annotations included. What a
+  // delete should take.
+  REGION_ROLE_ENCLOSING = 7;
+}
+// One portable category an edge falls into. Kinds are language-specific, so `typescript.import`
+// and `rust.use` are different kinds that share the `imports` facet, which is what lets one
+// query cross languages.
+enum RelationshipFacet {
+  // The caller did not set a value.
+  RELATIONSHIP_FACET_UNSPECIFIED = 0;
+  // `from` lexically holds `to` — a module and the functions written in it.
+  RELATIONSHIP_FACET_CONTAINS = 1;
+  // `from` introduces `to` as a name.
+  RELATIONSHIP_FACET_DECLARES = 2;
+  // `from` gives `to` its body.
+  RELATIONSHIP_FACET_DEFINES = 3;
+  // `from` mentions `to` and nothing narrower fits. The fallback edge.
+  RELATIONSHIP_FACET_REFERENCES = 4;
+  // `from` invokes `to`.
+  RELATIONSHIP_FACET_CALLS = 5;
+  // `from` creates an instance of `to`.
+  RELATIONSHIP_FACET_CONSTRUCTS = 6;
+  // `from` takes the value of `to`.
+  RELATIONSHIP_FACET_READS = 7;
+  // `from` assigns to `to`.
+  RELATIONSHIP_FACET_WRITES = 8;
+  // `from` brings `to` in from another unit.
+  RELATIONSHIP_FACET_IMPORTS = 9;
+  // `from` makes `to` visible outside its unit.
+  RELATIONSHIP_FACET_EXPORTS = 10;
+  // `from` inherits from `to`.
+  RELATIONSHIP_FACET_EXTENDS = 11;
+  // `from` satisfies the contract `to` declares.
+  RELATIONSHIP_FACET_IMPLEMENTS = 12;
+  // `to` is the type of `from`. What jump-to-type-definition follows.
+  RELATIONSHIP_FACET_TYPE_DEFINITION = 13;
+  // `from` replaces an inherited `to`.
+  RELATIONSHIP_FACET_OVERRIDES = 14;
+  // `from` is another name for `to` — a type alias, a re-export, an `as` rename.
+  RELATIONSHIP_FACET_ALIASES = 15;
+  // `to` was produced from `from` by a build step, so editing `to` lasts until the next build.
+  RELATIONSHIP_FACET_GENERATES = 16;
+  // `from` needs `to` and the compiler did not say how. The coarsest edge there is.
+  RELATIONSHIP_FACET_DEPENDS_ON = 17;
+}
+// How formatting participates in a change. The policy is part of the preview identity, so
+// refresh and publish cannot widen its reach.
+enum FormattingPolicy {
+  // The caller did not set a value.
+  FORMATTING_POLICY_UNSPECIFIED = 0;
+  // Keep every byte outside the resolved edits unchanged.
+  FORMATTING_POLICY_PRESERVE = 1;
+  // Run the language formatter over the smallest syntactic regions containing the resolved
+  // edits.
+  FORMATTING_POLICY_CHANGED_REGIONS = 2;
+  // Run the language formatter over every text file touched by the change.
+  FORMATTING_POLICY_AFFECTED_FILES = 3;
+}
+// A property an action claims and must establish with scoped evidence when resolved.
+enum GuaranteeKind {
+  // The caller did not set a value.
+  GUARANTEE_KIND_UNSPECIFIED = 0;
+  // The language parser accepts the affected source under the stated scope.
+  GUARANTEE_KIND_SYNTAX_VALIDATED = 1;
+  // Unchanged references in scope resolve to the same symbols before and after the action.
+  GUARANTEE_KIND_BINDINGS_PRESERVED = 2;
+  // Every resolved reference in scope that should follow the operation now reaches its intended
+  // target.
+  GUARANTEE_KIND_REFERENCES_UPDATED = 3;
+  // A named static analysis or sandbox validator checked a stated behavioral property. The
+  // evidence is limited to that named property and scope.
+  GUARANTEE_KIND_BEHAVIOR_CHECKED = 4;
+}
+// One kind of thing a compiler can tell Rift about a file. Coverage, analysis streaming and
+// invalidation all key on this, so a family is the unit in which an answer can be complete,
+// partial or missing.
+enum FactFamily {
+  // The caller did not set a value.
+  FACT_FAMILY_UNSPECIFIED = 0;
+  // Relations from produced source ranges to the physical or virtual source ranges that
+  // contributed them.
+  FACT_FAMILY_ORIGIN_MAPPINGS = 1;
+  // The declarations the compiler resolved in the file.
+  FACT_FAMILY_SYMBOLS = 2;
+  // The nodes of the file's syntax tree, and which symbol each writes.
+  FACT_FAMILY_LEAVES = 3;
+  // The edges between symbols the compiler read out of this file.
+  FACT_FAMILY_RELATIONSHIPS = 4;
+  // The types carried by those symbols. Type facts live in `Symbol.types` and `Signature`; this
+  // family records how completely the adapter resolved them.
+  FACT_FAMILY_TYPES = 5;
+  // What the compiler complained about while reading the file.
+  FACT_FAMILY_DIAGNOSTICS = 6;
+}
+// A commit. Nothing about it can change, so the object ID is the whole of the state.
+message SnapshotCommit {
+  // The object ID the revision resolved to.
+  string commit = 1;
+}
+// A working tree, which changes under you while you read it. It is reported as the commit it
+// sits on plus a digest of what differs, so a second call can tell whether the disk moved.
+message SnapshotWorktree {
+  // Which working tree on disk, in the spelling git uses to reach one from another.
+  string worktree = 1;
+  // The commit this working tree sits on.
+  string base = 2;
+  // What makes this snapshot an identity: two reads of one dirty tree on the same `base` are
+  // otherwise indistinguishable. The changed set has no bound. This field is SHA-256 over each
+  // differing path with the digest of its content, in RFC 8785 canonical JSON. A clean tree
+  // digests the empty set.
+  string changes = 3;
+}
+// What a `Revision` resolved to, reported beside every answer so a second call can ask the same
+// question again and get the same state.
+//
+// A commit names its immutable tree. A working-tree snapshot names its base commit and digests
+// the changed set, leaving every unedited file's identity in the base.
+message Snapshot {
+  oneof variant {
+    SnapshotCommit commit = 1;
+    SnapshotWorktree worktree = 2;
+  }
+}
+// A byte range of one file and the language used to parse it. The owner of `App.svelte` can
+// mark its script block as TypeScript. A produced virtual file records ranges in its own byte
+// coordinates.
+message LanguageRegion {
+  // The language grammar used for these bytes.
+  string language = 1;
+  // Offsets of the language region inside the file.
+  TextRange range = 2;
+}
+// A physical or virtual file with bytes in it. Every leaf and symbol with readable source comes
+// from this kind.
+message FileContentRegular {
+  // SHA-256 of the bytes. The same value `Snapshot.changes` digests for a file that differs
+  // from its base.
+  string digest = 1;
+  // Size in bytes.
+  int64 size = 2;
+  // Whether Git records the executable bit.
+  bool executable = 3;
+}
+// A Git LFS pointer: a stub committed in place of a large file. Rift reads the stub and never
+// fetches what it names, so the size and hash below are the only facts available.
+message FileContentLfsPointer {
+  // The content hash the pointer names. Rift checks the pointer's syntax and never fetches what
+  // it points at.
+  string oid = 1;
+  // Size in bytes of the content the pointer names.
+  int64 size = 2;
+}
+// A symbolic link. The entry is the path it points at, reported as git recorded it, because the
+// target may not exist in this checkout at all.
+message FileContentSymlink {
+  // The path the link points at, as recorded. Rift does not follow it.
+  string target = 1;
+}
+// A submodule boundary: the parent repository records one child commit at this path. Tree,
+// file, search, and adapter analysis treat the gitlink as one opaque entry and do not descend
+// into the child checkout.
+message FileContentGitlink {
+  // The child repository commit stored in the parent tree entry. Its hexadecimal width matches
+  // the parent repository's object format. A separate Rift workspace can open the child
+  // repository at this commit.
+  string commit = 1;
+}
+// What the entry holds. Only a regular entry has source in it; the other three are paths that
+// point elsewhere and carry no leaves.
+message FileContent {
+  oneof variant {
+    FileContentRegular regular = 1;
+    FileContentLfsPointer lfs_pointer = 2;
+    FileContentSymlink symlink = 3;
+    FileContentGitlink gitlink = 4;
+  }
+}
+// One source entry at a revision: what it is called, what it holds, and which languages read
+// it. Physical entries come from the Git tree. A generated regular entry comes from a retained
+// adapter virtual publication. Bytes are read from the same URI that identifies the entry.
+message File {
+  // Project-relative source identity and the URI from which this record and its bytes are read.
+  string id = 1;
+  // Distinct languages in `regions`, sorted by language ID. This summary avoids scanning every
+  // region. The physical owner reports embedded languages even when another adapter consumes
+  // virtual source.
+  repeated string languages = 3;
+  // Byte ranges parsed with each language grammar. Entries sort by start, end, and language.
+  // Regions may overlap when two grammars parse the same bytes.
+  repeated LanguageRegion regions = 4;
+  // Whether Rift produced facts from this file. False where there is nothing to read, and where
+  // no adapter claims the path.
+  bool semantic = 5;
+}
+// A derived directory containing at least one visible descendant at this snapshot.
+message ProjectEntryDirectory {
+  // Project-relative directory path. The empty path names the project root.
+  string path = 1;
+}
+// A physical Git tree entry with content and language ownership metadata. Generated virtual
+// files remain outside the project tree listing.
+message ProjectEntryFile {
+  // The file represented by this tree node.
+  File file = 1;
+}
+// One visible node in a project tree. Rift walks Git tree objects at the requested snapshot,
+// returning a directory path or the complete `File` for a content-bearing entry.
+message ProjectEntry {
+  oneof variant {
+    ProjectEntryDirectory directory = 1;
+    ProjectEntryFile file = 2;
+  }
+}
+// Versioned extension value. data is validated against the schema advertised for its key and
+// version.
+message ExtensionValue {
+  // Which version of the key's advertised schema shaped `data`. A consumer skips a value whose
+  // version it does not implement.
+  int64 version = 1;
+  // The value itself, shaped by whatever that key and version advertise. Rift carries it and
+  // never interprets it.
+  google.protobuf.Value data = 2;
+}
+// Facts an adapter carries that the model has no field for, under a reverse-domain key. Keys
+// and values use RFC 8785 canonical JSON. `Capabilities.extension_values` advertises every key
+// and version, and consumers skip entries they do not implement.
+message Extensions {
+  map<string, ExtensionValue> entries = 1;
+}
+// Which files a query runs over, as two lists of globs matched against the project-relative
+// path. `include: ["src/**"]` selects the source tree; `exclude: ["src/generated/**"]` then
+// removes generated output.
+message PathSelector {
+  // Globs a path has to match to be searched at all.
+  repeated string include = 1;
+  // Globs that drop a path `include` already matched.
+  repeated string exclude = 2;
+}
+// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from its
+// compiler's native offsets at the seam. No JSON Schema keyword can tie one field to another,
+// so that `end` is never below `start` is asserted by the conformance tests instead.
+message TextRange {
+  // First byte of the range, counted from the start of the file.
+  int64 start = 1;
+  // One past the last byte. Equal to `start` for an empty range, which is how a position
+  // between two bytes is spelled.
+  int64 end = 2;
+}
+// A byte range of one file.
+message SourceSpan {
+  // Which file the offsets are into.
+  string unit = 1;
+  // The bytes, as offsets into that file.
+  TextRange range = 2;
+}
+// One byte range of one file, and what replaces it. Offsets are into the file as it stands at
+// the pinned snapshot, so edits in a set never observe each other, and two of them may not
+// overlap.
+message TextEdit {
+  string kind = 1;
+  // The file, and the byte range being replaced.
+  SourceSpan span = 2;
+  // What the range becomes. Empty deletes it.
+  string text = 3;
+}
+// A regular UTF-8 file that does not exist yet, with its complete content and executable bit.
+message EditCreate {
+  // A path that does not exist at the pinned snapshot. Extracting a module is the usual reason.
+  string file = 1;
+  // All UTF-8 source in the new file.
+  string text = 2;
+  // Whether Git records the new file as executable.
+  bool executable = 3;
+}
+// Removing a file by path. The pinned snapshot supplies its previous entry and content
+// identity.
+message EditDelete {
+  // The file to remove, as it stands at the pinned snapshot.
+  string file = 1;
+}
+// A move carries the source and destination paths. Its content stays in the existing Git
+// object.
+message EditRename {
+  // The path the file has now.
+  string file = 1;
+  // The path it moves to.
+  string destination = 2;
+}
+// Copying an existing file preserves its bytes and executable bit. A caller that needs
+// different destination content uses `create` with that content.
+message EditCopy {
+  // The existing file whose entry is copied.
+  string file = 1;
+  // A path that does not exist before this edit runs.
+  string destination = 2;
+}
+// Changing the executable bit without rewriting file content.
+message EditSetExecutable {
+  // The regular file whose Git mode changes.
+  string file = 1;
+  // The executable bit the file has after the edit.
+  bool executable = 2;
+}
+// Creating a submodule tree entry in the parent repository. A companion text edit updates
+// `.gitmodules` when the mapping is new.
+message EditCreateGitlink {
+  // A parent-repository path that does not exist at the pinned snapshot.
+  string file = 1;
+  // Child repository commit stored in the new gitlink. Its hexadecimal width matches the parent
+  // repository's object format.
+  string commit = 2;
+}
+// Updating an existing submodule entry to a different child commit. The operation changes the
+// parent tree entry and does not read or mutate the child checkout.
+message EditSetGitlink {
+  // Existing gitlink in the parent repository at the pinned snapshot.
+  string file = 1;
+  // Child repository commit stored after the edit. Its hexadecimal width matches the parent
+  // repository's object format.
+  string commit = 2;
+}
+// A filesystem effect described before Rift performs it. Edit sets are atomic and sorted
+// bytewise by each edit's RFC 8785 canonical JSON. Text replacements in one set address the
+// same input state and cannot overlap.
+message Edit {
+  oneof variant {
+    TextEdit text_edit = 1;
+    EditCreate create = 2;
+    EditDelete delete = 3;
+    EditRename rename = 4;
+    EditCopy copy = 5;
+    EditSetExecutable set_executable = 6;
+    EditCreateGitlink create_gitlink = 7;
+    EditSetGitlink set_gitlink = 8;
+  }
+}
+// One file between two states. A creation has no `before`. A deletion has no `after`. A rename
+// has different paths on each side. The path comes from `after.id`, or `before.id` after
+// deletion.
+message FileChange {
+  // The entry before the change. Null where the file did not exist.
+  optional File before = 1;
+  // The entry after the change. Null where the file was deleted.
+  optional File after = 2;
+  // Text replacements that transform the `before` content into `after`. The surrounding entries
+  // carry creation, deletion, and rename state.
+  repeated TextEdit edits = 3;
+  // Whether edits were dropped to stay inside the size limit.
+  bool truncated = 4;
+}
+// One origin, byte for byte. An offset in the generated file maps back to an offset in the
+// source arithmetically.
+message OriginMappingExact {
+  repeated google.protobuf.Value origins = 1;
+}
+// One or more origins, without a position inside them. A macro expansion knows which source it
+// came from and cannot say which byte of it.
+message OriginMappingApproximate {
+  repeated google.protobuf.Value origins = 1;
+}
+// No origin. The generator invented these bytes, so there is nothing in the workspace to jump
+// to.
+message OriginMappingSynthetic {
+  repeated google.protobuf.Value origins = 1;
+}
+// A relation from one produced source range to the source ranges that contributed its bytes. It
+// lets Rift project a finding on compiler input back to source a person can edit.
+message OriginMapping {
+  oneof variant {
+    OriginMappingExact exact = 1;
+    OriginMappingApproximate approximate = 2;
+    OriginMappingSynthetic synthetic = 3;
+  }
+}
+// A standing scope identified by its name.
+message CoverageScopeKind {
+}
+// One file. The claim holds for that path and says nothing about any other.
+message CoverageScopeUnit {
+  // The file the claim is about.
+  string unit = 1;
+}
+// What a completeness statement covers — everything the request asked for, one file, or a
+// standing scope the answer holds over.
+message CoverageScope {
+  oneof variant {
+    CoverageScopeKind kind = 1;
+    CoverageScopeUnit unit = 2;
+  }
+}
+// Everything in scope is here, so a fact that is missing is a fact that does not exist.
+message CoverageComplete {
+  // What the claim covers.
+  CoverageScope scope = 1;
+}
+// Some of what is in scope is missing. `reason` is required here because a caller that reads
+// absence as proof would be wrong.
+message CoveragePartial {
+  // What the claim covers.
+  CoverageScope scope = 1;
+  // Why the answer stops short — a limit hit, a file that would not parse, a page boundary.
+  // Prose for a reader; nothing keys on it.
+  string reason = 2;
+  // How to ask for the rest, where there is a way to.
+  optional string continuation = 3;
+}
+// The family was never produced at all, so there is nothing here to be complete about.
+message CoverageState {
+  // What the claim covers.
+  CoverageScope scope = 2;
+  // Which of the two this is, in words: the feature the adapter lacks, or the concept the
+  // language lacks.
+  string reason = 3;
+}
+// How much of one `FactFamily` an answer actually covers. Absence of a fact means the fact does
+// not exist only where the state is `complete`; anywhere else it means Rift did not get that
+// far.
+message Coverage {
+  oneof variant {
+    CoverageComplete complete = 1;
+    CoveragePartial partial = 2;
+    CoverageState state = 3;
+  }
+}
+// Coverage for every fact family. Absence is authoritative only where state is complete.
+message SemanticCoverage {
+  map<string, Coverage> entries = 1;
+}
+// How a type is written in the source, plus the symbol that declares it when one does. A type
+// with a declaration resolves to that symbol; a structural type — `string | null`, `{ a: string
+// }` — has the spelling and nothing to resolve to.
+message TypeExpression {
+  // The language the spelling is in, and so the adapter that produced it.
+  string language = 1;
+  // The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
+  string source = 2;
+  // The symbol that declares this type, where one does. Null for a structural type, which has a
+  // spelling and nothing to open.
+  optional string resolved = 3;
+  // Type facts the model has no field for, namespaced by the adapter that emitted them.
+  Extensions extensions = 4;
+}
+// One type a symbol carries, together with the role it plays for that symbol.
+message TypeBinding {
+  // The type itself.
+  TypeExpression type = 2;
+}
+// One block of documentation attached to a declaration, in the markup it was written in.
+message Documentation {
+  // The body of the comment, with the comment syntax stripped.
+  string text = 2;
+}
+// One parameter of a `Signature`: what it is called, the types bound to it, and how a call may
+// pass it. A receiver is one of these too, held in its own field because it has no position in
+// the parameter list.
+message Parameter {
+  // What the parameter is called. Null where the language allows an unnamed one, as a
+  // positional parameter in a function type.
+  optional string name = 1;
+  // Where this parameter is written in the source.
+  optional string leaf = 2;
+  // What it accepts. An array because a declared type and an inferred one are separate
+  // bindings.
+  repeated TypeBinding types = 3;
+  // Whether a call may leave it out.
+  bool optional = 4;
+  // Whether it absorbs the arguments that follow — `*args`, `...rest`.
+  bool variadic = 5;
+  // The default value as written in the source. Null where there is none.
+  optional string default = 6;
+  // Parameter facts the model has no field for, namespaced by the adapter that emitted them.
+  Extensions extensions = 7;
+}
+// One callable form of a symbol: the text it renders as, the symbols that text points at, and
+// its structure. Overloads are separate entries.
+message Signature {
+  // The signature as a reader sees it, in the language's own syntax.
+  string display = 1;
+  // Symbols named inside `display`, each with the byte range of `display` that names it, so a
+  // renderer can turn the rendered text into links.
+  repeated SignatureLink links = 2;
+  // The language whose syntax `display` is written in.
+  string language = 3;
+  // The implicit first parameter — `self`, `this`. Null for a free function, and for languages
+  // that have no such thing.
+  optional Parameter receiver = 4;
+  // Declared parameters, in source order.
+  repeated Parameter parameters = 5;
+  // What the call yields. An array because a language may return several values, and because a
+  // declared and an inferred return are separate bindings.
+  repeated TypeBinding returns = 6;
+  // The generic parameters this form declares, each as the symbol that declares it.
+  repeated string type_parameters = 7;
+  // Types this form declares it can raise.
+  repeated TypeExpression throws = 8;
+  // Effect keywords the declaration carries, in the language's own words: `async`, `unsafe`,
+  // `pure`. The spelling is preserved and never mapped onto a portable meaning.
+  repeated string effects = 9;
+  // Signature facts the model has no field for, namespaced by the adapter that emitted them.
+  Extensions extensions = 10;
+}
+// One symbol named inside a rendered signature, with the byte range of that rendering which
+// names it.
+message SignatureLink {
+  // Offsets into the rendered string in `Signature.display`.
+  TextRange range = 1;
+  // The symbol that stretch of text names.
+  string symbol = 2;
+}
+// Declared in a dependency. `manager` is the package manager that installed it, so `npm`,
+// `cargo` or `pip`; `name` and `version` are that manager's own. Upgrading the dependency
+// replaces these symbols.
+message SymbolOriginPackage {
+  // The package manager that installed it.
+  string manager = 1;
+  // The package name, as that manager spells it.
+  string name = 2;
+  // The installed version.
+  string version = 3;
+}
+// Where this symbol is defined. The origins answer different questions: whether you can edit
+// it, whether it moves when you upgrade something, and whether anything can be read from it at
+// all.
+message SymbolOrigin {
+  oneof variant {
+    google.protobuf.Empty workspace = 1;
+    SymbolOriginPackage package = 2;
+    google.protobuf.Empty stdlib = 3;
+    google.protobuf.Empty external = 4;
+    google.protobuf.Empty generated = 5;
+    google.protobuf.Empty synthetic = 6;
+  }
+}
+// Compiler-resolved semantic identity. Source structure lives in Leaf and is connected through
+// Relationship.
+message Symbol {
+  // One portable category a symbol falls into. Kinds are language-specific; facets are shared,
+  // so a filter written once applies to every language an adapter is installed for.
+  enum SymbolFacet {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Groups names without being a unit the language loads — a C++ `namespace`, a Rust `mod`.
+    SYMBOL_FACET_NAMESPACE = 1;
+    // A unit the language imports whole. A TypeScript file carries this facet; a Rust module
+    // can span several files.
+    SYMBOL_FACET_MODULE = 2;
+    // Declares a type. `struct Config` and `interface Props` both qualify, which is what makes
+    // one search for types find both.
+    SYMBOL_FACET_TYPE = 3;
+    // Names something that exists while the program runs: a variable, a constant, a function
+    // object.
+    SYMBOL_FACET_VALUE = 4;
+    // Can be called, and so carries at least one `Signature`.
+    SYMBOL_FACET_CALLABLE = 5;
+    // Declared inside another symbol — a method, a field, an enum variant.
+    SYMBOL_FACET_MEMBER = 6;
+    // Can hold members: a class, a struct, an interface.
+    SYMBOL_FACET_MEMBER_CONTAINER = 7;
+    // A parameter of a callable, declared as a symbol of its own so it can be renamed and
+    // referred to.
+    SYMBOL_FACET_PARAMETER = 8;
+    // A generic parameter — the `T` in `Vec<T>`.
+    SYMBOL_FACET_TYPE_PARAMETER = 9;
+    // Can be instantiated — `new Foo()`, `Foo { .. }`.
+    SYMBOL_FACET_CONSTRUCTIBLE = 10;
+    // Can be inherited from. A `final` class omits this facet.
+    SYMBOL_FACET_EXTENSIBLE = 11;
+    // Names a contract another type can satisfy: an interface, a trait, a protocol.
+    SYMBOL_FACET_IMPLEMENTABLE = 12;
+    // Expands source at compile time, as `macro_rules!` and preprocessor definitions do.
+    SYMBOL_FACET_MACRO = 13;
+    // The language's test tooling collects it as a test: a `#[test]` function, a `describe`
+    // block.
+    SYMBOL_FACET_TEST = 14;
+  }
+  // Unique identifier of this symbol across the whole workspace, and the URI that resolves it.
+  // Hand it to the symbol resource as it stands.
+  string id = 1;
+  // The language this symbol belongs to.
+  string language = 2;
+  // The human-readable name, as written in the source: `parseConfig`. Rendered signatures live
+  // in `signatures`.
+  string name = 3;
+  // What this symbol is in its own language's words — `rust.trait`, `typescript.function`. The
+  // adapter owns this vocabulary, so each language keeps its own term.
+  string kind = 4;
+  // Portable classification, so one query can cross languages. `rust.trait` and
+  // `typescript.interface` are different kinds that share the `type` facet, which is what lets
+  // a search for types find both.
+  repeated SymbolFacet facets = 5;
+  // Where the symbol comes from: code in this workspace, or a package it depends on.
+  SymbolOrigin origin = 6;
+  // The symbol this one is declared inside — the class that owns a method, the module that owns
+  // a function. Absent at the top level.
+  optional string container = 7;
+  // Language keywords qualifying the declaration: `export`, `async`, `const`.
+  repeated string modifiers = 8;
+  // How widely the symbol is visible, in the language's own terms — `public`, `private`,
+  // `pub(crate)`. Null where the language has no such concept.
+  optional string visibility = 9;
+  // The types this symbol carries, each tagged with the role it plays: a return type, a field
+  // type, a bound.
+  repeated TypeBinding types = 10;
+  // One entry per callable form. Overloads are separate entries.
+  repeated Signature signatures = 11;
+  // Doc comments attached to the declaration, with the markup format they were written in.
+  repeated Documentation documentation = 12;
+  // Language-specific facts with no portable equivalent, namespaced by the adapter that emitted
+  // them.
+  Extensions extensions = 13;
+  // Whether language semantics confine this symbol to the document that declares it. The
+  // compiler adapter classifies the symbol; Rift does not infer locality from observed
+  // references.
+  bool document_local = 14;
+}
+// One named part of a leaf, and the bytes it spans.
+message LeafRegion {
+  // One named part of a leaf. A language marks these out inside a declaration, so an operation
+  // can address the body of a function without addressing its documentation.
+  enum RegionRole {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // What an editor should select on arriving here: the name for a declaration, the whole node
+    // otherwise.
+    REGION_ROLE_SELECTION = 1;
+    // The identifier alone. What a rename rewrites.
+    REGION_ROLE_NAME = 2;
+    // Everything before the body — the keyword, the name, the parameters, the return type.
+    REGION_ROLE_HEADER = 3;
+    // The implementation. Replacing it leaves the signature and the documentation standing.
+    REGION_ROLE_BODY = 4;
+    // What the node holds where its interior is not code: the text of a comment, the characters
+    // inside a string.
+    REGION_ROLE_CONTENT = 5;
+    // The doc comment for this declaration. In most languages it sits outside the declaration,
+    // which is why the leaf has to point at it.
+    REGION_ROLE_DOCUMENTATION = 6;
+    // The node with everything that belongs to it, documentation and annotations included. What
+    // a delete should take.
+    REGION_ROLE_ENCLOSING = 7;
+  }
+  // Which part of the leaf this is.
+  RegionRole role = 1;
+  // Offsets into the file, on the same scale as `Leaf.range`.
+  TextRange range = 2;
+}
+// One leaf of a file's concrete syntax tree: the place where a symbol is physically written. It
+// carries where it is — the unit, the byte range, the syntax kind — and the symbol it writes.
+// Everything semantic about that symbol is read from the symbol.
+message Leaf {
+  // Portable structural facets. generated and test are load-bearing: destructive policy,
+  // reference policy, and refactor scope all gate on them.
+  enum LeafFacet {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Introduces a name without necessarily giving it a body — a prototype, an `extern` line.
+    LEAF_FACET_DECLARATION = 1;
+    // Gives a name its body. Where jump-to-definition lands.
+    LEAF_FACET_DEFINITION = 2;
+    // The implementation part of a declaration, after its header.
+    LEAF_FACET_BODY = 3;
+    // A run of statements that opens a scope, however the language delimits one.
+    LEAF_FACET_BLOCK = 4;
+    // One step of execution.
+    LEAF_FACET_STATEMENT = 5;
+    // Something that evaluates to a value.
+    LEAF_FACET_EXPRESSION = 6;
+    // A type as written, in a position where the language expects one.
+    LEAF_FACET_TYPE_EXPRESSION = 7;
+    // Brings a name in from another unit.
+    LEAF_FACET_IMPORT = 8;
+    // Makes a name visible outside this unit.
+    LEAF_FACET_EXPORT = 9;
+    // A parameter as written in a declaration.
+    LEAF_FACET_PARAMETER = 10;
+    // A value as written at a call site.
+    LEAF_FACET_ARGUMENT = 11;
+    // Metadata attached to a declaration: a decorator, an attribute, a Java annotation.
+    LEAF_FACET_ANNOTATION = 12;
+    // Text the compiler ignores. A doc comment carries this too; `RegionRole.documentation` is
+    // what ties one to the declaration it describes.
+    LEAF_FACET_COMMENT = 13;
+    // A name as written, whether it declares or refers.
+    LEAF_FACET_IDENTIFIER = 14;
+    // A value written straight into the source — `42`, `true`.
+    LEAF_FACET_LITERAL = 15;
+    // A destructuring or matching form: a `match` arm, a binding that pulls fields apart.
+    LEAF_FACET_PATTERN = 16;
+    // Produced by a tool from something else in the workspace. Destructive policy gates on
+    // this, because the next build overwrites whatever you write here.
+    LEAF_FACET_GENERATED = 17;
+    // Part of the test suite. Refactor scope gates on this, so a change can be confined to
+    // production code or carried across both.
+    LEAF_FACET_TEST = 18;
+  }
+  // Unique identifier of this source region, and the URI that resolves it.
+  string id = 1;
+  // The symbol written at this leaf. Absent where a leaf writes no symbol — punctuation, a
+  // keyword, a comment.
+  optional string symbol = 2;
+  // The file the leaf is written in.
+  string unit = 3;
+  // The grammar that produced this leaf. It belongs to the identity because two adapters can
+  // produce different trees over the same file bytes.
+  string language = 4;
+  // What the node is in its own grammar's words — `rust.fn_item`, `python.call`.
+  string kind = 5;
+  // Portable structural classification, so a query can ask for bodies or imports without
+  // knowing the grammar that produced them.
+  repeated LeafFacet facets = 6;
+  // The bytes it spans, as offsets into the file.
+  TextRange range = 7;
+  // The leaf's named parts, so an operation can rewrite a function body without touching the
+  // documentation above it.
+  repeated LeafRegion regions = 8;
+  // The region this one is nested inside. Absent at the top level of a unit.
+  optional string parent = 9;
+  // Syntax facts the model has no field for, namespaced by the adapter that emitted them.
+  Extensions extensions = 10;
+}
+// One directed edge between two symbols. Its evidence is the leaves it was read from, and its
+// derivation is how much the compiler knew when it was read.
+message Relationship {
+  // One portable category an edge falls into. Kinds are language-specific, so
+  // `typescript.import` and `rust.use` are different kinds that share the `imports` facet,
+  // which is what lets one query cross languages.
+  enum RelationshipFacet {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // `from` lexically holds `to` — a module and the functions written in it.
+    RELATIONSHIP_FACET_CONTAINS = 1;
+    // `from` introduces `to` as a name.
+    RELATIONSHIP_FACET_DECLARES = 2;
+    // `from` gives `to` its body.
+    RELATIONSHIP_FACET_DEFINES = 3;
+    // `from` mentions `to` and nothing narrower fits. The fallback edge.
+    RELATIONSHIP_FACET_REFERENCES = 4;
+    // `from` invokes `to`.
+    RELATIONSHIP_FACET_CALLS = 5;
+    // `from` creates an instance of `to`.
+    RELATIONSHIP_FACET_CONSTRUCTS = 6;
+    // `from` takes the value of `to`.
+    RELATIONSHIP_FACET_READS = 7;
+    // `from` assigns to `to`.
+    RELATIONSHIP_FACET_WRITES = 8;
+    // `from` brings `to` in from another unit.
+    RELATIONSHIP_FACET_IMPORTS = 9;
+    // `from` makes `to` visible outside its unit.
+    RELATIONSHIP_FACET_EXPORTS = 10;
+    // `from` inherits from `to`.
+    RELATIONSHIP_FACET_EXTENDS = 11;
+    // `from` satisfies the contract `to` declares.
+    RELATIONSHIP_FACET_IMPLEMENTS = 12;
+    // `to` is the type of `from`. What jump-to-type-definition follows.
+    RELATIONSHIP_FACET_TYPE_DEFINITION = 13;
+    // `from` replaces an inherited `to`.
+    RELATIONSHIP_FACET_OVERRIDES = 14;
+    // `from` is another name for `to` — a type alias, a re-export, an `as` rename.
+    RELATIONSHIP_FACET_ALIASES = 15;
+    // `to` was produced from `from` by a build step, so editing `to` lasts until the next
+    // build.
+    RELATIONSHIP_FACET_GENERATES = 16;
+    // `from` needs `to` and the compiler did not say how. The coarsest edge there is.
+    RELATIONSHIP_FACET_DEPENDS_ON = 17;
+  }
+  // The symbol the edge starts at.
+  string from = 1;
+  // What the edge is in its own language's words — `typescript.import`, `rust.impl`.
+  string kind = 2;
+  // Portable classification, so a query for `imports` finds `typescript.import` and `rust.use`
+  // alike.
+  repeated RelationshipFacet facets = 3;
+  // The symbol the edge points at. One Rift cannot read carries the `external` origin; the edge
+  // is the same either way.
+  string to = 4;
+  // The leaves this edge was read from.
+  repeated string evidence = 5;
+  // How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other derivation.
+  optional double confidence = 7;
+  // Edge facts the model has no field for, namespaced by the adapter that emitted them.
+  Extensions extensions = 8;
+}
+// A predicate over a standard, namespaced substrate, or diagnostic field. Rift evaluates the
+// regex operation under `rift-regex`, including filters nested in
+// `StructuralCaptureConstraint.semantic`. Structural patterns and path selectors carry separate
+// grammars.
+message FieldFilter {
+  // Which field to test, by its name in this model: `facets`, `origin.kind`, `severity`.
+  // Extension keys and diagnostic fields are addressed the same way.
+  string field = 1;
+  // The operand, for every op except `in` and `exists`.
+  optional google.protobuf.Value value = 3;
+  // The operands for `in`.
+  repeated google.protobuf.Value values = 4;
+}
+// A predicate over an exact advertised relationship kind or portable facet.
+message RelationFilter {
+  // One portable category an edge falls into. Kinds are language-specific, so
+  // `typescript.import` and `rust.use` are different kinds that share the `imports` facet,
+  // which is what lets one query cross languages.
+  enum RelationshipFacet {
+    // The caller did not set a value.
+    RELATIONSHIP_FACET_UNSPECIFIED = 0;
+    // `from` lexically holds `to` — a module and the functions written in it.
+    RELATIONSHIP_FACET_CONTAINS = 1;
+    // `from` introduces `to` as a name.
+    RELATIONSHIP_FACET_DECLARES = 2;
+    // `from` gives `to` its body.
+    RELATIONSHIP_FACET_DEFINES = 3;
+    // `from` mentions `to` and nothing narrower fits. The fallback edge.
+    RELATIONSHIP_FACET_REFERENCES = 4;
+    // `from` invokes `to`.
+    RELATIONSHIP_FACET_CALLS = 5;
+    // `from` creates an instance of `to`.
+    RELATIONSHIP_FACET_CONSTRUCTS = 6;
+    // `from` takes the value of `to`.
+    RELATIONSHIP_FACET_READS = 7;
+    // `from` assigns to `to`.
+    RELATIONSHIP_FACET_WRITES = 8;
+    // `from` brings `to` in from another unit.
+    RELATIONSHIP_FACET_IMPORTS = 9;
+    // `from` makes `to` visible outside its unit.
+    RELATIONSHIP_FACET_EXPORTS = 10;
+    // `from` inherits from `to`.
+    RELATIONSHIP_FACET_EXTENDS = 11;
+    // `from` satisfies the contract `to` declares.
+    RELATIONSHIP_FACET_IMPLEMENTS = 12;
+    // `to` is the type of `from`. What jump-to-type-definition follows.
+    RELATIONSHIP_FACET_TYPE_DEFINITION = 13;
+    // `from` replaces an inherited `to`.
+    RELATIONSHIP_FACET_OVERRIDES = 14;
+    // `from` is another name for `to` — a type alias, a re-export, an `as` rename.
+    RELATIONSHIP_FACET_ALIASES = 15;
+    // `to` was produced from `from` by a build step, so editing `to` lasts until the next
+    // build.
+    RELATIONSHIP_FACET_GENERATES = 16;
+    // `from` needs `to` and the compiler did not say how. The coarsest edge there is.
+    RELATIONSHIP_FACET_DEPENDS_ON = 17;
+  }
+  // Whether a match needs such an edge, or needs there to be none.
+  enum Quantifier {
+    // The caller did not set a value.
+    QUANTIFIER_UNSPECIFIED = 0;
+    // At least one edge matches.
+    QUANTIFIER_EXISTS = 1;
+    // No edge matches. How "a symbol nothing calls" is written.
+    QUANTIFIER_NOT_EXISTS = 2;
+  }
+  // Exact relationship kinds advertised by an adapter. Any listed kind matches.
+  repeated string kind = 1;
+  // Portable relationship facets. Any listed facet matches.
+  repeated RelationshipFacet facet = 2;
+  // What has to be true of the entity at the other end. Nesting a filter here is how "callers
+  // that are tests" becomes one query.
+  optional Filter target = 4;
+  // How many edges to walk before a hit counts. Above 1 this asks about indirect neighbours and
+  // skips the direct ones.
+  optional int64 min_depth = 5;
+  // How many edges a traversal may cross. Call graphs contain cycles and can span the
+  // workspace, so every traversal has this bound.
+  optional int64 max_depth = 6;
+  // Whether a match needs such an edge, or needs there to be none.
+  optional Quantifier quantifier = 7;
+}
+// A test on one field of the entity.
+message FilterField {
+  // The field and the comparison.
+  FieldFilter field = 1;
+}
+// A test on the edges the entity has.
+message FilterRelation {
+  // The edges to look for, and what they must reach.
+  RelationFilter relation = 1;
+}
+// Conjunction: every member has to hold.
+message FilterAll {
+  // The filters that must all hold.
+  repeated Filter all = 1;
+}
+// Disjunction: at least one member has to hold.
+message FilterAny {
+  // The filters, of which one is enough.
+  repeated Filter any = 1;
+}
+// Negation of what it holds.
+message FilterNot {
+  // The filter being negated.
+  Filter not = 1;
+}
+// A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass.
+message Filter {
+  oneof variant {
+    FilterField field = 1;
+    FilterRelation relation = 2;
+    FilterAll all = 3;
+    FilterAny any = 4;
+    FilterNot not = 5;
+  }
+}
+// A symbol, wherever it happens to be written. Addressed this way, a rename reaches every leaf
+// the compiler knows about.
+message AddressSymbol {
+  // The symbol the operation applies to.
+  string symbol = 1;
+}
+// One node of one file's syntax tree, optionally narrowed to one of its named parts.
+message AddressLeaf {
+  // One named part of a leaf. A language marks these out inside a declaration, so an operation
+  // can address the body of a function without addressing its documentation.
+  enum RegionRole {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // What an editor should select on arriving here: the name for a declaration, the whole node
+    // otherwise.
+    REGION_ROLE_SELECTION = 1;
+    // The identifier alone. What a rename rewrites.
+    REGION_ROLE_NAME = 2;
+    // Everything before the body — the keyword, the name, the parameters, the return type.
+    REGION_ROLE_HEADER = 3;
+    // The implementation. Replacing it leaves the signature and the documentation standing.
+    REGION_ROLE_BODY = 4;
+    // What the node holds where its interior is not code: the text of a comment, the characters
+    // inside a string.
+    REGION_ROLE_CONTENT = 5;
+    // The doc comment for this declaration. In most languages it sits outside the declaration,
+    // which is why the leaf has to point at it.
+    REGION_ROLE_DOCUMENTATION = 6;
+    // The node with everything that belongs to it, documentation and annotations included. What
+    // a delete should take.
+    REGION_ROLE_ENCLOSING = 7;
+  }
+  // The node the operation applies to.
+  string leaf = 1;
+  // Which part of the leaf. Absent, the whole of it.
+  optional RegionRole region = 2;
+}
+// A byte range, whether or not anything was parsed there. This is what addresses a `LICENSE`
+// file, or a region of a file no adapter claims.
+message AddressSource {
+  // The file, and the bytes in it.
+  SourceSpan span = 1;
+}
+// A result of a `StructuralQuery`, by the identity it came back with. That identity carries its
+// source state; resolution returns `stale_match` when the candidate has moved.
+message AddressMatch {
+  // The match, and the state it was found in.
+  MatchKey match = 1;
+  // Which named capture of the match. Null addresses the match itself.
+  optional string capture = 2;
+}
+// Where an operation applies. Separate union branches distinguish a semantic symbol, a syntax
+// leaf, a source range, and a retained match.
+message Address {
+  oneof variant {
+    AddressSymbol symbol = 1;
+    AddressLeaf leaf = 2;
+    AddressSource source = 3;
+    AddressMatch match = 4;
+  }
+}
+// A condition one capture of a `StructuralQuery` has to meet. Constraints are where a pattern
+// over syntax reaches the compiler's knowledge: match every call, then keep only the ones whose
+// target carries the `test` facet.
+message StructuralCaptureConstraint {
+  // Portable structural facets. generated and test are load-bearing: destructive policy,
+  // reference policy, and refactor scope all gate on them.
+  enum LeafFacet {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Introduces a name without necessarily giving it a body — a prototype, an `extern` line.
+    LEAF_FACET_DECLARATION = 1;
+    // Gives a name its body. Where jump-to-definition lands.
+    LEAF_FACET_DEFINITION = 2;
+    // The implementation part of a declaration, after its header.
+    LEAF_FACET_BODY = 3;
+    // A run of statements that opens a scope, however the language delimits one.
+    LEAF_FACET_BLOCK = 4;
+    // One step of execution.
+    LEAF_FACET_STATEMENT = 5;
+    // Something that evaluates to a value.
+    LEAF_FACET_EXPRESSION = 6;
+    // A type as written, in a position where the language expects one.
+    LEAF_FACET_TYPE_EXPRESSION = 7;
+    // Brings a name in from another unit.
+    LEAF_FACET_IMPORT = 8;
+    // Makes a name visible outside this unit.
+    LEAF_FACET_EXPORT = 9;
+    // A parameter as written in a declaration.
+    LEAF_FACET_PARAMETER = 10;
+    // A value as written at a call site.
+    LEAF_FACET_ARGUMENT = 11;
+    // Metadata attached to a declaration: a decorator, an attribute, a Java annotation.
+    LEAF_FACET_ANNOTATION = 12;
+    // Text the compiler ignores. A doc comment carries this too; `RegionRole.documentation` is
+    // what ties one to the declaration it describes.
+    LEAF_FACET_COMMENT = 13;
+    // A name as written, whether it declares or refers.
+    LEAF_FACET_IDENTIFIER = 14;
+    // A value written straight into the source — `42`, `true`.
+    LEAF_FACET_LITERAL = 15;
+    // A destructuring or matching form: a `match` arm, a binding that pulls fields apart.
+    LEAF_FACET_PATTERN = 16;
+    // Produced by a tool from something else in the workspace. Destructive policy gates on
+    // this, because the next build overwrites whatever you write here.
+    LEAF_FACET_GENERATED = 17;
+    // Part of the test suite. Refactor scope gates on this, so a change can be confined to
+    // production code or carried across both.
+    LEAF_FACET_TEST = 18;
+  }
+  // Which metavariable of the pattern this constrains, written without the `$`.
+  string capture = 1;
+  // The syntax kind the captured node has to be, in its grammar's own words.
+  optional string exact_kind = 3;
+  // A portable structural facet the captured node has to carry.
+  optional LeafFacet facet = 4;
+  // A `rift-regex` expression the capture's text must match. Rift evaluates it with Unicode
+  // character classes, linear-time matching, and no look-around or backreferences.
+  optional string text_regex = 5;
+  // What has to be true of the symbol written at the capture. The adapter matches syntax; Rift
+  // applies this, because only Rift holds the resolved facts.
+  optional Filter semantic = 6;
+}
+// A text or structural pattern, tagged by the engine that evaluates it. Carrying the complete
+// query lets a match key explain its own identity and lets a caller rerun it without retrieving
+// hidden state.
+message MatchQuery {
+  oneof variant {
+    StructuralQuery structural_query = 1;
+    TextQuery text_query = 2;
+  }
+}
+// Literal or regular-expression matching over any UTF-8 file. Rift evaluates this query even
+// when no adapter claims the path. Matches are leftmost-first and non-overlapping. After an
+// empty regular-expression match, scanning advances to the next UTF-8 boundary. The query
+// carries its dialect so a stored match key remains self-contained.
+message TextQuery {
+  // Selects Rift's text matcher.
+  string kind = 1;
+  // Version of the query shape and pattern semantics.
+  int64 version = 2;
+  // Regular-expression grammar used in `regex` mode. The separate `version` field selects its
+  // syntax and match semantics. Version 1 has Unicode character classes, linear-time matching,
+  // and no look-around or backreferences. Protocol conformance fixtures define accepted syntax
+  // and match selection.
+  string dialect = 3;
+  // Text to find in the selected grammar.
+  string pattern = 5;
+  // Initial case-sensitivity for regular-expression mode. Inline flags may change it within the
+  // pattern.
+  bool case_sensitive = 6;
+  // Whether `^` and `$` initially match line boundaries in regular-expression mode. Inline
+  // flags may change it within the pattern.
+  bool multiline = 7;
+  // Files searched by this query.
+  PathSelector paths = 8;
+}
+// Every leaf that writes one symbol.
+message StructuralQueryWithinSymbol {
+  string symbol = 1;
+}
+// One syntax subtree.
+message StructuralQueryWithinLeaf {
+  string leaf = 1;
+}
+// One source byte range.
+message StructuralQueryWithinSource {
+  SourceSpan span = 1;
+}
+// Optional source boundary for the search. A symbol selects its leaves. A leaf selects its
+// syntax subtree. A span selects its bytes.
+message StructuralQueryWithin {
+  oneof variant {
+    StructuralQueryWithinSymbol symbol = 1;
+    StructuralQueryWithinLeaf leaf = 2;
+    StructuralQueryWithinSource source = 3;
+  }
+}
+// A syntax search parsed with the target language's grammar. `$NAME` stands for one node and
+// `$$$NAME` for a run of nodes. Each adapter uses the shared capture, constraint, and result
+// shapes.
+message StructuralQuery {
+  string kind = 1;
+  // Which revision of the metavariable grammar the pattern is written in.
+  int64 version = 2;
+  // Which grammar parses `pattern`, and so which adapter runs the search.
+  string language = 3;
+  // The pattern, in the target language's own syntax, with metavariables where the shape
+  // matters and the text does not.
+  string pattern = 4;
+  // Which files to search.
+  PathSelector paths = 5;
+  // Optional source boundary for the search. A symbol selects its leaves. A leaf selects its
+  // syntax subtree. A span selects its bytes.
+  optional StructuralQueryWithin within = 6;
+  // Conditions the captures have to meet. The pattern finds a shape; these narrow it to the
+  // occurrences you meant.
+  repeated StructuralCaptureConstraint constraints = 7;
+  // Query fields the model has no place for, namespaced by the adapter that reads them.
+  Extensions extensions = 9;
+}
+// One named capture of a match, and the bytes it bound.
+message Capture {
+  // Which metavariable of the pattern bound these bytes.
+  string name = 1;
+  // Where it bound. A capture that matched a run of nodes has one span per node.
+  repeated SourceSpan spans = 2;
+  // The source it bound, as written.
+  string text = 3;
+  // The leaf this capture landed on, or null when the capture is text and nothing was parsed —
+  // as every text-regex capture is. What the leaf means is read through `Leaf.symbol`.
+  optional string entity = 4;
+}
+// The ranges a replacement can be written over, computed by the adapter that parsed the match.
+// Whether the trivia around a node belongs to the edit depends on what you are doing — deleting
+// a list element has to take a separator with it — and only the grammar knows where that trivia
+// ends.
+message StructuralMatchRanges {
+  // The node itself, with nothing around it. What a replacement in place writes over.
+  SourceSpan exact = 1;
+  // The node with the trivia in front of it: the indentation on its line, a separator that
+  // precedes it.
+  SourceSpan leading = 2;
+  // The node with what follows it: a trailing comma, the newline that ends its line.
+  SourceSpan trailing = 3;
+  // The node with the trivia on either side. Deleting this leaves no blank line and no orphaned
+  // separator.
+  SourceSpan both = 4;
+}
+// A second place the compiler wants you to look — the earlier declaration a redefinition
+// conflicts with, the bound that failed. It carries a message and a location, and never a
+// severity of its own, because it is part of one finding.
+message DiagnosticRelated {
+  // What to notice there — "first defined here", "required by this bound".
+  string message = 1;
+  // Where to look.
+  SourceSpan span = 2;
+}
+// One thing a compiler said about the source. The message and the code are passed through in
+// the compiler's own words, because a normalised message loses the detail that makes it
+// actionable.
+message Diagnostic {
+  // How much a `Diagnostic` matters, in the compiler's own judgement. Adapters map their
+  // compiler's levels onto these four, so a caller can drop everything below `warning` without
+  // knowing which language produced it.
+  enum Severity {
+    // The caller did not set a value.
+    SEVERITY_UNSPECIFIED = 0;
+    // The compiler would not accept the code. Facts read from around it may be missing.
+    SEVERITY_ERROR = 1;
+    // The code compiles and the compiler thinks it is wrong anyway.
+    SEVERITY_WARNING = 2;
+    // Something worth knowing that is not a defect.
+    SEVERITY_INFO = 3;
+    // A suggestion, usually with a code action behind it.
+    SEVERITY_HINT = 4;
+  }
+  enum Tags {
+    // The caller did not set a value.
+    TAGS_UNSPECIFIED = 0;
+    // The code still works and is marked for removal.
+    TAGS_DEPRECATED = 1;
+    // The code has no effect — an unused import, an unreachable branch.
+    TAGS_UNNECESSARY = 2;
+  }
+  // How much it matters.
+  Severity severity = 1;
+  // The compiler's own identifier for this finding — `TS2345`, `E0308`. Null where the compiler
+  // issues none.
+  optional string code = 2;
+  // What the compiler said, in its own words.
+  string message = 3;
+  // Where it applies. Null for a finding about the file as a whole, or about the build.
+  optional SourceSpan span = 4;
+  // Other places the compiler pointed at while explaining this one.
+  repeated DiagnosticRelated related = 5;
+  // Presentation tags for the finding. An editor can render them as strikethrough or grey text.
+  repeated Tags tags = 6;
+  // Diagnostic fields the model has no place for, namespaced by the adapter that emitted them.
+  Extensions extensions = 9;
+  // Which adapter produced this. Null for a finding Rift itself raised.
+  optional string language = 10;
+}
+// One compiler's verdict over a candidate snapshot. `coverage` states how much the compiler
+// checked, while `valid` records whether the checked scope contains an error. Publication
+// requires complete coverage from every adapter that owns an affected file and a valid verdict
+// from each of them.
+message ValidationReport {
+  // The adapter that produced this verdict.
+  string language = 1;
+  // Whether this compiler accepted every file in `files` under the reported coverage.
+  bool valid = 2;
+  // How much of the affected program the compiler checked. Publication refuses partial or
+  // unsupported coverage where the change depends on that language.
+  Coverage coverage = 3;
+  // Affected files this verdict covers, sorted by project path.
+  repeated string files = 4;
+  // Compiler findings produced while checking the candidate, sorted by file and source range.
+  repeated Diagnostic diagnostics = 5;
+}
+// How many matches an atomic rewrite accepts. Rift counts against the candidate state at that
+// point in the ordered change list and refuses the whole preview when the count falls outside
+// this interval.
+message MatchCardinality {
+  // Fewest matches required.
+  int64 minimum = 1;
+  // Most matches accepted. Null uses the workspace's `max_rewrite_expansions` limit.
+  optional int64 maximum = 2;
+}
+// The project source an action may inspect or change. Dependencies remain readable compiler
+// input and are never editable through this scope.
+message OperationScope {
+  // Project paths eligible for the action. Every resolved edit must remain inside this
+  // selector.
+  PathSelector paths = 1;
+}
+// How a compiler may eliminate each remaining use while deleting a declaration. `refuse` stops
+// when that use exists, `rewrite` replaces it with a compiler-selected valid form, and `remove`
+// deletes its containing construct at a compiler-selected safe boundary. Complete reference
+// coverage is mandatory; any unresolved use refuses `refactor.safe_delete` before a candidate
+// is built.
+message SafeDeletePolicy {
+}
+// The desired callable shape for a structured signature action. Existing parameters retain
+// identity through `Parameter.leaf`; a parameter without a leaf is new. Language constructs
+// outside this shape travel in `extensions` under an advertised versioned schema.
+message SignatureChange {
+  // Desired implicit receiver, or null for a free callable.
+  optional Parameter receiver = 1;
+  // Desired parameters in declaration order. Reordering existing leaves preserves their
+  // identity while changing their position.
+  repeated Parameter parameters = 2;
+  // Desired declared return bindings.
+  repeated TypeBinding returns = 3;
+  // Desired existing generic parameters in order. Creating a language-specific generic
+  // parameter uses `extensions`.
+  repeated string type_parameters = 4;
+  // Desired declared error or exception types.
+  repeated TypeExpression throws = 5;
+  // Desired language effect keywords, in the adapter's spelling.
+  repeated string effects = 6;
+  // Versioned language-specific signature fields.
+  Extensions extensions = 8;
+}
+// Portable arguments for `refactor.rename` actions.
+message RenameArguments {
+  // New source name. The compiler checks language spelling, collisions, visibility, and binding
+  // changes.
+  string name = 1;
+  // Source eligible for propagation. Complete references outside it cause refusal.
+  OperationScope scope = 2;
+}
+message MoveArgumentsDestinationAddress {
+  // Existing semantic container that receives the moved declaration.
+  Address address = 1;
+}
+message MoveArgumentsDestinationPath {
+  // Project path that receives a file, module, or declaration supported by the language.
+  string path = 1;
+}
+// Existing destination container or project path. Symbols use an Address; files and new modules
+// use a ProjectPath.
+message MoveArgumentsDestination {
+  oneof variant {
+    MoveArgumentsDestinationAddress address = 1;
+    MoveArgumentsDestinationPath path = 2;
+  }
+}
+// Portable arguments for `refactor.move` actions.
+message MoveArguments {
+  // Source eligible for import and reference updates.
+  OperationScope scope = 2;
+}
+// Portable arguments for `refactor.safe_delete` actions.
+message SafeDeleteArguments {
+  // Required behavior for every classified remaining use.
+  SafeDeletePolicy policy = 1;
+  // Source in which complete usage analysis and any requested rewrite may occur.
+  OperationScope scope = 2;
+}
+// Portable arguments for `refactor.change_signature` actions.
+message ChangeSignatureArguments {
+  // Desired callable structure and propagation policy.
+  SignatureChange signature = 1;
+  // Source eligible for caller and override propagation.
+  OperationScope scope = 2;
+}
+// Arguments conform to RenameArguments at the stated contract version.
+message ArgumentContractRename {
+  int64 version = 1;
+}
+// Arguments conform to MoveArguments at the stated contract version.
+message ArgumentContractMove {
+  int64 version = 1;
+}
+// Arguments conform to SafeDeleteArguments at the stated contract version.
+message ArgumentContractSafeDelete {
+  int64 version = 1;
+}
+// Arguments conform to ChangeSignatureArguments at the stated contract version.
+message ArgumentContractChangeSignature {
+  int64 version = 1;
+}
+// A portable argument contract attached to a discovered compiler action. Its stable name and
+// numeric version are separate fields. The descriptor's self-contained schema may narrow the
+// selected contract for one language without changing its field meanings.
+message ArgumentContract {
+  oneof variant {
+    ArgumentContractRename rename = 1;
+    ArgumentContractMove move = 2;
+    ArgumentContractSafeDelete safe_delete = 3;
+    ArgumentContractChangeSignature change_signature = 4;
+  }
+}
+// A language adapter checked compiler-owned state.
+message OperationVerifierAdapter {
+  // Adapter whose compiler performed the check.
+  string language = 1;
+}
+// One caller-supplied sandbox validator checked the candidate.
+message OperationVerifierValidator {
+  // Zero-based position in the preview's validator declarations.
+  int64 validator = 1;
+}
+// The component that checked a precondition or established a guarantee.
+message OperationVerifier {
+  oneof variant {
+    google.protobuf.Empty rift = 1;
+    OperationVerifierAdapter adapter = 2;
+    OperationVerifierValidator validator = 3;
+  }
+}
+// Boolean property such as target existence or writability.
+message PreconditionValueBoolean {
+  bool value = 1;
+}
+// Non-negative count such as remaining usages.
+message PreconditionValueCount {
+  int64 value = 1;
+}
+// Pinned project state used by stale-state checks.
+message PreconditionValueSnapshot {
+  Snapshot value = 1;
+}
+// Coverage required or observed for a compiler fact family.
+message PreconditionValueCoverage {
+  Coverage value = 1;
+}
+// Language or policy value whose spelling is itself significant.
+message PreconditionValueText {
+  string value = 1;
+}
+// A typed value compared by an operation precondition. The tag prevents a snapshot string, a
+// name, and a count rendered as text from becoming indistinguishable.
+message PreconditionValue {
+  oneof variant {
+    PreconditionValueBoolean boolean = 1;
+    PreconditionValueCount count = 2;
+    PreconditionValueSnapshot snapshot = 3;
+    PreconditionValueCoverage coverage = 4;
+    PreconditionValueText text = 5;
+  }
+}
+// One executable condition checked during resolution and rechecked during publication. Expected
+// and observed values carry explicit value tags.
+message OperationPrecondition {
+  // Component that performed the check.
+  OperationVerifier verifier = 3;
+  // Existing semantic or source subjects involved in the condition.
+  repeated Address addresses = 4;
+  // Project paths involved in the condition, including destinations that do not yet exist.
+  repeated string paths = 5;
+  // Required value. Examples include the discovered snapshot, zero remaining usages, or
+  // complete coverage.
+  PreconditionValue expected = 6;
+  // Value found while checking the condition.
+  PreconditionValue observed = 7;
+  // Compiler or Rift findings that explain the observed value.
+  repeated Diagnostic diagnostics = 8;
+}
+// Existing semantic or source target.
+message OperationBlockerAddress {
+  Address address = 1;
+}
+// Project path involved in a collision, ownership refusal, or illegal destination.
+message OperationBlockerPath {
+  string path = 1;
+}
+// Compiler relationship the operation could not preserve or rewrite.
+message OperationBlockerRelationship {
+  Relationship relationship = 1;
+}
+// A concrete subject preventing resolution. The union admits existing code, a path that may not
+// exist, or the compiler edge that cannot be changed safely.
+message OperationBlocker {
+  oneof variant {
+    OperationBlockerAddress address = 1;
+    OperationBlockerPath path = 2;
+    OperationBlockerRelationship relationship = 3;
+  }
+}
+// One semantic consequence of a resolved change. Exact bytes remain in `Edit`; this record
+// explains what those bytes did to declarations and resolved relationships.
+message OperationEffect {
+  // Subjects in the state before this change. Empty for creation.
+  repeated Address before = 2;
+  // Subjects after Rift applies the change and every adapter sharing the worktree acknowledges
+  // the new snapshot. Empty for deletion.
+  repeated Address after = 3;
+  // Source locations demonstrating the effect, pinned to their respective before or after
+  // address state.
+  repeated SourceSpan spans = 4;
+  // Concrete account of the semantic consequence.
+  string detail = 5;
+}
+// Evidence establishing an action-advertised or caller-declared guarantee for a resolved
+// change. The record supplies its scope, verifier, method, and findings.
+message GuaranteeEvidence {
+  // A property an action claims and must establish with scoped evidence when resolved.
+  enum GuaranteeKind {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // The language parser accepts the affected source under the stated scope.
+    GUARANTEE_KIND_SYNTAX_VALIDATED = 1;
+    // Unchanged references in scope resolve to the same symbols before and after the action.
+    GUARANTEE_KIND_BINDINGS_PRESERVED = 2;
+    // Every resolved reference in scope that should follow the operation now reaches its
+    // intended target.
+    GUARANTEE_KIND_REFERENCES_UPDATED = 3;
+    // A named static analysis or sandbox validator checked a stated behavioral property. The
+    // evidence is limited to that named property and scope.
+    GUARANTEE_KIND_BEHAVIOR_CHECKED = 4;
+  }
+  GuaranteeKind kind = 1;
+  // Source over which the guarantee holds.
+  CoverageScope scope = 2;
+  // Component that established the property.
+  OperationVerifier verifier = 3;
+  // Exact property checked and any limit on its interpretation.
+  string detail = 5;
+  // Findings produced while establishing the guarantee.
+  repeated Diagnostic diagnostics = 6;
+}
+// One effect a caller must acknowledge before publication. Requirements are sorted by kind,
+// source location, title, and detail, then numbered from zero. The acknowledgement is
+// interpreted only with the preview named by the publish request.
+message ConfirmationRequirement {
+  // Zero-based position in the preview's ordered confirmation list.
+  int64 id = 1;
+  // A short account of the effect being acknowledged.
+  string title = 3;
+  // The concrete consequence, including the scope or unresolved item that triggered it.
+  string detail = 4;
+  // Source locations that demonstrate the effect. Empty where the condition applies to the
+  // candidate as a whole.
+  repeated SourceSpan spans = 5;
+}
+// One compiler action family advertised for a language. The prefix supports planning. Discovery
+// still decides whether the family applies at an address.
+message ActionSupport {
+  // A property an action claims and must establish with scoped evidence when resolved.
+  enum GuaranteeKind {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // The language parser accepts the affected source under the stated scope.
+    GUARANTEE_KIND_SYNTAX_VALIDATED = 1;
+    // Unchanged references in scope resolve to the same symbols before and after the action.
+    GUARANTEE_KIND_BINDINGS_PRESERVED = 2;
+    // Every resolved reference in scope that should follow the operation now reaches its
+    // intended target.
+    GUARANTEE_KIND_REFERENCES_UPDATED = 3;
+    // A named static analysis or sandbox validator checked a stated behavioral property. The
+    // evidence is limited to that named property and scope.
+    GUARANTEE_KIND_BEHAVIOR_CHECKED = 4;
+  }
+  // Supported action kind prefix, such as `refactor.rename` or `quickfix`.
+  string kind = 1;
+  // Languages, files, or constructs for which this family can be discovered and resolved.
+  Coverage coverage = 2;
+  // Guarantee kinds this family may advertise. Each discovered action states its actual subset.
+  repeated GuaranteeKind guarantees = 3;
+}
+// A compiler's portable description of one discovered operation. Listing carries no edits
+// because resolution computes only the selected action.
+message ActionDescriptor {
+  // A property an action claims and must establish with scoped evidence when resolved.
+  enum GuaranteeKind {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // The language parser accepts the affected source under the stated scope.
+    GUARANTEE_KIND_SYNTAX_VALIDATED = 1;
+    // Unchanged references in scope resolve to the same symbols before and after the action.
+    GUARANTEE_KIND_BINDINGS_PRESERVED = 2;
+    // Every resolved reference in scope that should follow the operation now reaches its
+    // intended target.
+    GUARANTEE_KIND_REFERENCES_UPDATED = 3;
+    // A named static analysis or sandbox validator checked a stated behavioral property. The
+    // evidence is limited to that named property and scope.
+    GUARANTEE_KIND_BEHAVIOR_CHECKED = 4;
+  }
+  // What the action is called, in the words the compiler would show a person.
+  string title = 1;
+  // What this action does. Filtering by prefix is what makes it useful: an agent that wants a
+  // fix asks for `quickfix` and never sees a refactor.
+  string kind = 2;
+  // Whether the compiler ranks this as the preferred action at the target. At most one action
+  // in a list is preferred.
+  bool preferred = 3;
+  // Why the compiler is offering it here.
+  string rationale = 5;
+  // What the action applies to.
+  Address target = 6;
+  // Portable argument shape used by a standard refactor, or null when the adapter's
+  // self-contained schema is the complete contract.
+  optional ArgumentContract argument_contract = 7;
+  // JSON Schema draft 2020-12 for the arguments this action takes. Remote references are
+  // forbidden. When `argument_contract` is set, this schema may add language constraints while
+  // preserving the portable fields and meanings.
+  google.protobuf.Struct arguments_schema = 8;
+  // Properties this action promises to establish when resolution succeeds. Resolve must return
+  // one complete `GuaranteeEvidence` entry for every kind listed here.
+  repeated GuaranteeKind guarantees = 9;
+  // Why the action cannot run right now, where the compiler lists it but refuses it. Null when
+  // it can run.
+  optional string disabled_reason = 10;
+  // The findings this action would clear. Empty for an action nothing reported.
+  repeated Diagnostic diagnostics = 11;
+  // Action fields the model has no place for, namespaced by the adapter that emitted them.
+  Extensions extensions = 12;
+}
+// Identity of one match: the query that found it, the snapshot it searched, and the range where
+// it landed. The complete query remains available for inspection and replay.
+message MatchKey {
+  // The snapshot it was found in. A match does not survive into another one, because the bytes
+  // its span points at have moved.
+  Snapshot snapshot = 1;
+  // The file and byte range that matched.
+  SourceSpan span = 2;
+  // The query that produced this match. One span found by two queries denotes two match
+  // identities.
+  MatchQuery query = 3;
+}
+// State-bound identity of one discovered compiler action. The language selects the adapter. The
+// opaque token binds its handle and adapter generation.
+message ActionKey {
+  // The snapshot it was discovered in. Rift rediscovers the adapter's action and checks this
+  // before applying anything, because an action is only meaningful against the code it was
+  // computed from.
+  Snapshot snapshot = 1;
+  // Language whose adapter minted the token and resolves it.
+  string language = 2;
+  // Opaque Rift handle containing the adapter token and generation. Rift unwraps it only when
+  // resolving the offer.
+  string token = 3;
+}

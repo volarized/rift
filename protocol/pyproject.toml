@@ -1,0 +1,27 @@
+[project]
+name = "rift-protocol"
+version = "0.0.0"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "grpcio-tools==1.76.0",
+  "jsonschema>=4.26.0",
+  "proto-schema-parser>=2.1.0",
+  "pydantic==2.11.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rift"]
+
+[tool.ruff.lint]
+# Ruff treats string values inside Literal as forward annotations under
+# `from __future__ import annotations`. They are wire values and must stay quoted.
+ignore = ["UP037"]
+
+[tool.ty.rules]
+# Pydantic resolves these forward annotations after every model module is loaded.
+# Ty rejects escape sequences inside the otherwise valid annotation strings.
+escape-character-in-forward-annotation = "ignore"

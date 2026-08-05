@@ -1,0 +1,57 @@
+syntax = "proto3";
+// Generated from the Pydantic models under protocol/src/rift/models. Do not edit.
+// The Rift server's read-only SCIP projection API.
+package rift.scip;
+import "rift/core.proto";
+import "scip/scip.proto";
+// One populated Rift field absent from the projected index.
+message Omission {
+  // Why a populated Rift value is absent from the SCIP index.
+  enum Reason {
+    // The server did not classify the omission.
+    REASON_UNSPECIFIED = 0;
+    // SCIP v0.9.0 has no field with the same meaning.
+    REASON_UNREPRESENTABLE = 1;
+    // The projection contract excludes the value. `detail` states the boundary.
+    REASON_OUTSIDE_PROJECTION = 2;
+  }
+  // Core model and field path whose populated value was omitted.
+  string field = 1;
+  // Why the value has no field in the projected index.
+  rift.scip.Omission.Reason reason = 2;
+  // The mapping boundary when `reason` is `REASON_OUTSIDE_PROJECTION`.
+  optional string detail = 3;
+}
+// Selects the Rift snapshot to project into SCIP.
+message Request {
+  // The exact repository state to project.
+  rift.core.Snapshot at = 1;
+}
+// Identity and coverage emitted before index records.
+message Header {
+  // The snapshot that produced every following record.
+  rift.core.Snapshot at = 1;
+  // The metadata field of the projected `scip.Index`.
+  .scip.Metadata metadata = 2;
+  // Availability of each Rift fact family used by the projection.
+  rift.core.SemanticCoverage coverage = 3;
+  // Populated Rift fields absent from the index, sorted by field and reason.
+  repeated rift.scip.Omission omissions = 4;
+}
+// One ordered part of a projected `scip.Index`.
+message Event {
+  oneof value {
+    // The first event. A stream contains exactly one header.
+    rift.scip.Header header = 1;
+    // One index document in canonical path order.
+    .scip.Document document = 2;
+    // One external symbol after the final document, in encoded-symbol order.
+    .scip.SymbolInformation external_symbol = 3;
+  }
+}
+// Projects one Rift snapshot into the pinned SCIP schema.
+service Projection {
+  // Returns one header, then documents, then external symbols. The stream order is the
+  // canonical `scip.Index` order.
+  rpc Read (rift.scip.Request) returns (stream rift.scip.Event);
+}
