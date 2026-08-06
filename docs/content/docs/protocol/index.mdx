@@ -2,15 +2,15 @@
 title: Protocol
 ---
 
-At the core of Rift there's a protocol. It fixes what crosses each process boundary — the JSON an
-agent validates against, and the Protobuf every process behind that agent exchanges.
+Rift uses JSON Schema at the agent boundary and Protobuf messages between its own processes. The
+protocol fixes the conversion between those representations and the gRPC method each request calls.
 
 Which processes exist and how they find each other is on the
 [architecture page](/docs/architecture). This page is about what they say to each other:
 
 | caller | callee | interface | transport | definition |
 | --- | --- | --- | --- | --- |
-| agent | `rift mcp` | MCP tools and resources | JSON-RPC over stdio | `mcp.json` |
+| agent | `rift mcp` | [MCP](https://modelcontextprotocol.io/specification/latest) tools and resources | JSON-RPC over stdio | `mcp.json` |
 | `rift mcp` | `rift server` | `rift.mcp.Rift` | gRPC over a Unix socket | `rift/mcp.proto` |
 | SCIP client | `rift server` | `rift.scip.Projection` | gRPC | `rift/scip.proto`, `scip/scip.proto` |
 | `rift server` | adapter | `rift.adapter.Adapter` | gRPC over a Unix socket | `rift/adapter.proto` |
@@ -30,8 +30,10 @@ Every JSON definition carries its Protobuf identity in `rift:proto` metadata, so
 the mapping out of the schema it already loaded. There's no operation table anywhere else to keep in
 step with it.
 
-The tools defined this way are `tree`, `outline`, `search`, `match`, `actions`, `apply` and `persist`.
-The resources are repository, symbol, diff, file and preview.
+The tools defined this way are `tree`, `outline`, `search`, `match`, `actions`, `execute`,
+`debug_start`, `debug_get_frame`, `debug_stop`, `apply`, `integrate`, and `persist`; the resources
+are repository, symbol, diff, file, and preview. The
+[MCP page](/docs/protocol/mcp) says what each one does.
 
 ## The SCIP seam
 
@@ -45,20 +47,28 @@ field number, alias and oneof membership those records use.
 
 ## The adapter seam
 
-The server calls each compiler process through `rift.adapter.Adapter`. A request names a worktree path;
-the reply carries compiler facts as Protobuf messages. Source bytes stay on disk, because the compiler
-opens that same tree.
+The server calls each adapter process through `rift.adapter.Adapter`. The server first resolves the
+requested revision and reuses or allocates a worktree representing that exact snapshot. `Open` gives
+the adapter its path; the adapter selects any revision-appropriate runtime and returns state. Source
+bytes stay on disk, and worktree allocation never crosses the adapter seam.
 
-The exception is source no compiler could open. An adapter that generates input for another language —
+The exception is source no adapter could open. An adapter that generates input for another language —
 the TypeScript inside a `.svelte` file — sends those bytes over the wire, since there's no path to read
 them from.
 
+Execution uses the same revision-resolution seam with a different lifetime. Rift materializes a
+disposable execution workspace for the exact `Snapshot`, opens a fresh `AdapterState`, and sends the
+caller-provided `CodeBlock` over gRPC. `Execute` removes that state after one result. `DebugStart`
+retains it behind a connection-bound public handle until `DebugStop`; `DebugGetFrame` reads one
+adapter-retained stack frame. Repository writes made by evaluated code are discarded with the
+workspace.
+
 ## Definitions
 
-We've split the protocol definition into separate, logically aligned blocks:
+The definitions split where a process boundary changes ownership:
 
 - [Core model](/docs/protocol/core) — entities shared by server services and adapters
 - [MCP](/docs/protocol/mcp) — tools and resources provided to an agent
 - [SCIP](/docs/protocol/scip) — export of retained facts as a SCIP index
-- [Adapter](/docs/protocol/adapter) — the gRPC service the server drives a compiler with
+- [Adapter](/docs/protocol/adapter) — the gRPC service through which the server calls adapters
 - [Reference](/docs/protocol/reference) — shared and seam types, grouped by axis

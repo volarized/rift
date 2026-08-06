@@ -2,8 +2,9 @@
  * Loads the MCP schema and answers questions about JSON Schema. What the
  * *documentation* makes of them — the tool catalogue, the per-page tables of
  * contents, the search index — lives in `protocol-surface.ts`, which builds on
- * this. `mcp.json` is the only JSON artifact. Its `rift:package` annotations
- * identify definitions that also cross the internal Protobuf seam.
+ * this. This module owns `mcp.json`; `config.ts` independently loads the generated
+ * `rift.toml` schema. The MCP document's `rift:package` annotations identify
+ * definitions that also cross the internal Protobuf seam.
  *
  * Subschema walking is `json-schema-traverse` (the walker Ajv uses), not a
  * hand-rolled one: it already knows which keywords hold schemas, which hold
@@ -351,9 +352,11 @@ if (unreachable.length > 0) {
 
 /**
  * Recursive filters are the protocol's only definition cycle. Request bytes
- * bound filter nesting. RelationFilter.max_depth bounds graph traversal.
+ * bound filter nesting. RelationFilter.max_depth bounds graph traversal, and
+ * ElementFilter.where descends into one entry of a list the entity already
+ * holds, so it terminates on the data rather than on a bound of its own.
  */
-const EXPECTED_CYCLES = new Set(["Filter,RelationFilter"]);
+const EXPECTED_CYCLES = new Set(["ElementFilter,Filter,RelationFilter"]);
 let nextIndex = 0;
 const indices = new Map<string, number>();
 const lowlinks = new Map<string, number>();

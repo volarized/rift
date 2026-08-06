@@ -4,17 +4,24 @@ title: MCP
 
 import { McpReference } from "@/components/protocol/mcp";
 
-Agents reach Rift through MCP tools and resources. Before the first call, a client reads the repository
-resource for the workspace's profile, tools, resources, language support, limits, and retention.
+Agents reach Rift through MCP tools and resources. A client begins by reading the repository resource,
+which reports the surface this workspace serves, its configured language adapters, and the limits on
+requests and retained records.
 
 | Profile | Additional surface |
 | --- | --- |
 | `read` | `tree`, `outline`, `search`, `match`, `actions`, and the repository, symbol, diff, and file resources |
-| `edit` | `apply`, the preview resource, compiler formatting, and compiler validation |
-| `full` | sandboxed validators and `persist` |
+| `edit` | `apply`, `integrate`, the preview resource, adapter formatting, and adapter validation |
+| `full` | command validators and `persist` |
 
-Profiles accumulate. The schemas contain every profile, so one generated client can use `read` now and
-discover `edit` or `full` when a workspace implements them.
+Profiles accumulate. The schemas describe the complete surface; the repository resource reports the
+profile and per-language capabilities available in this workspace.
+
+Execution and debugging are host-policy capabilities rather than another profile tier. `execute` is
+listed only when execution policy enables caller-provided code and the selected language advertises
+`execute`. The three debugging tools appear together only when policy enables them and an adapter
+advertises `debug_start`, `debug_get_frame`, and `debug_stop`. Passing the `full` conformance suite
+does not authorize either capability.
 
 The [`ConformanceProfile`](/docs/protocol/reference#ConformanceProfile) definition specifies the
 executable gate behind each claim. The repository reports a profile only after that suite passes on the
@@ -28,46 +35,80 @@ content and changes. Text `match` searches UTF-8 source. These calls work for ev
 starting an adapter.
 
 `outline` reads declarations, definitions, imports, exports, and their source nesting for one file.
-`search` retrieves files, leaves, or symbols by text and compiler facts. Relationship filters express
+`search` retrieves files, nodes, or symbols by text and adapter facts. Relationship filters express
 callers, callees, dependencies, implementations, overrides, and type hierarchy walks. `match` returns
-source ranges for a `MatchQuery`. `actions` asks a compiler for fixes and refactors at an `Address`.
+source ranges for a `MatchQuery`. `actions` asks an adapter for fixes and refactors at an `Address`.
 Each semantic answer carries coverage and the `Snapshot` it used.
 
-Repository, symbol, diff, and file records use `rift://` URIs.
+Repository, symbol, diff and file records are addressed by `rift://` URIs, so an answer can be handed
+straight back as the input to the next call. The file resource pages through content that way: it
+returns one byte range as UTF-8 or base64, and its next URI starts where that range ended.
 
-The file resource returns one byte range as UTF-8 or base64. Its next URI starts at the returned end.
+Answers are bounded. `max_response_bytes` fixes the serialized page ceiling at 64 KiB,
+`max_record_bytes` holds back enough of it for the page's own identity and cursor, and
+`max_file_chunk_bytes` caps source bytes before encoding; an item that can't fit `max_record_bytes` is
+refused rather than truncated. Anything larger comes back with a `Cursor` bound to both the request
+and the snapshot it read, and Rift refuses that cursor once the source has moved — otherwise paging
+would stitch two different states into one answer.
 
-Large answers carry a `Cursor` bound to the request and snapshot. Rift refuses the cursor after the
-source state moves.
+The read conformance suite measures cold and warm latency against fixed repositories, and records
+serialized bytes alongside answer tokens. Warm there means a semantic read served from retained facts
+with its adapter stopped, which is the case that decides whether an agent waits on a compiler.
 
-`max_response_bytes` fixes the serialized page ceiling at 64 KiB. `max_record_bytes` leaves room for
-page identity and a cursor. `max_file_chunk_bytes` bounds source bytes before encoding. Rift refuses an
-item that cannot fit within `max_record_bytes`.
-
-The read conformance suite measures cold and warm latency against fixed repositories. It also records
-serialized bytes and answer tokens. A warm semantic read uses retained facts while its adapter is
-stopped.
-
-Clients can derive ranked context maps from tree, symbol, and relationship records. They can derive
-change-frequency views from diffs. Those views retain the source record identities.
-
-For a two-commit frequency window, read `rift://diff/HEAD~1..HEAD` and
-`rift://diff/HEAD~2..HEAD~1`, then count each `FileChange` path.
+From those records a client can build its own views: ranked context maps out of tree, symbol and
+relationship records, change frequency out of diffs. The derived view keeps the identities of the
+records it was built from, so a ranking can be traced back to the code it ranked. For a two-commit
+frequency window, read `rift://diff/HEAD~1..HEAD` and `rift://diff/HEAD~2..HEAD~1`, then count each
+`FileChange` path.
 
 A submodule appears in the parent project tree as one gitlink entry carrying the child commit. Parent
 reads and adapters stop at that path. The child repository uses its own Rift connection. A parent edit
 can create or update the gitlink, while a matching `.gitmodules` change travels as an ordinary text edit.
 
+## Execution and debugging
+
+`execute` takes an exact `Language`, an optional `rev`, and a `CodeBlock`. Rift resolves the revision,
+prepares a disposable execution workspace, opens a fresh adapter state, and calls that adapter's
+`Execute` RPC. The result reports the exact `Snapshot`, completion or language failure, bounded stdout
+and stderr, and structured diagnostics. Cancellation, deadline expiry, adapter loss, and workspace
+preparation remain protocol errors rather than code outcomes.
+
+The block includes a project-relative working directory and never becomes a repository file. Imports,
+dependencies, toolchain selection, and configuration come from the chosen snapshot. Files the block
+writes are discarded with the execution workspace after the call.
+
+Debugging is an explicit three-tool lifecycle:
+
+| tool | effect |
+| --- | --- |
+| `debug_start` | Runs a block to normal completion or an unhandled failure and returns a connection-bound `DebugSession`. |
+| `debug_get_frame` | Reads one retained failure frame by zero-based stack depth, innermost first. It does not resume execution. |
+| `debug_stop` | Releases the adapter token, adapter state, and execution workspace. |
+
+Normal completion returns `frame_count: 0`. A failed run retains bounded frame names, repository source
+locations where one exists, and adapter-rendered arguments and locals. Values are strings rather than
+a portable object graph; child expansion, stepping, continue, breakpoints, and variable mutation can
+be added as separate interfaces later without changing frame identity.
+
+The public `DebugSessionId` is opaque and valid only on the MCP connection that started it. Rift maps
+it to the adapter-local token and never exposes that token to an agent. Connection close, adapter exit,
+and server recovery perform the same cleanup as `debug_stop`.
+
+An execution workspace prevents evaluated code from changing Rift's repository state; it is not host
+isolation. Evaluated code retains the filesystem, process, and network access of `rift server`. The
+workspace administrator must opt in through execution policy before any of these tools are advertised.
+
 ## Changes
 
-The `apply` tool accepts an ordered array of `Change` values. Five variants cover the public
+The `apply` tool accepts an ordered array of `Change` values. Six variants cover the public
 deterministic input surface:
 
 - `edits` supplies an atomic set of concrete `Edit` values.
 - `patch` supplies a unified text diff whose paths and context Rift validates.
-- `action` resolves an `ActionOffer` through the compiler that offered it.
+- `action` resolves an `ActionOffer` through the adapter that offered it.
 - `rewrite` runs a `MatchQuery`, checks its cardinality, and replaces every selected match atomically.
 - `revert` computes the three-way inverse of one exact commit against its selected parent.
+- `merge` performs a three-way merge of one exact commit into the current candidate.
 
 Each change observes the candidate state produced by its predecessors. A refusal discards the whole
 candidate.
@@ -78,18 +119,16 @@ adapter-resolved change reads the acknowledged state.
 Discover an action against the candidate when it targets a declaration created by an earlier change.
 That discovery call uses the new declaration's stable address.
 
-Compiler action discovery is the semantic editing interface. Portable kind families cover quick fixes,
+Adapter action discovery is the semantic editing interface. Portable kind families cover quick fixes,
 source organization, rename, move, safe delete, signature change, extract, inline, introduce, convert,
 and member generation. An adapter advertises supported prefixes for the language, then target-specific
 discovery returns applicable actions and a self-contained argument schema.
 
 Rename, move, safe-delete, and signature-change actions can name an `ArgumentContract`.
-
-`OperationScope` constrains paths and source classes. Safe-delete arguments state the disposition of
-each classified use. Incomplete reference coverage refuses the action.
-
-Signature-change arguments describe the callable shape and propagation. Advertised extensions carry
-language-specific fields.
+`OperationScope` constrains the paths and source classes the adapter may change. Safe-delete arguments
+state how to handle each classified use, and incomplete reference coverage refuses the action.
+Signature-change arguments describe the resulting callable shape and how it propagates; advertised
+extensions carry fields specific to the language.
 
 Each `ResolvedChange` correlates one request index with its contributing adapters and record counts.
 The preview resource pages exact edits, semantic effects, executable preconditions, diagnostics, and
@@ -107,20 +146,25 @@ provider completions into those values before calling Rift.
 
 `apply` has three modes. `preview` resolves the ordered changes against one base, writes their result to
 an immutable candidate commit, validates that commit, and retains the complete plan. It leaves the
-accepted ref and session worktree unchanged.
+accepted ref and connection worktree unchanged.
+
+`expected_accepted` separates resolution state from publication concurrency. It defaults to the
+current accepted head, must be an ancestor of the resolution base, and becomes the compare-and-swap
+value at publication. Normal previews resolve directly on that commit. A merge repair resolves on a
+provisional two-parent commit while still advancing from the accepted source parent.
 
 The tool returns a bounded `CandidateSummary`. Its `PreviewResourceLink` opens the complete retained
 plan.
 
-The preview resource is immutable and paginated. It carries requested changes and their resolved
-records. It also carries validation evidence and confirmations.
+The immutable preview resource pages the requested changes, their resolved records, validation
+evidence, and confirmations.
 
 After a validation rejection, the candidate commit and evidence remain readable. A repair can use
 that commit as a new preview base.
 
 The summary reports evidence counts and the complete verdict. Concatenating the preview pages yields
 the corresponding records. Each `ResolvedChange` count matches records carrying that change index;
-the validation totals match compiler reports and validator results across all pages.
+the validation totals match adapter reports and validator results across all pages.
 
 `refresh` reruns the retained changes and validators against a selected base. The result counts changed
 requests and files. Compare the two preview resources for their exact records.
@@ -137,20 +181,24 @@ publication have separate result branches.
 
 ## Validation and persistence
 
-Every affected language adapter validates the candidate commit. Publication requires complete coverage
-and a valid `ValidationReport` from each adapter that owns a changed file.
+Validation support is optional per adapter. Workspace policy defaults to `require = "available"`,
+which requires complete, valid reports from affected adapters that advertise `validate`. An explicit
+list such as `['rust', 'sql:postgresql', 'json']` turns those exact languages into fixed publication
+gates. Source ownership and validation requirements are independent.
 
-Under the `full` profile, callers can add `SandboxedValidator` declarations. Rift runs each executable
-directly in a disposable candidate copy. The result retains the exit status and bounded output.
+Under the `full` profile, callers can add `CommandValidator` declarations. Rift runs each executable
+directly, without a shell, in a disposable validation workspace copied from the candidate. The result
+retains the exit status and bounded output. Writes inside the workspace disappear with it, but the
+command can still access the host filesystem and network.
 
-A declaration is refused unless its argv, timeout and network policy fall inside what
-[`sandbox` in `rift.toml`](/docs/configuration#sandbox) permits, so which binaries can run is decided
-by the repository rather than by the caller.
+A declaration is refused unless its argv and timeout fall inside what
+[`validators` in `rift.toml`](/docs/configuration#validators) permits, so which binaries can run is
+decided by the repository rather than by the caller.
 
 A validator can name the changes and guarantee it checks. A pass creates `GuaranteeEvidence` linked by
 the validator's position.
 
-An accepted candidate exists as a Git commit before it touches the session worktree. `persist` selects
+An accepted candidate exists as a Git commit before it touches the connection worktree. `persist` selects
 paths from that commit.
 
 Rift computes every per-path outcome before writing. An oversized result writes nothing. Each path
@@ -159,14 +207,32 @@ reports its materialization result.
 Gitlinks and their descendants return `skipped_nested_repository`. Persistence leaves child checkouts
 unchanged.
 
-One apply transaction belongs to one repository. Future multi-repository orchestration composes these
-leaf transactions with independent previews, per-repository compare-and-swap, partial-failure reports,
-and explicit compensation. Each leaf publishes and reports acceptance independently.
+One workspace and every transaction in it cover one repository. A gitlink remains an opaque entry in
+the parent repository; its child repository is outside this connection.
+
+## Integration
+
+`integrate` uses the same retained lifecycle as `apply`:
+
+- `preview` merges an accepted source commit into a local target branch, validates the candidate, and
+  leaves the target unchanged.
+- `refresh` reruns the retained merge contract against the target's current head.
+- `publish` replays validation and compare-and-swaps the target head with an idempotency key.
+
+A merge conflict returns a retained two-parent provisional commit. Non-conflicting paths contain the
+automatic merge, while each conflict path retains the target entry so the candidate remains parseable.
+`MergeConflict` carries the base, source, and target entries. The caller repairs that candidate with
+ordinary `apply`, passing the provisional commit as `rev` and the conflict result's `source` as
+`expected_accepted`. It then publishes the repair to the accepted ref and previews integration again.
+
+Publication of a checked-out branch requires a clean worktree and
+`session.integration = "auto"`. Otherwise `integration_refused` returns the validated candidate for
+manual handling. `integration_conflict` distinguishes a moved target from idempotency-key reuse.
 
 ## Failures
 
-A failed MCP request returns `ErrorData`. Its code classifies the failure. Its phase identifies the
-lifecycle step.
+A failed MCP request returns `ErrorData`, whose code classifies the failure and whose phase identifies
+the lifecycle step that failed.
 
 Refusal, rejection, and publication conflict are completed decisions. They remain typed `ApplyResult`
 values.

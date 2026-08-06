@@ -2,20 +2,30 @@
 title: Core
 ---
 
+import { Callout } from "fumadocs-ui/components/callout";
+
 Rift resolves every request against a Git revision, so the workspace must be a Git repository.
 
 <Callout type="info" title="Git is required">
-    If it isn't already enabled, run `git init` in the workspace.
+  If it isn't already enabled, run `git init` in the workspace.
 </Callout>
 
-The MCP schema assigns each definition to a group under `rift:axes`. That assignment is part of the
-contract. This page explains the groups that describe code. The
-[reference](/docs/protocol/reference) also includes protocol machinery and MCP-specific shapes.
+The schema groups its definitions by the part of a request they describe. `rift:axes` records those
+groups in the generated contract, so the documentation and schema use the same ownership boundaries.
+This page explains revision state, source structure, semantic facts, discovery, coverage, and
+operations. The [reference](/docs/protocol/reference) also includes protocol machinery and MCP-only
+shapes.
 
 ## Versioning
 
-A request names Git state. The protocol calls that input a `Revision`. Rift resolves it to a commit or
-working tree and returns the exact state, called a `Snapshot`, so another call can reuse it.
+A request may name a revision of the workspace. The Rift server resolves it to a commit or a working
+tree and returns a `Snapshot` containing the exact state it read. Passing that snapshot to a later
+request makes both requests resolve against the same code.
+
+Revision resolution belongs to the server. A mechanical read uses Git objects directly. Before an
+adapter-backed read, the server reuses a physical tree only when it represents the exact resolved
+snapshot; otherwise it allocates a detached read worktree. The adapter receives the resolved snapshot
+and tree through `Open`, rather than deciding which revision to check out.
 
 ### Revision
 
@@ -54,13 +64,44 @@ response:
 A working-tree snapshot contains its base commit and a digest of the files that differ from it.
 Editing one file therefore leaves every other file's state unchanged.
 
-The tree also contains dependency and compiler configuration files. An adapter tracks changes to
-those inputs across `Refresh`. The repository resource identifies the compiler serving the snapshot.
+The tree also contains dependency and adapter configuration files. An adapter tracks changes to
+those inputs across `Refresh`. The repository resource identifies the adapter serving the snapshot.
+
+## Execution
+
+Execution and debugging reuse the same `Revision` to `Snapshot` resolution as semantic reads. A
+[`CodeBlock`](/docs/protocol/reference#CodeBlock) contains caller-provided source and a
+project-relative working directory. It is evaluated in the selected adapter's project runtime but is
+not part of the snapshot and is never written into the repository tree.
+
+[`ExecutionResult`](/docs/protocol/reference#ExecutionResult) distinguishes a language outcome from a
+protocol failure. `completed` and `failed` describe what the evaluated code did; cancellation,
+deadline expiry, adapter loss, and workspace failures use the ordinary MCP error contract. Standard
+output and error use `CapturedOutput`, whose bounded prefix, full byte count, truncation flag, and
+digest preserve the identity of output too large to return.
+
+A [`DebugFrame`](/docs/protocol/reference#DebugFrame) is a retained stack frame from one failed debug
+evaluation. Its source span points into the pinned repository snapshot where possible. Arguments and
+locals are bounded adapter-rendered strings, not a portable runtime object graph.
 
 ## Filesystem
 
-File and leaf identities use project-relative paths and byte offsets. Editing a file can change those
+File and node identities use project-relative paths and byte offsets. Editing a file can change those
 identities.
+
+### Language
+
+`Language` is a structured pair:
+
+```json
+{ "name": "python" }
+{ "name": "sql", "dialect": "postgresql" }
+{ "name": "css", "dialect": "scss" }
+```
+
+The optional dialect identifies syntax or semantics that require a distinct adapter. URI identities
+encode the pair as `name` or `name:dialect` in their first segment. The remaining node and symbol
+structure stays language-defined.
 
 ### File
 
@@ -71,7 +112,7 @@ rift://file/pkg/util.py
 ```
 
 The URI contains the path. The resource returns the Git entry and file content. It also reports which
-languages read the file. The same resource reads `LICENSE` and compiler-owned source.
+languages read the file. The same resource reads `LICENSE` and adapter-owned source.
 
 An adapter's retained virtual publication also resolves as a regular, non-executable `File`. Its bytes
 come from the adapter overlay and do not create a `ProjectEntry` in the Git tree listing.
@@ -98,35 +139,43 @@ directory branch needed by the MCP `tree` call. Its file branch carries the comp
 directory branch carries only a `ProjectPath`. A directory therefore has no second resource identity
 and disappears when the selected snapshot contains no visible descendant.
 
-### Leaf
+### Node
 
 Parsing turns those bytes into a
 [concrete syntax tree](https://en.wikipedia.org/wiki/Parse_tree): every token the source contains, in
-the shape the grammar gives it. A leaf is one node of that tree. Its identity contains the grammar and
+the shape the grammar gives it. A node is one node of that tree. Its identity contains the grammar and
 file, followed by the byte range it spans:
 
 ```
-rift://leaf/python/pkg/util.py@1204-1266
+rift://node/python/pkg/util.py@1204-1266
+rift://node/sql:postgresql/db/schema.sql@40-88
 ```
 
-The grammar determines the tree, so the language is part of the leaf identity. One physical file can
+The grammar determines the tree, so the language is part of the node identity. One physical file can
 contain several grammars.
 
 A container adapter owns `App.svelte`. It can publish the script block as a virtual TypeScript file.
-The two leaves then use different source units:
+The two nodes then use different source units:
 
 ```
-rift://leaf/svelte/App.svelte@100-200
-rift://leaf/typescript/__virtual__/App.svelte.ts@0-100
+rift://node/svelte/App.svelte@100-200
+rift://node/typescript/__virtual__/App.svelte.ts@0-100
 ```
 
 An exact `OriginMapping` links the virtual range back to `App.svelte`.
 
-A leaf also marks named regions. For a function, an operation can address its `body` independently
+A node also marks named regions. For a function, an operation can address its `body` independently
 from its `documentation`.
 
-A leaf is where a [symbol](#symbol) is written. One symbol has many leaves: the place it is declared,
-and every place it is mentioned.
+A node may write a [symbol](#symbol). One symbol can have many nodes: its declaration and each
+reference. Nodes also represent syntax with no semantic identity, such as a JSON comma or CSS block.
+
+Static and data languages use the same model. A SQL adapter can emit `create_table` nodes and table
+symbols under `sql:postgresql`. A CSS adapter can emit `selector.class` nodes and custom-property
+symbols. JSON, TOML, and YAML adapters can provide full node trees, structural matching, formatting,
+and diagnostics without inventing symbols for values that have no stable semantic identity. Schema
+resolution or YAML anchors can add symbols when the language supplies that identity, and a key that
+becomes a symbol is what lets a `configures` edge reach the field it fills.
 
 ### Edit
 
@@ -142,7 +191,7 @@ delete, rename, or copy a file, change its executable bit, and create or update 
 ```
 
 An adapter returns proposed source changes to Rift as `Edit` values. Rift can inspect the values before
-writing them to the session worktree. The [adapter contract](/docs/protocol/adapter#source-ownership)
+writing them to the connection worktree. The [adapter contract](/docs/protocol/adapter#source-ownership)
 defines that ownership boundary.
 
 An edit set is atomic. Every text range addresses the input state, and ranges in one set cannot
@@ -171,17 +220,33 @@ replacements within those entries. Read the whole comparison at
 
 ## Semantic
 
-Semantic identities use compiler names, so moving a file preserves them when the language's name stays
-the same.
+Semantic identities use `Language`, so moving a file preserves them when the language-defined name
+stays the same.
 
 ### Symbol
 
-A symbol is a compiler-recognized entity at one revision. For example, the Python function
+A symbol is an adapter-recognized entity at one revision. For example, the Python function
 `pkg.util.load_config` is one symbol. The server indexes symbols and the relationships returned by the
-compiler, so a caller can retrieve the function's callers.
+adapter, so a caller can retrieve the function's callers.
 
-A declared type is also a symbol. The portable marker for a type declaration is stored in the symbol's
-`facets` field as `type`. A Python adapter can emit a function symbol without attaching that facet.
+A symbol carries two classifications. `kind` is the word the adapter's own language uses — `trait`,
+`function`, `table` — and nothing portable can be built on it, because no two languages agree on the
+word. `facets` is the portable half, and it is a set rather than a choice: a Kotlin `object` carries
+`type`, `value`, and `member_container` at once, so a search for types and a search for singletons both
+find it.
+
+A facet says what a symbol can do, not only what it is. `extensible` marks a class you can inherit from
+and a method you can override; `abstract` marks a declaration whose implementation something else has
+to supply; `deprecated` marks what six languages spell six ways.
+
+Ownership is not lexical. `container` names the symbol this one belongs to, which for a Go method is
+the type in its receiver and for a Rust method the type its `impl` block is written for — neither of
+which encloses it in the source. Where a symbol is written is a question for [nodes](#node).
+
+A symbol carrying no facet at all is invisible to every portable filter, so a language without types
+still assigns one. A CSS class selector, a SQL sequence, and a `@keyframes` rule each name something
+that exists while the artifact runs, and each carries `value`. A SQL table carries `type` and
+`member_container`; its columns carry `member`.
 
 A symbol is identified by the URI that resolves it: the language, then the name the language itself
 gives the declaration.
@@ -189,10 +254,11 @@ gives the declaration.
 ```
 rift://symbol/python/pkg.util.load_config
 rift://symbol/rust/serde::de::Deserialize
+rift://symbol/sql:postgresql/public.users
 ```
 
 The URI follows the language's naming rules. A TypeScript module name includes its file path; a Rust
-module name follows the module tree. Leaves record where the symbol is written, so the symbol URI can
+module name follows the module tree. Nodes record where the symbol is written, so the symbol URI can
 survive a file move. The `origin` field records whether Rift can open the declaration and what can
 replace it. A dependency upgrade replaces a package symbol. Rebuilding can replace a generated one.
 
@@ -209,44 +275,87 @@ A [`Relationship`](/docs/protocol/reference#Relationship) is a directed edge bet
 from `handler` to `load_config` is one such edge. Rift indexes these edges, so a caller query reads the
 index.
 
-An edge carries `evidence` — the leaves the compiler read it from:
+An edge carries `evidence`: the nodes from which the adapter derived it.
 
 ```
 from:     rift://symbol/python/pkg.api.handler
 to:       rift://symbol/python/pkg.util.load_config
-evidence: rift://leaf/python/pkg/api.py@880-899
+evidence: rift://node/python/pkg/api.py@880-899
 ```
 
-`Leaf.symbol` links a syntax-tree node to semantic identity. `Relationship.evidence` links a semantic
+`Node.symbol` links a syntax-tree node to semantic identity. `Relationship.evidence` links a semantic
 edge back to the node that established it. The symbol URI remains stable when only the file path
 changes.
 
-The compiler also reports how it derived each edge. In the `derivation` field, `resolution` comes from
-the compiler's name resolver or type checker. `syntax` comes from the parsed tree. `heuristic` marks a
-guess with a confidence value.
+Edges carry portable facets the way symbols do, and `from` is the symbol the adapter read the edge out
+of. A decorated function carries `annotated_by` to its decorator, because the mention that established
+the edge is written inside the function.
+
+Two facets are fallbacks, and they divide on evidence. `references` covers a mention with a node behind
+it that nothing narrower fits. `depends_on` covers a need with no source location at all — a manifest
+entry, a build dependency.
+
+Not everything an edge reaches is something a language declares. A C header and a CSS stylesheet
+declare nothing of their own, so an adapter gives each a synthetic symbol carrying the `module` facet.
+`#include` and `@import` are then the same `imports` edge as a Python `import`.
+
+The adapter also reports how it derived each edge. In the `derivation` field, `resolution` comes from
+the adapter's name resolver or type checker. `syntax` comes from the parsed tree. `heuristic` marks a
+guess with a confidence value. Go and TypeScript satisfy interfaces structurally, with no declaration
+that says so, which is why an `implements` edge there is something the type checker computed rather
+than something the source states.
 
 ## Discovery
 
-Callers use a `Filter` to test compiler facts. A `MatchQuery` selects text matching in Rift or
+Callers use a `Filter` to test adapter facts. A `MatchQuery` selects text matching in Rift or
 structural matching in a language adapter.
 
 ### Filter
 
-A [`Filter`](/docs/protocol/reference#Filter) asks by what the compiler knows. Each node has a tag.
-`field` tests a value, while `relation` follows an edge. `all` and `any` combine child nodes;
-`not` negates one. The tags make nesting explicit:
+A [`Filter`](/docs/protocol/reference#Filter) asks by what the adapter knows. Each node has a tag.
+`field` tests a value, `relation` follows an edge, and `element` looks inside one entry of a list.
+`all` and `any` combine child nodes; `not` negates one. The tags make nesting explicit:
 
-```
-all: [ { field:    { field: "facets", op: "contains", value: "function" } },
-       { relation: { direction: "incoming", facet: "call",
-                     target: { field: { field: "facets", op: "contains", value: "test" } } } } ]
+```json
+{ "kind": "all", "all": [
+  { "kind": "field",
+    "field": { "field": "facets", "op": "contains", "value": "callable" } },
+  { "kind": "relation",
+    "relation": { "direction": "incoming", "facet": ["calls"],
+                  "target": { "kind": "field",
+                              "field": { "field": "facets", "op": "contains",
+                                         "value": "test" } } } } ] }
 ```
 
-That reads "functions called from a test". The nested `target` performs the relationship join inside
+That reads "callables called from a test". The nested `target` performs the relationship join inside
 the query.
 
-A `relation` node can traverse a cyclic graph, so `max_depth` bounds the walk. The
-`quantifier: "not_exists"` form selects symbols with no matching edge.
+`contains` tests one member of a list, and `in` tests for any of several, which is how one node asks
+for a symbol carrying any of four facets. The ordering and string operations have no meaning against a
+list, so Rift rejects them there.
+
+A symbol's `types` holds several entries, each a type and the role it plays. Testing `role` and the
+resolved symbol as two separate fields would accept a symbol whose return type came from one entry and
+whose `Config` came from another, so `element` scopes both tests to the same entry:
+
+```json
+{ "kind": "element",
+  "element": { "field": "types",
+               "where": { "kind": "all", "all": [
+                 { "kind": "field",
+                   "field": { "field": "role", "op": "eq", "value": "return" } },
+                 { "kind": "field",
+                   "field": { "field": "type.resolved", "op": "eq",
+                              "value": "rift://symbol/rust/crate::Config" } } ] } } }
+```
+
+That reads "functions that return `Config`".
+
+A `relation` node can traverse a cyclic graph, so `max_depth` bounds the walk. Only edges that compose
+carry a depth — `contains`, `calls`, `imports`, `extends` and the rest of the transitive set — because
+walking three `annotated_by` hops asks a question no graph answers. The `quantifier: "not_exists"` form
+selects symbols with no matching edge, and it applies after the depth bound, so `max_depth: 3` says
+nothing about the fourth hop.
 
 ### MatchQuery
 
@@ -262,14 +371,14 @@ The pattern is written in the target language's own syntax, with `$NAME` standin
 `$$$NAME` for a run of them:
 
 ```
-{ "language": "python",
+{ "language": { "name": "python" },
   "pattern": "requests.get($URL, timeout=$T)",
   "constraints": [ { "capture": "T", "cardinality": "one", "text_regex": "^[0-9]+$" } ] }
 ```
 
 The grammar parses the pattern, so whitespace and a trailing comma preserve the same match.
 
-A constraint combines a syntax match with compiler facts. For example, it can retain only calls whose
+A constraint combines a syntax match with adapter facts. For example, it can retain only calls whose
 target carries the `test` facet. Rift evaluates caller-supplied regular expressions with one engine.
 A second engine could accept different syntax, and backtracking could stall a shared adapter process.
 
@@ -305,7 +414,7 @@ analysis state:
 
 Absence proves absence only under `complete`. Under `partial` the `reason` says what stopped it, and a
 `continuation` says how to ask for the rest where there is a way to. `unsupported` means the adapter
-cannot produce this at all; `not_applicable` means the compiler consumes physical source and has no
+cannot produce this at all; `not_applicable` means the adapter consumes physical source and has no
 produced ranges to map.
 
 Coverage is recorded separately for each fact family. An adapter can resolve every symbol in a file
@@ -313,8 +422,8 @@ while failing to type one of them, so one combined value would hide the incomple
 
 ### Diagnostic
 
-A [`Diagnostic`](/docs/protocol/reference#Diagnostic) is one compiler finding under its original code,
-such as `TS2345`. Rift forwards the compiler's message unchanged.
+A [`Diagnostic`](/docs/protocol/reference#Diagnostic) is one adapter finding under its original code,
+such as `TS2345`. Rift forwards the adapter's message unchanged.
 
 The `reliability` field is `recovered` when the parser repaired invalid source to continue, so facts in
 that region may be approximate. The `continuation` field marks a diagnostic caused by source that ends
@@ -323,11 +432,12 @@ mid-construct, as it can while an agent is writing a file.
 ### ValidationReport
 
 A [`ValidationReport`](/docs/protocol/reference#ValidationReport) records one adapter's verdict over a
-candidate commit. It names the language, the files checked, the compiler diagnostics, and the coverage
-of the affected program. Publication requires complete coverage and a valid verdict from every adapter
-that owns a changed file.
+candidate commit. It names the language, the files checked, the adapter diagnostics, and the coverage
+of the affected program. Workspace validation policy selects required reports independently of source
+ownership. The default requires complete, valid reports from affected adapters that advertise
+validation; a repository can instead list exact `Language` values as fixed gates.
 
-The MCP surface combines those compiler reports with results from caller-supplied sandboxed validators.
+The MCP surface combines those adapter reports with results from caller-supplied command validators.
 The candidate retains the complete evidence, so an accepted result can be audited after publication.
 
 ## Operations
@@ -340,25 +450,25 @@ An [`Address`](/docs/protocol/reference#Address) names the code an operation app
 
 ```
 { "kind": "symbol", "symbol": "rift://symbol/python/pkg.util.load_config" }
-{ "kind": "leaf",   "leaf": "rift://leaf/python/pkg/util.py@1204-1266", "region": "name" }
+{ "kind": "node",   "node": "rift://node/python/pkg/util.py@1204-1266", "region": "name" }
 { "kind": "source", "span": { "unit": "rift://file/LICENSE",
                               "range": { "start": 0, "end": 11 } } }
 ```
 
-A symbol address lets a rename reach every leaf known to the compiler. A leaf address selects one
+A symbol address lets a rename reach every node known to the adapter. A node address selects one
 syntax-tree node. A source address selects raw bytes, including bytes in `LICENSE` or in an unclaimed
 file.
 
 ### ActionDescriptor
 
-A compiler describes a discovered operation before it computes the edits. An
+An adapter describes a discovered operation before it computes the edits. An
 [`ActionDescriptor`](/docs/protocol/reference#ActionDescriptor) carries that description:
 
 ```
 kind:          quickfix.import.add
 title:         Import `Config` from `pkg.config`
 applicability: always
-target:        rift://leaf/python/pkg/api.py@88-94
+target:        rift://node/python/pkg/api.py@88-94
 guarantees:    [syntax_validated, bindings_preserved]
 ```
 
@@ -371,12 +481,12 @@ conversion, and generation. An adapter can refine a portable family or advertise
 family. An agent can request a prefix such as `quickfix` or `refactor.extract`.
 
 `applicability` records how the action was selected. `always` needs no caller-supplied fact before
-resolution. `conditional` exposes a condition outside the compiler's knowledge.
+resolution. `conditional` exposes a condition outside the adapter's knowledge.
 `speculative` records inferred intent. Every branch still passes preview validation.
 
 The descriptor lists the guarantees resolution must establish. `syntax_validated` covers parsing;
 `bindings_preserved` covers unchanged references; `references_updated` covers references that should
-follow the action. `behavior_checked` names a specific static analysis or sandbox validator and never
+follow the action. `behavior_checked` names a specific static analysis or command validator and never
 claims general behavioral equivalence.
 
 ### Portable action arguments
@@ -388,7 +498,7 @@ references, and other resolved uses. Safe delete requires complete reference cov
 unresolved use.
 
 `ChangeSignatureArguments` carries a `SignatureChange`. Existing parameters retain identity through
-their source leaves, so reordering preserves the same parameter identities. The desired shape includes
+their source nodes, so reordering preserves the same parameter identities. The desired shape includes
 receiver, parameter order and defaults, return types, generic parameters, declared errors, language
 effects, and propagation through callers or overrides. Advertised extensions carry constructs that
 the portable shape cannot express.
@@ -404,7 +514,7 @@ without a portable contract.
 An `OperationPrecondition` records the expected and observed values for a check, the component that
 verified it, and the addresses or paths it covered. State equality, target existence, writability,
 reference completeness, remaining usages, destination legality, and name availability have portable
-kinds. A compiler-specific condition retains its diagnostics.
+kinds. An adapter-specific condition retains its diagnostics.
 
 An `OperationEffect` explains the semantic consequence of exact edits: a declaration was created,
 removed, moved, or changed; references or imports were updated; source was rewritten; or formatting

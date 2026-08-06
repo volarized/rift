@@ -1,4 +1,4 @@
-"""Convert compiler records into a typed Protobuf AST and serialize it."""
+"""Convert schema records into a typed Protobuf AST and serialize it."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from proto_schema_parser import ast
 from proto_schema_parser.generator import Generator
 
 from . import model
+from .types import proto_type_name
 
 
 def _comments(description: str | None, indent: int = 0) -> list[ast.Comment]:
@@ -52,7 +53,9 @@ def _field(value: model.Field, *, in_oneof: bool = False) -> ast.Field | ast.Map
     return ast.Field(
         name=value.name,
         number=value.number,
-        type=value.type,
+        type=(
+            proto_type_name(value.type) if isinstance(value.type, int) else value.type
+        ),
         cardinality=cardinality,
         options=_options(value.deprecated),
     )

@@ -252,8 +252,8 @@ export interface ProtoSection {
  * declaration carries:
  *
  * ```proto
- * message WorkspaceState {
- *   option (section) = "Workspaces";
+ * message AdapterState {
+ *   option (section) = "Adapter state";
  * ```
  *
  * Declaring it in the file is the same reason `mcp.json` carries `rift:axes`:

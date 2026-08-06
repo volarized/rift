@@ -3,49 +3,19 @@ title: Configuration
 ---
 
 import { Callout } from "fumadocs-ui/components/callout";
+import { ConfigFile, ConfigReference } from "@/components/config-reference";
 
 `rift.toml` sits in the workspace root, next to `.git`, and is meant to be committed. It's where the
 server learns which adapters exist, and where you bound what an agent may do with them:
 
-```toml
-[server]
-idle-timeout = "10m"
+<ConfigFile />
 
-[session]
-base = "head"
-branch-prefix = "rift/"
-integration = "manual"
+This repository's file spells out the defaults. `validators.allow`, `validators.carry`, and the
+adapter table default to empty and appear only when the repository needs them.
 
-[reads]
-max-worktrees = 2
-worktree-idle-timeout = "5m"
-
-[facts]
-max-size = "4GiB"
-
-[profile]
-max = "edit"
-
-[sandbox]
-allow = [["cargo", "test"]]
-carry = [".env.test"]
-network = "deny"
-max-timeout = "5m"
-
-[adapters.rust]
-command = ["rift-adapter-rust"]
-env = { RUSTUP_TOOLCHAIN = "stable" }
-max-workspaces = 4
-startup-timeout = "60s"
-```
-
-Every value above is its default except `sandbox.allow`, `sandbox.carry` and the adapter table, which
-have none.
-
-`.rift/config.toml` overrides it and is already excluded from Git, for the paths and toolchains that
-are yours rather than the project's. Environment variables named `RIFT_SESSION`, `RIFT_PROFILE_MAX`
-and so on win over both, which is how an agent launcher sets something for one run without editing a
-file.
+`.rift/config.toml` uses the same schema and overrides it for the paths and toolchains that are yours
+rather than the project's; `.rift/` is excluded from Git. Connection-scoped process controls such as
+`RIFT_ACCEPTED` are separate from both configuration files.
 
 A workspace with no `rift.toml` gets the defaults and no adapters, which means `tree`, `match` and the
 file and diff resources work and nothing semantic does. The repository resource reports no languages,
@@ -53,17 +23,15 @@ so an agent can tell the difference between a language Rift can't analyze and on
 
 ## server
 
-`idle-timeout` is how long the server stays up with no session open. It holds compiler processes, so
+`idle-timeout` is how long the server stays up with no session open. It holds adapter processes, so
 leaving it running forever costs you gigabytes of resident memory for a repository you closed at
 lunchtime.
 
 ## session
 
-`base` decides what a new session starts from. `head` uses the workspace's last commit. `worktree`
-records your uncommitted changes as the session branch's first commit, so an agent starts from what
+`base` decides what a new connection starts from. `head` uses the workspace's last commit. `worktree`
+records your uncommitted changes as the accepted ref's initial commit, so an agent starts from what
 you have open instead of from what you last committed.
-
-`branch-prefix` names the branch namespace. Session `a1` gets `rift/a1`.
 
 `integration` is whether [`integrate`](/docs/architecture#targets) may move a branch that a working
 tree has checked out. Under `manual` it merges, validates, and reports the commit without moving
@@ -89,38 +57,61 @@ claims a profile after that profile's conformance suite passes on this host, so 
 the lower of the two. Setting `max = "read"` on a repository nobody should be editing is enough to
 make every write tool absent from the schema an agent reads.
 
+## validation
+
+`require = "available"` requires complete, valid reports from affected adapters that advertise
+`validate`. An adapter is affected when the candidate changes one of its source claims, one of its
+auxiliary claims, or a virtual unit routed to it. An adapter that only parses or formats the path adds
+no validation gate. Unsupported adapter RPCs return gRPC `UNIMPLEMENTED`.
+
+Repositories that need fixed gates can name exact languages:
+
+```toml
+[validation]
+require = ["rust", "sql:postgresql", "json"]
+```
+
+The `name:dialect` spelling is the same one used at the start of node and symbol URIs. When a listed
+language is affected, a missing adapter, an unadvertised `validate` operation, or incomplete coverage
+refuses publication.
+
 ## adapters
 
-Each `[adapters.<name>]` table says how to start one language adapter process:
+Each `[adapters.<process>]` table says how to start one adapter process:
 
 ```toml
 [adapters.rust]
 command = ["rift-adapter-rust"]
 env = { RUSTUP_TOOLCHAIN = "stable" }
-max-workspaces = 4
+state-cap = 4
 startup-timeout = "60s"
 ```
 
 The server passes a socket path on the command line, starts the process, and calls `Describe`. That
-call is where the languages, capabilities and write claims come from — the config file never states
-them. Putting them in both places would let a file and a running compiler disagree about what the
-compiler can do, and the file would be the one that's wrong.
+call returns the exact `Language`, implemented operations, emitted fact families, and path claims.
+The config key only identifies the process definition. Its `command` and `env` configure the stable
+adapter process, not the project runtime for every revision it may open.
 
-`max-workspaces` bounds how many sessions this adapter serves at once. One process holds a workspace
-per session that uses its language, plus one per candidate under validation, and each carries a
-compiler's index. Past the bound, a session opening a workspace waits.
+An adapter selects project runtimes after `Open`, when Rift has supplied the complete tree for an
+exact snapshot, and re-evaluates that selection on `Refresh` when runtime-defining inputs change. For
+example, one Python adapter can inspect `.python-version` or `pyproject.toml` and back a Python 3.11
+state and a Python 3.12 state with separate workers. Those workers are internal to the adapter; Rift
+continues to own the worktrees and starts only the configured adapter process.
 
-## sandbox
+`Describe` returns the adapter's hard `limits.max_states`. Optional `state-cap` sets a lower
+repository-side cap; the server uses the smaller value. One process can hold states for connection,
+candidate, and detached read worktrees. Each may retain a parsed tree, index, and runtime worker. Past
+the effective bound, an `Open` call waits.
 
-Under the `full` profile a caller declares a `SandboxedValidator` with an `apply` — an argv, a
-timeout, a network policy, and the guarantees a pass is meant to establish. The `[sandbox]` table is
-what bounds that:
+## validators
+
+Under the `full` profile a caller declares a `CommandValidator` with an argv, a timeout, and the
+guarantees a pass is meant to establish. The `[validators]` table bounds command execution:
 
 ```toml
-[sandbox]
+[validators]
 allow = [["cargo", "test"], ["pytest"]]
 carry = [".env.test"]
-network = "deny"
 max-timeout = "5m"
 ```
 
@@ -129,12 +120,18 @@ max-timeout = "5m"
 run and the caller says how to run them, which leaves the choice of binary with whoever has commit
 access rather than with the agent.
 
-`network` and `max-timeout` cap what a validator may ask for. A declaration exceeding either is
-refused before anything executes.
+`max-timeout` caps what a validator may ask for. A declaration exceeding it is refused before
+anything executes.
 
-`carry` lists ignored paths to copy into the sandbox. The sandbox is a copy of the candidate tree,
-which holds tracked files only, so a suite that reads `.env.test` otherwise fails there for a reason
-that has nothing to do with the change under test.
+`carry` lists ignored paths to copy into the validation workspace. The workspace starts as a copy of
+the candidate tree, which holds tracked files only, so a suite that reads `.env.test` otherwise fails
+there for a reason that has nothing to do with the change under test.
+
+<Callout type="warning" title="A validation workspace provides no process isolation">
+  Writes made inside the workspace disappear with it, but the command can still access the host
+  filesystem and network. Only allow commands that repository policy trusts to run with Rift's host
+  access.
+</Callout>
 
 A pass turns each declared guarantee into `GuaranteeEvidence` on the preview. The exit status and
 bounded output are retained with the candidate, so an accepted result can be read back after
@@ -145,3 +142,11 @@ publication.
   edit take four minutes, which is why the example allows `cargo test` and leaves `--no-run` to the
   caller.
 </Callout>
+
+## Generated schema reference
+
+The tables below come from [`protocol/rift.schema.json`](https://github.com/volarized/rift/blob/main/protocol/rift.schema.json),
+which is generated from the Pydantic config models. The protocol seam labels are checked against the
+same typed fields that generate `mcp.json` and the adapter Protobuf contract.
+
+<ConfigReference />

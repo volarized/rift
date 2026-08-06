@@ -16,3 +16,10 @@ skills-lock.json
 .env
 .env.*
 !.env.example
+
+# Machine-local Rift overrides, caches, state, and worktrees.
+.rift/
+
+CONTEXT.md
+
+.ruff_cache

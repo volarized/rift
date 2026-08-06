@@ -224,7 +224,7 @@ export const axisOf: Record<string, string> = (() => {
     for (const name of group.holds ?? []) assigned[name] = group.name;
   }
   // Before any closure, so a group cannot claim another's identifier on the way
-  // past: `Leaf` reaches `SymbolId`, and the identity of a symbol is semantic.
+  // past: `Node` reaches `SymbolId`, and the identity of a symbol is semantic.
   for (const group of axisGroups) {
     for (const name of group.identifiedBy ?? []) assigned[name] ??= group.name;
   }

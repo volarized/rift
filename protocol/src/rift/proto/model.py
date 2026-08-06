@@ -1,4 +1,4 @@
-"""Compiler records consumed by the Protobuf AST adapter."""
+"""Schema records consumed by the Protobuf AST builder."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ class Enum:
 class Field:
     name: str
     number: int
-    type: str
+    type: str | int
     description: str | None = None
     repeated: bool = False
     optional: bool = False

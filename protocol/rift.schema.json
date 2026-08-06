@@ -1,0 +1,332 @@
+{
+  "$defs": {
+    "AdapterProcessConfig": {
+      "additionalProperties": false,
+      "description": "How Rift starts one configured adapter process and bounds its advertised state capacity.",
+      "properties": {
+        "command": {
+          "description": "Executable followed by literal arguments used to start the adapter process.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Command",
+          "type": "array"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment additions supplied to the adapter process.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "title": "Env",
+          "type": "object"
+        },
+        "state-cap": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional repository-side cap on adapter.AdapterLimits.max_states; Rift uses the smaller bound.",
+          "rift:bounds": {
+            "field": "max_states",
+            "model": "AdapterLimits"
+          },
+          "rift:operation": "minimum",
+          "title": "State-Cap"
+        },
+        "startup-timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "60s",
+          "description": "Time allowed for the process to start serving and answer Describe."
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "title": "AdapterProcessConfig",
+      "type": "object"
+    },
+    "ByteSize": {
+      "description": "A non-negative byte size using binary units where a suffix is present.",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:B|KiB|MiB|GiB|TiB)$",
+      "title": "ByteSize",
+      "type": "string"
+    },
+    "ConformanceProfile": {
+      "description": "Runtime conformance level verified for this workspace. Profiles accumulate. Shared checks validate schemas and examples, reference reachability, axis ownership, generated Protobuf output, adapter service compilation, and the handshake. Runtime fixtures cover ordering, limits, typed failures, the shared-worktree barrier, and topological virtual-source sync. `Contract` identifies the schema under test.",
+      "enum": [
+        "read",
+        "edit",
+        "full"
+      ],
+      "rift:enumDescriptions": {
+        "edit": "Adds `apply` and `integrate` preview, refresh, and publish, the preview resource, adapter formatting, and adapter validation. Fixtures exercise every Change variant and advertised action family, complete validation, preview pagination, refresh comparison, rejected-candidate repair, idempotent retry, compare-and-swap races, integration conflicts and target races, cancellation, and crash recovery. Caller-supplied validators remain unavailable and `max_validators` is zero.",
+        "full": "Adds command validators and `persist` materialization. Fixtures verify response preflight before worktree writes, per-path drift outcomes, direct execution without shell expansion, validation-workspace cleanup, environment construction, timeouts, and bounded output capture. A release claim also runs the suite with two different language adapters and one embedded-language repository.",
+        "read": "Serves the read tools plus repository, symbol, diff, and file resources. Fixtures reconstruct file bytes, verify language summaries and match tags, replay cursors, reject stale state, preserve coverage, and stop at gitlinks. Fixtures cover shared-worktree languages and retained virtual files. Mechanical reads and warm cached semantic reads run with adapters stopped. Fixed repositories record latency, bytes, tokens, and adapter memory."
+      },
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "ConformanceProfile",
+        "type": "rift.mcp.ConformanceProfile",
+        "values": {
+          "edit": {
+            "name": "CONFORMANCE_PROFILE_EDIT",
+            "number": 2
+          },
+          "full": {
+            "name": "CONFORMANCE_PROFILE_FULL",
+            "number": 3
+          },
+          "read": {
+            "name": "CONFORMANCE_PROFILE_READ",
+            "number": 1
+          }
+        }
+      },
+      "title": "ConformanceProfile",
+      "type": "string"
+    },
+    "Duration": {
+      "description": "A non-negative duration with one explicit unit.",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
+      "title": "Duration",
+      "type": "string"
+    },
+    "FactsConfig": {
+      "additionalProperties": false,
+      "description": "Retention bound for adapter facts cached by snapshot.",
+      "properties": {
+        "max-size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4GiB",
+          "description": "Maximum size of the semantic fact cache before least-recently-used eviction."
+        }
+      },
+      "title": "FactsConfig",
+      "type": "object"
+    },
+    "IntegrationMode": {
+      "description": "Whether Rift may advance a branch checked out in a clean working tree.",
+      "enum": [
+        "manual",
+        "auto"
+      ],
+      "title": "IntegrationMode",
+      "type": "string"
+    },
+    "LanguageSelector": {
+      "description": "The TOML spelling of the same exact language pair represented by ``core.Language``.",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}(?::[A-Za-z][A-Za-z0-9._-]{0,63})?$",
+      "title": "LanguageSelector",
+      "type": "string"
+    },
+    "ProfileConfig": {
+      "additionalProperties": false,
+      "description": "Repository-side ceiling over the conformance profile advertised to callers.",
+      "properties": {
+        "max": {
+          "$ref": "#/$defs/ConformanceProfile",
+          "default": "edit",
+          "description": "Highest conformance profile this repository permits Rift to advertise."
+        }
+      },
+      "title": "ProfileConfig",
+      "type": "object"
+    },
+    "ProjectPath": {
+      "description": "One path below the project root, using forward slashes and UTF-8. The empty path names the root itself. Absolute paths, backslashes, control characters, empty segments, and `.` or `..` segments are refused before the filesystem is touched.",
+      "maxLength": 1000,
+      "pattern": "^(?:$|(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "package": "rift.core",
+        "scalar": "string"
+      },
+      "title": "ProjectPath",
+      "type": "string"
+    },
+    "ReadsConfig": {
+      "additionalProperties": false,
+      "description": "Bounds for detached worktrees materialized by adapter-backed revision reads.",
+      "properties": {
+        "max-worktrees": {
+          "default": 2,
+          "description": "Maximum detached read worktrees retained at once; zero disables materialization.",
+          "maximum": 64,
+          "minimum": 0,
+          "title": "Max-Worktrees",
+          "type": "integer"
+        },
+        "worktree-idle-timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "5m",
+          "description": "Time an unreferenced detached read worktree remains available for reuse."
+        }
+      },
+      "title": "ReadsConfig",
+      "type": "object"
+    },
+    "ServerConfig": {
+      "additionalProperties": false,
+      "description": "Lifecycle policy for the repository's shared Rift server.",
+      "properties": {
+        "idle-timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "10m",
+          "description": "Time with no open connection after which the server exits."
+        }
+      },
+      "title": "ServerConfig",
+      "type": "object"
+    },
+    "SessionBase": {
+      "description": "Source state from which a new connection starts.",
+      "enum": [
+        "head",
+        "worktree"
+      ],
+      "title": "SessionBase",
+      "type": "string"
+    },
+    "SessionConfig": {
+      "additionalProperties": false,
+      "description": "Initial state and integration policy for each connection-bound session.",
+      "properties": {
+        "base": {
+          "$ref": "#/$defs/SessionBase",
+          "default": "head",
+          "description": "State captured as the session's initial accepted commit."
+        },
+        "integration": {
+          "$ref": "#/$defs/IntegrationMode",
+          "default": "manual",
+          "description": "Whether integration may advance and update a clean checked-out branch."
+        }
+      },
+      "title": "SessionConfig",
+      "type": "object"
+    },
+    "ValidationConfig": {
+      "additionalProperties": false,
+      "description": "Adapter validation reports required before candidate publication.",
+      "properties": {
+        "require": {
+          "anyOf": [
+            {
+              "const": "available",
+              "type": "string"
+            },
+            {
+              "items": {
+                "$ref": "#/$defs/LanguageSelector"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          ],
+          "default": "available",
+          "description": "`available` requires every affected adapter that advertises validation; an explicit list requires those exact core.Language pairs.",
+          "rift:selectsType": "Language",
+          "title": "Require"
+        }
+      },
+      "title": "ValidationConfig",
+      "type": "object"
+    },
+    "ValidatorsConfig": {
+      "additionalProperties": false,
+      "description": "Repository policy for caller-declared ``mcp.CommandValidator`` processes.",
+      "properties": {
+        "allow": {
+          "description": "Allowed literal prefixes of CommandValidator.argv.",
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "rift:prefixOf": {
+            "field": "argv",
+            "model": "CommandValidator"
+          },
+          "title": "Allow",
+          "type": "array"
+        },
+        "carry": {
+          "description": "Ignored project paths copied into each disposable validation workspace.",
+          "items": {
+            "$ref": "#/$defs/ProjectPath"
+          },
+          "title": "Carry",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "max-timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "5m",
+          "description": "Upper bound on CommandValidator.timeout_ms after conversion to milliseconds.",
+          "rift:bounds": {
+            "field": "timeout_ms",
+            "model": "CommandValidator"
+          },
+          "rift:conversion": "Duration.milliseconds"
+        }
+      },
+      "title": "ValidatorsConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The typed rift.toml file. Configuration reuses protocol enums and paths, and carries machine-checked links to the fields it bounds.",
+  "properties": {
+    "server": {
+      "$ref": "#/$defs/ServerConfig"
+    },
+    "session": {
+      "$ref": "#/$defs/SessionConfig"
+    },
+    "reads": {
+      "$ref": "#/$defs/ReadsConfig"
+    },
+    "facts": {
+      "$ref": "#/$defs/FactsConfig"
+    },
+    "profile": {
+      "$ref": "#/$defs/ProfileConfig"
+    },
+    "validation": {
+      "$ref": "#/$defs/ValidationConfig"
+    },
+    "validators": {
+      "$ref": "#/$defs/ValidatorsConfig"
+    },
+    "adapters": {
+      "additionalProperties": {
+        "$ref": "#/$defs/AdapterProcessConfig"
+      },
+      "description": "Configured adapter processes keyed by repository-local process name. Each process answers Describe with its exact core.Language and adapter capabilities.",
+      "propertyNames": {
+        "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+      },
+      "rift:describesAs": "Capabilities",
+      "title": "Adapters",
+      "type": "object"
+    }
+  },
+  "title": "Rift repository configuration",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volar.sh/rift/protocol/rift.schema.json"
+}

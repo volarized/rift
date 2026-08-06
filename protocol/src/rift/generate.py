@@ -9,26 +9,35 @@ import json
 import re
 import sys
 import tempfile
+import types
 from dataclasses import dataclass
 from enum import Enum as PythonEnum
 from pathlib import Path
-from typing import Any, Union, cast
+from typing import Any, Union, cast, get_args, get_origin
 
+import tomli
 from google.protobuf import descriptor_pb2
 from grpc_tools import protoc
 from jsonschema.validators import Draft202012Validator
 from pydantic import TypeAdapter
 
-from .models import adapter, scip, scip_api
+from .models import adapter, config, scip, scip_api
 from .models.base import (
     DEFINITIONS,
     PROTO_ENUMS,
     PROTO_MESSAGES,
     DefinitionMetadata,
+    Proto,
+    ProtoFieldDescriptor,
     ProtoPackage,
+    proto_type_name,
     rebuild_models,
 )
-from .models.document import DOCUMENT_METADATA
+from .models.base import (
+    Field as ModelField,
+)
+from .models.document import DOCUMENT
+from .models.surface import Document
 from .proto import serde
 from .proto.model import Enum as EnumSpec
 from .proto.model import EnumValue as EnumValueSpec
@@ -46,6 +55,8 @@ SCALAR = {"string": "string", "integer": "int64", "number": "double", "boolean":
 class Definition:
     owner: str
     public: bool
+    model: type[Any]
+    mapping: Proto
     body: dict[str, Any]
 
 
@@ -66,7 +77,13 @@ def definitions() -> dict[str, Definition]:
         body = generated_definitions[model.__name__]
         if model.__name__ in result:
             raise ValueError(f"duplicate JSON definition {model.__name__}")
-        result[model.__name__] = Definition(metadata.owner, metadata.public, body)
+        result[model.__name__] = Definition(
+            metadata.namespace.owner,
+            metadata.public,
+            model,
+            metadata.mapping,
+            body,
+        )
     return result
 
 
@@ -96,6 +113,25 @@ def ref_name(schema: dict[str, Any]) -> str | None:
     return ref[len(prefix) :]
 
 
+def json_named_fields(model: type[Any]) -> dict[str, ModelField[Any]]:
+    """
+    A model's declared fields, keyed the way JSON Schema names them.
+
+    `__protocol_fields__` is keyed by the Python attribute, and a field whose
+    name collides with a Python keyword is authored as `from_` with an alias.
+    Pydantic emits the alias as the property name, so looking a property up by
+    attribute misses exactly those fields and drops them out of the Protobuf —
+    which is how `Relationship` lost the end the edge starts at.
+    """
+    declared: dict[str, ModelField[Any]] = getattr(model, "__protocol_fields__", {})
+    pydantic_fields = getattr(model, "model_fields", {})
+    named: dict[str, ModelField[Any]] = {}
+    for attribute, field in declared.items():
+        info = pydantic_fields.get(attribute)
+        named[info.alias if info is not None and info.alias else attribute] = field
+    return named
+
+
 def real_schema(schema: dict[str, Any]) -> dict[str, Any]:
     for keyword in ["oneOf", "anyOf"]:
         branches = schema.get(keyword)
@@ -121,13 +157,20 @@ class SchemaCompiler:
         return name if target.owner == self.owner else f"rift.{target.owner}.{name}"
 
     def scalar_alias(self, name: str) -> str | None:
-        schema = DEFINITION_MAP[name].body
-        proto = schema.get("rift:proto", {})
-        return proto.get("scalar")
+        mapping = DEFINITION_MAP[name].mapping
+        if mapping.scalar_type is None:
+            return None
+        return proto_type_name(mapping.scalar_type)
 
-    def enum(self, name: str, schema: dict[str, Any], *, prefixed: bool) -> EnumSpec:
-        meta = schema["rift:proto"]
-        values_meta = meta["values"]
+    def enum(
+        self,
+        name: str,
+        schema: dict[str, Any],
+        mapping: Proto,
+        *,
+        prefixed: bool,
+    ) -> EnumSpec:
+        values_meta = {value.json: value for value in mapping.enum_values}
         descriptions = schema.get("rift:enumDescriptions", {})
         values = [
             EnumValueSpec(
@@ -144,8 +187,8 @@ class SchemaCompiler:
             wire = values_meta[str(value)]
             values.append(
                 EnumValueSpec(
-                    name=wire["name"],
-                    number=wire["number"],
+                    name=wire.proto,
+                    number=wire.number,
                     description=descriptions.get(str(value)),
                 )
             )
@@ -154,27 +197,23 @@ class SchemaCompiler:
     def type_of(
         self,
         schema: dict[str, Any],
-        nested_enums: list[tuple[str, dict[str, Any]]],
+        nested_enums: list[tuple[str, dict[str, Any], Proto]],
     ) -> tuple[str, bool, str | None, str | None]:
         schema = real_schema(schema)
-        meta = schema.get("rift:proto", {})
-        if "scalar" in meta:
-            return meta["scalar"], False, None, None
         ref = ref_name(schema)
-        target_schema = DEFINITION_MAP[ref].body if ref else None
-        if ref and ("enum" in meta or "enum" in (target_schema or {})):
-            enum_schema = copy.deepcopy(DEFINITION_MAP[ref].body)
-            enum_meta = meta if "enum" in meta else enum_schema["rift:proto"]
-            enum_schema["rift:proto"] = enum_meta
-            nested_enums.append((enum_meta["enum"], enum_schema))
-            return enum_meta["enum"], False, None, None
+        target = DEFINITION_MAP[ref] if ref else None
+        if target and target.mapping.kind == "enum":
+            enum_name = target.mapping.enum_name
+            if enum_name is None:
+                raise TypeError(f"{ref} has no Protobuf enum name")
+            nested_enums.append((enum_name, copy.deepcopy(target.body), target.mapping))
+            return enum_name, False, None, None
         if ref:
             return self.scalar_alias(ref) or self.qualify(ref), False, None, None
         if schema.get("contentEncoding") == "base64":
             return "bytes", False, None, None
         if "enum" in schema:
-            nested_enums.append((meta["enum"], schema))
-            return meta["enum"], False, None, None
+            raise TypeError("an inline enum has no typed protocol definition")
         if "const" in schema:
             return (
                 ("string" if isinstance(schema["const"], str) else "int64"),
@@ -201,19 +240,30 @@ class SchemaCompiler:
             None,
         )
 
-    def compile_message(self, name: str, schema: dict[str, Any]) -> MessageSpec:
+    def compile_message(self, definition: Definition) -> MessageSpec:
+        name = definition.model.__name__
+        schema = definition.body
         if name in self.message_names:
             return next(message for message in self.messages if message.name == name)
         self.message_names.add(name)
-        meta = schema["rift:proto"]
         required = set(schema.get("required", []))
-        nested_raw: list[tuple[str, dict[str, Any]]] = []
+        nested_raw: list[tuple[str, dict[str, Any], Proto]] = []
         fields: list[FieldSpec] = []
+        declared_fields = json_named_fields(definition.model)
         for json_name, field_schema in schema.get("properties", {}).items():
-            wire = field_schema.get("rift:proto", {})
-            if "number" not in wire:
+            declared = declared_fields.get(json_name)
+            if declared is None or declared.number is None:
                 continue
-            kind, repeated, map_key, map_value = self.type_of(field_schema, nested_raw)
+            kind, repeated, map_key, map_value = (
+                (
+                    proto_type_name(declared.proto_type),
+                    False,
+                    None,
+                    None,
+                )
+                if declared.proto_type is not None
+                else self.type_of(field_schema, nested_raw)
+            )
             nullable = any(
                 branch.get("type") == "null"
                 for keyword in ["oneOf", "anyOf"]
@@ -221,8 +271,8 @@ class SchemaCompiler:
             )
             fields.append(
                 FieldSpec(
-                    name=wire.get("field", snake(json_name)),
-                    number=wire["number"],
+                    name=declared.proto_name or snake(json_name).rstrip("_"),
+                    number=declared.number,
                     type=kind,
                     description=field_schema.get("description"),
                     repeated=repeated,
@@ -234,13 +284,13 @@ class SchemaCompiler:
         if (
             not fields
             and isinstance(schema.get("additionalProperties"), dict)
-            and "number" in meta
+            and definition.mapping.placement is not None
         ):
             value, _, _, _ = self.type_of(schema["additionalProperties"], nested_raw)
             fields.append(
                 FieldSpec(
-                    name=meta.get("field", "entries"),
-                    number=meta["number"],
+                    name=definition.mapping.placement.name,
+                    number=definition.mapping.placement.number,
                     type="map",
                     map_key="string",
                     map_value=value,
@@ -248,43 +298,46 @@ class SchemaCompiler:
             )
         prefixed = len(nested_raw) > 1
         nested = [
-            self.enum(enum_name, enum_schema, prefixed=prefixed)
-            for enum_name, enum_schema in nested_raw
+            self.enum(enum_name, enum_schema, mapping, prefixed=prefixed)
+            for enum_name, enum_schema, mapping in nested_raw
         ]
         message = MessageSpec(
             name=name,
             description=schema.get("description"),
             fields=fields,
             enums=nested,
-            reserved_numbers=meta.get("reservedNumbers", []),
-            reserved_names=meta.get("reservedNames", []),
         )
         self.messages.append(message)
         return message
 
-    def compile_union(self, name: str, schema: dict[str, Any]) -> MessageSpec:
+    def compile_union(self, definition: Definition) -> MessageSpec:
+        name = definition.model.__name__
+        schema = definition.body
         if name in self.message_names:
             return next(message for message in self.messages if message.name == name)
         self.message_names.add(name)
-        meta = schema["rift:proto"]
-        oneof = meta["oneof"]
-        variants = meta["variants"]
+        mapping = definition.mapping
+        if mapping.oneof is None:
+            raise TypeError(f"{name} has no oneof")
+        oneof = mapping.oneof.name
         fields = [
             FieldSpec(
-                name=variant["field"],
-                number=variant["number"],
-                type=variant["type"],
+                name=variant.name,
+                number=variant.number,
+                type=(
+                    cast(Any, variant.proto_model).DESCRIPTOR.full_name
+                    if variant.proto_model
+                    else variant.resolve().__name__
+                ),
                 oneof=oneof,
             )
-            for variant in variants
+            for variant in mapping.variants
         ]
         message = MessageSpec(
             name=name,
             description=schema.get("description"),
             fields=fields,
             oneofs=[oneof],
-            reserved_numbers=meta.get("reservedNumbers", []),
-            reserved_names=meta.get("reservedNames", []),
         )
         self.messages.append(message)
         return message
@@ -294,27 +347,24 @@ class SchemaCompiler:
             if definition.owner != self.owner:
                 continue
             schema = definition.body
-            meta = schema.get("rift:proto", {})
-            if not definition.public and not any(
-                key in meta for key in ["type", "scalar"]
-            ):
-                continue
+            mapping = definition.mapping
             if "enum" in schema:
-                if "type" not in meta:
+                if mapping.kind != "enum" or not mapping.named:
                     continue
                 if name not in self.enum_names:
                     self.enum_names.add(name)
-                    self.enums.append(self.enum(name, schema, prefixed=True))
-            elif ("oneOf" in schema or "anyOf" in schema) and "oneof" in meta:
-                self.compile_union(name, schema)
+                    self.enums.append(self.enum(name, schema, mapping, prefixed=True))
+            elif ("oneOf" in schema or "anyOf" in schema) and mapping.kind == "union":
+                if mapping.named:
+                    self.compile_union(definition)
             elif schema.get("properties") is not None or isinstance(
                 schema.get("additionalProperties"), dict
             ):
-                if "type" in meta:
-                    self.compile_message(meta["type"].split(".")[-1], schema)
+                if mapping.named:
+                    self.compile_message(definition)
         imports = ["google/protobuf/struct.proto"]
         if any(
-            "google.protobuf.Empty" in field.type
+            isinstance(field.type, str) and "google.protobuf.Empty" in field.type
             for message in self.messages
             for field in message.fields
         ):
@@ -323,39 +373,24 @@ class SchemaCompiler:
             imports.insert(0, "rift/core.proto")
         services: list[ServiceSpec] = []
         if self.owner == "mcp":
-            entries = cast(dict[str, Any], DOCUMENT_METADATA["rift:entryPoints"])
-            tools = cast(dict[str, dict[str, Any]], entries["mcp.tools"])
-            members = [
-                *tools.values(),
-                cast(dict[str, Any], entries["mcp.resources.read"]),
-            ]
             rpcs: list[RpcSpec] = []
-            for member in members:
-                rpc = member["rpc"]
-                service, method = rpc.rsplit("/", 1)
-                if service != "rift.mcp.Rift":
-                    raise ValueError(f"unsupported MCP service mapping {rpc}")
-                request_name = ref_name(member["params"])
-                response_name = ref_name(member["result"])
-                if request_name is None or response_name is None:
-                    raise ValueError(f"MCP service mapping {rpc} has no message types")
-                request = DEFINITION_MAP[request_name].body["rift:proto"]["type"]
-                response = DEFINITION_MAP[response_name].body["rift:proto"]["type"]
+            for rpc in DOCUMENT.service.rpcs:
+                request = rpc.request.__protocol__.proto["type"]
+                response = rpc.response.__protocol__.proto["type"]
                 rpcs.append(
                     RpcSpec(
-                        name=method,
+                        name=rpc.name,
                         request=request,
                         response=response,
-                        description=member.get("description"),
+                        description=rpc.description,
+                        request_stream=rpc.request_stream,
+                        response_stream=rpc.response_stream,
                     )
                 )
             services.append(
                 ServiceSpec(
-                    name="Rift",
-                    description=(
-                        "The Protobuf service exposed by the Rift server. rift-mcp maps its "
-                        "JSON entry points to these methods using mcp.json metadata."
-                    ),
+                    name=DOCUMENT.service.name,
+                    description=DOCUMENT.service.description,
                     rpcs=rpcs,
                 )
             )
@@ -386,6 +421,57 @@ def enum_from_model(model: type[PythonEnum]) -> EnumSpec:
     )
 
 
+def _direct_value_type(annotation: Any) -> tuple[Any, bool, bool]:
+    origin = get_origin(annotation)
+    if origin is list:
+        return get_args(annotation)[0], True, False
+    if origin in {Union, types.UnionType}:
+        members = get_args(annotation)
+        values = [member for member in members if member is not type(None)]
+        if len(values) == 1 and len(values) != len(members):
+            return values[0], False, True
+    return annotation, False, False
+
+
+def _direct_proto_type(
+    annotation: Any,
+    declared: ModelField[Any],
+    package: str,
+) -> str | int:
+    if declared.proto_type is not None:
+        return declared.proto_type
+    primitive = {
+        bool: ProtoFieldDescriptor.TYPE_BOOL,
+        bytes: ProtoFieldDescriptor.TYPE_BYTES,
+        float: ProtoFieldDescriptor.TYPE_DOUBLE,
+        int: ProtoFieldDescriptor.TYPE_INT64,
+        str: ProtoFieldDescriptor.TYPE_STRING,
+    }
+    if annotation in primitive:
+        return primitive[annotation]
+    direct = getattr(annotation, "__proto__", None)
+    if direct is not None:
+        metadata = direct.values
+        qualified = (
+            f"{metadata['parent']}.{metadata['name']}"
+            if metadata.get("parent")
+            else f"{metadata['package']}.{metadata['name']}"
+        )
+        return (
+            f".{qualified}"
+            if metadata["package"] == "scip" and package != "scip"
+            else qualified
+        )
+    definition = getattr(annotation, "__protocol__", None)
+    if definition is not None:
+        mapping = definition.proto
+        if "scalar" in mapping:
+            return mapping["scalar"]
+        if "type" in mapping:
+            return mapping["type"]
+    raise TypeError(f"cannot derive a Protobuf type from {annotation!r}")
+
+
 def message_from_model(model: type[Any]) -> MessageSpec:
     meta = model.__proto__.values
     wire_name = (
@@ -394,10 +480,29 @@ def message_from_model(model: type[Any]) -> MessageSpec:
         else f"{meta['parent']}.{meta['name']}"
     )
     fields = []
-    for pydantic_field in model.model_fields.values():
-        extra = pydantic_field.json_schema_extra or {}
-        value = extra["rift:proto"]
-        fields.append(FieldSpec(**value))
+    oneofs: list[str] = []
+    declared_fields: dict[str, ModelField[Any]] = model.__protocol_fields__
+    for name, declared in declared_fields.items():
+        if declared.number is None:
+            continue
+        pydantic_field = model.model_fields[name]
+        value_type, repeated, nullable = _direct_value_type(pydantic_field.annotation)
+        wire_type = _direct_proto_type(value_type, declared, meta["package"])
+        oneof = declared.oneof.name if declared.oneof else None
+        if oneof and oneof not in oneofs:
+            oneofs.append(oneof)
+        fields.append(
+            FieldSpec(
+                name=declared.proto_name or name.rstrip("_"),
+                number=declared.number,
+                type=wire_type,
+                description=pydantic_field.description,
+                repeated=repeated,
+                optional=nullable and isinstance(wire_type, int),
+                oneof=oneof,
+                deprecated=declared.deprecated,
+            )
+        )
     nested_messages = [
         message_from_model(child)
         for child in PROTO_MESSAGES
@@ -414,7 +519,7 @@ def message_from_model(model: type[Any]) -> MessageSpec:
         fields=fields,
         messages=nested_messages,
         enums=nested_enums,
-        oneofs=meta.get("oneofs", []),
+        oneofs=oneofs,
         reserved_numbers=meta.get("reserved_numbers", []),
         reserved_ranges=meta.get("reserved_ranges", []),
         reserved_names=meta.get("reserved_names", []),
@@ -422,39 +527,63 @@ def message_from_model(model: type[Any]) -> MessageSpec:
     )
 
 
+def _direct_rpc_type(model: type[Any]) -> str:
+    descriptor = getattr(model, "DESCRIPTOR", None)
+    if descriptor is not None:
+        return descriptor.full_name
+    metadata = cast(Any, model).__proto__.values
+    return (
+        f"{metadata['parent']}.{metadata['name']}"
+        if metadata.get("parent")
+        else f"{metadata['package']}.{metadata['name']}"
+    )
+
+
 def file_from_package(package: ProtoPackage) -> FileSpec:
-    spec = package.spec
-    description = spec.get("description")
-    if not description and spec["package"] == "rift.adapter":
+    spec = package.file
+    description = spec.description
+    if not description and spec.namespace.package == "rift.adapter":
         description = (
-            "The Rift server owns one adapter process per language and calls it over gRPC on a Unix "
-            "domain socket. Different-language adapters may open the same session worktree. Each keeps "
-            "its own compiler state and cache. Rift serializes source writes, then refreshes every "
+            "The Rift server owns at most one configured adapter process per exact Language and calls "
+            "it over gRPC on a Unix domain socket. The process can hold states for several snapshots "
+            "and back them with separate runtime workers. Rift resolves revisions and supplies "
+            "server-owned worktrees; adapters never allocate or switch them. Different-language "
+            "adapters may open the same tree. Rift serializes source writes, then refreshes every "
             "adapter that holds the worktree."
         )
-    if not description and spec["package"] == "scip":
-        release = spec["upstream_release"]
+    if not description and spec.namespace.package == "scip":
+        release = spec.upstream_release
         description = (
             "SCIP is a language-neutral Protobuf format for code indexes. Rift protocol version 1 "
             f"pins the schema from SCIP {release}."
         )
     return FileSpec(
-        path=spec["path"],
-        package=spec["package"],
+        path=spec.path,
+        package=spec.namespace.package,
         description=description,
-        imports=spec.get("imports", []),
-        options=spec.get("options", {}),
+        imports=list(spec.imports),
+        options={option.name: option.value for option in spec.options},
         messages=[message_from_model(model) for model in package.models],
         enums=[enum_from_model(model) for model in package.enums],
         services=[
             ServiceSpec(
-                name=service["name"],
-                description=service.get("description"),
-                rpcs=[RpcSpec(**rpc) for rpc in service["rpcs"]],
+                name=service.name,
+                description=service.description,
+                rpcs=[
+                    RpcSpec(
+                        name=rpc.name,
+                        request=_direct_rpc_type(rpc.request),
+                        response=_direct_rpc_type(rpc.response),
+                        description=rpc.description,
+                        request_stream=rpc.request_stream,
+                        response_stream=rpc.response_stream,
+                    )
+                    for rpc in service.rpcs
+                ],
             )
             for service in package.services
         ],
-        section_option=spec.get("section_option", False),
+        section_option=spec.section_option,
     )
 
 
@@ -510,7 +639,11 @@ def external_uses(document: dict[str, Any], parents: dict[str, Any]) -> set[str]
         for key, value in node.items():
             if key == "discriminator":
                 continue
-            if owner in parents and key in {"oneOf", "anyOf"} and isinstance(value, list):
+            if (
+                owner in parents
+                and key in {"oneOf", "anyOf"}
+                and isinstance(value, list)
+            ):
                 for branch in value:
                     # A bare `$ref` here is the variant's declaration; anything
                     # else in the branch is an ordinary reference.
@@ -542,10 +675,9 @@ def inline_variants(document: dict[str, Any]) -> None:
 
     A variant something else refers to keeps its name, because inlining it would
     delete a reference target. `FileChange` holds `TextEdit` values, so `TextEdit`
-    stays a definition even though it is also a branch of `Edit`. So does a
-    variant two unions both declare, such as the empty branch `SymbolOrigin` and
-    `OperationVerifier` share: folding it into the first would leave the second
-    pointing at a definition that no longer exists.
+    stays a definition even though it is also a branch of `Edit`. A variant two
+    unions both declare also stays named: folding it into the first would leave
+    the second pointing at a definition that no longer exists.
     """
     definitions = document["$defs"]
     parents = union_parents(definitions)
@@ -578,11 +710,88 @@ def inline_variants(document: dict[str, Any]) -> None:
             definitions[name].pop("discriminator", None)
 
 
+def _schema_ref(model: type[Any]) -> dict[str, str]:
+    return {"$ref": f"#/$defs/{model.__name__}"}
+
+
+def document_metadata(document: Document) -> dict[str, Any]:
+    service_name = f"rift.mcp.{document.service.name}"
+    tools = {
+        tool.name: {
+            "rpc": f"{service_name}/{tool.rpc.name}",
+            "description": tool.rpc.description,
+            "params": _schema_ref(tool.rpc.request),
+            "result": _schema_ref(tool.rpc.response),
+        }
+        for tool in document.tools
+    }
+    resources = {
+        resource.name: {
+            "description": resource.description,
+            "template": _schema_ref(resource.template),
+            "uri": _schema_ref(resource.uri),
+            "link": _schema_ref(resource.link),
+        }
+        for resource in document.resources
+    }
+    resource_read = document.resource_read
+    entry_points = {
+        "description": document.entry_points_description,
+        "mcp.tools": tools,
+        "mcp.resources": resources,
+        "mcp.error": _schema_ref(document.error),
+        "mcp.resources.read": {
+            "rpc": f"{service_name}/{resource_read.name}",
+            "params": _schema_ref(resource_read.request),
+            "result": _schema_ref(resource_read.response),
+        },
+    }
+    groups = []
+    for axis in document.axes:
+        group: dict[str, Any] = {"name": axis.name, "summary": axis.summary}
+        if axis.identified_by:
+            group["identifiedBy"] = [model.__name__ for model in axis.identified_by]
+        if axis.holds:
+            group["holds"] = [model.__name__ for model in axis.holds]
+        if axis.residual_of:
+            group["residualOf"] = axis.residual_of
+        groups.append(group)
+    return {
+        "$schema": document.schema,
+        "$id": document.id,
+        "title": document.title,
+        "description": document.description,
+        "rift:entryPoints": entry_points,
+        "rift:axes": {"description": document.axes_description, "groups": groups},
+    }
+
+
 def schema_output() -> dict[str, Any]:
-    result = copy.deepcopy(DOCUMENT_METADATA)
+    result = document_metadata(DOCUMENT)
     result["$defs"] = copy.deepcopy(PYDANTIC_SCHEMA["$defs"])
     inline_variants(result)
     return result
+
+
+def config_schema_output() -> dict[str, Any]:
+    """JSON Schema for the TOML-compatible value authored in ``rift.toml``."""
+
+    body = config.RiftConfig.model_json_schema(
+        by_alias=True,
+        ref_template="#/$defs/{model}",
+    )
+    body.update(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://volar.sh/rift/protocol/rift.schema.json",
+            "title": "Rift repository configuration",
+            "description": (
+                "The typed rift.toml file. Configuration reuses protocol enums and paths, and "
+                "carries machine-checked links to the fields it bounds."
+            ),
+        }
+    )
+    return body
 
 
 def validate_json_schema(content: str) -> dict[str, Any]:
@@ -614,6 +823,60 @@ def validate_json_schema(content: str) -> dict[str, Any]:
         if isinstance(mapped, str) and mapped.startswith(("rift.scip.", "scip.")):
             raise ValueError(f"$defs/{name} exposes the separate SCIP API through MCP")
     return schema
+
+
+def validate_config_schema(content: str) -> dict[str, Any]:
+    schema = json.loads(content)
+    Draft202012Validator.check_schema(schema)
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict):
+        raise TypeError("rift.schema.json has no $defs object")
+
+    linked_fields = {"rift:bounds", "rift:prefixOf"}
+    linked_types = {"rift:selectsType", "rift:describesAs"}
+    protocol_models = {
+        model.__name__: model for model in [*DEFINITIONS, *PROTO_MESSAGES, *PROTO_ENUMS]
+    }
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+            return
+        if not isinstance(node, dict):
+            return
+        for keyword in linked_fields:
+            target = node.get(keyword)
+            if target is None:
+                continue
+            if not isinstance(target, dict):
+                raise TypeError(f"{path}.{keyword} is not a field target")
+            model_name = target.get("model")
+            field_name = target.get("field")
+            model = protocol_models.get(model_name)
+            declared = getattr(model, "__protocol_fields__", {}) if model else {}
+            if model is None or field_name not in declared:
+                raise ValueError(f"{path}.{keyword} targets missing field {target!r}")
+        for keyword in linked_types:
+            target = node.get(keyword)
+            if target is not None and target not in protocol_models:
+                raise ValueError(f"{path}.{keyword} targets missing type {target!r}")
+        for key, value in node.items():
+            if key not in {"examples", "default"}:
+                walk(value, f"{path}.{key}")
+
+    walk(schema, "rift.schema.json")
+    return schema
+
+
+def validate_rift_toml(path: Path) -> config.RiftConfig:
+    """Parse the repository's real config through the same model as its schema."""
+
+    try:
+        value = tomli.loads(path.read_text())
+    except tomli.TOMLDecodeError as error:
+        raise ValueError(f"invalid {path.name}: {error}") from error
+    return config.RiftConfig.model_validate(value)
 
 
 def descriptor_names(
@@ -734,6 +997,7 @@ def validate_proto(files: dict[str, str], schema: dict[str, Any]) -> None:
         names.update(
             f"{descriptor.package}.{enum.name}" for enum in descriptor.enum_type
         )
+
     # Every mapping in the document, not only the ones at the top of a
     # definition: an inlined union branch keeps the Protobuf type it compiles to,
     # and dropping it out of this check is how the two drift apart unnoticed.
@@ -781,11 +1045,17 @@ def main() -> int:
         file_from_package(scip.SCIP_PACKAGE),
     ]
     json_content = json.dumps(schema_output(), indent=2) + "\n"
+    config_content = json.dumps(config_schema_output(), indent=2) + "\n"
     proto_content = {value.path: serde.serialize(value) for value in files}
     schema = validate_json_schema(json_content)
+    validate_config_schema(config_content)
+    validate_rift_toml(PROTOCOL.parent / "rift.toml")
     validate_proto(proto_content, schema)
 
     ok = write_or_check(PROTOCOL / "mcp.json", json_content, args.check)
+    ok = (
+        write_or_check(PROTOCOL / "rift.schema.json", config_content, args.check) and ok
+    )
     for path, content in proto_content.items():
         ok = write_or_check(PROTOCOL / path, content, args.check) and ok
     return 0 if ok else 1

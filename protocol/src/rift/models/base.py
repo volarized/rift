@@ -3,26 +3,344 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Annotated, Any, Generic, Literal, TypeVar, cast
+from typing import (
+    Annotated,
+    Any,
+    Generic,
+    Literal,
+    TypeVar,
+    cast,
+    get_args,
+    get_origin,
+    overload,
+)
 
-from pydantic import BaseModel, ConfigDict, Field, GetJsonSchemaHandler, RootModel
+from google.protobuf import empty_pb2
+from google.protobuf.message import Message as ProtoMessage
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    GetJsonSchemaHandler,
+    RootModel,
+)
+from pydantic import (
+    Field as schema_field,
+)
+from pydantic._internal._model_construction import ModelMetaclass
 from pydantic.json_schema import JsonSchemaValue
-from pydantic_core import CoreSchema
+from pydantic_core import CoreSchema, PydanticUndefined
+
+from ..proto.types import ProtoFieldDescriptor, proto_type_name
+from .surface import Rpc, Service
+
+ProtoEmpty = cast(Any, empty_pb2).Empty
 
 T = TypeVar("T")
+M = TypeVar("M", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class FieldRef(Generic[M, T]):
+    """The identity of one field in one protocol model."""
+
+    owner: type[M]
+    name: str
+    field: Field[T]
+
+    @property
+    def proto_name(self) -> str:
+        return self.field.proto_name or self.name.rstrip("_")
+
+
+@dataclass(frozen=True)
+class Oneof:
+    """A named Protobuf oneof declared by fields that share it."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class Namespace:
+    owner: str
+    package: str
+
+
+CORE = Namespace("core", "rift.core")
+MCP = Namespace("mcp", "rift.mcp")
+ADAPTER = Namespace("adapter", "rift.adapter")
+SCIP = Namespace("scip", "scip")
+RIFT_SCIP = Namespace("scip", "rift.scip")
+
+
+@dataclass(frozen=True)
+class Placement:
+    name: str
+    number: int
+
+
+@dataclass(frozen=True)
+class Variant:
+    tag: str | None
+    name: str
+    number: int
+    model: type[Any] | Callable[[], type[Any]]
+    proto_model: type[ProtoMessage] | None = None
+
+    def resolve(self) -> type[Any]:
+        return self.model if isinstance(self.model, type) else self.model()
+
+
+@dataclass(frozen=True)
+class EnumValue:
+    json: str
+    proto: str
+    number: int
+
+
+@dataclass(frozen=True)
+class Proto:
+    """Typed Protobuf identity attached to one JSON Schema definition."""
+
+    kind: Literal["empty", "enum", "message", "scalar", "union"]
+    scalar_type: int | None = None
+    named: bool = False
+    placement: Placement | None = None
+    enum_name: str | None = None
+    enum_values: tuple[EnumValue, ...] = ()
+    oneof: Oneof | None = None
+    variants: tuple[Variant, ...] = ()
+
+    @classmethod
+    def empty(cls) -> Proto:
+        return cls("empty")
+
+    @classmethod
+    def scalar(cls, scalar_type: int) -> Proto:
+        return cls("scalar", scalar_type=scalar_type)
+
+    @classmethod
+    def message(
+        cls,
+        *,
+        named: bool = True,
+        placement: Placement | None = None,
+    ) -> Proto:
+        return cls("message", named=named, placement=placement)
+
+    @classmethod
+    def enum(
+        cls,
+        name: str,
+        values: tuple[EnumValue, ...],
+        *,
+        named: bool = False,
+        placement: Placement | None = None,
+    ) -> Proto:
+        return cls(
+            "enum",
+            named=named,
+            placement=placement,
+            enum_name=name,
+            enum_values=values,
+        )
+
+    @classmethod
+    def union(
+        cls,
+        oneof: Oneof,
+        variants: tuple[Variant, ...],
+        *,
+        named: bool = True,
+        placement: Placement | None = None,
+    ) -> Proto:
+        return cls(
+            "union",
+            named=named,
+            placement=placement,
+            oneof=oneof,
+            variants=variants,
+        )
+
+    def schema(self, namespace: Namespace, model: type[Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        if self.kind == "scalar":
+            if self.scalar_type is None:
+                raise TypeError(f"{model.__name__} has no scalar type")
+            result.update(
+                scalar=(proto_type_name(self.scalar_type)),
+                package=namespace.package,
+            )
+        elif self.named:
+            result["type"] = f"{namespace.package}.{model.__name__}"
+        if self.placement:
+            result.update(
+                field=self.placement.name,
+                number=self.placement.number,
+            )
+        if self.kind == "enum":
+            result["enum"] = self.enum_name
+            result["values"] = {
+                value.json: {"name": value.proto, "number": value.number}
+                for value in self.enum_values
+            }
+        if self.kind == "union":
+            if self.oneof is None:
+                raise TypeError(f"{model.__name__} has no oneof")
+            result["oneof"] = self.oneof.name
+            result["variants"] = [
+                {
+                    "tag": variant.tag,
+                    "field": variant.name,
+                    "number": variant.number,
+                    "type": (
+                        cast(Any, variant.proto_model).DESCRIPTOR.full_name
+                        if variant.proto_model
+                        else variant.resolve().__name__
+                    ),
+                }
+                for variant in self.variants
+            ]
+        return result
+
+
+class Field(Generic[T]):
+    """A model value on instances and a typed field reference on model classes."""
+
+    def __init__(
+        self,
+        *,
+        number: int | None = None,
+        proto_name: str | None = None,
+        proto_type: int | None = None,
+        oneof: Oneof | None = None,
+        deprecated: bool = False,
+        default: Any = PydanticUndefined,
+        **schema: Any,
+    ) -> None:
+        self.number = number
+        self.proto_name = proto_name
+        self.proto_type = proto_type
+        self.oneof = oneof
+        self.deprecated = deprecated
+        self.owner: type[BaseModel] | None = None
+        self.name: str | None = None
+        schema_extra = cast(dict[str, Any], schema.pop("json_schema_extra", {}) or {})
+        wire: dict[str, Any] = {}
+        if number is not None:
+            wire["number"] = number
+        if proto_name is not None:
+            wire["field"] = proto_name
+        if proto_type is not None:
+            wire["scalar"] = proto_type_name(proto_type)
+        if wire:
+            schema_extra["rift:proto"] = wire
+        if schema_extra:
+            schema["json_schema_extra"] = schema_extra
+        self.info = schema_field(default=default, **schema)
+
+    def bind(self, owner: type[BaseModel], name: str) -> None:
+        self.owner = owner
+        self.name = name
+
+    @overload
+    def __get__(self, instance: None, owner: type[M]) -> FieldRef[M, T]: ...
+
+    @overload
+    def __get__(self, instance: M, owner: type[M] | None = None) -> T: ...
+
+    def __get__(
+        self,
+        instance: BaseModel | None,
+        owner: type[BaseModel] | None = None,
+    ) -> Any:
+        if instance is None:
+            if owner is None or self.name is None:
+                raise AttributeError("unbound protocol field")
+            return FieldRef(owner, self.name, self)
+        if self.name is None:
+            raise AttributeError("unbound protocol field")
+        return instance.__dict__[self.name]
+
+
+def field(
+    *,
+    number: int | None = None,
+    proto_name: str | None = None,
+    proto_type: int | None = None,
+    oneof: Oneof | None = None,
+    deprecated: bool = False,
+    default: Any = PydanticUndefined,
+    **schema: Any,
+) -> Field[Any]:
+    return Field(
+        number=number,
+        proto_name=proto_name,
+        proto_type=proto_type,
+        oneof=oneof,
+        deprecated=deprecated,
+        default=default,
+        **schema,
+    )
+
+
+def _field_value_annotation(annotation: Any) -> Any:
+    if isinstance(annotation, str):
+        prefix = "Field["
+        if annotation.startswith(prefix) and annotation.endswith("]"):
+            return annotation[len(prefix) : -1]
+        return annotation
+    if get_origin(annotation) is Field:
+        return get_args(annotation)[0]
+    return annotation
+
+
+class ProtocolModelMetaclass(ModelMetaclass):
+    """Lower authored field descriptors into Pydantic, then restore their class view."""
+
+    def __new__(
+        mcls,
+        name: str,
+        bases: tuple[type[Any], ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> type[Any]:
+        namespace = dict(namespace)
+        annotations = dict(namespace.get("__annotations__", {}))
+        declared: dict[str, Field[Any]] = {}
+        for field_name, value in list(namespace.items()):
+            if not isinstance(value, Field):
+                continue
+            if field_name not in annotations:
+                raise TypeError(f"{name}.{field_name} has no field annotation")
+            declared[field_name] = value
+            annotations[field_name] = _field_value_annotation(annotations[field_name])
+            namespace[field_name] = value.info
+        namespace["__annotations__"] = annotations
+
+        model = cast(type[Any], super().__new__(mcls, name, bases, namespace, **kwargs))
+        inherited: dict[str, Field[Any]] = {}
+        for base in reversed(model.__mro__[1:]):
+            inherited.update(getattr(base, "__protocol_fields__", {}))
+        inherited.update(declared)
+        model.__protocol_fields__ = inherited
+        for field_name, value in declared.items():
+            value.bind(model, field_name)
+            setattr(model, field_name, value)
+        return model
 
 
 class ProtocolRoot(RootModel[T], Generic[T]):
     model_config = ConfigDict(regex_engine="python-re")
 
 
-class ClosedModel(BaseModel):
+class ClosedModel(BaseModel, metaclass=ProtocolModelMetaclass):
     model_config = ConfigDict(extra="forbid", regex_engine="python-re")
 
 
-class ProtoModel(BaseModel):
+class ProtoModel(BaseModel, metaclass=ProtocolModelMetaclass):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
@@ -36,23 +354,118 @@ def closed_config(schema_extra: dict[str, Any]) -> ConfigDict:
 
 @dataclass(frozen=True)
 class DefinitionMetadata:
-    owner: str
+    namespace: Namespace
     public: bool
-    proto: dict[str, Any]
+    mapping: Proto
     schema_extra: dict[str, Any]
+    model: type[Any]
+
+    @property
+    def proto(self) -> dict[str, Any]:
+        return self.mapping.schema(self.namespace, self.model)
 
 
 @dataclass(frozen=True)
 class ProtoMetadata:
-    values: dict[str, Any]
+    declaration: DirectMessage | DirectEnum
+    model: type[Any]
+
+    @property
+    def values(self) -> dict[str, Any]:
+        return self.declaration.values(self.model)
+
+
+DirectParent = type[Any] | Callable[[], type[Any]]
+
+
+def _direct_parent_name(parent: DirectParent | None) -> str | None:
+    if parent is None:
+        return None
+    model = parent if isinstance(parent, type) else parent()
+    metadata = cast(Any, model).__proto__.values
+    return f"{metadata['package']}.{metadata['name']}"
+
+
+@dataclass(frozen=True)
+class DirectMessage:
+    namespace: Namespace
+    name: str | None = None
+    description: str | None = None
+    reserved_numbers: tuple[int, ...] = ()
+    reserved_ranges: tuple[tuple[int, int], ...] = ()
+    reserved_names: tuple[str, ...] = ()
+    section: str | None = None
+
+    def values(self, model: type[Any]) -> dict[str, Any]:
+        return {
+            "package": self.namespace.package,
+            "name": self.name or model.__name__,
+            "parent": None,
+            "description": self.description,
+            "reserved_numbers": list(self.reserved_numbers),
+            "reserved_ranges": list(self.reserved_ranges),
+            "reserved_names": list(self.reserved_names),
+            "section": self.section,
+        }
+
+
+@dataclass(frozen=True)
+class DirectEnum:
+    namespace: Namespace
+    name: str | None = None
+    parent: DirectParent | None = None
+    description: str | None = None
+    value_descriptions: tuple[str | None, ...] = ()
+    allow_alias: bool = False
+    reserved_numbers: tuple[int, ...] = ()
+    reserved_names: tuple[str, ...] = ()
+
+    def values(self, model: type[IntEnum]) -> dict[str, Any]:
+        members = list(model.__members__.items())
+        descriptions = self.value_descriptions or (None,) * len(members)
+        if len(descriptions) != len(members):
+            raise ValueError(f"{model.__name__} has a description-count mismatch")
+        return {
+            "package": self.namespace.package,
+            "name": self.name or model.__name__,
+            "parent": _direct_parent_name(self.parent),
+            "description": self.description,
+            "allow_alias": self.allow_alias,
+            "reserved_numbers": list(self.reserved_numbers),
+            "reserved_names": list(self.reserved_names),
+            "values": [
+                {"name": name, "number": member.value, "description": description}
+                for (name, member), description in zip(
+                    members, descriptions, strict=True
+                )
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class ProtoOption:
+    name: str
+    value: str | bool
+
+
+@dataclass(frozen=True)
+class ProtoFile:
+    path: str
+    namespace: Namespace
+    description: str | None = None
+    imports: tuple[str, ...] = ()
+    options: tuple[ProtoOption, ...] = ()
+    section_option: bool = False
+    upstream_release: str | None = None
+    upstream_schema: str | None = None
 
 
 @dataclass(frozen=True)
 class ProtoPackage:
-    spec: dict[str, Any]
+    file: ProtoFile
     models: tuple[type[ProtoModel], ...]
     enums: tuple[type[IntEnum], ...]
-    services: list[dict[str, Any]]
+    services: tuple[Service, ...] = ()
 
 
 DEFINITIONS: list[type[Any]] = []
@@ -62,20 +475,24 @@ PROTO_ENUMS: list[type[IntEnum]] = []
 
 def definition(
     *,
-    owner: str,
+    owner: Namespace,
     public: bool,
-    proto: dict[str, Any],
+    proto: Proto,
     schema_extra: dict[str, Any],
 ):
     def decorate(model: type[T]) -> type[T]:
-        metadata = DefinitionMetadata(owner, public, proto, schema_extra)
+        metadata = DefinitionMetadata(owner, public, proto, schema_extra, model)
         dynamic = cast(Any, model)
         dynamic.__protocol__ = metadata
-        extra = {
-            **schema_extra,
-            "rift:proto": proto,
-            "rift:package": f"rift.{owner}",
-        }
+
+        def add_metadata(schema: JsonSchemaValue) -> None:
+            schema.update(
+                schema_extra,
+                **{
+                    "rift:proto": metadata.proto,
+                    "rift:package": owner.package,
+                },
+            )
 
         def emit_schema(
             cls: type[Any],
@@ -83,7 +500,7 @@ def definition(
             handler: GetJsonSchemaHandler,
         ) -> JsonSchemaValue:
             schema = handler(core_schema)
-            schema.update(extra)
+            add_metadata(schema)
             return schema
 
         if issubclass(model, BaseModel):
@@ -91,14 +508,16 @@ def definition(
             if issubclass(model, RootModel):
                 dynamic.__get_pydantic_json_schema__ = classmethod(emit_schema)
             else:
-                current = cast(
-                    dict[str, Any] | None,
-                    pydantic_model.model_config.get("json_schema_extra"),
-                )
-                pydantic_model.model_config["json_schema_extra"] = {
-                    **(current or {}),
-                    **extra,
-                }
+                current = pydantic_model.model_config.get("json_schema_extra")
+
+                def emit_model_schema(schema: JsonSchemaValue) -> None:
+                    if isinstance(current, dict):
+                        schema.update(cast(dict[str, Any], current))
+                    elif callable(current):
+                        cast(Callable[[JsonSchemaValue], None], current)(schema)
+                    add_metadata(schema)
+
+                pydantic_model.model_config["json_schema_extra"] = emit_model_schema
         elif issubclass(model, Enum):
             dynamic.__get_pydantic_json_schema__ = classmethod(emit_schema)
         DEFINITIONS.append(model)
@@ -107,31 +526,45 @@ def definition(
     return decorate
 
 
-def proto_message(values: dict[str, Any]):
+def proto_message(declaration: DirectMessage):
     def decorate(model: type[T]) -> type[T]:
         typed = cast(type[ProtoModel], model)
-        cast(Any, typed).__proto__ = ProtoMetadata(values)
+        cast(Any, typed).__proto__ = ProtoMetadata(declaration, typed)
         PROTO_MESSAGES.append(typed)
         return model
 
     return decorate
 
 
-def proto_enum(values: dict[str, Any]):
+def proto_enum(declaration: DirectEnum):
     def decorate(model: type[T]) -> type[T]:
         typed = cast(type[IntEnum], model)
-        cast(Any, typed).__proto__ = ProtoMetadata(values)
+        cast(Any, typed).__proto__ = ProtoMetadata(declaration, typed)
         PROTO_ENUMS.append(typed)
         return model
 
     return decorate
 
 
-def proto_field(*, default: Any, spec: dict[str, Any]):
-    return Field(
+def proto_field(
+    *,
+    default: Any = PydanticUndefined,
+    number: int | None = None,
+    proto_name: str | None = None,
+    proto_type: int | None = None,
+    oneof: Oneof | None = None,
+    deprecated: bool = False,
+    **schema: Any,
+) -> Field[Any]:
+    """Declare one protocol field from typed Python and Protobuf facts."""
+    return field(
         default=default,
-        description=spec.get("description"),
-        json_schema_extra={"rift:proto": spec},
+        number=number,
+        proto_name=proto_name,
+        proto_type=proto_type,
+        oneof=oneof,
+        deprecated=deprecated,
+        **schema,
     )
 
 
@@ -145,24 +578,47 @@ def rebuild_models() -> None:
 
 
 __all__ = [
+    "ADAPTER",
+    "CORE",
     "DEFINITIONS",
+    "MCP",
     "PROTO_ENUMS",
     "PROTO_MESSAGES",
+    "RIFT_SCIP",
+    "SCIP",
     "Annotated",
     "Any",
     "ClosedModel",
     "ConfigDict",
+    "DirectEnum",
+    "DirectMessage",
     "Enum",
+    "EnumValue",
     "Field",
+    "FieldRef",
     "IntEnum",
     "Literal",
+    "Namespace",
+    "Oneof",
+    "Placement",
+    "Proto",
+    "ProtoEmpty",
+    "ProtoFieldDescriptor",
+    "ProtoFile",
     "ProtoModel",
+    "ProtoOption",
     "ProtoPackage",
     "ProtocolRoot",
+    "Rpc",
+    "Service",
+    "Variant",
     "closed_config",
     "definition",
+    "field",
     "proto_enum",
     "proto_field",
     "proto_message",
+    "proto_type_name",
     "rebuild_models",
+    "schema_field",
 ]

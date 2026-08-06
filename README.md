@@ -1,20 +1,14 @@
-# rift
+# Rift
 
-`rift` is an agentic development toolkit, with tools and resources to read, search, discover and edit codebases at scale and with high token efficiency.
+Rift exposes Git-pinned code reads and validated change transactions to agents over MCP. Language
+adapters provide the parsing, analysis, formatting, validation, and actions they implement.
 
-## Installation
+The target protocol and repository configuration are defined as Pydantic models in
+`protocol/src/rift/models`. Generation produces the MCP and `rift.toml` JSON Schemas and gRPC
+Protobuf files under `protocol/`, and checks the repository's own `rift.toml` against that model.
 
-<TODO>
+```sh
+uv run python -m rift.generate --check
+```
 
-## How it works?
-
-Rift provides a skill and an MCP server with tools and resources. Agents can use these tools to read, search, discover and edit codebases in efficient, compiler-driven and validated way.
-
-### Resources
-
-<TODO>
-
-### Tools
-
-<TODO>
-
+The architecture, configuration, protocol rationale, and generated reference live in `docs/`.

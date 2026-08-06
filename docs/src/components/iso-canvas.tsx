@@ -1,13 +1,13 @@
 "use client";
 
 import {
+  CheckCircleIcon,
   DatabaseIcon,
   GearIcon,
   GitBranchIcon,
   GitCommitIcon,
   PlugsConnectedIcon,
   RobotIcon,
-  ShieldCheckIcon,
 } from "@phosphor-icons/react/dist/ssr";
 import { Html, OrbitControls } from "@react-three/drei";
 import { Canvas, useThree } from "@react-three/fiber";
@@ -90,7 +90,7 @@ const MARKS: Record<MarkName, (size: number) => React.ReactNode> = {
   commit: (size) => <GitCommitIcon size={size} weight="light" className="shrink-0" />,
   adapter: (size) => <PlugsConnectedIcon size={size} weight="light" className="shrink-0" />,
   config: (size) => <GearIcon size={size} weight="light" className="shrink-0" />,
-  sandbox: (size) => <ShieldCheckIcon size={size} weight="light" className="shrink-0" />,
+  validator: (size) => <CheckCircleIcon size={size} weight="light" className="shrink-0" />,
 };
 
 /** A ground-plane point, lifted to a height and scaled into world units. */

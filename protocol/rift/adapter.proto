@@ -1,9 +1,11 @@
 syntax = "proto3";
 // Generated from the Pydantic models under protocol/src/rift/models. Do not edit.
-// The Rift server owns one adapter process per language and calls it over gRPC on a Unix domain
-// socket. Different-language adapters may open the same session worktree. Each keeps its own
-// compiler state and cache. Rift serializes source writes, then refreshes every adapter that
-// holds the worktree.
+// The Rift server owns at most one configured adapter process per exact Language and calls it
+// over gRPC on a Unix domain socket. The process can hold states for several snapshots and back
+// them with separate runtime workers. Rift resolves revisions and supplies server-owned
+// worktrees; adapters never allocate or switch them. Different-language adapters may open the
+// same tree. Rift serializes source writes, then refreshes every adapter that holds the
+// worktree.
 package rift.adapter;
 import "rift/core.proto";
 import "google/protobuf/descriptor.proto";
@@ -11,50 +13,55 @@ import "google/protobuf/empty.proto";
 extend google.protobuf.MessageOptions {
   optional string section = 50000;
 }
+// How long Rift may retain one Analyze result.
+enum CacheScope {
+  // No cache claim. Rift treats the result as request-volatile.
+  CACHE_SCOPE_UNSPECIFIED = 0;
+  // The source snapshot, adapter implementation, language, and derived virtual inputs determine
+  // the result.
+  SNAPSHOT = 1;
+  // Adapter-observed external state also affects the result. Retention ends with the process or
+  // adapter-state generation.
+  PROCESS = 2;
+  // The result is request-volatile and is not retained.
+  NONE = 3;
+}
 // Adapter capabilities read once during startup.
 message Capabilities {
   option (section) = "Capabilities";
   // The contract version this adapter implements. A mismatch stops startup.
   uint32 protocol_version = 1;
-  // The language this adapter answers for, as every `LanguageId` in the model
-  // will spell it. One workspace runs one adapter per language, so this is also
-  // what makes two adapters distinct.
-  string language = 2;
+  // Language name and optional dialect handled by this configured adapter process. A workspace
+  // configures at most one process for the exact pair; that process can hold many adapter
+  // states.
+  rift.core.Language language = 2;
   // The adapter build, as it names itself.
   string implementation = 3;
-  // The compiler behind it, as it names itself.
-  string compiler = 4;
-  // Which files this adapter owns, and which it merely reads.
-  repeated rift.adapter.SourceClaim claims = 5;
-  // Files that configure the compiler without being source themselves —
+  // Physical source files this adapter owns and parses as `language`.
+  repeated rift.adapter.SourceClaim source_claims = 4;
+  // Files this adapter reads as configuration or dependency metadata —
   // `Cargo.toml`, `tsconfig.json`. Several adapters may claim the same one.
-  repeated rift.adapter.AuxiliaryClaim auxiliary_claims = 6;
-  // Languages whose generated files this adapter consumes from other adapters.
-  repeated rift.adapter.VirtualClaim virtual_claims = 7;
-  // Which paths inside the workspace this adapter's compiler writes to.
-  repeated rift.adapter.WriteClaim write_claims = 8;
-  // The exact kinds this adapter emits, and the portable facets each carries.
-  repeated rift.adapter.KindDescriptor kinds = 9;
-  // Coverage and failure reason for structural queries. `StructuralQuery.version`
-  // selects the pattern grammar revision the adapter must parse.
-  rift.core.Coverage structural_matching = 10;
-  // Coverage and failure reason for compiler action discovery.
-  rift.core.Coverage action_discovery = 11;
+  repeated rift.adapter.AuxiliaryClaim auxiliary_claims = 5;
+  // Paths inside the workspace this adapter writes while operating.
+  repeated rift.adapter.WriteClaim write_claims = 6;
+  // The exact kinds this adapter emits, and the portable facets each carries. This is the
+  // vocabulary Rift filters against: a facet nobody advertises is one no answer can be negated
+  // on.
+  repeated rift.adapter.KindDescriptor kinds = 7;
+  // Optional RPC operations this adapter implements, sorted by enum number.
+  repeated rift.core.AdapterOperation operations = 8;
+  // Fact families Analyze may emit, sorted by enum number. Non-empty requires the `analyze`
+  // operation.
+  repeated rift.core.FactFamily fact_families = 9;
+  // Action families available for planning before a target-specific Actions call. Non-empty
+  // requires `actions` and `resolve`; entries sort by kind prefix.
+  repeated rift.core.ActionSupport action_kinds = 10;
   // Versioned extension values this adapter emits, and where each may appear.
-  repeated rift.adapter.ExtensionDescriptor extension_values = 12;
+  repeated rift.adapter.ExtensionDescriptor extension_values = 11;
   // Bounds Rift must stay inside when driving this adapter.
-  rift.adapter.AdapterLimits limits = 13;
-  // What the host has to enforce around this adapter's process.
-  rift.adapter.RuntimeRequirements runtime = 14;
-  // Whether this adapter can validate a changed program before publication,
-  // and which scope it can check completely.
-  rift.core.Coverage validation = 15;
-  // Whether this adapter can format changed syntax regions or complete affected
-  // files under FormattingPolicy.
-  rift.core.Coverage formatting = 16;
-  // Action families available for planning before a target-specific Actions
-  // call. Sorted by kind prefix.
-  repeated rift.core.ActionSupport action_kinds = 17;
+  rift.adapter.AdapterLimits limits = 12;
+  // Execution behavior the host should account for while this adapter runs.
+  rift.adapter.RuntimeRequirements runtime = 13;
 }
 // A deterministic claim on physical files, re-evaluated after every path or
 // content change. Selectors are ORed and compare UTF-8 bytes: suffixes against
@@ -63,29 +70,27 @@ message Capabilities {
 // ownership error.
 message SourceClaim {
   option (section) = "Capabilities";
-  // The language these files are parsed as.
-  string language = 1;
   // Which adapter wins where two claim the same path. Higher takes it.
-  uint32 priority = 2;
+  uint32 priority = 1;
   // Suffixes matched against the whole path, so `.d.ts` can be claimed apart
   // from `.ts`.
-  repeated string path_suffixes = 3;
+  repeated string path_suffixes = 2;
   // Whole final path components, for files whose name carries the meaning —
   // `Makefile`, `Dockerfile`.
-  repeated string path_names = 4;
+  repeated string path_names = 3;
   // First-line prefixes for extensionless scripts: `#!/usr/bin/env python`.
-  repeated string shebang_prefixes = 5;
+  repeated string shebang_prefixes = 4;
   // Whether a claimed file may contain other languages. A Svelte owner sets
   // this for an embedded TypeScript region, then publishes that region as a
   // virtual source when the TypeScript adapter has to analyze it.
-  bool container = 6;
+  bool container = 5;
 }
-// A non-owning claim on project files needed to discover or configure compiler
+// A non-owning claim on project files needed to discover or configure adapter
 // semantics. Same bytewise rules as SourceClaim, may overlap across adapters,
 // and never makes a file a source unit.
 message AuxiliaryClaim {
   option (section) = "Capabilities";
-  // What an auxiliary file is to the compiler that reads it. This is what the
+  // What an auxiliary file is to the adapter that reads it. This is what the
   // file means, and it is what Rift acts on: a workspace manifest changing can
   // add or remove whole source trees, which Rift has to rescan for. What the
   // adapter has to redo is `environment_defining`.
@@ -93,23 +98,23 @@ message AuxiliaryClaim {
     // The adapter did not say. Treated as the widest purpose, so a change to
     // the file invalidates everything derived from it.
     UNSPECIFIED = 0;
-    // Settings the compiler reads directly — `tsconfig.json`, `.rustfmt.toml`.
-    COMPILER_CONFIGURATION = 1;
+    // Settings the adapter reads directly — `tsconfig.json`, `.rustfmt.toml`.
+    ADAPTER_CONFIGURATION = 1;
     // Declared dependencies, before resolution — `package.json`, `Cargo.toml`.
     DEPENDENCY_MANIFEST = 2;
     // Resolved dependency versions — `Cargo.lock`, `bun.lock`. Editing one can
-    // change every type the compiler resolves.
+    // change every type the adapter resolves.
     DEPENDENCY_LOCK = 3;
     // Which packages make up the project — a Cargo workspace, an npm workspace.
     // A change here can add or remove whole source trees.
     WORKSPACE_MANIFEST = 4;
-    // Metadata a build step wrote for the compiler to read back.
+    // Metadata a build step wrote for the adapter to read back.
     GENERATED_METADATA = 5;
-    // Something the compiler needs that none of the above describes. The claim
+    // Something the adapter needs that none of the above describes. The claim
     // states its purpose.
     OTHER = 6;
   }
-  // What the file is to the compiler, and so what Rift itself has to redo when
+  // What the file is to the adapter, and so what Rift itself has to redo when
   // it changes.
   repeated rift.adapter.AuxiliaryClaim.Purpose purposes = 1;
   // Suffixes matched against the whole path.
@@ -117,27 +122,15 @@ message AuxiliaryClaim {
   // Whole final path components — `Cargo.toml`, `package.json`.
   repeated string path_names = 3;
   // Whether a Refresh touching this file forces the adapter to rebuild its
-  // resolved state. Declared and never inferred
-  // from purpose or path, because whether a compiler rereads a given file is a
-  // fact only the adapter driving it has.
+  // resolved state, including reselecting its project runtime when necessary. Declared and
+  // never inferred from purpose or path, because only the adapter knows whether it
+  // rereads a given file.
   bool environment_defining = 4;
 }
-// A claim to consume virtual sources of one language. Highest priority selects
-// one consumer. Equal priorities, duplicate producer paths, collisions with a
-// physical entry or write claim, paths below a gitlink, and cycles in the
-// producer-to-consumer graph are adapter protocol errors. The producer keeps
-// authority over the virtual bytes, regions, and origin mappings.
-message VirtualClaim {
-  option (section) = "Capabilities";
-  // The language of the produced files this adapter will consume.
-  string language = 1;
-  // Which consumer wins where two claim the same produced language.
-  uint32 priority = 2;
-}
-// Paths inside the workspace that this adapter's compiler writes to. Rift
-// classifies each claimed subtree as compiler output and excludes it from
+// Paths inside the workspace that this adapter writes to. Rift
+// classifies each claimed subtree as adapter output and excludes it from
 // source analysis, snapshot diffs, and agent results.
-// Write claims are exclusive across adapters sharing a session worktree. Rift
+// Write claims are exclusive across adapters sharing a connection worktree. Rift
 // refuses workspace admission when two adapters can write the same path; one
 // of them must redirect that output to its private state_root.
 //
@@ -156,22 +149,22 @@ message WriteClaim {
   // Suffixes matched against the whole path, covering generated files in
   // several directories.
   repeated string path_suffixes = 2;
-  // Why the compiler needs it, in one line. Rift logs this when a claim shadows
+  // Why the adapter needs it, in one line. Rift logs this when a claim shadows
   // a file the repository actually tracks, which is nearly always a mistake.
   string reason = 3;
 }
 // One kind this adapter emits, and the portable facets it carries. Which facet
-// vocabulary applies depends on what the kind describes — a symbol, a leaf or
+// vocabulary applies depends on what the kind describes — a symbol, a node or
 // a relationship — so the branch that is set is what says which.
 message KindDescriptor {
   option (section) = "Capabilities";
-  // The kind as the language names it: `rust.trait`, `typescript.interface`.
+  // The adapter-local kind name, such as `trait`, `mapping.key`, or `selector.class`.
   string kind = 1;
   oneof facets {
     // Facets carried by symbols of this kind.
     rift.adapter.SymbolFacets symbol = 2;
-    // Facets carried by leaves of this kind.
-    rift.adapter.LeafFacets leaf = 3;
+    // Facets carried by nodes of this kind.
+    rift.adapter.NodeFacets node = 3;
     // Facets carried by relationships of this kind.
     rift.adapter.RelationshipFacets relationship = 4;
   }
@@ -180,9 +173,9 @@ message SymbolFacets {
   option (section) = "Capabilities";
   repeated rift.core.SymbolFacet values = 1;
 }
-message LeafFacets {
+message NodeFacets {
   option (section) = "Capabilities";
-  repeated rift.core.LeafFacet values = 1;
+  repeated rift.core.NodeFacet values = 1;
 }
 message RelationshipFacets {
   option (section) = "Capabilities";
@@ -197,7 +190,7 @@ message ExtensionDescriptor {
   // Bumped whenever the schema changes shape. A consumer skips versions it does
   // not implement.
   uint32 version = 2;
-  // Which model types this value may be attached to — `Symbol`, `Leaf`.
+  // Which model types this value may be attached to — `Symbol`, `Node`.
   repeated string targets = 3;
   // A self-contained JSON Schema draft 2020-12 document. Remote references are
   // forbidden, so validation fetches nothing.
@@ -205,11 +198,9 @@ message ExtensionDescriptor {
   // Whether Rift builds a search index over this value. Each indexed fact costs
   // storage, so the adapter declares this explicitly.
   bool indexed = 5;
-  // Whether this value contributes to semantic cache identity.
-  bool semantic = 6;
 }
-// Bounds this adapter advertises. One connection holds several workspaces, so
-// each workspace receives its own in-flight limit.
+// Bounds this adapter advertises. One process holds state for several server-owned
+// worktrees, so each state receives its own in-flight limit.
 message AdapterLimits {
   option (section) = "Capabilities";
   // Largest single message this adapter will accept or send. A fact batch is
@@ -217,65 +208,70 @@ message AdapterLimits {
   uint64 max_message_bytes = 1;
   // Concurrent calls accepted across the whole connection.
   uint32 max_in_flight = 2;
-  // Concurrent calls accepted for any one workspace, so one agent cannot
-  // consume the process.
-  uint32 max_in_flight_per_workspace = 3;
-  // Workspaces this adapter will hold open at once. Each one is a parsed tree
-  // and a compiler's state, so this is the number that decides its memory.
-  uint32 max_workspaces = 4;
+  // Concurrent calls accepted for one adapter state, so one caller cannot consume the process.
+  uint32 max_in_flight_per_state = 3;
+  // Server-owned worktree states this adapter will hold at once. Each can retain a parsed tree,
+  // index, and runtime worker, so the bound controls resource use.
+  uint32 max_states = 4;
 }
-// What the host must enforce for this adapter to run on untrusted source.
-// The host denies network access. It mounts the workspace and declared
-// dependencies read-only. Only state_root and WriteClaim paths are writable.
+// Execution behavior reported by an adapter process for host policy and audit.
+// Rift does not isolate the process or its workers from the host. These requirements
+// do not select the project runtime used for one adapter state.
 message RuntimeRequirements {
   option (section) = "Capabilities";
   // Whether the adapter executes code from the repository — a build script, a
   // plugin, a macro.
   bool executes_repository_code = 1;
-  // Whether the adapter spawns subprocesses.
+  // Whether the adapter spawns subprocesses, including runtime workers selected for individual
+  // adapter states.
   bool spawns_subprocesses = 2;
 }
-// What a workspace holds right now. Every call that reads code carries one. A
-// call naming an earlier state receives `StaleState`.
-message WorkspaceState {
-  option (section) = "Workspaces";
-  // Which workspace this describes, by the absolute path of its working tree.
+// One adapter's state for a server-owned Git worktree. Every call that reads code
+// carries it. The adapter may back different states with different project
+// runtimes. A call naming an earlier state receives `StaleState`.
+message AdapterState {
+  option (section) = "Adapter state";
+  // Absolute path of the Git worktree this state describes.
   // The path is unique within this adapter process. Another language adapter
-  // can hold the same path with its own compiler state and state_root.
-  string workspace = 1;
+  // can hold the same path with its own adapter state and state_root.
+  string tree = 1;
   // The state the files in it hold.
   rift.core.Snapshot snapshot = 2;
-  // Adapter-local state generation. OpenWorkspace mints the first value;
+  // Adapter-local state generation. Open mints the first value;
   // Refresh and SyncVirtual advance it. Calls carrying an earlier generation
   // receive StaleState even when the Git snapshot is unchanged.
   uint64 generation = 3;
 }
-// Take this working tree and start a compiler against it. Rift has already
-// written every file, so nothing here has to be fetched or waited for.
-message OpenWorkspaceRequest {
-  option (section) = "Workspaces";
-  // Absolute path to the shared session worktree, and the identity this adapter
-  // process uses for it. Other language adapters can receive the same path.
-  // Compiler writes go to `state_root` or a declared WriteClaim.
-  string workspace = 1;
+// Open a complete server-owned working tree in the adapter. Rift resolved the
+// requested revision and either reused an exact physical tree or allocated this
+// one before the call. The adapter does not allocate or switch Git worktrees. It
+// may inspect revision-local configuration and select or start the project runtime
+// for this state.
+message OpenRequest {
+  option (section) = "Adapter state";
+  // Absolute path to the tree Rift selected for the exact snapshot, and the identity this
+  // adapter process uses for it. Other language adapters can receive the same path. Adapter
+  // writes go to `state_root` or a declared WriteClaim.
+  string tree = 1;
   // Absolute path to a directory the adapter owns and Rift never reads. Build
   // output belongs here — point CARGO_TARGET_DIR and friends at it. Every open
-  // workspace receives a distinct path, and Rift never reuses that path after
-  // CloseWorkspace. An adapter may maintain its own shared read-only cache
-  // outside this directory when its compiler supports safe sharing.
+  // adapter state receives a distinct path, and Rift never reuses that path after
+  // Close. An adapter may maintain its own shared read-only cache
+  // outside this directory when its adapter supports safe sharing.
   string state_root = 2;
   // The state that tree holds.
   rift.core.Snapshot snapshot = 3;
 }
-// Rift rewrote the tree in place under the session-wide write barrier. It sends
+// Rift rewrote the tree in place under the connection-wide write barrier. It sends
 // this call to every language adapter holding the shared path. Paths are
 // project-relative and cover every file Rift touched; each adapter decides
-// which changes affect its compiler. Content is on disk before this call.
+// which changes affect its adapter. Content is on disk before this call. The adapter
+// reselects its project runtime when runtime-defining inputs have changed.
 message RefreshRequest {
-  option (section) = "Workspaces";
+  option (section) = "Adapter state";
   // The state the adapter last acknowledged. A mismatch means Rift and the
   // adapter disagree about what is on disk, and comes back as StaleState.
-  rift.adapter.WorkspaceState from = 1;
+  rift.adapter.AdapterState from = 1;
   // The state the tree holds now.
   rift.core.Snapshot to = 2;
   // Files created or overwritten since `from`, as `rift://file/<path>`.
@@ -290,28 +286,32 @@ message RefreshRequest {
 // units are the complete set selected for this consumer at `start.snapshot`,
 // including an empty set when every previous unit has been retracted.
 message VirtualSyncEvent {
-  option (section) = "Workspaces";
+  option (section) = "Adapter state";
   oneof event {
-    // Current adapter-local state. The returned WorkspaceState keeps its
+    // Current adapter-local state. The returned AdapterState keeps its
     // snapshot and advances its generation.
-    rift.adapter.WorkspaceState start = 1;
-    // One virtual file selected for this adapter by VirtualClaim.
+    rift.adapter.AdapterState start = 1;
+    // One virtual file whose exact Language matches this adapter.
     rift.adapter.VirtualUnit unit = 2;
     // Ordered bytes for the preceding unit.
     rift.adapter.VirtualText text = 3;
   }
 }
-// Let go of this workspace. Rift deletes the tree once the adapter has.
-message CloseWorkspaceRequest {
-  option (section) = "Workspaces";
-  string workspace = 1;
+// Release adapter state for this tree so Rift can delete it.
+message CloseRequest {
+  option (section) = "Adapter state";
+  string tree = 1;
 }
-// Read every claimed physical or synced virtual source in this workspace. A
-// physical unit below a gitlink is an adapter protocol error. The state is what
-// the answer is pinned to.
+// Read selected claimed physical or synced virtual sources at one state. A
+// physical unit below a gitlink is an adapter protocol error.
 message AnalyzeRequest {
   option (section) = "Analysis";
-  rift.adapter.WorkspaceState state = 1;
+  rift.adapter.AdapterState state = 1;
+  // Source units requested as `rift://file/<path>`, sorted by URI. Empty selects every source
+  // unit this adapter owns.
+  repeated string units = 2;
+  // Advertised fact families requested in enum order. Empty selects every advertised family.
+  repeated rift.core.FactFamily fact_families = 3;
 }
 // One event of an analyze stream, followed eventually by exactly one summary.
 message AnalyzeEvent {
@@ -333,7 +333,7 @@ message AnalyzeEvent {
 }
 // Metadata for one physical or synced virtual source unit this adapter owns.
 // Rift resolves the URI against the parent Git tree or the virtual overlay at
-// this WorkspaceState generation.
+// this AdapterState generation.
 message SourceUnit {
   option (section) = "Analysis";
   // The unit, as `rift://file/<path>`. The same spelling `SourceSpan.unit`
@@ -353,8 +353,9 @@ message VirtualUnit {
   // downstream facts use the same identity even though the bytes live in the
   // consumer's private overlay.
   string unit = 1;
-  // The language that will consume these bytes, selected by a VirtualClaim.
-  string language = 2;
+  // The exact language that consumes these bytes. Rift routes it to the configured adapter for
+  // this pair.
+  rift.core.Language language = 2;
   // Which bytes each language owns inside the produced file. A consumer echoes
   // these regions when it later emits SourceUnit for the synced path.
   repeated rift.core.LanguageRegion regions = 3;
@@ -381,7 +382,7 @@ message Facts {
   oneof family {
     rift.adapter.OriginMappings origin_mappings = 2;
     rift.adapter.Symbols symbols = 3;
-    rift.adapter.Leaves leaves = 4;
+    rift.adapter.Nodes nodes = 4;
     rift.adapter.Relationships relationships = 5;
     rift.adapter.Diagnostics diagnostics = 6;
   }
@@ -394,9 +395,9 @@ message Symbols {
   option (section) = "Analysis";
   repeated rift.core.Symbol items = 1;
 }
-message Leaves {
+message Nodes {
   option (section) = "Analysis";
-  repeated rift.core.Leaf items = 1;
+  repeated rift.core.Node items = 1;
 }
 message Relationships {
   option (section) = "Analysis";
@@ -413,30 +414,31 @@ message UnitCoverage {
   string unit = 1;
   // Whether the file exists and was read at all. False retracts it.
   bool present = 2;
-  // How complete each fact family is for this file. All six are stated: a
+  // How complete each fact family is for this file. Every family is stated: a
   // family the adapter cannot produce is `unsupported` and one the language has
   // no concept of is `not_applicable`, so there is no silence to interpret.
   rift.core.SemanticCoverage coverage = 3;
 }
-// Analyze is rerun-equal: the same snapshot under the same environment yields
-// the same ordered facts. Rift compares or stores those facts directly.
+// Completes one ordered Analyze stream and states how long Rift may retain its facts.
 message AnalyzeSummary {
   option (section) = "Analysis";
   // The state every fact in this stream was read against.
-  rift.adapter.WorkspaceState state = 1;
+  rift.adapter.AdapterState state = 1;
   // Files whose previously published facts no longer hold, as
   // `rift://file/<path>`. This reaches files the stream said nothing about,
   // which is what a per-file `UnitCoverage` cannot do.
   repeated string invalidated = 2;
+  // Retention scope for every fact in this Analyze stream.
+  rift.adapter.CacheScope cache_scope = 3;
 }
-// Ask the compiler to validate the closure affected by a candidate change.
+// Ask the adapter to validate the closure affected by a candidate change.
 // Rift has already applied the candidate and acknowledged its state through
 // Refresh, so the adapter reads the same files publication is considering.
 message ValidateRequest {
   option (section) = "Validation";
   // Candidate state being checked.
-  rift.adapter.WorkspaceState state = 1;
-  // Files changed by the candidate, as project-relative paths. The compiler
+  rift.adapter.AdapterState state = 1;
+  // Files changed by the candidate, as project-relative paths. The adapter
   // expands these to the dependent files its own validity rules require.
   repeated string changed = 2;
 }
@@ -444,7 +446,7 @@ message ValidateRequest {
 message ValidateEvent {
   option (section) = "Validation";
   oneof event {
-    // A bounded batch of findings from the compiler.
+    // A bounded batch of findings from the adapter.
     rift.adapter.Diagnostics diagnostics = 1;
     // The final verdict and the scope actually checked.
     rift.adapter.ValidationSummary summary = 2;
@@ -455,10 +457,10 @@ message ValidateEvent {
 message ValidationSummary {
   option (section) = "Validation";
   // State every finding and the verdict were computed from.
-  rift.adapter.WorkspaceState state = 1;
-  // Whether the compiler accepted the checked scope.
+  rift.adapter.AdapterState state = 1;
+  // Whether the adapter accepted the checked scope.
   bool valid = 2;
-  // How completely the adapter checked the affected compiler closure.
+  // How completely the adapter checked the affected source closure.
   rift.core.Coverage coverage = 3;
   // Files included in that closure, as project-relative paths in byte order.
   repeated string files = 4;
@@ -468,7 +470,7 @@ message ValidationSummary {
 message FormatRequest {
   option (section) = "Formatting";
   // Candidate state whose offsets the response must use.
-  rift.adapter.WorkspaceState state = 1;
+  rift.adapter.AdapterState state = 1;
   // CHANGED_REGIONS or AFFECTED_FILES. PRESERVE is refused because it requires
   // no formatter work.
   rift.core.FormattingPolicy policy = 2;
@@ -483,7 +485,7 @@ message FormatRequest {
 message FormatResponse {
   option (section) = "Formatting";
   // State the formatter read.
-  rift.adapter.WorkspaceState state = 1;
+  rift.adapter.AdapterState state = 1;
   // Atomic non-overlapping replacements in canonical file-and-range order.
   repeated rift.core.TextEdit edits = 2;
   // Whether every requested region or file was formatted.
@@ -491,11 +493,11 @@ message FormatResponse {
   // Formatter findings that explain partial coverage or a refusal.
   repeated rift.core.Diagnostic diagnostics = 4;
 }
-// Find every place matching one pattern parsed by the language compiler.
+// Find every place matching one pattern parsed by the language adapter.
 message MatchRequest {
   option (section) = "Matching";
   // The state to search, and what the answer is pinned to.
-  rift.adapter.WorkspaceState state = 1;
+  rift.adapter.AdapterState state = 1;
   // The pattern, and the constraints on what its captures may be.
   rift.core.StructuralQuery query = 2;
 }
@@ -531,7 +533,7 @@ message StructuralMatch {
 message MatchSummary {
   option (section) = "Matching";
   // The state every match was found against.
-  rift.adapter.WorkspaceState state = 1;
+  rift.adapter.AdapterState state = 1;
   // Matches sort by unit UTF-8 bytes, range start, range end, then RFC 8785
   // bytes of their replacement ranges and captures.
   // How much of the workspace the pattern actually reached.
@@ -542,8 +544,8 @@ message MatchSummary {
 message ActionsRequest {
   option (section) = "Actions";
   // The state to ask against. The answer is only valid against it.
-  rift.adapter.WorkspaceState state = 1;
-  // Where in the code to ask: a symbol, a leaf, a byte range, or a match.
+  rift.adapter.AdapterState state = 1;
+  // Where in the code to ask: a symbol, a node, a byte range, or a match.
   rift.core.Address target = 2;
   // Hierarchical kind prefixes. Empty requests every action.
   repeated string only = 3;
@@ -552,8 +554,8 @@ message ActionsRequest {
 message ActionsResponse {
   option (section) = "Actions";
   // The state they were discovered against.
-  rift.adapter.WorkspaceState state = 1;
-  // What the compiler can do here, each with the token that resolves it.
+  rift.adapter.AdapterState state = 1;
+  // What the adapter can do here, each with the token that resolves it.
   repeated rift.adapter.ActionOffer actions = 2;
   // Coverage of action discovery at this address.
   rift.core.Coverage coverage = 3;
@@ -564,7 +566,7 @@ message ActionsResponse {
 message ActionOffer {
   option (section) = "Actions";
   // The adapter's own handle on this action. Tokens are unique within one
-  // WorkspaceState. Rift passes the selected token back unread.
+  // AdapterState. Rift passes the selected token back unread.
   string token = 1;
   // What the action is, in terms the model shares with MCP.
   rift.core.ActionDescriptor descriptor = 2;
@@ -575,7 +577,7 @@ message ResolveRequest {
   // The state the token was discovered in. A token resolved against anything
   // else comes back as StaleState, because the offsets it computed no longer
   // point where they did.
-  rift.adapter.WorkspaceState state = 1;
+  rift.adapter.AdapterState state = 1;
   // The token from the `ActionOffer` being resolved.
   string token = 2;
   // Arguments, as RFC 8785 canonical JSON, validated against the descriptor's
@@ -587,16 +589,16 @@ message ResolveRequest {
 message ResolveResponse {
   option (section) = "Actions";
   // The state whose bytes the edit offsets address.
-  rift.adapter.WorkspaceState state = 1;
+  rift.adapter.AdapterState state = 1;
   // The change itself, as byte ranges and their replacements.
   repeated rift.core.Edit edits = 2;
-  // Whether the edits are the whole change. Partial means the compiler could
+  // Whether the edits are the whole change. Partial means the adapter could
   // only rewrite part of what the action names — a rename it cannot follow into
   // a macro, say — and the diagnostics say where it stopped.
   rift.core.Coverage coverage = 3;
-  // What the compiler wants the caller to know before applying this.
+  // What the adapter wants the caller to know before applying this.
   repeated rift.core.Diagnostic diagnostics = 4;
-  // Conditions the compiler checked while resolving. Every entry is satisfied;
+  // Conditions the adapter checked while resolving. Every entry is satisfied;
   // a failed condition is returned in Refusal instead.
   repeated rift.core.OperationPrecondition preconditions = 5;
   // Semantic consequences of the edits. Rift refreshes the adapter and
@@ -604,6 +606,61 @@ message ResolveResponse {
   repeated rift.core.OperationEffect effects = 6;
   // Scoped evidence for every guarantee advertised by the action descriptor.
   repeated rift.core.GuaranteeEvidence guarantees = 7;
+}
+// Evaluate one caller-provided block in the project runtime selected for a pinned adapter
+// state. Rift gives this call a disposable execution workspace, so evaluated code never runs in
+// a shared read, candidate, or connection worktree.
+message ExecuteRequest {
+  option (section) = "Execution";
+  // Exact snapshot and adapter generation to evaluate against.
+  rift.adapter.AdapterState state = 1;
+  // Source and project-relative working directory.
+  rift.core.CodeBlock block = 2;
+}
+// Bounded result of evaluating a block against one unchanged adapter state.
+message ExecuteResponse {
+  option (section) = "Execution";
+  // State whose project runtime and source context were used.
+  rift.adapter.AdapterState state = 1;
+  rift.core.ExecutionResult result = 2;
+}
+// Adapter-local handle for an inspect-only debugging evaluation. Start runs until normal
+// completion or an unhandled failure. A failed evaluation retains its stack frames until
+// DebugStop or adapter-state cleanup.
+message DebugSession {
+  option (section) = "Debugging";
+  // Pinned adapter state used by the debugging evaluation.
+  rift.adapter.AdapterState state = 1;
+  // Opaque adapter-local handle. Rift never exposes it to the MCP caller.
+  string token = 2;
+  // Retained stack frames, innermost first. Zero after normal completion.
+  uint32 frame_count = 3;
+  // How evaluation ended and its bounded output.
+  rift.core.ExecutionResult result = 4;
+}
+// Start an inspect-only debugging evaluation against one pinned adapter state.
+message DebugStartRequest {
+  option (section) = "Debugging";
+  rift.adapter.AdapterState state = 1;
+  rift.core.CodeBlock block = 2;
+}
+// Select one retained stack frame from a debugging session.
+message DebugGetFrameRequest {
+  option (section) = "Debugging";
+  rift.adapter.DebugSession session = 1;
+  // Zero-based stack depth, with the innermost retained frame first.
+  uint32 depth = 2;
+}
+// One retained frame and the session identity it came from.
+message DebugGetFrameResponse {
+  option (section) = "Debugging";
+  rift.adapter.DebugSession session = 1;
+  rift.core.DebugFrame frame = 2;
+}
+// Release one debugging session and all retained runtime state behind it.
+message DebugStopRequest {
+  option (section) = "Debugging";
+  rift.adapter.DebugSession session = 1;
 }
 // Carried in `google.rpc.Status.details` when an adapter declines work it
 // understood: the target is ambiguous, an action went stale, the language
@@ -622,10 +679,10 @@ message Refusal {
     // The address resolves to several targets. The caller narrows it and asks
     // again.
     AMBIGUOUS_TARGET = 3;
-    // The action was discovered against a state the workspace has left.
+    // The action was discovered against an adapter state that has advanced.
     // Rediscover it and resolve the new token.
     STALE_ACTION = 4;
-    // The match was found against a state the workspace has left. Search again.
+    // The match was found against an adapter state that has advanced. Search again.
     STALE_MATCH = 5;
     // Doing it would reach further than the caller can have meant — outside the
     // workspace, or into generated code nothing regenerates.
@@ -641,59 +698,73 @@ message Refusal {
   string message = 2;
   // What in the code stopped it.
   repeated rift.core.OperationBlocker blockers = 3;
-  // What the compiler reported while trying.
+  // What the adapter reported while trying.
   repeated rift.core.Diagnostic diagnostics = 4;
   // Executable conditions checked before refusal, including failed values.
   repeated rift.core.OperationPrecondition preconditions = 5;
 }
 // Carried in `google.rpc.Status.details` when a pinned call names a state the
-// workspace has moved past. The caller resyncs to `actual` before retrying.
+// adapter has moved past. The caller resyncs to `actual` before retrying.
 message StaleState {
   option (section) = "Failure";
-  rift.adapter.WorkspaceState actual = 1;
+  rift.adapter.AdapterState actual = 1;
 }
 // Everything Rift can ask one language for. The adapter answers `Describe`
-// once, then holds workspaces and answers questions about the code in them.
+// once, then holds state for worktrees and answers questions about their code. Optional
+// calls are advertised in `Capabilities.operations`; an unimplemented call returns
+// gRPC `UNIMPLEMENTED`. Rift issues only advertised optional calls. Returning
+// `UNIMPLEMENTED` from an advertised call is an adapter protocol error.
 service Adapter {
   // What this adapter can do, asked once before anything else. Rift holds the
   // adapter to exactly what it claims here and never probes or feature-tests.
   rpc Describe (google.protobuf.Empty) returns (rift.adapter.Capabilities);
-  // Here is a worktree and here is the state it holds. The tree exists before
-  // this call, so the adapter can start its compiler against something complete
-  // the moment it is named.
-  rpc OpenWorkspace (rift.adapter.OpenWorkspaceRequest) returns (rift.adapter.WorkspaceState);
-  // The files on disk moved to a new state, and these are the paths that
-  // changed. Without this the adapter would have to stat the tree to find out,
-  // and a fresh workspace per edit would make every keystroke a cold compile.
-  rpc Refresh (rift.adapter.RefreshRequest) returns (rift.adapter.WorkspaceState);
-  // Replace this adapter workspace's private virtual-source overlay. The first
-  // event pins the current workspace state; the remaining events carry a
+  // Here is the server-owned worktree for an exact snapshot. The tree exists before this call,
+  // so the adapter can inspect complete source, select any revision-appropriate runtime worker,
+  // and initialize state.
+  rpc Open (rift.adapter.OpenRequest) returns (rift.adapter.AdapterState);
+  // The files on disk moved to a new state, and these are the paths that changed. The adapter
+  // re-evaluates runtime-defining inputs before acknowledging the new state. Without this it
+  // would have to stat the tree to find out, and rebuilding adapter state per edit would
+  // discard incremental work.
+  rpc Refresh (rift.adapter.RefreshRequest) returns (rift.adapter.AdapterState);
+  // Replace this adapter state's private virtual-source overlay. The first
+  // event pins the current adapter state; the remaining events carry a
   // complete manifest and its bytes. Rift drains calls for this adapter
-  // workspace before the stream and blocks new calls until completion. Stream
+  // state before the stream and blocks new calls until completion. Stream
   // completion commits the overlay atomically.
-  rpc SyncVirtual (stream rift.adapter.VirtualSyncEvent) returns (rift.adapter.WorkspaceState);
-  // Stop holding this workspace, and let Rift delete the tree. Refused while
-  // calls are in flight so their compiler state and source path remain valid
+  rpc SyncVirtual (stream rift.adapter.VirtualSyncEvent) returns (rift.adapter.AdapterState);
+  // Release this tree's adapter state so Rift can delete the tree. Refused while
+  // calls are in flight so their adapter state and source path remain valid
   // through the final stream event.
-  rpc CloseWorkspace (rift.adapter.CloseWorkspaceRequest) returns (google.protobuf.Empty);
+  rpc Close (rift.adapter.CloseRequest) returns (google.protobuf.Empty);
   // Read the code and say what is in it: symbols, where they appear, how they
-  // connect, and what the compiler complains about. Facts stream per file and
+  // connect, and what the adapter complains about. Facts stream per file and
   // the summary closes it.
   rpc Analyze (rift.adapter.AnalyzeRequest) returns (stream rift.adapter.AnalyzeEvent);
-  // Check a candidate after Rift has written it and refreshed the workspace.
+  // Check a candidate after Rift has written it and refreshed adapter state.
   // The stream carries diagnostics followed by one verdict over the affected
-  // compiler closure.
+  // source closure.
   rpc Validate (rift.adapter.ValidateRequest) returns (stream rift.adapter.ValidateEvent);
   // Format the files or syntactic regions touched by a candidate. Rift applies
-  // the returned text edits and refreshes the workspace before the next change.
+  // the returned text edits and refreshes adapter state before the next change.
   rpc Format (rift.adapter.FormatRequest) returns (rift.adapter.FormatResponse);
-  // Find code by compiler-parsed shape: a call with two arguments, or a class
+  // Find code by structural shape: a call with two arguments, or a class
   // implementing an interface.
   rpc Match (rift.adapter.MatchRequest) returns (stream rift.adapter.MatchEvent);
-  // List the fixes and refactors the compiler can offer at one address.
+  // List the fixes and refactors the adapter can offer at one address.
   rpc Actions (rift.adapter.ActionsRequest) returns (rift.adapter.ActionsResponse);
   // Work out what one of those actions would actually change. Separate from
   // `Actions` because computing an action's edits costs about as much as
   // performing it, and only one of the actions offered gets picked.
   rpc Resolve (rift.adapter.ResolveRequest) returns (rift.adapter.ResolveResponse);
+  // Evaluate a caller-provided code block in the project runtime selected for this exact
+  // adapter state. The surrounding workspace is disposable.
+  rpc Execute (rift.adapter.ExecuteRequest) returns (rift.adapter.ExecuteResponse);
+  // Evaluate a code block for post-mortem inspection, retaining stack frames after an unhandled
+  // failure until StopDebug.
+  rpc DebugStart (rift.adapter.DebugStartRequest) returns (rift.adapter.DebugSession);
+  // Read one retained stack frame without resuming evaluation.
+  rpc DebugGetFrame (rift.adapter.DebugGetFrameRequest) returns (rift.adapter.DebugGetFrameResponse);
+  // Release a debugging session and its retained execution workspace.
+  rpc DebugStop (rift.adapter.DebugStopRequest) returns (google.protobuf.Empty);
 }

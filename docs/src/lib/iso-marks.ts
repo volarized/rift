@@ -17,7 +17,7 @@ export const MARK_NAMES = [
   "commit",
   "adapter",
   "config",
-  "sandbox",
+  "validator",
 ] as const;
 
 export type MarkName = (typeof MARK_NAMES)[number];

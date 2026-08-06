@@ -1,3 +1,20 @@
 ---
-title: rift
+title: Rift
 ---
+
+Rift is an agentic development toolkit for discovering and editing code.
+
+An agent such as Claude Code or Codex starts `rift mcp` in a Git workspace. That process forwards the
+agent's requests to a shared `rift server`, which reads Git state and calls the language adapters
+configured for the workspace.
+
+Most users only need the agent configuration that launches `rift mcp`. The remaining pages describe
+the server and its protocol for adapter authors, client implementers, and people debugging a
+workspace:
+
+- [Architecture](/docs/architecture) follows a request through the MCP process, shared server, Git
+  worktrees, and language adapters.
+- [Configuration](/docs/configuration) defines the committed and machine-local settings that control
+  adapters, limits, validation, and command validators.
+- [Protocol](/docs/protocol) documents the MCP JSON surface, its gRPC mapping, the adapter service,
+  and the read-only SCIP projection.

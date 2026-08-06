@@ -1,13 +1,10 @@
 import { ArrowRightIcon } from "@phosphor-icons/react/dist/ssr";
 import Link from "next/link";
 
-import { Command } from "@/components/command";
 import { type ExplodedKind, ExplodedObject } from "@/components/exploded-object";
-import { type IsoLayer, IsoStack } from "@/components/iso-stack";
 import { LineObject, type LineObjectKind } from "@/components/line-object";
 import { Logo } from "@/components/logo";
 import { Reveal } from "@/components/reveal";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -63,18 +60,8 @@ function Section({
   );
 }
 
-const LAYERS: IsoLayer[] = [
-  { label: "your codebase" },
-  { label: "your agent" },
-  { label: "rift", note: "the toolkit for your agent" },
-  {
-    label: "result",
-    note: "token-efficient reads and edits, with full introspection",
-  },
-];
-
 /**
- * One object per point: the compiler is the solid taken apart, the other two
+ * One object per point: the adapter is the solid taken apart, the other two
  * are attractors — a reversible system and a dynamo that swaps between two
  * states.
  */
@@ -88,20 +75,20 @@ const DIFFERENCES: {
   fit?: number;
 }[] = [
   {
-    title: "Direct compiler integration",
-    body: "rift talks to the language’s own compiler, so every read is typed and every edit is validated before it lands.",
+    title: "Language adapters",
+    body: "Describe returns the adapter’s exact language, optional dialect, implemented operations, and emitted fact families.",
     solid: "sphere",
   },
   {
-    title: "Reversible, git-backed worktrees",
-    body: "Every change an agent makes is staged in a worktree.",
+    title: "Candidate worktrees",
+    body: "Apply resolves edits in an isolated worktree and stores the result as a Git commit before publication.",
     line: "shimizu",
     // The butterfly stands in the x–z plane; turn it to face the camera.
     tilt: 1.5,
   },
   {
-    title: "Structured reads and writes over MCP",
-    body: "Tools and resources instead of shell transcripts. Agents work with code semantics and edit it structurally.",
+    title: "MCP values",
+    body: "Tools return typed files, nodes, symbols, edits, and validation evidence through the generated JSON Schema.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
@@ -127,7 +114,7 @@ export default function HomePage() {
             </h1>
 
             <Body className="max-w-115">
-              Agentic development toolkit for reading, discovering and editing codebases.
+              Snapshot-pinned code reads and validated change transactions for agents.
             </Body>
           </div>
 
@@ -153,9 +140,9 @@ export default function HomePage() {
           className="w-full min-w-96 justify-self-center sm:h-72 md:w-72"
         />
         <div className="grid gap-5">
-          <Statement>Agents depend on context and tooling.</Statement>
+          <Statement>Every answer names the Git state it read.</Statement>
           <Body className="text-balance">
-            rift provides typesafe, token-efficient, compiler-backed reads and edits.
+            Commit snapshots and working-tree snapshots let a later call detect moved source.
           </Body>
         </div>
       </Section>
@@ -167,7 +154,7 @@ export default function HomePage() {
           <div className="grid max-w-165 gap-7">
             {index === 0 ? (
               <Statement className="max-w-125">
-                Designed with simplicity and minimalism in mind.
+                Adapters declare the operations they implement.
               </Statement>
             ) : null}
             <div className="grid gap-3">
@@ -186,9 +173,9 @@ export default function HomePage() {
                 index % 2 === 1 && "md:order-first",
               )}
             />
-          ) : (
+          ) : item.line ? (
             <LineObject
-              kind={item.line!}
+              kind={item.line}
               reveal
               tilt={item.tilt}
               spin={item.spin}
@@ -199,7 +186,7 @@ export default function HomePage() {
                 index % 2 === 1 && "md:order-first",
               )}
             />
-          )}
+          ) : null}
         </Section>
       ))}
 
@@ -208,14 +195,14 @@ export default function HomePage() {
       <Section wide className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
           <Statement className="max-w-125">
-            Coming soon, reach out if you want to get involved.
+            The generated reference lists each request, response, and wire mapping.
           </Statement>
           <Link
-            href="mailto:contact@volar.sh"
+            href="/docs/protocol/reference"
             className="flex items-center gap-2 text-sm font-medium w-0"
           >
             <Button variant="outline" size="lg" className="w-fit">
-              Get in touch
+              Open the reference
               <ArrowRightIcon weight="bold" className="h-4 w-4" />
             </Button>
           </Link>

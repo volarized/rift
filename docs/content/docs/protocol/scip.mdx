@@ -14,9 +14,8 @@ MCP tools use Rift's native model. They don't advertise or transport the SCIP pr
 
 Rift protocol version 1 pins
 [`scip.proto` from SCIP v0.9.0](https://github.com/scip-code/scip/blob/v0.9.0/scip.proto).
-The official schema fixes each field and enum number. It fixes aliases and reservations. It also fixes
-which fields share a oneof. Rift's Pydantic model preserves those identities in the generated `scip`
-package.
+The official schema fixes field and enum numbers, aliases, reservations, and oneof membership. Rift's
+Pydantic model preserves those identities in the generated `scip` package.
 
 ## API
 
@@ -42,8 +41,8 @@ and appends each external symbol to `Index.external_symbols`.
 | `Metadata.tool_info` | Rift build | Emit name `rift`, the build version, and no process arguments. |
 | `Metadata.text_document_encoding` | Rift source bytes | Emit `UTF8`. |
 | `Document.relative_path` | <RiftMapping text={"`File.id`"} /> | Decode its canonical `ProjectPath`. |
-| `Document.language` | <RiftMapping text={"Physical or virtual file owner"} /> | Use the official SCIP spelling when its normalized `LanguageId` matches. Preserve other IDs. |
-| `Document.occurrences` | <RiftMapping text={"`Leaf`, relationship evidence, and ranged `Diagnostic` records"} /> | Apply the occurrence rules below. |
+| `Document.language` | <RiftMapping text={"Physical or virtual file owner's `Language`"} /> | Use the official SCIP spelling for a name without a dialect. Otherwise emit the canonical `name:dialect` spelling. |
+| `Document.occurrences` | <RiftMapping text={"`Node`, relationship evidence, and ranged `Diagnostic` records"} /> | Apply the occurrence rules below. |
 | `Document.symbols` | <RiftMapping text={"`Symbol` records declared or defined in the file"} /> | Emit one entry per encoded symbol. |
 | `Document.text` | File bytes | Leave empty for physical files. Include retained virtual text because no disk path can recover it. |
 | `Document.position_encoding` | <RiftMapping text={"`TextRange` byte coordinates"} /> | Emit `UTF8CodeUnitOffsetFromLineStart`. |
@@ -52,9 +51,9 @@ A parent index stops at a gitlink. The child repository exports a separate index
 workspace.
 
 Different-language adapters may contribute symbol-bearing occurrences to one physical file. The
-physical owner supplies `Document.language`. Each symbol scheme includes its Rift language ID.
-Symbol-less highlighting from a non-owner adapter is omitted because a SCIP occurrence carries no
-language.
+physical owner supplies `Document.language`. Each symbol scheme includes a reversible encoding of its
+Rift `Language`. Symbol-less highlighting from a non-owner adapter is omitted because a SCIP
+occurrence carries no language.
 
 ## Ranges
 
@@ -79,9 +78,9 @@ projection if a document-local symbol has a declaration or occurrence in another
 | SCIP component | Rift source | Rule |
 | --- | --- | --- |
 | local ID | <RiftMapping text={"`Symbol.document_local` and `Symbol.id`"} /> | For a document-local symbol, encode `Symbol.id` as the local ID. |
-| scheme | <RiftMapping text={"`Symbol.language`"} /> | Emit `rift-<LanguageId>`. |
+| scheme | <RiftMapping text={"`Symbol.language`"} /> | Base64url-encode the UTF-8 `name` or `name:dialect` spelling without padding and prefix it with `rift-`. |
 | package origin | <RiftMapping text={"`Symbol.origin`"} /> | Copy package manager, name, and version. |
-| standard library origin | Language and compiler metadata | Emit manager `stdlib`, language name, and compiler version. Use `.` for a missing version. |
+| standard library origin | Language and adapter metadata | Emit manager `stdlib`, language name, and adapter version. Use `.` for a missing version. |
 | workspace, generated, synthetic, or opaque origin | No portable package identity | Emit SCIP's `. . .` placeholders. Report lost opaque origin data. |
 | descriptors | <RiftMapping text={"`Symbol.container`, `Symbol.name`, `Symbol.id`, and `Symbol.facets`"} /> | Walk the container chain. Preserve a terminal `~N` collision suffix as the disambiguator. Verify injective encoded symbols. |
 
@@ -105,7 +104,7 @@ Descriptor suffixes follow one ordered rule:
 
 <p>
   <RiftMapping
-    text={"`SymbolInformation.kind` first uses an exact SCIP kind when the terminal component of `ExactKind` matches. Otherwise it applies this conservative order: type parameter, parameter, macro, namespace, module, member callable, callable, type, value, then unspecified."}
+    text={"`SymbolInformation.kind` first uses an exact SCIP kind when the terminal component of `ExactKind` matches. Otherwise it applies this conservative order over facets: type parameter, parameter, macro, constructor, operator, variant, enumeration, property, namespace, module, member callable, callable, type, value, then unspecified. A `static` symbol takes the `Static` form of whichever kind that order picked, where SCIP has one."}
   />
 </p>
 
@@ -115,29 +114,33 @@ SCIP relationships control navigation equivalence. General graph edges remain Ri
 
 | <RiftMapping text={"`RelationshipFacet` value"} /> | SCIP flags |
 | --- | --- |
-| `type_definition` | `is_type_definition` |
-| `extends` or `implements` | `is_implementation` |
+| `has_type` | `is_type_definition` |
+| `extends`, `implements`, or `mixes_in` | `is_implementation` |
 | `overrides` | `is_implementation`, `is_reference` |
 | callable `implements` | `is_implementation`, `is_reference` |
 | every other facet | No SCIP relationship. Report populated lost fields. |
 
-Rift never sets `is_definition`. Its `defines` facet means containment, while SCIP uses the flag for an
+That last row covers the edges SCIP has no flag for, and Rift has more of them than SCIP has flags:
+`annotated_by`, `augments`, `bounded_by`, `configures`, and `binds` all survive an export only as
+reported omissions.
+
+Rift never sets `is_definition`. Its `declares` facet means ownership, while SCIP uses the flag for an
 alternate or otherwise missing definition.
 
 ## Occurrences and diagnostics
 
-For each leaf, Rift chooses the symbol name region, then the selection region, then the leaf range. An
+For each node, Rift chooses the symbol name region, then the selection region, then the node range. An
 `enclosing` region becomes the typed enclosing range.
 
 Symbol roles combine as a bitset:
 
-| <RiftMapping text={"Rift evidence from `LeafFacet` and relationships"} /> | SCIP role |
+| <RiftMapping text={"Rift evidence from `NodeFacet` and relationships"} /> | SCIP role |
 | --- | --- |
-| `definition` leaf | `Definition` |
+| `definition` node | `Definition` |
 | `declaration` without `definition` | `ForwardDefinition` |
-| `import` leaf | `Import` |
-| generated leaf or symbol | `Generated` |
-| test leaf or symbol | `Test` |
+| `import` node | `Import` |
+| generated node or symbol | `Generated` |
+| test node or symbol | `Test` |
 | evidence for a `writes` relationship | `WriteAccess` |
 | evidence for a `reads` relationship | `ReadAccess` |
 
@@ -145,7 +148,7 @@ Rift maps syntax highlighting only when facets establish it. Comments, identifie
 macros, and callables have direct mappings. Other syntax remains `UnspecifiedSyntaxKind`.
 
 A diagnostic with a span joins an occurrence at that exact range. Rift creates a symbol-less occurrence
-when no leaf already owns the range. Severity, code, message, source language, and presentation tags map
+when no node already owns the range. Severity, code, message, source language, and presentation tags map
 directly.
 
 A diagnostic without a span has no SCIP representation. Related locations, parser reliability,
