@@ -22,6 +22,8 @@ class RiftConfigTests(TestCase):
 
         self.assertEqual(parsed.profile.max, mcp.ConformanceProfile.EDIT)
         self.assertEqual(parsed.validators.max_timeout.milliseconds, 300_000)
+        self.assertEqual(parsed.execution.allow, [])
+        self.assertEqual(parsed.execution.max_timeout.milliseconds, 30_000)
 
     def test_tables_are_closed(self) -> None:
         with self.assertRaises(ValidationError):
