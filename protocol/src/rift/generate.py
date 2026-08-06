@@ -327,7 +327,7 @@ class SchemaCompiler:
                 type=(
                     cast(Any, variant.proto_model).DESCRIPTOR.full_name
                     if variant.proto_model
-                    else variant.resolve().__name__
+                    else variant.type_name
                 ),
                 oneof=oneof,
             )
@@ -716,9 +716,17 @@ def _schema_ref(model: type[Any]) -> dict[str, str]:
 
 def document_metadata(document: Document) -> dict[str, Any]:
     service_name = f"rift.mcp.{document.service.name}"
+    groups = {
+        group.name: {"title": group.title, "summary": group.summary}
+        for group in document.tool_groups
+    }
+    declared = {tool.group for tool in document.tools} - set(groups)
+    if declared:
+        raise ValueError(f"tools name undeclared groups: {sorted(declared)}")
     tools = {
         tool.name: {
             "rpc": f"{service_name}/{tool.rpc.name}",
+            "group": tool.group,
             "description": tool.rpc.description,
             "params": _schema_ref(tool.rpc.request),
             "result": _schema_ref(tool.rpc.response),
@@ -737,6 +745,7 @@ def document_metadata(document: Document) -> dict[str, Any]:
     resource_read = document.resource_read
     entry_points = {
         "description": document.entry_points_description,
+        "mcp.toolGroups": groups,
         "mcp.tools": tools,
         "mcp.resources": resources,
         "mcp.error": _schema_ref(document.error),

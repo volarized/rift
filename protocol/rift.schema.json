@@ -102,6 +102,119 @@
       "title": "Duration",
       "type": "string"
     },
+    "ExecutionConfig": {
+      "additionalProperties": false,
+      "description": "Repository authorization and resource policy for caller-provided code.",
+      "properties": {
+        "allow": {
+          "description": "Exact languages authorized for execute when their adapters advertise the execute operation. Empty disables caller-provided code.",
+          "items": {
+            "$ref": "#/$defs/LanguageSelector"
+          },
+          "rift:selectsType": "Language",
+          "title": "Allow",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "debug": {
+          "description": "Subset of allow authorized for debugging when all three debug operations are advertised. Empty disables debugging.",
+          "items": {
+            "$ref": "#/$defs/LanguageSelector"
+          },
+          "rift:selectsType": "Language",
+          "title": "Debug",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "max-code": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16KiB",
+          "description": "Maximum UTF-8 bytes in one CodeBlock.source.",
+          "rift:bounds": {
+            "field": "source",
+            "model": "CodeBlock"
+          },
+          "rift:conversion": "UTF-8 byte length"
+        },
+        "max-timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "Wall-clock bound applied to each execution and debugging evaluation.",
+          "rift:bounds": {
+            "field": "timeout_ms",
+            "model": "ExecutionBudget"
+          },
+          "rift:conversion": "Duration.milliseconds"
+        },
+        "max-output": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "8KiB",
+          "description": "Captured prefix bound applied separately to stdout and stderr.",
+          "rift:bounds": {
+            "field": "output_bytes",
+            "model": "ExecutionBudget"
+          },
+          "rift:conversion": "ByteSize.bytes"
+        },
+        "max-concurrent": {
+          "default": 2,
+          "description": "Evaluations admitted concurrently across the workspace.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Max-Concurrent",
+          "type": "integer"
+        },
+        "max-debug-sessions": {
+          "default": 2,
+          "description": "Retained debugging sessions admitted across the workspace.",
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Max-Debug-Sessions",
+          "type": "integer"
+        },
+        "debug-idle-timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "5m",
+          "description": "Idle time before Rift stops a debugging session and releases its lease."
+        },
+        "max-debug-frames": {
+          "default": 64,
+          "description": "Stack frames one failed debugging evaluation may retain.",
+          "maximum": 256,
+          "minimum": 1,
+          "rift:bounds": {
+            "field": "frames",
+            "model": "DebugBudget"
+          },
+          "title": "Max-Debug-Frames",
+          "type": "integer"
+        },
+        "max-debug-bindings": {
+          "default": 32,
+          "description": "Arguments plus locals returned for one debug frame.",
+          "maximum": 128,
+          "minimum": 1,
+          "rift:bounds": {
+            "field": "bindings_per_frame",
+            "model": "DebugBudget"
+          },
+          "title": "Max-Debug-Bindings",
+          "type": "integer"
+        },
+        "max-debug-value": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1KiB",
+          "description": "Captured UTF-8 bytes in each adapter-rendered debug binding value.",
+          "rift:bounds": {
+            "field": "value_bytes",
+            "model": "DebugBudget"
+          },
+          "rift:conversion": "ByteSize.bytes"
+        }
+      },
+      "title": "ExecutionConfig",
+      "type": "object"
+    },
     "FactsConfig": {
       "additionalProperties": false,
       "description": "Retention bound for adapter facts cached by snapshot.",
@@ -145,6 +258,11 @@
     },
     "ProjectPath": {
       "description": "One path below the project root, using forward slashes and UTF-8. The empty path names the root itself. Absolute paths, backslashes, control characters, empty segments, and `.` or `..` segments are refused before the filesystem is touched.",
+      "examples": [
+        "",
+        "src/config.ts",
+        "packages/api/Cargo.toml"
+      ],
       "maxLength": 1000,
       "pattern": "^(?:$|(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
       "rift:package": "rift.core",
@@ -305,6 +423,9 @@
     },
     "profile": {
       "$ref": "#/$defs/ProfileConfig"
+    },
+    "execution": {
+      "$ref": "#/$defs/ExecutionConfig"
     },
     "validation": {
       "$ref": "#/$defs/ValidationConfig"

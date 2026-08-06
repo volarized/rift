@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pydantic import model_validator
+
 from . import core
 from .base import *
 
@@ -95,6 +97,27 @@ class Capabilities(ProtoModel):
         number=13,
         description="Execution behavior the host should account for while this adapter runs.",
     )
+
+    @model_validator(mode="after")
+    def operation_sets_are_consistent(self) -> Capabilities:
+        operations = set(self.operations)
+        if len(operations) != len(self.operations):
+            raise ValueError("Capabilities.operations must not contain duplicates")
+        if self.fact_families and core.AdapterOperation.ANALYZE not in operations:
+            raise ValueError("Capabilities.fact_families requires analyze")
+        if self.action_kinds and not {
+            core.AdapterOperation.ACTIONS,
+            core.AdapterOperation.RESOLVE,
+        }.issubset(operations):
+            raise ValueError("Capabilities.action_kinds requires actions and resolve")
+        debug = {
+            core.AdapterOperation.DEBUG_START,
+            core.AdapterOperation.DEBUG_GET_FRAME,
+            core.AdapterOperation.DEBUG_STOP,
+        }
+        if operations.intersection(debug) and not debug.issubset(operations):
+            raise ValueError("Capabilities debugging operations are all-or-none")
+        return self
 
 
 @proto_message(
@@ -1511,10 +1534,19 @@ class ExecuteRequest(ProtoModel):
     state."""
 
     state: Field[AdapterState] = proto_field(
-        default=..., number=1, description="Exact snapshot and adapter generation to evaluate against."
+        default=...,
+        number=1,
+        description="Exact snapshot and adapter generation to evaluate against.",
     )
     block: Field[core.CodeBlock] = proto_field(
-        default=..., number=2, description="Source and project-relative working directory."
+        default=...,
+        number=2,
+        description="Source and project-relative working directory.",
+    )
+    budget: Field[core.ExecutionBudget] = proto_field(
+        default=...,
+        number=3,
+        description="Exact host-policy bounds the adapter must enforce for this evaluation.",
     )
 
 
@@ -1529,7 +1561,9 @@ class ExecuteResponse(ProtoModel):
     """Bounded result of evaluating a block against one unchanged adapter state."""
 
     state: Field[AdapterState] = proto_field(
-        default=..., number=1, description="State whose project runtime and source context were used."
+        default=...,
+        number=1,
+        description="State whose project runtime and source context were used.",
     )
     result: Field[core.ExecutionResult] = proto_field(default=..., number=2)
 
@@ -1545,11 +1579,13 @@ class ExecuteResponse(ProtoModel):
         section="Debugging",
     )
 )
-class DebugSession(ProtoModel):
-    """Adapter-local handle and terminal evaluation summary for one debugging session."""
+class DebugSessionKey(ProtoModel):
+    """Minimal adapter-local identity of one debugging session."""
 
     state: Field[AdapterState] = proto_field(
-        default=..., number=1, description="Pinned adapter state used by the debugging evaluation."
+        default=...,
+        number=1,
+        description="Pinned adapter state used by the debugging evaluation.",
     )
     token: Field[str] = proto_field(
         default=...,
@@ -1557,15 +1593,43 @@ class DebugSession(ProtoModel):
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description="Opaque adapter-local handle. Rift never exposes it to the MCP caller.",
     )
+
+
+@proto_message(
+    DirectMessage(
+        ADAPTER,
+        description="Adapter-local key and terminal evaluation summary for one debugging session.",
+        section="Debugging",
+    )
+)
+class DebugSession(ProtoModel):
+    """Adapter-local key and terminal evaluation summary for one debugging session."""
+
+    key: Field[DebugSessionKey] = proto_field(
+        default=...,
+        number=1,
+        description="Stable identity used by frame reads and cleanup.",
+    )
     frame_count: Field[int] = proto_field(
         default=...,
-        number=3,
+        number=2,
         proto_type=ProtoFieldDescriptor.TYPE_UINT32,
         description="Retained stack frames, innermost first. Zero after normal completion.",
     )
     result: Field[core.ExecutionResult] = proto_field(
-        default=..., number=4, description="How evaluation ended and its bounded output."
+        default=...,
+        number=3,
+        description="How evaluation ended and its bounded output.",
     )
+
+    @model_validator(mode="after")
+    def completed_session_has_no_frames(self) -> DebugSession:
+        if (
+            self.result.status is core.ExecutionStatus.COMPLETED
+            and self.frame_count != 0
+        ):
+            raise ValueError("completed debugging session must have frame_count zero")
+        return self
 
 
 @proto_message(
@@ -1580,6 +1644,11 @@ class DebugStartRequest(ProtoModel):
 
     state: Field[AdapterState] = proto_field(default=..., number=1)
     block: Field[core.CodeBlock] = proto_field(default=..., number=2)
+    budget: Field[core.DebugBudget] = proto_field(
+        default=...,
+        number=3,
+        description="Exact host-policy bounds for evaluation, retained frames, and bindings.",
+    )
 
 
 @proto_message(
@@ -1592,7 +1661,7 @@ class DebugStartRequest(ProtoModel):
 class DebugGetFrameRequest(ProtoModel):
     """Select one retained stack frame from a debugging session."""
 
-    session: Field[DebugSession] = proto_field(default=..., number=1)
+    session: Field[DebugSessionKey] = proto_field(default=..., number=1)
     depth: Field[int] = proto_field(
         default=...,
         number=2,
@@ -1611,7 +1680,7 @@ class DebugGetFrameRequest(ProtoModel):
 class DebugGetFrameResponse(ProtoModel):
     """One retained frame and the session identity it came from."""
 
-    session: Field[DebugSession] = proto_field(default=..., number=1)
+    session: Field[DebugSessionKey] = proto_field(default=..., number=1)
     frame: Field[core.DebugFrame] = proto_field(default=..., number=2)
 
 
@@ -1625,7 +1694,7 @@ class DebugGetFrameResponse(ProtoModel):
 class DebugStopRequest(ProtoModel):
     """Release one debugging session and all retained runtime state behind it."""
 
-    session: Field[DebugSession] = proto_field(default=..., number=1)
+    session: Field[DebugSessionKey] = proto_field(default=..., number=1)
 
 
 @proto_enum(
@@ -1784,6 +1853,7 @@ ADAPTER_PACKAGE = ProtoPackage(
         ResolveResponse,
         ExecuteRequest,
         ExecuteResponse,
+        DebugSessionKey,
         DebugSession,
         DebugStartRequest,
         DebugGetFrameRequest,
@@ -1930,7 +2000,7 @@ ADAPTER_PACKAGE = ProtoPackage(
                     DebugSession,
                     description=(
                         "Evaluate a code block for post-mortem inspection, retaining stack frames "
-                        "after an unhandled failure until StopDebug."
+                        "after an unhandled failure until DebugStop."
                     ),
                 ),
                 Rpc(

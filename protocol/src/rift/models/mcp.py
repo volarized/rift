@@ -1,28 +1,20 @@
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 from . import core
 from .base import *
 
 
-@definition(
+@scalar(
     owner=MCP,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    min_length=1,
+    max_length=4096,
 )
-class Cursor(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='An opaque string that continues a "
-            "paginated answer from where the last page ended. It binds the request, state, "
-            "order, and page size. A mismatch returns `cursor_invalid`.', min_length=1, "
-            "max_length=4096)]"
-        )
-    ]
-):
-    "An opaque string that continues a paginated answer from where the last page ended. It binds the request, state, order, and page size. A mismatch returns `cursor_invalid`."
+class Cursor(ProtocolRoot):
+    """An opaque string that continues a paginated answer from where the last page ended. It binds the request, state, order, and page size. A mismatch returns `cursor_invalid`."""
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -434,6 +426,41 @@ class PreviewResourceLink(ClosedModel):
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ActionsResourceLink(ClosedModel):
+    """A link to the actions available at one address."""
+
+    uri: Field[ActionsResourceUri] = proto_field(
+        description="The address to read, optionally filtered by kind and continued by a cursor.",
+        number=1,
+    )
+    name: Field[Literal["actions"]] = proto_field(
+        description="The resource family this link belongs to.", number=2
+    )
+    mimeType: Field[Literal["application/vnd.rift.actions+json"]] = proto_field(
+        description="What a read of this URI returns: `ActionsResourcePayload` as JSON.",
+        number=3,
+        proto_name="mime_type",
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ActionResourceLink(ClosedModel):
+    """A link to one discovered action and the arguments it takes."""
+
+    uri: Field[ActionResourceUri] = proto_field(
+        description="The offer to read.", number=1
+    )
+    name: Field[Literal["action"]] = proto_field(
+        description="The resource family this link belongs to.", number=2
+    )
+    mimeType: Field[Literal["application/vnd.rift.action+json"]] = proto_field(
+        description="What a read of this URI returns: `ActionResourcePayload` as JSON.",
+        number=3,
+        proto_name="mime_type",
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class SymbolResourceLink(ClosedModel):
     """A link to the symbol resource, carrying the symbol's own URI."""
 
@@ -516,29 +543,21 @@ class FileResourceLink(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("symbol", "symbol", 1, SymbolResourceLink),
-            Variant("repository", "repository", 2, RepositoryResourceLink),
-            Variant("diff", "diff", 3, DiffResourceLink),
-            Variant("file", "file", 4, FileResourceLink),
-            Variant("preview", "preview", 5, PreviewResourceLink),
-        ),
+    oneof="variant",
+    discriminator="mimeType",
+    variants=(
+        Variant("symbol", "symbol", 1, SymbolResourceLink),
+        Variant("repository", "repository", 2, RepositoryResourceLink),
+        Variant("diff", "diff", 3, DiffResourceLink),
+        Variant("file", "file", 4, FileResourceLink),
+        Variant("preview", "preview", 5, PreviewResourceLink),
+        Variant("actions", "actions", 6, ActionsResourceLink),
+        Variant("action", "action", 7, ActionResourceLink),
     ),
-    schema_extra={},
 )
-class ResourceLink(
-    ProtocolRoot[
-        (
-            "Annotated[SymbolResourceLink | RepositoryResourceLink | DiffResourceLink | "
-            "FileResourceLink | PreviewResourceLink, schema_field(discriminator='mimeType')]"
-        )
-    ]
-):
+class ResourceLink(ProtocolRoot):
     "A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed per resource, and the URI is the one that resource accepts."
 
 
@@ -654,6 +673,81 @@ class Contract(ClosedModel):
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class DebugLimits(ClosedModel):
+    """Workspace policy ceilings for retained debugging sessions. Null at
+    `ExecutionLimits.debug` means policy disables debugging."""
+
+    max_sessions: Field[int] = proto_field(
+        description="Debugging sessions retained across all connections in this workspace.",
+        ge=1,
+        le=16,
+        number=1,
+    )
+    idle_timeout_ms: Field[int] = proto_field(
+        description=(
+            "Milliseconds without debug_get_frame or debug_stop after which Rift stops the session "
+            "and releases its execution workspace."
+        ),
+        ge=1,
+        le=86400000,
+        number=2,
+    )
+    max_frames: Field[int] = proto_field(
+        description="Stack frames one failed debugging evaluation may retain.",
+        ge=1,
+        le=256,
+        number=3,
+    )
+    max_bindings_per_frame: Field[int] = proto_field(
+        description="Arguments plus locals one debug frame may return.",
+        ge=1,
+        le=128,
+        number=4,
+    )
+    max_value_bytes: Field[int] = proto_field(
+        description="Captured UTF-8 bytes in each rendered binding value.",
+        ge=0,
+        le=8192,
+        number=5,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ExecutionLimits(ClosedModel):
+    """Workspace policy ceilings for caller-provided code. Null at `Limits.execution` means
+    policy disables execution, regardless of adapter capability."""
+
+    max_code_bytes: Field[int] = proto_field(
+        description="UTF-8 bytes accepted in one CodeBlock.source.",
+        ge=1,
+        le=32768,
+        number=1,
+    )
+    max_timeout_ms: Field[int] = proto_field(
+        description="Wall-clock milliseconds allowed for one evaluation.",
+        ge=1,
+        le=86400000,
+        number=2,
+    )
+    max_output_bytes: Field[int] = proto_field(
+        description="Captured prefix bytes allowed separately for stdout and stderr.",
+        ge=0,
+        le=16384,
+        number=3,
+    )
+    max_concurrent: Field[int] = proto_field(
+        description="Evaluations running concurrently across all connections in the workspace.",
+        ge=1,
+        le=64,
+        number=4,
+    )
+    debug: Field[DebugLimits | None] = proto_field(
+        description="Debugging ceilings, or null when debugging policy is disabled.",
+        number=5,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class Limits(ClosedModel):
     "The ceilings this server enforces on MCP requests and responses. They come from host policy at launch, so two workspaces running the same Rift can differ. A request over one of them, or a response that would be, fails with `limit_exceeded` carrying `LimitEvidence`."
 
@@ -754,64 +848,45 @@ class Limits(ClosedModel):
         le=31536000,
         number=11,
     )
+    execution: Field[ExecutionLimits | None] = proto_field(
+        description=(
+            "Caller-code execution ceilings. Null means host policy disables execute and all "
+            "debug tools; adapter capability alone never enables them."
+        ),
+        number=12,
+    )
 
 
-@definition(
+@scalar(
     owner=MCP,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://repository(\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
 )
-class RepositoryResourceUri(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='Paginated workspace metadata and "
-            "capabilities at one revision.', pattern=\"^rift://repository(\\\\?(rev=[A-Za-z0-9._"
-            "~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$\")]"
-        )
-    ]
-):
+class RepositoryResourceUri(ProtocolRoot):
     """Paginated workspace metadata and capabilities at one revision."""
 
 
-@definition(
+@scalar(
     owner=MCP,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(?:\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(?:&start=[0-9]+&length=[1-9][0-9]*)?|\?start=[0-9]+&length=[1-9][0-9]*)?$",
+    min_length=13,
+    max_length=1200,
 )
-class FileResourceUri(
-    ProtocolRoot[
-        (
-            'Annotated[str, schema_field(description="URI for one file content range. `start` '
-            "and `length` are byte coordinates and appear together. Their absence starts at "
-            "byte zero with the server's advertised chunk bound.\", "
-            "pattern=\"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(?:\\"
-            "\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(?:&start=[0-9]+&length=[1-9][0-9]*)?|"
-            '\\\\?start=[0-9]+&length=[1-9][0-9]*)?$", min_length=13, max_length=1200)]'
-        )
-    ]
-):
-    "URI for one file content range. `start` and `length` are byte coordinates and appear together. Their absence starts at byte zero with the server's advertised chunk bound."
+class FileResourceUri(ProtocolRoot):
+    """URI for one file content range. `start` and `length` are byte coordinates and appear together. Their absence starts at byte zero with the server's advertised chunk bound."""
 
 
-@definition(
+@scalar(
     owner=MCP,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://preview/[A-Za-z0-9_-]{16,128}(\?cursor=[^&#]+)?$",
 )
-class PreviewResourceUri(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='URI for one page of a retained preview. "
-            "The path carries its opaque `PreviewId`; an optional cursor continues the same "
-            "immutable plan.', pattern='^rift://preview/[A-Za-z0-9_-]{16,128}(\\\\?cursor=[^&#]"
-            "+)?$')]"
-        )
-    ]
-):
-    "URI for one page of a retained preview. The path carries its opaque `PreviewId`; an optional cursor continues the same immutable plan."
+class PreviewResourceUri(ProtocolRoot):
+    """URI for one page of a retained preview. The path carries its opaque `PreviewId`; an optional cursor continues the same immutable plan."""
 
 
 @definition(
@@ -824,14 +899,24 @@ class PreviewResourceUri(
             EnumValue("outline", "TOOLS_OUTLINE", 2),
             EnumValue("search", "TOOLS_SEARCH", 3),
             EnumValue("match", "TOOLS_MATCH", 4),
-            EnumValue("actions", "TOOLS_ACTIONS", 5),
-            EnumValue("apply", "TOOLS_APPLY", 6),
-            EnumValue("integrate", "TOOLS_INTEGRATE", 7),
-            EnumValue("persist", "TOOLS_PERSIST", 8),
-            EnumValue("execute", "TOOLS_EXECUTE", 9),
-            EnumValue("debug_start", "TOOLS_DEBUG_START", 10),
-            EnumValue("debug_get_frame", "TOOLS_DEBUG_GET_FRAME", 11),
-            EnumValue("debug_stop", "TOOLS_DEBUG_STOP", 12),
+            EnumValue("edit", "TOOLS_EDIT", 5),
+            EnumValue("patch", "TOOLS_PATCH", 6),
+            EnumValue("rewrite", "TOOLS_REWRITE", 7),
+            EnumValue("revert", "TOOLS_REVERT", 8),
+            EnumValue("merge", "TOOLS_MERGE", 9),
+            EnumValue("rename", "TOOLS_RENAME", 10),
+            EnumValue("move", "TOOLS_MOVE", 11),
+            EnumValue("delete", "TOOLS_DELETE", 12),
+            EnumValue("change_signature", "TOOLS_CHANGE_SIGNATURE", 13),
+            EnumValue("act", "TOOLS_ACT", 14),
+            EnumValue("integrate", "TOOLS_INTEGRATE", 15),
+            EnumValue("refresh", "TOOLS_REFRESH", 16),
+            EnumValue("publish", "TOOLS_PUBLISH", 17),
+            EnumValue("persist", "TOOLS_PERSIST", 18),
+            EnumValue("execute", "TOOLS_EXECUTE", 19),
+            EnumValue("debug_start", "TOOLS_DEBUG_START", 20),
+            EnumValue("debug_get_frame", "TOOLS_DEBUG_GET_FRAME", 21),
+            EnumValue("debug_stop", "TOOLS_DEBUG_STOP", 22),
         ),
     ),
     schema_extra={
@@ -840,12 +925,19 @@ class PreviewResourceUri(
             "outline": "Adapter-owned declaration structure and diagnostics for one file.",
             "search": "Ranked lookup of symbols, nodes and files.",
             "match": "Literal, regular-expression and structural matching, with a key per hit.",
-            "actions": "The fixes and refactors an adapter offers at one address.",
-            "apply": (
-                "Previews, refreshes, and publishes deterministic candidates through the retained "
-                "validation contract."
-            ),
-            "integrate": "Previews, refreshes, and publishes a validated merge into a local branch.",
+            "edit": "Builds a candidate from concrete edits.",
+            "patch": "Builds a candidate from a unified diff.",
+            "rewrite": "Builds a candidate by replacing every match of one query.",
+            "revert": "Builds a candidate from the three-way inverse of one commit.",
+            "merge": "Builds a candidate by merging one commit into the candidate state.",
+            "rename": "Changes what a declaration is called and rewrites its references.",
+            "move": "Moves a declaration or file and updates imports and references.",
+            "delete": "Removes a declaration, mechanically or with a reference-aware policy.",
+            "change_signature": "Changes a callable's shape and propagates it to callers and overrides.",
+            "act": "Resolves one discovered adapter action that has no portable contract.",
+            "integrate": "Builds a validated merge candidate for a local branch.",
+            "refresh": "Reruns a retained candidate's operation on a newer base.",
+            "publish": "Runs the declared validators and advances the candidate's destination ref.",
             "persist": "Materializes selected paths from an accepted commit into the connection worktree.",
             "execute": "Evaluates a code block in one adapter's revision-specific project runtime.",
             "debug_start": "Starts an inspect-only debugging evaluation.",
@@ -859,9 +951,19 @@ class RepositoryResourcePayloadToolsItemTools(str, Enum):
     OUTLINE = "outline"
     SEARCH = "search"
     MATCH = "match"
-    ACTIONS = "actions"
-    APPLY = "apply"
+    EDIT = "edit"
+    PATCH = "patch"
+    REWRITE = "rewrite"
+    REVERT = "revert"
+    MERGE = "merge"
+    RENAME = "rename"
+    MOVE = "move"
+    DELETE = "delete"
+    CHANGE_SIGNATURE = "change_signature"
+    ACT = "act"
     INTEGRATE = "integrate"
+    REFRESH = "refresh"
+    PUBLISH = "publish"
     PERSIST = "persist"
     EXECUTE = "execute"
     DEBUG_START = "debug_start"
@@ -880,6 +982,8 @@ class RepositoryResourcePayloadToolsItemTools(str, Enum):
             EnumValue("diff", "RESOURCES_DIFF", 3),
             EnumValue("file", "RESOURCES_FILE", 4),
             EnumValue("preview", "RESOURCES_PREVIEW", 5),
+            EnumValue("actions", "RESOURCES_ACTIONS", 6),
+            EnumValue("action", "RESOURCES_ACTION", 7),
         ),
     ),
     schema_extra={
@@ -888,7 +992,9 @@ class RepositoryResourcePayloadToolsItemTools(str, Enum):
             "symbol": "One symbol, its nodes, its edges and its diagnostics.",
             "diff": "What changed between two revisions.",
             "file": "One file's tree entry and its bytes.",
-            "preview": "One retained candidate's requests, resolved plans, validation evidence, and confirmations.",
+            "preview": "One retained candidate's operation, resolved plan, validation evidence, and confirmations.",
+            "actions": "The fixes and refactors an adapter offers at one address, or across one file.",
+            "action": "One discovered action, with the schema of the arguments it takes.",
         }
     },
 )
@@ -898,6 +1004,8 @@ class RepositoryResourcePayloadResourcesItemResources(str, Enum):
     DIFF = "diff"
     FILE = "file"
     PREVIEW = "preview"
+    ACTIONS = "actions"
+    ACTION = "action"
 
 
 @definition(
@@ -964,7 +1072,9 @@ class RepositoryResourcePayload(ClosedModel):
     tools: Field[list[RepositoryResourcePayloadToolsItemTools]] = proto_field(
         description=(
             "The MCP tools this workspace serves. A tool the profile or host policy does not "
-            "reach is absent from this list and from `tools/list`."
+            "reach is absent from this list and from `tools/list`. Execute appears when at "
+            "least one LanguageSupport.execution.execute is true; the debug triplet appears "
+            "together when at least one LanguageSupport.execution.debug is true."
         ),
         number=7,
         json_schema_extra={"uniqueItems": True},
@@ -1035,77 +1145,97 @@ class SearchResult(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ActionOffer(ClosedModel):
-    "One adapter action discovered at an address. It combines a portable descriptor with a state-bound resolution key."
+    "One adapter action discovered at an address: the URI that resolves it, and the portable description the adapter returned. A listing page leaves `descriptor.arguments_schema` null, because a page of offers carries as many schemas as it has entries and a caller reads one. The single-offer resource always carries it."
 
-    descriptor: Field[core.ActionDescriptor] = proto_field(
-        description="What the action does, what it applies to, and the schema of the arguments it takes.",
-        number=1,
-    )
-    key: Field[core.ActionKey] = proto_field(
-        description="Language, snapshot, and adapter token used to resolve this offer.",
-        number=2,
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class ActionsParams(ClosedModel):
-    "What to ask an adapter for, and where. `target` picks the place, `only` narrows the kinds, and `rev` selects the source state."
-
-    target: Field[core.Address] = proto_field(
-        description="Where in the code to ask. A symbol, a node, a byte range, or a match you already have.",
-        number=1,
-    )
-    only: Field[list[core.ActionKind]] = proto_field(
+    action: Field[core.ActionOfferId] = proto_field(
         description=(
-            "Kind prefixes to keep. `refactor` returns everything under it; an empty list "
-            "returns every action the adapter offers."
+            "Identity of this offer. Hand it to `act`, or read it for the argument schema the "
+            "action takes."
         ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
+        number=1,
     )
-    limit: Field[int | None] = proto_field(
-        default=None,
-        description="Most actions to return in one page.",
-        ge=1,
-        le=4294967295,
-        number=3,
+    descriptor: Field[core.ActionDescriptor] = proto_field(
+        description="What the action does and what it applies to.", number=2
     )
-    cursor: Field[Cursor | None] = proto_field(
-        default=None,
-        description="Continues a previous call. Omit for the first page.",
-        number=4,
-    )
-    rev: Field[core.Revision | None] = proto_field(
-        default=None,
-        description="Which revision to answer against. Absent, the default branch at its latest commit.",
-        number=5,
-    )
+
+
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://actions/(?:symbol|node|match|file)/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}(\?(?:only|rev|cursor)=[^&#]+(&(?:only|rev|cursor)=[^&#]+){0,2})?$",
+    min_length=22,
+    max_length=8448,
+    examples=[
+        "rift://actions/file/src/api.rs?only=quickfix",
+        "rift://actions/symbol/python/pkg.util.load_config",
+    ],
+)
+class ActionsResourceUri(ProtocolRoot):
+    """URI for the actions an adapter offers at one place. The path after `rift://actions/` is the address: `symbol/<language>/<name>`, `node/<language>/<path>@<start>-<end>`, `match/<token>`, or `file/<path>` for every offer in one file. A file address is what asks for the fixes across a file whose diagnostics an agent is working through. `?only=` keeps one kind prefix, `?rev=` selects the revision, and `?cursor=` continues the page."""
+
+
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^rift://action/[A-Za-z0-9_-]{16,8192}$",
+    min_length=31,
+    max_length=8207,
+    examples=["rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ"],
+)
+class ActionResourceUri(ProtocolRoot):
+    """URI for one discovered action. It is the `ActionOfferId` a listing returned, and reading it returns the same offer with the JSON Schema of the arguments the action takes."""
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class ActionsResult(ClosedModel):
-    "Discovered actions for one pinned address. Offers sort by language name, dialect with null first, target, kind, argument contract, argument schema, guarantees, full descriptor, and token. Object fields use RFC 8785 ordering. The cursor binds this order, the snapshot, and the adapter build."
+class ActionsResourcePayload(ClosedModel):
+    "One page of the actions available at one address. Offers sort by language name, dialect with null first, target, kind, and offer identity. The cursor binds that order, the snapshot, and the adapter build."
 
+    uri: Field[ActionsResourceUri] = proto_field(
+        description="The address this page answers for, echoed back as it resolved.",
+        number=1,
+    )
     at: Field[core.Snapshot] = proto_field(
         description=(
             "The snapshot this answer was resolved against. Pass it back as `rev` when a "
             "later call has to agree with this one."
         ),
-        number=1,
+        number=2,
     )
-    actions: Field[list[ActionOffer]] = proto_field(
-        description="The actions on this page.", number=2
+    offers: Field[list[ActionOffer]] = proto_field(
+        description="The actions on this page, each without its argument schema.",
+        number=3,
     )
     coverage: Field[core.Coverage] = proto_field(
         description=(
             "Whether the adapter could answer here. A language with no action support returns "
             "an empty list with `unsupported` coverage and its reason."
         ),
-        number=3,
-    )
-    next_cursor: Field[Cursor | None] = proto_field(
-        description="Pass this back to get the next page. Null on the last one.",
         number=4,
+    )
+    next: Field[ActionsResourceUri | None] = proto_field(
+        description="The same address carrying the cursor for the next page, or null on the last one.",
+        number=5,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ActionResourcePayload(ClosedModel):
+    "One discovered action and the arguments it accepts. This is the read that supplies `arguments_schema`, so a caller fetches one schema for the action it chose rather than a schema per offer on a page."
+
+    uri: Field[ActionResourceUri] = proto_field(
+        description="The offer this payload answers for, echoed back as it resolved.",
+        number=1,
+    )
+    at: Field[core.Snapshot] = proto_field(
+        description="The snapshot this offer was discovered in.", number=2
+    )
+    language: Field[core.Language] = proto_field(
+        description="Language whose adapter minted the offer and resolves it.", number=3
+    )
+    offer: Field[ActionOffer] = proto_field(
+        description="The offer, with `descriptor.arguments_schema` present.", number=4
     )
 
 
@@ -1116,10 +1246,12 @@ class ExecuteParams(ClosedModel):
     the adapter seam."""
 
     language: Field[core.Language] = proto_field(
-        description="Exact language and optional dialect selecting the adapter.", number=1
+        description="Exact language and optional dialect selecting the adapter.",
+        number=1,
     )
     block: Field[core.CodeBlock] = proto_field(
-        description="Source to evaluate and its project-relative working directory.", number=2
+        description="Source to evaluate and its project-relative working directory.",
+        number=2,
     )
     rev: Field[core.Revision | None] = proto_field(
         default=None,
@@ -1140,22 +1272,22 @@ class ExecuteResult(ClosedModel):
         description="Adapter that evaluated the block.", number=2
     )
     result: Field[core.ExecutionResult] = proto_field(
-        description="Runtime status, bounded output, and structured diagnostics.", number=3
+        description="Runtime status, bounded output, and structured diagnostics.",
+        number=3,
+    )
+    budget: Field[core.ExecutionBudget] = proto_field(
+        description="Exact bounds sent to the adapter for this evaluation.", number=4
     )
 
 
-@definition(
+@scalar(
     owner=MCP,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^[A-Za-z0-9_-]{16,128}$",
 )
-class DebugSessionId(
-    ProtocolRoot[
-        "Annotated[str, schema_field(description='Opaque connection-bound identity of one debugging session. It is valid only on the MCP connection that started it and until debug_stop or connection cleanup.', pattern='^[A-Za-z0-9_-]{16,128}$')]"
-    ]
-):
-    """Opaque connection-bound identity of one debugging session."""
+class DebugSessionId(ProtocolRoot):
+    """Opaque connection-bound identity of one debugging session. It is valid only on the MCP connection that started it and until debug_stop or connection cleanup."""
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -1164,7 +1296,7 @@ class DebugSession(ClosedModel):
     completion or an unhandled failure; failed runs retain their stack for frame reads."""
 
     id: Field[DebugSessionId] = proto_field(
-        description="Server-minted public handle. The adapter-local token never crosses MCP.",
+        description="Server-minted public handle. The adapter-local DebugSessionKey never crosses MCP.",
         number=1,
     )
     at: Field[core.Snapshot] = proto_field(
@@ -1180,8 +1312,22 @@ class DebugSession(ClosedModel):
         number=4,
     )
     result: Field[core.ExecutionResult] = proto_field(
-        description="How the debugging evaluation ended and its bounded output.", number=5
+        description="How the debugging evaluation ended and its bounded output.",
+        number=5,
     )
+    budget: Field[core.DebugBudget] = proto_field(
+        description="Exact execution and retained-frame bounds applied to this session.",
+        number=6,
+    )
+
+    @model_validator(mode="after")
+    def completed_session_has_no_frames(self) -> DebugSession:
+        if (
+            self.result.status is core.ExecutionStatus.COMPLETED
+            and self.frame_count != 0
+        ):
+            raise ValueError("completed debugging session must have frame_count zero")
+        return self
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -1189,7 +1335,8 @@ class DebugStartParams(ClosedModel):
     """Start an inspect-only debugging evaluation in a disposable execution workspace."""
 
     language: Field[core.Language] = proto_field(
-        description="Exact language and optional dialect selecting the adapter.", number=1
+        description="Exact language and optional dialect selecting the adapter.",
+        number=1,
     )
     block: Field[core.CodeBlock] = proto_field(number=2)
     rev: Field[core.Revision | None] = proto_field(
@@ -1261,7 +1408,7 @@ class MatchHitStructural(ClosedModel):
         description="Facts the adapter carries that this model has no field for, under a reverse-domain key.",
         number=4,
     )
-    key: Field[core.MatchKey] = proto_field(
+    key: Field[core.MatchId] = proto_field(
         description=(
             "Identity of this match and the state it was found in. An edit addressed at it is "
             "checked against this before it lands."
@@ -1282,7 +1429,7 @@ class MatchHitText(ClosedModel):
     explanation: Field[list[str]] = proto_field(
         description="Why this is a match, one step per line.", number=2
     )
-    key: Field[core.MatchKey] = proto_field(
+    key: Field[core.MatchId] = proto_field(
         description=(
             "Identity of this match and the state it was found in. An edit addressed at it is "
             "checked against this before it lands."
@@ -1291,23 +1438,16 @@ class MatchHitText(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("structural", "structural", 1, MatchHitStructural),
-            Variant("text", "text", 2, MatchHitText),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("structural", "structural", 1, MatchHitStructural),
+        Variant("text", "text", 2, MatchHitText),
     ),
-    schema_extra={},
 )
-class MatchHit(
-    ProtocolRoot[
-        "Annotated[MatchHitStructural | MatchHitText, schema_field(discriminator='kind')]"
-    ]
-):
+class MatchHit(ProtocolRoot):
     "One match, tagged by the engine that produced it. The tag equals `key.query.kind`. A structural match carries grammar-derived replacement ranges. A text match carries source captures only."
 
 
@@ -1491,7 +1631,8 @@ class DiagnosticContext(ClosedModel):
             ),
             "permission_denied": (
                 "Host policy refused — a path outside the workspace, a revision this deployment "
-                "does not expose. The same request fails the same way."
+                "does not expose, a language not authorized for execution, or a debugging session "
+                "owned by another connection. The same request fails the same way."
             ),
             "snapshot_not_found": (
                 "The revision does not resolve here: a deleted branch, a commit never fetched, a "
@@ -1513,8 +1654,9 @@ class DiagnosticContext(ClosedModel):
                 "succeeds."
             ),
             "resource_not_found": (
-                "The URI is well-formed and resolves to nothing — no such symbol, no such file at "
-                "that revision. Retrying does not help."
+                "The identity is well-formed and resolves to nothing — no such symbol, no such "
+                "file at that revision, or a debug session already stopped or expired. Retrying "
+                "does not help."
             ),
             "record_reclaimed": (
                 "The record existed and has been vacuumed away after its retention window. It "
@@ -1618,10 +1760,7 @@ class ErrorCode(str, Enum):
         (
             EnumValue("never", "RETRY_DIRECTIVE_NEVER", 1),
             EnumValue("same_request", "RETRY_DIRECTIVE_SAME_REQUEST", 2),
-            EnumValue(
-                "same_idempotency_key", "RETRY_DIRECTIVE_SAME_IDEMPOTENCY_KEY", 3
-            ),
-            EnumValue("refresh_snapshot", "RETRY_DIRECTIVE_REFRESH_SNAPSHOT", 4),
+            EnumValue("refresh_snapshot", "RETRY_DIRECTIVE_REFRESH_SNAPSHOT", 3),
         ),
         named=True,
     ),
@@ -1631,10 +1770,6 @@ class ErrorCode(str, Enum):
             "same_request": (
                 "Send the same bytes again. The cause was transient — a busy working tree, an "
                 "adapter still starting."
-            ),
-            "same_idempotency_key": (
-                "Retry under the operation's existing key. Rift returns the retained outcome when "
-                "the first call completed before its response was lost."
             ),
             "refresh_snapshot": (
                 "The state moved under the request. Re-read the current state, rebuild whatever "
@@ -1648,7 +1783,6 @@ class RetryDirective(str, Enum):
 
     NEVER = "never"
     SAME_REQUEST = "same_request"
-    SAME_IDEMPOTENCY_KEY = "same_idempotency_key"
     REFRESH_SNAPSHOT = "refresh_snapshot"
 
 
@@ -1683,6 +1817,8 @@ class ErrorCause(ClosedModel):
             EnumValue("preview", "PREVIEW", 5),
             EnumValue("publish", "PUBLISH", 6),
             EnumValue("persist", "PERSIST", 7),
+            EnumValue("execute", "EXECUTE", 8),
+            EnumValue("debug", "DEBUG", 9),
         ),
         placement=Placement("phase", 4),
     ),
@@ -1698,6 +1834,8 @@ class ErrorCause(ClosedModel):
             "preview": "Building a change into something readable without publishing it.",
             "publish": "Rerunning a retained preview and advancing the accepted ref through compare-and-swap.",
             "persist": "Materializing selected paths from an accepted commit into the connection worktree.",
+            "execute": "Preparing an execution workspace and evaluating caller-provided code.",
+            "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
         }
     },
 )
@@ -1711,6 +1849,8 @@ class ErrorDataPhase(str, Enum):
     PREVIEW = "preview"
     PUBLISH = "publish"
     PERSIST = "persist"
+    EXECUTE = "execute"
+    DEBUG = "debug"
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -1767,6 +1907,8 @@ class ErrorData(ClosedModel):
                 "preview": "Building a change into something readable without publishing it.",
                 "publish": "Rerunning a retained preview and advancing the accepted ref through compare-and-swap.",
                 "persist": "Materializing selected paths from an accepted commit into the connection worktree.",
+                "execute": "Preparing an execution workspace and evaluating caller-provided code.",
+                "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
             }
         },
     )
@@ -1850,8 +1992,8 @@ class LimitEvidence(ClosedModel):
     )
     field: Field[str] = proto_field(
         description=(
-            "The limit's field name in whichever message `scope` names, such as "
-            "`max_page_items` or `max_in_flight_per_state`."
+            "The limit's field path below whichever message `scope` names, such as "
+            "`max_page_items`, `execution.max_concurrent`, or `max_in_flight_per_state`."
         ),
         min_length=1,
         max_length=128,
@@ -2008,46 +2150,79 @@ class PreviewResourceTemplate(ClosedModel):
     )
 
 
-@definition(
-    owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(
-                "rift://repository{?rev,cursor}",
-                "repository",
-                1,
-                RepositoryResourceTemplate,
-            ),
-            Variant(
-                "rift://symbol/{language}/{name}{?rev,cursor}",
-                "symbol",
-                2,
-                SymbolResourceTemplate,
-            ),
-            Variant(
-                "rift://diff/{from}..{to}{?cursor}", "diff", 3, DiffResourceTemplate
-            ),
-            Variant(
-                "rift://file/{path}{?rev,start,length}", "file", 4, FileResourceTemplate
-            ),
-            Variant(
-                "rift://preview/{id}{?cursor}", "preview", 5, PreviewResourceTemplate
-            ),
-        ),
-    ),
-    schema_extra={},
-)
-class ResourceTemplate(
-    ProtocolRoot[
-        (
-            "Annotated[RepositoryResourceTemplate | SymbolResourceTemplate | "
-            "DiffResourceTemplate | FileResourceTemplate | PreviewResourceTemplate, "
-            "schema_field(discriminator='mimeType')]"
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ActionsResourceTemplate(ClosedModel):
+    """The actions resource, addressed by the place to ask about."""
+
+    uriTemplate: Field[Literal["rift://actions/{address}{?only,rev,cursor}"]] = (
+        proto_field(
+            description=(
+                "The template, in RFC 6570 form. The address is `symbol/{language}/{name}`, "
+                "`node/{language}/{path}@{start}-{end}`, `match/{token}`, or `file/{path}`."
+            )
         )
-    ]
-):
+    )
+    name: Field[Literal["actions"]] = proto_field(
+        description="The resource family, as `resources/templates/list` advertises it.",
+        number=1,
+    )
+    mimeType: Field[Literal["application/vnd.rift.actions+json"]] = proto_field(
+        description="What a read of a URI from this template returns: `ActionsResourcePayload` as JSON.",
+        number=2,
+        proto_name="mime_type",
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ActionResourceTemplate(ClosedModel):
+    """One discovered action, addressed by the offer identity a listing returned."""
+
+    uriTemplate: Field[Literal["rift://action/{token}"]] = proto_field(
+        description="The template, in RFC 6570 form."
+    )
+    name: Field[Literal["action"]] = proto_field(
+        description="The resource family, as `resources/templates/list` advertises it.",
+        number=1,
+    )
+    mimeType: Field[Literal["application/vnd.rift.action+json"]] = proto_field(
+        description="What a read of a URI from this template returns: `ActionResourcePayload` as JSON.",
+        number=2,
+        proto_name="mime_type",
+    )
+
+
+@union(
+    owner=MCP,
+    oneof="variant",
+    discriminator="mimeType",
+    variants=(
+        Variant(
+            "rift://repository{?rev,cursor}",
+            "repository",
+            1,
+            RepositoryResourceTemplate,
+        ),
+        Variant(
+            "rift://symbol/{language}/{name}{?rev,cursor}",
+            "symbol",
+            2,
+            SymbolResourceTemplate,
+        ),
+        Variant("rift://diff/{from}..{to}{?cursor}", "diff", 3, DiffResourceTemplate),
+        Variant(
+            "rift://file/{path}{?rev,start,length}", "file", 4, FileResourceTemplate
+        ),
+        Variant("rift://preview/{id}{?cursor}", "preview", 5, PreviewResourceTemplate),
+        Variant(
+            "rift://actions/{address}{?only,rev,cursor}",
+            "actions",
+            6,
+            ActionsResourceTemplate,
+        ),
+        Variant("rift://action/{token}", "action", 7, ActionResourceTemplate),
+    ),
+)
+class ResourceTemplate(ProtocolRoot):
     """One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per family."""
 
 
@@ -2168,42 +2343,71 @@ class PreviewResourceContent(ClosedModel):
     )
 
 
-@definition(
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ActionsResourceContent(ClosedModel):
+    """What a read of a `rift://actions/…` URI returns."""
+
+    uri: Field[ActionsResourceUri] = proto_field(
+        description="The address that was read, as it resolved.", number=1
+    )
+    mimeType: Field[Literal["application/vnd.rift.actions+json"]] = proto_field(
+        description="Which payload `text` holds."
+    )
+    text: Field[str] = proto_field(
+        description="An `ActionsResourcePayload`, serialized as JSON.",
+        number=2,
+        json_schema_extra={
+            "contentMediaType": "application/vnd.rift.actions+json",
+            "rift:contentType": "ActionsResourcePayload",
+        },
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ActionResourceContent(ClosedModel):
+    """What a read of a `rift://action/…` URI returns."""
+
+    uri: Field[ActionResourceUri] = proto_field(
+        description="The offer that was read, as it resolved.", number=1
+    )
+    mimeType: Field[Literal["application/vnd.rift.action+json"]] = proto_field(
+        description="Which payload `text` holds."
+    )
+    text: Field[str] = proto_field(
+        description="An `ActionResourcePayload`, serialized as JSON.",
+        number=2,
+        json_schema_extra={
+            "contentMediaType": "application/vnd.rift.action+json",
+            "rift:contentType": "ActionResourcePayload",
+        },
+    )
+
+
+@union(
     owner=MCP,
-    public=False,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(
-                "application/vnd.rift.repository+json",
-                "repository",
-                1,
-                RepositoryResourceContent,
-            ),
-            Variant(
-                "application/vnd.rift.symbol+json", "symbol", 2, SymbolResourceContent
-            ),
-            Variant("application/vnd.rift.diff+json", "diff", 3, DiffResourceContent),
-            Variant("application/vnd.rift.file+json", "file", 4, FileResourceContent),
-            Variant(
-                "application/vnd.rift.preview+json",
-                "preview",
-                5,
-                PreviewResourceContent,
-            ),
+    oneof="variant",
+    discriminator="mimeType",
+    variants=(
+        Variant(
+            "application/vnd.rift.repository+json",
+            "repository",
+            1,
+            RepositoryResourceContent,
         ),
+        Variant("application/vnd.rift.symbol+json", "symbol", 2, SymbolResourceContent),
+        Variant("application/vnd.rift.diff+json", "diff", 3, DiffResourceContent),
+        Variant("application/vnd.rift.file+json", "file", 4, FileResourceContent),
+        Variant(
+            "application/vnd.rift.preview+json", "preview", 5, PreviewResourceContent
+        ),
+        Variant(
+            "application/vnd.rift.actions+json", "actions", 6, ActionsResourceContent
+        ),
+        Variant("application/vnd.rift.action+json", "action", 7, ActionResourceContent),
     ),
-    schema_extra={},
+    public=False,
 )
-class ResourceContent(
-    ProtocolRoot[
-        (
-            "Annotated[RepositoryResourceContent | SymbolResourceContent | "
-            "DiffResourceContent | FileResourceContent | PreviewResourceContent, "
-            "schema_field(discriminator='mimeType')]"
-        )
-    ]
-):
+class ResourceContent(ProtocolRoot):
     pass
 
 
@@ -2256,114 +2460,98 @@ class SearchHitTargetFile(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("symbol", "symbol", 1, SearchHitTargetSymbol),
-            Variant("node", "node", 2, SearchHitTargetNode),
-            Variant("file", "file", 3, SearchHitTargetFile),
-        ),
+    oneof="variant",
+    discriminator="target",
+    variants=(
+        Variant("symbol", "symbol", 1, SearchHitTargetSymbol),
+        Variant("node", "node", 2, SearchHitTargetNode),
+        Variant("file", "file", 3, SearchHitTargetFile),
     ),
-    schema_extra={},
 )
-class SearchHitTarget(
-    ProtocolRoot[
-        (
-            "Annotated[SearchHitTargetSymbol | SearchHitTargetNode | SearchHitTargetFile, "
-            "schema_field(discriminator='target')]"
-        )
-    ]
-):
+class SearchHitTarget(ProtocolRoot):
     """What a search hit is. Tagged, so the payload correlation survives code generation."""
 
 
-@definition(
-    owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(None, "direct_change", 1, lambda: DirectChange),
-            Variant(None, "patch_change", 2, lambda: PatchChange),
-            Variant(None, "action_change", 3, lambda: ActionChange),
-            Variant(None, "rewrite_change", 4, lambda: RewriteChange),
-            Variant(None, "revert_change", 5, lambda: RevertChange),
-            Variant(None, "merge_change", 6, lambda: MergeChange),
-        ),
-    ),
-    schema_extra={},
-)
-class Change(
-    ProtocolRoot[
-        (
-            "Annotated[DirectChange | PatchChange | ActionChange | RewriteChange | "
-            "RevertChange | MergeChange, schema_field(discriminator='kind')]"
-        )
-    ]
-):
-    "One deterministic contribution to a candidate. Rift resolves the ordered array against one pinned state. After each change, it applies formatting and makes every adapter sharing the worktree acknowledge the new snapshot before resolving the next; any refusal discards the candidate. Product model components convert prompts and provider completions into these values before calling Rift."
-
-
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class DirectChange(ClosedModel):
-    "Concrete filesystem edits supplied by the caller. Their ranges address the candidate state at this point in the ordered change list."
+class EditParams(ClosedModel):
+    "Concrete filesystem edits supplied by the caller. Their ranges address the state this operation resolves against, and replacements in one set may not overlap."
 
-    kind: Field[Literal["edits"]] = proto_field(
-        description="Tags this as a concrete edit list.", number=1
-    )
-    edits: Field[list[core.Edit]] = proto_field(
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
         description=(
-            "An atomic effect set in canonical file-and-range order. Every text replacement "
-            "addresses the state before this change, and replacements may not overlap."
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
         ),
-        min_length=1,
-        number=2,
+        number=1,
     )
-    formatting: Field[core.FormattingPolicy] = proto_field(
-        description="Formatting applied after these edits resolve.", number=3
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class PatchChange(ClosedModel):
-    "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the candidate state."
-
-    kind: Field[Literal["patch"]] = proto_field(
-        description="Tags this as a unified diff.", number=1
-    )
-    patch: Field[str] = proto_field(
-        description="Unified diff in Git's text patch syntax, with project-relative `a/` and `b/` paths.",
-        min_length=1,
-        number=2,
-    )
-    formatting: Field[core.FormattingPolicy] = proto_field(
-        description="Formatting applied after every hunk resolves.", number=3
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class ActionChange(ClosedModel):
-    "One adapter action selected from `actions`. Rift validates `arguments` against the advertised schema and resolves the token. Refresh and publish rediscover at the descriptor's target. Kind, target, argument contract, argument schema, and guarantees select the same action. Zero or several matches cause a refusal."
-
-    kind: Field[Literal["action"]] = proto_field(
-        description="Tags this as an adapter action.", number=1
-    )
-    action: Field[ActionOffer] = proto_field(
-        description="The descriptor used for replay and the key used for initial resolution.",
-        number=2,
-    )
-    arguments: Field[dict[str, Any]] = proto_field(
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
         description=(
-            "Arguments accepted by the offer's `ActionDescriptor.arguments_schema`. An action "
-            "with no parameters receives an empty object."
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
         ),
         number=3,
     )
     formatting: Field[core.FormattingPolicy] = proto_field(
-        description="Formatting applied after the action's edits resolve.", number=4
+        description="Formatting applied after this operation's edits resolve.", number=4
+    )
+    edits: Field[list[core.Edit]] = proto_field(
+        description=(
+            "An atomic effect set in canonical file-and-range order. Every text replacement "
+            "addresses the state before this operation."
+        ),
+        min_length=1,
+        number=5,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class PatchParams(ClosedModel):
+    "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the state it resolves against."
+
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
+        number=1,
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    formatting: Field[core.FormattingPolicy] = proto_field(
+        description="Formatting applied after this operation's edits resolve.", number=4
+    )
+    patch: Field[str] = proto_field(
+        description="Unified diff in Git's text patch syntax, with project-relative `a/` and `b/` paths.",
+        min_length=1,
+        number=5,
     )
 
 
@@ -2378,11 +2566,11 @@ class ActionChange(ClosedModel):
             EnumValue("trailing", "TRAILING", 3),
             EnumValue("both", "BOTH", 4),
         ),
-        placement=Placement("range", 4),
+        placement=Placement("range", 7),
     ),
     schema_extra={},
 )
-class RewriteChangeRange(str, Enum):
+class RewriteRange(str, Enum):
     "Which safe structural range is replaced. Text queries accept `exact` only because they have no grammar-owned trivia boundaries."
 
     EXACT = "exact"
@@ -2392,15 +2580,40 @@ class RewriteChangeRange(str, Enum):
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RewriteChange(ClosedModel):
-    "An atomic query-and-rewrite over the candidate state. Rift finds every match, checks the cardinality, expands the replacement, and either applies all resulting edits or refuses the candidate."
+class RewriteParams(ClosedModel):
+    "An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the replacement, and either applies all resulting edits or refuses the candidate."
 
-    kind: Field[Literal["rewrite"]] = proto_field(
-        description="Tags this as an atomic match rewrite.", number=1
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
+        number=1,
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    formatting: Field[core.FormattingPolicy] = proto_field(
+        description="Formatting applied after this operation's edits resolve.", number=4
     )
     query: Field[core.MatchQuery] = proto_field(
-        description="The text or structural pattern evaluated at this point in the change list.",
-        number=2,
+        description="The text or structural pattern evaluated against the state this operation resolves against.",
+        number=5,
     )
     replacement: Field[str] = proto_field(
         description=(
@@ -2408,40 +2621,63 @@ class RewriteChange(ClosedModel):
             "numeric capture, `${0}` inserts the whole match, and `$$` inserts one dollar "
             "sign. An absent capture refuses the rewrite."
         ),
-        number=3,
+        number=6,
     )
-    range: Field[RewriteChangeRange] = proto_field(
+    range: Field[RewriteRange] = proto_field(
         description=(
             "Which safe structural range is replaced. Text queries accept `exact` only "
             "because they have no grammar-owned trivia boundaries."
         ),
-        number=4,
+        number=7,
     )
     cardinality: Field[core.MatchCardinality] = proto_field(
-        description="The accepted number of matches before expansion.", number=5
-    )
-    formatting: Field[core.FormattingPolicy] = proto_field(
-        description="Formatting applied after every replacement resolves.", number=6
+        description="The accepted number of matches before expansion.", number=8
     )
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RevertChange(ClosedModel):
-    "A validated three-way inverse of one commit. Rift computes the difference from `parent` to `revision`, applies its inverse to the candidate state, and refuses overlapping changes it cannot merge without guessing."
+class RevertParams(ClosedModel):
+    "A validated three-way inverse of one commit. Rift computes the difference from `parent` to `revision`, applies its inverse, and refuses overlapping changes it cannot merge without guessing."
 
-    kind: Field[Literal["revert"]] = proto_field(
-        description="Tags this as a revision revert.", number=1
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
+        number=1,
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    formatting: Field[core.FormattingPolicy] = proto_field(
+        description="Formatting applied after this operation's edits resolve.", number=4
     )
     revision: Field[core.Commit] = proto_field(
-        description="Exact commit whose changes are inverted.", number=2
+        description="Exact commit whose changes are inverted.", number=5
     )
     parent: Field[core.Commit | None] = proto_field(
+        default=None,
         description=(
             "Parent against which the commit's change is defined. Required for ordinary and "
             "merge commits; null selects the empty tree for a root commit. A commit that does "
             "not have this parent is refused."
         ),
-        number=3,
+        number=6,
     )
     paths: Field[core.PathSelector] = proto_field(
         description=(
@@ -2449,76 +2685,319 @@ class RevertChange(ClosedModel):
             "untouched; the commit diff exposes them when the caller needs to inspect the "
             "omission."
         ),
-        number=4,
-    )
-    formatting: Field[core.FormattingPolicy] = proto_field(
-        description="Formatting applied after the inverse edits resolve.", number=5
+        number=7,
     )
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class MergeChange(ClosedModel):
-    """A three-way merge of one exact commit into the candidate state."""
+class MergeParams(ClosedModel):
+    """A three-way merge of one exact commit into the state this operation resolves against."""
 
-    kind: Field[Literal["merge"]] = proto_field(
-        description="Tags this as a Git merge.", number=1
-    )
-    revision: Field[core.Commit] = proto_field(
-        description="Commit merged into the candidate state.", number=2
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class ResolvedChange(ClosedModel):
-    "Bounded summary of one requested change after resolution. The preview resource pages its exact edits and evidence as records carrying this change index."
-
-    index: Field[int] = proto_field(
-        description="Zero-based position in the ordered request.",
-        ge=0,
-        le=4294967295,
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
         number=1,
     )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    revision: Field[core.Commit] = proto_field(
+        description="Commit merged into the candidate state.", number=5
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class RenameParams(ClosedModel):
+    "Changes what a declaration is called and rewrites the references that name it. The adapter checks language spelling, collisions, and binding changes; a reference outside `scope` refuses the operation rather than leaving it half done."
+
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
+        number=1,
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    formatting: Field[core.FormattingPolicy] = proto_field(
+        description="Formatting applied after this operation's edits resolve.", number=4
+    )
+    target: Field[core.Address] = proto_field(
+        description="The declaration to rename: a symbol, a node, a byte range, or a match.",
+        number=5,
+    )
+    arguments: Field[core.RenameArguments] = proto_field(
+        description="The new name, and the source eligible for propagation.", number=6
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class MoveParams(ClosedModel):
+    "Moves a declaration or file to another container or path and updates the imports and references that reach it."
+
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
+        number=1,
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    formatting: Field[core.FormattingPolicy] = proto_field(
+        description="Formatting applied after this operation's edits resolve.", number=4
+    )
+    target: Field[core.Address] = proto_field(
+        description="The declaration or file to move.", number=5
+    )
+    arguments: Field[core.MoveArguments] = proto_field(
+        description="The destination, and the source eligible for import and reference updates.",
+        number=6,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class DeleteParams(ClosedModel):
+    "Removes a declaration. Without a policy this is a mechanical removal that analyses no references and claims no reference guarantee. With one, the adapter classifies every remaining use, applies the stated disposition, and refuses the operation when reference coverage is incomplete."
+
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
+        number=1,
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    formatting: Field[core.FormattingPolicy] = proto_field(
+        description="Formatting applied after this operation's edits resolve.", number=4
+    )
+    target: Field[core.Address] = proto_field(
+        description="The declaration or file to remove.", number=5
+    )
+    arguments: Field[core.SafeDeleteArguments] = proto_field(
+        description="The disposition for each classified use, and the source it may be applied in.",
+        number=6,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ChangeSignatureParams(ClosedModel):
+    "Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument lists: a new required parameter has to be supplied at every call site, which is why the operation commonly raises a `behavior_unknown` confirmation."
+
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
+        number=1,
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    formatting: Field[core.FormattingPolicy] = proto_field(
+        description="Formatting applied after this operation's edits resolve.", number=4
+    )
+    target: Field[core.Address] = proto_field(
+        description="The callable whose signature changes.", number=5
+    )
+    arguments: Field[core.ChangeSignatureArguments] = proto_field(
+        description="The desired callable shape, its propagation, and the source it may reach.",
+        number=6,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ActParams(ClosedModel):
+    "Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an adapter offers that has no portable contract. Rift validates `arguments` against the offer's advertised schema. An offer whose kind belongs to a portable family is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points."
+
+    on: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "Retained candidate this operation continues. Omission starts from `rev`. The "
+            "operation resolves against that candidate's tree, so a rename can follow the edit "
+            "that created what it renames, and the chain is the transaction."
+        ),
+        number=1,
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description=(
+            "State against which resolution begins when `on` is absent. Omission selects the "
+            "connection's current accepted revision."
+        ),
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+    formatting: Field[core.FormattingPolicy] = proto_field(
+        description="Formatting applied after this operation's edits resolve.", number=4
+    )
+    action: Field[core.ActionOfferId] = proto_field(
+        description="The offer to resolve, as the actions resource returned it.",
+        number=5,
+    )
+    arguments: Field[dict[str, Any]] = proto_field(
+        description=(
+            "Arguments accepted by the offer's `ActionDescriptor.arguments_schema`. An action "
+            "with no parameters receives an empty object."
+        ),
+        number=6,
+    )
+
+
+@union(
+    owner=MCP,
+    oneof="variant",
+    variants=(
+        Variant(None, "edit_params", 1, EditParams),
+        Variant(None, "patch_params", 2, PatchParams),
+        Variant(None, "rewrite_params", 3, RewriteParams),
+        Variant(None, "revert_params", 4, RevertParams),
+        Variant(None, "merge_params", 5, MergeParams),
+        Variant(None, "rename_params", 6, RenameParams),
+        Variant(None, "move_params", 7, MoveParams),
+        Variant(None, "delete_params", 8, DeleteParams),
+        Variant(None, "change_signature_params", 9, ChangeSignatureParams),
+        Variant(None, "act_params", 10, ActParams),
+        Variant(None, "integrate_params", 11, "IntegrateParams"),
+    ),
+)
+class PreviewOperation(ProtocolRoot):
+    "The request one retained candidate was built from, as the tool received it. It appears in the preview resource rather than in any tool parameter, so a plan can be read back and a refresh can repeat exactly what was asked."
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ResolvedOperation(ClosedModel):
+    "Bounded summary of one candidate's operation after resolution. The preview resource pages its exact edits and evidence."
+
     owners: Field[list[core.Language]] = proto_field(
         description=(
             "Language adapters that contributed to resolution, sorted by name and dialect "
-            "with null first. Empty for a change resolved entirely by Rift."
+            "with null first. Empty for an operation resolved entirely by Rift."
         ),
-        number=2,
+        number=1,
         json_schema_extra={"uniqueItems": True},
     )
     edit_count: Field[int] = proto_field(
-        description="Number of concrete Edit records retained for this change.",
+        description="Number of concrete Edit records retained for this operation.",
+        ge=0,
+        le=4294967295,
+        number=2,
+    )
+    precondition_count: Field[int] = proto_field(
+        description="Number of satisfied preconditions retained for this operation.",
         ge=0,
         le=4294967295,
         number=3,
     )
-    precondition_count: Field[int] = proto_field(
-        description="Number of satisfied preconditions retained for this change.",
+    effect_count: Field[int] = proto_field(
+        description="Number of semantic effects retained for this operation.",
         ge=0,
         le=4294967295,
         number=4,
     )
-    effect_count: Field[int] = proto_field(
-        description="Number of semantic effects retained for this change.",
+    guarantee_count: Field[int] = proto_field(
+        description="Number of guarantee evidence records retained for this operation.",
         ge=0,
         le=4294967295,
         number=5,
     )
-    guarantee_count: Field[int] = proto_field(
-        description="Number of guarantee evidence records retained for this change.",
-        ge=0,
-        le=4294967295,
-        number=6,
-    )
     coverage: Field[core.Coverage] = proto_field(
         description="How completely Rift and its adapters resolved the request. Publication requires complete coverage.",
-        number=7,
+        number=6,
     )
     diagnostic_count: Field[int] = proto_field(
-        description="Number of resolution diagnostics retained for this change.",
+        description="Number of resolution diagnostics retained for this operation.",
         ge=0,
         le=4294967295,
-        number=8,
+        number=7,
     )
 
 
@@ -2568,23 +3047,19 @@ class CommandValidatorChangedPaths(str, Enum):
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class CommandValidatorGuarantees(ClosedModel):
-    changes: Field[list[int]] = proto_field(
-        description="Requested change indexes to which this evidence applies.",
-        min_length=1,
-        number=1,
-        json_schema_extra={"uniqueItems": True},
-    )
+    "What a passing run of one command is taken to establish. The evidence covers the published chain, which is the whole of what the command ran against."
+
     kind: Field[core.GuaranteeKind] = proto_field(
-        description="Guarantee established when the validator passes.", number=2
+        description="Guarantee established when the validator passes.", number=1
     )
     scope: Field[core.CoverageScope] = proto_field(
-        description="Source over which the command checks the property.", number=3
+        description="Source over which the command checks the property.", number=2
     )
     detail: Field[str] = proto_field(
         description="Exact property the command checks and limits on interpreting a pass.",
         min_length=1,
         max_length=4096,
-        number=4,
+        number=3,
     )
 
 
@@ -2657,7 +3132,7 @@ class CommandValidator(ClosedModel):
     )
     output_limit_bytes: Field[int] = proto_field(
         description=(
-            "Captured prefix limit for each output stream. `ValidatorOutput.total_bytes` "
+            "Captured prefix limit for each output stream. `CapturedText.total_bytes` "
             "reports the omitted size. The upper bound keeps one escaped validator result "
             "inside a 65536-byte preview page."
         ),
@@ -2676,32 +3151,6 @@ class CommandValidator(ClosedModel):
     determinism: Field[CommandValidatorDeterminism] = proto_field(
         description="Whether an identical candidate and environment are expected to produce the same result.",
         number=10,
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class ValidatorOutput(ClosedModel):
-    "A bounded UTF-8 rendering of one process stream. Invalid byte sequences become U+FFFD. The digest covers the complete raw stream, including bytes beyond the captured prefix."
-
-    text: Field[str] = proto_field(description="Decoded captured prefix.", number=1)
-    captured_bytes: Field[int] = proto_field(
-        description="Raw bytes represented by `text` before replacement decoding.",
-        ge=0,
-        number=2,
-    )
-    total_bytes: Field[int] = proto_field(
-        description="Raw bytes emitted by the complete stream.", ge=0, number=3
-    )
-    truncated: Field[bool] = proto_field(
-        description="Whether bytes after the captured prefix were omitted from `text`.",
-        number=4,
-    )
-    digest: Field[core.Digest] = proto_field(
-        description=(
-            "SHA-256 of the complete raw stream. This retains the identity of omitted bytes "
-            "when `truncated` is true."
-        ),
-        number=5,
     )
 
 
@@ -2731,10 +3180,10 @@ class ValidatorResultPassed(ClosedModel):
         ),
         number=4,
     )
-    stdout: Field[ValidatorOutput] = proto_field(
+    stdout: Field[core.CapturedText] = proto_field(
         description="Bounded standard output from the process.", number=5
     )
-    stderr: Field[ValidatorOutput] = proto_field(
+    stderr: Field[core.CapturedText] = proto_field(
         description="Bounded standard error from the process.", number=6
     )
 
@@ -2767,10 +3216,10 @@ class ValidatorResultFailed(ClosedModel):
         ),
         number=4,
     )
-    stdout: Field[ValidatorOutput] = proto_field(
+    stdout: Field[core.CapturedText] = proto_field(
         description="Bounded standard output from the process.", number=5
     )
-    stderr: Field[ValidatorOutput] = proto_field(
+    stderr: Field[core.CapturedText] = proto_field(
         description="Bounded standard error from the process.", number=6
     )
 
@@ -2782,23 +3231,16 @@ class ValidatorResultFailed(ClosedModel):
         return value
 
 
-@definition(
+@union(
     owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("passed", "passed", 1, ValidatorResultPassed),
-            Variant("failed", "failed", 2, ValidatorResultFailed),
-        ),
+    oneof="variant",
+    discriminator="status",
+    variants=(
+        Variant("passed", "passed", 1, ValidatorResultPassed),
+        Variant("failed", "failed", 2, ValidatorResultFailed),
     ),
-    schema_extra={},
 )
-class ValidatorResult(
-    ProtocolRoot[
-        "Annotated[ValidatorResultPassed | ValidatorResultFailed, schema_field(discriminator='status')]"
-    ]
-):
+class ValidatorResult(ProtocolRoot):
     "The completed outcome of one declared validator. Exit status zero passes. Every other exit status fails. A workspace, launch, timeout, or capture failure raises `validator_execution_failure` before Rift produces candidate evidence."
 
 
@@ -2845,10 +3287,19 @@ class CandidateSummary(ClosedModel):
     "Bounded identity and validation evidence for a retained apply or integration candidate. The linked preview resource carries the complete plan."
 
     preview: Field[core.PreviewId] = proto_field(
-        description="The retained plan's stable identity.", number=1
+        description="The retained plan's stable identity, derived from the request that produced it.",
+        number=1,
     )
     base: Field[core.Snapshot] = proto_field(
-        description="The state against which the first change was resolved.", number=2
+        description="The state against which this operation resolved.", number=2
+    )
+    parent: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description=(
+            "The candidate this one continues, or null when it started from `rev`. Following "
+            "`parent` from a tip reads the complete chain a publication would advance."
+        ),
+        number=8,
     )
     expected_head: Field[core.Commit] = proto_field(
         description=(
@@ -2878,66 +3329,9 @@ class CandidateSummary(ClosedModel):
     )
 
 
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class PreviewResourcePayloadEdits(ClosedModel):
-    change: Field[int] = proto_field(
-        description="Requested change index that produced this edit.",
-        ge=0,
-        le=4294967295,
-        number=1,
-    )
-    edit: Field[core.Edit] = proto_field(
-        description="Concrete filesystem effect.", number=2
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class PreviewResourcePayloadPreconditions(ClosedModel):
-    change: Field[int] = proto_field(
-        description="Requested change index checked by this condition.",
-        ge=0,
-        le=4294967295,
-        number=1,
-    )
-    precondition: Field[core.OperationPrecondition] = proto_field(number=2)
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class PreviewResourcePayloadEffects(ClosedModel):
-    change: Field[int] = proto_field(
-        description="Requested change index that produced this effect.",
-        ge=0,
-        le=4294967295,
-        number=1,
-    )
-    effect: Field[core.OperationEffect] = proto_field(number=2)
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class PreviewResourcePayloadGuarantees(ClosedModel):
-    change: Field[int] = proto_field(
-        description="Requested change index supported by this evidence.",
-        ge=0,
-        le=4294967295,
-        number=1,
-    )
-    evidence: Field[core.GuaranteeEvidence] = proto_field(number=2)
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class PreviewResourcePayloadResolutionDiagnostics(ClosedModel):
-    change: Field[int] = proto_field(
-        description="Requested change index that produced this finding.",
-        ge=0,
-        le=4294967295,
-        number=1,
-    )
-    diagnostic: Field[core.Diagnostic] = proto_field(number=2)
-
-
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class PreviewResourcePayload(ClosedModel):
-    "One page of a retained candidate contract. Concatenating every array from successive pages reconstructs the complete plan and validation evidence. Every page repeats the URI, base, candidate, and bounded validation verdict."
+    "One page of a retained candidate. Concatenating every array from successive pages reconstructs the complete plan and its validation evidence. Every page repeats the URI, base, candidate, and bounded verdict. A candidate holds one operation; `parent` reads back the chain it belongs to."
 
     uri: Field[PreviewResourceUri] = proto_field(
         description="The preview resource URI for this page.", number=1
@@ -2945,43 +3339,40 @@ class PreviewResourcePayload(ClosedModel):
     base: Field[core.Snapshot] = proto_field(
         description="The state from which resolution began.", number=2
     )
-    candidate: Field[core.Commit] = proto_field(
-        description="The immutable candidate commit produced by the complete plan.",
+    parent: Field[core.PreviewId | None] = proto_field(
+        default=None,
+        description="The candidate this one continues, or null when it started from a revision.",
         number=3,
     )
-    validators: Field[list[CommandValidator]] = proto_field(
-        description="Caller-supplied checks on this page, preserving declaration order.",
+    candidate: Field[core.Commit] = proto_field(
+        description="The immutable candidate commit produced by this operation.",
         number=4,
     )
-    requested: Field[list[Change]] = proto_field(
-        description="Requested changes on this page, preserving their transaction order.",
+    operation: Field[PreviewOperation] = proto_field(
+        description="The request this candidate was built from, as the tool received it.",
         number=5,
     )
-    resolved: Field[list[ResolvedChange]] = proto_field(
-        description="Bounded resolution summaries on this page, ordered by request index.",
-        number=6,
+    resolved: Field[ResolvedOperation] = proto_field(
+        description="Bounded resolution summary for that operation.", number=6
     )
-    edits: Field[list[PreviewResourcePayloadEdits]] = proto_field(
-        description="Concrete edits on this page, ordered by change index and canonical edit order.",
+    edits: Field[list[core.Edit]] = proto_field(
+        description="Concrete edits on this page, in canonical file-and-range order.",
         number=7,
     )
-    preconditions: Field[list[PreviewResourcePayloadPreconditions]] = proto_field(
-        description="Satisfied preconditions on this page, ordered by change index and check order.",
-        number=8,
+    preconditions: Field[list[core.OperationPrecondition]] = proto_field(
+        description="Satisfied preconditions on this page, in check order.", number=8
     )
-    effects: Field[list[PreviewResourcePayloadEffects]] = proto_field(
-        description="Semantic effects on this page, ordered by change index and adapter emission order.",
+    effects: Field[list[core.OperationEffect]] = proto_field(
+        description="Semantic effects on this page, in adapter emission order.",
         number=9,
     )
-    guarantees: Field[list[PreviewResourcePayloadGuarantees]] = proto_field(
-        description="Guarantee evidence on this page, ordered by change index and guarantee kind.",
+    guarantees: Field[list[core.GuaranteeEvidence]] = proto_field(
+        description="Guarantee evidence on this page, ordered by guarantee kind.",
         number=10,
     )
-    resolution_diagnostics: Field[list[PreviewResourcePayloadResolutionDiagnostics]] = (
-        proto_field(
-            description="Resolution findings on this page, ordered by change index and source location.",
-            number=11,
-        )
+    resolution_diagnostics: Field[list[core.Diagnostic]] = proto_field(
+        description="Resolution findings on this page, ordered by source location.",
+        number=11,
     )
     files: Field[list[core.FileChange]] = proto_field(
         description=(
@@ -2993,278 +3384,92 @@ class PreviewResourcePayload(ClosedModel):
     validation: Field[CandidateValidation] = proto_field(
         description="Bounded verdict for the complete candidate.", number=13
     )
+    validators: Field[list[CommandValidator]] = proto_field(
+        description=(
+            "Command declarations supplied at publication, preserving declaration order. Empty "
+            "until the candidate is published."
+        ),
+        number=14,
+    )
     adapter_reports: Field[list[core.ValidationReport]] = proto_field(
         description=(
             "Adapter reports on this page, sorted by language name and dialect with null "
             "first and unique across the complete resource."
         ),
-        number=14,
+        number=15,
     )
     validator_results: Field[list[ValidatorResult]] = proto_field(
         description=(
             "Command-validator results on this page, preserving declaration order and "
             "appearing once across the complete resource."
         ),
-        number=15,
+        number=16,
     )
     confirmations: Field[list[core.ConfirmationRequirement]] = proto_field(
         description="Acknowledgements on this page, sorted by id across the complete resource.",
-        number=16,
+        number=17,
         json_schema_extra={"uniqueItems": True},
     )
     diagnostics: Field[list[core.Diagnostic]] = proto_field(
         description="Rift findings about the complete plan, including path, ownership, and formatting decisions.",
-        number=17,
+        number=18,
     )
     next: Field[PreviewResourceUri | None] = proto_field(
         description="The URI for the next plan page, or null after the final page.",
-        number=18,
+        number=19,
     )
 
 
 @definition(
     owner=MCP,
     public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(None, "preview_apply_params", 1, lambda: PreviewApplyParams),
-            Variant(None, "refresh_apply_params", 2, lambda: RefreshApplyParams),
-            Variant(None, "publish_apply_params", 3, lambda: PublishApplyParams),
-        ),
-    ),
-    schema_extra={},
-)
-class ApplyParams(
-    ProtocolRoot[
-        "Annotated[PreviewApplyParams | RefreshApplyParams | PublishApplyParams, schema_field(discriminator='mode')]"
-    ]
-):
-    "One phase of the candidate lifecycle. Preview creates a retained plan, refresh re-resolves it on a selected base, and publish attempts to advance the accepted ref with that contract."
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class PreviewApplyParams(ClosedModel):
-    """Builds and validates an immutable candidate while leaving the accepted ref and connection worktree unchanged."""
-
-    mode: Field[Literal["preview"]] = proto_field(
-        description="Selects candidate creation.", number=1
-    )
-    rev: Field[core.Revision | None] = proto_field(
-        default=None,
-        description=(
-            "State against which resolution begins. Omission selects the connection's current "
-            "accepted revision."
-        ),
-        number=2,
-    )
-    expected_accepted: Field[core.Commit | None] = proto_field(
-        default=None,
-        description=(
-            "Accepted-ref head expected at publication. Omission selects the current accepted "
-            "head. The selected commit must be an ancestor of `rev`."
-        ),
-        number=3,
-    )
-    changes: Field[list[Change]] = proto_field(
-        description="Ordered deterministic changes. Each observes the result of its predecessors.",
-        min_length=1,
-        number=4,
-    )
-    validators: Field[list[CommandValidator]] = proto_field(
-        description=(
-            "Caller-supplied acceptance checks. The `edit` profile accepts an empty array. "
-            "The `full` profile may accept up to `Limits.max_validators` declarations."
-        ),
-        number=5,
-        json_schema_extra={"uniqueItems": True},
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RefreshApplyParams(ClosedModel):
-    "Re-resolves a retained preview's exact changes and validators on a selected base. It creates a new preview and leaves the accepted ref unchanged."
-
-    mode: Field[Literal["refresh"]] = proto_field(
-        description="Selects preview refresh.", number=1
-    )
-    previous: Field[core.PreviewId] = proto_field(
-        description="The retained contract to run again.", number=2
-    )
-    rev: Field[core.Revision | None] = proto_field(
-        default=None,
-        description="New base. Omission selects the current accepted revision.",
-        number=3,
-    )
-    expected_accepted: Field[core.Commit | None] = proto_field(
-        default=None,
-        description=(
-            "Accepted-ref head expected at publication. Omission selects the current accepted "
-            "head. The selected commit must be an ancestor of `rev`."
-        ),
-        number=4,
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class PublishApplyParams(ClosedModel):
-    "Attempts to advance the accepted ref with a retained preview. Rift replays resolution and validation. Every deterministic preview record and the candidate tree must match. It then compares the accepted ref with the retained base and advances it to the candidate. Fresh validator verdicts govern publication; captured output may differ."
-
-    mode: Field[Literal["publish"]] = proto_field(
-        description="Selects publication.", number=1
-    )
-    preview: Field[core.PreviewId] = proto_field(
-        description="The retained contract to publish.", number=2
-    )
-    idempotency_key: Field[str] = proto_field(
-        description=(
-            "Caller-chosen retry key. Rift retains the key with the exact publish request and "
-            "result, returning that result on an exact retry and refusing reuse with "
-            "different input."
-        ),
-        pattern="^[\\x21-\\x7E]{1,256}$",
-        number=3,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        description=(
-            "Every currently required confirmation id, sorted bytewise. Missing or extra ids "
-            "refuse publication."
-        ),
-        number=4,
-        json_schema_extra={"uniqueItems": True},
-    )
-
-
-@definition(
-    owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(None, "preview_apply_result", 1, lambda: PreviewApplyResult),
-            Variant(None, "refresh_apply_result", 2, lambda: RefreshApplyResult),
-            Variant(None, "accepted_apply_result", 3, lambda: AcceptedApplyResult),
-            Variant(None, "rejected_apply_result", 4, lambda: RejectedApplyResult),
-            Variant(None, "refused_apply_result", 5, lambda: RefusedApplyResult),
-            Variant(None, "conflict_apply_result", 6, lambda: ConflictApplyResult),
-        ),
-    ),
-    schema_extra={},
-)
-class ApplyResult(
-    ProtocolRoot[
-        (
-            "Annotated[PreviewApplyResult | RefreshApplyResult | AcceptedApplyResult | "
-            "RejectedApplyResult | RefusedApplyResult | ConflictApplyResult, "
-            "schema_field(discriminator='status')]"
-        )
-    ]
-):
-    "A completed candidate lifecycle decision. Malformed requests, unavailable infrastructure, storage faults, and validator execution failures use `ErrorData`."
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class PreviewApplyResult(ClosedModel):
-    """A retained preview created without advancing the accepted ref or materializing its files."""
-
-    status: Field[Literal["preview"]] = proto_field(
-        description="Identifies preview creation.", number=1
-    )
-    summary: Field[CandidateSummary] = proto_field(
-        description="Candidate identity and acceptance evidence.", number=2
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RefreshApplyResult(ClosedModel):
-    """A new retained preview produced from an earlier contract and a selected base."""
-
-    status: Field[Literal["refresh"]] = proto_field(
-        description="Identifies preview refresh.", number=1
-    )
-    previous: Field[core.PreviewId] = proto_field(
-        description="The preview whose contract was rerun.", number=2
-    )
-    summary: Field[CandidateSummary] = proto_field(
-        description="Identity and evidence for the refreshed candidate.", number=3
-    )
-    changed_request_count: Field[int] = proto_field(
-        description=(
-            "Number of request indexes whose resolved owner, edits, preconditions, effects, "
-            "guarantees, coverage, or diagnostics differ from the previous preview. Comparing "
-            "the two preview resources yields the exact indexes."
-        ),
-        ge=0,
-        le=4294967295,
-        number=4,
-    )
-    changed_file_count: Field[int] = proto_field(
-        description=(
-            "Number of candidate paths that differ from the previous preview. Comparing the "
-            "paginated file records yields the exact paths."
-        ),
-        ge=0,
-        le=4294967295,
-        number=5,
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class AcceptedApplyResult(ClosedModel):
-    "Publication advanced the accepted ref to the retained candidate commit. `accepted` therefore equals `summary.candidate`. The connection worktree remains unchanged until `persist` materializes it."
-
-    status: Field[Literal["accepted"]] = proto_field(
-        description="Identifies successful publication.", number=1
-    )
-    summary: Field[CandidateSummary] = proto_field(
-        description="The published candidate and its acceptance evidence.", number=2
-    )
-    accepted: Field[core.Commit] = proto_field(
-        description="The commit now held by the accepted ref.", number=3
-    )
-    replayed: Field[bool] = proto_field(
-        description="Whether Rift returned a previously stored result for this exact idempotency key and request.",
-        number=4,
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RejectedApplyResult(ClosedModel):
-    "Publication reran the retained contract and validation did not pass. The candidate remains readable as a preview and the accepted ref is unchanged."
-
-    status: Field[Literal["rejected"]] = proto_field(
-        description="Identifies validation rejection.", number=1
-    )
-    summary: Field[CandidateSummary] = proto_field(
-        description="The rejected candidate and the evidence that prevented acceptance.",
-        number=2,
-    )
-
-
-@definition(
-    owner=MCP,
-    public=False,
     proto=Proto.enum(
-        "Reason",
+        "RefusalReason",
         (
-            EnumValue("unsupported", "UNSUPPORTED", 1),
-            EnumValue("unmet_precondition", "UNMET_PRECONDITION", 2),
-            EnumValue("ambiguous_target", "AMBIGUOUS_TARGET", 3),
-            EnumValue("stale_preview", "STALE_PREVIEW", 4),
-            EnumValue("stale_action", "STALE_ACTION", 5),
-            EnumValue("stale_match", "STALE_MATCH", 6),
-            EnumValue("cardinality_mismatch", "CARDINALITY_MISMATCH", 7),
-            EnumValue("confirmation_required", "CONFIRMATION_REQUIRED", 8),
-            EnumValue("unsafe_effect", "UNSAFE_EFFECT", 9),
-            EnumValue("formatter_unsupported", "FORMATTER_UNSUPPORTED", 10),
-            EnumValue("validation_incomplete", "VALIDATION_INCOMPLETE", 11),
+            EnumValue("unsupported", "REFUSAL_REASON_UNSUPPORTED", 1),
+            EnumValue("unmet_precondition", "REFUSAL_REASON_UNMET_PRECONDITION", 2),
+            EnumValue("ambiguous_target", "REFUSAL_REASON_AMBIGUOUS_TARGET", 3),
+            EnumValue("stale_preview", "REFUSAL_REASON_STALE_PREVIEW", 4),
+            EnumValue("stale_action", "REFUSAL_REASON_STALE_ACTION", 5),
+            EnumValue("stale_match", "REFUSAL_REASON_STALE_MATCH", 6),
+            EnumValue("cardinality_mismatch", "REFUSAL_REASON_CARDINALITY_MISMATCH", 7),
+            EnumValue(
+                "confirmation_required", "REFUSAL_REASON_CONFIRMATION_REQUIRED", 8
+            ),
+            EnumValue("unsafe_effect", "REFUSAL_REASON_UNSAFE_EFFECT", 9),
+            EnumValue(
+                "formatter_unsupported", "REFUSAL_REASON_FORMATTER_UNSUPPORTED", 10
+            ),
+            EnumValue(
+                "validation_incomplete", "REFUSAL_REASON_VALIDATION_INCOMPLETE", 11
+            ),
+            EnumValue("portable_family", "REFUSAL_REASON_PORTABLE_FAMILY", 12),
+            EnumValue("checked_out_target", "REFUSAL_REASON_CHECKED_OUT_TARGET", 13),
+            EnumValue("dirty_target", "REFUSAL_REASON_DIRTY_TARGET", 14),
         ),
-        placement=Placement("reason", 4),
+        named=True,
     ),
-    schema_extra={},
+    schema_extra={
+        "rift:enumDescriptions": {
+            "unsupported": "No adapter implements this operation for the language it reaches, or repository state cannot satisfy the contract.",
+            "unmet_precondition": "A condition checked before resolution failed. The failed entry is in `preconditions`.",
+            "ambiguous_target": "The address resolves to several targets. Narrow it and ask again.",
+            "stale_preview": "The retained candidate no longer matches the head or source it was built against.",
+            "stale_action": "The offer was discovered against a snapshot that has moved. Read the actions resource again.",
+            "stale_match": "The match was found against a snapshot that has moved. Search again.",
+            "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
+            "confirmation_required": "Publication needs an acknowledgement the caller did not supply.",
+            "unsafe_effect": "The complete effect reaches outside what the caller can have meant — outside the project, or into generated source.",
+            "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
+            "validation_incomplete": "Required adapter or command validation did not complete.",
+            "portable_family": "The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
+            "checked_out_target": "The integration target is checked out and automatic integration is disabled.",
+            "dirty_target": "The checked-out integration target has local changes.",
+        }
+    },
 )
-class RefusedApplyResultReason(str, Enum):
-    """Condition the caller can act on."""
+class RefusalReason(str, Enum):
+    "Why Rift declined a candidate operation or its publication. A refusal is a completed decision with evidence, not a transport failure; `ErrorData` carries the failures that never reached a decision."
 
     UNSUPPORTED = "unsupported"
     UNMET_PRECONDITION = "unmet_precondition"
@@ -3277,43 +3482,9 @@ class RefusedApplyResultReason(str, Enum):
     UNSAFE_EFFECT = "unsafe_effect"
     FORMATTER_UNSUPPORTED = "formatter_unsupported"
     VALIDATION_INCOMPLETE = "validation_incomplete"
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RefusedApplyResult(ClosedModel):
-    "Resolution or publication stopped before a valid candidate outcome existed. No accepted ref or connection worktree changes."
-
-    status: Field[Literal["refused"]] = proto_field(
-        description="Identifies a domain refusal.", number=1
-    )
-    base: Field[core.Snapshot] = proto_field(
-        description="State against which the refused work was attempted.", number=2
-    )
-    change: Field[int | None] = proto_field(
-        description="Zero-based requested change that caused the refusal, or null for a publication-wide condition.",
-        number=3,
-    )
-    reason: Field[RefusedApplyResultReason] = proto_field(
-        description="Condition the caller can act on.", number=4
-    )
-    preconditions: Field[list[core.OperationPrecondition]] = proto_field(
-        description="Conditions checked before refusal, including at least one failed entry for `unmet_precondition`.",
-        number=5,
-    )
-    blockers: Field[list[core.OperationBlocker]] = proto_field(
-        description="Existing code, paths, or relationships that prevented a deterministic resolution.",
-        number=6,
-    )
-    diagnostics: Field[list[core.Diagnostic]] = proto_field(
-        description="Evidence that explains the refusal.", number=7
-    )
-    suggestions: Field[list[Change]] = proto_field(
-        description=(
-            "Deterministic replacement changes that satisfy the condition Rift could "
-            "identify. Empty when no safe repair is known."
-        ),
-        number=8,
-    )
+    PORTABLE_FAMILY = "portable_family"
+    CHECKED_OUT_TARGET = "checked_out_target"
+    DIRTY_TARGET = "dirty_target"
 
 
 @definition(
@@ -3323,138 +3494,291 @@ class RefusedApplyResult(ClosedModel):
         "Reason",
         (
             EnumValue("stale_base", "STALE_BASE", 1),
-            EnumValue("idempotency_key_reused", "IDEMPOTENCY_KEY_REUSED", 2),
+            EnumValue("target_moved", "TARGET_MOVED", 2),
         ),
         placement=Placement("reason", 2),
     ),
-    schema_extra={},
+    schema_extra={
+        "rift:enumDescriptions": {
+            "stale_base": "The accepted head moved after the candidate was built.",
+            "target_moved": "The integration target head moved after the candidate was built.",
+        }
+    },
 )
-class ConflictApplyResultReason(str, Enum):
-    """Which identity comparison failed."""
+class ConflictReason(str, Enum):
+    "Which compare-and-swap lost. Publication is idempotent by construction: a retry that finds the destination already holding the candidate returns the same success."
 
     STALE_BASE = "stale_base"
-    IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
+    TARGET_MOVED = "target_moved"
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RefusedResult(ClosedModel):
+    "Resolution or publication stopped before a valid candidate existed. No ref and no worktree changed."
+
+    status: Field[Literal["refused"]] = proto_field(
+        description="Identifies a domain refusal.", default="refused"
+    )
+    base: Field[core.Snapshot] = proto_field(
+        description="State against which the refused work was attempted.", number=1
+    )
+    reason: Field[RefusalReason] = proto_field(
+        description="The condition the caller can act on.", number=2
+    )
+    preconditions: Field[list[core.OperationPrecondition]] = proto_field(
+        description=(
+            "Conditions checked before refusal, including at least one failed entry for "
+            "`unmet_precondition`."
+        ),
+        number=3,
+    )
+    blockers: Field[list[core.OperationBlocker]] = proto_field(
+        description="Existing code, paths, or relationships that prevented a deterministic resolution.",
+        number=4,
+    )
+    diagnostics: Field[list[core.Diagnostic]] = proto_field(
+        description="Evidence that explains the refusal.", number=5
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class CandidateCreated(ClosedModel):
+    "A retained candidate. Nothing has been published: the accepted ref, the integration target, and the connection worktree are unchanged until `publish` and `persist`."
+
+    status: Field[Literal["candidate"]] = proto_field(
+        description="Identifies candidate creation.", default="candidate"
+    )
+    summary: Field[CandidateSummary] = proto_field(
+        description="Candidate identity and acceptance evidence.", number=1
+    )
+
+
+@union(
+    owner=MCP,
+    oneof="variant",
+    discriminator="status",
+    variants=(
+        Variant("candidate", "candidate", 1, CandidateCreated),
+        Variant("refused", "refused", 2, RefusedResult),
+    ),
+)
+class CandidateResult(ProtocolRoot):
+    "What every candidate-creating tool returns: a retained candidate, or a refusal carrying the conditions and code that stopped it. Malformed requests, unavailable infrastructure, storage faults, and validator execution failures use `ErrorData` instead."
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class ConflictApplyResult(ClosedModel):
-    "Publication reached compare-and-swap after another accepted change had moved the ref, or reused an idempotency key for different input. The accepted ref is unchanged by this request."
+class RefreshParams(ClosedModel):
+    "Re-runs a retained candidate's operation on a newer base. Because each candidate holds one operation and names the candidate it continued, refreshing a chain replays the same requests in the same order."
+
+    preview: Field[core.PreviewId] = proto_field(
+        description="The retained candidate to run again.", number=1
+    )
+    rev: Field[core.Revision | None] = proto_field(
+        default=None,
+        description="New base. Omission selects the current accepted revision.",
+        number=2,
+    )
+    expected_accepted: Field[core.Commit | None] = proto_field(
+        default=None,
+        description=(
+            "Accepted-ref head expected at publication. Omission selects the current accepted "
+            "head. The selected commit must be an ancestor of `rev`."
+        ),
+        number=3,
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RefreshedResult(ClosedModel):
+    """A new retained candidate produced from an earlier one and a selected base."""
+
+    status: Field[Literal["refreshed"]] = proto_field(
+        description="Identifies a refreshed candidate.", default="refreshed"
+    )
+    previous: Field[core.PreviewId] = proto_field(
+        description="The candidate whose operation was rerun.", number=1
+    )
+    summary: Field[CandidateSummary] = proto_field(
+        description="Identity and evidence for the refreshed candidate.", number=2
+    )
+    changed_record_count: Field[int] = proto_field(
+        description=(
+            "Number of resolved records — edits, preconditions, effects, guarantees, "
+            "coverage, diagnostics — that differ from the previous candidate. Comparing the "
+            "two preview resources yields the exact records."
+        ),
+        ge=0,
+        le=4294967295,
+        number=3,
+    )
+    changed_file_count: Field[int] = proto_field(
+        description=(
+            "Number of candidate paths that differ from the previous candidate. Comparing the "
+            "paginated file records yields the exact paths."
+        ),
+        ge=0,
+        le=4294967295,
+        number=4,
+    )
+
+
+@union(
+    owner=MCP,
+    oneof="variant",
+    discriminator="status",
+    variants=(
+        Variant("refreshed", "refreshed", 1, RefreshedResult),
+        Variant("refused", "refused", 2, RefusedResult),
+    ),
+)
+class RefreshResult(ProtocolRoot):
+    """A rerun of one retained candidate against a newer base."""
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class PublishParams(ClosedModel):
+    "Publishes one retained candidate. Rift replays the chain's resolution, runs the declared command validators against the candidate, and advances the destination by compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration. Validators are declared here rather than at creation, so building a change does not pay for a test suite at every step."
+
+    preview: Field[core.PreviewId] = proto_field(
+        description="The retained candidate to publish. Its chain publishes with it.",
+        number=1,
+    )
+    confirmations: Field[list[int]] = proto_field(
+        description=(
+            "Every confirmation id the candidate currently requires, sorted bytewise. Missing "
+            "or extra ids refuse publication."
+        ),
+        number=2,
+        json_schema_extra={"uniqueItems": True},
+    )
+    validators: Field[list[CommandValidator]] = proto_field(
+        description=(
+            "Caller-supplied acceptance checks run against the candidate before it is "
+            "published. The `edit` profile accepts an empty array; the `full` profile accepts "
+            "up to `Limits.max_validators` declarations."
+        ),
+        number=3,
+        json_schema_extra={"uniqueItems": True},
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class AcceptedResult(ClosedModel):
+    "Publication advanced the accepted ref to the retained candidate commit, so `accepted` equals `summary.candidate`. The connection worktree remains unchanged until `persist` materializes it."
+
+    status: Field[Literal["accepted"]] = proto_field(
+        description="Identifies successful publication.", default="accepted"
+    )
+    summary: Field[CandidateSummary] = proto_field(
+        description="The published candidate and its acceptance evidence.", number=1
+    )
+    accepted: Field[core.Commit] = proto_field(
+        description="The commit now held by the accepted ref.", number=2
+    )
+    replayed: Field[bool] = proto_field(
+        description=(
+            "Whether the accepted ref already held this candidate, so publication returned the "
+            "earlier outcome without repeating it."
+        ),
+        number=3,
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class IntegratedResult(ClosedModel):
+    """Publication advanced an integration target to the retained merge candidate."""
+
+    status: Field[Literal["integrated"]] = proto_field(
+        description="Identifies successful integration publication.",
+        default="integrated",
+    )
+    target: Field[IntegrationTarget] = proto_field(
+        description="Local branch advanced by publication.", number=1
+    )
+    previous: Field[core.Commit] = proto_field(
+        description="Target head replaced by publication.", number=2
+    )
+    integrated: Field[core.Commit] = proto_field(
+        description="Commit now held by the target ref.", number=3
+    )
+    summary: Field[CandidateSummary] = proto_field(
+        description="Published merge candidate and fresh validation evidence.", number=4
+    )
+    replayed: Field[bool] = proto_field(
+        description="Whether the target already held this candidate, so publication returned the earlier outcome.",
+        number=5,
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RejectedResult(ClosedModel):
+    "Publication reran the retained contract and validation did not pass. The candidate remains readable as a preview and no ref moved."
+
+    status: Field[Literal["rejected"]] = proto_field(
+        description="Identifies validation rejection.", default="rejected"
+    )
+    summary: Field[CandidateSummary] = proto_field(
+        description="The rejected candidate and the evidence that prevented acceptance.",
+        number=1,
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ConflictResult(ClosedModel):
+    """Publication reached compare-and-swap after another publication had moved the destination ref."""
 
     status: Field[Literal["conflict"]] = proto_field(
-        description="Identifies an optimistic concurrency conflict.", number=1
+        description="Identifies an optimistic concurrency conflict.", default="conflict"
     )
-    reason: Field[ConflictApplyResultReason] = proto_field(
-        description="Which identity comparison failed.", number=2
+    reason: Field[ConflictReason] = proto_field(
+        description="Which destination moved.", number=2
     )
-    base: Field[core.Snapshot] = proto_field(
-        description="Accepted snapshot the retained preview expected.", number=3
+    expected: Field[core.Snapshot] = proto_field(
+        description="Destination state the retained candidate expected.", number=3
     )
     current: Field[core.Snapshot] = proto_field(
-        description="Accepted snapshot observed at publication time.", number=4
+        description="Destination state observed at publication.", number=4
     )
 
 
-@definition(
+@union(
     owner=MCP,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    oneof="variant",
+    discriminator="status",
+    variants=(
+        Variant("accepted", "accepted", 1, AcceptedResult),
+        Variant("integrated", "integrated", 2, IntegratedResult),
+        Variant("rejected", "rejected", 3, RejectedResult),
+        Variant("refused", "refused", 4, RefusedResult),
+        Variant("conflict", "conflict", 5, ConflictResult),
+    ),
 )
-class IntegrationTarget(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='A local branch ref that integration may "
-            "compare-and-swap.', pattern='^refs/heads/(?!/)(?!.*//)(?!.*\\\\.\\\\.)(?!.*[~^:?*\\\\"
-            "\\\\])[A-Za-z0-9._/-]+$', examples=['refs/heads/main', 'refs/heads/release/1.x'])]"
-        )
-    ]
-):
+class PublishResult(ProtocolRoot):
+    "A completed publication decision. An ordinary candidate advances the accepted ref; an integration candidate advances its target branch."
+
+
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^refs/heads/(?!/)(?!.*//)(?!.*\.\.)(?!.*[~^:?*\\])[A-Za-z0-9._/-]+$",
+    examples=["refs/heads/main", "refs/heads/release/1.x"],
+)
+class IntegrationTarget(ProtocolRoot):
     """A local branch ref that integration may compare-and-swap."""
 
 
-@definition(
-    owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(
-                None, "preview_integrate_params", 1, lambda: PreviewIntegrateParams
-            ),
-            Variant(
-                None, "refresh_integrate_params", 2, lambda: RefreshIntegrateParams
-            ),
-            Variant(
-                None, "publish_integrate_params", 3, lambda: PublishIntegrateParams
-            ),
-        ),
-    ),
-    schema_extra={},
-)
-class IntegrateParams(
-    ProtocolRoot[
-        (
-            "Annotated[PreviewIntegrateParams | RefreshIntegrateParams | "
-            "PublishIntegrateParams, schema_field(discriminator='mode')]"
-        )
-    ]
-):
-    """One retained preview, refresh, or publish phase for integration in the current repository."""
-
-
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class PreviewIntegrateParams(ClosedModel):
-    """Builds and validates a merge candidate while leaving the target ref unchanged."""
+class IntegrateParams(ClosedModel):
+    "Merges an accepted commit into a local branch and validates the result, leaving the target unchanged. Two commits that are each valid can merge into a broken tree, which is why the merge candidate is validated like any other. `publish` advances the target."
 
-    mode: Field[Literal["preview"]] = proto_field(
-        description="Selects integration preview.", number=1
-    )
     target: Field[IntegrationTarget] = proto_field(
-        description="Branch that receives the accepted commit.", number=2
+        description="Branch that receives the accepted commit.", number=1
     )
     source: Field[core.Commit | None] = proto_field(
         default=None,
         description="Accepted commit to integrate. Omission selects the connection's current accepted ref.",
-        number=3,
-    )
-    validators: Field[list[CommandValidator]] = proto_field(
-        description="Caller-supplied checks run on the merge candidate.",
-        number=4,
-        json_schema_extra={"uniqueItems": True},
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RefreshIntegrateParams(ClosedModel):
-    """Rebuilds an integration preview against the target's current head."""
-
-    mode: Field[Literal["refresh"]] = proto_field(
-        description="Selects integration refresh.", number=1
-    )
-    previous: Field[core.PreviewId] = proto_field(
-        description="Retained integration contract to run again.", number=2
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class PublishIntegrateParams(ClosedModel):
-    """Replays a retained integration preview and attempts to advance its target ref."""
-
-    mode: Field[Literal["publish"]] = proto_field(
-        description="Selects integration publication.", number=1
-    )
-    preview: Field[core.PreviewId] = proto_field(
-        description="Retained integration contract to publish.", number=2
-    )
-    idempotency_key: Field[str] = proto_field(
-        description="Caller-chosen retry key bound to this exact publish request.",
-        pattern="^[\\x21-\\x7E]{1,256}$",
-        number=3,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        description="Every confirmation required by the retained integration preview.",
-        number=4,
-        json_schema_extra={"uniqueItems": True},
+        number=2,
     )
 
 
@@ -3477,255 +3801,73 @@ class MergeConflict(ClosedModel):
     )
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class PreparedIntegrateResult(ClosedModel):
-    """A retained, conflict-free integration preview."""
+    """A retained, conflict-free merge candidate."""
 
-    status: Field[Literal["integration_preview"]] = proto_field(
-        description="Identifies a conflict-free integration preview.", number=1
+    status: Field[Literal["prepared"]] = proto_field(
+        description="Identifies a conflict-free integration candidate.",
+        default="prepared",
     )
     target: Field[IntegrationTarget] = proto_field(
-        description="Local branch the candidate would advance.", number=2
+        description="Local branch the candidate would advance.", number=1
     )
     source: Field[core.Commit] = proto_field(
-        description="Accepted commit merged into the target.", number=3
+        description="Accepted commit merged into the target.", number=2
     )
     summary: Field[CandidateSummary] = proto_field(
-        description="Retained merge candidate and validation evidence.", number=4
+        description="Retained merge candidate and validation evidence.", number=3
     )
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RefreshedIntegrateResult(ClosedModel):
-    """A new integration preview built from an earlier contract and the current target head."""
-
-    status: Field[Literal["integration_refresh"]] = proto_field(
-        description="Identifies a refreshed integration preview.", number=1
-    )
-    previous: Field[core.PreviewId] = proto_field(
-        description="Integration preview whose contract was rerun.", number=2
-    )
-    target: Field[IntegrationTarget] = proto_field(
-        description="Local branch the candidate would advance.", number=3
-    )
-    source: Field[core.Commit] = proto_field(
-        description="Accepted commit merged into the target.", number=4
-    )
-    summary: Field[CandidateSummary] = proto_field(
-        description="Refreshed merge candidate and validation evidence.", number=5
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class MergeConflictIntegrateResult(ClosedModel):
-    """A retained provisional merge whose conflicting paths still use the target entries."""
+    "A retained provisional merge whose conflicting paths still hold the target entries, so the tree stays parseable and adapters can still read it. Repair it with an ordinary candidate tool whose `on` is this candidate."
 
     status: Field[Literal["merge_conflict"]] = proto_field(
-        description="Identifies a retained provisional merge with conflicts.", number=1
+        description="Identifies a retained provisional merge with conflicts.",
+        default="merge_conflict",
     )
     target: Field[IntegrationTarget] = proto_field(
-        description="Local branch used as the merge target.", number=2
+        description="Local branch used as the merge target.", number=1
     )
     target_head: Field[core.Commit] = proto_field(
-        description="Target head used as the provisional merge parent.", number=3
+        description="Target head used as the provisional merge parent.", number=2
     )
     source: Field[core.Commit] = proto_field(
         description="Accepted source used as the other provisional merge parent.",
-        number=4,
+        number=3,
     )
     candidate: Field[core.Commit] = proto_field(
         description=(
             "Two-parent provisional merge commit. Non-conflicting paths are merged; "
-            "conflicting paths retain the target entries so the tree stays parseable."
+            "conflicting paths retain the target entries."
         ),
-        number=5,
-    )
-    preview: Field[core.PreviewId] = proto_field(
-        description="Retained conflict record.", number=6
-    )
-    resource: Field[PreviewResourceLink] = proto_field(
-        description="Link to the retained merge and conflict evidence.", number=7
-    )
-    conflicts: Field[list[MergeConflict]] = proto_field(
-        description="Conflicts in project-path order.", min_length=1, number=8
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class IntegratedResult(ClosedModel):
-    """Integration advanced the target ref to the retained candidate."""
-
-    status: Field[Literal["integrated"]] = proto_field(
-        description="Identifies successful integration publication.", number=1
-    )
-    target: Field[IntegrationTarget] = proto_field(
-        description="Local branch advanced by publication.", number=2
-    )
-    previous: Field[core.Commit] = proto_field(
-        description="Target head replaced by publication.", number=3
-    )
-    integrated: Field[core.Commit] = proto_field(
-        description="Commit now held by the target ref.", number=4
-    )
-    summary: Field[CandidateSummary] = proto_field(
-        description="Published merge candidate and fresh validation evidence.", number=5
-    )
-    replayed: Field[bool] = proto_field(
-        description="Whether this is a retained idempotent result.", number=6
-    )
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RejectedIntegrateResult(ClosedModel):
-    """Fresh validation rejected a replayed integration candidate."""
-
-    status: Field[Literal["integration_rejected"]] = proto_field(
-        description="Identifies fresh validation rejection.", number=1
-    )
-    target: Field[IntegrationTarget] = proto_field(
-        description="Local branch left unchanged.", number=2
-    )
-    summary: Field[CandidateSummary] = proto_field(
-        description="Rejected merge candidate and fresh validation evidence.", number=3
-    )
-
-
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.enum(
-        "Reason",
-        (
-            EnumValue("checked_out_target", "CHECKED_OUT_TARGET", 1),
-            EnumValue("dirty_target", "DIRTY_TARGET", 2),
-            EnumValue("stale_preview", "STALE_PREVIEW", 3),
-            EnumValue("confirmation_required", "CONFIRMATION_REQUIRED", 4),
-            EnumValue("validation_incomplete", "VALIDATION_INCOMPLETE", 5),
-            EnumValue("unsupported", "UNSUPPORTED", 6),
-        ),
-        placement=Placement("reason", 3),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "checked_out_target": "Target branch is checked out and automatic integration is disabled.",
-            "dirty_target": "Checked-out target worktree has local changes.",
-            "stale_preview": "Retained preview no longer matches its target head or source.",
-            "confirmation_required": "Caller omitted a confirmation retained by the preview.",
-            "validation_incomplete": "Required adapter or command validation did not complete.",
-            "unsupported": "Repository state cannot satisfy this integration contract.",
-        }
-    },
-)
-class RefusedIntegrateResultReason(str, Enum):
-    """Repository or policy condition that prevented integration publication."""
-
-    CHECKED_OUT_TARGET = "checked_out_target"
-    DIRTY_TARGET = "dirty_target"
-    STALE_PREVIEW = "stale_preview"
-    CONFIRMATION_REQUIRED = "confirmation_required"
-    VALIDATION_INCOMPLETE = "validation_incomplete"
-    UNSUPPORTED = "unsupported"
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RefusedIntegrateResult(ClosedModel):
-    """Integration stopped on a repository or policy condition the caller can change."""
-
-    status: Field[Literal["integration_refused"]] = proto_field(
-        description="Identifies an actionable integration refusal.", number=1
-    )
-    target: Field[IntegrationTarget] = proto_field(
-        description="Local branch left unchanged.", number=2
-    )
-    reason: Field[RefusedIntegrateResultReason] = proto_field(
-        description="Repository or policy condition that stopped publication.", number=3
-    )
-    candidate: Field[core.Commit | None] = proto_field(
-        default=None,
-        description="Validated merge commit available for manual handling.",
         number=4,
     )
-    diagnostics: Field[list[core.Diagnostic]] = proto_field(
-        description="Findings associated with the refusal.", number=5
+    preview: Field[core.PreviewId] = proto_field(
+        description="Retained conflict record.", number=5
+    )
+    resource: Field[PreviewResourceLink] = proto_field(
+        description="Link to the retained merge and conflict evidence.", number=6
+    )
+    conflicts: Field[list[MergeConflict]] = proto_field(
+        description="Conflicts in project-path order.", min_length=1, number=7
     )
 
 
-@definition(
+@union(
     owner=MCP,
-    public=False,
-    proto=Proto.enum(
-        "Reason",
-        (
-            EnumValue("target_moved", "TARGET_MOVED", 1),
-            EnumValue("idempotency_key_reused", "IDEMPOTENCY_KEY_REUSED", 2),
-        ),
-        placement=Placement("reason", 3),
+    oneof="variant",
+    discriminator="status",
+    variants=(
+        Variant("prepared", "prepared", 1, PreparedIntegrateResult),
+        Variant("merge_conflict", "merge_conflict", 2, MergeConflictIntegrateResult),
+        Variant("refused", "refused", 3, RefusedResult),
     ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "target_moved": "Target head changed after the retained preview was built.",
-            "idempotency_key_reused": "The same idempotency key was already bound to different input.",
-        }
-    },
 )
-class ConflictIntegrateResultReason(str, Enum):
-    """Concurrency or idempotency conflict during integration publication."""
-
-    TARGET_MOVED = "target_moved"
-    IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
-
-
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class ConflictIntegrateResult(ClosedModel):
-    """Integration lost compare-and-swap or reused an idempotency key for different input."""
-
-    status: Field[Literal["integration_conflict"]] = proto_field(
-        description="Identifies an integration publication conflict.", number=1
-    )
-    target: Field[IntegrationTarget] = proto_field(
-        description="Local branch left unchanged.", number=2
-    )
-    reason: Field[ConflictIntegrateResultReason] = proto_field(
-        description="Concurrency or idempotency condition that conflicted.", number=3
-    )
-    expected: Field[core.Commit] = proto_field(
-        description="Target head retained by the preview.", number=4
-    )
-    current: Field[core.Commit] = proto_field(
-        description="Target head observed at publication.", number=5
-    )
-
-
-@definition(
-    owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(None, "prepared_integrate_result", 1, PreparedIntegrateResult),
-            Variant(None, "refreshed_integrate_result", 2, RefreshedIntegrateResult),
-            Variant(
-                None, "merge_conflict_integrate_result", 3, MergeConflictIntegrateResult
-            ),
-            Variant(None, "integrated_result", 4, IntegratedResult),
-            Variant(None, "rejected_integrate_result", 5, RejectedIntegrateResult),
-            Variant(None, "refused_integrate_result", 6, RefusedIntegrateResult),
-            Variant(None, "conflict_integrate_result", 7, ConflictIntegrateResult),
-        ),
-    ),
-    schema_extra={},
-)
-class IntegrateResult(
-    ProtocolRoot[
-        (
-            "Annotated[PreparedIntegrateResult | RefreshedIntegrateResult | "
-            "MergeConflictIntegrateResult | IntegratedResult | RejectedIntegrateResult | "
-            "RefusedIntegrateResult | ConflictIntegrateResult, "
-            "schema_field(discriminator='status')]"
-        )
-    ]
-):
-    """A completed integration preview, publication, conflict, rejection, or refusal."""
+class IntegrateResult(ProtocolRoot):
+    """A merge candidate, a retained provisional merge with its conflicts, or a refusal."""
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -4069,28 +4211,39 @@ class FileResourcePayloadNone(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=MCP,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("utf8", "utf8", 1, FileResourcePayloadUtf8),
-            Variant("base64", "base64", 2, FileResourcePayloadBase64),
-            Variant("none", "none", 3, FileResourcePayloadNone),
-        ),
+    oneof="variant",
+    discriminator="encoding",
+    variants=(
+        Variant("utf8", "utf8", 1, FileResourcePayloadUtf8),
+        Variant("base64", "base64", 2, FileResourcePayloadBase64),
+        Variant("none", "none", 3, FileResourcePayloadNone),
     ),
-    schema_extra={},
 )
-class FileResourcePayload(
-    ProtocolRoot[
-        (
-            "Annotated[FileResourcePayloadUtf8 | FileResourcePayloadBase64 | "
-            "FileResourcePayloadNone, schema_field(discriminator='encoding')]"
-        )
-    ]
-):
+class FileResourcePayload(ProtocolRoot):
     "One bounded byte range from a file at one state. Regular files carry UTF-8 text where the selected bytes form valid UTF-8 and base64 otherwise. `next` continues at `end` until the complete file has been read."
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ExecutionAvailability(ClosedModel):
+    """Effective caller-code capability after intersecting repository policy with one adapter's
+    advertised operations. These values, rather than adapter capability alone, govern routing."""
+
+    execute: Field[bool] = proto_field(
+        description=(
+            "Whether execute may route to this language after policy, adapter capability, and "
+            "host conformance intersect."
+        ),
+        number=1,
+    )
+    debug: Field[bool] = proto_field(
+        description=(
+            "Whether all three debug tools may route to this language. True requires execute "
+            "authorization, the complete adapter debug operation triplet, and host conformance."
+        ),
+        number=2,
+    )
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -4124,6 +4277,10 @@ class LanguageSupport(ClosedModel):
         ),
         number=5,
     )
+    execution: Field[ExecutionAvailability] = proto_field(
+        description="Effective host-policy and adapter-capability intersection for caller code.",
+        number=6,
+    )
 
 
 MODELS = (
@@ -4137,10 +4294,14 @@ MODELS = (
     SearchParams,
     SearchHit,
     PreviewResourceLink,
+    ActionsResourceLink,
+    ActionResourceLink,
     ResourceLink,
     SymbolResourcePayload,
     DiffResourcePayload,
     Contract,
+    DebugLimits,
+    ExecutionLimits,
     Limits,
     RepositoryResourceUri,
     FileResourceUri,
@@ -4148,8 +4309,10 @@ MODELS = (
     RepositoryResourcePayload,
     SearchResult,
     ActionOffer,
-    ActionsParams,
-    ActionsResult,
+    ActionsResourceUri,
+    ActionResourceUri,
+    ActionsResourcePayload,
+    ActionResourcePayload,
     ExecuteParams,
     ExecuteResult,
     DebugSessionId,
@@ -4173,50 +4336,39 @@ MODELS = (
     ResourceReadParams,
     ResourceReadResult,
     SearchHitTarget,
-    Change,
-    DirectChange,
-    PatchChange,
-    ActionChange,
-    RewriteChange,
-    RevertChange,
-    MergeChange,
-    ResolvedChange,
+    EditParams,
+    PatchParams,
+    RewriteParams,
+    RevertParams,
+    MergeParams,
+    RenameParams,
+    MoveParams,
+    DeleteParams,
+    ChangeSignatureParams,
+    ActParams,
+    PreviewOperation,
+    ResolvedOperation,
     CommandValidator,
-    ValidatorOutput,
     ValidatorResult,
     CandidateValidation,
     CandidateSummary,
     PreviewResourcePayload,
-    ApplyParams,
-    PreviewApplyParams,
-    RefreshApplyParams,
-    PublishApplyParams,
-    ApplyResult,
-    PreviewApplyResult,
-    RefreshApplyResult,
-    AcceptedApplyResult,
-    RejectedApplyResult,
-    RefusedApplyResult,
-    ConflictApplyResult,
+    RefusalReason,
+    CandidateResult,
+    RefreshParams,
+    RefreshResult,
+    PublishParams,
+    PublishResult,
     IntegrationTarget,
     IntegrateParams,
-    PreviewIntegrateParams,
-    RefreshIntegrateParams,
-    PublishIntegrateParams,
     MergeConflict,
     IntegrateResult,
-    PreparedIntegrateResult,
-    RefreshedIntegrateResult,
-    MergeConflictIntegrateResult,
-    IntegratedResult,
-    RejectedIntegrateResult,
-    RefusedIntegrateResult,
-    ConflictIntegrateResult,
     PersistParams,
     PersistOutcome,
     PersistResult,
     ConformanceProfile,
     ResultOrder,
     FileResourcePayload,
+    ExecutionAvailability,
     LanguageSupport,
 )

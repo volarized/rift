@@ -21,8 +21,3 @@ packages = ["src/rift"]
 # Ruff treats string values inside Literal as forward annotations under
 # `from __future__ import annotations`. They are wire values and must stay quoted.
 ignore = ["UP037"]
-
-[tool.ty.rules]
-# Pydantic resolves these forward annotations after every model module is loaded.
-# Ty rejects escape sequences inside the otherwise valid annotation strings.
-escape-character-in-forward-annotation = "ignore"

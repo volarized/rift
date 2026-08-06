@@ -1,7 +1,7 @@
 """The typed MCP surface and JSON Schema document."""
 
 from . import core, mcp
-from .surface import Axis, Document, Resource, Rpc, Service, Tool
+from .surface import Axis, Document, Resource, Rpc, Service, Tool, ToolGroup
 
 RPC_TREE = Rpc(
     name="Tree",
@@ -47,17 +47,6 @@ RPC_MATCH = Rpc(
     ),
 )
 
-RPC_ACTIONS = Rpc(
-    name="Actions",
-    request=mcp.ActionsParams,
-    response=mcp.ActionsResult,
-    description=(
-        "Asks an adapter what it can offer at one address: the fixes and refactors it "
-        "would suggest there. Each result carries the snapshot and adapter token needed "
-        "for resolution. Rift refuses a token after its snapshot moves."
-    ),
-)
-
 RPC_EXECUTE = Rpc(
     name="Execute",
     request=mcp.ExecuteParams,
@@ -93,16 +82,105 @@ RPC_DEBUG_STOP = Rpc(
     description="Releases a debugging session, adapter state, and execution workspace.",
 )
 
-RPC_APPLY = Rpc(
-    name="Apply",
-    request=mcp.ApplyParams,
-    response=mcp.ApplyResult,
+RPC_EDIT = Rpc(
+    name="Edit",
+    request=mcp.EditParams,
+    response=mcp.CandidateResult,
     description=(
-        "Builds, refreshes, or publishes a deterministic candidate. Preview retains each "
-        "request with its checked preconditions, exact edits, semantic effects, guarantee "
-        "evidence, diff, validation, and confirmations. Refresh repeats that contract on "
-        "a newer base. Publish replays it and advances the accepted ref when the retained "
-        "plan still agrees, fresh validation passes, and the accepted head still matches."
+        "Builds a candidate from an atomic set of concrete edits. Nothing is published: the "
+        "candidate is an immutable commit that `publish` can advance a ref to."
+    ),
+)
+
+RPC_PATCH = Rpc(
+    name="Patch",
+    request=mcp.PatchParams,
+    response=mcp.CandidateResult,
+    description=(
+        "Builds a candidate from a unified diff. Rift checks every hunk's context against the "
+        "state it resolves against. A patch written for older bytes is refused before any hunk "
+        "is applied."
+    ),
+)
+
+RPC_REWRITE = Rpc(
+    name="Rewrite",
+    request=mcp.RewriteParams,
+    response=mcp.CandidateResult,
+    description=(
+        "Builds a candidate by replacing every match of one query. The cardinality is checked "
+        "before expansion, so a pattern that matches more places than intended refuses instead "
+        "of rewriting them."
+    ),
+)
+
+RPC_REVERT = Rpc(
+    name="Revert",
+    request=mcp.RevertParams,
+    response=mcp.CandidateResult,
+    description=(
+        "Builds a candidate from the three-way inverse of one commit against a selected parent."
+    ),
+)
+
+RPC_MERGE = Rpc(
+    name="Merge",
+    request=mcp.MergeParams,
+    response=mcp.CandidateResult,
+    description="Builds a candidate by merging one exact commit into the candidate state.",
+)
+
+RPC_RENAME = Rpc(
+    name="Rename",
+    request=mcp.RenameParams,
+    response=mcp.CandidateResult,
+    description=(
+        "Changes what a declaration is called and rewrites every reference that names it. The "
+        "adapter checks spelling, collisions, and binding changes. A reference outside the "
+        "scope refuses the whole operation."
+    ),
+)
+
+RPC_MOVE = Rpc(
+    name="Move",
+    request=mcp.MoveParams,
+    response=mcp.CandidateResult,
+    description=(
+        "Moves a declaration or file to another container or path and updates the imports and "
+        "references that reach it."
+    ),
+)
+
+RPC_DELETE = Rpc(
+    name="Delete",
+    request=mcp.DeleteParams,
+    response=mcp.CandidateResult,
+    description=(
+        "Removes a declaration. Without a policy this is a mechanical removal that analyses no "
+        "references. With one, the adapter classifies every remaining use, applies the stated "
+        "disposition, and refuses when reference coverage is incomplete."
+    ),
+)
+
+RPC_CHANGE_SIGNATURE = Rpc(
+    name="ChangeSignature",
+    request=mcp.ChangeSignatureParams,
+    response=mcp.CandidateResult,
+    description=(
+        "Changes the shape of a callable and propagates it to callers, overrides, and "
+        "implementations. Unlike a rename, it rewrites argument lists, so it commonly raises a "
+        "`behavior_unknown` confirmation."
+    ),
+)
+
+RPC_ACT = Rpc(
+    name="Act",
+    request=mcp.ActParams,
+    response=mcp.CandidateResult,
+    description=(
+        "Resolves one action an adapter offered — a quick fix, an extraction, an inline, or an "
+        "adapter-specific family. Arguments are validated against the schema the offer "
+        "advertises. A portable family is refused here and resolves through its own tool."
     ),
 )
 
@@ -111,9 +189,32 @@ RPC_INTEGRATE = Rpc(
     request=mcp.IntegrateParams,
     response=mcp.IntegrateResult,
     description=(
-        "Previews, refreshes, or publishes a merge from the connection's accepted commit "
-        "into one local target branch. Publication replays validation and "
-        "compare-and-swaps the target head."
+        "Merges the connection's accepted commit into a local branch and validates the result. "
+        "Two commits that are each valid can merge into a broken tree, so the merge candidate "
+        "is validated like any other. A conflict returns a parseable provisional merge."
+    ),
+)
+
+RPC_REFRESH = Rpc(
+    name="Refresh",
+    request=mcp.RefreshParams,
+    response=mcp.RefreshResult,
+    description=(
+        "Reruns a retained candidate's operation against a newer base and reports how much the "
+        "result moved. The candidate holds the request it was built from, so nothing has to be "
+        "restated."
+    ),
+)
+
+RPC_PUBLISH = Rpc(
+    name="Publish",
+    request=mcp.PublishParams,
+    response=mcp.PublishResult,
+    description=(
+        "Runs the declared command validators against a retained candidate and advances its "
+        "destination by compare-and-swap: the accepted ref for an ordinary candidate, the "
+        "target branch for an integration. A retry that finds the destination already holding "
+        "the candidate returns the same result."
     ),
 )
 
@@ -142,13 +243,23 @@ RIFT_SERVICE = Service(
         RPC_OUTLINE,
         RPC_SEARCH,
         RPC_MATCH,
-        RPC_ACTIONS,
         RPC_EXECUTE,
         RPC_DEBUG_START,
         RPC_DEBUG_GET_FRAME,
         RPC_DEBUG_STOP,
-        RPC_APPLY,
+        RPC_EDIT,
+        RPC_PATCH,
+        RPC_REWRITE,
+        RPC_REVERT,
+        RPC_MERGE,
+        RPC_RENAME,
+        RPC_MOVE,
+        RPC_DELETE,
+        RPC_CHANGE_SIGNATURE,
+        RPC_ACT,
         RPC_INTEGRATE,
+        RPC_REFRESH,
+        RPC_PUBLISH,
         RPC_PERSIST,
         RPC_READRESOURCE,
     ),
@@ -168,19 +279,67 @@ DOCUMENT = Document(
         "is reachable from one of these entries."
     ),
     service=RIFT_SERVICE,
+    tool_groups=(
+        ToolGroup(
+            name="discovery",
+            title="Discovery",
+            summary=(
+                "Find code and read what an adapter knows about it. Every answer carries the "
+                "snapshot it resolved against and how much of the source it covered, so a "
+                "later call can ask about the same state."
+            ),
+        ),
+        ToolGroup(
+            name="changes",
+            title="Changes",
+            summary=(
+                "Build a candidate. Each tool resolves one operation against a base or against "
+                "the candidate named by `on`, writes an immutable commit, and validates it. "
+                "Nothing reaches a ref or the connection worktree until publication."
+            ),
+        ),
+        ToolGroup(
+            name="lifecycle",
+            title="Lifecycle",
+            summary=(
+                "Continue a retained candidate. `refresh` reruns it on a newer base. `publish` "
+                "advances a ref after replay and validation, while `persist` copies accepted "
+                "paths into the connection worktree."
+            ),
+        ),
+        ToolGroup(
+            name="execution",
+            title="Execution",
+            summary=(
+                "Evaluate caller-provided code against an exact snapshot in a disposable "
+                "workspace, and inspect the frames a failed evaluation left behind. Host policy "
+                "authorizes these per language before they are advertised at all."
+            ),
+        ),
+    ),
     tools=(
-        Tool(name="tree", rpc=RPC_TREE),
-        Tool(name="outline", rpc=RPC_OUTLINE),
-        Tool(name="search", rpc=RPC_SEARCH),
-        Tool(name="match", rpc=RPC_MATCH),
-        Tool(name="actions", rpc=RPC_ACTIONS),
-        Tool(name="execute", rpc=RPC_EXECUTE),
-        Tool(name="debug_start", rpc=RPC_DEBUG_START),
-        Tool(name="debug_get_frame", rpc=RPC_DEBUG_GET_FRAME),
-        Tool(name="debug_stop", rpc=RPC_DEBUG_STOP),
-        Tool(name="apply", rpc=RPC_APPLY),
-        Tool(name="integrate", rpc=RPC_INTEGRATE),
-        Tool(name="persist", rpc=RPC_PERSIST),
+        Tool(name="tree", rpc=RPC_TREE, group="discovery"),
+        Tool(name="outline", rpc=RPC_OUTLINE, group="discovery"),
+        Tool(name="search", rpc=RPC_SEARCH, group="discovery"),
+        Tool(name="match", rpc=RPC_MATCH, group="discovery"),
+        Tool(name="edit", rpc=RPC_EDIT, group="changes"),
+        Tool(name="patch", rpc=RPC_PATCH, group="changes"),
+        Tool(name="rewrite", rpc=RPC_REWRITE, group="changes"),
+        Tool(name="revert", rpc=RPC_REVERT, group="changes"),
+        Tool(name="merge", rpc=RPC_MERGE, group="changes"),
+        Tool(name="rename", rpc=RPC_RENAME, group="changes"),
+        Tool(name="move", rpc=RPC_MOVE, group="changes"),
+        Tool(name="delete", rpc=RPC_DELETE, group="changes"),
+        Tool(name="change_signature", rpc=RPC_CHANGE_SIGNATURE, group="changes"),
+        Tool(name="act", rpc=RPC_ACT, group="changes"),
+        Tool(name="integrate", rpc=RPC_INTEGRATE, group="changes"),
+        Tool(name="refresh", rpc=RPC_REFRESH, group="lifecycle"),
+        Tool(name="publish", rpc=RPC_PUBLISH, group="lifecycle"),
+        Tool(name="persist", rpc=RPC_PERSIST, group="lifecycle"),
+        Tool(name="execute", rpc=RPC_EXECUTE, group="execution"),
+        Tool(name="debug_start", rpc=RPC_DEBUG_START, group="execution"),
+        Tool(name="debug_get_frame", rpc=RPC_DEBUG_GET_FRAME, group="execution"),
+        Tool(name="debug_stop", rpc=RPC_DEBUG_STOP, group="execution"),
     ),
     resources=(
         Resource(
@@ -229,13 +388,36 @@ DOCUMENT = Document(
         Resource(
             name="preview",
             description=(
-                "Returns the retained plan behind an apply preview, including its input changes, "
-                "concrete edits, candidate diff, adapter and validator evidence, and confirmations. "
-                "The tool result links here when the plan does not fit in its bounded summary."
+                "Returns the retained plan behind one candidate, including the request it was "
+                "built from, its concrete edits, candidate diff, adapter and validator evidence, "
+                "and confirmations. Its `parent` reads back the chain the candidate belongs to."
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.PreviewResourceUri,
             link=mcp.PreviewResourceLink,
+        ),
+        Resource(
+            name="actions",
+            description=(
+                "Returns the fixes and refactors an adapter offers at one address, or across one "
+                "file. Each entry carries the offer identity and what the action would do, and "
+                "leaves out the argument schema so a page stays bounded however many offers it "
+                "holds."
+            ),
+            template=mcp.ResourceTemplate,
+            uri=mcp.ActionsResourceUri,
+            link=mcp.ActionsResourceLink,
+        ),
+        Resource(
+            name="action",
+            description=(
+                "Returns one discovered action with the JSON Schema of the arguments it takes. "
+                "This is the read a caller makes for the offer it chose, before handing the same "
+                "identity to `act`."
+            ),
+            template=mcp.ResourceTemplate,
+            uri=mcp.ActionResourceUri,
+            link=mcp.ActionResourceLink,
         ),
     ),
     resource_read=RPC_READRESOURCE,
@@ -335,7 +517,7 @@ DOCUMENT = Document(
                 core.ValidationReport,
                 mcp.CandidateValidation,
                 mcp.ValidatorResult,
-                mcp.ValidatorOutput,
+                core.CapturedText,
             ),
         ),
         Axis(
@@ -345,8 +527,8 @@ DOCUMENT = Document(
                 core.Address,
                 core.ActionDescriptor,
                 core.ActionKind,
-                core.MatchKey,
-                core.ActionKey,
+                core.MatchId,
+                core.ActionOfferId,
                 core.FormattingPolicy,
                 core.MatchCardinality,
                 core.OperationScope,
@@ -365,13 +547,19 @@ DOCUMENT = Document(
                 core.GuaranteeKind,
                 core.GuaranteeEvidence,
                 core.ConfirmationRequirement,
-                mcp.Change,
-                mcp.DirectChange,
-                mcp.PatchChange,
-                mcp.ActionChange,
-                mcp.RewriteChange,
-                mcp.RevertChange,
-                mcp.ResolvedChange,
+                mcp.PreviewOperation,
+                mcp.EditParams,
+                mcp.PatchParams,
+                mcp.RewriteParams,
+                mcp.RevertParams,
+                mcp.MergeParams,
+                mcp.RenameParams,
+                mcp.MoveParams,
+                mcp.DeleteParams,
+                mcp.ChangeSignatureParams,
+                mcp.ActParams,
+                mcp.ResolvedOperation,
+                mcp.RefusalReason,
                 core.ActionSupport,
                 mcp.CommandValidator,
             ),
@@ -386,7 +574,9 @@ DOCUMENT = Document(
                 core.CodeBlock,
                 core.ExecutionResult,
                 core.ExecutionStatus,
-                core.CapturedOutput,
+                core.CapturedText,
+                core.ExecutionBudget,
+                core.DebugBudget,
                 core.DebugFrame,
                 core.DebugBinding,
                 mcp.ExecuteParams,

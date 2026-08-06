@@ -616,6 +616,8 @@ message ExecuteRequest {
   rift.adapter.AdapterState state = 1;
   // Source and project-relative working directory.
   rift.core.CodeBlock block = 2;
+  // Exact host-policy bounds the adapter must enforce for this evaluation.
+  rift.core.ExecutionBudget budget = 3;
 }
 // Bounded result of evaluating a block against one unchanged adapter state.
 message ExecuteResponse {
@@ -627,40 +629,48 @@ message ExecuteResponse {
 // Adapter-local handle for an inspect-only debugging evaluation. Start runs until normal
 // completion or an unhandled failure. A failed evaluation retains its stack frames until
 // DebugStop or adapter-state cleanup.
-message DebugSession {
+message DebugSessionKey {
   option (section) = "Debugging";
   // Pinned adapter state used by the debugging evaluation.
   rift.adapter.AdapterState state = 1;
   // Opaque adapter-local handle. Rift never exposes it to the MCP caller.
   string token = 2;
+}
+// Adapter-local key and terminal evaluation summary for one debugging session.
+message DebugSession {
+  option (section) = "Debugging";
+  // Stable identity used by frame reads and cleanup.
+  rift.adapter.DebugSessionKey key = 1;
   // Retained stack frames, innermost first. Zero after normal completion.
-  uint32 frame_count = 3;
+  uint32 frame_count = 2;
   // How evaluation ended and its bounded output.
-  rift.core.ExecutionResult result = 4;
+  rift.core.ExecutionResult result = 3;
 }
 // Start an inspect-only debugging evaluation against one pinned adapter state.
 message DebugStartRequest {
   option (section) = "Debugging";
   rift.adapter.AdapterState state = 1;
   rift.core.CodeBlock block = 2;
+  // Exact host-policy bounds for evaluation, retained frames, and bindings.
+  rift.core.DebugBudget budget = 3;
 }
 // Select one retained stack frame from a debugging session.
 message DebugGetFrameRequest {
   option (section) = "Debugging";
-  rift.adapter.DebugSession session = 1;
+  rift.adapter.DebugSessionKey session = 1;
   // Zero-based stack depth, with the innermost retained frame first.
   uint32 depth = 2;
 }
 // One retained frame and the session identity it came from.
 message DebugGetFrameResponse {
   option (section) = "Debugging";
-  rift.adapter.DebugSession session = 1;
+  rift.adapter.DebugSessionKey session = 1;
   rift.core.DebugFrame frame = 2;
 }
 // Release one debugging session and all retained runtime state behind it.
 message DebugStopRequest {
   option (section) = "Debugging";
-  rift.adapter.DebugSession session = 1;
+  rift.adapter.DebugSessionKey session = 1;
 }
 // Carried in `google.rpc.Status.details` when an adapter declines work it
 // understood: the target is ambiguous, an action went stale, the language
@@ -761,7 +771,7 @@ service Adapter {
   // adapter state. The surrounding workspace is disposable.
   rpc Execute (rift.adapter.ExecuteRequest) returns (rift.adapter.ExecuteResponse);
   // Evaluate a code block for post-mortem inspection, retaining stack frames after an unhandled
-  // failure until StopDebug.
+  // failure until DebugStop.
   rpc DebugStart (rift.adapter.DebugStartRequest) returns (rift.adapter.DebugSession);
   // Read one retained stack frame without resuming evaluation.
   rpc DebugGetFrame (rift.adapter.DebugGetFrameRequest) returns (rift.adapter.DebugGetFrameResponse);

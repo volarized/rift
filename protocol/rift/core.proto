@@ -706,10 +706,6 @@ message Coverage {
     CoverageState state = 3;
   }
 }
-// Coverage for every fact family. Absence is authoritative only where state is complete.
-message SemanticCoverage {
-  map<string, Coverage> entries = 1;
-}
 // How a type is written in the source, plus the symbol that declares it when one does. A type
 // with a declaration resolves to that symbol; a structural type — `string | null`, `{ a: string
 // }` — has the spelling and nothing to resolve to.
@@ -1488,7 +1484,7 @@ message AddressSource {
 // source state; resolution returns `stale_match` when the candidate has moved.
 message AddressMatch {
   // The match, and the state it was found in.
-  MatchKey match = 1;
+  string match = 1;
   // Which named capture of the match. Null addresses the match itself.
   optional string capture = 2;
 }
@@ -1970,10 +1966,14 @@ message MoveArguments {
   // Source eligible for import and reference updates.
   OperationScope scope = 2;
 }
-// Portable arguments for `refactor.safe_delete` actions.
+// Portable arguments for deleting a declaration. `policy` is what separates the two kinds of
+// removal: without it the declaration goes and nothing analyses what referred to it, and with
+// it the adapter must classify every remaining use and dispose of it as stated.
 message SafeDeleteArguments {
-  // Required behavior for every classified remaining use.
-  SafeDeletePolicy policy = 1;
+  // Required behavior for every classified remaining use. Null removes the declaration without
+  // reference analysis, which claims no reference guarantee and reports no remaining-usage
+  // precondition.
+  optional SafeDeletePolicy policy = 1;
   // Source in which complete usage analysis and any requested rewrite may occur.
   OperationScope scope = 2;
 }
@@ -2308,8 +2308,10 @@ message ActionDescriptor {
   optional ArgumentContract argument_contract = 7;
   // JSON Schema draft 2020-12 for the arguments this action takes. Remote references are
   // forbidden. When `argument_contract` is set, this schema may add language constraints while
-  // preserving the portable fields and meanings.
-  google.protobuf.Struct arguments_schema = 8;
+  // preserving the portable fields and meanings. An adapter always supplies it; Rift leaves it
+  // null in a listing page and carries it in the read of one offer, so a caller fetches one
+  // schema rather than a schema per offer.
+  optional google.protobuf.Struct arguments_schema = 8;
   // Properties this action promises to establish when resolution succeeds. Resolve must return
   // one complete `GuaranteeEvidence` entry for every kind listed here.
   repeated GuaranteeKind guarantees = 9;
@@ -2321,6 +2323,10 @@ message ActionDescriptor {
   // Action fields the model has no place for, namespaced by the adapter that emitted them.
   Extensions extensions = 12;
 }
+// Coverage for every fact family. Absence is authoritative only where state is complete.
+message SemanticCoverage {
+  map<string, Coverage> entries = 1;
+}
 // Caller-provided source evaluated by an adapter in the project runtime selected for one
 // exact snapshot. It is sent over the adapter seam and is never written into the repository
 // snapshot.
@@ -2331,19 +2337,38 @@ message CodeBlock {
   // the project root. It must name a directory in the resolved snapshot.
   optional string working_directory = 2;
 }
-// A bounded UTF-8 rendering of one execution stream. Invalid byte sequences become U+FFFD.
-// The digest covers the complete raw stream, including bytes beyond the captured prefix.
-message CapturedOutput {
+// A bounded UTF-8 rendering of bytes. Invalid byte sequences become U+FFFD. The digest
+// covers the complete raw value, including bytes beyond the captured prefix.
+message CapturedText {
   // Decoded captured prefix.
   string text = 1;
   // Raw bytes represented by `text` before replacement decoding.
   int64 captured_bytes = 2;
-  // Raw bytes emitted by the complete stream.
+  // Raw bytes in the complete value.
   int64 total_bytes = 3;
   // Whether bytes after the captured prefix were omitted from `text`.
   bool truncated = 4;
-  // SHA-256 of the complete raw stream.
+  // SHA-256 of the complete raw value.
   string digest = 5;
+}
+// Exact server-selected bounds an adapter must enforce for one code-block evaluation.
+// The gRPC deadline may be shorter than `timeout_ms`; whichever expires first governs.
+message ExecutionBudget {
+  // Maximum evaluation wall time in milliseconds.
+  int64 timeout_ms = 1;
+  // Captured prefix limit applied separately to stdout and stderr.
+  int64 output_bytes = 2;
+}
+// Execution and retained-frame bounds for one debugging session.
+message DebugBudget {
+  // Bounds for running and capturing the debugging evaluation.
+  ExecutionBudget execution = 1;
+  // Maximum stack frames the adapter may retain, innermost first.
+  int64 frames = 2;
+  // Maximum arguments plus locals returned for one frame.
+  int64 bindings_per_frame = 3;
+  // Captured prefix limit for each rendered debug binding value.
+  int64 value_bytes = 4;
 }
 // The complete bounded observation of one code-block evaluation.
 message ExecutionResult {
@@ -2363,24 +2388,23 @@ message ExecutionResult {
   // A nonzero value accompanies `failed`.
   optional int64 exit_code = 2;
   // Bounded standard output from the evaluation.
-  CapturedOutput stdout = 3;
+  CapturedText stdout = 3;
   // Bounded standard error from the evaluation.
-  CapturedOutput stderr = 4;
+  CapturedText stderr = 4;
   // Structured failures produced while compiling or evaluating the block.
   repeated Diagnostic diagnostics = 5;
 }
 // One visible name in a debug frame, rendered by the language adapter. Values are display
-// strings rather than a portable object graph; future expansion can add a separate child-value
+// text rather than a portable object graph; future expansion can add a separate child-value
 // interface without changing frame identity.
 message DebugBinding {
   // Name as the language presents it.
   string name = 1;
   // Adapter-rendered runtime type, or null when unavailable.
   optional string type = 2;
-  // Bounded adapter-rendered value.
-  string value = 3;
-  // Whether the adapter omitted part of the rendered value.
-  bool truncated = 4;
+  // Bounded adapter-rendered value. Its digest identifies the complete rendering when the
+  // session budget truncates it.
+  CapturedText value = 3;
 }
 // One stack frame retained by a debugging session. Depth zero is the innermost frame at
 // the inspection stop.
@@ -2396,29 +2420,4 @@ message DebugFrame {
   repeated DebugBinding arguments = 4;
   // Visible local bindings in adapter order.
   repeated DebugBinding locals = 5;
-}
-// Identity of one match: the query that found it, the snapshot it searched, and the range where
-// it landed. The complete query remains available for inspection and replay.
-message MatchKey {
-  // The snapshot it was found in. A match does not survive into another one, because the bytes
-  // its span points at have moved.
-  Snapshot snapshot = 1;
-  // The file and byte range that matched.
-  SourceSpan span = 2;
-  // The query that produced this match. One span found by two queries denotes two match
-  // identities.
-  MatchQuery query = 3;
-}
-// State-bound identity of one discovered adapter action. The language selects the adapter. The
-// opaque token binds its handle and adapter generation.
-message ActionKey {
-  // The snapshot it was discovered in. Rift rediscovers the adapter's action and checks this
-  // before applying anything, because an action is only meaningful against the code it was
-  // computed from.
-  Snapshot snapshot = 1;
-  // Language whose adapter minted the token and resolves it.
-  Language language = 2;
-  // Opaque Rift handle containing the adapter token and generation. Rift unwraps it only when
-  // resolving the offer.
-  string token = 3;
 }

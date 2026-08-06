@@ -17,6 +17,19 @@ max-size = "4GiB"
 [profile]
 max = "edit"
 
+[execution]
+allow = []
+debug = []
+max-code = "16KiB"
+max-timeout = "30s"
+max-output = "8KiB"
+max-concurrent = 2
+max-debug-sessions = 2
+debug-idle-timeout = "5m"
+max-debug-frames = 64
+max-debug-bindings = 32
+max-debug-value = "1KiB"
+
 [validation]
 require = "available"
 

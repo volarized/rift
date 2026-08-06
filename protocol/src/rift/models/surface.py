@@ -26,9 +26,19 @@ class Service:
 
 
 @dataclass(frozen=True)
+class ToolGroup:
+    """One family of tools, and what a reader needs it for."""
+
+    name: str
+    title: str
+    summary: str
+
+
+@dataclass(frozen=True)
 class Tool:
     name: str
     rpc: Rpc
+    group: str
 
 
 @dataclass(frozen=True)
@@ -57,6 +67,7 @@ class Document:
     description: str
     entry_points_description: str
     service: Service
+    tool_groups: tuple[ToolGroup, ...]
     tools: tuple[Tool, ...]
     resources: tuple[Resource, ...]
     resource_read: Rpc
@@ -72,4 +83,5 @@ __all__ = [
     "Rpc",
     "Service",
     "Tool",
+    "ToolGroup",
 ]

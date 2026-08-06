@@ -18,7 +18,8 @@ enum ErrorCode {
   // supported contract.
   ERROR_CODE_UNSUPPORTED_PROTOCOL = 2;
   // Host policy refused — a path outside the workspace, a revision this deployment does not
-  // expose. The same request fails the same way.
+  // expose, a language not authorized for execution, or a debugging session owned by another
+  // connection. The same request fails the same way.
   ERROR_CODE_PERMISSION_DENIED = 3;
   // The revision does not resolve here: a deleted branch, a commit never fetched, a working
   // tree that has been removed. Retrying helps only once the revision exists.
@@ -33,8 +34,8 @@ enum ErrorCode {
   // The revision resolves, but Rift has no index for it yet: the adapters are still analysing,
   // or that state's facts were dropped. Retrying once indexing catches up succeeds.
   ERROR_CODE_SEMANTIC_SNAPSHOT_UNAVAILABLE = 7;
-  // The URI is well-formed and resolves to nothing — no such symbol, no such file at that
-  // revision. Retrying does not help.
+  // The identity is well-formed and resolves to nothing — no such symbol, no such file at that
+  // revision, or a debug session already stopped or expired. Retrying does not help.
   ERROR_CODE_RESOURCE_NOT_FOUND = 8;
   // The record existed and has been vacuumed away after its retention window. It stays distinct
   // from `resource_not_found` because a retry that read a silent miss would re-run work that
@@ -94,12 +95,48 @@ enum RetryDirective {
   // Send the same bytes again. The cause was transient — a busy working tree, an adapter still
   // starting.
   RETRY_DIRECTIVE_SAME_REQUEST = 2;
-  // Retry under the operation's existing key. Rift returns the retained outcome when the first
-  // call completed before its response was lost.
-  RETRY_DIRECTIVE_SAME_IDEMPOTENCY_KEY = 3;
   // The state moved under the request. Re-read the current state, rebuild whatever was pinned
   // to the old one, then ask again.
-  RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 4;
+  RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
+}
+// Why Rift declined a candidate operation or its publication. A refusal is a completed decision
+// with evidence, not a transport failure; `ErrorData` carries the failures that never reached a
+// decision.
+enum RefusalReason {
+  // The caller did not set a value.
+  REFUSAL_REASON_UNSPECIFIED = 0;
+  // No adapter implements this operation for the language it reaches, or repository state
+  // cannot satisfy the contract.
+  REFUSAL_REASON_UNSUPPORTED = 1;
+  // A condition checked before resolution failed. The failed entry is in `preconditions`.
+  REFUSAL_REASON_UNMET_PRECONDITION = 2;
+  // The address resolves to several targets. Narrow it and ask again.
+  REFUSAL_REASON_AMBIGUOUS_TARGET = 3;
+  // The retained candidate no longer matches the head or source it was built against.
+  REFUSAL_REASON_STALE_PREVIEW = 4;
+  // The offer was discovered against a snapshot that has moved. Read the actions resource
+  // again.
+  REFUSAL_REASON_STALE_ACTION = 5;
+  // The match was found against a snapshot that has moved. Search again.
+  REFUSAL_REASON_STALE_MATCH = 6;
+  // A rewrite matched fewer or more times than its cardinality accepts.
+  REFUSAL_REASON_CARDINALITY_MISMATCH = 7;
+  // Publication needs an acknowledgement the caller did not supply.
+  REFUSAL_REASON_CONFIRMATION_REQUIRED = 8;
+  // The complete effect reaches outside what the caller can have meant — outside the project,
+  // or into generated source.
+  REFUSAL_REASON_UNSAFE_EFFECT = 9;
+  // The requested formatting policy has no formatter behind it for an affected language.
+  REFUSAL_REASON_FORMATTER_UNSUPPORTED = 10;
+  // Required adapter or command validation did not complete.
+  REFUSAL_REASON_VALIDATION_INCOMPLETE = 11;
+  // The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`,
+  // or `change_signature` rather than through `act`.
+  REFUSAL_REASON_PORTABLE_FAMILY = 12;
+  // The integration target is checked out and automatic integration is disabled.
+  REFUSAL_REASON_CHECKED_OUT_TARGET = 13;
+  // The checked-out integration target has local changes.
+  REFUSAL_REASON_DIRTY_TARGET = 14;
 }
 // Runtime conformance level verified for this workspace. Profiles accumulate. Shared checks
 // validate schemas and examples, reference reachability, axis ownership, generated Protobuf
@@ -341,6 +378,24 @@ message PreviewResourceLink {
   // What a read of this URI returns: `PreviewResourcePayload` as JSON.
   string mime_type = 4;
 }
+// A link to the actions available at one address.
+message ActionsResourceLink {
+  // The address to read, optionally filtered by kind and continued by a cursor.
+  string uri = 1;
+  // The resource family this link belongs to.
+  string name = 2;
+  // What a read of this URI returns: `ActionsResourcePayload` as JSON.
+  string mime_type = 3;
+}
+// A link to one discovered action and the arguments it takes.
+message ActionResourceLink {
+  // The offer to read.
+  string uri = 1;
+  // The resource family this link belongs to.
+  string name = 2;
+  // What a read of this URI returns: `ActionResourcePayload` as JSON.
+  string mime_type = 3;
+}
 // A link to the symbol resource, carrying the symbol's own URI.
 message SymbolResourceLink {
   // The symbol to read. Hand it to `resources/read` unchanged.
@@ -386,6 +441,8 @@ message ResourceLink {
     DiffResourceLink diff = 3;
     FileResourceLink file = 4;
     PreviewResourceLink preview = 5;
+    ActionsResourceLink actions = 6;
+    ActionResourceLink action = 7;
   }
 }
 // JSON payload for one symbol at one snapshot.
@@ -447,6 +504,35 @@ message Contract {
   // generated Protobuf packages.
   string schema = 2;
 }
+// Workspace policy ceilings for retained debugging sessions. Null at
+// `ExecutionLimits.debug` means policy disables debugging.
+message DebugLimits {
+  // Debugging sessions retained across all connections in this workspace.
+  int64 max_sessions = 1;
+  // Milliseconds without debug_get_frame or debug_stop after which Rift stops the session and
+  // releases its execution workspace.
+  int64 idle_timeout_ms = 2;
+  // Stack frames one failed debugging evaluation may retain.
+  int64 max_frames = 3;
+  // Arguments plus locals one debug frame may return.
+  int64 max_bindings_per_frame = 4;
+  // Captured UTF-8 bytes in each rendered binding value.
+  int64 max_value_bytes = 5;
+}
+// Workspace policy ceilings for caller-provided code. Null at `Limits.execution` means
+// policy disables execution, regardless of adapter capability.
+message ExecutionLimits {
+  // UTF-8 bytes accepted in one CodeBlock.source.
+  int64 max_code_bytes = 1;
+  // Wall-clock milliseconds allowed for one evaluation.
+  int64 max_timeout_ms = 2;
+  // Captured prefix bytes allowed separately for stdout and stderr.
+  int64 max_output_bytes = 3;
+  // Evaluations running concurrently across all connections in the workspace.
+  int64 max_concurrent = 4;
+  // Debugging ceilings, or null when debugging policy is disabled.
+  optional DebugLimits debug = 5;
+}
 // The ceilings this server enforces on MCP requests and responses. They come from host policy
 // at launch, so two workspaces running the same Rift can differ. A request over one of them, or
 // a response that would be, fails with `limit_exceeded` carrying `LimitEvidence`.
@@ -485,6 +571,9 @@ message Limits {
   // Minimum time Rift retains previews and idempotent publish results after their last access.
   // A later read returns `record_reclaimed` once collection removes the record.
   int64 record_retention_seconds = 11;
+  // Caller-code execution ceilings. Null means host policy disables execute and all debug
+  // tools; adapter capability alone never enables them.
+  optional ExecutionLimits execution = 12;
 }
 // Capability manifest for one repository workspace, including configured languages, adapter
 // support, resolved state, and request limits.
@@ -500,23 +589,42 @@ message RepositoryResourcePayload {
     TOOLS_SEARCH = 3;
     // Literal, regular-expression and structural matching, with a key per hit.
     TOOLS_MATCH = 4;
-    // The fixes and refactors an adapter offers at one address.
-    TOOLS_ACTIONS = 5;
-    // Previews, refreshes, and publishes deterministic candidates through the retained
-    // validation contract.
-    TOOLS_APPLY = 6;
-    // Previews, refreshes, and publishes a validated merge into a local branch.
-    TOOLS_INTEGRATE = 7;
+    // Builds a candidate from concrete edits.
+    TOOLS_EDIT = 5;
+    // Builds a candidate from a unified diff.
+    TOOLS_PATCH = 6;
+    // Builds a candidate by replacing every match of one query.
+    TOOLS_REWRITE = 7;
+    // Builds a candidate from the three-way inverse of one commit.
+    TOOLS_REVERT = 8;
+    // Builds a candidate by merging one commit into the candidate state.
+    TOOLS_MERGE = 9;
+    // Changes what a declaration is called and rewrites its references.
+    TOOLS_RENAME = 10;
+    // Moves a declaration or file and updates imports and references.
+    TOOLS_MOVE = 11;
+    // Removes a declaration, mechanically or with a reference-aware policy.
+    TOOLS_DELETE = 12;
+    // Changes a callable's shape and propagates it to callers and overrides.
+    TOOLS_CHANGE_SIGNATURE = 13;
+    // Resolves one discovered adapter action that has no portable contract.
+    TOOLS_ACT = 14;
+    // Builds a validated merge candidate for a local branch.
+    TOOLS_INTEGRATE = 15;
+    // Reruns a retained candidate's operation on a newer base.
+    TOOLS_REFRESH = 16;
+    // Runs the declared validators and advances the candidate's destination ref.
+    TOOLS_PUBLISH = 17;
     // Materializes selected paths from an accepted commit into the connection worktree.
-    TOOLS_PERSIST = 8;
+    TOOLS_PERSIST = 18;
     // Evaluates a code block in one adapter's revision-specific project runtime.
-    TOOLS_EXECUTE = 9;
+    TOOLS_EXECUTE = 19;
     // Starts an inspect-only debugging evaluation.
-    TOOLS_DEBUG_START = 10;
+    TOOLS_DEBUG_START = 20;
     // Reads one retained stack frame from a debugging session.
-    TOOLS_DEBUG_GET_FRAME = 11;
+    TOOLS_DEBUG_GET_FRAME = 21;
     // Releases a debugging session and its execution workspace.
-    TOOLS_DEBUG_STOP = 12;
+    TOOLS_DEBUG_STOP = 22;
   }
   enum Resources {
     // The caller did not set a value.
@@ -529,9 +637,13 @@ message RepositoryResourcePayload {
     RESOURCES_DIFF = 3;
     // One file's tree entry and its bytes.
     RESOURCES_FILE = 4;
-    // One retained candidate's requests, resolved plans, validation evidence, and
+    // One retained candidate's operation, resolved plan, validation evidence, and
     // confirmations.
     RESOURCES_PREVIEW = 5;
+    // The fixes and refactors an adapter offers at one address, or across one file.
+    RESOURCES_ACTIONS = 6;
+    // One discovered action, with the schema of the arguments it takes.
+    RESOURCES_ACTION = 7;
   }
   // Git object hash used by this repository. It determines whether a `Commit` contains 40 or 64
   // hexadecimal characters.
@@ -587,7 +699,9 @@ message RepositoryResourcePayload {
   // remains unsupported in subsequent answers.
   rift.core.SemanticCoverage coverage = 6;
   // The MCP tools this workspace serves. A tool the profile or host policy does not reach is
-  // absent from this list and from `tools/list`.
+  // absent from this list and from `tools/list`. Execute appears when at least one
+  // LanguageSupport.execution.execute is true; the debug triplet appears together when at least
+  // one LanguageSupport.execution.debug is true.
   repeated Tools tools = 7;
   // The MCP resource families this workspace serves.
   repeated Resources resources = 8;
@@ -616,44 +730,46 @@ message SearchResult {
   // Pass this back to get the next page. Null on the last one.
   optional string next_cursor = 4;
 }
-// One adapter action discovered at an address. It combines a portable descriptor with a
-// state-bound resolution key.
+// One adapter action discovered at an address: the URI that resolves it, and the portable
+// description the adapter returned. A listing page leaves `descriptor.arguments_schema` null,
+// because a page of offers carries as many schemas as it has entries and a caller reads one.
+// The single-offer resource always carries it.
 message ActionOffer {
-  // What the action does, what it applies to, and the schema of the arguments it takes.
-  rift.core.ActionDescriptor descriptor = 1;
-  // Language, snapshot, and adapter token used to resolve this offer.
-  rift.core.ActionKey key = 2;
+  // Identity of this offer. Hand it to `act`, or read it for the argument schema the action
+  // takes.
+  string action = 1;
+  // What the action does and what it applies to.
+  rift.core.ActionDescriptor descriptor = 2;
 }
-// What to ask an adapter for, and where. `target` picks the place, `only` narrows the kinds,
-// and `rev` selects the source state.
-message ActionsParams {
-  // Where in the code to ask. A symbol, a node, a byte range, or a match you already have.
-  rift.core.Address target = 1;
-  // Kind prefixes to keep. `refactor` returns everything under it; an empty list returns every
-  // action the adapter offers.
-  repeated string only = 2;
-  // Most actions to return in one page.
-  optional int64 limit = 3;
-  // Continues a previous call. Omit for the first page.
-  optional string cursor = 4;
-  // Which revision to answer against. Absent, the default branch at its latest commit.
-  optional string rev = 5;
-}
-// Discovered actions for one pinned address. Offers sort by language name, dialect with null
-// first, target, kind, argument contract, argument schema, guarantees, full descriptor, and
-// token. Object fields use RFC 8785 ordering. The cursor binds this order, the snapshot, and
+// One page of the actions available at one address. Offers sort by language name, dialect with
+// null first, target, kind, and offer identity. The cursor binds that order, the snapshot, and
 // the adapter build.
-message ActionsResult {
+message ActionsResourcePayload {
+  // The address this page answers for, echoed back as it resolved.
+  string uri = 1;
   // The snapshot this answer was resolved against. Pass it back as `rev` when a later call has
   // to agree with this one.
-  rift.core.Snapshot at = 1;
-  // The actions on this page.
-  repeated ActionOffer actions = 2;
+  rift.core.Snapshot at = 2;
+  // The actions on this page, each without its argument schema.
+  repeated ActionOffer offers = 3;
   // Whether the adapter could answer here. A language with no action support returns an empty
   // list with `unsupported` coverage and its reason.
-  rift.core.Coverage coverage = 3;
-  // Pass this back to get the next page. Null on the last one.
-  optional string next_cursor = 4;
+  rift.core.Coverage coverage = 4;
+  // The same address carrying the cursor for the next page, or null on the last one.
+  optional string next = 5;
+}
+// One discovered action and the arguments it accepts. This is the read that supplies
+// `arguments_schema`, so a caller fetches one schema for the action it chose rather than a
+// schema per offer on a page.
+message ActionResourcePayload {
+  // The offer this payload answers for, echoed back as it resolved.
+  string uri = 1;
+  // The snapshot this offer was discovered in.
+  rift.core.Snapshot at = 2;
+  // Language whose adapter minted the offer and resolves it.
+  rift.core.Language language = 3;
+  // The offer, with `descriptor.arguments_schema` present.
+  ActionOffer offer = 4;
 }
 // Evaluate a caller-provided code block with one configured language adapter against an
 // exact revision. The server materializes a disposable execution workspace before crossing
@@ -675,11 +791,13 @@ message ExecuteResult {
   rift.core.Language language = 2;
   // Runtime status, bounded output, and structured diagnostics.
   rift.core.ExecutionResult result = 3;
+  // Exact bounds sent to the adapter for this evaluation.
+  rift.core.ExecutionBudget budget = 4;
 }
 // Public summary of an inspect-only debugging evaluation. Start runs the block to normal
 // completion or an unhandled failure; failed runs retain their stack for frame reads.
 message DebugSession {
-  // Server-minted public handle. The adapter-local token never crosses MCP.
+  // Server-minted public handle. The adapter-local DebugSessionKey never crosses MCP.
   string id = 1;
   // Snapshot retained by the session's execution workspace.
   rift.core.Snapshot at = 2;
@@ -689,6 +807,8 @@ message DebugSession {
   int64 frame_count = 4;
   // How the debugging evaluation ended and its bounded output.
   rift.core.ExecutionResult result = 5;
+  // Exact execution and retained-frame bounds applied to this session.
+  rift.core.DebugBudget budget = 6;
 }
 // Start an inspect-only debugging evaluation in a disposable execution workspace.
 message DebugStartParams {
@@ -732,7 +852,7 @@ message MatchHitStructural {
   rift.core.Extensions extensions = 4;
   // Identity of this match and the state it was found in. An edit addressed at it is checked
   // against this before it lands.
-  rift.core.MatchKey key = 5;
+  string key = 5;
 }
 // A text match. Bytes matched bytes, with no tree behind them and nothing to say about what is
 // safe to replace.
@@ -743,7 +863,7 @@ message MatchHitText {
   repeated string explanation = 2;
   // Identity of this match and the state it was found in. An edit addressed at it is checked
   // against this before it lands.
-  rift.core.MatchKey key = 3;
+  string key = 3;
 }
 // One match, tagged by the engine that produced it. The tag equals `key.query.kind`. A
 // structural match carries grammar-derived replacement ranges. A text match carries source
@@ -827,7 +947,8 @@ message ErrorCause {
     // client's supported contract.
     ERROR_CODE_UNSUPPORTED_PROTOCOL = 2;
     // Host policy refused — a path outside the workspace, a revision this deployment does not
-    // expose. The same request fails the same way.
+    // expose, a language not authorized for execution, or a debugging session owned by another
+    // connection. The same request fails the same way.
     ERROR_CODE_PERMISSION_DENIED = 3;
     // The revision does not resolve here: a deleted branch, a commit never fetched, a working
     // tree that has been removed. Retrying helps only once the revision exists.
@@ -843,8 +964,8 @@ message ErrorCause {
     // analysing, or that state's facts were dropped. Retrying once indexing catches up
     // succeeds.
     ERROR_CODE_SEMANTIC_SNAPSHOT_UNAVAILABLE = 7;
-    // The URI is well-formed and resolves to nothing — no such symbol, no such file at that
-    // revision. Retrying does not help.
+    // The identity is well-formed and resolves to nothing — no such symbol, no such file at
+    // that revision, or a debug session already stopped or expired. Retrying does not help.
     ERROR_CODE_RESOURCE_NOT_FOUND = 8;
     // The record existed and has been vacuumed away after its retention window. It stays
     // distinct from `resource_not_found` because a retry that read a silent miss would re-run
@@ -904,12 +1025,9 @@ message ErrorCause {
     // Send the same bytes again. The cause was transient — a busy working tree, an adapter
     // still starting.
     RETRY_DIRECTIVE_SAME_REQUEST = 2;
-    // Retry under the operation's existing key. Rift returns the retained outcome when the
-    // first call completed before its response was lost.
-    RETRY_DIRECTIVE_SAME_IDEMPOTENCY_KEY = 3;
     // The state moved under the request. Re-read the current state, rebuild whatever was pinned
     // to the old one, then ask again.
-    RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 4;
+    RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
   }
   // How this link classifies on its own.
   ErrorCode code = 1;
@@ -936,7 +1054,8 @@ message ErrorData {
     // client's supported contract.
     ERROR_CODE_UNSUPPORTED_PROTOCOL = 2;
     // Host policy refused — a path outside the workspace, a revision this deployment does not
-    // expose. The same request fails the same way.
+    // expose, a language not authorized for execution, or a debugging session owned by another
+    // connection. The same request fails the same way.
     ERROR_CODE_PERMISSION_DENIED = 3;
     // The revision does not resolve here: a deleted branch, a commit never fetched, a working
     // tree that has been removed. Retrying helps only once the revision exists.
@@ -952,8 +1071,8 @@ message ErrorData {
     // analysing, or that state's facts were dropped. Retrying once indexing catches up
     // succeeds.
     ERROR_CODE_SEMANTIC_SNAPSHOT_UNAVAILABLE = 7;
-    // The URI is well-formed and resolves to nothing — no such symbol, no such file at that
-    // revision. Retrying does not help.
+    // The identity is well-formed and resolves to nothing — no such symbol, no such file at
+    // that revision, or a debug session already stopped or expired. Retrying does not help.
     ERROR_CODE_RESOURCE_NOT_FOUND = 8;
     // The record existed and has been vacuumed away after its retention window. It stays
     // distinct from `resource_not_found` because a retry that read a silent miss would re-run
@@ -1013,12 +1132,9 @@ message ErrorData {
     // Send the same bytes again. The cause was transient — a busy working tree, an adapter
     // still starting.
     RETRY_DIRECTIVE_SAME_REQUEST = 2;
-    // Retry under the operation's existing key. Rift returns the retained outcome when the
-    // first call completed before its response was lost.
-    RETRY_DIRECTIVE_SAME_IDEMPOTENCY_KEY = 3;
     // The state moved under the request. Re-read the current state, rebuild whatever was pinned
     // to the old one, then ask again.
-    RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 4;
+    RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
   }
   // How far the request got before it failed. The same code means different things at different
   // phases: `limit_exceeded` while reading is a response too big, and while validating it is a
@@ -1043,6 +1159,10 @@ message ErrorData {
     PUBLISH = 6;
     // Materializing selected paths from an accepted commit into the connection worktree.
     PERSIST = 7;
+    // Preparing an execution workspace and evaluating caller-provided code.
+    EXECUTE = 8;
+    // Starting, inspecting, or stopping a connection-bound debugging session.
+    DEBUG = 9;
   }
   // Why the request failed.
   ErrorCode code = 1;
@@ -1084,8 +1204,8 @@ message LimitEvidence {
     ADAPTER = 2;
   }
   Scope scope = 1;
-  // The limit's field name in whichever message `scope` names, such as `max_page_items` or
-  // `max_in_flight_per_state`.
+  // The limit's field path below whichever message `scope` names, such as `max_page_items`,
+  // `execution.max_concurrent`, or `max_in_flight_per_state`.
   string field = 2;
   // The value in force when the request was rejected.
   int64 limit = 3;
@@ -1146,6 +1266,20 @@ message PreviewResourceTemplate {
   // What a read of a URI from this template returns: `PreviewResourcePayload` as JSON.
   string mime_type = 2;
 }
+// The actions resource, addressed by the place to ask about.
+message ActionsResourceTemplate {
+  // The resource family, as `resources/templates/list` advertises it.
+  string name = 1;
+  // What a read of a URI from this template returns: `ActionsResourcePayload` as JSON.
+  string mime_type = 2;
+}
+// One discovered action, addressed by the offer identity a listing returned.
+message ActionResourceTemplate {
+  // The resource family, as `resources/templates/list` advertises it.
+  string name = 1;
+  // What a read of a URI from this template returns: `ActionResourcePayload` as JSON.
+  string mime_type = 2;
+}
 // One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per
 // family.
 message ResourceTemplate {
@@ -1155,6 +1289,8 @@ message ResourceTemplate {
     DiffResourceTemplate diff = 3;
     FileResourceTemplate file = 4;
     PreviewResourceTemplate preview = 5;
+    ActionsResourceTemplate actions = 6;
+    ActionResourceTemplate action = 7;
   }
 }
 // The URI passed to MCP `resources/read`. Each branch is one advertised Rift resource family.
@@ -1197,6 +1333,20 @@ message PreviewResourceContent {
   // A `PreviewResourcePayload`, serialized as JSON.
   string text = 2;
 }
+// What a read of a `rift://actions/…` URI returns.
+message ActionsResourceContent {
+  // The address that was read, as it resolved.
+  string uri = 1;
+  // An `ActionsResourcePayload`, serialized as JSON.
+  string text = 2;
+}
+// What a read of a `rift://action/…` URI returns.
+message ActionResourceContent {
+  // The offer that was read, as it resolved.
+  string uri = 1;
+  // An `ActionResourcePayload`, serialized as JSON.
+  string text = 2;
+}
 message ResourceContent {
   oneof variant {
     RepositoryResourceContent repository = 1;
@@ -1204,6 +1354,8 @@ message ResourceContent {
     DiffResourceContent diff = 3;
     FileResourceContent file = 4;
     PreviewResourceContent preview = 5;
+    ActionsResourceContent actions = 6;
+    ActionResourceContent action = 7;
   }
 }
 // The result of one MCP resource read. Each Rift resource returns one JSON payload in `text`,
@@ -1238,24 +1390,9 @@ message SearchHitTarget {
     SearchHitTargetFile file = 3;
   }
 }
-// One deterministic contribution to a candidate. Rift resolves the ordered array against one
-// pinned state. After each change, it applies formatting and makes every adapter sharing the
-// worktree acknowledge the new snapshot before resolving the next; any refusal discards the
-// candidate. Product model components convert prompts and provider completions into these
-// values before calling Rift.
-message Change {
-  oneof variant {
-    DirectChange direct_change = 1;
-    PatchChange patch_change = 2;
-    ActionChange action_change = 3;
-    RewriteChange rewrite_change = 4;
-    RevertChange revert_change = 5;
-    MergeChange merge_change = 6;
-  }
-}
-// Concrete filesystem edits supplied by the caller. Their ranges address the candidate state at
-// this point in the ordered change list.
-message DirectChange {
+// Concrete filesystem edits supplied by the caller. Their ranges address the state this
+// operation resolves against, and replacements in one set may not overlap.
+message EditParams {
   // How formatting participates in a change. The policy is part of the preview identity, so
   // refresh and publish cannot widen its reach.
   enum FormattingPolicy {
@@ -1269,18 +1406,26 @@ message DirectChange {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Tags this as a concrete edit list.
-  string kind = 1;
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
+  FormattingPolicy formatting = 4;
   // An atomic effect set in canonical file-and-range order. Every text replacement addresses
-  // the state before this change, and replacements may not overlap.
-  repeated rift.core.Edit edits = 2;
-  // Formatting applied after these edits resolve.
-  FormattingPolicy formatting = 3;
+  // the state before this operation.
+  repeated rift.core.Edit edits = 5;
 }
 // A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path
 // traversal, binary patches, malformed headers, and any hunk whose context differs from the
-// candidate state.
-message PatchChange {
+// state it resolves against.
+message PatchParams {
   // How formatting participates in a change. The policy is part of the preview identity, so
   // refresh and publish cannot widen its reach.
   enum FormattingPolicy {
@@ -1294,55 +1439,24 @@ message PatchChange {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Tags this as a unified diff.
-  string kind = 1;
-  // Unified diff in Git's text patch syntax, with project-relative `a/` and `b/` paths.
-  string patch = 2;
-  // Formatting applied after every hunk resolves.
-  FormattingPolicy formatting = 3;
-}
-// One adapter action selected from `actions`. Rift validates `arguments` against the advertised
-// schema and resolves the token. Refresh and publish rediscover at the descriptor's target.
-// Kind, target, argument contract, argument schema, and guarantees select the same action. Zero
-// or several matches cause a refusal.
-message ActionChange {
-  // How formatting participates in a change. The policy is part of the preview identity, so
-  // refresh and publish cannot widen its reach.
-  enum FormattingPolicy {
-    // The caller did not set a value.
-    UNSPECIFIED = 0;
-    // Keep every byte outside the resolved edits unchanged.
-    FORMATTING_POLICY_PRESERVE = 1;
-    // Run the language formatter over the smallest syntactic regions containing the resolved
-    // edits.
-    FORMATTING_POLICY_CHANGED_REGIONS = 2;
-    // Run the language formatter over every text file touched by the change.
-    FORMATTING_POLICY_AFFECTED_FILES = 3;
-  }
-  // Tags this as an adapter action.
-  string kind = 1;
-  // The descriptor used for replay and the key used for initial resolution.
-  ActionOffer action = 2;
-  // Arguments accepted by the offer's `ActionDescriptor.arguments_schema`. An action with no
-  // parameters receives an empty object.
-  google.protobuf.Struct arguments = 3;
-  // Formatting applied after the action's edits resolve.
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 4;
+  // Unified diff in Git's text patch syntax, with project-relative `a/` and `b/` paths.
+  string patch = 5;
 }
-// An atomic query-and-rewrite over the candidate state. Rift finds every match, checks the
-// cardinality, expands the replacement, and either applies all resulting edits or refuses the
-// candidate.
-message RewriteChange {
-  // Which safe structural range is replaced. Text queries accept `exact` only because they have
-  // no grammar-owned trivia boundaries.
-  enum Range {
-    // The caller did not set a value.
-    RANGE_UNSPECIFIED = 0;
-    EXACT = 1;
-    LEADING = 2;
-    TRAILING = 3;
-    BOTH = 4;
-  }
+// An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the
+// replacement, and either applies all resulting edits or refuses the candidate.
+message RewriteParams {
   // How formatting participates in a change. The policy is part of the preview identity, so
   // refresh and publish cannot widen its reach.
   enum FormattingPolicy {
@@ -1356,24 +1470,42 @@ message RewriteChange {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Tags this as an atomic match rewrite.
-  string kind = 1;
-  // The text or structural pattern evaluated at this point in the change list.
-  rift.core.MatchQuery query = 2;
+  // Which safe structural range is replaced. Text queries accept `exact` only because they have
+  // no grammar-owned trivia boundaries.
+  enum Range {
+    // The caller did not set a value.
+    RANGE_UNSPECIFIED = 0;
+    EXACT = 1;
+    LEADING = 2;
+    TRAILING = 3;
+    BOTH = 4;
+  }
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
+  FormattingPolicy formatting = 4;
+  // The text or structural pattern evaluated against the state this operation resolves against.
+  rift.core.MatchQuery query = 5;
   // UTF-8 replacement template. `${NAME}` inserts the source bound by a named or numeric
   // capture, `${0}` inserts the whole match, and `$$` inserts one dollar sign. An absent
   // capture refuses the rewrite.
-  string replacement = 3;
-  Range range = 4;
+  string replacement = 6;
+  Range range = 7;
   // The accepted number of matches before expansion.
-  rift.core.MatchCardinality cardinality = 5;
-  // Formatting applied after every replacement resolves.
-  FormattingPolicy formatting = 6;
+  rift.core.MatchCardinality cardinality = 8;
 }
 // A validated three-way inverse of one commit. Rift computes the difference from `parent` to
-// `revision`, applies its inverse to the candidate state, and refuses overlapping changes it
-// cannot merge without guessing.
-message RevertChange {
+// `revision`, applies its inverse, and refuses overlapping changes it cannot merge without
+// guessing.
+message RevertParams {
   // How formatting participates in a change. The policy is part of the preview identity, so
   // refresh and publish cannot widen its reach.
   enum FormattingPolicy {
@@ -1387,49 +1519,255 @@ message RevertChange {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Tags this as a revision revert.
-  string kind = 1;
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
+  FormattingPolicy formatting = 4;
   // Exact commit whose changes are inverted.
-  string revision = 2;
+  string revision = 5;
   // Parent against which the commit's change is defined. Required for ordinary and merge
   // commits; null selects the empty tree for a root commit. A commit that does not have this
   // parent is refused.
-  optional string parent = 3;
+  optional string parent = 6;
   // Paths from the original commit eligible for inversion. Excluded paths remain untouched; the
   // commit diff exposes them when the caller needs to inspect the omission.
-  rift.core.PathSelector paths = 4;
-  // Formatting applied after the inverse edits resolve.
-  FormattingPolicy formatting = 5;
+  rift.core.PathSelector paths = 7;
 }
-// A three-way merge of one exact commit into the candidate state.
-message MergeChange {
-  // Tags this as a Git merge.
-  string kind = 1;
+// A three-way merge of one exact commit into the state this operation resolves against.
+message MergeParams {
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
   // Commit merged into the candidate state.
-  string revision = 2;
+  string revision = 5;
 }
-// Bounded summary of one requested change after resolution. The preview resource pages its
-// exact edits and evidence as records carrying this change index.
-message ResolvedChange {
-  // Zero-based position in the ordered request.
-  int64 index = 1;
+// Changes what a declaration is called and rewrites the references that name it. The adapter
+// checks language spelling, collisions, and binding changes; a reference outside `scope`
+// refuses the operation rather than leaving it half done.
+message RenameParams {
+  // How formatting participates in a change. The policy is part of the preview identity, so
+  // refresh and publish cannot widen its reach.
+  enum FormattingPolicy {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Keep every byte outside the resolved edits unchanged.
+    FORMATTING_POLICY_PRESERVE = 1;
+    // Run the language formatter over the smallest syntactic regions containing the resolved
+    // edits.
+    FORMATTING_POLICY_CHANGED_REGIONS = 2;
+    // Run the language formatter over every text file touched by the change.
+    FORMATTING_POLICY_AFFECTED_FILES = 3;
+  }
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
+  FormattingPolicy formatting = 4;
+  // The declaration to rename: a symbol, a node, a byte range, or a match.
+  rift.core.Address target = 5;
+  // The new name, and the source eligible for propagation.
+  rift.core.RenameArguments arguments = 6;
+}
+// Moves a declaration or file to another container or path and updates the imports and
+// references that reach it.
+message MoveParams {
+  // How formatting participates in a change. The policy is part of the preview identity, so
+  // refresh and publish cannot widen its reach.
+  enum FormattingPolicy {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Keep every byte outside the resolved edits unchanged.
+    FORMATTING_POLICY_PRESERVE = 1;
+    // Run the language formatter over the smallest syntactic regions containing the resolved
+    // edits.
+    FORMATTING_POLICY_CHANGED_REGIONS = 2;
+    // Run the language formatter over every text file touched by the change.
+    FORMATTING_POLICY_AFFECTED_FILES = 3;
+  }
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
+  FormattingPolicy formatting = 4;
+  // The declaration or file to move.
+  rift.core.Address target = 5;
+  // The destination, and the source eligible for import and reference updates.
+  rift.core.MoveArguments arguments = 6;
+}
+// Removes a declaration. Without a policy this is a mechanical removal that analyses no
+// references and claims no reference guarantee. With one, the adapter classifies every
+// remaining use, applies the stated disposition, and refuses the operation when reference
+// coverage is incomplete.
+message DeleteParams {
+  // How formatting participates in a change. The policy is part of the preview identity, so
+  // refresh and publish cannot widen its reach.
+  enum FormattingPolicy {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Keep every byte outside the resolved edits unchanged.
+    FORMATTING_POLICY_PRESERVE = 1;
+    // Run the language formatter over the smallest syntactic regions containing the resolved
+    // edits.
+    FORMATTING_POLICY_CHANGED_REGIONS = 2;
+    // Run the language formatter over every text file touched by the change.
+    FORMATTING_POLICY_AFFECTED_FILES = 3;
+  }
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
+  FormattingPolicy formatting = 4;
+  // The declaration or file to remove.
+  rift.core.Address target = 5;
+  // The disposition for each classified use, and the source it may be applied in.
+  rift.core.SafeDeleteArguments arguments = 6;
+}
+// Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument
+// lists: a new required parameter has to be supplied at every call site, which is why the
+// operation commonly raises a `behavior_unknown` confirmation.
+message ChangeSignatureParams {
+  // How formatting participates in a change. The policy is part of the preview identity, so
+  // refresh and publish cannot widen its reach.
+  enum FormattingPolicy {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Keep every byte outside the resolved edits unchanged.
+    FORMATTING_POLICY_PRESERVE = 1;
+    // Run the language formatter over the smallest syntactic regions containing the resolved
+    // edits.
+    FORMATTING_POLICY_CHANGED_REGIONS = 2;
+    // Run the language formatter over every text file touched by the change.
+    FORMATTING_POLICY_AFFECTED_FILES = 3;
+  }
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
+  FormattingPolicy formatting = 4;
+  // The callable whose signature changes.
+  rift.core.Address target = 5;
+  // The desired callable shape, its propagation, and the source it may reach.
+  rift.core.ChangeSignatureArguments arguments = 6;
+}
+// Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an
+// adapter offers that has no portable contract. Rift validates `arguments` against the offer's
+// advertised schema. An offer whose kind belongs to a portable family is refused here, because
+// `rename`, `move`, `delete`, and `change_signature` are its typed entry points.
+message ActParams {
+  // How formatting participates in a change. The policy is part of the preview identity, so
+  // refresh and publish cannot widen its reach.
+  enum FormattingPolicy {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Keep every byte outside the resolved edits unchanged.
+    FORMATTING_POLICY_PRESERVE = 1;
+    // Run the language formatter over the smallest syntactic regions containing the resolved
+    // edits.
+    FORMATTING_POLICY_CHANGED_REGIONS = 2;
+    // Run the language formatter over every text file touched by the change.
+    FORMATTING_POLICY_AFFECTED_FILES = 3;
+  }
+  // Retained candidate this operation continues. Omission starts from `rev`. The operation
+  // resolves against that candidate's tree, so a rename can follow the edit that created what
+  // it renames, and the chain is the transaction.
+  optional string on = 1;
+  // State against which resolution begins when `on` is absent. Omission selects the
+  // connection's current accepted revision.
+  optional string rev = 2;
+  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
+  // selected commit must be an ancestor of `rev`.
+  optional string expected_accepted = 3;
+  // Formatting applied after this operation's edits resolve.
+  FormattingPolicy formatting = 4;
+  // The offer to resolve, as the actions resource returned it.
+  string action = 5;
+  // Arguments accepted by the offer's `ActionDescriptor.arguments_schema`. An action with no
+  // parameters receives an empty object.
+  google.protobuf.Struct arguments = 6;
+}
+// The request one retained candidate was built from, as the tool received it. It appears in the
+// preview resource rather than in any tool parameter, so a plan can be read back and a refresh
+// can repeat exactly what was asked.
+message PreviewOperation {
+  oneof variant {
+    EditParams edit_params = 1;
+    PatchParams patch_params = 2;
+    RewriteParams rewrite_params = 3;
+    RevertParams revert_params = 4;
+    MergeParams merge_params = 5;
+    RenameParams rename_params = 6;
+    MoveParams move_params = 7;
+    DeleteParams delete_params = 8;
+    ChangeSignatureParams change_signature_params = 9;
+    ActParams act_params = 10;
+    IntegrateParams integrate_params = 11;
+  }
+}
+// Bounded summary of one candidate's operation after resolution. The preview resource pages its
+// exact edits and evidence.
+message ResolvedOperation {
   // Language adapters that contributed to resolution, sorted by name and dialect with null
-  // first. Empty for a change resolved entirely by Rift.
-  repeated rift.core.Language owners = 2;
-  // Number of concrete Edit records retained for this change.
-  int64 edit_count = 3;
-  // Number of satisfied preconditions retained for this change.
-  int64 precondition_count = 4;
-  // Number of semantic effects retained for this change.
-  int64 effect_count = 5;
-  // Number of guarantee evidence records retained for this change.
-  int64 guarantee_count = 6;
+  // first. Empty for an operation resolved entirely by Rift.
+  repeated rift.core.Language owners = 1;
+  // Number of concrete Edit records retained for this operation.
+  int64 edit_count = 2;
+  // Number of satisfied preconditions retained for this operation.
+  int64 precondition_count = 3;
+  // Number of semantic effects retained for this operation.
+  int64 effect_count = 4;
+  // Number of guarantee evidence records retained for this operation.
+  int64 guarantee_count = 5;
   // How completely Rift and its adapters resolved the request. Publication requires complete
   // coverage.
-  rift.core.Coverage coverage = 7;
-  // Number of resolution diagnostics retained for this change.
-  int64 diagnostic_count = 8;
+  rift.core.Coverage coverage = 6;
+  // Number of resolution diagnostics retained for this operation.
+  int64 diagnostic_count = 7;
 }
+// What a passing run of one command is taken to establish. The evidence covers the published
+// chain, which is the whole of what the command ran against.
 message CommandValidatorGuarantees {
   // A property an action claims and must establish with scoped evidence when resolved.
   enum GuaranteeKind {
@@ -1446,14 +1784,12 @@ message CommandValidatorGuarantees {
     // evidence is limited to that named property and scope.
     GUARANTEE_KIND_BEHAVIOR_CHECKED = 4;
   }
-  // Requested change indexes to which this evidence applies.
-  repeated int64 changes = 1;
   // Guarantee established when the validator passes.
-  GuaranteeKind kind = 2;
+  GuaranteeKind kind = 1;
   // Source over which the command checks the property.
-  rift.core.CoverageScope scope = 3;
+  rift.core.CoverageScope scope = 2;
   // Exact property the command checks and limits on interpreting a pass.
-  string detail = 4;
+  string detail = 3;
 }
 // A caller-authorized acceptance check executed directly, without a shell, in a disposable
 // validation workspace materialized from the complete candidate tree. The workspace is only the
@@ -1501,7 +1837,7 @@ message CommandValidator {
   map<string, string> environment = 6;
   // Wall-clock limit before Rift terminates the process.
   int64 timeout_ms = 7;
-  // Captured prefix limit for each output stream. `ValidatorOutput.total_bytes` reports the
+  // Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the
   // omitted size. The upper bound keeps one escaped validator result inside a 65536-byte
   // preview page.
   int64 output_limit_bytes = 8;
@@ -1509,21 +1845,6 @@ message CommandValidator {
   // declaration into `GuaranteeEvidence`; a failed result rejects publication.
   repeated CommandValidatorGuarantees guarantees = 9;
   Determinism determinism = 10;
-}
-// A bounded UTF-8 rendering of one process stream. Invalid byte sequences become U+FFFD. The
-// digest covers the complete raw stream, including bytes beyond the captured prefix.
-message ValidatorOutput {
-  // Decoded captured prefix.
-  string text = 1;
-  // Raw bytes represented by `text` before replacement decoding.
-  int64 captured_bytes = 2;
-  // Raw bytes emitted by the complete stream.
-  int64 total_bytes = 3;
-  // Whether bytes after the captured prefix were omitted from `text`.
-  bool truncated = 4;
-  // SHA-256 of the complete raw stream. This retains the identity of omitted bytes when
-  // `truncated` is true.
-  string digest = 5;
 }
 // A declared validator process that exited with status zero.
 message ValidatorResultPassed {
@@ -1537,9 +1858,9 @@ message ValidatorResultPassed {
   // configured diagnostic decoder.
   repeated rift.core.Diagnostic diagnostics = 4;
   // Bounded standard output from the process.
-  ValidatorOutput stdout = 5;
+  rift.core.CapturedText stdout = 5;
   // Bounded standard error from the process.
-  ValidatorOutput stderr = 6;
+  rift.core.CapturedText stderr = 6;
 }
 // A declared validator process that exited with a nonzero status.
 message ValidatorResultFailed {
@@ -1553,9 +1874,9 @@ message ValidatorResultFailed {
   // configured diagnostic decoder.
   repeated rift.core.Diagnostic diagnostics = 4;
   // Bounded standard output from the process.
-  ValidatorOutput stdout = 5;
+  rift.core.CapturedText stdout = 5;
   // Bounded standard error from the process.
-  ValidatorOutput stderr = 6;
+  rift.core.CapturedText stderr = 6;
 }
 // The completed outcome of one declared validator. Exit status zero passes. Every other exit
 // status fails. A workspace, launch, timeout, or capture failure raises
@@ -1585,10 +1906,13 @@ message CandidateValidation {
 // Bounded identity and validation evidence for a retained apply or integration candidate. The
 // linked preview resource carries the complete plan.
 message CandidateSummary {
-  // The retained plan's stable identity.
+  // The retained plan's stable identity, derived from the request that produced it.
   string preview = 1;
-  // The state against which the first change was resolved.
+  // The state against which this operation resolved.
   rift.core.Snapshot base = 2;
+  // The candidate this one continues, or null when it started from `rev`. Following `parent`
+  // from a tip reads the complete chain a publication would advance.
+  optional string parent = 8;
   // Ref head that publication will compare-and-swap. Apply reports the accepted head;
   // integration reports the target head.
   string expected_head = 3;
@@ -1602,280 +1926,242 @@ message CandidateSummary {
   // Number of acknowledgement requirements retained in the preview resource.
   int64 confirmation_count = 7;
 }
-message PreviewResourcePayloadEdits {
-  // Requested change index that produced this edit.
-  int64 change = 1;
-  // Concrete filesystem effect.
-  rift.core.Edit edit = 2;
-}
-message PreviewResourcePayloadPreconditions {
-  // Requested change index checked by this condition.
-  int64 change = 1;
-  rift.core.OperationPrecondition precondition = 2;
-}
-message PreviewResourcePayloadEffects {
-  // Requested change index that produced this effect.
-  int64 change = 1;
-  rift.core.OperationEffect effect = 2;
-}
-message PreviewResourcePayloadGuarantees {
-  // Requested change index supported by this evidence.
-  int64 change = 1;
-  rift.core.GuaranteeEvidence evidence = 2;
-}
-message PreviewResourcePayloadResolutionDiagnostics {
-  // Requested change index that produced this finding.
-  int64 change = 1;
-  rift.core.Diagnostic diagnostic = 2;
-}
-// One page of a retained candidate contract. Concatenating every array from successive pages
-// reconstructs the complete plan and validation evidence. Every page repeats the URI, base,
-// candidate, and bounded validation verdict.
+// One page of a retained candidate. Concatenating every array from successive pages
+// reconstructs the complete plan and its validation evidence. Every page repeats the URI, base,
+// candidate, and bounded verdict. A candidate holds one operation; `parent` reads back the
+// chain it belongs to.
 message PreviewResourcePayload {
   // The preview resource URI for this page.
   string uri = 1;
   // The state from which resolution began.
   rift.core.Snapshot base = 2;
-  // The immutable candidate commit produced by the complete plan.
-  string candidate = 3;
-  // Caller-supplied checks on this page, preserving declaration order.
-  repeated CommandValidator validators = 4;
-  // Requested changes on this page, preserving their transaction order.
-  repeated Change requested = 5;
-  // Bounded resolution summaries on this page, ordered by request index.
-  repeated ResolvedChange resolved = 6;
-  // Concrete edits on this page, ordered by change index and canonical edit order.
-  repeated PreviewResourcePayloadEdits edits = 7;
-  // Satisfied preconditions on this page, ordered by change index and check order.
-  repeated PreviewResourcePayloadPreconditions preconditions = 8;
-  // Semantic effects on this page, ordered by change index and adapter emission order.
-  repeated PreviewResourcePayloadEffects effects = 9;
-  // Guarantee evidence on this page, ordered by change index and guarantee kind.
-  repeated PreviewResourcePayloadGuarantees guarantees = 10;
-  // Resolution findings on this page, ordered by change index and source location.
-  repeated PreviewResourcePayloadResolutionDiagnostics resolution_diagnostics = 11;
+  // The candidate this one continues, or null when it started from a revision.
+  optional string parent = 3;
+  // The immutable candidate commit produced by this operation.
+  string candidate = 4;
+  // The request this candidate was built from, as the tool received it.
+  PreviewOperation operation = 5;
+  // Bounded resolution summary for that operation.
+  ResolvedOperation resolved = 6;
+  // Concrete edits on this page, in canonical file-and-range order.
+  repeated rift.core.Edit edits = 7;
+  // Satisfied preconditions on this page, in check order.
+  repeated rift.core.OperationPrecondition preconditions = 8;
+  // Semantic effects on this page, in adapter emission order.
+  repeated rift.core.OperationEffect effects = 9;
+  // Guarantee evidence on this page, ordered by guarantee kind.
+  repeated rift.core.GuaranteeEvidence guarantees = 10;
+  // Resolution findings on this page, ordered by source location.
+  repeated rift.core.Diagnostic resolution_diagnostics = 11;
   // File-level diff entries on this page, ordered by the path present after the change and then
   // by the path present before it.
   repeated rift.core.FileChange files = 12;
   // Bounded verdict for the complete candidate.
   CandidateValidation validation = 13;
+  // Command declarations supplied at publication, preserving declaration order. Empty until the
+  // candidate is published.
+  repeated CommandValidator validators = 14;
   // Adapter reports on this page, sorted by language name and dialect with null first and
   // unique across the complete resource.
-  repeated rift.core.ValidationReport adapter_reports = 14;
+  repeated rift.core.ValidationReport adapter_reports = 15;
   // Command-validator results on this page, preserving declaration order and appearing once
   // across the complete resource.
-  repeated ValidatorResult validator_results = 15;
+  repeated ValidatorResult validator_results = 16;
   // Acknowledgements on this page, sorted by id across the complete resource.
-  repeated rift.core.ConfirmationRequirement confirmations = 16;
+  repeated rift.core.ConfirmationRequirement confirmations = 17;
   // Rift findings about the complete plan, including path, ownership, and formatting decisions.
-  repeated rift.core.Diagnostic diagnostics = 17;
+  repeated rift.core.Diagnostic diagnostics = 18;
   // The URI for the next plan page, or null after the final page.
-  optional string next = 18;
+  optional string next = 19;
 }
-// One phase of the candidate lifecycle. Preview creates a retained plan, refresh re-resolves it
-// on a selected base, and publish attempts to advance the accepted ref with that contract.
-message ApplyParams {
+// Resolution or publication stopped before a valid candidate existed. No ref and no worktree
+// changed.
+message RefusedResult {
+  // Why Rift declined a candidate operation or its publication. A refusal is a completed
+  // decision with evidence, not a transport failure; `ErrorData` carries the failures that
+  // never reached a decision.
+  enum RefusalReason {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // No adapter implements this operation for the language it reaches, or repository state
+    // cannot satisfy the contract.
+    REFUSAL_REASON_UNSUPPORTED = 1;
+    // A condition checked before resolution failed. The failed entry is in `preconditions`.
+    REFUSAL_REASON_UNMET_PRECONDITION = 2;
+    // The address resolves to several targets. Narrow it and ask again.
+    REFUSAL_REASON_AMBIGUOUS_TARGET = 3;
+    // The retained candidate no longer matches the head or source it was built against.
+    REFUSAL_REASON_STALE_PREVIEW = 4;
+    // The offer was discovered against a snapshot that has moved. Read the actions resource
+    // again.
+    REFUSAL_REASON_STALE_ACTION = 5;
+    // The match was found against a snapshot that has moved. Search again.
+    REFUSAL_REASON_STALE_MATCH = 6;
+    // A rewrite matched fewer or more times than its cardinality accepts.
+    REFUSAL_REASON_CARDINALITY_MISMATCH = 7;
+    // Publication needs an acknowledgement the caller did not supply.
+    REFUSAL_REASON_CONFIRMATION_REQUIRED = 8;
+    // The complete effect reaches outside what the caller can have meant — outside the project,
+    // or into generated source.
+    REFUSAL_REASON_UNSAFE_EFFECT = 9;
+    // The requested formatting policy has no formatter behind it for an affected language.
+    REFUSAL_REASON_FORMATTER_UNSUPPORTED = 10;
+    // Required adapter or command validation did not complete.
+    REFUSAL_REASON_VALIDATION_INCOMPLETE = 11;
+    // The offer belongs to a portable family, which resolves through `rename`, `move`,
+    // `delete`, or `change_signature` rather than through `act`.
+    REFUSAL_REASON_PORTABLE_FAMILY = 12;
+    // The integration target is checked out and automatic integration is disabled.
+    REFUSAL_REASON_CHECKED_OUT_TARGET = 13;
+    // The checked-out integration target has local changes.
+    REFUSAL_REASON_DIRTY_TARGET = 14;
+  }
+  // State against which the refused work was attempted.
+  rift.core.Snapshot base = 1;
+  // The condition the caller can act on.
+  RefusalReason reason = 2;
+  // Conditions checked before refusal, including at least one failed entry for
+  // `unmet_precondition`.
+  repeated rift.core.OperationPrecondition preconditions = 3;
+  // Existing code, paths, or relationships that prevented a deterministic resolution.
+  repeated rift.core.OperationBlocker blockers = 4;
+  // Evidence that explains the refusal.
+  repeated rift.core.Diagnostic diagnostics = 5;
+}
+// A retained candidate. Nothing has been published: the accepted ref, the integration target,
+// and the connection worktree are unchanged until `publish` and `persist`.
+message CandidateCreated {
+  // Candidate identity and acceptance evidence.
+  CandidateSummary summary = 1;
+}
+// What every candidate-creating tool returns: a retained candidate, or a refusal carrying the
+// conditions and code that stopped it. Malformed requests, unavailable infrastructure, storage
+// faults, and validator execution failures use `ErrorData` instead.
+message CandidateResult {
   oneof variant {
-    PreviewApplyParams preview_apply_params = 1;
-    RefreshApplyParams refresh_apply_params = 2;
-    PublishApplyParams publish_apply_params = 3;
+    CandidateCreated candidate = 1;
+    RefusedResult refused = 2;
   }
 }
-// Builds and validates an immutable candidate while leaving the accepted ref and connection
-// worktree unchanged.
-message PreviewApplyParams {
-  // Selects candidate creation.
-  string mode = 1;
-  // State against which resolution begins. Omission selects the connection's current accepted
-  // revision.
+// Re-runs a retained candidate's operation on a newer base. Because each candidate holds one
+// operation and names the candidate it continued, refreshing a chain replays the same requests
+// in the same order.
+message RefreshParams {
+  // The retained candidate to run again.
+  string preview = 1;
+  // New base. Omission selects the current accepted revision.
   optional string rev = 2;
   // Accepted-ref head expected at publication. Omission selects the current accepted head. The
   // selected commit must be an ancestor of `rev`.
   optional string expected_accepted = 3;
-  // Ordered deterministic changes. Each observes the result of its predecessors.
-  repeated Change changes = 4;
-  // Caller-supplied acceptance checks. The `edit` profile accepts an empty array. The `full`
-  // profile may accept up to `Limits.max_validators` declarations.
-  repeated CommandValidator validators = 5;
 }
-// Re-resolves a retained preview's exact changes and validators on a selected base. It creates
-// a new preview and leaves the accepted ref unchanged.
-message RefreshApplyParams {
-  // Selects preview refresh.
-  string mode = 1;
-  // The retained contract to run again.
-  string previous = 2;
-  // New base. Omission selects the current accepted revision.
-  optional string rev = 3;
-  // Accepted-ref head expected at publication. Omission selects the current accepted head. The
-  // selected commit must be an ancestor of `rev`.
-  optional string expected_accepted = 4;
+// A new retained candidate produced from an earlier one and a selected base.
+message RefreshedResult {
+  // The candidate whose operation was rerun.
+  string previous = 1;
+  // Identity and evidence for the refreshed candidate.
+  CandidateSummary summary = 2;
+  // Number of resolved records — edits, preconditions, effects, guarantees, coverage,
+  // diagnostics — that differ from the previous candidate. Comparing the two preview resources
+  // yields the exact records.
+  int64 changed_record_count = 3;
+  // Number of candidate paths that differ from the previous candidate. Comparing the paginated
+  // file records yields the exact paths.
+  int64 changed_file_count = 4;
 }
-// Attempts to advance the accepted ref with a retained preview. Rift replays resolution and
-// validation. Every deterministic preview record and the candidate tree must match. It then
-// compares the accepted ref with the retained base and advances it to the candidate. Fresh
-// validator verdicts govern publication; captured output may differ.
-message PublishApplyParams {
-  // Selects publication.
-  string mode = 1;
-  // The retained contract to publish.
-  string preview = 2;
-  // Caller-chosen retry key. Rift retains the key with the exact publish request and result,
-  // returning that result on an exact retry and refusing reuse with different input.
-  string idempotency_key = 3;
-  // Every currently required confirmation id, sorted bytewise. Missing or extra ids refuse
-  // publication.
-  repeated int64 confirmations = 4;
-}
-// A completed candidate lifecycle decision. Malformed requests, unavailable infrastructure,
-// storage faults, and validator execution failures use `ErrorData`.
-message ApplyResult {
+// A rerun of one retained candidate against a newer base.
+message RefreshResult {
   oneof variant {
-    PreviewApplyResult preview_apply_result = 1;
-    RefreshApplyResult refresh_apply_result = 2;
-    AcceptedApplyResult accepted_apply_result = 3;
-    RejectedApplyResult rejected_apply_result = 4;
-    RefusedApplyResult refused_apply_result = 5;
-    ConflictApplyResult conflict_apply_result = 6;
+    RefreshedResult refreshed = 1;
+    RefusedResult refused = 2;
   }
 }
-// A retained preview created without advancing the accepted ref or materializing its files.
-message PreviewApplyResult {
-  // Identifies preview creation.
-  string status = 1;
-  // Candidate identity and acceptance evidence.
-  CandidateSummary summary = 2;
+// Publishes one retained candidate. Rift replays the chain's resolution, runs the declared
+// command validators against the candidate, and advances the destination by compare-and-swap:
+// the accepted ref for an ordinary candidate, the target branch for an integration. Validators
+// are declared here rather than at creation, so building a change does not pay for a test suite
+// at every step.
+message PublishParams {
+  // The retained candidate to publish. Its chain publishes with it.
+  string preview = 1;
+  // Every confirmation id the candidate currently requires, sorted bytewise. Missing or extra
+  // ids refuse publication.
+  repeated int64 confirmations = 2;
+  // Caller-supplied acceptance checks run against the candidate before it is published. The
+  // `edit` profile accepts an empty array; the `full` profile accepts up to
+  // `Limits.max_validators` declarations.
+  repeated CommandValidator validators = 3;
 }
-// A new retained preview produced from an earlier contract and a selected base.
-message RefreshApplyResult {
-  // Identifies preview refresh.
-  string status = 1;
-  // The preview whose contract was rerun.
-  string previous = 2;
-  // Identity and evidence for the refreshed candidate.
-  CandidateSummary summary = 3;
-  // Number of request indexes whose resolved owner, edits, preconditions, effects, guarantees,
-  // coverage, or diagnostics differ from the previous preview. Comparing the two preview
-  // resources yields the exact indexes.
-  int64 changed_request_count = 4;
-  // Number of candidate paths that differ from the previous preview. Comparing the paginated
-  // file records yields the exact paths.
-  int64 changed_file_count = 5;
-}
-// Publication advanced the accepted ref to the retained candidate commit. `accepted` therefore
-// equals `summary.candidate`. The connection worktree remains unchanged until `persist`
-// materializes it.
-message AcceptedApplyResult {
-  // Identifies successful publication.
-  string status = 1;
+// Publication advanced the accepted ref to the retained candidate commit, so `accepted` equals
+// `summary.candidate`. The connection worktree remains unchanged until `persist` materializes
+// it.
+message AcceptedResult {
   // The published candidate and its acceptance evidence.
-  CandidateSummary summary = 2;
+  CandidateSummary summary = 1;
   // The commit now held by the accepted ref.
-  string accepted = 3;
-  // Whether Rift returned a previously stored result for this exact idempotency key and
-  // request.
-  bool replayed = 4;
+  string accepted = 2;
+  // Whether the accepted ref already held this candidate, so publication returned the earlier
+  // outcome without repeating it.
+  bool replayed = 3;
+}
+// Publication advanced an integration target to the retained merge candidate.
+message IntegratedResult {
+  // Local branch advanced by publication.
+  string target = 1;
+  // Target head replaced by publication.
+  string previous = 2;
+  // Commit now held by the target ref.
+  string integrated = 3;
+  // Published merge candidate and fresh validation evidence.
+  CandidateSummary summary = 4;
+  // Whether the target already held this candidate, so publication returned the earlier
+  // outcome.
+  bool replayed = 5;
 }
 // Publication reran the retained contract and validation did not pass. The candidate remains
-// readable as a preview and the accepted ref is unchanged.
-message RejectedApplyResult {
-  // Identifies validation rejection.
-  string status = 1;
+// readable as a preview and no ref moved.
+message RejectedResult {
   // The rejected candidate and the evidence that prevented acceptance.
-  CandidateSummary summary = 2;
+  CandidateSummary summary = 1;
 }
-// Resolution or publication stopped before a valid candidate outcome existed. No accepted ref
-// or connection worktree changes.
-message RefusedApplyResult {
-  // Condition the caller can act on.
+// Publication reached compare-and-swap after another publication had moved the destination ref.
+message ConflictResult {
+  // Which compare-and-swap lost. Publication is idempotent by construction: a retry that finds
+  // the destination already holding the candidate returns the same success.
   enum Reason {
     // The caller did not set a value.
     UNSPECIFIED = 0;
-    UNSUPPORTED = 1;
-    UNMET_PRECONDITION = 2;
-    AMBIGUOUS_TARGET = 3;
-    STALE_PREVIEW = 4;
-    STALE_ACTION = 5;
-    STALE_MATCH = 6;
-    CARDINALITY_MISMATCH = 7;
-    CONFIRMATION_REQUIRED = 8;
-    UNSAFE_EFFECT = 9;
-    FORMATTER_UNSUPPORTED = 10;
-    VALIDATION_INCOMPLETE = 11;
-  }
-  // Identifies a domain refusal.
-  string status = 1;
-  // State against which the refused work was attempted.
-  rift.core.Snapshot base = 2;
-  // Zero-based requested change that caused the refusal, or null for a publication-wide
-  // condition.
-  optional int64 change = 3;
-  Reason reason = 4;
-  // Conditions checked before refusal, including at least one failed entry for
-  // `unmet_precondition`.
-  repeated rift.core.OperationPrecondition preconditions = 5;
-  // Existing code, paths, or relationships that prevented a deterministic resolution.
-  repeated rift.core.OperationBlocker blockers = 6;
-  // Evidence that explains the refusal.
-  repeated rift.core.Diagnostic diagnostics = 7;
-  // Deterministic replacement changes that satisfy the condition Rift could identify. Empty
-  // when no safe repair is known.
-  repeated Change suggestions = 8;
-}
-// Publication reached compare-and-swap after another accepted change had moved the ref, or
-// reused an idempotency key for different input. The accepted ref is unchanged by this request.
-message ConflictApplyResult {
-  // Which identity comparison failed.
-  enum Reason {
-    // The caller did not set a value.
-    UNSPECIFIED = 0;
+    // The accepted head moved after the candidate was built.
     STALE_BASE = 1;
-    IDEMPOTENCY_KEY_REUSED = 2;
+    // The integration target head moved after the candidate was built.
+    TARGET_MOVED = 2;
   }
-  // Identifies an optimistic concurrency conflict.
-  string status = 1;
+  // Which destination moved.
   Reason reason = 2;
-  // Accepted snapshot the retained preview expected.
-  rift.core.Snapshot base = 3;
-  // Accepted snapshot observed at publication time.
+  // Destination state the retained candidate expected.
+  rift.core.Snapshot expected = 3;
+  // Destination state observed at publication.
   rift.core.Snapshot current = 4;
 }
-// One retained preview, refresh, or publish phase for integration in the current repository.
-message IntegrateParams {
+// A completed publication decision. An ordinary candidate advances the accepted ref; an
+// integration candidate advances its target branch.
+message PublishResult {
   oneof variant {
-    PreviewIntegrateParams preview_integrate_params = 1;
-    RefreshIntegrateParams refresh_integrate_params = 2;
-    PublishIntegrateParams publish_integrate_params = 3;
+    AcceptedResult accepted = 1;
+    IntegratedResult integrated = 2;
+    RejectedResult rejected = 3;
+    RefusedResult refused = 4;
+    ConflictResult conflict = 5;
   }
 }
-// Builds and validates a merge candidate while leaving the target ref unchanged.
-message PreviewIntegrateParams {
-  // Selects integration preview.
-  string mode = 1;
+// Merges an accepted commit into a local branch and validates the result, leaving the target
+// unchanged. Two commits that are each valid can merge into a broken tree, which is why the
+// merge candidate is validated like any other. `publish` advances the target.
+message IntegrateParams {
   // Branch that receives the accepted commit.
-  string target = 2;
+  string target = 1;
   // Accepted commit to integrate. Omission selects the connection's current accepted ref.
-  optional string source = 3;
-  // Caller-supplied checks run on the merge candidate.
-  repeated CommandValidator validators = 4;
-}
-// Rebuilds an integration preview against the target's current head.
-message RefreshIntegrateParams {
-  // Selects integration refresh.
-  string mode = 1;
-  // Retained integration contract to run again.
-  string previous = 2;
-}
-// Replays a retained integration preview and attempts to advance its target ref.
-message PublishIntegrateParams {
-  // Selects integration publication.
-  string mode = 1;
-  // Retained integration contract to publish.
-  string preview = 2;
-  // Caller-chosen retry key bound to this exact publish request.
-  string idempotency_key = 3;
-  // Every confirmation required by the retained integration preview.
-  repeated int64 confirmations = 4;
+  optional string source = 2;
 }
 // Three Git entries that could not be merged automatically at one path.
 message MergeConflict {
@@ -1888,136 +2174,41 @@ message MergeConflict {
   // Entry at the target head, or null when absent.
   optional rift.core.File target = 4;
 }
-// A retained, conflict-free integration preview.
+// A retained, conflict-free merge candidate.
 message PreparedIntegrateResult {
-  // Identifies a conflict-free integration preview.
-  string status = 1;
   // Local branch the candidate would advance.
-  string target = 2;
+  string target = 1;
   // Accepted commit merged into the target.
-  string source = 3;
+  string source = 2;
   // Retained merge candidate and validation evidence.
-  CandidateSummary summary = 4;
-}
-// A new integration preview built from an earlier contract and the current target head.
-message RefreshedIntegrateResult {
-  // Identifies a refreshed integration preview.
-  string status = 1;
-  // Integration preview whose contract was rerun.
-  string previous = 2;
-  // Local branch the candidate would advance.
-  string target = 3;
-  // Accepted commit merged into the target.
-  string source = 4;
-  // Refreshed merge candidate and validation evidence.
-  CandidateSummary summary = 5;
-}
-// A retained provisional merge whose conflicting paths still use the target entries.
-message MergeConflictIntegrateResult {
-  // Identifies a retained provisional merge with conflicts.
-  string status = 1;
-  // Local branch used as the merge target.
-  string target = 2;
-  // Target head used as the provisional merge parent.
-  string target_head = 3;
-  // Accepted source used as the other provisional merge parent.
-  string source = 4;
-  // Two-parent provisional merge commit. Non-conflicting paths are merged; conflicting paths
-  // retain the target entries so the tree stays parseable.
-  string candidate = 5;
-  // Retained conflict record.
-  string preview = 6;
-  // Link to the retained merge and conflict evidence.
-  PreviewResourceLink resource = 7;
-  // Conflicts in project-path order.
-  repeated MergeConflict conflicts = 8;
-}
-// Integration advanced the target ref to the retained candidate.
-message IntegratedResult {
-  // Identifies successful integration publication.
-  string status = 1;
-  // Local branch advanced by publication.
-  string target = 2;
-  // Target head replaced by publication.
-  string previous = 3;
-  // Commit now held by the target ref.
-  string integrated = 4;
-  // Published merge candidate and fresh validation evidence.
-  CandidateSummary summary = 5;
-  // Whether this is a retained idempotent result.
-  bool replayed = 6;
-}
-// Fresh validation rejected a replayed integration candidate.
-message RejectedIntegrateResult {
-  // Identifies fresh validation rejection.
-  string status = 1;
-  // Local branch left unchanged.
-  string target = 2;
-  // Rejected merge candidate and fresh validation evidence.
   CandidateSummary summary = 3;
 }
-// Integration stopped on a repository or policy condition the caller can change.
-message RefusedIntegrateResult {
-  // Repository or policy condition that prevented integration publication.
-  enum Reason {
-    // The caller did not set a value.
-    UNSPECIFIED = 0;
-    // Target branch is checked out and automatic integration is disabled.
-    CHECKED_OUT_TARGET = 1;
-    // Checked-out target worktree has local changes.
-    DIRTY_TARGET = 2;
-    // Retained preview no longer matches its target head or source.
-    STALE_PREVIEW = 3;
-    // Caller omitted a confirmation retained by the preview.
-    CONFIRMATION_REQUIRED = 4;
-    // Required adapter or command validation did not complete.
-    VALIDATION_INCOMPLETE = 5;
-    // Repository state cannot satisfy this integration contract.
-    UNSUPPORTED = 6;
-  }
-  // Identifies an actionable integration refusal.
-  string status = 1;
-  // Local branch left unchanged.
-  string target = 2;
-  // Repository or policy condition that stopped publication.
-  Reason reason = 3;
-  // Validated merge commit available for manual handling.
-  optional string candidate = 4;
-  // Findings associated with the refusal.
-  repeated rift.core.Diagnostic diagnostics = 5;
+// A retained provisional merge whose conflicting paths still hold the target entries, so the
+// tree stays parseable and adapters can still read it. Repair it with an ordinary candidate
+// tool whose `on` is this candidate.
+message MergeConflictIntegrateResult {
+  // Local branch used as the merge target.
+  string target = 1;
+  // Target head used as the provisional merge parent.
+  string target_head = 2;
+  // Accepted source used as the other provisional merge parent.
+  string source = 3;
+  // Two-parent provisional merge commit. Non-conflicting paths are merged; conflicting paths
+  // retain the target entries.
+  string candidate = 4;
+  // Retained conflict record.
+  string preview = 5;
+  // Link to the retained merge and conflict evidence.
+  PreviewResourceLink resource = 6;
+  // Conflicts in project-path order.
+  repeated MergeConflict conflicts = 7;
 }
-// Integration lost compare-and-swap or reused an idempotency key for different input.
-message ConflictIntegrateResult {
-  // Concurrency or idempotency conflict during integration publication.
-  enum Reason {
-    // The caller did not set a value.
-    UNSPECIFIED = 0;
-    // Target head changed after the retained preview was built.
-    TARGET_MOVED = 1;
-    // The same idempotency key was already bound to different input.
-    IDEMPOTENCY_KEY_REUSED = 2;
-  }
-  // Identifies an integration publication conflict.
-  string status = 1;
-  // Local branch left unchanged.
-  string target = 2;
-  // Concurrency or idempotency condition that conflicted.
-  Reason reason = 3;
-  // Target head retained by the preview.
-  string expected = 4;
-  // Target head observed at publication.
-  string current = 5;
-}
-// A completed integration preview, publication, conflict, rejection, or refusal.
+// A merge candidate, a retained provisional merge with its conflicts, or a refusal.
 message IntegrateResult {
   oneof variant {
-    PreparedIntegrateResult prepared_integrate_result = 1;
-    RefreshedIntegrateResult refreshed_integrate_result = 2;
-    MergeConflictIntegrateResult merge_conflict_integrate_result = 3;
-    IntegratedResult integrated_result = 4;
-    RejectedIntegrateResult rejected_integrate_result = 5;
-    RefusedIntegrateResult refused_integrate_result = 6;
-    ConflictIntegrateResult conflict_integrate_result = 7;
+    PreparedIntegrateResult prepared = 1;
+    MergeConflictIntegrateResult merge_conflict = 2;
+    RefusedResult refused = 3;
   }
 }
 // Selects files from one accepted commit for materialization into the connection worktree.
@@ -2129,6 +2320,16 @@ message FileResourcePayload {
     FileResourcePayloadNone none = 3;
   }
 }
+// Effective caller-code capability after intersecting repository policy with one adapter's
+// advertised operations. These values, rather than adapter capability alone, govern routing.
+message ExecutionAvailability {
+  // Whether execute may route to this language after policy, adapter capability, and host
+  // conformance intersect.
+  bool execute = 1;
+  // Whether all three debug tools may route to this language. True requires execute
+  // authorization, the complete adapter debug operation triplet, and host conformance.
+  bool debug = 2;
+}
 // Adapter identity and advertised capability sets for one language in this workspace.
 message LanguageSupport {
   // Optional adapter operations advertised before Rift issues a call.
@@ -2189,6 +2390,8 @@ message LanguageSupport {
   // Supported action families in kind-prefix order. Empty when `actions` is not advertised or
   // the adapter has no action families.
   repeated rift.core.ActionSupport action_kinds = 5;
+  // Effective host-policy and adapter-capability intersection for caller code.
+  ExecutionAvailability execution = 6;
 }
 // The Protobuf service exposed by the Rift server. `rift mcp` maps its JSON entry points to
 // these methods.
@@ -2209,10 +2412,6 @@ service Rift {
   // The owning adapter parses structural patterns because it defines the language's syntax.
   // Every hit carries a key an edit can address.
   rpc Match (rift.mcp.MatchParams) returns (rift.mcp.MatchResult);
-  // Asks an adapter what it can offer at one address: the fixes and refactors it would suggest
-  // there. Each result carries the snapshot and adapter token needed for resolution. Rift
-  // refuses a token after its snapshot moves.
-  rpc Actions (rift.mcp.ActionsParams) returns (rift.mcp.ActionsResult);
   // Evaluates a caller-provided code block with one configured language adapter against an
   // exact snapshot. Rift prepares a disposable execution workspace and discards every
   // filesystem write made by the evaluated code.
@@ -2224,15 +2423,52 @@ service Rift {
   rpc DebugGetFrame (rift.mcp.DebugGetFrameParams) returns (rift.mcp.DebugGetFrameResult);
   // Releases a debugging session, adapter state, and execution workspace.
   rpc DebugStop (rift.mcp.DebugStopParams) returns (rift.mcp.DebugStopResult);
-  // Builds, refreshes, or publishes a deterministic candidate. Preview retains each request
-  // with its checked preconditions, exact edits, semantic effects, guarantee evidence, diff,
-  // validation, and confirmations. Refresh repeats that contract on a newer base. Publish
-  // replays it and advances the accepted ref when the retained plan still agrees, fresh
-  // validation passes, and the accepted head still matches.
-  rpc Apply (rift.mcp.ApplyParams) returns (rift.mcp.ApplyResult);
-  // Previews, refreshes, or publishes a merge from the connection's accepted commit into one
-  // local target branch. Publication replays validation and compare-and-swaps the target head.
+  // Builds a candidate from an atomic set of concrete edits. Nothing is published: the
+  // candidate is an immutable commit that `publish` can advance a ref to.
+  rpc Edit (rift.mcp.EditParams) returns (rift.mcp.CandidateResult);
+  // Builds a candidate from a unified diff. Rift checks every hunk's context against the state
+  // it resolves against. A patch written for older bytes is refused before any hunk is applied.
+  rpc Patch (rift.mcp.PatchParams) returns (rift.mcp.CandidateResult);
+  // Builds a candidate by replacing every match of one query. The cardinality is checked before
+  // expansion, so a pattern that matches more places than intended refuses instead of rewriting
+  // them.
+  rpc Rewrite (rift.mcp.RewriteParams) returns (rift.mcp.CandidateResult);
+  // Builds a candidate from the three-way inverse of one commit against a selected parent.
+  rpc Revert (rift.mcp.RevertParams) returns (rift.mcp.CandidateResult);
+  // Builds a candidate by merging one exact commit into the candidate state.
+  rpc Merge (rift.mcp.MergeParams) returns (rift.mcp.CandidateResult);
+  // Changes what a declaration is called and rewrites every reference that names it. The
+  // adapter checks spelling, collisions, and binding changes. A reference outside the scope
+  // refuses the whole operation.
+  rpc Rename (rift.mcp.RenameParams) returns (rift.mcp.CandidateResult);
+  // Moves a declaration or file to another container or path and updates the imports and
+  // references that reach it.
+  rpc Move (rift.mcp.MoveParams) returns (rift.mcp.CandidateResult);
+  // Removes a declaration. Without a policy this is a mechanical removal that analyses no
+  // references. With one, the adapter classifies every remaining use, applies the stated
+  // disposition, and refuses when reference coverage is incomplete.
+  rpc Delete (rift.mcp.DeleteParams) returns (rift.mcp.CandidateResult);
+  // Changes the shape of a callable and propagates it to callers, overrides, and
+  // implementations. Unlike a rename, it rewrites argument lists, so it commonly raises a
+  // `behavior_unknown` confirmation.
+  rpc ChangeSignature (rift.mcp.ChangeSignatureParams) returns (rift.mcp.CandidateResult);
+  // Resolves one action an adapter offered — a quick fix, an extraction, an inline, or an
+  // adapter-specific family. Arguments are validated against the schema the offer advertises. A
+  // portable family is refused here and resolves through its own tool.
+  rpc Act (rift.mcp.ActParams) returns (rift.mcp.CandidateResult);
+  // Merges the connection's accepted commit into a local branch and validates the result. Two
+  // commits that are each valid can merge into a broken tree, so the merge candidate is
+  // validated like any other. A conflict returns a parseable provisional merge.
   rpc Integrate (rift.mcp.IntegrateParams) returns (rift.mcp.IntegrateResult);
+  // Reruns a retained candidate's operation against a newer base and reports how much the
+  // result moved. The candidate holds the request it was built from, so nothing has to be
+  // restated.
+  rpc Refresh (rift.mcp.RefreshParams) returns (rift.mcp.RefreshResult);
+  // Runs the declared command validators against a retained candidate and advances its
+  // destination by compare-and-swap: the accepted ref for an ordinary candidate, the target
+  // branch for an integration. A retry that finds the destination already holding the candidate
+  // returns the same result.
+  rpc Publish (rift.mcp.PublishParams) returns (rift.mcp.PublishResult);
   // Materializes an accepted commit into the connection worktree. Each requested path reports
   // its own outcome, so drift, sparse checkout rules, nested repositories, and deletion policy
   // remain visible to the caller.

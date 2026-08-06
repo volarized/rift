@@ -1,106 +1,65 @@
 from __future__ import annotations
 
+from pydantic import model_validator
+
 from .base import *
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_INT64),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_INT64,
+    root=Literal[1],
 )
-class ProtocolVersion(
-    ProtocolRoot[
-        (
-            "Annotated[Literal[1], schema_field(description='Which revision of this contract "
-            "a message speaks. A single integer changes when a reader would break. The "
-            "handshake compares it before either side reads request fields.')]"
-        )
-    ]
-):
-    "Which revision of this contract a message speaks. A single integer changes when a reader would break. The handshake compares it before either side reads request fields."
+class ProtocolVersion(ProtocolRoot):
+    """Which revision of this contract a message speaks. A single integer changes when a reader would break. The handshake compares it before either side reads request fields."""
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^[0-9a-f]{64}$",
 )
-class Digest(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='SHA-256 of the value being identified, "
-            "lowercase hex, 64 characters. The contract fixes the algorithm so Rift and its "
-            "adapters produce the same identity for the same bytes.', "
-            "pattern='^[0-9a-f]{64}$')]"
-        )
-    ]
-):
-    "SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes the algorithm so Rift and its adapters produce the same identity for the same bytes."
+class Digest(ProtocolRoot):
+    """SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes the algorithm so Rift and its adapters produce the same identity for the same bytes."""
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    default="HEAD",
+    pattern=r"^[^\u0000-\u001F\u007F]+$",
+    min_length=1,
+    max_length=256,
+    examples=["main", "v1.2.0", "HEAD~3", "worktrees/feature-x"],
 )
-class Revision(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(default='HEAD', description='Which state to answer "
-            "against. Absent, the default branch at its latest commit.\\n\\nA git revision "
-            "parameter, as gitrevisions(7) defines one: `main`, `v1.2.0`, `dae86e1`, "
-            "`HEAD~3`. Dropping the `/HEAD` from a worktree ref addresses what is on disk "
-            "there, uncommitted edits included, which gitrevisions cannot spell and is what "
-            "an agent editing code usually means.', pattern='^[^\\\\u0000-\\\\u001F\\\\u007F]+$', "
-            "min_length=1, max_length=256, examples=['main', 'v1.2.0', 'HEAD~3', "
-            "'worktrees/feature-x'])]"
-        )
-    ]
-):
+class Revision(ProtocolRoot):
     """Which state to answer against. Absent, the default branch at its latest commit.
 
     A git revision parameter, as gitrevisions(7) defines one: `main`, `v1.2.0`, `dae86e1`, `HEAD~3`. Dropping the `/HEAD` from a worktree ref addresses what is on disk there, uncommitted edits included, which gitrevisions cannot spell and is what an agent editing code usually means."""
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^[0-9a-f]{40}([0-9a-f]{24})?$",
+    examples=["dae86e1950b1277e545cee180551750029cfe735"],
 )
-class Commit(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='One committed state, as its full object "
-            "ID. SHA-1 repositories write 40 hex characters and SHA-256 repositories 64.', "
-            "pattern='^[0-9a-f]{40}([0-9a-f]{24})?$', "
-            "examples=['dae86e1950b1277e545cee180551750029cfe735'])]"
-        )
-    ]
-):
-    "One committed state, as its full object ID. SHA-1 repositories write 40 hex characters and SHA-256 repositories 64."
+class Commit(ProtocolRoot):
+    """One committed state, as its full object ID. SHA-1 repositories write 40 hex characters and SHA-256 repositories 64."""
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^(main-worktree|worktrees/[A-Za-z0-9._-]{1,100})$",
+    examples=["main-worktree", "worktrees/feature-x"],
 )
-class Worktree(
-    ProtocolRoot[
-        (
-            'Annotated[str, schema_field(description="A working tree, spelled the way git '
-            "reaches one from any other: `main-worktree` for the repository's own, and "
-            "`worktrees/<name>` for a linked one.\", pattern='^(main-worktree|worktrees/[A-Za-"
-            "z0-9._-]{1,100})$', examples=['main-worktree', 'worktrees/feature-x'])]"
-        )
-    ]
-):
-    "A working tree, spelled the way git reaches one from any other: `main-worktree` for the repository's own, and `worktrees/<name>` for a linked one."
+class Worktree(ProtocolRoot):
+    """A working tree, spelled the way git reaches one from any other: `main-worktree` for the repository's own, and `worktrees/<name>` for a linked one."""
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
@@ -136,23 +95,16 @@ class SnapshotWorktree(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("commit", "commit", 1, SnapshotCommit),
-            Variant("worktree", "worktree", 2, SnapshotWorktree),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("commit", "commit", 1, SnapshotCommit),
+        Variant("worktree", "worktree", 2, SnapshotWorktree),
     ),
-    schema_extra={},
 )
-class Snapshot(
-    ProtocolRoot[
-        "Annotated[SnapshotCommit | SnapshotWorktree, schema_field(discriminator='kind')]"
-    ]
-):
+class Snapshot(ProtocolRoot):
     """What a `Revision` resolved to, reported beside every answer so a second call can ask the same question again and get the same state.
 
     A commit names its immutable tree. A working-tree snapshot names its base commit and digests the changed set, leaving every unedited file's identity in the base."""
@@ -170,28 +122,21 @@ class LanguageRegion(ClosedModel):
     )
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+    min_length=13,
+    max_length=1024,
+    examples=[
+        "rift://file/pkg/util.py",
+        "rift://file/src/%E2%98%83.ts",
+        "rift://file/src/config.ts?rev=main",
+    ],
 )
-class FileId(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='Identity of one file, and the URI that "
-            "resolves it. The path after `rift://file/` is a `ProjectPath`: unreserved URI "
-            "characters remain literal, `/` separates segments, and every other UTF-8 byte "
-            "uses uppercase percent-encoding. Decoding to an absolute path or a `.` or `..` "
-            "segment is refused. A revision can be attached as `?rev=`.', "
-            "pattern=\"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(\\\\?"
-            "rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$\", min_length=13, max_length=1024, "
-            "examples=['rift://file/pkg/util.py', 'rift://file/src/%E2%98%83.ts', "
-            "'rift://file/src/config.ts?rev=main'])]"
-        )
-    ]
-):
-    "Identity of one file, and the URI that resolves it. The path after `rift://file/` is a `ProjectPath`: unreserved URI characters remain literal, `/` separates segments, and every other UTF-8 byte uses uppercase percent-encoding. Decoding to an absolute path or a `.` or `..` segment is refused. A revision can be attached as `?rev=`."
+class FileId(ProtocolRoot):
+    """Identity of one file, and the URI that resolves it. The path after `rift://file/` is a `ProjectPath`: unreserved URI characters remain literal, `/` separates segments, and every other UTF-8 byte uses uppercase percent-encoding. Decoding to an absolute path or a `.` or `..` segment is refused. A revision can be attached as `?rev=`."""
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
@@ -262,29 +207,20 @@ class FileContentGitlink(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=False,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("regular", "regular", 1, FileContentRegular),
-            Variant("lfs_pointer", "lfs_pointer", 2, FileContentLfsPointer),
-            Variant("symlink", "symlink", 3, FileContentSymlink),
-            Variant("gitlink", "gitlink", 4, FileContentGitlink),
-        ),
-        placement=Placement("content", 2),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("regular", "regular", 1, FileContentRegular),
+        Variant("lfs_pointer", "lfs_pointer", 2, FileContentLfsPointer),
+        Variant("symlink", "symlink", 3, FileContentSymlink),
+        Variant("gitlink", "gitlink", 4, FileContentGitlink),
     ),
-    schema_extra={},
+    placement=Placement("content", 2),
+    public=False,
 )
-class FileContent(
-    ProtocolRoot[
-        (
-            "Annotated[FileContentRegular | FileContentLfsPointer | FileContentSymlink | "
-            "FileContentGitlink, schema_field(discriminator='kind')]"
-        )
-    ]
-):
+class FileContent(ProtocolRoot):
     "What the entry holds. Only a regular entry has source in it; the other three are paths that point elsewhere and carry no nodes."
 
 
@@ -377,75 +313,50 @@ class ProjectEntryFile(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("directory", "directory", 1, ProjectEntryDirectory),
-            Variant("file", "file", 2, ProjectEntryFile),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("directory", "directory", 1, ProjectEntryDirectory),
+        Variant("file", "file", 2, ProjectEntryFile),
     ),
-    schema_extra={},
 )
-class ProjectEntry(
-    ProtocolRoot[
-        "Annotated[ProjectEntryDirectory | ProjectEntryFile, schema_field(discriminator='kind')]"
-    ]
-):
+class ProjectEntry(ProtocolRoot):
     "One visible node in a project tree. Rift walks Git tree objects at the requested snapshot, returning a directory path or the complete `File` for a content-bearing entry."
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\d+-\d+(\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+    min_length=18,
+    max_length=1024,
+    examples=[
+        "rift://node/python/pkg/util.py@1204-1266",
+        "rift://node/sql:postgresql/db/schema.sql@40-88",
+    ],
 )
-class NodeId(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='Identity and resource URI of one "
-            "syntax-tree node. The first path segment is the language name followed by "
-            "`:<dialect>` when a dialect is present. The remaining path is a canonical "
-            "`ProjectPath`, followed by a half-open UTF-8 byte range. A revision can be "
-            "attached as `?rev=`.', pattern=\"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z]"
-            "[A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\\\d+-\\\\d"
-            "+(\\\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$\", min_length=18, "
-            "max_length=1024, examples=['rift://node/python/pkg/util.py@1204-1266', "
-            "'rift://node/sql:postgresql/db/schema.sql@40-88'])]"
-        )
-    ]
-):
-    """Identity and resource URI of one syntax-tree node. The language segment uses `name` or `name:dialect`."""
+class NodeId(ProtocolRoot):
+    """Identity and resource URI of one syntax-tree node. The first path segment is the language name followed by `:<dialect>` when a dialect is present. The remaining path is a canonical `ProjectPath`, followed by a half-open UTF-8 byte range. A revision can be attached as `?rev=`."""
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}(\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
+    min_length=17,
+    max_length=1024,
+    examples=[
+        "rift://symbol/python/pkg.util.load_config~1?rev=HEAD~3",
+        "rift://symbol/sql:postgresql/public.users",
+        "rift://symbol/css:scss/theme.$accent",
+    ],
 )
-class SymbolId(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='Identity and resource URI of one "
-            "symbol. The first path segment is the language name followed by `:<dialect>` "
-            "when present. The adapter supplies the remaining qualified name and "
-            "percent-encodes UTF-8 bytes outside URI path characters with uppercase hex. "
-            "Where a namespace declares identical names, the adapter appends `~` and an "
-            "index. A revision can be attached as `?rev=`.', "
-            'pattern="^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:'
-            "[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}(\\\\?(rev=[A-Za-z0-9._~%!$&'()"
-            '*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$", min_length=17, '
-            "max_length=1024, examples=['rift://symbol/python/pkg.util.load_config~1?rev=HEAD"
-            "~3', 'rift://symbol/sql:postgresql/public.users', "
-            "'rift://symbol/css:scss/theme.$accent'])]"
-        )
-    ]
-):
-    """Identity and resource URI of one symbol. The language segment uses `name` or `name:dialect`."""
+class SymbolId(ProtocolRoot):
+    """Identity and resource URI of one symbol. The first path segment is the language name followed by `:<dialect>` when present. The adapter supplies the remaining qualified name and percent-encodes UTF-8 bytes outside URI path characters with uppercase hex. Where a namespace declares identical names, the adapter appends `~` and an index. A revision can be attached as `?rev=`."""
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -494,83 +405,45 @@ class ExtensionValue(ClosedModel):
     )
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^[a-z0-9]+(?:[.-][a-z0-9]+)+\.[A-Za-z][A-Za-z0-9_-]*$",
 )
-class ExtensionKey(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='A reverse-domain namespaced extension "
-            "or extension-operation identifier.', pattern='^[a-z0-9]+(?:[.-][a-z0-9]+)+\\\\.[A-"
-            "Za-z][A-Za-z0-9_-]*$')]"
-        )
-    ]
-):
+class ExtensionKey(ProtocolRoot):
     """A reverse-domain namespaced extension or extension-operation identifier."""
 
 
-@definition(
+@mapping(
     owner=CORE,
-    public=True,
-    proto=Proto.message(placement=Placement("entries", 1)),
-    schema_extra={},
+    root=dict[ExtensionKey, ExtensionValue],
+    placement=Placement("entries", 1),
 )
-class Extensions(
-    ProtocolRoot[
-        (
-            "Annotated[dict[ExtensionKey, ExtensionValue], schema_field(description='Facts an "
-            "adapter carries that the model has no field for, under a reverse-domain key. "
-            "Keys and values use RFC 8785 canonical JSON. `Capabilities.extension_values` "
-            "advertises every key and version, and consumers skip entries they do not "
-            "implement.')]"
-        )
-    ]
-):
-    "Facts an adapter carries that the model has no field for, under a reverse-domain key. Keys and values use RFC 8785 canonical JSON. `Capabilities.extension_values` advertises every key and version, and consumers skip entries they do not implement."
+class Extensions(ProtocolRoot):
+    """Facts an adapter carries that the model has no field for, under a reverse-domain key. Keys and values use RFC 8785 canonical JSON. `Capabilities.extension_values` advertises every key and version, and consumers skip entries they do not implement."""
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^(?!/)(?!\.\.?(/|$))(?!.*(/\.\.?)(/|$))[^\\\u0000-\u001F\u007F]+$",
 )
-class PathPattern(
-    ProtocolRoot[
-        (
-            'Annotated[str, schema_field(description="Project-relative Git-style glob using '
-            "*, ?, **, and character classes; absolute, backslash, control, and '..' segments "
-            "are forbidden.\", pattern='^(?!/)(?!\\\\.\\\\.?(/|$))(?!.*(/\\\\.\\\\.?)(/|$))[^\\\\\\"
-            "\\\\\\u0000-\\\\u001F\\\\u007F]+$')]"
-        )
-    ]
-):
-    "Project-relative Git-style glob using *, ?, **, and character classes; absolute, backslash, control, and '..' segments are forbidden."
+class PathPattern(ProtocolRoot):
+    """Project-relative Git-style glob using *, ?, **, and character classes; absolute, backslash, control, and '..' segments are forbidden."""
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^(?:$|(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)[^\\\u0000-\u001F\u007F/]+(?:/[^\\\u0000-\u001F\u007F/]+)*)$",
+    max_length=1000,
+    examples=["", "src/config.ts", "packages/api/Cargo.toml"],
 )
-class ProjectPath(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='One path below the project root, using "
-            "forward slashes and UTF-8. The empty path names the root itself. Absolute paths, "
-            "backslashes, control characters, empty segments, and `.` or `..` segments are "
-            "refused before the filesystem is touched.', "
-            "pattern='^(?:$|(?!/)(?!.*(?:^|/)\\\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\\\\\\\u0000-\\\\u001"
-            "F\\\\u007F/]+(?:/[^\\\\\\\\\\\\u0000-\\\\u001F\\\\u007F/]+)*)$', max_length=1000, "
-            "examples=['', 'src/config.ts', 'packages/api/Cargo.toml'])]"
-        )
-    ]
-):
-    "One path below the project root, using forward slashes and UTF-8. The empty path names the root itself. Absolute paths, backslashes, control characters, empty segments, and `.` or `..` segments are refused before the filesystem is touched."
+class ProjectPath(ProtocolRoot):
+    """One path below the project root, using forward slashes and UTF-8. The empty path names the root itself. Absolute paths, backslashes, control characters, empty segments, and `.` or `..` segments are refused before the filesystem is touched."""
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -774,33 +647,22 @@ class EditSetGitlink(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(None, "text_edit", 1, TextEdit),
-            Variant("create", "create", 2, EditCreate),
-            Variant("delete", "delete", 3, EditDelete),
-            Variant("rename", "rename", 4, EditRename),
-            Variant("copy", "copy", 5, EditCopy),
-            Variant("set_executable", "set_executable", 6, EditSetExecutable),
-            Variant("create_gitlink", "create_gitlink", 7, EditCreateGitlink),
-            Variant("set_gitlink", "set_gitlink", 8, EditSetGitlink),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant(None, "text_edit", 1, TextEdit),
+        Variant("create", "create", 2, EditCreate),
+        Variant("delete", "delete", 3, EditDelete),
+        Variant("rename", "rename", 4, EditRename),
+        Variant("copy", "copy", 5, EditCopy),
+        Variant("set_executable", "set_executable", 6, EditSetExecutable),
+        Variant("create_gitlink", "create_gitlink", 7, EditCreateGitlink),
+        Variant("set_gitlink", "set_gitlink", 8, EditSetGitlink),
     ),
-    schema_extra={},
 )
-class Edit(
-    ProtocolRoot[
-        (
-            "Annotated[TextEdit | EditCreate | EditDelete | EditRename | EditCopy | "
-            "EditSetExecutable | EditCreateGitlink | EditSetGitlink, "
-            "schema_field(discriminator='kind')]"
-        )
-    ]
-):
+class Edit(ProtocolRoot):
     "A filesystem effect described before Rift performs it. Edit sets are atomic and sorted bytewise by each edit's RFC 8785 canonical JSON. Text replacements in one set address the same input state and cannot overlap."
 
 
@@ -829,48 +691,30 @@ class FileChange(ClosedModel):
     )
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://diff/(?:[A-Za-z0-9_~%!$&'()*+,;:@/-]|\.(?!\.)){1,256}\.\.(?:[A-Za-z0-9_~%!$&'()*+,;:@/-]|\.(?!\.)){1,256}(\?cursor=[^&#]+)?$",
+    min_length=15,
+    max_length=1024,
+    examples=["rift://diff/main..feature-x", "rift://diff/HEAD~3..HEAD"],
 )
-class DiffId(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='URI for one comparison: "
-            "`rift://diff/<from>..<to>`. The two revisions use Git range spelling. Git "
-            "forbids `..` in a ref name, so the separator is unambiguous.\\n\\nAttach "
-            "`?cursor=` to continue a paged read.', pattern=\"^rift://diff/(?:[A-Za-z0-9_~%!$&"
-            "'()*+,;:@/-]|\\\\.(?!\\\\.)){1,256}\\\\.\\\\.(?:[A-Za-z0-9_~%!$&'()*+,;:@/-]|\\\\.(?!"
-            '\\\\.)){1,256}(\\\\?cursor=[^&#]+)?$", min_length=15, max_length=1024, '
-            "examples=['rift://diff/main..feature-x', 'rift://diff/HEAD~3..HEAD'])]"
-        )
-    ]
-):
+class DiffId(ProtocolRoot):
     """URI for one comparison: `rift://diff/<from>..<to>`. The two revisions use Git range spelling. Git forbids `..` in a ref name, so the separator is unambiguous.
 
     Attach `?cursor=` to continue a paged read."""
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^[A-Za-z0-9_-]{16,128}$",
+    examples=["AQIDBAUGBwgJCgsMDQ4PEA"],
 )
-class PreviewId(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='Identity of one retained candidate. "
-            "Rift mints an opaque base64url token when it retains the preview; reading the "
-            "corresponding resource reveals the pinned base, ordered changes, resolved edits, "
-            "validation evidence, and confirmations.', pattern='^[A-Za-z0-9_-]{16,128}$', "
-            "examples=['AQIDBAUGBwgJCgsMDQ4PEA'])]"
-        )
-    ]
-):
-    "Identity of one retained candidate. Rift mints an opaque base64url token when it retains the preview; reading the corresponding resource reveals the pinned base, ordered changes, resolved edits, validation evidence, and confirmations."
+class PreviewId(ProtocolRoot):
+    """Identity of one retained candidate: base64url of the SHA-256 over the connection, the resolution base, the expected head, the preview this one continues, and the requested operation. The same request therefore names the same candidate, so a repeated call returns the retained plan instead of resolving and validating a second time. Reading the corresponding resource reveals the pinned base, the operation, resolved edits, validation evidence, and confirmations."""
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
@@ -899,27 +743,17 @@ class OriginMappingSynthetic(ClosedModel):
     origins: Field[list[Any] | None] = proto_field(default=None, max_length=0, number=1)
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("exact", "exact", 1, OriginMappingExact),
-            Variant("approximate", "approximate", 2, OriginMappingApproximate),
-            Variant("synthetic", "synthetic", 3, OriginMappingSynthetic),
-        ),
+    oneof="variant",
+    discriminator="precision",
+    variants=(
+        Variant("exact", "exact", 1, OriginMappingExact),
+        Variant("approximate", "approximate", 2, OriginMappingApproximate),
+        Variant("synthetic", "synthetic", 3, OriginMappingSynthetic),
     ),
-    schema_extra={},
 )
-class OriginMapping(
-    ProtocolRoot[
-        (
-            "Annotated[OriginMappingExact | OriginMappingApproximate | "
-            "OriginMappingSynthetic, schema_field(discriminator='precision')]"
-        )
-    ]
-):
+class OriginMapping(ProtocolRoot):
     "A relation from one produced source range to the source ranges that contributed its bytes. It lets Rift project a finding on adapter input back to source a person can edit."
 
 
@@ -988,19 +822,15 @@ class CoverageScopeUnit(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(None, "kind", 1, CoverageScopeKind),
-            Variant("unit", "unit", 2, CoverageScopeUnit),
-        ),
+    oneof="variant",
+    variants=(
+        Variant(None, "kind", 1, CoverageScopeKind),
+        Variant("unit", "unit", 2, CoverageScopeUnit),
     ),
-    schema_extra={},
 )
-class CoverageScope(ProtocolRoot["CoverageScopeKind | CoverageScopeUnit"]):
+class CoverageScope(ProtocolRoot):
     "What a completeness statement covers — everything the request asked for, one file, or a standing scope the answer holds over."
 
 
@@ -1099,39 +929,17 @@ class CoverageState(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("complete", "complete", 1, CoverageComplete),
-            Variant("partial", "partial", 2, CoveragePartial),
-            Variant(None, "state", 3, CoverageState),
-        ),
+    oneof="variant",
+    variants=(
+        Variant("complete", "complete", 1, CoverageComplete),
+        Variant("partial", "partial", 2, CoveragePartial),
+        Variant(None, "state", 3, CoverageState),
     ),
-    schema_extra={},
 )
-class Coverage(ProtocolRoot["CoverageComplete | CoveragePartial | CoverageState"]):
+class Coverage(ProtocolRoot):
     "How much of one `FactFamily` an answer actually covers. Absence of a fact means the fact does not exist only where the state is `complete`; anywhere else it means Rift did not get that far."
-
-
-@definition(
-    owner=CORE,
-    public=True,
-    proto=Proto.message(placement=Placement("entries", 1)),
-    schema_extra={},
-)
-class SemanticCoverage(
-    ProtocolRoot[
-        (
-            "Annotated[dict[FactFamily, Coverage], schema_field(description='Coverage for "
-            "every fact family. Absence is authoritative only where state is complete.', "
-            "json_schema_extra={'minProperties': 6})]"
-        )
-    ]
-):
-    """Coverage for every fact family. Absence is authoritative only where state is complete."""
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -1609,23 +1417,15 @@ class SymbolFacet(str, Enum):
     GENERATOR = "generator"
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^[A-Za-z][A-Za-z0-9._-]*$",
+    examples=["create_table", "selector.class", "mapping.key"],
 )
-class ExactKind(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='An adapter-local kind preserving the "
-            "construct name used by that language implementation.', "
-            "pattern='^[A-Za-z][A-Za-z0-9._-]*$', examples=['create_table', 'selector.class', "
-            "'mapping.key'])]"
-        )
-    ]
-):
-    """An adapter-local kind preserving exact language meaning."""
+class ExactKind(ProtocolRoot):
+    """An adapter-local kind preserving the construct name used by that language implementation."""
 
 
 @definition(
@@ -1965,27 +1765,20 @@ class SymbolOriginPackage(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("workspace", "workspace", 1, SymbolOriginWorkspace, ProtoEmpty),
-            Variant("package", "package", 2, SymbolOriginPackage),
-            Variant("stdlib", "stdlib", 3, SymbolOriginStdlib, ProtoEmpty),
-            Variant("external", "external", 4, SymbolOriginExternal, ProtoEmpty),
-            Variant("generated", "generated", 5, SymbolOriginGenerated, ProtoEmpty),
-            Variant("synthetic", "synthetic", 6, SymbolOriginSynthetic, ProtoEmpty),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("workspace", "workspace", 1, SymbolOriginWorkspace, ProtoEmpty),
+        Variant("package", "package", 2, SymbolOriginPackage),
+        Variant("stdlib", "stdlib", 3, SymbolOriginStdlib, ProtoEmpty),
+        Variant("external", "external", 4, SymbolOriginExternal, ProtoEmpty),
+        Variant("generated", "generated", 5, SymbolOriginGenerated, ProtoEmpty),
+        Variant("synthetic", "synthetic", 6, SymbolOriginSynthetic, ProtoEmpty),
     ),
-    schema_extra={},
 )
-class SymbolOrigin(
-    ProtocolRoot[
-        "Annotated[SymbolOriginWorkspace | SymbolOriginPackage | SymbolOriginStdlib | SymbolOriginExternal | SymbolOriginGenerated | SymbolOriginSynthetic, schema_field(discriminator='kind')]"
-    ]
-):
+class SymbolOrigin(ProtocolRoot):
     "Source of a symbol definition. The variant determines whether its source can be read or edited and whether a package upgrade can replace it."
 
 
@@ -2591,30 +2384,20 @@ class FilterNot(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("field", "field", 1, FilterField),
-            Variant("relation", "relation", 2, FilterRelation),
-            Variant("all", "all", 3, FilterAll),
-            Variant("any", "any", 4, FilterAny),
-            Variant("not", "not", 5, FilterNot),
-            Variant("element", "element", 6, FilterElement),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("field", "field", 1, FilterField),
+        Variant("relation", "relation", 2, FilterRelation),
+        Variant("all", "all", 3, FilterAll),
+        Variant("any", "any", 4, FilterAny),
+        Variant("not", "not", 5, FilterNot),
+        Variant("element", "element", 6, FilterElement),
     ),
-    schema_extra={},
 )
-class Filter(
-    ProtocolRoot[
-        (
-            "Annotated[FilterField | FilterRelation | FilterAll | FilterAny | FilterNot "
-            "| FilterElement, schema_field(discriminator='kind')]"
-        )
-    ]
-):
+class Filter(ProtocolRoot):
     """A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass."""
 
 
@@ -2658,7 +2441,7 @@ class AddressMatch(ClosedModel):
     "A result of a `StructuralQuery`, by the identity it came back with. That identity carries its source state; resolution returns `stale_match` when the candidate has moved."
 
     kind: Field[Literal["match"]] = proto_field()
-    match: Field[MatchKey] = proto_field(
+    match: Field[MatchId] = proto_field(
         description="The match, and the state it was found in.", number=1
     )
     capture: Field[str | None] = proto_field(
@@ -2667,25 +2450,18 @@ class AddressMatch(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("symbol", "symbol", 1, AddressSymbol),
-            Variant("node", "node", 2, AddressNode),
-            Variant("source", "source", 3, AddressSource),
-            Variant("match", "match", 4, AddressMatch),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("symbol", "symbol", 1, AddressSymbol),
+        Variant("node", "node", 2, AddressNode),
+        Variant("source", "source", 3, AddressSource),
+        Variant("match", "match", 4, AddressMatch),
     ),
-    schema_extra={},
 )
-class Address(
-    ProtocolRoot[
-        "Annotated[AddressSymbol | AddressNode | AddressSource | AddressMatch, schema_field(discriminator='kind')]"
-    ]
-):
+class Address(ProtocolRoot):
     "Where an operation applies. Separate union branches distinguish a semantic symbol, a syntax node, a source range, and a retained match."
 
 
@@ -2759,23 +2535,16 @@ class StructuralCaptureConstraint(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant(None, "structural_query", 1, lambda: StructuralQuery),
-            Variant(None, "text_query", 2, lambda: TextQuery),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant(None, "structural_query", 1, "StructuralQuery"),
+        Variant(None, "text_query", 2, "TextQuery"),
     ),
-    schema_extra={},
 )
-class MatchQuery(
-    ProtocolRoot[
-        "Annotated[StructuralQuery | TextQuery, schema_field(discriminator='kind')]"
-    ]
-):
+class MatchQuery(ProtocolRoot):
     "A text or structural pattern, tagged by the engine that evaluates it. Carrying the complete query lets a match key explain its own identity and lets a caller rerun it without retrieving hidden state."
 
 
@@ -2878,28 +2647,19 @@ class StructuralQueryWithinSource(ClosedModel):
     span: Field[SourceSpan] = proto_field(number=1)
 
 
-@definition(
+@union(
     owner=CORE,
-    public=False,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("symbol", "symbol", 1, StructuralQueryWithinSymbol),
-            Variant("node", "node", 2, StructuralQueryWithinNode),
-            Variant("source", "source", 3, StructuralQueryWithinSource),
-        ),
-        placement=Placement("within", 6),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("symbol", "symbol", 1, StructuralQueryWithinSymbol),
+        Variant("node", "node", 2, StructuralQueryWithinNode),
+        Variant("source", "source", 3, StructuralQueryWithinSource),
     ),
-    schema_extra={},
+    placement=Placement("within", 6),
+    public=False,
 )
-class StructuralQueryWithin(
-    ProtocolRoot[
-        (
-            "Annotated[StructuralQueryWithinSymbol | StructuralQueryWithinNode | "
-            "StructuralQueryWithinSource, schema_field(discriminator='kind')]"
-        )
-    ]
-):
+class StructuralQueryWithin(ProtocolRoot):
     "Optional source boundary for the search. A symbol selects its nodes. A node selects its syntax subtree. A span selects its bytes."
 
 
@@ -3040,21 +2800,13 @@ class StructuralMatchRanges(ClosedModel):
     )
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^(?:[A-Za-z][A-Za-z0-9_]*|[0-9]+)$",
 )
-class CaptureName(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='Structural captures use identifier "
-            "names; text regex results may additionally use numeric capture indexes.', "
-            "pattern='^(?:[A-Za-z][A-Za-z0-9_]*|[0-9]+)$')]"
-        )
-    ]
-):
+class CaptureName(ProtocolRoot):
     """Structural captures use identifier names; text regex results may additionally use numeric capture indexes."""
 
 
@@ -3690,24 +3442,18 @@ class MoveArgumentsDestinationPath(ClosedModel):
     )
 
 
-@definition(
+@union(
     owner=CORE,
-    public=False,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("address", "address", 1, MoveArgumentsDestinationAddress),
-            Variant("path", "path", 2, MoveArgumentsDestinationPath),
-        ),
-        placement=Placement("destination", 1),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("address", "address", 1, MoveArgumentsDestinationAddress),
+        Variant("path", "path", 2, MoveArgumentsDestinationPath),
     ),
-    schema_extra={},
+    placement=Placement("destination", 1),
+    public=False,
 )
-class MoveArgumentsDestination(
-    ProtocolRoot[
-        "Annotated[MoveArgumentsDestinationAddress | MoveArgumentsDestinationPath, schema_field(discriminator='kind')]"
-    ]
-):
+class MoveArgumentsDestination(ProtocolRoot):
     "Existing destination container or project path. Symbols use an Address; files and new modules use a ProjectPath."
 
 
@@ -3729,10 +3475,16 @@ class MoveArguments(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class SafeDeleteArguments(ClosedModel):
-    """Portable arguments for `refactor.safe_delete` actions."""
+    "Portable arguments for deleting a declaration. `policy` is what separates the two kinds of removal: without it the declaration goes and nothing analyses what referred to it, and with it the adapter must classify every remaining use and dispose of it as stated."
 
-    policy: Field[SafeDeletePolicy] = proto_field(
-        description="Required behavior for every classified remaining use.", number=1
+    policy: Field[SafeDeletePolicy | None] = proto_field(
+        default=None,
+        description=(
+            "Required behavior for every classified remaining use. Null removes the declaration "
+            "without reference analysis, which claims no reference guarantee and reports no "
+            "remaining-usage precondition."
+        ),
+        number=1,
     )
     scope: Field[OperationScope] = proto_field(
         description="Source in which complete usage analysis and any requested rewrite may occur.",
@@ -3804,34 +3556,20 @@ class ArgumentContractChangeSignature(ClosedModel):
     version: Field[Literal[1]] = proto_field(number=1)
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("rename", "rename", 1, ArgumentContractRename),
-            Variant("move", "move", 2, ArgumentContractMove),
-            Variant("safe_delete", "safe_delete", 3, ArgumentContractSafeDelete),
-            Variant(
-                "change_signature",
-                "change_signature",
-                4,
-                ArgumentContractChangeSignature,
-            ),
+    oneof="variant",
+    discriminator="name",
+    variants=(
+        Variant("rename", "rename", 1, ArgumentContractRename),
+        Variant("move", "move", 2, ArgumentContractMove),
+        Variant("safe_delete", "safe_delete", 3, ArgumentContractSafeDelete),
+        Variant(
+            "change_signature", "change_signature", 4, ArgumentContractChangeSignature
         ),
     ),
-    schema_extra={},
 )
-class ArgumentContract(
-    ProtocolRoot[
-        (
-            "Annotated[ArgumentContractRename | ArgumentContractMove | "
-            "ArgumentContractSafeDelete | ArgumentContractChangeSignature, "
-            "schema_field(discriminator='name')]"
-        )
-    ]
-):
+class ArgumentContract(ProtocolRoot):
     "A portable argument contract attached to a discovered adapter action. Its stable name and numeric version are separate fields. The descriptor's self-contained schema may narrow the selected contract for one language without changing its field meanings."
 
 
@@ -3865,24 +3603,17 @@ class OperationVerifierRift(ClosedModel):
     kind: Field[Literal["rift"]] = proto_field()
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("rift", "rift", 1, OperationVerifierRift, ProtoEmpty),
-            Variant("adapter", "adapter", 2, OperationVerifierAdapter),
-            Variant("validator", "validator", 3, OperationVerifierValidator),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("rift", "rift", 1, OperationVerifierRift, ProtoEmpty),
+        Variant("adapter", "adapter", 2, OperationVerifierAdapter),
+        Variant("validator", "validator", 3, OperationVerifierValidator),
     ),
-    schema_extra={},
 )
-class OperationVerifier(
-    ProtocolRoot[
-        "Annotated[OperationVerifierRift | OperationVerifierAdapter | OperationVerifierValidator, schema_field(discriminator='kind')]"
-    ]
-):
+class OperationVerifier(ProtocolRoot):
     """The component that checked a precondition or established a guarantee."""
 
 
@@ -3926,30 +3657,19 @@ class PreconditionValueText(ClosedModel):
     value: Field[str] = proto_field(max_length=4096, number=1)
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("boolean", "boolean", 1, PreconditionValueBoolean),
-            Variant("count", "count", 2, PreconditionValueCount),
-            Variant("snapshot", "snapshot", 3, PreconditionValueSnapshot),
-            Variant("coverage", "coverage", 4, PreconditionValueCoverage),
-            Variant("text", "text", 5, PreconditionValueText),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("boolean", "boolean", 1, PreconditionValueBoolean),
+        Variant("count", "count", 2, PreconditionValueCount),
+        Variant("snapshot", "snapshot", 3, PreconditionValueSnapshot),
+        Variant("coverage", "coverage", 4, PreconditionValueCoverage),
+        Variant("text", "text", 5, PreconditionValueText),
     ),
-    schema_extra={},
 )
-class PreconditionValue(
-    ProtocolRoot[
-        (
-            "Annotated[PreconditionValueBoolean | PreconditionValueCount | "
-            "PreconditionValueSnapshot | PreconditionValueCoverage | PreconditionValueText, "
-            "schema_field(discriminator='kind')]"
-        )
-    ]
-):
+class PreconditionValue(ProtocolRoot):
     "A typed value compared by an operation precondition. The tag prevents a snapshot string, a name, and a count rendered as text from becoming indistinguishable."
 
 
@@ -4091,27 +3811,17 @@ class OperationBlockerRelationship(ClosedModel):
     relationship: Field[Relationship] = proto_field(number=1)
 
 
-@definition(
+@union(
     owner=CORE,
-    public=True,
-    proto=Proto.union(
-        Oneof("variant"),
-        (
-            Variant("address", "address", 1, OperationBlockerAddress),
-            Variant("path", "path", 2, OperationBlockerPath),
-            Variant("relationship", "relationship", 3, OperationBlockerRelationship),
-        ),
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("address", "address", 1, OperationBlockerAddress),
+        Variant("path", "path", 2, OperationBlockerPath),
+        Variant("relationship", "relationship", 3, OperationBlockerRelationship),
     ),
-    schema_extra={},
 )
-class OperationBlocker(
-    ProtocolRoot[
-        (
-            "Annotated[OperationBlockerAddress | OperationBlockerPath | "
-            "OperationBlockerRelationship, schema_field(discriminator='kind')]"
-        )
-    ]
-):
+class OperationBlocker(ProtocolRoot):
     "A concrete subject preventing resolution. The union admits existing code, a path that may not exist, or the adapter edge that cannot be changed safely."
 
 
@@ -4485,11 +4195,14 @@ class ActionDescriptor(ClosedModel):
         ),
         number=7,
     )
-    arguments_schema: Field[dict[str, Any]] = proto_field(
+    arguments_schema: Field[dict[str, Any] | None] = proto_field(
+        default=None,
         description=(
             "JSON Schema draft 2020-12 for the arguments this action takes. Remote references "
             "are forbidden. When `argument_contract` is set, this schema may add language "
-            "constraints while preserving the portable fields and meanings."
+            "constraints while preserving the portable fields and meanings. An adapter always "
+            "supplies it; Rift leaves it null in a listing page and carries it in the read of "
+            "one offer, so a caller fetches one schema rather than a schema per offer."
         ),
         number=8,
     )
@@ -4559,6 +4272,16 @@ class FactFamily(str, Enum):
     RELATIONSHIPS = "relationships"
     TYPES = "types"
     DIAGNOSTICS = "diagnostics"
+
+
+@mapping(
+    owner=CORE,
+    root=dict[FactFamily, Coverage],
+    placement=Placement("entries", 1),
+    json_schema_extra={"minProperties": 6},
+)
+class SemanticCoverage(ProtocolRoot):
+    """Coverage for every fact family. Absence is authoritative only where state is complete."""
 
 
 @definition(
@@ -4636,9 +4359,9 @@ class CodeBlock(ClosedModel):
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class CapturedOutput(ClosedModel):
-    """A bounded UTF-8 rendering of one execution stream. Invalid byte sequences become U+FFFD.
-    The digest covers the complete raw stream, including bytes beyond the captured prefix."""
+class CapturedText(ClosedModel):
+    """A bounded UTF-8 rendering of bytes. Invalid byte sequences become U+FFFD. The digest
+    covers the complete raw value, including bytes beyond the captured prefix."""
 
     text: Field[str] = proto_field(description="Decoded captured prefix.", number=1)
     captured_bytes: Field[int] = proto_field(
@@ -4647,14 +4370,71 @@ class CapturedOutput(ClosedModel):
         number=2,
     )
     total_bytes: Field[int] = proto_field(
-        description="Raw bytes emitted by the complete stream.", ge=0, number=3
+        description="Raw bytes in the complete value.", ge=0, number=3
     )
     truncated: Field[bool] = proto_field(
         description="Whether bytes after the captured prefix were omitted from `text`.",
         number=4,
     )
     digest: Field[Digest] = proto_field(
-        description="SHA-256 of the complete raw stream.", number=5
+        description="SHA-256 of the complete raw value.", number=5
+    )
+
+    @model_validator(mode="after")
+    def counts_and_truncation_agree(self) -> CapturedText:
+        if self.captured_bytes > self.total_bytes:
+            raise ValueError("captured_bytes cannot exceed total_bytes")
+        if self.truncated != (self.captured_bytes < self.total_bytes):
+            raise ValueError(
+                "truncated must say whether captured_bytes is below total_bytes"
+            )
+        return self
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class ExecutionBudget(ClosedModel):
+    """Exact server-selected bounds an adapter must enforce for one code-block evaluation.
+    The gRPC deadline may be shorter than `timeout_ms`; whichever expires first governs."""
+
+    timeout_ms: Field[int] = proto_field(
+        description="Maximum evaluation wall time in milliseconds.",
+        ge=1,
+        le=86400000,
+        number=1,
+    )
+    output_bytes: Field[int] = proto_field(
+        description="Captured prefix limit applied separately to stdout and stderr.",
+        ge=0,
+        le=16384,
+        number=2,
+    )
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class DebugBudget(ClosedModel):
+    """Execution and retained-frame bounds for one debugging session."""
+
+    execution: Field[ExecutionBudget] = proto_field(
+        description="Bounds for running and capturing the debugging evaluation.",
+        number=1,
+    )
+    frames: Field[int] = proto_field(
+        description="Maximum stack frames the adapter may retain, innermost first.",
+        ge=1,
+        le=256,
+        number=2,
+    )
+    bindings_per_frame: Field[int] = proto_field(
+        description="Maximum arguments plus locals returned for one frame.",
+        ge=1,
+        le=128,
+        number=3,
+    )
+    value_bytes: Field[int] = proto_field(
+        description="Captured prefix limit for each rendered debug binding value.",
+        ge=0,
+        le=8192,
+        number=4,
     )
 
 
@@ -4689,7 +4469,8 @@ class ExecutionResult(ClosedModel):
     """The complete bounded observation of one code-block evaluation."""
 
     status: Field[ExecutionStatus] = proto_field(
-        description="Whether the language runtime completed or failed the block.", number=1
+        description="Whether the language runtime completed or failed the block.",
+        number=1,
     )
     exit_code: Field[int | None] = proto_field(
         description=(
@@ -4698,10 +4479,10 @@ class ExecutionResult(ClosedModel):
         ),
         number=2,
     )
-    stdout: Field[CapturedOutput] = proto_field(
+    stdout: Field[CapturedText] = proto_field(
         description="Bounded standard output from the evaluation.", number=3
     )
-    stderr: Field[CapturedOutput] = proto_field(
+    stderr: Field[CapturedText] = proto_field(
         description="Bounded standard error from the evaluation.", number=4
     )
     diagnostics: Field[list[Diagnostic]] = proto_field(
@@ -4709,26 +4490,38 @@ class ExecutionResult(ClosedModel):
         number=5,
     )
 
+    @model_validator(mode="after")
+    def status_and_exit_code_agree(self) -> ExecutionResult:
+        if self.status is ExecutionStatus.COMPLETED and self.exit_code not in {None, 0}:
+            raise ValueError("completed execution cannot have a nonzero exit_code")
+        if self.status is ExecutionStatus.FAILED and self.exit_code == 0:
+            raise ValueError("failed execution cannot have exit_code zero")
+        return self
+
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class DebugBinding(ClosedModel):
     """One visible name in a debug frame, rendered by the language adapter. Values are display
-    strings rather than a portable object graph; future expansion can add a separate child-value
+    text rather than a portable object graph; future expansion can add a separate child-value
     interface without changing frame identity."""
 
     name: Field[str] = proto_field(
-        description="Name as the language presents it.", min_length=1, max_length=1024, number=1
+        description="Name as the language presents it.",
+        min_length=1,
+        max_length=1024,
+        number=1,
     )
     type: Field[str | None] = proto_field(
         description="Adapter-rendered runtime type, or null when unavailable.",
         max_length=1024,
         number=2,
     )
-    value: Field[str] = proto_field(
-        description="Bounded adapter-rendered value.", max_length=8192, number=3
-    )
-    truncated: Field[bool] = proto_field(
-        description="Whether the adapter omitted part of the rendered value.", number=4
+    value: Field[CapturedText] = proto_field(
+        description=(
+            "Bounded adapter-rendered value. Its digest identifies the complete rendering when "
+            "the session budget truncates it."
+        ),
+        number=3,
     )
 
 
@@ -4764,72 +4557,41 @@ class DebugFrame(ClosedModel):
     )
 
 
-@definition(
+@scalar(
     owner=CORE,
-    public=True,
-    proto=Proto.scalar(ProtoFieldDescriptor.TYPE_STRING),
-    schema_extra={},
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^[a-z][a-z0-9_.-]*$",
+    max_length=128,
 )
-class ActionKind(
-    ProtocolRoot[
-        (
-            "Annotated[str, schema_field(description='What an adapter action does, as a "
-            "dotted hierarchical name. Rift fixes the portable families `quickfix`, `source`, "
-            "`refactor.rename`, `refactor.move`, `refactor.safe_delete`, "
-            "`refactor.change_signature`, `refactor.extract`, `refactor.inline`, "
-            "`refactor.introduce`, `refactor.convert`, and `generate`; adapters may refine "
-            "them with suffixes. Other roots are reverse-domain namespaced. Prefix filtering "
-            "selects a whole family.', pattern='^[a-z][a-z0-9_.-]*$', max_length=128)]"
-        )
-    ]
-):
-    "What an adapter action does, as a dotted hierarchical name. Portable prefixes group common operations; reverse-domain roots identify adapter-specific families."
+class ActionKind(ProtocolRoot):
+    """What an adapter action does, as a dotted hierarchical name. Rift fixes the portable families `quickfix`, `source`, `refactor.rename`, `refactor.move`, `refactor.safe_delete`, `refactor.change_signature`, `refactor.extract`, `refactor.inline`, `refactor.introduce`, `refactor.convert`, and `generate`; adapters may refine them with suffixes. Other roots are reverse-domain namespaced. Prefix filtering selects a whole family."""
 
 
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class MatchKey(ClosedModel):
-    "Identity of one match: the query that found it, the snapshot it searched, and the range where it landed. The complete query remains available for inspection and replay."
-
-    snapshot: Field[Snapshot] = proto_field(
-        description=(
-            "The snapshot it was found in. A match does not survive into another one, because "
-            "the bytes its span points at have moved."
-        ),
-        number=1,
-    )
-    span: Field[SourceSpan] = proto_field(
-        description="The file and byte range that matched.", number=2
-    )
-    query: Field[MatchQuery] = proto_field(
-        description="The query that produced this match. One span found by two queries denotes two match identities.",
-        number=3,
-    )
+@scalar(
+    owner=CORE,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^rift://match/[A-Za-z0-9_-]{16,8192}$",
+    min_length=30,
+    max_length=8206,
+    examples=["rift://match/eyJzbmFwc2hvdCI6eyJraW5kIjoiY29tbWl0In19"],
+)
+class MatchId(ProtocolRoot):
+    """Identity of one match, and the URI that resolves it. The segment after `rift://match/` is base64url of the RFC 8785 canonical JSON holding the snapshot it was found in, the span it landed on, and the query that produced it. Rift decodes the segment and retains nothing, so a match survives a server restart; reading the URI expands it back into those three fields. A span found by two queries denotes two matches."""
 
 
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class ActionKey(ClosedModel):
-    "State-bound identity of one discovered adapter action. The language selects the adapter. The opaque token binds its handle and adapter generation."
-
-    snapshot: Field[Snapshot] = proto_field(
-        description=(
-            "The snapshot it was discovered in. Rift rediscovers the adapter's action and "
-            "checks this before applying anything, because an action is only meaningful "
-            "against the code it was computed from."
-        ),
-        number=1,
-    )
-    language: Field[Language] = proto_field(
-        description="Language whose adapter minted the token and resolves it.", number=2
-    )
-    token: Field[str] = proto_field(
-        description=(
-            "Opaque Rift handle containing the adapter token and generation. Rift unwraps it "
-            "only when resolving the offer."
-        ),
-        min_length=1,
-        max_length=4096,
-        number=3,
-    )
+@scalar(
+    owner=CORE,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern="^rift://action/[A-Za-z0-9_-]{16,8192}$",
+    min_length=31,
+    max_length=8207,
+    examples=["rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ"],
+)
+class ActionOfferId(ProtocolRoot):
+    """Identity of one discovered adapter action, and the URI that resolves it. The segment after `rift://action/` is base64url of the RFC 8785 canonical JSON holding the snapshot it was discovered in, the language whose adapter minted it, and the opaque adapter token. Reading the URI returns the offer with its argument schema. Rift unwraps the token only when resolving the offer, and refuses one whose snapshot has moved."""
 
 
 MODELS = (
@@ -4917,12 +4679,14 @@ MODELS = (
     FactFamily,
     AdapterOperation,
     CodeBlock,
-    CapturedOutput,
+    CapturedText,
+    ExecutionBudget,
+    DebugBudget,
     ExecutionStatus,
     ExecutionResult,
     DebugBinding,
     DebugFrame,
     ActionKind,
-    MatchKey,
-    ActionKey,
+    MatchId,
+    ActionOfferId,
 )

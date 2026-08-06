@@ -9,9 +9,11 @@ from enum import Enum, IntEnum
 from typing import (
     Annotated,
     Any,
+    ForwardRef,
     Generic,
     Literal,
     TypeVar,
+    Union,
     cast,
     get_args,
     get_origin,
@@ -83,14 +85,22 @@ class Placement:
 
 @dataclass(frozen=True)
 class Variant:
+    """One branch of a tagged union, named by its model or by the model's name.
+
+    A branch declared further down the module is named as a string. Nothing here
+    imports it: the union needs the name to build its own annotation, and Pydantic
+    resolves that name against the module when the models are rebuilt.
+    """
+
     tag: str | None
     name: str
     number: int
-    model: type[Any] | Callable[[], type[Any]]
+    model: type[Any] | str
     proto_model: type[ProtoMessage] | None = None
 
-    def resolve(self) -> type[Any]:
-        return self.model if isinstance(self.model, type) else self.model()
+    @property
+    def type_name(self) -> str:
+        return self.model if isinstance(self.model, str) else self.model.__name__
 
 
 @dataclass(frozen=True)
@@ -198,7 +208,7 @@ class Proto:
                     "type": (
                         cast(Any, variant.proto_model).DESCRIPTOR.full_name
                         if variant.proto_model
-                        else variant.resolve().__name__
+                        else variant.type_name
                     ),
                 }
                 for variant in self.variants
@@ -526,6 +536,128 @@ def definition(
     return decorate
 
 
+def _root_model(cls: type[Any], annotation: Any) -> type[Any]:
+    """Rebuild one authored root definition as the Pydantic model it describes.
+
+    The authored class carries a name and a docstring; Pydantic needs
+    `RootModel[...]` parametrized with the value type. Building it here is what
+    keeps the value type out of a string in the model files, where a regex would
+    have to survive two rounds of escaping and no checker would read it.
+    """
+
+    return cast(
+        type[Any],
+        type(
+            cls.__name__,
+            (ProtocolRoot[annotation],),
+            {
+                "__doc__": cls.__doc__,
+                "__module__": cls.__module__,
+                "__qualname__": cls.__qualname__,
+            },
+        ),
+    )
+
+
+def _constrained(root: Any, constraints: dict[str, Any]) -> Any:
+    if not constraints:
+        return root
+    return Annotated[root, schema_field(**constraints)]
+
+
+def scalar(
+    *,
+    owner: Namespace,
+    proto: int,
+    root: Any,
+    public: bool = True,
+    schema_extra: dict[str, Any] | None = None,
+    **constraints: Any,
+):
+    """One JSON scalar and the Protobuf scalar it maps to.
+
+    The docstring is the schema description, so it is written once. `constraints`
+    are the JSON Schema keywords Pydantic accepts — `pattern`, `min_length`,
+    `examples`.
+    """
+
+    def decorate(cls: type[T]) -> type[T]:
+        model = _root_model(cls, _constrained(root, constraints))
+        return definition(
+            owner=owner,
+            public=public,
+            proto=Proto.scalar(proto),
+            schema_extra=schema_extra or {},
+        )(model)
+
+    return decorate
+
+
+def mapping(
+    *,
+    owner: Namespace,
+    root: Any,
+    public: bool = True,
+    placement: Placement | None = None,
+    schema_extra: dict[str, Any] | None = None,
+    **constraints: Any,
+):
+    """A JSON object keyed by a scalar, carried as a Protobuf map field."""
+
+    def decorate(cls: type[T]) -> type[T]:
+        model = _root_model(cls, _constrained(root, constraints))
+        return definition(
+            owner=owner,
+            public=public,
+            proto=Proto.message(placement=placement),
+            schema_extra=schema_extra or {},
+        )(model)
+
+    return decorate
+
+
+def union(
+    *,
+    owner: Namespace,
+    oneof: str,
+    variants: tuple[Variant, ...],
+    discriminator: str | None = None,
+    public: bool = True,
+    named: bool = True,
+    placement: Placement | None = None,
+    schema_extra: dict[str, Any] | None = None,
+):
+    """A tagged union, described once by its variants.
+
+    The Python type, the JSON `oneOf`, and the Protobuf oneof all come from
+    `variants`, so a branch cannot be added to one and missed in another. A branch
+    named as a string becomes a `ForwardRef`, which Pydantic resolves against the
+    module when the models are rebuilt.
+    """
+
+    def decorate(cls: type[T]) -> type[T]:
+        members = tuple(
+            variant.model
+            if isinstance(variant.model, type)
+            else ForwardRef(variant.model)
+            for variant in variants
+        )
+        annotation: Any = Union[members]  # noqa: UP007 - the members are dynamic
+        if discriminator:
+            annotation = Annotated[
+                annotation, schema_field(discriminator=discriminator)
+            ]
+        model = _root_model(cls, annotation)
+        return definition(
+            owner=owner,
+            public=public,
+            proto=Proto.union(Oneof(oneof), variants, named=named, placement=placement),
+            schema_extra=schema_extra or {},
+        )(model)
+
+    return decorate
+
+
 def proto_message(declaration: DirectMessage):
     def decorate(model: type[T]) -> type[T]:
         typed = cast(type[ProtoModel], model)
@@ -615,10 +747,13 @@ __all__ = [
     "closed_config",
     "definition",
     "field",
+    "mapping",
     "proto_enum",
     "proto_field",
     "proto_message",
     "proto_type_name",
     "rebuild_models",
+    "scalar",
     "schema_field",
+    "union",
 ]
