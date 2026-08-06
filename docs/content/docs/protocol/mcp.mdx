@@ -10,24 +10,25 @@ requests and retained records.
 
 | Profile | Additional surface |
 | --- | --- |
-| `read` | `tree`, `outline`, `search`, `match`, `actions`, and the repository, symbol, diff, and file resources |
-| `edit` | `apply`, `integrate`, the preview resource, adapter formatting, and adapter validation |
+| `read` | `tree`, `outline`, `search`, `match`, and the repository, symbol, diff, file, actions, and action resources |
+| `edit` | candidate tools, `refresh`, `publish`, the preview resource, adapter formatting, and adapter validation |
 | `full` | command validators and `persist` |
 
 Profiles accumulate. The schemas describe the complete surface; the repository resource reports the
 profile and per-language capabilities available in this workspace.
 
-Execution and debugging are host-policy capabilities rather than another profile tier. `execute` is
-listed only when execution policy enables caller-provided code and the selected language advertises
-`execute`. The three debugging tools appear together only when policy enables them and an adapter
-advertises `debug_start`, `debug_get_frame`, and `debug_stop`. Passing the `full` conformance suite
-does not authorize either capability.
+Host policy governs execution and debugging. `execute` is listed only when that policy authorizes at
+least one language, its adapter advertises `execute`, and the execution fixtures pass on this host.
+The debugging tools appear together under the same rule and require the complete `debug_start`,
+`debug_get_frame`, `debug_stop` adapter triplet.
+`LanguageSupport.execution` reports the effective intersection for each language. Passing the `full`
+conformance suite does not authorize either capability.
 
 The [`ConformanceProfile`](/docs/protocol/reference#ConformanceProfile) definition specifies the
 executable gate behind each claim. The repository reports a profile only after that suite passes on the
 current host.
 
-## Read surface
+## Discovery
 
 `tree` lists project paths from Git objects. A depth of one lists a directory; recursive depth plus
 include and exclude globs provides tree, glob, and file-find queries. File and diff resources supply
@@ -37,12 +38,14 @@ starting an adapter.
 `outline` reads declarations, definitions, imports, exports, and their source nesting for one file.
 `search` retrieves files, nodes, or symbols by text and adapter facts. Relationship filters express
 callers, callees, dependencies, implementations, overrides, and type hierarchy walks. `match` returns
-source ranges for a `MatchQuery`. `actions` asks an adapter for fixes and refactors at an `Address`.
-Each semantic answer carries coverage and the `Snapshot` it used.
+source ranges for a `MatchQuery`. Each semantic answer carries coverage and the `Snapshot` it used.
 
-Repository, symbol, diff and file records are addressed by `rift://` URIs, so an answer can be handed
-straight back as the input to the next call. The file resource pages through content that way: it
-returns one byte range as UTF-8 or base64, and its next URI starts where that range ended.
+Records that another call can address carry an identity for that purpose. A symbol uses a
+`rift://symbol/…` URI, while a retained match uses `rift://match/…`. The match URI's last segment is
+base64url of the snapshot, the span, and the query that found it. Rift decodes that segment without a
+stored record, so the same identity resolves after a server restart. Resource pages also carry their
+next URI: the file resource returns one byte range as UTF-8 or base64, then puts the following offset
+in that link.
 
 Answers are bounded. `max_response_bytes` fixes the serialized page ceiling at 64 KiB,
 `max_record_bytes` holds back enough of it for the page's own identity and cursor, and
@@ -65,141 +68,137 @@ A submodule appears in the parent project tree as one gitlink entry carrying the
 reads and adapters stop at that path. The child repository uses its own Rift connection. A parent edit
 can create or update the gitlink, while a matching `.gitmodules` change travels as an ordinary text edit.
 
-## Execution and debugging
+### Actions
 
-`execute` takes an exact `Language`, an optional `rev`, and a `CodeBlock`. Rift resolves the revision,
-prepares a disposable execution workspace, opens a fresh adapter state, and calls that adapter's
-`Execute` RPC. The result reports the exact `Snapshot`, completion or language failure, bounded stdout
-and stderr, and structured diagnostics. Cancellation, deadline expiry, adapter loss, and workspace
-preparation remain protocol errors rather than code outcomes.
+Adapters expose the actions available at one place through a resource URI:
 
-The block includes a project-relative working directory and never becomes a repository file. Imports,
-dependencies, toolchain selection, and configuration come from the chosen snapshot. Files the block
-writes are discarded with the execution workspace after the call.
+```
+rift://actions/symbol/python/pkg.util.load_config
+rift://actions/file/src/api.rs?only=quickfix
+```
 
-Debugging is an explicit three-tool lifecycle:
+A point address asks about one symbol, node, byte range, or match. A file address asks for every
+offer in that file, which is the read you want when an agent is working through the diagnostics of a
+file it just wrote; Rift fans out over the nodes those diagnostics land on. `?only=` keeps one kind
+prefix, `?rev=` selects the revision, and the page continues through `?cursor=`.
 
-| tool | effect |
-| --- | --- |
-| `debug_start` | Runs a block to normal completion or an unhandled failure and returns a connection-bound `DebugSession`. |
-| `debug_get_frame` | Reads one retained failure frame by zero-based stack depth, innermost first. It does not resume execution. |
-| `debug_stop` | Releases the adapter token, adapter state, and execution workspace. |
+Each entry carries what the action would do and its own URI, and leaves `arguments_schema` out. An
+adapter can offer a dozen actions at one address, and a page carrying a dozen JSON Schemas would
+spend its whole 64 KB on schemas the caller will not use. Reading the one offer you picked returns it
+with its schema:
 
-Normal completion returns `frame_count: 0`. A failed run retains bounded frame names, repository source
-locations where one exists, and adapter-rendered arguments and locals. Values are strings rather than
-a portable object graph; child expansion, stepping, continue, breakpoints, and variable mutation can
-be added as separate interfaces later without changing frame identity.
+```
+rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ
+```
 
-The public `DebugSessionId` is opaque and valid only on the MCP connection that started it. Rift maps
-it to the adapter-local token and never exposes that token to an agent. Connection close, adapter exit,
-and server recovery perform the same cleanup as `debug_stop`.
-
-An execution workspace prevents evaluated code from changing Rift's repository state; it is not host
-isolation. Evaluated code retains the filesystem, process, and network access of `rift server`. The
-workspace administrator must opt in through execution policy before any of these tools are advertised.
+That URI is what `act` takes.
 
 ## Changes
 
-The `apply` tool accepts an ordered array of `Change` values. Six variants cover the public
-deterministic input surface:
+Each candidate-building tool performs one operation with typed arguments:
 
-- `edits` supplies an atomic set of concrete `Edit` values.
-- `patch` supplies a unified text diff whose paths and context Rift validates.
-- `action` resolves an `ActionOffer` through the adapter that offered it.
-- `rewrite` runs a `MatchQuery`, checks its cardinality, and replaces every selected match atomically.
-- `revert` computes the three-way inverse of one exact commit against its selected parent.
-- `merge` performs a three-way merge of one exact commit into the current candidate.
+| tool | what it does |
+| --- | --- |
+| `edit` | an atomic set of concrete `Edit` values |
+| `patch` | a unified diff, checked hunk by hunk against the state it resolves on |
+| `rewrite` | one `MatchQuery`, a replacement template, and the number of matches you accept |
+| `revert` | the three-way inverse of one commit against a selected parent |
+| `merge` | a three-way merge of one commit into the candidate |
+| `rename` | a new name for a declaration, propagated to its references |
+| `move` | a new container or path, with imports and references updated |
+| `delete` | removal of a declaration, with or without reference analysis |
+| `change_signature` | a new callable shape, propagated to callers and overrides |
+| `act` | any other action an adapter offered, by its `rift://action/…` URI |
+| `integrate` | a merge of an accepted commit into a local branch, described under [Integration](#integration) |
 
-Each change observes the candidate state produced by its predecessors. A refusal discards the whole
-candidate.
+`rename`, `move`, `delete`, and `change_signature` use portable argument contracts, so their arguments
+are in the tool schema an agent already has. Everything else an adapter can do — extract, inline,
+organize imports, a quick fix, an adapter's own family — is discovered through the actions resource
+and resolved by `act`, whose arguments follow the schema that offer advertises. `act` refuses an offer
+belonging to a portable family, which leaves one entry point for each operation.
 
-After each change, Rift formats and refreshes every adapter sharing the worktree. The next
-adapter-resolved change reads the acknowledged state.
+`delete` carries both kinds of removal on one axis. Without a `policy` it removes the declaration and
+analyses nothing, which is what you want for a file you just created and no longer need. With one, the
+adapter classifies every remaining use and applies the disposition you chose for each. Incomplete
+reference coverage refuses the operation before it can leave a dangling call behind.
 
-Discover an action against the candidate when it targets a declaration created by an earlier change.
-That discovery call uses the new declaration's stable address.
+Nothing here publishes. Each tool resolves its operation, writes the result to an immutable candidate
+commit, validates that commit with the adapters, and returns a bounded `CandidateSummary` whose
+`PreviewResourceLink` opens the complete retained plan.
 
-Adapter action discovery is the semantic editing interface. Portable kind families cover quick fixes,
-source organization, rename, move, safe delete, signature change, extract, inline, introduce, convert,
-and member generation. An adapter advertises supported prefixes for the language, then target-specific
-discovery returns applicable actions and a self-contained argument schema.
+### Composing operations
 
-Rename, move, safe-delete, and signature-change actions can name an `ArgumentContract`.
-`OperationScope` constrains the paths and source classes the adapter may change. Safe-delete arguments
-state how to handle each classified use, and incomplete reference coverage refuses the action.
-Signature-change arguments describe the resulting callable shape and how it propagates; advertised
-extensions carry fields specific to the language.
+A change that takes several steps is a chain. Every candidate tool takes `on`, the candidate it
+continues:
 
-Each `ResolvedChange` correlates one request index with its contributing adapters and record counts.
-The preview resource pages exact edits, semantic effects, executable preconditions, diagnostics, and
-scoped guarantee evidence as records carrying that index. A refusal returns failed preconditions and
-concrete blocking addresses, paths, or relationships.
+```
+edit(…)                        -> preview: 9f2c…
+rename(on: 9f2c…, …)           -> preview: be71…
+act(on: be71…, action: …)      -> preview: 04ad…
+publish(preview: 04ad…)        -> accepted
+```
 
-Propagation choices belong to action arguments. A caller that changes a choice creates another
-preview with new arguments. The ordered change array provides deterministic composition. Saved recipes
-can store that array outside the transaction protocol.
+Each step resolves against its predecessor's tree, so the rename sees the declaration the edit
+created. Before `act`, the caller reads the actions resource against that resulting candidate and
+passes back the selected `ActionOfferId`. Between steps, Rift formats and refreshes every adapter
+sharing the worktree, which makes the next adapter-resolved operation read the acknowledged state.
 
-The public protocol accepts deterministic change input. Product model components turn prompts and
-provider completions into those values before calling Rift.
+The chain is the transaction: no ref moves until `publish`, and `publish` names the tip. Each link is
+also a real preview you can read, refresh, or abandon on its own — which an ordered array of changes
+inside one call never allowed.
 
-## Candidate lifecycle
+## Lifecycle
 
-`apply` has three modes. `preview` resolves the ordered changes against one base, writes their result to
-an immutable candidate commit, validates that commit, and retains the complete plan. It leaves the
-accepted ref and connection worktree unchanged.
+A `PreviewId` is derived from the request that produced it: base64url of the SHA-256 over the
+connection, the base, the expected head, the parent candidate, and the operation. Sending the same
+request twice therefore names the same candidate, and the second call returns the retained plan
+without another resolution and validation pass. A lost response costs one round trip.
 
 `expected_accepted` separates resolution state from publication concurrency. It defaults to the
 current accepted head, must be an ancestor of the resolution base, and becomes the compare-and-swap
-value at publication. Normal previews resolve directly on that commit. A merge repair resolves on a
-provisional two-parent commit while still advancing from the accepted source parent.
+value at publication. A merge repair resolves on a provisional two-parent commit while still advancing
+from the accepted source parent.
 
-The tool returns a bounded `CandidateSummary`. Its `PreviewResourceLink` opens the complete retained
-plan.
+`refresh` reruns a retained candidate's operation on a newer base. The candidate holds the request it
+was built from, so nothing is restated; the result counts the resolved records and files that moved,
+and comparing the two preview resources gives the exact ones. A portable refactor reruns the same
+typed call, which is why replaying it needs no matching rule. `act` still has to
+find its offer again, and Rift matches it by language, target, kind, argument contract, argument
+schema, and guarantees — zero or several matches refuse, as does a stale match.
 
-The immutable preview resource pages the requested changes, their resolved records, validation
-evidence, and confirmations.
+`publish` replays the chain's resolution, compares its plans, confirmations, and candidate tree with
+what was retained, runs the declared command validators, and advances the destination through
+compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration.
+Publication needs no idempotency key, because the compare-and-swap is the idempotence — a retry that
+finds the destination already holding the candidate returns the same accepted result with `replayed`
+set. Validation rejection, resolution refusal, and a lost compare-and-swap have separate result
+branches.
 
-After a validation rejection, the candidate commit and evidence remain readable. A repair can use
-that commit as a new preview base.
+After a rejection the candidate commit and its evidence remain readable, and a repair can use that
+commit as the base of a new candidate.
 
-The summary reports evidence counts and the complete verdict. Concatenating the preview pages yields
-the corresponding records. Each `ResolvedChange` count matches records carrying that change index;
-the validation totals match adapter reports and validator results across all pages.
+### Validation and persistence
 
-`refresh` reruns the retained changes and validators against a selected base. The result counts changed
-requests and files. Compare the two preview resources for their exact records.
+Adapter validation runs when a candidate is built. Workspace policy defaults to `require =
+"available"`, which requires complete, valid reports from affected adapters that advertise `validate`.
+An explicit list such as `['rust', 'sql:postgresql', 'json']` turns those exact languages into fixed
+publication gates. Source ownership and validation requirements are independent.
 
-Rift replays an action by matching its language, target, kind, argument contract, argument schema, and
-guarantees. Zero or several matches cause a typed refusal. A stale match also causes a refusal.
-
-`publish` replays the retained contract and compares its resolved plans, confirmations, and candidate
-tree with the preview. It then advances the accepted ref to the retained candidate commit through
-compare-and-swap. Validator output may differ between runs; the fresh pass or fail result governs
-publication. A caller supplies an idempotency key. An exact retry returns the retained result, while
-reuse with different input returns a conflict. Validation rejection, resolution refusal, and concurrent
-publication have separate result branches.
-
-## Validation and persistence
-
-Validation support is optional per adapter. Workspace policy defaults to `require = "available"`,
-which requires complete, valid reports from affected adapters that advertise `validate`. An explicit
-list such as `['rust', 'sql:postgresql', 'json']` turns those exact languages into fixed publication
-gates. Source ownership and validation requirements are independent.
-
-Under the `full` profile, callers can add `CommandValidator` declarations. Rift runs each executable
-directly, without a shell, in a disposable validation workspace copied from the candidate. The result
-retains the exit status and bounded output. Writes inside the workspace disappear with it, but the
-command can still access the host filesystem and network.
+Command validators belong to `publish`. A test suite that takes four minutes would charge the same
+four minutes to every step if it belonged to candidate creation, and publication has to run a fresh
+check before advancing the ref. Under the `full` profile Rift runs each executable directly, without
+a shell, in a disposable validation workspace copied from the candidate, and retains its exit status
+and bounded output.
+Writes inside the workspace disappear with it, and the command still reaches the host filesystem and
+network.
 
 A declaration is refused unless its argv and timeout fall inside what
 [`validators` in `rift.toml`](/docs/configuration#validators) permits, so which binaries can run is
-decided by the repository rather than by the caller.
+decided by repository policy. The caller supplies a permitted declaration, names the guarantee a pass
+establishes, and receives `GuaranteeEvidence` over the published chain.
 
-A validator can name the changes and guarantee it checks. A pass creates `GuaranteeEvidence` linked by
-the validator's position.
-
-An accepted candidate exists as a Git commit before it touches the connection worktree. `persist` selects
-paths from that commit.
+An accepted candidate exists as a Git commit before it touches the connection worktree. `persist`
+selects paths from that commit.
 
 Rift computes every per-path outcome before writing. An oversized result writes nothing. Each path
 reports its materialization result.
@@ -210,31 +209,73 @@ unchanged.
 One workspace and every transaction in it cover one repository. A gitlink remains an opaque entry in
 the parent repository; its child repository is outside this connection.
 
-## Integration
+### Integration
 
-`integrate` uses the same retained lifecycle as `apply`:
-
-- `preview` merges an accepted source commit into a local target branch, validates the candidate, and
-  leaves the target unchanged.
-- `refresh` reruns the retained merge contract against the target's current head.
-- `publish` replays validation and compare-and-swaps the target head with an idempotency key.
+`integrate` merges an accepted commit into a local target branch and validates the merge candidate,
+leaving the target unchanged. Two commits that are each valid can merge into a broken tree — `main`
+can rename a function the accepted commit added a call to — which is why the merge candidate is
+validated like any other. `refresh` rebuilds it against the target's current head, and `publish`
+advances the target.
 
 A merge conflict returns a retained two-parent provisional commit. Non-conflicting paths contain the
-automatic merge, while each conflict path retains the target entry so the candidate remains parseable.
-`MergeConflict` carries the base, source, and target entries. The caller repairs that candidate with
-ordinary `apply`, passing the provisional commit as `rev` and the conflict result's `source` as
-`expected_accepted`. It then publishes the repair to the accepted ref and previews integration again.
+automatic merge, while each conflict path keeps the target entry so the candidate remains parseable.
+`MergeConflict` carries the base, source, and target entries. Repair that candidate with any ordinary
+candidate tool whose `on` is the provisional merge, publish the repair to the accepted ref, and
+integrate again.
 
 Publication of a checked-out branch requires a clean worktree and
-`session.integration = "auto"`. Otherwise `integration_refused` returns the validated candidate for
-manual handling. `integration_conflict` distinguishes a moved target from idempotency-key reuse.
+`session.integration = "auto"`. Otherwise the result refuses with `checked_out_target` or
+`dirty_target` and returns the validated candidate for manual handling.
+
+## Execution and debugging
+
+`execute` takes an exact `Language`, an optional `rev`, and a `CodeBlock`. Rift resolves the revision,
+prepares a disposable execution workspace, opens a fresh adapter state, and calls that adapter's
+`Execute` RPC. The result reports the exact `Snapshot`, completion or language failure, bounded stdout
+and stderr, structured diagnostics, and the exact `ExecutionBudget` applied. `Limits.execution`
+reports code, time, output, concurrency, and optional debugging ceilings; null means policy disables
+caller code. A returned `DebugSession` likewise echoes its `DebugBudget`. Cancellation, deadline
+expiry, adapter loss, and workspace preparation return protocol errors. They do not become code
+outcomes.
+
+The block includes a project-relative working directory and never becomes a repository file. Imports,
+dependencies, toolchain selection, and configuration come from the chosen snapshot. Files the block
+writes are discarded with the execution workspace after the call.
+
+Debugging retains a session across explicit lifecycle calls:
+
+| tool | effect |
+| --- | --- |
+| `debug_start` | Runs a block to normal completion or an unhandled failure and returns a connection-bound `DebugSession`. |
+| `debug_get_frame` | Reads one retained failure frame by zero-based stack depth, innermost first. It does not resume execution. |
+| `debug_stop` | Releases the adapter token, adapter state, and execution workspace. |
+
+Normal completion returns `frame_count: 0`. A failed run retains bounded frame names, repository source
+locations where one exists, and adapter-rendered arguments and locals. Each value uses `CapturedText`,
+which carries a prefix plus its complete byte count, truncation flag, and digest. The interface has no
+portable runtime object graph. Child expansion,
+stepping, continue, breakpoints, and variable mutation can be added as separate interfaces later
+without changing frame identity.
+
+The public `DebugSessionId` is opaque and valid only on the MCP connection that started it. Rift maps
+it to an adapter-local `DebugSessionKey` and never exposes that key to an agent. A stop is idempotent:
+an exact retry after a lost response returns the same success without retaining the workspace. An ID
+from another connection is `permission_denied`; an unknown or idle-expired ID is
+`resource_not_found`. A stopped-session tombstone retains idempotency until connection close.
+Connection close, adapter exit, and server recovery perform the same cleanup as `debug_stop`.
+
+An execution workspace contains repository writes so Rift can discard them after evaluation.
+Evaluated code retains the filesystem, process, and network access of `rift server`, so the workspace
+administrator must opt in through execution policy before any of these tools are advertised.
 
 ## Failures
 
 A failed MCP request returns `ErrorData`, whose code classifies the failure and whose phase identifies
 the lifecycle step that failed.
 
-Refusal, rejection, and publication conflict are completed decisions. They remain typed `ApplyResult`
-values.
+A refused operation returns its failed preconditions and blockers in `RefusalReason`, while a rejected
+candidate returns its validation evidence. A publication conflict carries the head it expected and
+the one it found. Rift reached each of these decisions with evidence, so they are ordinary results;
+`ErrorData` covers requests that failed before reaching one.
 
 <McpReference />

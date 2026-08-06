@@ -83,6 +83,7 @@ function shape(node: unknown): Schema | undefined {
 
 export interface ToolEntry {
   name: string;
+  group: string;
   description?: string;
   params: string;
   result: string;
@@ -92,8 +93,34 @@ export const mcpTools: ToolEntry[] = seam("mcp", "mcp.tools").map(([name, member
   const params = role(member, "params");
   const result = role(member, "result");
   if (!params || !result) throw new Error(`tool \`${name}\` is missing a params or result type`);
-  return { name, description: member.description, params, result };
+  const group = member.group;
+  if (typeof group !== "string") throw new Error(`tool \`${name}\` is missing a group`);
+  return { name, group, description: member.description, params, result };
 });
+
+export interface ToolGroupEntry {
+  name: string;
+  title: string;
+  summary: string;
+  tools: ToolEntry[];
+}
+
+/**
+ * Tools in the families the schema declares. The grouping is metadata rather
+ * than a list kept here, so a tool added to `mcp.toolGroups` cannot end up
+ * rendered outside the family it belongs to.
+ */
+export const mcpToolGroups: ToolGroupEntry[] = seam("mcp", "mcp.toolGroups").map(
+  ([name, member]) => {
+    const { title, summary } = member as { title?: unknown; summary?: unknown };
+    if (typeof title !== "string" || typeof summary !== "string") {
+      throw new Error(`tool group \`${name}\` is missing a title or summary`);
+    }
+    const tools = mcpTools.filter((tool) => tool.group === name);
+    if (tools.length === 0) throw new Error(`tool group \`${name}\` has no tools`);
+    return { name, title, summary, tools };
+  },
+);
 
 export interface ResourceEntry {
   name: string;
@@ -325,7 +352,14 @@ function mcpPage(): PageData {
   return {
     toc: [
       { title: "Tools", url: "#tools", depth: 2 },
-      ...mcpTools.map((tool) => ({ title: tool.name, url: `#tool-${tool.name}`, depth: 3 })),
+      ...mcpToolGroups.flatMap((group) => [
+        { title: group.title, url: `#tools-${group.name}`, depth: 3 },
+        ...group.tools.map((tool) => ({
+          title: tool.name,
+          url: `#tool-${tool.name}`,
+          depth: 4,
+        })),
+      ]),
       { title: "Resources", url: "#resources", depth: 2 },
       ...mcpResources.map((resource) => ({
         title: resource.name,
@@ -336,7 +370,10 @@ function mcpPage(): PageData {
     structuredData: {
       headings: [
         { id: "tools", content: "Tools" },
-        ...mcpTools.map((tool) => ({ id: `tool-${tool.name}`, content: tool.name })),
+        ...mcpToolGroups.flatMap((group) => [
+          { id: `tools-${group.name}`, content: group.title },
+          ...group.tools.map((tool) => ({ id: `tool-${tool.name}`, content: tool.name })),
+        ]),
         { id: "resources", content: "Resources" },
         ...mcpResources.map((resource) => ({
           id: `resource-${resource.name}`,
@@ -344,6 +381,10 @@ function mcpPage(): PageData {
         })),
       ],
       contents: [
+        ...mcpToolGroups.map((group) => ({
+          heading: `tools-${group.name}`,
+          content: group.summary,
+        })),
         ...mcpTools.flatMap((tool) => [
           ...(tool.description
             ? [{ heading: `tool-${tool.name}`, content: tool.description }]
@@ -482,9 +523,7 @@ function scipPage(): PageData {
         ),
         ...declarations.flatMap((value) => [
           { heading: `scip-${value.name}`, content: value.name },
-          ...(value.comment
-            ? [{ heading: `scip-${value.name}`, content: value.comment }]
-            : []),
+          ...(value.comment ? [{ heading: `scip-${value.name}`, content: value.comment }] : []),
         ]),
       ],
     },

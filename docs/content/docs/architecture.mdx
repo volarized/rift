@@ -181,10 +181,10 @@ A worktree's lifetime depends on what made it:
 | worktree | created by | removed | written by |
 | --- | --- | --- | --- |
 | session `a1` | opening a connection | connection close | `persist` |
-| candidate `cand-a1-7` | `apply` in `preview` mode | when validation finishes | the preview's resolved edits |
+| candidate `cand-a1-7` | any candidate tool — `edit`, `rename`, `act` | when validation finishes | that operation's resolved edits |
 | read `read-dae86e1` | a semantic read at a revision nothing has checked out | idle timeout, or the LRU cap | nobody |
 | execution `exec-a1-8` | `execute` | when the call returns | evaluated repository code |
-| debug `debug-a1-9` | `debug_start` | `debug_stop`, connection close, or adapter loss | evaluated repository code |
+| debug `debug-a1-9` | `debug_start` | `debug_stop`, idle expiry, connection close, adapter loss, or startup reconciliation | evaluated repository code |
 
 Adapters open source with `open(2)`, so a real tree on disk is the interface. Source bytes stay on
 disk. Adapters return `Edit` values, and Rift is the only source writer. `git diff` therefore contains
@@ -253,48 +253,127 @@ removes the workspace. This is post-mortem inspection, not a stepping debugger: 
 continue, and variable mutation are outside the initial interface.
 
 The server mints the public debugging-session ID and binds it to the MCP connection. It maps that ID
-to the adapter's private token, exact `Snapshot`, language, adapter state, and execution workspace.
-The token never crosses MCP, and a caller cannot name another connection's debugging session. The
-same cleanup runs on `debug_stop`, connection close, adapter exit, server reconciliation, and
-cancellation while starting.
+to the adapter's private `DebugSessionKey`, exact `Snapshot`, language, adapter state, execution
+workspace, and last-access time. The key contains the adapter token and pinned state and never crosses
+MCP. A caller cannot name another connection's debugging session.
 
 The execution workspace is disposable, not isolated. Evaluated code and adapter runtime workers keep
 the host filesystem, process, and network access of `rift server`, just as command validators do.
-Consequently these tools are absent from `tools/list` unless host execution policy explicitly enables
-them and the selected adapter advertises the corresponding operations. The conformance profile and
-execution authorization remain separate decisions: passing `full` does not by itself authorize
-caller-provided code.
+Consequently these tools are absent from `tools/list` unless execution policy authorizes at least one
+exact `Language`, its adapter advertises the corresponding operations, and the execution conformance
+fixtures pass on this host. `LanguageSupport.execution` reports the effective intersection for each
+language. The conformance profile and execution authorization remain separate decisions: passing
+`full` does not by itself authorize caller-provided code.
+
+### Admission and budgets
+
+Admission happens before Rift creates a worktree. For `execute`, the language must appear in
+`execution.allow` and advertise `execute`. For debugging, it must also appear in `execution.debug` and
+advertise the complete `debug_start`, `debug_get_frame`, `debug_stop` triplet. Rift then checks the
+UTF-8 code size, workspace-wide concurrent evaluation count, workspace-wide retained debug-session
+count, and the selected adapter's effective state capacity. A refusal before admission allocates
+nothing.
+
+Repository policy becomes an exact `ExecutionBudget` or `DebugBudget` on the adapter request. The
+adapter enforces evaluation time, captured stdout and stderr, retained frames, bindings per frame, and
+captured bytes per rendered value. The gRPC deadline may be shorter than the budget; the earlier one
+wins. `Limits.execution` publishes the same ceilings, while a null value means execution policy is
+disabled.
+
+### Execution leases
+
+Every admitted call acquires an internal execution lease. The server does not expose its identity:
+
+```
+connection  a1
+snapshot    dae86e1…
+language    python
+workspace   .rift/worktrees/exec-a1-8
+state       AdapterState after Open, once available
+debug key   adapter token plus state, only after DebugStart
+phase       materializing | opening | running | retained | releasing
+```
+
+The lease owns cleanup from the moment its workspace path is reserved. A one-shot execution moves
+through `materializing → opening → running → releasing`. A successful `debug_start` moves from
+`running → retained`; frame reads leave it retained, and `debug_stop` moves it to releasing. Any
+failure or cancellation from any phase also moves it to releasing.
+
+Release is ordered and idempotent: `DebugStop` when a debug key exists, then `Close` when adapter
+state exists, then removal of the state root and execution workspace, then release of admission
+capacity. Failure of one cleanup step does not skip the later steps. `DebugStop` itself is idempotent
+while the adapter state lives, so a lost response can be retried safely.
+
+After evaluation starts, the execution workspace is tainted: arbitrary code may have changed source.
+Rift never calls `Refresh`, `Analyze`, or another execution against that state, and never commits or
+reuses its tree. Cleanup is its only successor.
+
+### Debug-session ownership and recovery
+
+The public debug map is connection-scoped. `debug_get_frame` refreshes the last-access time;
+`debug_stop` removes the active mapping and retains a lightweight stopped tombstone so an exact retry
+can return the same success without retaining the workspace. The tombstone lasts until connection
+close. A well-formed ID never minted on this connection, or one expired by `debug-idle-timeout`,
+returns `resource_not_found`. Presenting an ID minted by another connection returns
+`permission_denied` without revealing its owner.
+
+Connection close stops all of its sessions. Adapter exit invalidates every session backed by that
+process and releases their workspaces; the in-flight call reports `adapter_unavailable`, and later
+frame reads report `resource_not_found`. On server startup, every `exec-*` or `debug-*` directory lacks
+a live in-memory lease by definition and is removed during reconciliation. Cancellation during
+`debug_start` publishes no session ID. Cancellation of a frame read leaves the session retained;
+cancellation during stop does not cancel cleanup.
 
 ### Reuse and required changes
 
-| concern | reused interface or implementation | required change |
+| concern | reused interface or implementation | execution/debug shape |
 | --- | --- | --- |
-| Revision context | `Revision` resolution, exact `Snapshot`, Git materialization | Add disposable execution and retained debug lifetimes to the worktree allocator. |
-| Project runtime | `Open`, `AdapterState`, revision-local runtime selection, `Close` | Open a fresh state per execution workspace; never run caller code in a shared state. |
-| Adapter discovery | `Capabilities.operations` and repository `LanguageSupport` | Add `execute` and the all-or-none debug operation triplet. |
-| Agent routing | generated MCP JSON-to-Protobuf mapping and repository tool manifest | Add four tools and advertise them only where adapter support and host policy intersect. |
-| Bounds and cancellation | MCP request/response ceilings, gRPC deadlines, cancellation, `Diagnostic` | Add bounded `CapturedOutput`, rendered debug bindings, and cleanup on every terminal path. |
-| Connection ownership | connection-bound session runtime and close reconciliation | Add the public-debug-ID to private-adapter-token map and reject cross-connection access. |
-| Host execution | disposable validation-workspace machinery can supply materialization and cleanup | Add separate execution policy; do not reuse `CommandValidator`, whose result is publication evidence and whose declaration is an executable argv rather than source for an adapter. |
+| Revision context | `Revision` resolution, exact `Snapshot`, Git materialization | The worktree allocator adds disposable execution and retained debug lease lifetimes. |
+| Project runtime | `Open`, `AdapterState`, revision-local runtime selection, `Close` | Every execution gets a fresh state; a tainted execution state has cleanup as its only successor. |
+| Adapter discovery | `Capabilities.operations` and repository `LanguageSupport` | `execute` stands alone; the debug operation triplet is admitted and advertised atomically. |
+| Agent routing | generated MCP JSON-to-Protobuf mapping and repository tool manifest | Four tools are projected through per-language effective `ExecutionAvailability`. |
+| Bounds and cancellation | MCP response ceilings, gRPC deadlines, cancellation, `Diagnostic` | Typed policy produces adapter-enforced budgets; `CapturedText` is shared by validators, execution streams, and debug values. |
+| Connection ownership | connection-bound session runtime and close reconciliation | A public ID maps to a private `DebugSessionKey`; active mappings and stopped tombstones have explicit cleanup semantics. |
+| Host execution | validation-workspace materialization and cleanup machinery | Execution has separate authorization and no guarantee-evidence semantics; it does not reuse `CommandValidator`. |
 
-The protocol and architecture define these seams now. An implementation still needs the execution
-policy fields in `rift.toml`, admission and limit enforcement, workspace leases, cleanup/recovery, and
-conformance fixtures for output truncation, timeouts, adapter loss, cross-connection handles, and
-filesystem-write discard.
+The protocol defines the interface and executable schema contracts. The server implementation must
+realize the lease state machine and the runtime conformance scenarios below through the existing
+public methods.
+
+### Execution conformance
+
+An implementation advertises execution only after these fixtures pass with a real adapter:
+
+| fixture | required observation |
+| --- | --- |
+| policy intersection | Unauthorized languages are absent from effective availability and allocate no workspace; partial debug operation advertisement is rejected. |
+| snapshot context | Imports and runtime selection come from the requested snapshot, including a dirty-worktree snapshot, while the block itself creates no repository entry. |
+| write discard | A block that rewrites tracked source and creates files changes neither the named snapshot, connection worktree, candidate history, nor accepted ref. |
+| budgets | Code size and admission caps fail with `limit_exceeded`; stdout, stderr, and debug values truncate at their budgets while preserving complete byte counts and digests. |
+| timeout and cancellation | Deadline expiry and cancellation release every lease stage, including a call cancelled during materialization, `Open`, and adapter evaluation. |
+| frame bounds | A failure deeper than `max-debug-frames` and a frame wider than `max-debug-bindings` return bounded, innermost-first results. |
+| ownership | Another connection cannot inspect or stop the session; an unknown or idle-expired ID is not found. |
+| idempotent stop | Losing the first stop response and retrying returns the same success with no retained adapter state or worktree. |
+| adapter loss | Killing the adapter invalidates its sessions and removes their workspaces without affecting other language adapters. |
+| restart reconciliation | Killing the server in every lease phase leaves directories that the next server removes before serving calls. |
+| capacity | Concurrent calls never exceed `max-concurrent`, retained sessions never exceed `max-debug-sessions`, and both remain within effective adapter state capacity. |
 
 ## Writes
 
-`apply` resolves an ordered array of changes into a fresh candidate worktree, validates the result, and
-retains the plan. `publish` replays that plan and advances the session's accepted ref. `persist`
-materializes selected paths from an accepted commit into the session worktree.
+Each candidate tool resolves one operation into a fresh candidate worktree, validates the result, and
+retains the plan under an identity derived from the request. A change that takes several steps chains
+them: every tool takes `on`, the candidate it continues, and each step resolves against its
+predecessor's tree. `publish` replays the chain, runs the declared command validators, and advances
+the session's accepted ref. `persist` materializes selected paths from an accepted commit into the
+session worktree.
 
 <IsoDiagram
-  alt="A base commit B becomes a candidate commit through apply in preview mode. Adapters refresh onto that candidate and validate it, and command validators run against it and return an exit status and bounded output. Publish advances refs slash rift slash accepted slash a1 to the candidate by compare-and-swap. From the accepted ref, persist materializes paths into the session worktree and integrate merges into main by compare-and-swap."
+  alt="A base commit B becomes a candidate commit through one candidate tool. Adapters refresh onto that candidate and validate it. Publish runs the command validators, which return an exit status and bounded output, and advances refs slash rift slash accepted slash a1 to the candidate by compare-and-swap. From the accepted ref, persist materializes paths into the session worktree and integrate merges into main by compare-and-swap."
   chart={`
     flowchart LR
-      base["base commit B"]:::commit -- "apply<br/>preview" --> candidate["candidate<br/>commit"]:::commit
+      base["base commit B"]:::commit -- "edit, rename,<br/>act, …" --> candidate["candidate<br/>commit"]:::commit
       adapters["adapters"]:::adapter -- "Refresh<br/>+ Validate" --> candidate
-      validators["command<br/>validators"]:::validator -- "exit status<br/>+ output" --> candidate
+      validators["command<br/>validators"]:::validator -- "run at publish:<br/>exit status + output" --> candidate
       candidate -- "publish<br/>compare-and-swap" --> accepted["refs/rift/accepted/a1"]:::git
       accepted -- "persist" --> session[".rift/worktrees/a1"]:::git
       accepted -- "integrate<br/>three-way from B<br/>compare-and-swap" --> target["main"]:::git
@@ -303,16 +382,19 @@ materializes selected paths from an accepted commit into the session worktree.
 
 The [MCP page](/docs/protocol/mcp) has the surface; what matters here is what waits on what:
 
-- **Previews don't block each other.** Each one builds its own candidate worktree from a base commit,
-  so two in flight in one session run in parallel and neither touches the session tree.
+- **Candidates don't block each other.** Each one builds its own candidate worktree from a base
+  commit, so two in flight in one session run in parallel and neither touches the session tree. Two
+  steps of the same chain do serialize, because the second resolves on the first one's tree.
 - **`publish` takes the accepted ref by compare-and-swap.** Every session has its own accepted ref, so
   this guards one thing: an agent with two `publish` calls in flight against the same base. The loser
-  gets a conflict result and can re-preview against the new head.
+  gets a conflict result and can `refresh` against the new head. A retry that finds the ref already
+  holding the candidate returns the same accepted result, which is why publication needs no
+  idempotency key.
 - **`persist` takes the session's write lock**, because it's the only operation that writes to the
   session worktree.
 
-Apply and persist touch connection-local state. Integration introduces cross-session contention by
-advancing a shared target ref.
+Candidate creation and `persist` touch connection-local state. Integration introduces cross-session
+contention by advancing a shared target ref.
 
 ## Integration
 
@@ -332,13 +414,13 @@ call to. Validation therefore runs on the merge candidate.
 
 | result | what happened |
 | --- | --- |
-| `integration_preview` | a conflict-free merge candidate and its validation were retained; no ref moved |
-| `integration_refresh` | the retained contract was rebuilt against the current target head |
+| `prepared` | a conflict-free merge candidate and its validation were retained; no ref moved |
 | `merge_conflict` | a parseable provisional merge and the three entries for each conflict were retained |
+| `refreshed` | the retained contract was rebuilt against the current target head |
 | `integrated` | fresh validation passed and compare-and-swap advanced the target |
-| `integration_rejected` | fresh validation failed; the retained evidence names the failure |
-| `integration_refused` | repository state or policy prevented publication; a validated candidate is returned when available |
-| `integration_conflict` | the target moved or an idempotency key was reused for different input |
+| `rejected` | fresh validation failed; the retained evidence names the failure |
+| `refused` | repository state or policy prevented publication — `checked_out_target`, `dirty_target`, a missing confirmation — and a validated candidate is returned when available |
+| `conflict` | the target moved after the candidate was built |
 
 Compare-and-swap on the target is where two sessions actually contend. Both integrating into `main`
 serialize, and the loser re-merges against the head that won.
@@ -351,18 +433,19 @@ conflict. No conflict markers are written into any tree, because a tree full of 
 no adapter can parse and therefore a tree
 Rift can't validate or ask an adapter about.
 
-Resolve the conflict with an ordinary `apply` whose `rev` is that candidate and whose
-`expected_accepted` is the conflict result's `source`: concrete edits, a patch, or an adapter action.
+Resolve the conflict with any candidate tool whose `on` is that provisional merge and whose
+`expected_accepted` is the conflict result's `source` — concrete edits, a patch, or an adapter action.
 The source must be an ancestor of the provisional merge, which gives publication a valid
-compare-and-swap base. Publish the repair to the accepted ref, then preview integration again. The new
-merge is normally a fast-forward or a conflict-free merge because the repair commit descends from
-both parents.
+compare-and-swap base. Publish the repair to the accepted ref, then integrate again. The new merge is
+normally a fast-forward or a conflict-free merge because the repair commit descends from both
+parents.
 
 ### Targets
 
 Rift can update a checked-out target only when `session.integration = "auto"` and the worktree is
-clean. Otherwise publication returns `integration_refused` with the validated candidate, leaving the
-branch and worktree unchanged. A local branch that is not checked out advances by compare-and-swap.
+clean. Otherwise publication refuses with `checked_out_target` or `dirty_target` and returns the
+validated candidate, leaving the branch and worktree unchanged. A local branch that is not checked out
+advances by compare-and-swap.
 
 ## Facts
 
@@ -395,7 +478,7 @@ Candidate commits are built from the base tree plus the resolved edits, with Git
 index and no `git add` involved, so a file an `Edit` creates is in the candidate tree. Incidental
 files created by an adapter process stay outside the commit.
 
-An `Edit` on a path matched by `.gitignore` fails the `writable` precondition, and the refusal carries
+An edit on a path matched by `.gitignore` fails the `writable` precondition, and the refusal carries
 the path and the rule that matched it. The commit would otherwise carry a file that your own
 `git status` hides from you, which puts what Rift validated and what you can see out of step.
 

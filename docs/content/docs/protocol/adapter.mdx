@@ -128,31 +128,36 @@ exact `AdapterState`. Rift never issues it against a connection, candidate, or s
 first materializes a disposable execution workspace for the requested `Snapshot` and calls `Open` for
 a fresh state. The block itself stays on the wire, while imports and project configuration come from
 the workspace. `ExecuteResponse` echoes the state and returns bounded output, diagnostics, and a
-completed or failed language outcome.
+completed or failed language outcome. `ExecuteRequest.budget` is the exact host-policy bound: the
+adapter enforces its wall time and per-stream captured byte limit even when its own hard limits are
+higher.
 
 Rift closes that state and deletes the workspace after the response. Evaluated code may write inside
 the disposable tree, so the adapter must not publish analysis facts from an execution state or expect
 its acknowledged `Snapshot` to describe post-execution bytes. Nothing from that tree is committed,
-refreshed into another adapter, or retained as repository state.
+refreshed into another adapter, or retained as repository state. After evaluation begins, Rift issues
+no RPC on that adapter state except debug inspection and cleanup.
 
 Debugging reuses the same workspace and runtime preparation but has an explicit retained lifecycle:
 
 1. `DebugStart` evaluates the block until normal completion or an unhandled failure. It returns an
-   adapter-local `DebugSession` containing the pinned adapter state, opaque token, bounded execution
-   result, and retained frame count.
+   adapter-local `DebugSession` containing a minimal `DebugSessionKey`, bounded execution result, and
+   retained frame count. Its `DebugBudget` bounds execution plus retained frames and bindings.
 2. `DebugGetFrame` selects one retained failure frame by depth. It is a read: it neither resumes the
    program nor advances adapter state.
 3. `DebugStop` releases the token and every runtime resource behind it. Rift then calls `Close` and
    removes the execution workspace.
 
-All three debug operations are advertised together. Rift serializes calls for one debug token, calls
-`DebugStop` before `Close`, and treats a token returned for another adapter state as a protocol error.
-The server maps its connection-bound public ID to this private token; adapters do not authenticate MCP
-callers or mint public identities.
+All three debug operations are advertised together. Rift serializes calls for one debug key, calls
+`DebugStop` before `Close`, and treats a key returned for another adapter state as a protocol error.
+`DebugStop` is idempotent for a key while its adapter state lives, which lets Rift retry after losing a
+response. The server maps its connection-bound public ID to this private key; adapters do not
+authenticate MCP callers or mint public identities.
 
-This first interface is post-mortem inspection rather than a general debugger protocol. `DebugFrame`
-contains a source location plus bounded adapter-rendered arguments and locals. Stepping, continuing,
-breakpoints, variable mutation, and recursive value expansion are intentionally absent.
+This interface inspects state retained after a failed evaluation. `DebugFrame` contains a source
+location plus bounded adapter-rendered arguments and locals. Each value uses the same shared
+`CapturedText` shape as execution streams and command validators. The protocol has no stepping,
+continuing, breakpoints, variable mutation, or recursive value expansion.
 
 Disposable means repository writes do not escape, not that execution is isolated from the host. The
 adapter and evaluated code keep the server's filesystem, process, and network authority. Host policy
@@ -253,7 +258,7 @@ language legality, complete reference analysis where claimed, and semantic effec
 
 ## Formatting
 
-Each public change declares a `FormattingPolicy`. `preserve` leaves bytes outside the resolved edit
+Every candidate tool except `merge` declares a `FormattingPolicy`. `preserve` leaves bytes outside the resolved edit
 set untouched. For `changed_regions` or `affected_files`, Rift refreshes the candidate workspace and
 calls `Format` on every adapter that owns the selected source. The adapter returns atomic `TextEdit`
 values and coverage for the requested scope.

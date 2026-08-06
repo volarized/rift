@@ -77,12 +77,19 @@ not part of the snapshot and is never written into the repository tree.
 [`ExecutionResult`](/docs/protocol/reference#ExecutionResult) distinguishes a language outcome from a
 protocol failure. `completed` and `failed` describe what the evaluated code did; cancellation,
 deadline expiry, adapter loss, and workspace failures use the ordinary MCP error contract. Standard
-output and error use `CapturedOutput`, whose bounded prefix, full byte count, truncation flag, and
-digest preserve the identity of output too large to return.
+output and error use `CapturedText`, whose bounded prefix, full byte count, truncation flag, and digest
+preserve the identity of output too large to return. Command-validator output and rendered debug
+values reuse the same type.
+
+`ExecutionBudget` carries the exact wall-time and per-stream capture bounds that host policy selected
+for one adapter call. `DebugBudget` adds retained frame, binding, and rendered-value bounds. They are
+per-call requirements at the adapter seam, while `Limits.execution` reports the workspace ceilings to
+the MCP caller.
 
 A [`DebugFrame`](/docs/protocol/reference#DebugFrame) is a retained stack frame from one failed debug
 evaluation. Its source span points into the pinned repository snapshot where possible. Arguments and
-locals are bounded adapter-rendered strings, not a portable runtime object graph.
+locals are bounded adapter-rendered `CapturedText` values. The interface does not define a portable
+runtime object graph.
 
 ## Filesystem
 
@@ -124,7 +131,7 @@ separate Rift workspace to read or edit its files.
 
 The parent repository can create a gitlink with `create_gitlink` or change its child commit with
 `set_gitlink`. Adding or moving a submodule also changes the parent repository's `.gitmodules` file, so
-the caller places that text edit in the same atomic `DirectChange`. These edits change Git tree entries;
+the caller places that text edit in the same atomic `edit` call. These edits change Git tree entries;
 they do not fetch, check out, or mutate the child repository.
 
 Paths remain raw UTF-8 at filesystem and adapter seams. In a `rift://` URI, unreserved characters and
@@ -195,8 +202,9 @@ writing them to the connection worktree. The [adapter contract](/docs/protocol/a
 defines that ownership boundary.
 
 An edit set is atomic. Every text range addresses the input state, and ranges in one set cannot
-overlap. Rift orders the set by file and range before it crosses a seam. A sequence of `Change`
-values provides ordered composition when a later change must observe an earlier one.
+overlap, and Rift orders the set by file and range before it crosses a seam. Where a later operation
+has to observe an earlier one, the caller chains candidates instead: each tool call takes the
+candidate it continues, so the second operation resolves against the first one's tree.
 
 Gitlink creation and update use `create_gitlink` and `set_gitlink`. Delete and rename also apply to a
 gitlink entry. Copy and executable-bit changes apply to regular files. The pinned snapshot supplies the
@@ -491,11 +499,12 @@ claims general behavioral equivalence.
 
 ### Portable action arguments
 
-Four common refactors have shared argument contracts. `RenameArguments` combines the new name with an
-`OperationScope`. `MoveArguments` selects a semantic container or project path. `SafeDeleteArguments`
-defines the disposition of reads, writes, imports, overrides, generated references, classified string
-references, and other resolved uses. Safe delete requires complete reference coverage and refuses an
-unresolved use.
+Common refactors have shared argument contracts, and each contract is the argument type of the tool
+that carries its name. `RenameArguments` combines the new name with an `OperationScope`, while
+`MoveArguments` selects a semantic container or project path. `SafeDeleteArguments` defines the
+disposition of resolved uses. Its optional `policy` controls reference analysis: omitting it removes
+the declaration directly, while supplying it requires complete coverage and refuses an unresolved
+use.
 
 `ChangeSignatureArguments` carries a `SignatureChange`. Existing parameters retain identity through
 their source nodes, so reordering preserves the same parameter identities. The desired shape includes
@@ -522,22 +531,27 @@ ran. `GuaranteeEvidence` then states the scope, verifier, method, and diagnostic
 guarantee. These records let a preview show why an action is admissible without replacing the concrete
 `Edit` values that determine the candidate tree.
 
-Commit reversion stays on the MCP seam because it is a request envelope over versioning and edits. A
-`RevertChange` selects an exact commit, its parent, and eligible paths. Rift computes a three-way
+Commit reversion stays on the MCP seam because it is a request envelope over versioning and edits. The
+`revert` tool selects an exact commit, its parent, and eligible paths. Rift computes a three-way
 inverse and returns the same preconditions, effects, edits, and validation evidence as every other
-change.
+operation.
 
-### Action and match keys
+### Action and match identities
 
-An action or match points into one snapshot. After the source moves, its byte offsets can be stale.
-Each result therefore carries a key bound to the snapshot, which Rift checks before applying it.
+An action or match points into one snapshot, and after the source moves its byte offsets can be stale.
+Both are therefore identified by a URI that carries the snapshot they were computed against, which
+Rift checks before applying anything addressed at one.
 
-A [`MatchKey`](/docs/protocol/reference#MatchKey) contains the snapshot and matched span. It also
-contains the complete `MatchQuery`. One query produces at most one match for a given span, so these
-fields identify the match and provide enough information to run it again.
+A [`MatchId`](/docs/protocol/reference#MatchId) is `rift://match/` followed by base64url of the
+snapshot, the matched span, and the complete `MatchQuery`, in RFC 8785 canonical JSON. One query
+produces at most one match for a given span, so those three fields identify the match, and because
+they travel in the identity Rift stores nothing: the same URI still resolves after a restart, and
+reading it returns the query that found it.
 
-An [`ActionKey`](/docs/protocol/reference#ActionKey) contains the snapshot, language, and an opaque Rift
-token. The language selects the adapter. The token binds its handle and adapter generation.
+An [`ActionOfferId`](/docs/protocol/reference#ActionOfferId) is `rift://action/` followed by base64url
+of the snapshot, the language whose adapter minted the offer, and an opaque adapter token. The
+language selects the adapter, and the token binds its handle and adapter generation. Reading the URI
+returns the offer with the JSON Schema of the arguments it takes.
 
-The `ActionDescriptor` carries the target once. Keeping it out of the key prevents two target fields
-from disagreeing.
+The `ActionDescriptor` carries the target once. Keeping it out of the identity prevents two target
+fields from disagreeing.

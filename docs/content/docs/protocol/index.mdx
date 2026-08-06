@@ -30,10 +30,19 @@ Every JSON definition carries its Protobuf identity in `rift:proto` metadata, so
 the mapping out of the schema it already loaded. There's no operation table anywhere else to keep in
 step with it.
 
-The tools defined this way are `tree`, `outline`, `search`, `match`, `actions`, `execute`,
-`debug_start`, `debug_get_frame`, `debug_stop`, `apply`, `integrate`, and `persist`; the resources
-are repository, symbol, diff, file, and preview. The
-[MCP page](/docs/protocol/mcp) says what each one does.
+The generated metadata assigns each tool to the phase where a caller uses it. The
+[MCP page](/docs/protocol/mcp) renders those groups from the same metadata as the tool manifest, while
+the repository resource reports which members the current workspace serves.
+
+Tool parameters carry retained identities where the complete record lives behind a resource. A
+candidate chain continues and publishes through its `PreviewId`, while `act` resolves an
+`ActionOfferId`; portable refactors locate their target with an `Address`.
+
+The manifest therefore omits retained plan records. Action discovery also keeps descriptors and
+per-offer argument schemas behind resources until the caller chooses one. Splitting candidate
+creation moves the operation choice into the tool name, which narrows each input schema. A client
+that loads every advertised tool receives more definitions overall because the split adds tool
+entries.
 
 ## The SCIP seam
 
@@ -60,8 +69,9 @@ Execution uses the same revision-resolution seam with a different lifetime. Rift
 disposable execution workspace for the exact `Snapshot`, opens a fresh `AdapterState`, and sends the
 caller-provided `CodeBlock` over gRPC. `Execute` removes that state after one result. `DebugStart`
 retains it behind a connection-bound public handle until `DebugStop`; `DebugGetFrame` reads one
-adapter-retained stack frame. Repository writes made by evaluated code are discarded with the
-workspace.
+adapter-retained stack frame. Host policy supplies an `ExecutionBudget` or `DebugBudget` on the
+starting adapter call, and the server maps the public handle to a private `DebugSessionKey`.
+Repository writes made by evaluated code are discarded with the workspace.
 
 ## Definitions
 

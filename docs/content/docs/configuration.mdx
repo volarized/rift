@@ -10,8 +10,9 @@ server learns which adapters exist, and where you bound what an agent may do wit
 
 <ConfigFile />
 
-This repository's file spells out the defaults. `validators.allow`, `validators.carry`, and the
-adapter table default to empty and appear only when the repository needs them.
+This repository's file spells out the defaults. `execution.allow`, `execution.debug`,
+`validators.allow`, `validators.carry`, and the adapter table default to empty and appear only when
+the repository needs them.
 
 `.rift/config.toml` uses the same schema and overrides it for the paths and toolchains that are yours
 rather than the project's; `.rift/` is excluded from Git. Connection-scoped process controls such as
@@ -56,6 +57,53 @@ is a cache, so the price of a small cap is paying for the same analysis more tha
 claims a profile after that profile's conformance suite passes on this host, so what an agent sees is
 the lower of the two. Setting `max = "read"` on a repository nobody should be editing is enough to
 make every write tool absent from the schema an agent reads.
+
+## execution
+
+Caller-provided code is disabled by default. Authorization names exact languages, so enabling Python
+does not silently enable every adapter that can run code:
+
+```toml
+[execution]
+allow = ["python", "typescript"]
+debug = ["python"]
+max-code = "16KiB"
+max-timeout = "30s"
+max-output = "8KiB"
+max-concurrent = 2
+max-debug-sessions = 2
+debug-idle-timeout = "5m"
+max-debug-frames = 64
+max-debug-bindings = 32
+max-debug-value = "1KiB"
+```
+
+`allow` intersects with adapters advertising `execute`. `debug` must be a subset of `allow` and
+intersects with adapters advertising all of `debug_start`, `debug_get_frame`, and `debug_stop`.
+Empty lists disable the corresponding surface. The repository resource reports the effective result
+per language in `LanguageSupport.execution`; tools are advertised only after the matching runtime
+conformance fixtures pass on this host.
+
+`max-code` counts UTF-8 source bytes. `max-timeout` and `max-output` become the exact
+`ExecutionBudget` sent to the adapter, with output applied separately to stdout and stderr.
+`max-concurrent` bounds evaluations running across the workspace before an execution worktree is
+allocated.
+
+The remaining fields form `DebugBudget` and retained-session policy. `max-debug-sessions` bounds
+workspace-wide retained sessions and therefore also their worktrees and adapter states.
+`debug-idle-timeout` stops an unused session. Frame and binding bounds keep each `debug_get_frame`
+response inside the MCP response ceiling; oversized rendered values return a bounded prefix, total
+byte count, and digest through `CapturedText`.
+
+These limits can only reduce the adapter's own hard message, concurrency, and state limits. Admission
+uses the smallest applicable bound. A request refused at admission creates no worktree or adapter
+state.
+
+<Callout type="warning" title="An execution workspace provides no host isolation">
+  Writes inside the disposable tree are discarded, but evaluated code keeps the filesystem, process,
+  and network authority of `rift server`. Authorize only languages whose adapters and project runtime
+  you trust with that access.
+</Callout>
 
 ## validation
 
@@ -105,8 +153,8 @@ the effective bound, an `Open` call waits.
 
 ## validators
 
-Under the `full` profile a caller declares a `CommandValidator` with an argv, a timeout, and the
-guarantees a pass is meant to establish. The `[validators]` table bounds command execution:
+Under the `full` profile a caller declares a `CommandValidator` on `publish`, with an argv, a timeout,
+and the guarantees a pass is meant to establish. The `[validators]` table bounds command execution:
 
 ```toml
 [validators]
@@ -138,9 +186,9 @@ bounded output are retained with the candidate, so an accepted result can be rea
 publication.
 
 <Callout>
-  Validators run on every preview and again on publish. A suite that takes four minutes makes every
-  edit take four minutes, which is why the example allows `cargo test` and leaves `--no-run` to the
-  caller.
+  Validators run at publication, once per published candidate, so building a change costs nothing
+  extra however many steps it takes. A four-minute suite still charges four minutes to the publish
+  that runs it, which is why the example allows `cargo test` and leaves `--no-run` to the caller.
 </Callout>
 
 ## Generated schema reference
