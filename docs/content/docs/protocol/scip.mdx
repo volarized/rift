@@ -12,19 +12,26 @@ The Rift server exposes a read-only SCIP projection over gRPC. A client calls
 
 MCP tools use Rift's native model. They don't advertise or transport the SCIP projection.
 
-Rift protocol version 1 pins
+Rift pins
 [`scip.proto` from SCIP v0.9.0](https://github.com/scip-code/scip/blob/v0.9.0/scip.proto).
 The official schema fixes field and enum numbers, aliases, reservations, and oneof membership. Rift's
 Pydantic model preserves those identities in the generated `scip` package.
 
 ## API
 
-`Projection.Read` accepts `rift.scip.Request`. Its `at` field identifies the exact Rift snapshot.
+The client first opens `rift.mcp.Rift.Connect` with role `scip`. It keeps that control stream open and
+places the returned connection ID in `rift-connection-id` metadata on `Projection.Read`. The
+`rift.scip.Request.at` field identifies the exact Rift snapshot. Contract negotiation therefore
+finishes before the projection reads repository state.
 
-The first `rift.scip.Event` carries a `Header`. The header contains the resolved snapshot, index
-metadata, semantic coverage, and every populated Rift field omitted by the mapping. The remaining
-events carry `scip.Document` values in path order, followed by external `scip.SymbolInformation`
-values in symbol order.
+The projection reads the server's process-local semantic store. When that snapshot has not been
+analyzed since server startup, Rift starts the required adapters and fills the store before it emits
+the stream.
+
+The first `rift.scip.Event` carries a `Header` containing the resolved snapshot, index metadata,
+semantic coverage, and every populated Rift field omitted by the mapping. The remaining events carry
+`scip.Document` values in path order, followed by external `scip.SymbolInformation` values in symbol
+order.
 
 The stream keeps each gRPC message bounded while preserving the repeated-field order of `scip.Index`.
 The client places the header metadata in `Index.metadata`, appends each document to `Index.documents`,

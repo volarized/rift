@@ -5,18 +5,61 @@ title: Configuration
 import { Callout } from "fumadocs-ui/components/callout";
 import { ConfigFile, ConfigReference } from "@/components/config-reference";
 
-`rift.toml` sits in the workspace root, next to `.git`, and is meant to be committed. It's where the
-server learns which adapters exist, and where you bound what an agent may do with them:
+`rift.toml` sits in the workspace root and is meant to be committed. It tells Rift which adapters and
+checks the project expects. Because a checkout can replace this file, every entry in it is a request;
+it cannot grant access to a host executable, secret, path, process, or network service.
 
 <ConfigFile />
 
-This repository's file spells out the defaults. `execution.allow`, `execution.debug`,
-`validators.allow`, `validators.carry`, and the adapter table default to empty and appear only when
-the repository needs them.
+User-owned policy decides whether those requests may run:
 
-`.rift/config.toml` uses the same schema and overrides it for the paths and toolchains that are yours
-rather than the project's; `.rift/` is excluded from Git. Connection-scoped process controls such as
-`RIFT_ACCEPTED` are separate from both configuration files.
+```text
+$XDG_CONFIG_HOME/rift/policy.toml
+    machine-wide executable grants and hard ceilings
+
+$XDG_CONFIG_HOME/rift/workspaces/9e0d2f1ca4b7c93915a30fef31d00821/<workspace-id>.toml
+    grants for one physical-path and workspace-ID pair
+```
+
+macOS uses `$HOME/Library/Application Support/Rift/Config`; Windows uses
+`%LOCALAPPDATA%\Rift\Config`. The path digest selects the policy directory; the ID component prevents
+a repository created later at the same path from inheriting the earlier workspace's grants. Moving a
+workspace changes this path and requires a new grant for its new location, even though `.rift`
+carries its sessions and previews through the move.
+No writable policy file lives inside the repository.
+
+Repository configuration comes from the exact snapshot a request resolves. A read of an older commit
+therefore uses the `rift.toml` stored in that commit. Candidate resolution uses its base snapshot;
+after Rift applies the edits, formatting and adapter validation use the candidate snapshot and store
+that snapshot's repository declarations with the preview. Those declarations remain requests subject
+to user-owned policy.
+
+Machine and workspace policy remain live authority. A filesystem watcher invalidates the cached
+generation, and each privileged admission also stats both files. When either changed, the server
+reopens it without following symlinks, verifies its identity and metadata before and after reading,
+then hashes the parsed result into a new generation. Each request retains one generation through
+completion, so a reload cannot change a running operation. A malformed or unreadable policy fails
+closed for new privileged requests; Rift does not continue using the last permissive generation.
+
+A preview stores its repository requests and `PublicationPlan`. At publication, Rift intersects those
+fixed requests with the current user policy. Revoking a grant blocks publication, while adding a grant
+cannot add a validator or widen the preview. A command already admitted continues under its original
+limits, and the next request sees the new generation.
+
+### Combining the files
+
+For each request, Rift intersects the repository declaration with both user-owned policy layers:
+
+| value | effective result |
+| --- | --- |
+| executable or language allowlist | present in the repository request, machine grant, and workspace grant |
+| numeric or duration limit | smallest value from every layer and the adapter's hard limit |
+| feature switch | enabled by every layer |
+| environment variable | literal repository value allowed by user policy, or a user-supplied value named by policy |
+
+The server rejects a repository request that has no matching grant and reports the missing policy
+entry without starting a process. User policy may grant less than the repository requests; no merge
+operation can broaden a grant.
 
 A workspace with no `rift.toml` gets the defaults and no adapters, which means `tree`, `match` and the
 file and diff resources work and nothing semantic does. The repository resource reports no languages,
@@ -24,44 +67,107 @@ so an agent can tell the difference between a language Rift can't analyze and on
 
 ## server
 
-`idle-timeout` is how long the server stays up with no session open. It holds adapter processes, so
-leaving it running forever costs you gigabytes of resident memory for a repository you closed at
-lunchtime.
+`idle-timeout` is how long the server stays up with no attached client connection. Durable sessions and
+previews remain in the registry and local worktrees; the timeout only bounds live adapter and
+in-memory semantic state after the last client disconnects.
+
+## state
+
+The durable workspace registry is `<workspace>/.rift/db/registry`. It records the workspace ID and
+current canonical path. Session-creation retry keys live beside the durable session and preview
+records. The registry also retains validation and publication recovery, plus its bounded request log.
+`.rift/run/server.sock` is the stable Unix endpoint, while `.rift/run/start.lock` serializes server
+startup. Semantic facts remain in server memory.
+
+The root `.rift` path is reserved for Rift worktrees and adapter-private state. Rift refuses a
+workspace when Git tracks that path or when it resolves through a symlink. `rift state reset` reports
+affected sessions and previews, requires confirmation, unregisters their Git worktrees, removes their
+Rift session refs, replaces the registry, and creates a new workspace ID.
+
+The server holds an exclusive OS lock on `<workspace>/.rift/lease` while the registry or any worktree
+is open. The locked file records the live server's protocol major and process generation. State
+commands call the live server; an offline reset waits for shutdown and acquires the same lease. Rift
+refuses state on a filesystem that cannot provide the locking, atomic rename, durable flush, and local
+socket operations required by its recovery protocol.
+
+After a directory move, startup repairs the registered Git worktree paths and updates the canonical
+path in the registry. A copied `.rift` is refused while its recorded source path still holds the same
+workspace ID; `rift state reset` gives the copy its own identity.
 
 ## session
 
-`base` decides what a new connection starts from. `head` uses the workspace's last commit. `worktree`
-records your uncommitted changes as the accepted ref's initial commit, so an agent starts from what
-you have open instead of from what you last committed.
+`base` decides what a new session starts from. `head` uses the workspace's last commit. `worktree`
+records the workspace's uncommitted changes as the accepted ref's initial commit, so the agent starts
+from the visible working state.
 
-`integration` is whether [`integrate`](/docs/architecture#targets) may move a branch that a working
-tree has checked out. Under `manual` it merges, validates, and reports the commit without moving
-anything. Under `auto` it advances the branch and updates the tree, which requires that tree to be
-clean.
+`integration` is `manual`. Rift advances an unchecked branch with a Git ref transaction and returns a
+prepared commit when any worktree has the target checked out. Updating a checked-out branch would
+also require non-atomic index and file writes, so `auto` is not an admitted runtime value.
 
 ## reads
 
 A semantic read at a revision nothing has checked out needs a
 [read worktree](/docs/architecture#reading-an-older-revision). `max-worktrees` caps how many exist at
 once and `worktree-idle-timeout` is how long an unreferenced one survives. Each is a full checkout of
-your source, which is why the default is 2 rather than something generous.
+the source, so the default cap is 2.
 
 ## facts
 
-`max-size` bounds `.rift/facts`. At the cap the server evicts least-recently-used snapshots. The store
-is a cache, so the price of a small cap is paying for the same analysis more than once.
+`max-size` bounds the process-local semantic store. At the cap the server evicts least-recently-used
+generations with no active reader or ready-preview pin. Server exit drops every generation, and the
+next semantic read starts the required adapters to rebuild it.
 
 ## profile
 
-`max` caps what the repository resource may advertise: `read`, `edit`, or `full`. A workspace only
-claims a profile after that profile's conformance suite passes on this host, so what an agent sees is
-the lower of the two. Setting `max = "read"` on a repository nobody should be editing is enough to
-make every write tool absent from the schema an agent reads.
+`max` caps implementation conformance:
+
+| profile | fixtures added |
+| --- | --- |
+| `file` | Git tree, diff, file, text match, concrete edit, patch, publication, and persistence |
+| `read` | adapter facts, coverage, structural matching, actions, and retained reads |
+| `edit` | adapter-resolved changes, formatting, validation, refresh, and integration |
+| `full` | two different language adapters plus an embedded-language producer and consumer |
+
+The repository resource reports the highest rung the current host passes. Its `tools`, `resources`,
+per-language operations, validation strength, and execution availability remain separate fields. A
+`file` workspace with no adapters can therefore report its mechanical surface honestly, while a
+`full` build still exposes no execution tool without a user policy grant.
+
+## limits
+
+Machine policy supplies the hard request and storage ceilings that `Limits` publishes:
+
+```toml
+[limits]
+max-request = "48KiB"
+max-response = "64KiB"
+max-record = "48KiB"
+max-file-chunk = "32KiB"
+max-page-items = 1000
+max-relation-depth = 8
+max-query-nodes = 256
+max-query-depth = 16
+max-edits = 10000
+max-rewrite-expansions = 5000
+record-retention = "30d"
+session-retention = "30d"
+orphan-worktree-grace = "24h"
+queue-per-session = 16
+snapshot-retries = 3
+```
+
+`rift.toml` and workspace policy may lower these values. Admission checks the request byte count and
+queue capacity before resolving a revision or allocating a worktree. Response pagination stops below
+the effective serialized-byte ceiling. `record-retention` applies to terminal preview records and
+their worktrees; ready previews remain until publication or `rift preview remove`.
+`session-retention` applies only to untouched sessions and integrated sessions that satisfy the safe
+collection rules. `orphan-worktree-grace` delays deletion of directories absent from the authoritative
+registry.
 
 ## execution
 
-Caller-provided code is disabled by default. Authorization names exact languages, so enabling Python
-does not silently enable every adapter that can run code:
+Caller-provided code is disabled until both user policy files grant an exact language and `rift.toml`
+requests it. The committed request looks like this:
 
 ```toml
 [execution]
@@ -78,11 +184,39 @@ max-debug-bindings = 32
 max-debug-value = "1KiB"
 ```
 
-`allow` intersects with adapters advertising `execute`. `debug` must be a subset of `allow` and
-intersects with adapters advertising all of `debug_start`, `debug_get_frame`, and `debug_stop`.
-Empty lists disable the corresponding surface. The repository resource reports the effective result
-per language in `LanguageSupport.execution`; tools are advertised only after the matching runtime
-conformance fixtures pass on this host.
+Machine policy grants the adapter executable and language separately:
+
+```toml
+[[executables]]
+name = "rift-adapter-python"
+path = "/opt/rift/bin/rift-adapter-python"
+sha256 = "8f10..."
+
+[execution]
+allow = ["python"]
+debug = ["python"]
+```
+
+The workspace policy names which of those machine grants this repository may use and pins the
+expected binary digest:
+
+```toml
+[[executables]]
+name = "rift-adapter-python"
+sha256 = "8f10..."
+
+[execution]
+allow = ["python"]
+debug = ["python"]
+```
+
+At admission Rift opens the executable without following symlinks, checks its file identity and
+digest, and executes that same file descriptor or platform handle. Replacing the path between the
+check and spawn therefore fails instead of running different bytes.
+
+The effective `allow` set intersects the two policy grants, the repository request, adapter
+capability, and host conformance. `debug` also requires the complete `debug_start`,
+`debug_get_frame`, and `debug_stop` operation set.
 
 `max-code` counts UTF-8 source bytes. `max-timeout` and `max-output` become the exact
 `ExecutionBudget` sent to the adapter, with output applied separately to stdout and stderr.
@@ -95,9 +229,8 @@ workspace-wide retained sessions and therefore also their worktrees and adapter 
 response inside the MCP response ceiling; oversized rendered values return a bounded prefix, total
 byte count, and digest through `CapturedText`.
 
-These limits can only reduce the adapter's own hard message, concurrency, and state limits. Admission
-uses the smallest applicable bound. A request refused at admission creates no worktree or adapter
-state.
+These limits can only reduce the adapter's own hard message, concurrency, and state limits. A request
+refused at admission creates no worktree or adapter state.
 
 <Callout type="warning" title="An execution workspace provides no host isolation">
   Writes inside the disposable tree are discarded, but evaluated code keeps the filesystem, process,
@@ -107,10 +240,10 @@ state.
 
 ## validation
 
-`require = "available"` requires complete, valid reports from affected adapters that advertise
-`validate`. An adapter is affected when the candidate changes one of its source claims, one of its
-auxiliary claims, or a virtual unit routed to it. An adapter that only parses or formats the path adds
-no validation gate. Unsupported adapter RPCs return gRPC `UNIMPLEMENTED`.
+`require = "available"` runs every affected adapter that advertises `validate`. An adapter is affected
+when the candidate changes one of its source claims, auxiliary claims, or routed virtual units. When
+none of them can validate, publication may still pass its mechanical checks and reports validation
+strength `mechanical`; the result never describes that empty report set as complete validation.
 
 Repositories that need fixed gates can name exact languages:
 
@@ -123,9 +256,19 @@ The `name:dialect` spelling is the same one used at the start of node and symbol
 language is affected, a missing adapter, an unadvertised `validate` operation, or incomplete coverage
 refuses publication.
 
+The repository resource and every candidate summary report one of these strengths:
+
+| strength | evidence required |
+| --- | --- |
+| `mechanical` | schema, path, edit, snapshot, and compare-and-swap preconditions |
+| `available` | complete valid reports from every affected adapter that advertises `validate` |
+| `required` | complete valid reports from every exact language listed by policy |
+
+An empty adapter-report set can satisfy `mechanical`. It cannot satisfy `available` or `required`.
+
 ## adapters
 
-Each `[adapters.<process>]` table says how to start one adapter process:
+Each `[adapters.<process>]` table requests one adapter process:
 
 ```toml
 [adapters.rust]
@@ -135,10 +278,18 @@ state-cap = 4
 startup-timeout = "60s"
 ```
 
-The server passes a socket path on the command line, starts the process, and calls `Describe`. That
-call returns the exact `Language`, implemented operations, emitted fact families, and path claims.
-The config key only identifies the process definition. Its `command` and `env` configure the stable
-adapter process, not the project runtime for every revision it may open.
+The first command word is a logical executable name. Machine policy maps it to the absolute path and
+digest; workspace policy allows that name for this repository and may require the same digest.
+Repository arguments remain literal. Rift starts the process with a private home and temp directory,
+a policy-supplied `PATH`, and no inherited environment.
+`HOME`, `PATH`, the `RIFT_` prefix, dynamic-loader variables, credential variables, and
+temporary-directory variables are reserved; repository and caller environment maps cannot set them.
+
+The server passes a socket path on the command line, supplies `RIFT_PROTOCOL_MAJOR`, and calls
+`Describe`. That call returns the exact `Language`, implemented operations, emitted fact families,
+path claims, supported minor-and-schema-digest tuples, and adapter artifact digest. The config key
+identifies the request. Its `command` and permitted `env` values configure that adapter process
+generation, while the adapter selects project runtimes after `Open`.
 
 An adapter selects project runtimes after `Open`, when Rift has supplied the complete tree for an
 exact snapshot, and re-evaluates that selection on `Refresh` when runtime-defining inputs change. For
@@ -147,14 +298,24 @@ state and a Python 3.12 state with separate workers. Those workers are internal 
 continues to own the worktrees and starts only the configured adapter process.
 
 `Describe` returns the adapter's hard `limits.max_states`. Optional `state-cap` sets a lower
-repository-side cap; the server uses the smaller value. One process can hold states for connection,
+repository-side cap; the server uses the smaller value. One process can hold states for session,
 candidate, and detached read worktrees. Each may retain a parsed tree, index, and runtime worker. Past
 the effective bound, an `Open` call waits.
 
+The configured process belongs to one repository-configuration and user-policy generation. When a
+request resolves a snapshot with a different adapter declaration, Rift drains calls using the old
+generation, stops that process, and starts the newly admitted one. At most one process for an exact
+`Language` runs at a time; requests needing another generation wait in the workspace scheduler. If a
+candidate edits its own adapter declaration, Rift closes the resolution state after committing the
+candidate, then admits formatting and validation against the candidate's generation.
+
 ## validators
 
-Under the `full` profile a caller declares a `CommandValidator` on `publish`, with an argv, a timeout,
-and the guarantees a pass is meant to establish. The `[validators]` table bounds command execution:
+A candidate request may declare a `CommandValidator` for its future publication when user policy
+grants the executable and the repository requests its argv prefix. The ready preview stores the exact
+declarations; `publish` cannot add or replace them. Validator authority is independent of the
+conformance profile.
+The committed request looks like this:
 
 ```toml
 [validators]
@@ -163,21 +324,24 @@ carry = [".env.test"]
 max-timeout = "5m"
 ```
 
-`allow` lists permitted argv prefixes. `["cargo", "test"]` admits
-`cargo test --no-run --test-threads=1` and refuses `cargo publish`. The file says which programs may
-run and the caller says how to run them, which leaves the choice of binary with whoever has commit
-access rather than with the agent.
+`allow` lists requested argv prefixes. `["cargo", "test"]` admits
+`cargo test --no-run --test-threads=1` and excludes `cargo publish`. User policy maps `cargo` to an
+absolute executable and may narrow the allowed arguments further. Arguments containing absolute
+paths or a `..` component are refused unless the workspace grant names that exact path.
 
 `max-timeout` caps what a validator may ask for. A declaration exceeding it is refused before
-anything executes.
+anything executes. At publication Rift reopens the executable without following symlinks and checks
+its file identity and digest against the current user policy. Replacement or mismatch refuses the
+validator; changing the preview's declaration requires `refresh`.
 
-`carry` lists ignored paths to copy into the validation workspace. The workspace starts as a copy of
-the candidate tree, which holds tracked files only, so a suite that reads `.env.test` otherwise fails
-there for a reason that has nothing to do with the change under test.
+`carry` requests ignored paths to copy into the validation workspace. Workspace policy must grant the
+same paths. Rift opens each component without following symlinks and refuses a path that escapes the
+workspace, enters a gitlink, or changes type during copying. Carried files remain under the
+repository-local `.rift` directory.
 
 <Callout type="warning" title="A validation workspace provides no process isolation">
   Writes made inside the workspace disappear with it, but the command can still access the host
-  filesystem and network. Only allow commands that repository policy trusts to run with Rift's host
+  filesystem and network. Grant only commands whose repository behavior you trust with Rift's host
   access.
 </Callout>
 
@@ -185,16 +349,31 @@ A pass turns each declared guarantee into `GuaranteeEvidence` on the preview. Th
 bounded output are retained with the candidate, so an accepted result can be read back after
 publication.
 
-<Callout>
-  Validators run at publication, once per published candidate, so building a change costs nothing
-  extra however many steps it takes. A four-minute suite still charges four minutes to the publish
-  that runs it, which is why the example allows `cargo test` and leaves `--no-run` to the caller.
-</Callout>
+Validators normally run once at publication regardless of the number of candidate steps. A crash
+after execution but before its registry result commits can run one again, so user policy may admit
+only repeat-safe validator commands. The example allows `cargo test` but leaves `--no-run` in the
+declaration, so the preview fixes whether the permitted invocation compiles or runs the suite.
+
+## logging
+
+User policy bounds structured logs:
+
+```toml
+[logging]
+max-size = "64MiB"
+max-age = "14d"
+level = "info"
+```
+
+Logs are bounded records in the workspace registry. They include request ids, methods, phases,
+durations, byte counts, adapter generations, and result codes. Rift redacts source, code blocks,
+environment values, and debug values.
 
 ## Generated schema reference
 
-The tables below come from [`protocol/rift.schema.json`](https://github.com/volarized/rift/blob/main/protocol/rift.schema.json),
-which is generated from the Pydantic config models. The protocol seam labels are checked against the
-same typed fields that generate `mcp.json` and the adapter Protobuf contract.
+The tables below describe the committed repository request. Machine and workspace policy use separate
+user-owned schemas because they contain host paths and grants that must never become repository
+content. The request schema comes from
+[`protocol/rift.schema.json`](https://github.com/volarized/rift/blob/main/protocol/rift.schema.json).
 
 <ConfigReference />

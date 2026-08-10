@@ -10,12 +10,14 @@ requests and retained records.
 
 | Profile | Additional surface |
 | --- | --- |
-| `read` | `tree`, `outline`, `search`, `match`, and the repository, symbol, diff, file, actions, and action resources |
-| `edit` | candidate tools, `refresh`, `publish`, the preview resource, adapter formatting, and adapter validation |
-| `full` | command validators and `persist` |
+| `file` | Git tree, diff, file and text-match reads; concrete edit, patch, publish, and persist |
+| `read` | adapter outline, search, structural match, symbol, actions, and retained facts |
+| `edit` | adapter-resolved candidate tools, formatting, validation, refresh, and integration |
+| `full` | the edit fixtures with two language adapters and one embedded-language route |
 
-Profiles accumulate. The schemas describe the complete surface; the repository resource reports the
-profile and per-language capabilities available in this workspace.
+Profiles accumulate and record runtime conformance. The repository resource separately reports the
+actual tools, resources, per-language operations, and validation strength. Command validators,
+execution, and debugging depend on user-owned host grants and do not follow the profile ladder.
 
 Host policy governs execution and debugging. `execute` is listed only when that policy authorizes at
 least one language, its adapter advertises `execute`, and the execution fixtures pass on this host.
@@ -27,6 +29,10 @@ conformance suite does not authorize either capability.
 The [`ConformanceProfile`](/docs/protocol/reference#ConformanceProfile) definition specifies the
 executable gate behind each claim. The repository reports a profile only after that suite passes on the
 current host.
+
+`tools/list` contains only the effective entries. A changed policy grant, adapter generation, or
+conformance result emits `notifications/tools/list_changed`; the next list reflects the new surface.
+This keeps execution and adapter-resolved schemas out of clients that cannot call them.
 
 ## Discovery
 
@@ -40,6 +46,39 @@ starting an adapter.
 callers, callees, dependencies, implementations, overrides, and type hierarchy walks. `match` returns
 source ranges for a `MatchQuery`. Each semantic answer carries coverage and the `Snapshot` it used.
 
+Recursive search predicates use the `rql/1` string grammar reported by `matching.search`. A query
+crosses MCP as one bounded string:
+
+```text
+rql/1: facets contains "callable" and
+       relation("outgoing", "returns",
+                type.resolved == "rift://symbol/rust/crate::Config", 1, "exists")
+```
+
+The grammar is:
+
+```text
+query       = or-expr ;
+or-expr     = and-expr, { "or", and-expr } ;
+and-expr    = unary, { "and", unary } ;
+unary       = [ "not" ], ( comparison | relation | element | "(", query, ")" ) ;
+comparison  = field, operator, json-value ;
+relation    = "relation(", direction, ",", facet, ",", query,
+              [ ",", depth, [ ",", quantifier ] ], ")" ;
+element     = "element(", field, ",", query, ")" ;
+operator    = "==" | "!=" | "<" | "<=" | ">" | ">=" | "contains" | "in"
+            | "matches" | "starts_with" | "ends_with" ;
+direction   = '"incoming"' | '"outgoing"' ;
+quantifier  = '"exists"' | '"not_exists"' ;
+```
+
+`field` is a dot-separated identifier, `facet` and every other quoted token use JSON string syntax,
+`json-value` is one canonical JSON value, and `depth` is an integer from 1 through the effective
+relation-depth limit. Whitespace is insignificant outside strings. The parser consumes the complete
+input after the `rql/1:` prefix and rejects unknown fields, invalid operator/type pairs, excessive
+nesting, and excess predicate nodes. It then builds the typed `Filter` model, which keeps the recursive
+model out of every tool's self-contained input schema.
+
 Records that another call can address carry an identity for that purpose. A symbol uses a
 `rift://symbol/…` URI, while a retained match uses `rift://match/…`. The match URI's last segment is
 base64url of the snapshot, the span, and the query that found it. Rift decodes that segment without a
@@ -50,9 +89,20 @@ in that link.
 Answers are bounded. `max_response_bytes` fixes the serialized page ceiling at 64 KiB,
 `max_record_bytes` holds back enough of it for the page's own identity and cursor, and
 `max_file_chunk_bytes` caps source bytes before encoding; an item that can't fit `max_record_bytes` is
-refused rather than truncated. Anything larger comes back with a `Cursor` bound to both the request
-and the snapshot it read, and Rift refuses that cursor once the source has moved — otherwise paging
-would stitch two different states into one answer.
+refused rather than truncated. Anything larger comes back with an opaque `Cursor` bound to an
+immutable result generation.
+
+The cursor contains a version, canonical request digest, snapshot cache key, result generation,
+ordering mode, final sort key, and checksum. Every following page reads the same facts and coverage,
+even when analysis publishes a newer generation between calls. Repeating the request without a
+cursor polls that newer state. The cursor is stateless. Semantic generations live in server memory,
+so eviction or server exit returns `cursor_expired`. A mechanical cursor names a Git object and
+survives restart while Git retains that object. A malformed cursor or one copied to a different
+request returns `cursor_invalid`.
+
+`max_query_nodes` and `max_query_depth` bound the parsed RQL tree before relation planning. The request
+byte limit applies before parsing, so a rejected query consumes neither an adapter slot nor a read
+worktree.
 
 The read conformance suite measures cold and warm latency against fixed repositories, and records
 serialized bytes alongside answer tokens. Warm there means a semantic read served from retained facts
@@ -78,14 +128,13 @@ rift://actions/file/src/api.rs?only=quickfix
 ```
 
 A point address asks about one symbol, node, byte range, or match. A file address asks for every
-offer in that file, which is the read you want when an agent is working through the diagnostics of a
-file it just wrote; Rift fans out over the nodes those diagnostics land on. `?only=` keeps one kind
+offer in that file, which supports an agent working through file diagnostics; Rift fans out over the
+nodes those diagnostics land on. `?only=` keeps one kind
 prefix, `?rev=` selects the revision, and the page continues through `?cursor=`.
 
 Each entry carries what the action would do and its own URI, and leaves `arguments_schema` out. An
-adapter can offer a dozen actions at one address, and a page carrying a dozen JSON Schemas would
-spend its whole 64 KB on schemas the caller will not use. Reading the one offer you picked returns it
-with its schema:
+adapter can offer a dozen actions at one address, and their JSON Schemas could consume the 64 KiB
+page. Reading one offer returns it with its schema:
 
 ```
 rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ
@@ -97,11 +146,16 @@ That URI is what `act` takes.
 
 Each candidate-building tool performs one operation with typed arguments:
 
+Every candidate request also carries one common publication envelope: `on`, `expected_accepted`, and
+zero or more `CommandValidator` declarations. Ordinary candidates fix the session's accepted ref as
+their destination; an integration candidate fixes its selected local branch. These values are stored
+with the ready preview and cannot be changed by `publish`.
+
 | tool | what it does |
 | --- | --- |
 | `edit` | an atomic set of concrete `Edit` values |
 | `patch` | a unified diff, checked hunk by hunk against the state it resolves on |
-| `rewrite` | one `MatchQuery`, a replacement template, and the number of matches you accept |
+| `rewrite` | one `MatchQuery`, a replacement template, and an accepted match count |
 | `revert` | the three-way inverse of one commit against a selected parent |
 | `merge` | a three-way merge of one commit into the candidate |
 | `rename` | a new name for a declaration, propagated to its references |
@@ -114,13 +168,15 @@ Each candidate-building tool performs one operation with typed arguments:
 `rename`, `move`, `delete`, and `change_signature` use portable argument contracts, so their arguments
 are in the tool schema an agent already has. Everything else an adapter can do — extract, inline,
 organize imports, a quick fix, an adapter's own family — is discovered through the actions resource
-and resolved by `act`, whose arguments follow the schema that offer advertises. `act` refuses an offer
-belonging to a portable family, which leaves one entry point for each operation.
+and resolved by `act`. Its `arguments_json` field is a JSON string whose contents follow the schema
+that offer advertises; Rift canonicalizes those contents as `rift-json/1` without passing the inner
+numbers through the outer JSON-RPC decoder. `act` refuses an offer belonging to a portable family,
+which leaves one entry point for each operation.
 
-`delete` carries both kinds of removal on one axis. Without a `policy` it removes the declaration and
-analyses nothing, which is what you want for a file you just created and no longer need. With one, the
-adapter classifies every remaining use and applies the disposition you chose for each. Incomplete
-reference coverage refuses the operation before it can leave a dangling call behind.
+`delete` carries both kinds of removal on one axis. Without a `policy` it removes the declaration
+without reference analysis, which supports deleting newly created code. With a policy, the adapter
+classifies every remaining use and applies the selected disposition. Incomplete reference coverage
+refuses the operation before it can leave a dangling call behind.
 
 Nothing here publishes. Each tool resolves its operation, writes the result to an immutable candidate
 commit, validates that commit with the adapters, and returns a bounded `CandidateSummary` whose
@@ -132,10 +188,10 @@ A change that takes several steps is a chain. Every candidate tool takes `on`, t
 continues:
 
 ```
-edit(…)                        -> preview: 9f2c…
-rename(on: 9f2c…, …)           -> preview: be71…
-act(on: be71…, action: …)      -> preview: 04ad…
-publish(preview: 04ad…)        -> accepted
+edit(publication: { validators: [] }, …) -> preview: prv_9f2c…
+rename(on: prv_9f2c…, …)                 -> preview: prv_be71…
+act(on: prv_be71…, action: …)            -> preview: prv_04ad…
+publish(preview: prv_04ad…)               -> accepted
 ```
 
 Each step resolves against its predecessor's tree, so the rename sees the declaration the edit
@@ -147,32 +203,41 @@ The chain is the transaction: no ref moves until `publish`, and `publish` names 
 also a real preview you can read, refresh, or abandon on its own — which an ordered array of changes
 inside one call never allowed.
 
+A root candidate supplies `publication`, whose validator array may be empty. A chained candidate
+inherits its parent's plan when it omits the field, while an explicit replacement belongs only to the
+new preview. Publishing the tip runs that tip's validators against the complete tip tree.
+
 ## Lifecycle
 
-A `PreviewId` is derived from the request that produced it: base64url of the SHA-256 over the
-connection, the base, the expected head, the parent candidate, and the operation. Sending the same
-request twice therefore names the same candidate, and the second call returns the retained plan
-without another resolution and validation pass. A lost response costs one round trip.
+A `PreviewId` is SHA-256 over the fixed request inputs. The hash starts with `rift.preview.v1`, then
+encodes the durable session ID, base, destination, expected head, parent candidate, canonical
+operation, and validator declarations with the
+[fixed binary framing](/docs/architecture#durable-identifiers). The public spelling is lowercase
+unpadded base32 with a `prv_` prefix. Sending the same request after reconnecting therefore returns
+the retained registry record and immutable preview worktree without another resolution or validation
+pass.
 
 `expected_accepted` separates resolution state from publication concurrency. It defaults to the
 current accepted head, must be an ancestor of the resolution base, and becomes the compare-and-swap
 value at publication. A merge repair resolves on a provisional two-parent commit while still advancing
 from the accepted source parent.
 
-`refresh` reruns a retained candidate's operation on a newer base. The candidate holds the request it
-was built from, so nothing is restated; the result counts the resolved records and files that moved,
-and comparing the two preview resources gives the exact ones. A portable refactor reruns the same
-typed call, which is why replaying it needs no matching rule. `act` still has to
+`refresh` reruns a retained candidate's operation on a newer base. It preserves the stored publication
+plan unless the request supplies a replacement for the new preview. The result counts the resolved
+records and files that moved, and comparing the two preview resources gives the exact ones. A portable
+refactor reruns the same typed call, which is why replaying it needs no matching rule. `act` still has to
 find its offer again, and Rift matches it by language, target, kind, argument contract, argument
 schema, and guarantees — zero or several matches refuse, as does a stale match.
 
-`publish` replays the chain's resolution, compares its plans, confirmations, and candidate tree with
-what was retained, runs the declared command validators, and advances the destination through
-compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration.
-Publication needs no idempotency key, because the compare-and-swap is the idempotence — a retry that
-finds the destination already holding the candidate returns the same accepted result with `replayed`
-set. Validation rejection, resolution refusal, and a lost compare-and-swap have separate result
-branches.
+`publish` verifies that the immutable worktree still has the HEAD and tree recorded for the preview,
+then runs its fixed command validators and compare-and-swap advances its fixed destination.
+`PreviewId` is the retry key. The workspace registry retains terminal success, rejection, and conflict
+results; repeating the same call returns that result.
+
+Registry transition phases, Git reflog reconciliation, and local recovery controls are implementation
+state rather than MCP methods or enums. When recovery cannot determine whether Git advanced before a
+crash, MCP returns `temporarily_unavailable` with a request id. A local operator resolves the preview
+through `rift preview resolve`, after which the ordinary resource and `publish` call work again.
 
 After a rejection the candidate commit and its evidence remain readable, and a repair can use that
 commit as the base of a new candidate.
@@ -180,28 +245,39 @@ commit as the base of a new candidate.
 ### Validation and persistence
 
 Adapter validation runs when a candidate is built. Workspace policy defaults to `require =
-"available"`, which requires complete, valid reports from affected adapters that advertise `validate`.
-An explicit list such as `['rust', 'sql:postgresql', 'json']` turns those exact languages into fixed
-publication gates. Source ownership and validation requirements are independent.
+"available"`, which runs affected adapters that advertise `validate`. A result with no such adapter
+reports validation strength `mechanical`. An explicit list such as
+`['rust', 'sql:postgresql', 'json']` requires complete, valid reports from those exact languages and
+reports strength `required`.
 
-Command validators belong to `publish`. A test suite that takes four minutes would charge the same
-four minutes to every step if it belonged to candidate creation, and publication has to run a fresh
-check before advancing the ref. Under the `full` profile Rift runs each executable directly, without
-a shell, in a disposable validation workspace copied from the candidate, and retains its exit status
-and bounded output.
+Command validators run during `publish`, while the candidate's `PublicationPlan` fixes their
+declarations. Rift stores the plan with the ready preview and includes its canonical bytes in the
+preview ID. A test suite that takes four minutes would charge the same four minutes to every step if it
+ran during candidate creation, and publication needs a fresh check before advancing the ref. When user
+policy grants one, Rift runs the executable directly, without a shell, in a disposable validation
+workspace copied from the candidate, and retains its exit status and bounded output in the workspace
+registry.
 Writes inside the workspace disappear with it, and the command still reaches the host filesystem and
 network.
 
-A declaration is refused unless its argv and timeout fall inside what
-[`validators` in `rift.toml`](/docs/configuration#validators) permits, so which binaries can run is
-decided by repository policy. The caller supplies a permitted declaration, names the guarantee a pass
-establishes, and receives `GuaranteeEvidence` over the published chain.
+A declaration is refused during preview creation unless its argv, resolved executable, carried paths,
+and timeout lie in the intersection of committed requests and user-owned grants. The caller names the
+guarantee a pass establishes and receives `GuaranteeEvidence` over the published chain. Validators
+must be repeat-safe because crash recovery can run an unrecorded invocation again.
 
-An accepted candidate exists as a Git commit before it touches the connection worktree. `persist`
+An accepted candidate exists as a Git commit before it touches the session worktree. `persist`
 selects paths from that commit.
 
 Rift computes every per-path outcome before writing. An oversized result writes nothing. Each path
-reports its materialization result.
+reports its materialization result. Cancellation can stop the call until the first write. After that
+point Rift holds the session write lock and finishes the bounded set, writing regular files through a
+same-directory temporary path and atomic rename.
+
+Atomicity stops at the path boundary. A process or host crash can leave some paths materialized and
+the rest unchanged. Repeating the same call converges: matching accepted entries report `unchanged`,
+eligible base entries are written, and independently changed entries report `skipped_drift`. The Git
+commit remains the durable source for every path, so a partial materialization needs no rollback
+journal.
 
 Gitlinks and their descendants return `skipped_nested_repository`. Persistence leaves child checkouts
 unchanged.
@@ -223,9 +299,9 @@ automatic merge, while each conflict path keeps the target entry so the candidat
 candidate tool whose `on` is the provisional merge, publish the repair to the accepted ref, and
 integrate again.
 
-Publication of a checked-out branch requires a clean worktree and
-`session.integration = "auto"`. Otherwise the result refuses with `checked_out_target` or
-`dirty_target` and returns the validated candidate for manual handling.
+Publication advances a branch only when Git reports that no worktree has it checked out. A checked-out
+target returns `checked_out_target` with the validated commit for manual handling. Rift never writes
+the target worktree's ref, index, and files as a multi-step automatic operation.
 
 ## Execution and debugging
 
@@ -265,13 +341,29 @@ from another connection is `permission_denied`; an unknown or idle-expired ID is
 Connection close, adapter exit, and server recovery perform the same cleanup as `debug_stop`.
 
 An execution workspace contains repository writes so Rift can discard them after evaluation.
-Evaluated code retains the filesystem, process, and network access of `rift server`, so the workspace
-administrator must opt in through execution policy before any of these tools are advertised.
+Evaluated code retains the filesystem, process, and network access of `rift server`, so machine and
+workspace policy must both grant the exact language before any of these tools are advertised. Rift
+resolves the working directory without following symlinks or entering gitlinks.
 
 ## Failures
 
 A failed MCP request returns `ErrorData`, whose code classifies the failure and whose phase identifies
-the lifecycle step that failed.
+the lifecycle step that failed. Its `request_id` is the same random id recorded in gRPC metadata and
+the structured server log, so an operator can find the matching adapter and storage events without
+logging source or caller arguments.
+
+The error model includes recovery failures that require a fresh query or a local state command:
+
+| code | condition | retry |
+| --- | --- | --- |
+| `unsupported_path` | Git contains a path the protocol or host filesystem cannot represent safely | `never` for that snapshot |
+| `cursor_expired` | the cursor is valid but its immutable result generation was evicted | `refresh_snapshot` from the first page |
+| `state_corrupt` | the registry, Git state, and registered worktrees disagree and reconciliation cannot choose safely | `operator_action` |
+| `temporarily_unavailable` | the resource exists but Rift cannot give a safe answer yet | `same_request`, or `operator_action` when publication recovery is indeterminate |
+
+`operator_action` tells an MCP client to stop retrying until a local command repairs or resolves the
+condition. The error carries the affected resource and request ID, while publication phases and
+recovery records remain internal to the server.
 
 A refused operation returns its failed preconditions and blockers in `RefusalReason`, while a rejected
 candidate returns its validation evidence. A publication conflict carries the head it expected and

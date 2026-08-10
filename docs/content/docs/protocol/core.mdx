@@ -18,9 +18,9 @@ shapes.
 
 ## Versioning
 
-A request may name a revision of the workspace. The Rift server resolves it to a commit or a working
-tree and returns a `Snapshot` containing the exact state it read. Passing that snapshot to a later
-request makes both requests resolve against the same code.
+A request may name a revision of the workspace. The Rift server resolves a commit directly and
+captures a mutable worktree into an immutable Git tree. It returns a `Snapshot` identifying the tree
+it actually read, so a later request can reuse the same code after the live worktree moves.
 
 Revision resolution belongs to the server. A mechanical read uses Git objects directly. Before an
 adapter-backed read, the server reuses a physical tree only when it represents the exact resolved
@@ -29,10 +29,9 @@ and tree through `Open`, rather than deciding which revision to check out.
 
 ### Revision
 
-By default Rift works with the default branch at its latest commit. Every tool and every resource also
-takes an optional `rev` that points somewhere else. It is a git revision parameter —
-[`gitrevisions(7)`](https://git-scm.com/docs/gitrevisions) — so anything git accepts on a command line
-works here:
+By default Rift works with the default branch at its latest commit. Every tool and resource also takes
+an optional `rev`. It accepts [`gitrevisions(7)`](https://git-scm.com/docs/gitrevisions) expressions
+without control characters or a leading `-`, plus Rift's mutable-worktree selectors:
 
 | `rev` | Points at |
 | --- | --- |
@@ -49,6 +48,11 @@ The worktree spellings are git's own — per-worktree refs are reachable from an
 `worktrees/<id>/HEAD` and `main-worktree/HEAD`. Dropping the `/HEAD` is Rift's one addition, because
 gitrevisions has no way to name work that isn't committed yet, and that is usually what you are editing.
 
+Resource URIs percent-encode the UTF-8 revision as one query-parameter value. For example,
+`HEAD^{tree}` becomes `rev=HEAD%5E%7Btree%7D`; decoding yields the same `Revision` a tool accepts. The
+server passes the decoded value to Git after `--end-of-options` and verifies that it resolves to an
+object kind admitted by the operation.
+
 ### Snapshot
 
 Because `main` names a different commit tomorrow, and a working tree changes under you, the answer says
@@ -61,8 +65,17 @@ response:
                       "base": "dae86e1…", "changes": "9f2c…" }
 ```
 
-A working-tree snapshot contains its base commit and a digest of the files that differ from it.
-Editing one file therefore leaves every other file's state unchanged.
+A working-tree snapshot contains its base commit and the SHA-256 of a canonical capture manifest.
+Each changed entry records its path, regular-file or symlink kind, executable mode, and Git object id;
+a deletion has an explicit deletion tag. Untracked non-ignored files appear as additions. An index
+`skip-worktree` entry distinguishes a sparse absent path from a deletion, gitlinks remain opaque, and
+untracked special files make capture fail. A mode-only change therefore changes the digest.
+
+The server pins the captured Git tree for the request and gives adapters a detached materialization of
+that tree. It then repeats the complete status enumeration and manifest construction. A changed
+`HEAD`, index checksum, file identity, or manifest restarts capture; exhausting the retry limit returns
+`worktree_busy` and no snapshot. The live worktree may move after capture without changing the state
+the request used.
 
 The tree also contains dependency and adapter configuration files. An adapter tracks changes to
 those inputs across `Refresh`. The repository resource identifies the adapter serving the snapshot.
@@ -134,9 +147,22 @@ The parent repository can create a gitlink with `create_gitlink` or change its c
 the caller places that text edit in the same atomic `edit` call. These edits change Git tree entries;
 they do not fetch, check out, or mutate the child repository.
 
-Paths remain raw UTF-8 at filesystem and adapter seams. In a `rift://` URI, unreserved characters and
-segment separators remain literal; every other UTF-8 byte uses uppercase percent-encoding. For example,
-`src/☃.ts` becomes `rift://file/src/%E2%98%83.ts`.
+Every protocol path is valid UTF-8, relative to the project root, and separated with `/`. An empty,
+`.` or `..` segment is invalid. Rift preserves the encoded Unicode and case exactly; it does not
+normalize either one. In a `rift://` URI, unreserved characters and segment separators remain
+literal, while every other UTF-8 byte uses uppercase percent-encoding. For example, `src/☃.ts`
+becomes `rift://file/src/%E2%98%83.ts`.
+
+Git can store names that a host filesystem or the protocol cannot represent. Before materializing a
+tree, Rift derives the host comparison key for every path and refuses aliases such as `A.ts` and
+`a.ts` on a case-insensitive volume. It also refuses invalid UTF-8, Windows reserved names,
+trailing-dot or trailing-space aliases, and paths the host cannot create. The repository can still
+open for unaffected Git operations; an operation that enumerates or touches such an entry returns
+`unsupported_path` with the original Git path bytes as bounded base64 evidence.
+
+Filesystem traversal opens one path component at a time relative to the workspace directory handle.
+Symlink following is disabled, and a resolved component cannot escape the workspace or enter a
+gitlink.
 
 The physical owner records every grammar present in a file. In `App.svelte`, `regions` can record that
 TypeScript starts at byte 412. The `languages` field is the sorted, distinct projection of those regions.
@@ -198,7 +224,7 @@ delete, rename, or copy a file, change its executable bit, and create or update 
 ```
 
 An adapter returns proposed source changes to Rift as `Edit` values. Rift can inspect the values before
-writing them to the connection worktree. The [adapter contract](/docs/protocol/adapter#source-ownership)
+writing them to the session worktree. The [adapter contract](/docs/protocol/adapter#source-ownership)
 defines that ownership boundary.
 
 An edit set is atomic. Every text range addresses the input state, and ranges in one set cannot
@@ -420,10 +446,10 @@ analysis state:
                           "reason": "this adapter emits no origin mappings" }
 ```
 
-Absence proves absence only under `complete`. Under `partial` the `reason` says what stopped it, and a
-`continuation` says how to ask for the rest where there is a way to. `unsupported` means the adapter
-cannot produce this at all; `not_applicable` means the adapter consumes physical source and has no
-produced ranges to map.
+Absence proves absence only under `complete`. Under `partial` the `reason` says what stopped analysis.
+The result's page cursor continues records already known, while repeating the same request at the same
+snapshot polls unfinished analysis. A page boundary does not change coverage. `unsupported` means the
+adapter cannot produce this family; `not_applicable` means the language has no corresponding concept.
 
 Coverage is recorded separately for each fact family. An adapter can resolve every symbol in a file
 while failing to type one of them, so one combined value would hide the incomplete type analysis.
@@ -445,8 +471,11 @@ of the affected program. Workspace validation policy selects required reports in
 ownership. The default requires complete, valid reports from affected adapters that advertise
 validation; a repository can instead list exact `Language` values as fixed gates.
 
-The MCP surface combines those adapter reports with results from caller-supplied command validators.
-The candidate retains the complete evidence, so an accepted result can be audited after publication.
+The MCP surface combines those adapter reports with results from command validators declared when the
+preview is created and executed during publication. Its validation strength says whether the result
+contains mechanical checks, every available report, or a fixed required language set. The workspace
+registry stores the evidence with the preview, so the accepted result remains auditable while that
+preview record is retained.
 
 ## Operations
 

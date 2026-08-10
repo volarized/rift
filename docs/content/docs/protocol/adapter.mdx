@@ -19,10 +19,14 @@ The Rift server starts at most one configured adapter process for each exact `La
 only client. That process can hold separate `AdapterState`s for several snapshots. The server opens,
 refreshes, and closes one state for each worktree.
 
+The server supplies the reserved `RIFT_PROTOCOL_MAJOR` environment value when it launches the
+adapter. An adapter that does not implement that major exits before binding its private socket.
 `Describe` advertises `operations` and `fact_families`, along with action kinds, extensions, path
-claims, limits, and runtime requirements. Rift calls an optional RPC only when its operation is
-advertised. An unimplemented RPC returns gRPC `UNIMPLEMENTED`; advertising an operation and then
-returning `UNIMPLEMENTED` is an adapter protocol error.
+claims, limits, runtime requirements, and supported minor-and-schema-digest tuples. Rift selects an
+exact tuple and passes it to `Open`. The server hashes the configured adapter executable for cache
+identity and diagnostics. It calls an optional RPC only when its operation is advertised. An
+unimplemented RPC returns gRPC `UNIMPLEMENTED`; advertising an operation and then returning
+`UNIMPLEMENTED` is an adapter protocol error.
 
 Non-empty `fact_families` requires `analyze`. Non-empty `action_kinds` requires `actions` and
 `resolve`. A virtual unit is routed only to an adapter that advertises `sync_virtual`. Debugging is
@@ -36,16 +40,17 @@ therefore says the adapter decides that facet per symbol, not that every symbol 
 The list is what Rift filters against — a facet nobody advertises is a facet no answer can be negated
 on, since a symbol missing it and an adapter that never emits it look identical.
 
-One adapter process can hold states for connection, candidate, and detached read worktrees. One
-connection owns one writable worktree; read worktrees may be shared by connections asking about the
-same commit. Different-language adapters receive the same worktree path and separate `state_root`
-paths. Limits apply to each adapter state, and interleaved RPC streams let `worktrees/a2` make progress
-while `worktrees/a1` runs a long analysis.
+One adapter process can hold states for session, candidate, and detached read worktrees. One session
+owns one writable worktree; read worktrees may be shared by sessions asking about the same commit.
+Different-language adapters receive the same worktree path and separate `state_root` paths. Limits
+apply to each adapter state, and round-robin dispatch lets one session make progress while another
+runs a long analysis.
 
-The configured process is stable across those states. After `Open`, the adapter may inspect the tree's
-configuration and reuse or start a revision-appropriate runtime worker. On `Refresh`, it re-evaluates
-that choice when runtime-defining inputs have changed. Two states in one adapter can therefore use
-incompatible project runtimes without becoming two configured adapters.
+One configured process generation can serve all of those states. After `Open`, the adapter may inspect
+the tree's configuration and reuse or start a revision-appropriate runtime worker. On `Refresh`, it
+re-evaluates that choice when runtime-defining inputs have changed. Two states in one adapter can
+therefore use incompatible project runtimes. A snapshot whose `rift.toml` selects another adapter
+declaration waits while Rift drains the old generation, then starts the newly admitted process.
 
 Each returned `AdapterState` combines the shared Git `Snapshot` with an adapter-local `generation`.
 `Refresh` advances it after a physical source change. `SyncVirtual` advances it after a private virtual
@@ -55,6 +60,27 @@ gRPC supplies the transport mechanics. The RPC method identifies the operation. 
 event order. The request context carries cancellation and deadlines. Failures use `google.rpc.Status`,
 with `Refusal` or `StaleState` in `status.details`.
 
+### Process restart
+
+An adapter is a disposable worker. The server assigns a monotonic process generation and can rebuild
+all usable state by calling `Describe`, `Open`, `Refresh`, and `SyncVirtual` after a restart. Adapter
+files under `state_root` are caches; durable correctness cannot depend on the process or those files
+surviving. This is the same operational expectation an IDE places on an LSP process: restart can cost
+indexing time, but it cannot lose accepted repository state.
+
+Process exit invalidates every `AdapterState` and debugging key minted by that generation. Rift
+discards partial streams unless facts and coverage already published a complete in-memory generation, then
+releases the affected leases. It starts a replacement lazily with bounded exponential backoff. After
+repeated startup or protocol failures, a circuit breaker returns `adapter_unavailable` until its
+backoff expires or configuration changes.
+
+Rift may retry one complete value-producing call against a fresh state when its deadline permits.
+This covers discovery, analysis, matching, action resolution, formatting, and validation because Rift
+applies returned edits only after a complete response. It never replays `Execute` or `DebugStart`:
+evaluated code can change systems outside the disposable worktree. A lost `DebugStop` response is
+retryable only while the same adapter generation remains alive; process exit has already released
+that generation's runtime state.
+
 ## Worktree
 
 The server owns revision resolution and worktree allocation. For an adapter-backed read, it resolves
@@ -63,31 +89,32 @@ snapshot, and otherwise allocates a detached read worktree. The adapter neither 
 nor asks Rift to switch one.
 
 rust-analyzer reads source through `open(2)`, so Rift gives every adapter using that state the path of
-the real `git worktree`:
+a server-owned `git worktree` under the reserved workspace-local state root:
 
 ```
-~/projects/charming-aurora            the main working tree — yours
-  .rift/worktrees/a1                  one connection's detached worktree
+<workspace>/.rift/
+  worktrees/session-f8py…             one session's detached worktree
+  state/session-f8py…/rust/           its Rust adapter's private state
 ```
 
 Adapters read this shared path. Declared adapter writes land there. `state_root` holds disposable
 caches and private virtual overlays in a separate directory.
 
-Every adapter used by the connection opens `.rift/worktrees/a1`. For example, Rust and TypeScript
+Every adapter used by the session opens the same detached tree. For example, Rust and TypeScript
 adapters in one monorepo open the same worktree while their source claims select different files.
 A container adapter owns a physical file such as `App.svelte` and publishes its embedded TypeScript
 as virtual source for the TypeScript adapter. The server later commits and integrates the shared tree
 through the [write lifecycle](/docs/architecture#writes).
 
 The `Analyze` RPC returns facts about files the adapter opened from the worktree. Each response also
-names the tree and state it used. That coordinate is a `Snapshot`; its worktree value uses Git's
-spelling, such as `worktrees/a1`.
+names the immutable captured tree and state it used. A request selecting `main-worktree` reaches the
+adapter only after the server has captured its observed entries into a pinned Git tree.
 
 For generated source, the producer sends a `VirtualUnit` manifest and `VirtualText` chunks. Rift
 validates the complete publication. It then calls `SyncVirtual` on the selected consumer.
 
 The consumer stores the bytes in a private overlay under `state_root`. Generated inputs stay outside
-the shared worktree and connection diff.
+the shared worktree and session diff.
 
 Rift drains calls for that consumer before synchronization. New calls begin after the atomic overlay
 replacement returns.
@@ -118,13 +145,14 @@ the project runtime or promise process isolation. An adapter that starts per-sta
 runtime state can change an analysis result independently of the source snapshot, the adapter returns
 `CacheScope.process` or `none`, not `snapshot`.
 
-Adapters and their workers retain the host access of `rift server`. Configure only adapter commands
-trusted to run with that access; `state_root` and `WriteClaim` express ownership, not containment.
+Adapters and their workers retain the host access of `rift server`. User-owned machine and workspace
+policy must grant the exact executable identity before a committed adapter request can start it.
+`state_root` and `WriteClaim` express ownership and provide no containment.
 
 ## Execution and debugging
 
 `Execute` evaluates a caller-provided `CodeBlock` using the project runtime already selected for an
-exact `AdapterState`. Rift never issues it against a connection, candidate, or shared read state. It
+exact `AdapterState`. Rift never issues it against a session, candidate, or shared read state. It
 first materializes a disposable execution workspace for the requested `Snapshot` and calls `Open` for
 a fresh state. The block itself stays on the wire, while imports and project configuration come from
 the workspace. `ExecuteResponse` echoes the state and returns bounded output, diagnostics, and a
@@ -165,26 +193,26 @@ therefore gates the MCP tools separately from `Capabilities.operations`.
 
 ## Source ownership
 
-Rift is the source writer for each connection worktree. When the adapter computes a fix, `Resolve` returns
+Rift is the source writer for each session worktree. When the adapter computes a fix, `Resolve` returns
 an atomic set of `Edit` values. The set can replace byte ranges, change paths, create or remove files,
 copy files, and change executable bits. Rift applies the set and reports the changed paths on the next
 `Refresh`.
 
 State-pinned calls from different adapters may read the worktree concurrently. Before a source write,
-Rift blocks new calls and drains current calls across every adapter holding the connection path. It
+Rift blocks new calls and drains current calls across every adapter holding the session worktree. It
 writes once, calls `Refresh` on each adapter, analyzes virtual-source producers, and applies
 `SyncVirtual` in producer-to-consumer order. The barrier opens after every adapter acknowledges the
 physical and virtual state.
 
 Several adapters can read the same tree. Routing source changes through Rift gives the tree one writer,
-so `git diff` contains the connection's complete source change for validation and commit.
+so `git diff` contains the session's complete source change for validation and commit.
 
 Returning the change as a value lets Rift inspect it before writing. For example, `gofmt` writes the
 formatted source to stdout when invoked without `-w`.
 
 Some adapter processes create files while analyzing. For example, npm creates `node_modules` beside
 its package. The adapter reports each adapter-owned path from `Describe`; the protocol calls the
-record a `WriteClaim`. Rift excludes claimed paths from source analysis and from the connection diff.
+record a `WriteClaim`. Rift excludes claimed paths from source analysis and from the session diff.
 
 Write claims are exclusive among adapters sharing a worktree. If two adapters can write the same path,
 Rift refuses workspace admission. One adapter must redirect that output to its private `state_root`.
@@ -216,12 +244,18 @@ cache fills proportional to the request. Each stream ends with a `CacheScope`:
 
 - `snapshot` means the source snapshot, adapter implementation, exact `Language`, and derived virtual
   inputs determine the result.
-- `process` means adapter-observed process or adapter-state generation also matters.
+- `process` means adapter-observed process or adapter-state generation also matters; Rift keeps the
+  result only in the server's in-memory semantic store.
 - `none` prevents retention.
 
 Rift takes the shortest scope in a virtual-source dependency chain. A consumer cannot claim
 `snapshot` retention when any producer result is `process` or `none`, because the same Git snapshot
-could then supply different virtual bytes.
+could then supply different virtual bytes. An adapter claiming `snapshot` must emit byte-for-byte
+equal canonical facts and coverage when conformance reruns the same retained key in fresh processes.
+
+That key includes the source tree, protocol schema digest, adapter artifact digest, implementation
+version, exact `Language`, effective configuration, runtime-environment fingerprint, and virtual-input
+digests. State the adapter cannot fingerprint forces `process` scope.
 
 Rift serves a warm read while the adapter is stopped only for `snapshot` results. It starts or
 refreshes an adapter when the requested fact family has no eligible retained result.
@@ -244,7 +278,9 @@ Rift workspace rooted at the child repository analyzes the child files.
 `Capabilities.action_kinds` advertises adapter action families before any target-specific query. Each
 entry states its kind prefix, coverage, and available guarantee kinds. `Actions`
 then lists the actions applicable at one pinned address. `Resolve` accepts the selected state-bound
-token and validated canonical JSON arguments.
+token and `CanonicalJson` arguments. That message carries `rift-json/1` UTF-8 bytes and their SHA-256
+digest. The exact-decimal number encoding preserves integers and object values that
+`google.protobuf.Struct` would round.
 
 A successful `ResolveResponse` returns exact edits and their evidence. Every advertised guarantee has
 one scoped evidence record.
@@ -273,11 +309,11 @@ the new `AdapterState`. `Validate` then asks the adapter to check the closure af
 paths. The stream carries diagnostic batches followed by one `ValidationSummary`.
 
 The summary reports the state checked, its coverage, the adapter verdict, and the files in the
-affected closure. Rift combines it with the adapter's language and the streamed diagnostics to produce
-the shared `ValidationReport`. Workspace policy decides which reports publication requires. By
-default, affected adapters that advertise `validate` are required; source, auxiliary, or routed
-virtual changes make an adapter affected. A repository can configure an explicit list of exact
-languages instead. Source ownership alone adds no validation gate.
+affected closure. Rift combines it with the adapter's language and streamed diagnostics to produce
+the shared `ValidationReport`. Policy decides which reports publication requires. An empty report set
+produces mechanical validation strength; it cannot satisfy available or required semantic strength.
+Source, auxiliary, or routed virtual changes make an adapter affected. An explicit policy list turns
+exact languages into required gates.
 
 ## Service boundary
 
