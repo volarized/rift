@@ -37,12 +37,7 @@ class RiftConfigTests(TestCase):
         self.assertEqual(language.name, "sql")
         self.assertEqual(language.dialect, "postgresql")
 
-    def test_validator_policy_accepts_only_typed_declarations_within_both_bounds(
-        self,
-    ) -> None:
-        policy = config.ValidatorsConfig.model_validate(
-            {"allow": [["pytest"]], "max-timeout": "2s"}
-        )
+    def test_validator_config_holds_exact_declarations_within_its_timeout(self) -> None:
         declaration = mcp.CommandValidator.model_validate(
             {
                 "id": "tests",
@@ -57,17 +52,22 @@ class RiftConfigTests(TestCase):
                 "determinism": "deterministic",
             }
         )
-
-        self.assertTrue(policy.permits(declaration))
-        self.assertFalse(
-            config.ValidatorsConfig.model_validate(
-                {"allow": [["cargo"]], "max-timeout": "2s"}
-            ).permits(declaration)
+        policy = config.ValidatorsConfig.model_validate(
+            {"commands": [declaration.model_dump()], "max-timeout": "2s"}
         )
+
+        self.assertEqual(policy.commands, [declaration])
+        with self.assertRaises(ValidationError):
+            config.ValidatorsConfig.model_validate(
+                {
+                    "commands": [{**declaration.model_dump(), "timeout_ms": 2_001}],
+                    "max-timeout": "2s",
+                }
+            )
         too_slow = mcp.CommandValidator.model_validate(
             {**declaration.model_dump(), "timeout_ms": 2_001}
         )
-        self.assertFalse(policy.permits(too_slow))
+        self.assertEqual(too_slow.timeout_ms, 2_001)
 
     def test_repository_cap_combines_with_the_advertised_adapter_limit(self) -> None:
         process = config.AdapterProcessConfig(
