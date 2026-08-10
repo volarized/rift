@@ -14,7 +14,6 @@ class ExecutionContractTests(TestCase):
         operations: list[core.AdapterOperation],
     ) -> adapter.Capabilities:
         return adapter.Capabilities(
-            protocol_version=1,
             language=core.Language(name="python"),
             implementation="test-adapter",
             source_claims=[],
@@ -35,6 +34,13 @@ class ExecutionContractTests(TestCase):
                 executes_repository_code=True,
                 spawns_subprocesses=True,
             ),
+            contracts=[
+                adapter.AdapterContract(
+                    major=2,
+                    minor=0,
+                    schema_digest="0" * 64,
+                )
+            ],
         )
 
     def test_default_policy_advertises_and_admits_nothing(self) -> None:
