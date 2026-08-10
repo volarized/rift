@@ -742,9 +742,16 @@ def document_metadata(document: Document) -> dict[str, Any]:
         }
         for resource in document.resources
     }
+    connect = next(rpc for rpc in document.service.rpcs if rpc.name == "Connect")
     resource_read = document.resource_read
     entry_points = {
         "description": document.entry_points_description,
+        "grpc.connection": {
+            "rpc": f"{service_name}/{connect.name}",
+            "description": connect.description,
+            "params": _schema_ref(connect.request),
+            "event": _schema_ref(connect.response),
+        },
         "mcp.toolGroups": groups,
         "mcp.tools": tools,
         "mcp.resources": resources,

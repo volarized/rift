@@ -73,7 +73,7 @@ enum ErrorCode {
   // The adapter took the call and did not answer inside its budget. Retrying can work: a cold
   // adapter on a large workspace is slow once and fast afterwards.
   ERROR_CODE_ADAPTER_TIMEOUT = 19;
-  // Rift could not read or write its own state — the semantic database, the git object store,
+  // Rift could not read or write its own state — the workspace registry, the git object store,
   // the socket directory. Worth retrying only if the cause was transient, such as a disk that
   // has since been cleared.
   ERROR_CODE_STORAGE_FAILURE = 20;
@@ -84,6 +84,18 @@ enum ErrorCode {
   // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected to
   // answer differently.
   ERROR_CODE_INTERNAL_ERROR = 22;
+  // Git contains a path the protocol or host filesystem cannot represent safely. The same
+  // snapshot remains unusable until that path changes.
+  ERROR_CODE_UNSUPPORTED_PATH = 23;
+  // The cursor is valid, but its immutable result generation left the process-local cache.
+  // Start again from the first page.
+  ERROR_CODE_CURSOR_EXPIRED = 24;
+  // The workspace registry, Git state, and registered worktrees disagree, and reconciliation
+  // cannot choose a safe repair. A local state command must resolve it.
+  ERROR_CODE_STATE_CORRUPT = 25;
+  // The resource exists, but Rift cannot produce a safe answer yet. Publication recovery can
+  // require a local operator decision before a retry.
+  ERROR_CODE_TEMPORARILY_UNAVAILABLE = 26;
 }
 // Stable retry instruction for one failed request. `deadline_exceeded` can permit the same
 // request; `invalid_request` requires changed input.
@@ -98,6 +110,9 @@ enum RetryDirective {
   // The state moved under the request. Re-read the current state, rebuild whatever was pinned
   // to the old one, then ask again.
   RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
+  // A local state command or policy change must resolve the condition before another request
+  // can succeed.
+  RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
 }
 // Why Rift declined a candidate operation or its publication. A refusal is a completed decision
 // with evidence, not a transport failure; `ErrorData` carries the failures that never reached a
@@ -495,14 +510,71 @@ message DiffResourcePayload {
   // The same comparison carrying the cursor for the next page, or null on the last one.
   optional string next = 6;
 }
-// Which protocol contract this server speaks. The version selects compatibility behavior. The
-// schema identifier names the JSON contract exposed through MCP.
+// One generated wire contract. A peer accepts it only when all three fields match one of its
+// own generated descriptors.
 message Contract {
-  // The protocol version both sides have to agree on before any other field is meaningful.
-  int64 protocol = 1;
-  // Canonical identifier of the MCP JSON Schema. The protocol version selects its matching
-  // generated Protobuf packages.
-  string schema = 2;
+  // Breaking protocol generation selected before the socket is opened.
+  int64 major = 1;
+  // Additive revision within the selected major.
+  uint32 minor = 2;
+  // SHA-256 of the generated descriptor and its MCP conversion metadata. Equal major and minor
+  // values with different digests are incompatible.
+  string schema_digest = 3;
+}
+// Opens one logical client connection before another server RPC. The control stream
+// remains open for the connection lifetime.
+message ConnectRequest {
+  // How this connection will use the workspace server.
+  enum Role {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // An MCP bridge that creates or attaches a durable session.
+    ROLE_MCP = 1;
+    // A read-only SCIP projection client with no session.
+    ROLE_SCIP = 2;
+  }
+  // Supported contracts in client preference order.
+  repeated Contract contracts = 1;
+  // Optional behaviors implemented by the client, sorted by identifier.
+  repeated string features = 2;
+  // Whether the connection serves MCP requests or a read-only SCIP projection.
+  Role role = 3;
+  // Durable session to attach. Null creates one for an MCP role.
+  optional string session = 4;
+  // Retry key required when an MCP role creates a session. The server commits its mapping to
+  // the new session in the same registry transaction.
+  optional string connect_attempt_id = 5;
+  // Canonical absolute UTF-8 path through which the client reached `.rift`. The server uses it
+  // to detect a moved or copied workspace.
+  string canonical_root = 6;
+  // Client build as it names itself in diagnostics.
+  string client_build = 7;
+}
+// The first event on an accepted control stream.
+message Connected {
+  // Exact generated contract selected for this connection.
+  Contract contract = 1;
+  // Features implemented by both peers, sorted by identifier.
+  repeated string features = 2;
+  // Workspace identity read from `.rift/workspace-id`.
+  string workspace = 3;
+  // Created or attached session for an MCP role; null for a SCIP role.
+  optional string session = 4;
+  // Identity required in metadata on every later RPC.
+  string connection = 5;
+}
+// Signals that adapter or policy changes altered the MCP tool manifest.
+message ToolsChanged {
+  // Monotonic server-process generation for the new manifest.
+  uint64 generation = 1;
+}
+// One event on the connection control stream. `connected` appears first and once; later
+// events report live capability changes.
+message ConnectionEvent {
+  oneof event {
+    Connected connected = 1;
+    ToolsChanged tools_changed = 2;
+  }
 }
 // Workspace policy ceilings for retained debugging sessions. Null at
 // `ExecutionLimits.debug` means policy disables debugging.
@@ -1003,9 +1075,9 @@ message ErrorCause {
     // The adapter took the call and did not answer inside its budget. Retrying can work: a cold
     // adapter on a large workspace is slow once and fast afterwards.
     ERROR_CODE_ADAPTER_TIMEOUT = 19;
-    // Rift could not read or write its own state — the semantic database, the git object store,
-    // the socket directory. Worth retrying only if the cause was transient, such as a disk that
-    // has since been cleared.
+    // Rift could not read or write its own state — the workspace registry, the git object
+    // store, the socket directory. Worth retrying only if the cause was transient, such as a
+    // disk that has since been cleared.
     ERROR_CODE_STORAGE_FAILURE = 20;
     // Rift could not prepare the validation workspace, launch the command validator, enforce
     // its timeout, or capture its output. One retry is reasonable when the host failure was
@@ -1014,6 +1086,18 @@ message ErrorCause {
     // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected
     // to answer differently.
     ERROR_CODE_INTERNAL_ERROR = 22;
+    // Git contains a path the protocol or host filesystem cannot represent safely. The same
+    // snapshot remains unusable until that path changes.
+    ERROR_CODE_UNSUPPORTED_PATH = 23;
+    // The cursor is valid, but its immutable result generation left the process-local cache.
+    // Start again from the first page.
+    ERROR_CODE_CURSOR_EXPIRED = 24;
+    // The workspace registry, Git state, and registered worktrees disagree, and reconciliation
+    // cannot choose a safe repair. A local state command must resolve it.
+    ERROR_CODE_STATE_CORRUPT = 25;
+    // The resource exists, but Rift cannot produce a safe answer yet. Publication recovery can
+    // require a local operator decision before a retry.
+    ERROR_CODE_TEMPORARILY_UNAVAILABLE = 26;
   }
   // Stable retry instruction for one failed request. `deadline_exceeded` can permit the same
   // request; `invalid_request` requires changed input.
@@ -1028,6 +1112,9 @@ message ErrorCause {
     // The state moved under the request. Re-read the current state, rebuild whatever was pinned
     // to the old one, then ask again.
     RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
+    // A local state command or policy change must resolve the condition before another request
+    // can succeed.
+    RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
   }
   // How this link classifies on its own.
   ErrorCode code = 1;
@@ -1110,9 +1197,9 @@ message ErrorData {
     // The adapter took the call and did not answer inside its budget. Retrying can work: a cold
     // adapter on a large workspace is slow once and fast afterwards.
     ERROR_CODE_ADAPTER_TIMEOUT = 19;
-    // Rift could not read or write its own state — the semantic database, the git object store,
-    // the socket directory. Worth retrying only if the cause was transient, such as a disk that
-    // has since been cleared.
+    // Rift could not read or write its own state — the workspace registry, the git object
+    // store, the socket directory. Worth retrying only if the cause was transient, such as a
+    // disk that has since been cleared.
     ERROR_CODE_STORAGE_FAILURE = 20;
     // Rift could not prepare the validation workspace, launch the command validator, enforce
     // its timeout, or capture its output. One retry is reasonable when the host failure was
@@ -1121,6 +1208,18 @@ message ErrorData {
     // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected
     // to answer differently.
     ERROR_CODE_INTERNAL_ERROR = 22;
+    // Git contains a path the protocol or host filesystem cannot represent safely. The same
+    // snapshot remains unusable until that path changes.
+    ERROR_CODE_UNSUPPORTED_PATH = 23;
+    // The cursor is valid, but its immutable result generation left the process-local cache.
+    // Start again from the first page.
+    ERROR_CODE_CURSOR_EXPIRED = 24;
+    // The workspace registry, Git state, and registered worktrees disagree, and reconciliation
+    // cannot choose a safe repair. A local state command must resolve it.
+    ERROR_CODE_STATE_CORRUPT = 25;
+    // The resource exists, but Rift cannot produce a safe answer yet. Publication recovery can
+    // require a local operator decision before a retry.
+    ERROR_CODE_TEMPORARILY_UNAVAILABLE = 26;
   }
   // Stable retry instruction for one failed request. `deadline_exceeded` can permit the same
   // request; `invalid_request` requires changed input.
@@ -1135,6 +1234,9 @@ message ErrorData {
     // The state moved under the request. Re-read the current state, rebuild whatever was pinned
     // to the old one, then ask again.
     RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
+    // A local state command or policy change must resolve the condition before another request
+    // can succeed.
+    RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
   }
   // How far the request got before it failed. The same code means different things at different
   // phases: `limit_exceeded` while reading is a response too big, and while validating it is a
@@ -1421,6 +1523,9 @@ message EditParams {
   // An atomic effect set in canonical file-and-range order. Every text replacement addresses
   // the state before this operation.
   repeated rift.core.Edit edits = 5;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 6;
 }
 // A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path
 // traversal, binary patches, malformed headers, and any hunk whose context differs from the
@@ -1453,6 +1558,9 @@ message PatchParams {
   FormattingPolicy formatting = 4;
   // Unified diff in Git's text patch syntax, with project-relative `a/` and `b/` paths.
   string patch = 5;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 6;
 }
 // An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the
 // replacement, and either applies all resulting edits or refuses the candidate.
@@ -1501,6 +1609,9 @@ message RewriteParams {
   Range range = 7;
   // The accepted number of matches before expansion.
   rift.core.MatchCardinality cardinality = 8;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 9;
 }
 // A validated three-way inverse of one commit. Rift computes the difference from `parent` to
 // `revision`, applies its inverse, and refuses overlapping changes it cannot merge without
@@ -1540,6 +1651,9 @@ message RevertParams {
   // Paths from the original commit eligible for inversion. Excluded paths remain untouched; the
   // commit diff exposes them when the caller needs to inspect the omission.
   rift.core.PathSelector paths = 7;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 8;
 }
 // A three-way merge of one exact commit into the state this operation resolves against.
 message MergeParams {
@@ -1555,6 +1669,9 @@ message MergeParams {
   optional string expected_accepted = 3;
   // Commit merged into the candidate state.
   string revision = 5;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 6;
 }
 // Changes what a declaration is called and rewrites the references that name it. The adapter
 // checks language spelling, collisions, and binding changes; a reference outside `scope`
@@ -1589,6 +1706,9 @@ message RenameParams {
   rift.core.Address target = 5;
   // The new name, and the source eligible for propagation.
   rift.core.RenameArguments arguments = 6;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 7;
 }
 // Moves a declaration or file to another container or path and updates the imports and
 // references that reach it.
@@ -1622,6 +1742,9 @@ message MoveParams {
   rift.core.Address target = 5;
   // The destination, and the source eligible for import and reference updates.
   rift.core.MoveArguments arguments = 6;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 7;
 }
 // Removes a declaration. Without a policy this is a mechanical removal that analyses no
 // references and claims no reference guarantee. With one, the adapter classifies every
@@ -1657,6 +1780,9 @@ message DeleteParams {
   rift.core.Address target = 5;
   // The disposition for each classified use, and the source it may be applied in.
   rift.core.SafeDeleteArguments arguments = 6;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 7;
 }
 // Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument
 // lists: a new required parameter has to be supplied at every call site, which is why the
@@ -1691,6 +1817,9 @@ message ChangeSignatureParams {
   rift.core.Address target = 5;
   // The desired callable shape, its propagation, and the source it may reach.
   rift.core.ChangeSignatureArguments arguments = 6;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 7;
 }
 // Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an
 // adapter offers that has no portable contract. Rift validates `arguments` against the offer's
@@ -1727,6 +1856,9 @@ message ActParams {
   // Arguments accepted by the offer's `ActionDescriptor.arguments_schema`. An action with no
   // parameters receives an empty object.
   google.protobuf.Struct arguments = 6;
+  // Fixed command validators for this preview. A root candidate requires a plan, which may
+  // contain an empty array; null on a chained candidate inherits its parent plan.
+  optional PublicationPlan publication = 7;
 }
 // The request one retained candidate was built from, as the tool received it. It appears in the
 // preview resource rather than in any tool parameter, so a plan can be read back and a refresh
@@ -1846,6 +1978,13 @@ message CommandValidator {
   repeated CommandValidatorGuarantees guarantees = 9;
   Determinism determinism = 10;
 }
+// Command checks fixed when a preview is created. Rift stores the complete plan with the
+// preview and includes its canonical bytes in `PreviewId`.
+message PublicationPlan {
+  // Checks run against the complete tip tree during publication, in declaration order. An empty
+  // array requests no command validators.
+  repeated CommandValidator validators = 1;
+}
 // A declared validator process that exited with status zero.
 message ValidatorResultPassed {
   optional int64 exit_code = 1;
@@ -1958,8 +2097,8 @@ message PreviewResourcePayload {
   repeated rift.core.FileChange files = 12;
   // Bounded verdict for the complete candidate.
   CandidateValidation validation = 13;
-  // Command declarations supplied at publication, preserving declaration order. Empty until the
-  // candidate is published.
+  // Command declarations fixed by this preview's publication plan, preserving declaration
+  // order.
   repeated CommandValidator validators = 14;
   // Adapter reports on this page, sorted by language name and dialect with null first and
   // unique across the complete resource.
@@ -2054,6 +2193,9 @@ message RefreshParams {
   // Accepted-ref head expected at publication. Omission selects the current accepted head. The
   // selected commit must be an ancestor of `rev`.
   optional string expected_accepted = 3;
+  // Replacement publication plan for the refreshed preview. Null preserves the exact plan
+  // stored by the earlier preview.
+  optional PublicationPlan publication = 4;
 }
 // A new retained candidate produced from an earlier one and a selected base.
 message RefreshedResult {
@@ -2076,21 +2218,15 @@ message RefreshResult {
     RefusedResult refused = 2;
   }
 }
-// Publishes one retained candidate. Rift replays the chain's resolution, runs the declared
-// command validators against the candidate, and advances the destination by compare-and-swap:
-// the accepted ref for an ordinary candidate, the target branch for an integration. Validators
-// are declared here rather than at creation, so building a change does not pay for a test suite
-// at every step.
+// Publishes one retained candidate. Rift verifies the retained chain, runs the command
+// validators fixed by the tip preview, and advances the destination by compare-and-swap: the
+// accepted ref for an ordinary candidate, the target branch for an integration.
 message PublishParams {
   // The retained candidate to publish. Its chain publishes with it.
   string preview = 1;
   // Every confirmation id the candidate currently requires, sorted bytewise. Missing or extra
   // ids refuse publication.
   repeated int64 confirmations = 2;
-  // Caller-supplied acceptance checks run against the candidate before it is published. The
-  // `edit` profile accepts an empty array; the `full` profile accepts up to
-  // `Limits.max_validators` declarations.
-  repeated CommandValidator validators = 3;
 }
 // Publication advanced the accepted ref to the retained candidate commit, so `accepted` equals
 // `summary.candidate`. The connection worktree remains unchanged until `persist` materializes
@@ -2162,6 +2298,8 @@ message IntegrateParams {
   string target = 1;
   // Accepted commit to integrate. Omission selects the connection's current accepted ref.
   optional string source = 2;
+  // Command validators fixed for the retained integration preview.
+  PublicationPlan publication = 3;
 }
 // Three Git entries that could not be merged automatically at one path.
 message MergeConflict {
@@ -2396,6 +2534,9 @@ message LanguageSupport {
 // The Protobuf service exposed by the Rift server. `rift mcp` maps its JSON entry points to
 // these methods.
 service Rift {
+  // Opens the control stream that owns one logical client connection. The first event selects
+  // the wire contract and returns the connection identity required by later RPCs.
+  rpc Connect (rift.mcp.ConnectRequest) returns (stream rift.mcp.ConnectionEvent);
   // Lists the project tree at one snapshot. Rift derives directories from Git paths and answers
   // without starting a language adapter. A depth of one is an `ls`; an unbounded depth with
   // path selectors is a recursive tree, glob, or file find.
@@ -2461,13 +2602,13 @@ service Rift {
   // validated like any other. A conflict returns a parseable provisional merge.
   rpc Integrate (rift.mcp.IntegrateParams) returns (rift.mcp.IntegrateResult);
   // Reruns a retained candidate's operation against a newer base and reports how much the
-  // result moved. The candidate holds the request it was built from, so nothing has to be
-  // restated.
+  // result moved. It preserves the stored publication plan unless the caller supplies a
+  // replacement for the new preview.
   rpc Refresh (rift.mcp.RefreshParams) returns (rift.mcp.RefreshResult);
-  // Runs the declared command validators against a retained candidate and advances its
-  // destination by compare-and-swap: the accepted ref for an ordinary candidate, the target
-  // branch for an integration. A retry that finds the destination already holding the candidate
-  // returns the same result.
+  // Runs the retained preview's command validators and advances its destination by
+  // compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an
+  // integration. A retry that finds the destination already holding the candidate returns the
+  // same result.
   rpc Publish (rift.mcp.PublishParams) returns (rift.mcp.PublishResult);
   // Materializes an accepted commit into the connection worktree. Each requested path reports
   // its own outcome, so drift, sparse checkout rules, nested repositories, and deletion policy

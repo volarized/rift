@@ -4,7 +4,17 @@
   "title": "Rift MCP surface",
   "description": "JSON values accepted and returned by the Rift MCP server. Each definition carries the Protobuf identity used after `rift mcp` decodes the request.",
   "rift:entryPoints": {
-    "description": "Tools map MCP request and result JSON to Rift service methods. Resources map each URI family to its template, link, and payload types. Every other schema definition is reachable from one of these entries.",
+    "description": "The internal connection stream establishes the gRPC context used by later calls. Tools map MCP request and result JSON to Rift service methods. Each resource entry maps one URI family to the types that carry it.",
+    "grpc.connection": {
+      "rpc": "rift.mcp.Rift/Connect",
+      "description": "Opens the control stream that owns one logical client connection. The first event selects the wire contract and returns the connection identity required by later RPCs.",
+      "params": {
+        "$ref": "#/$defs/ConnectRequest"
+      },
+      "event": {
+        "$ref": "#/$defs/ConnectionEvent"
+      }
+    },
     "mcp.toolGroups": {
       "discovery": {
         "title": "Discovery",
@@ -192,7 +202,7 @@
       "refresh": {
         "rpc": "rift.mcp.Rift/Refresh",
         "group": "lifecycle",
-        "description": "Reruns a retained candidate's operation against a newer base and reports how much the result moved. The candidate holds the request it was built from, so nothing has to be restated.",
+        "description": "Reruns a retained candidate's operation against a newer base and reports how much the result moved. It preserves the stored publication plan unless the caller supplies a replacement for the new preview.",
         "params": {
           "$ref": "#/$defs/RefreshParams"
         },
@@ -203,7 +213,7 @@
       "publish": {
         "rpc": "rift.mcp.Rift/Publish",
         "group": "lifecycle",
-        "description": "Runs the declared command validators against a retained candidate and advances its destination by compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration. A retry that finds the destination already holding the candidate returns the same result.",
+        "description": "Runs the retained preview's command validators and advances its destination by compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration. A retry that finds the destination already holding the candidate returns the same result.",
         "params": {
           "$ref": "#/$defs/PublishParams"
         },
@@ -526,6 +536,14 @@
         ]
       },
       {
+        "name": "Connection",
+        "summary": "Control-stream negotiation and the logical identities required before an application RPC.",
+        "identifiedBy": [
+          "ConnectRequest",
+          "ConnectionEvent"
+        ]
+      },
+      {
         "name": "Protocol",
         "summary": "Protocol versions, content digests, and extension namespaces shared across seams.",
         "holds": [
@@ -547,6 +565,43 @@
   "$defs": {
     "ActParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "Resolves one discovered adapter action \u2014 a quick fix, an extraction, an inline, anything an adapter offers that has no portable contract. Rift validates `arguments` against the offer's advertised schema. An offer whose kind belongs to a portable family is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.",
       "properties": {
         "on": {
@@ -616,6 +671,21 @@
           },
           "title": "Arguments",
           "type": "object"
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 7
+          }
         }
       },
       "required": [
@@ -1932,6 +2002,43 @@
     },
     "ChangeSignatureParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument lists: a new required parameter has to be supplied at every call site, which is why the operation commonly raises a `behavior_unknown` confirmation.",
       "properties": {
         "on": {
@@ -1998,6 +2105,21 @@
           "description": "The desired callable shape, its propagation, and the source it may reach.",
           "rift:proto": {
             "number": 6
+          }
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 7
           }
         }
       },
@@ -2489,30 +2611,308 @@
       "title": "ConformanceProfile",
       "type": "string"
     },
-    "Contract": {
+    "ConnectAttemptId": {
+      "description": "Client-minted retry key for one durable session creation attempt.",
+      "pattern": "^try_[a-z2-7]{26}$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "ConnectAttemptId",
+      "type": "string"
+    },
+    "ConnectRequest": {
       "additionalProperties": false,
-      "description": "Which protocol contract this server speaks. The version selects compatibility behavior. The schema identifier names the JSON contract exposed through MCP.",
+      "description": "Opens one logical client connection before another server RPC. The control stream\nremains open for the connection lifetime.",
       "properties": {
-        "protocol": {
-          "$ref": "#/$defs/ProtocolVersion",
-          "description": "The protocol version both sides have to agree on before any other field is meaningful.",
+        "contracts": {
+          "description": "Supported contracts in client preference order.",
+          "items": {
+            "$ref": "#/$defs/Contract"
+          },
+          "minItems": 1,
           "rift:proto": {
             "number": 1
-          }
+          },
+          "title": "Contracts",
+          "type": "array"
         },
-        "schema": {
-          "const": "https://volar.sh/rift/protocol/mcp.json",
-          "description": "Canonical identifier of the MCP JSON Schema. The protocol version selects its matching generated Protobuf packages.",
+        "features": {
+          "description": "Optional behaviors implemented by the client, sorted by identifier.",
+          "items": {
+            "$ref": "#/$defs/FeatureId"
+          },
           "rift:proto": {
             "number": 2
           },
-          "title": "Schema",
+          "title": "Features",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "role": {
+          "$ref": "#/$defs/ConnectRole",
+          "description": "Whether the connection serves MCP requests or a read-only SCIP projection.",
+          "rift:proto": {
+            "number": 3
+          }
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Durable session to attach. Null creates one for an MCP role.",
+          "rift:proto": {
+            "number": 4
+          }
+        },
+        "connect_attempt_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectAttemptId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Retry key required when an MCP role creates a session. The server commits its mapping to the new session in the same registry transaction.",
+          "rift:proto": {
+            "number": 5
+          }
+        },
+        "canonical_root": {
+          "description": "Canonical absolute UTF-8 path through which the client reached `.rift`. The server uses it to detect a moved or copied workspace.",
+          "maxLength": 32768,
+          "minLength": 1,
+          "rift:proto": {
+            "number": 6
+          },
+          "title": "Canonical Root",
+          "type": "string"
+        },
+        "client_build": {
+          "description": "Client build as it names itself in diagnostics.",
+          "maxLength": 256,
+          "minLength": 1,
+          "rift:proto": {
+            "number": 7
+          },
+          "title": "Client Build",
           "type": "string"
         }
       },
       "required": [
-        "protocol",
-        "schema"
+        "contracts",
+        "features",
+        "role",
+        "canonical_root",
+        "client_build"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.ConnectRequest"
+      },
+      "title": "ConnectRequest",
+      "type": "object"
+    },
+    "ConnectRole": {
+      "description": "How this connection will use the workspace server.",
+      "enum": [
+        "mcp",
+        "scip"
+      ],
+      "rift:enumDescriptions": {
+        "mcp": "An MCP bridge that creates or attaches a durable session.",
+        "scip": "A read-only SCIP projection client with no session."
+      },
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Role",
+        "field": "role",
+        "number": 3,
+        "values": {
+          "mcp": {
+            "name": "ROLE_MCP",
+            "number": 1
+          },
+          "scip": {
+            "name": "ROLE_SCIP",
+            "number": 2
+          }
+        }
+      },
+      "title": "ConnectRole",
+      "type": "string"
+    },
+    "ConnectionEvent": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "description": "The first event on an accepted control stream.",
+          "properties": {
+            "contract": {
+              "$ref": "#/$defs/Contract",
+              "description": "Exact generated contract selected for this connection.",
+              "rift:proto": {
+                "number": 1
+              }
+            },
+            "features": {
+              "description": "Features implemented by both peers, sorted by identifier.",
+              "items": {
+                "$ref": "#/$defs/FeatureId"
+              },
+              "rift:proto": {
+                "number": 2
+              },
+              "title": "Features",
+              "type": "array",
+              "uniqueItems": true
+            },
+            "workspace": {
+              "$ref": "#/$defs/WorkspaceId",
+              "description": "Workspace identity read from `.rift/workspace-id`.",
+              "rift:proto": {
+                "number": 3
+              }
+            },
+            "session": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SessionId"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Created or attached session for an MCP role; null for a SCIP role.",
+              "rift:proto": {
+                "number": 4
+              }
+            },
+            "connection": {
+              "$ref": "#/$defs/ConnectionId",
+              "description": "Identity required in metadata on every later RPC.",
+              "rift:proto": {
+                "number": 5
+              }
+            }
+          },
+          "required": [
+            "contract",
+            "features",
+            "workspace",
+            "connection"
+          ],
+          "rift:package": "rift.mcp",
+          "rift:proto": {
+            "type": "rift.mcp.Connected"
+          },
+          "title": "Connected",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Signals that adapter or policy changes altered the MCP tool manifest.",
+          "properties": {
+            "generation": {
+              "description": "Monotonic server-process generation for the new manifest.",
+              "maximum": 18446744073709551615,
+              "minimum": 1,
+              "rift:proto": {
+                "number": 1,
+                "scalar": "uint64"
+              },
+              "title": "Generation",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "generation"
+          ],
+          "rift:package": "rift.mcp",
+          "rift:proto": {
+            "type": "rift.mcp.ToolsChanged"
+          },
+          "title": "ToolsChanged",
+          "type": "object"
+        }
+      ],
+      "description": "One event on the connection control stream. `connected` appears first and once; later\nevents report live capability changes.",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "oneof": "event",
+        "type": "rift.mcp.ConnectionEvent",
+        "variants": [
+          {
+            "field": "connected",
+            "number": 1,
+            "tag": null,
+            "type": "Connected"
+          },
+          {
+            "field": "tools_changed",
+            "number": 2,
+            "tag": null,
+            "type": "ToolsChanged"
+          }
+        ]
+      },
+      "title": "ConnectionEvent"
+    },
+    "ConnectionId": {
+      "description": "Random 128-bit identity of one live control stream. Subsequent RPCs carry it in\n`rift-connection-id` metadata.",
+      "pattern": "^con_[a-z2-7]{26}$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "ConnectionId",
+      "type": "string"
+    },
+    "Contract": {
+      "additionalProperties": false,
+      "description": "One generated wire contract. A peer accepts it only when all three fields match one of its own generated descriptors.",
+      "properties": {
+        "major": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "Breaking protocol generation selected before the socket is opened.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "minor": {
+          "description": "Additive revision within the selected major.",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "rift:proto": {
+            "number": 2,
+            "scalar": "uint32"
+          },
+          "title": "Minor",
+          "type": "integer"
+        },
+        "schema_digest": {
+          "$ref": "#/$defs/Digest",
+          "description": "SHA-256 of the generated descriptor and its MCP conversion metadata. Equal major and minor values with different digests are incompatible.",
+          "rift:proto": {
+            "number": 3
+          }
+        }
+      },
+      "required": [
+        "major",
+        "minor",
+        "schema_digest"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -3312,6 +3712,43 @@
     },
     "DeleteParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "Removes a declaration. Without a policy this is a mechanical removal that analyses no references and claims no reference guarantee. With one, the adapter classifies every remaining use, applies the stated disposition, and refuses the operation when reference coverage is incomplete.",
       "properties": {
         "on": {
@@ -3378,6 +3815,21 @@
           "description": "The disposition for each classified use, and the source it may be applied in.",
           "rift:proto": {
             "number": 6
+          }
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 7
           }
         }
       },
@@ -4245,6 +4697,43 @@
     },
     "EditParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "Concrete filesystem edits supplied by the caller. Their ranges address the state this operation resolves against, and replacements in one set may not overlap.",
       "properties": {
         "on": {
@@ -4310,6 +4799,21 @@
           },
           "title": "Edits",
           "type": "array"
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 6
+          }
         }
       },
       "required": [
@@ -4421,7 +4925,11 @@
         "adapter_timeout",
         "storage_failure",
         "validator_execution_failure",
-        "internal_error"
+        "internal_error",
+        "unsupported_path",
+        "cursor_expired",
+        "state_corrupt",
+        "temporarily_unavailable"
       ],
       "rift:enumDescriptions": {
         "adapter_protocol_error": "An adapter contract is unusable. Causes include a malformed message, a field outside its range, ambiguous source or virtual claims, overlapping write claims, a virtual path collision, and a cycle in virtual-source routing. Correct the adapter configuration before retrying.",
@@ -4429,6 +4937,7 @@
         "adapter_unavailable": "No adapter is running for the language the request names: none is installed, or the one that was has died. A structural query against a language with no adapter lands here.",
         "cancelled": "The caller cancelled, or the connection went away before the request finished. Sending it again is fine.",
         "content_unavailable": "The entry is known but its bytes cannot be produced: an LFS object Rift does not fetch, or a blob the object store cannot read. Retrying does not help.",
+        "cursor_expired": "The cursor is valid, but its immutable result generation left the process-local cache. Start again from the first page.",
         "cursor_invalid": "The cursor is malformed, or it was minted for a different request, order or page size. Start the query again from its first page.",
         "cursor_snapshot_mismatch": "The cursor is well-formed but the state it was minted against has moved, so continuing it would splice two different answers together. Start again against the current state.",
         "deadline_exceeded": "The request ran past its time budget. A smaller one may succeed \u2014 a lower `limit`, a narrower path selector \u2014 and so may the same one once a cold adapter has warmed up.",
@@ -4442,7 +4951,10 @@
         "semantic_snapshot_mismatch": "The snapshot passed back is no longer one the server can answer from \u2014 the working tree moved under it, or the adapter that held its facts was restarted. Re-read the current snapshot and rebuild whatever was pinned to the old one.",
         "semantic_snapshot_unavailable": "The revision resolves, but Rift has no index for it yet: the adapters are still analysing, or that state's facts were dropped. Retrying once indexing catches up succeeds.",
         "snapshot_not_found": "The revision does not resolve here: a deleted branch, a commit never fetched, a working tree that has been removed. Retrying helps only once the revision exists.",
-        "storage_failure": "Rift could not read or write its own state \u2014 the semantic database, the git object store, the socket directory. Worth retrying only if the cause was transient, such as a disk that has since been cleared.",
+        "state_corrupt": "The workspace registry, Git state, and registered worktrees disagree, and reconciliation cannot choose a safe repair. A local state command must resolve it.",
+        "storage_failure": "Rift could not read or write its own state \u2014 the workspace registry, the git object store, the socket directory. Worth retrying only if the cause was transient, such as a disk that has since been cleared.",
+        "temporarily_unavailable": "The resource exists, but Rift cannot produce a safe answer yet. Publication recovery can require a local operator decision before a retry.",
+        "unsupported_path": "Git contains a path the protocol or host filesystem cannot represent safely. The same snapshot remains unusable until that path changes.",
         "unsupported_protocol": "The client and server use different protocol versions. Compare `Contract` with the client's supported contract.",
         "validator_execution_failure": "Rift could not prepare the validation workspace, launch the command validator, enforce its timeout, or capture its output. One retry is reasonable when the host failure was transient.",
         "worktree_busy": "Another Rift process holds the lease on the working tree this request has to touch. Contention is transient, so the same request retries."
@@ -4471,6 +4983,10 @@
           "content_unavailable": {
             "name": "ERROR_CODE_CONTENT_UNAVAILABLE",
             "number": 10
+          },
+          "cursor_expired": {
+            "name": "ERROR_CODE_CURSOR_EXPIRED",
+            "number": 24
           },
           "cursor_invalid": {
             "name": "ERROR_CODE_CURSOR_INVALID",
@@ -4524,9 +5040,21 @@
             "name": "ERROR_CODE_SNAPSHOT_NOT_FOUND",
             "number": 4
           },
+          "state_corrupt": {
+            "name": "ERROR_CODE_STATE_CORRUPT",
+            "number": 25
+          },
           "storage_failure": {
             "name": "ERROR_CODE_STORAGE_FAILURE",
             "number": 20
+          },
+          "temporarily_unavailable": {
+            "name": "ERROR_CODE_TEMPORARILY_UNAVAILABLE",
+            "number": 26
+          },
+          "unsupported_path": {
+            "name": "ERROR_CODE_UNSUPPORTED_PATH",
+            "number": 23
           },
           "unsupported_protocol": {
             "name": "ERROR_CODE_UNSUPPORTED_PROTOCOL",
@@ -5211,6 +5739,17 @@
         }
       },
       "title": "FactFamily",
+      "type": "string"
+    },
+    "FeatureId": {
+      "description": "One optional behavior implemented by a client or server.",
+      "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "FeatureId",
       "type": "string"
     },
     "FieldFilter": {
@@ -6569,10 +7108,18 @@
           "rift:proto": {
             "number": 2
           }
+        },
+        "publication": {
+          "$ref": "#/$defs/PublicationPlan",
+          "description": "Command validators fixed for the retained integration preview.",
+          "rift:proto": {
+            "number": 3
+          }
         }
       },
       "required": [
-        "target"
+        "target",
+        "publication"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -7680,6 +8227,43 @@
     },
     "MergeParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "A three-way merge of one exact commit into the state this operation resolves against.",
       "properties": {
         "on": {
@@ -7732,6 +8316,21 @@
           "description": "Commit merged into the candidate state.",
           "rift:proto": {
             "number": 5
+          }
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 6
           }
         }
       },
@@ -7857,6 +8456,43 @@
     },
     "MoveParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "Moves a declaration or file to another container or path and updates the imports and references that reach it.",
       "properties": {
         "on": {
@@ -7923,6 +8559,21 @@
           "description": "The destination, and the source eligible for import and reference updates.",
           "rift:proto": {
             "number": 6
+          }
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 7
           }
         }
       },
@@ -9354,6 +10005,43 @@
     },
     "PatchParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the state it resolves against.",
       "properties": {
         "on": {
@@ -9416,6 +10104,21 @@
           },
           "title": "Patch",
           "type": "string"
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 6
+          }
         }
       },
       "required": [
@@ -9859,11 +10562,11 @@
       "title": "PreconditionValue"
     },
     "PreviewId": {
-      "description": "Identity of one retained candidate: base64url of the SHA-256 over the connection, the resolution base, the expected head, the preview this one continues, and the requested operation. The same request therefore names the same candidate, so a repeated call returns the retained plan instead of resolving and validating a second time. Reading the corresponding resource reveals the pinned base, the operation, resolved edits, validation evidence, and confirmations.",
+      "description": "Identity of one retained candidate: `prv_` followed by lowercase unpadded RFC 4648\nbase32 of SHA-256 over the durable session, resolution base, destination, expected head,\nparent preview, canonical operation, and publication plan. Repeating the same request returns\nthe retained preview.",
       "examples": [
-        "AQIDBAUGBwgJCgsMDQ4PEA"
+        "prv_aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq"
       ],
-      "pattern": "^[A-Za-z0-9_-]{16,128}$",
+      "pattern": "^prv_[a-z2-7]{52}$",
       "rift:package": "rift.core",
       "rift:proto": {
         "package": "rift.core",
@@ -10165,7 +10868,7 @@
           }
         },
         "validators": {
-          "description": "Command declarations supplied at publication, preserving declaration order. Empty until the candidate is published.",
+          "description": "Command declarations fixed by this preview's publication plan, preserving declaration order.",
           "items": {
             "$ref": "#/$defs/CommandValidator"
           },
@@ -10372,8 +11075,8 @@
       "type": "string"
     },
     "ProtocolVersion": {
-      "const": 1,
-      "description": "Which revision of this contract a message speaks. A single integer changes when a reader would break. The handshake compares it before either side reads request fields.",
+      "const": 2,
+      "description": "The protocol major. It changes when a peer cannot decode the next message safely. The\nworkspace lease exposes it before a client opens the version-independent server socket.",
       "rift:package": "rift.core",
       "rift:proto": {
         "package": "rift.core",
@@ -10382,9 +11085,36 @@
       "title": "ProtocolVersion",
       "type": "integer"
     },
+    "PublicationPlan": {
+      "additionalProperties": false,
+      "description": "Command checks fixed when a preview is created. Rift stores the complete plan with the\npreview and includes its canonical bytes in `PreviewId`.",
+      "properties": {
+        "validators": {
+          "description": "Checks run against the complete tip tree during publication, in declaration order. An empty array requests no command validators.",
+          "items": {
+            "$ref": "#/$defs/CommandValidator"
+          },
+          "rift:proto": {
+            "number": 1
+          },
+          "title": "Validators",
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "validators"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.PublicationPlan"
+      },
+      "title": "PublicationPlan",
+      "type": "object"
+    },
     "PublishParams": {
       "additionalProperties": false,
-      "description": "Publishes one retained candidate. Rift replays the chain's resolution, runs the declared command validators against the candidate, and advances the destination by compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration. Validators are declared here rather than at creation, so building a change does not pay for a test suite at every step.",
+      "description": "Publishes one retained candidate. Rift verifies the retained chain, runs the command validators fixed by the tip preview, and advances the destination by compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration.",
       "properties": {
         "preview": {
           "$ref": "#/$defs/PreviewId",
@@ -10404,24 +11134,11 @@
           "title": "Confirmations",
           "type": "array",
           "uniqueItems": true
-        },
-        "validators": {
-          "description": "Caller-supplied acceptance checks run against the candidate before it is published. The `edit` profile accepts an empty array; the `full` profile accepts up to `Limits.max_validators` declarations.",
-          "items": {
-            "$ref": "#/$defs/CommandValidator"
-          },
-          "rift:proto": {
-            "number": 3
-          },
-          "title": "Validators",
-          "type": "array",
-          "uniqueItems": true
         }
       },
       "required": [
         "preview",
-        "confirmations",
-        "validators"
+        "confirmations"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -10697,6 +11414,21 @@
           "description": "Accepted-ref head expected at publication. Omission selects the current accepted head. The selected commit must be an ancestor of `rev`.",
           "rift:proto": {
             "number": 3
+          }
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Replacement publication plan for the refreshed preview. Null preserves the exact plan stored by the earlier preview.",
+          "rift:proto": {
+            "number": 4
           }
         }
       },
@@ -11591,6 +12323,43 @@
     },
     "RenameParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "Changes what a declaration is called and rewrites the references that name it. The adapter checks language spelling, collisions, and binding changes; a reference outside `scope` refuses the operation rather than leaving it half done.",
       "properties": {
         "on": {
@@ -11657,6 +12426,21 @@
           "description": "The new name, and the source eligible for propagation.",
           "rift:proto": {
             "number": 6
+          }
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 7
           }
         }
       },
@@ -13189,10 +13973,12 @@
       "enum": [
         "never",
         "same_request",
-        "refresh_snapshot"
+        "refresh_snapshot",
+        "operator_action"
       ],
       "rift:enumDescriptions": {
         "never": "The request fails the same way every time. Change it or give up.",
+        "operator_action": "A local state command or policy change must resolve the condition before another request can succeed.",
         "refresh_snapshot": "The state moved under the request. Re-read the current state, rebuild whatever was pinned to the old one, then ask again.",
         "same_request": "Send the same bytes again. The cause was transient \u2014 a busy working tree, an adapter still starting."
       },
@@ -13204,6 +13990,10 @@
           "never": {
             "name": "RETRY_DIRECTIVE_NEVER",
             "number": 1
+          },
+          "operator_action": {
+            "name": "RETRY_DIRECTIVE_OPERATOR_ACTION",
+            "number": 4
           },
           "refresh_snapshot": {
             "name": "RETRY_DIRECTIVE_REFRESH_SNAPSHOT",
@@ -13220,6 +14010,43 @@
     },
     "RevertParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "A validated three-way inverse of one commit. Rift computes the difference from `parent` to `revision`, applies its inverse, and refuses overlapping changes it cannot merge without guessing.",
       "properties": {
         "on": {
@@ -13302,6 +14129,21 @@
           "rift:proto": {
             "number": 7
           }
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 8
+          }
         }
       },
       "required": [
@@ -13338,6 +14180,43 @@
     },
     "RewriteParams": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "on": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "publication": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "publication"
+            ]
+          }
+        }
+      ],
       "description": "An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the replacement, and either applies all resulting edits or refuses the candidate.",
       "properties": {
         "on": {
@@ -13418,6 +14297,21 @@
           "description": "The accepted number of matches before expansion.",
           "rift:proto": {
             "number": 8
+          }
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fixed command validators for this preview. A root candidate requires a plan, which may contain an empty array; null on a chained candidate inherits its parent plan.",
+          "rift:proto": {
+            "number": 9
           }
         }
       },
@@ -14311,6 +15205,17 @@
       },
       "title": "SemanticCoverage",
       "type": "object"
+    },
+    "SessionId": {
+      "description": "Random 128-bit identity of one durable accepted history.",
+      "pattern": "^ses_[a-z2-7]{26}$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "SessionId",
+      "type": "string"
     },
     "Severity": {
       "description": "How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their adapter's levels onto these four, so a caller can drop everything below `warning` without knowing which language produced it.",
@@ -16774,6 +17679,17 @@
         ]
       },
       "title": "ValidatorResult"
+    },
+    "WorkspaceId": {
+      "description": "Random 128-bit identity stored in `.rift/workspace-id`, encoded as lowercase unpadded\nRFC 4648 base32.",
+      "pattern": "^ws_[a-z2-7]{26}$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "WorkspaceId",
+      "type": "string"
     },
     "Worktree": {
       "description": "A working tree, spelled the way git reaches one from any other: `main-worktree` for the repository's own, and `worktrees/<name>` for a linked one.",

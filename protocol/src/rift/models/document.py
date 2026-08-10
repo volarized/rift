@@ -3,6 +3,17 @@
 from . import core, mcp
 from .surface import Axis, Document, Resource, Rpc, Service, Tool, ToolGroup
 
+RPC_CONNECT = Rpc(
+    name="Connect",
+    request=mcp.ConnectRequest,
+    response=mcp.ConnectionEvent,
+    response_stream=True,
+    description=(
+        "Opens the control stream that owns one logical client connection. The first event "
+        "selects the wire contract and returns the connection identity required by later RPCs."
+    ),
+)
+
 RPC_TREE = Rpc(
     name="Tree",
     request=mcp.TreeParams,
@@ -201,8 +212,8 @@ RPC_REFRESH = Rpc(
     response=mcp.RefreshResult,
     description=(
         "Reruns a retained candidate's operation against a newer base and reports how much the "
-        "result moved. The candidate holds the request it was built from, so nothing has to be "
-        "restated."
+        "result moved. It preserves the stored publication plan unless the caller supplies a "
+        "replacement for the new preview."
     ),
 )
 
@@ -211,7 +222,7 @@ RPC_PUBLISH = Rpc(
     request=mcp.PublishParams,
     response=mcp.PublishResult,
     description=(
-        "Runs the declared command validators against a retained candidate and advances its "
+        "Runs the retained preview's command validators and advances its "
         "destination by compare-and-swap: the accepted ref for an ordinary candidate, the "
         "target branch for an integration. A retry that finds the destination already holding "
         "the candidate returns the same result."
@@ -239,6 +250,7 @@ RIFT_SERVICE = Service(
     name="Rift",
     description="The Protobuf service exposed by the Rift server. `rift mcp` maps its JSON entry points to these methods.",
     rpcs=(
+        RPC_CONNECT,
         RPC_TREE,
         RPC_OUTLINE,
         RPC_SEARCH,
@@ -274,9 +286,9 @@ DOCUMENT = Document(
         "carries the Protobuf identity used after `rift mcp` decodes the request."
     ),
     entry_points_description=(
-        "Tools map MCP request and result JSON to Rift service methods. Resources map each "
-        "URI family to its template, link, and payload types. Every other schema definition "
-        "is reachable from one of these entries."
+        "The internal connection stream establishes the gRPC context used by later calls. Tools "
+        "map MCP request and result JSON to Rift service methods. Each resource entry maps one "
+        "URI family to the types that carry it."
     ),
     service=RIFT_SERVICE,
     tool_groups=(
@@ -588,6 +600,17 @@ DOCUMENT = Document(
                 mcp.DebugGetFrameResult,
                 mcp.DebugStopParams,
                 mcp.DebugStopResult,
+            ),
+        ),
+        Axis(
+            name="Connection",
+            summary=(
+                "Control-stream negotiation and the logical identities required before an "
+                "application RPC."
+            ),
+            identified_by=(
+                mcp.ConnectRequest,
+                mcp.ConnectionEvent,
             ),
         ),
         Axis(

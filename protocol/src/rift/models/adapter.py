@@ -9,19 +9,38 @@ from .base import *
 @proto_message(
     DirectMessage(
         ADAPTER,
+        description="One generated adapter wire contract supported by the process.",
+        section="Capabilities",
+    )
+)
+class AdapterContract(ProtoModel):
+    major: Field[core.ProtocolVersion] = proto_field(
+        default=..., number=1, description="Breaking adapter protocol generation."
+    )
+    minor: Field[int] = proto_field(
+        default=...,
+        number=2,
+        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
+        description="Additive revision within the selected major.",
+    )
+    schema_digest: Field[core.Digest] = proto_field(
+        default=...,
+        number=3,
+        description="SHA-256 of the generated adapter descriptor.",
+    )
+
+
+@proto_message(
+    DirectMessage(
+        ADAPTER,
         description="Adapter capabilities read once during startup.",
+        reserved_numbers=(1,),
         section="Capabilities",
     )
 )
 class Capabilities(ProtoModel):
     """Adapter capabilities read once during startup."""
 
-    protocol_version: Field[int] = proto_field(
-        default=...,
-        number=1,
-        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
-        description="The contract version this adapter implements. A mismatch stops startup.",
-    )
     language: Field[core.Language] = proto_field(
         default=...,
         number=2,
@@ -97,6 +116,11 @@ class Capabilities(ProtoModel):
         number=13,
         description="Execution behavior the host should account for while this adapter runs.",
     )
+    contracts: Field[list[AdapterContract]] = proto_field(
+        default=...,
+        number=14,
+        description="Supported generated contracts in adapter preference order.",
+    )
 
     @model_validator(mode="after")
     def operation_sets_are_consistent(self) -> Capabilities:
@@ -117,6 +141,8 @@ class Capabilities(ProtoModel):
         }
         if operations.intersection(debug) and not debug.issubset(operations):
             raise ValueError("Capabilities debugging operations are all-or-none")
+        if not self.contracts:
+            raise ValueError("Capabilities.contracts must not be empty")
         return self
 
 
@@ -608,6 +634,11 @@ class OpenRequest(ProtoModel):
     )
     snapshot: Field[core.Snapshot] = proto_field(
         default=..., number=3, description="The state that tree holds."
+    )
+    contract: Field[AdapterContract] = proto_field(
+        default=...,
+        number=4,
+        description="Exact contract selected from the adapter's `Capabilities.contracts`.",
     )
 
 
@@ -1807,6 +1838,7 @@ ADAPTER_PACKAGE = ProtoPackage(
         section_option=True,
     ),
     models=(
+        AdapterContract,
         Capabilities,
         SourceClaim,
         AuxiliaryClaim,

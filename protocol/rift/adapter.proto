@@ -26,11 +26,20 @@ enum CacheScope {
   // The result is request-volatile and is not retained.
   NONE = 3;
 }
+// One generated adapter wire contract supported by the process.
+message AdapterContract {
+  option (section) = "Capabilities";
+  // Breaking adapter protocol generation.
+  int64 major = 1;
+  // Additive revision within the selected major.
+  uint32 minor = 2;
+  // SHA-256 of the generated adapter descriptor.
+  string schema_digest = 3;
+}
 // Adapter capabilities read once during startup.
 message Capabilities {
   option (section) = "Capabilities";
-  // The contract version this adapter implements. A mismatch stops startup.
-  uint32 protocol_version = 1;
+  reserved 1;
   // Language name and optional dialect handled by this configured adapter process. A workspace
   // configures at most one process for the exact pair; that process can hold many adapter
   // states.
@@ -62,6 +71,8 @@ message Capabilities {
   rift.adapter.AdapterLimits limits = 12;
   // Execution behavior the host should account for while this adapter runs.
   rift.adapter.RuntimeRequirements runtime = 13;
+  // Supported generated contracts in adapter preference order.
+  repeated rift.adapter.AdapterContract contracts = 14;
 }
 // A deterministic claim on physical files, re-evaluated after every path or
 // content change. Selectors are ORed and compare UTF-8 bytes: suffixes against
@@ -261,6 +272,8 @@ message OpenRequest {
   string state_root = 2;
   // The state that tree holds.
   rift.core.Snapshot snapshot = 3;
+  // Exact contract selected from the adapter's `Capabilities.contracts`.
+  rift.adapter.AdapterContract contract = 4;
 }
 // Rift rewrote the tree in place under the connection-wide write barrier. It sends
 // this call to every language adapter holding the shared path. Paths are

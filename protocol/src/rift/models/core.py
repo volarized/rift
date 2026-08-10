@@ -8,10 +8,11 @@ from .base import *
 @scalar(
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_INT64,
-    root=Literal[1],
+    root=Literal[2],
 )
 class ProtocolVersion(ProtocolRoot):
-    """Which revision of this contract a message speaks. A single integer changes when a reader would break. The handshake compares it before either side reads request fields."""
+    """The protocol major. It changes when a peer cannot decode the next message safely. The
+    workspace lease exposes it before a client opens the version-independent server socket."""
 
 
 @scalar(
@@ -710,11 +711,14 @@ class DiffId(ProtocolRoot):
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern="^[A-Za-z0-9_-]{16,128}$",
-    examples=["AQIDBAUGBwgJCgsMDQ4PEA"],
+    pattern=r"^prv_[a-z2-7]{52}$",
+    examples=["prv_aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq"],
 )
 class PreviewId(ProtocolRoot):
-    """Identity of one retained candidate: base64url of the SHA-256 over the connection, the resolution base, the expected head, the preview this one continues, and the requested operation. The same request therefore names the same candidate, so a repeated call returns the retained plan instead of resolving and validating a second time. Reading the corresponding resource reveals the pinned base, the operation, resolved edits, validation evidence, and confirmations."""
+    """Identity of one retained candidate: `prv_` followed by lowercase unpadded RFC 4648
+    base32 of SHA-256 over the durable session, resolution base, destination, expected head,
+    parent preview, canonical operation, and publication plan. Repeating the same request returns
+    the retained preview."""
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})

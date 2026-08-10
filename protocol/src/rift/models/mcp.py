@@ -656,20 +656,222 @@ class DiffResourcePayload(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class Contract(ClosedModel):
-    "Which protocol contract this server speaks. The version selects compatibility behavior. The schema identifier names the JSON contract exposed through MCP."
+    "One generated wire contract. A peer accepts it only when all three fields match one of its own generated descriptors."
 
-    protocol: Field[core.ProtocolVersion] = proto_field(
-        description="The protocol version both sides have to agree on before any other field is meaningful.",
+    major: Field[core.ProtocolVersion] = proto_field(
+        description="Breaking protocol generation selected before the socket is opened.",
         number=1,
     )
-    schema_: Field[Literal["https://volar.sh/rift/protocol/mcp.json"]] = proto_field(
-        alias="schema",
-        description=(
-            "Canonical identifier of the MCP JSON Schema. The protocol version selects its "
-            "matching generated Protobuf packages."
-        ),
+    minor: Field[int] = proto_field(
+        description="Additive revision within the selected major.",
+        ge=0,
+        le=4294967295,
         number=2,
+        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
     )
+    schema_digest: Field[core.Digest] = proto_field(
+        description=(
+            "SHA-256 of the generated descriptor and its MCP conversion metadata. Equal major "
+            "and minor values with different digests are incompatible."
+        ),
+        number=3,
+    )
+
+
+@scalar(
+    owner=MCP,
+    public=False,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^ws_[a-z2-7]{26}$",
+)
+class WorkspaceId(ProtocolRoot):
+    """Random 128-bit identity stored in `.rift/workspace-id`, encoded as lowercase unpadded
+    RFC 4648 base32."""
+
+
+@scalar(
+    owner=MCP,
+    public=False,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^ses_[a-z2-7]{26}$",
+)
+class SessionId(ProtocolRoot):
+    """Random 128-bit identity of one durable accepted history."""
+
+
+@scalar(
+    owner=MCP,
+    public=False,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^con_[a-z2-7]{26}$",
+)
+class ConnectionId(ProtocolRoot):
+    """Random 128-bit identity of one live control stream. Subsequent RPCs carry it in
+    `rift-connection-id` metadata."""
+
+
+@scalar(
+    owner=MCP,
+    public=False,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^try_[a-z2-7]{26}$",
+)
+class ConnectAttemptId(ProtocolRoot):
+    """Client-minted retry key for one durable session creation attempt."""
+
+
+@scalar(
+    owner=MCP,
+    public=False,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^[a-z][a-z0-9_.-]{0,127}$",
+)
+class FeatureId(ProtocolRoot):
+    """One optional behavior implemented by a client or server."""
+
+
+@definition(
+    owner=MCP,
+    public=False,
+    proto=Proto.enum(
+        "Role",
+        (
+            EnumValue("mcp", "ROLE_MCP", 1),
+            EnumValue("scip", "ROLE_SCIP", 2),
+        ),
+        placement=Placement("role", 3),
+    ),
+    schema_extra={
+        "rift:enumDescriptions": {
+            "mcp": "An MCP bridge that creates or attaches a durable session.",
+            "scip": "A read-only SCIP projection client with no session.",
+        }
+    },
+)
+class ConnectRole(str, Enum):
+    """How this connection will use the workspace server."""
+
+    MCP = "mcp"
+    SCIP = "scip"
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ConnectRequest(ClosedModel):
+    """Opens one logical client connection before another server RPC. The control stream
+    remains open for the connection lifetime."""
+
+    contracts: Field[list[Contract]] = proto_field(
+        description="Supported contracts in client preference order.",
+        min_length=1,
+        number=1,
+    )
+    features: Field[list[FeatureId]] = proto_field(
+        description="Optional behaviors implemented by the client, sorted by identifier.",
+        number=2,
+        json_schema_extra={"uniqueItems": True},
+    )
+    role: Field[ConnectRole] = proto_field(
+        description="Whether the connection serves MCP requests or a read-only SCIP projection.",
+        number=3,
+    )
+    session: Field[SessionId | None] = proto_field(
+        default=None,
+        description="Durable session to attach. Null creates one for an MCP role.",
+        number=4,
+    )
+    connect_attempt_id: Field[ConnectAttemptId | None] = proto_field(
+        default=None,
+        description=(
+            "Retry key required when an MCP role creates a session. The server commits its "
+            "mapping to the new session in the same registry transaction."
+        ),
+        number=5,
+    )
+    canonical_root: Field[str] = proto_field(
+        description=(
+            "Canonical absolute UTF-8 path through which the client reached `.rift`. The server "
+            "uses it to detect a moved or copied workspace."
+        ),
+        min_length=1,
+        max_length=32768,
+        number=6,
+    )
+    client_build: Field[str] = proto_field(
+        description="Client build as it names itself in diagnostics.",
+        min_length=1,
+        max_length=256,
+        number=7,
+    )
+
+    @model_validator(mode="after")
+    def role_has_valid_session_fields(self) -> ConnectRequest:
+        if self.role == ConnectRole.MCP:
+            if self.session is None and self.connect_attempt_id is None:
+                raise ValueError("MCP session creation requires connect_attempt_id")
+            if self.session is not None and self.connect_attempt_id is not None:
+                raise ValueError(
+                    "MCP session attachment cannot carry connect_attempt_id"
+                )
+        elif self.session is not None or self.connect_attempt_id is not None:
+            raise ValueError("SCIP connections cannot carry session fields")
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class Connected(ClosedModel):
+    """The first event on an accepted control stream."""
+
+    contract: Field[Contract] = proto_field(
+        description="Exact generated contract selected for this connection.", number=1
+    )
+    features: Field[list[FeatureId]] = proto_field(
+        description="Features implemented by both peers, sorted by identifier.",
+        number=2,
+        json_schema_extra={"uniqueItems": True},
+    )
+    workspace: Field[WorkspaceId] = proto_field(
+        description="Workspace identity read from `.rift/workspace-id`.", number=3
+    )
+    session: Field[SessionId | None] = proto_field(
+        default=None,
+        description="Created or attached session for an MCP role; null for a SCIP role.",
+        number=4,
+    )
+    connection: Field[ConnectionId] = proto_field(
+        description="Identity required in metadata on every later RPC.", number=5
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ToolsChanged(ClosedModel):
+    """Signals that adapter or policy changes altered the MCP tool manifest."""
+
+    generation: Field[int] = proto_field(
+        description="Monotonic server-process generation for the new manifest.",
+        ge=1,
+        le=18446744073709551615,
+        number=1,
+        proto_type=ProtoFieldDescriptor.TYPE_UINT64,
+    )
+
+
+@union(
+    owner=MCP,
+    public=False,
+    oneof="event",
+    variants=(
+        Variant(None, "connected", 1, Connected),
+        Variant(None, "tools_changed", 2, ToolsChanged),
+    ),
+)
+class ConnectionEvent(ProtocolRoot):
+    """One event on the connection control stream. `connected` appears first and once; later
+    events report live capability changes."""
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -1615,6 +1817,14 @@ class DiagnosticContext(ClosedModel):
                 21,
             ),
             EnumValue("internal_error", "ERROR_CODE_INTERNAL_ERROR", 22),
+            EnumValue("unsupported_path", "ERROR_CODE_UNSUPPORTED_PATH", 23),
+            EnumValue("cursor_expired", "ERROR_CODE_CURSOR_EXPIRED", 24),
+            EnumValue("state_corrupt", "ERROR_CODE_STATE_CORRUPT", 25),
+            EnumValue(
+                "temporarily_unavailable",
+                "ERROR_CODE_TEMPORARILY_UNAVAILABLE",
+                26,
+            ),
         ),
         named=True,
     ),
@@ -1709,7 +1919,7 @@ class DiagnosticContext(ClosedModel):
                 "work: a cold adapter on a large workspace is slow once and fast afterwards."
             ),
             "storage_failure": (
-                "Rift could not read or write its own state — the semantic database, the git "
+                "Rift could not read or write its own state — the workspace registry, the git "
                 "object store, the socket directory. Worth retrying only if the cause was "
                 "transient, such as a disk that has since been cleared."
             ),
@@ -1721,6 +1931,22 @@ class DiagnosticContext(ClosedModel):
             "internal_error": (
                 "A bug in Rift. `causes` says what it was doing at the time, and a retry is not "
                 "expected to answer differently."
+            ),
+            "unsupported_path": (
+                "Git contains a path the protocol or host filesystem cannot represent safely. "
+                "The same snapshot remains unusable until that path changes."
+            ),
+            "cursor_expired": (
+                "The cursor is valid, but its immutable result generation left the process-local "
+                "cache. Start again from the first page."
+            ),
+            "state_corrupt": (
+                "The workspace registry, Git state, and registered worktrees disagree, and "
+                "reconciliation cannot choose a safe repair. A local state command must resolve it."
+            ),
+            "temporarily_unavailable": (
+                "The resource exists, but Rift cannot produce a safe answer yet. Publication "
+                "recovery can require a local operator decision before a retry."
             ),
         }
     },
@@ -1750,6 +1976,10 @@ class ErrorCode(str, Enum):
     STORAGE_FAILURE = "storage_failure"
     VALIDATOR_EXECUTION_FAILURE = "validator_execution_failure"
     INTERNAL_ERROR = "internal_error"
+    UNSUPPORTED_PATH = "unsupported_path"
+    CURSOR_EXPIRED = "cursor_expired"
+    STATE_CORRUPT = "state_corrupt"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
 
 
 @definition(
@@ -1761,6 +1991,7 @@ class ErrorCode(str, Enum):
             EnumValue("never", "RETRY_DIRECTIVE_NEVER", 1),
             EnumValue("same_request", "RETRY_DIRECTIVE_SAME_REQUEST", 2),
             EnumValue("refresh_snapshot", "RETRY_DIRECTIVE_REFRESH_SNAPSHOT", 3),
+            EnumValue("operator_action", "RETRY_DIRECTIVE_OPERATOR_ACTION", 4),
         ),
         named=True,
     ),
@@ -1775,6 +2006,10 @@ class ErrorCode(str, Enum):
                 "The state moved under the request. Re-read the current state, rebuild whatever "
                 "was pinned to the old one, then ask again."
             ),
+            "operator_action": (
+                "A local state command or policy change must resolve the condition before another "
+                "request can succeed."
+            ),
         }
     },
 )
@@ -1784,6 +2019,7 @@ class RetryDirective(str, Enum):
     NEVER = "never"
     SAME_REQUEST = "same_request"
     REFRESH_SNAPSHOT = "refresh_snapshot"
+    OPERATOR_ACTION = "operator_action"
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -2474,7 +2710,33 @@ class SearchHitTarget(ProtocolRoot):
     """What a search hit is. Tagged, so the payload correlation survives code generation."""
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+CANDIDATE_PUBLICATION_SCHEMA = {
+    "allOf": [
+        {
+            "if": {
+                "anyOf": [
+                    {"not": {"required": ["on"]}},
+                    {
+                        "properties": {"on": {"type": "null"}},
+                        "required": ["on"],
+                    },
+                ]
+            },
+            "then": {
+                "properties": {"publication": {"not": {"type": "null"}}},
+                "required": ["publication"],
+            },
+        }
+    ]
+}
+
+
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class EditParams(ClosedModel):
     "Concrete filesystem edits supplied by the caller. Their ranges address the state this operation resolves against, and replacements in one set may not overlap."
 
@@ -2514,9 +2776,28 @@ class EditParams(ClosedModel):
         min_length=1,
         number=5,
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=6,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> EditParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class PatchParams(ClosedModel):
     "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the state it resolves against."
 
@@ -2553,6 +2834,20 @@ class PatchParams(ClosedModel):
         min_length=1,
         number=5,
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=6,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> PatchParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
 @definition(
@@ -2579,7 +2874,12 @@ class RewriteRange(str, Enum):
     BOTH = "both"
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class RewriteParams(ClosedModel):
     "An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the replacement, and either applies all resulting edits or refuses the candidate."
 
@@ -2633,9 +2933,28 @@ class RewriteParams(ClosedModel):
     cardinality: Field[core.MatchCardinality] = proto_field(
         description="The accepted number of matches before expansion.", number=8
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=9,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> RewriteParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class RevertParams(ClosedModel):
     "A validated three-way inverse of one commit. Rift computes the difference from `parent` to `revision`, applies its inverse, and refuses overlapping changes it cannot merge without guessing."
 
@@ -2687,9 +3006,28 @@ class RevertParams(ClosedModel):
         ),
         number=7,
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=8,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> RevertParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class MergeParams(ClosedModel):
     """A three-way merge of one exact commit into the state this operation resolves against."""
 
@@ -2721,9 +3059,28 @@ class MergeParams(ClosedModel):
     revision: Field[core.Commit] = proto_field(
         description="Commit merged into the candidate state.", number=5
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=6,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> MergeParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class RenameParams(ClosedModel):
     "Changes what a declaration is called and rewrites the references that name it. The adapter checks language spelling, collisions, and binding changes; a reference outside `scope` refuses the operation rather than leaving it half done."
 
@@ -2762,9 +3119,28 @@ class RenameParams(ClosedModel):
     arguments: Field[core.RenameArguments] = proto_field(
         description="The new name, and the source eligible for propagation.", number=6
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=7,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> RenameParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class MoveParams(ClosedModel):
     "Moves a declaration or file to another container or path and updates the imports and references that reach it."
 
@@ -2803,9 +3179,28 @@ class MoveParams(ClosedModel):
         description="The destination, and the source eligible for import and reference updates.",
         number=6,
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=7,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> MoveParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class DeleteParams(ClosedModel):
     "Removes a declaration. Without a policy this is a mechanical removal that analyses no references and claims no reference guarantee. With one, the adapter classifies every remaining use, applies the stated disposition, and refuses the operation when reference coverage is incomplete."
 
@@ -2844,9 +3239,28 @@ class DeleteParams(ClosedModel):
         description="The disposition for each classified use, and the source it may be applied in.",
         number=6,
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=7,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> DeleteParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class ChangeSignatureParams(ClosedModel):
     "Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument lists: a new required parameter has to be supplied at every call site, which is why the operation commonly raises a `behavior_unknown` confirmation."
 
@@ -2885,9 +3299,28 @@ class ChangeSignatureParams(ClosedModel):
         description="The desired callable shape, its propagation, and the source it may reach.",
         number=6,
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=7,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> ChangeSignatureParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.message(),
+    schema_extra=CANDIDATE_PUBLICATION_SCHEMA,
+)
 class ActParams(ClosedModel):
     "Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an adapter offers that has no portable contract. Rift validates `arguments` against the offer's advertised schema. An offer whose kind belongs to a portable family is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points."
 
@@ -2930,6 +3363,20 @@ class ActParams(ClosedModel):
         ),
         number=6,
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Fixed command validators for this preview. A root candidate requires a plan, "
+            "which may contain an empty array; null on a chained candidate inherits its parent plan."
+        ),
+        number=7,
+    )
+
+    @model_validator(mode="after")
+    def root_has_publication_plan(self) -> ActParams:
+        if self.on is None and self.publication is None:
+            raise ValueError("a root candidate requires publication")
+        return self
 
 
 @union(
@@ -3151,6 +3598,21 @@ class CommandValidator(ClosedModel):
     determinism: Field[CommandValidatorDeterminism] = proto_field(
         description="Whether an identical candidate and environment are expected to produce the same result.",
         number=10,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class PublicationPlan(ClosedModel):
+    """Command checks fixed when a preview is created. Rift stores the complete plan with the
+    preview and includes its canonical bytes in `PreviewId`."""
+
+    validators: Field[list[CommandValidator]] = proto_field(
+        description=(
+            "Checks run against the complete tip tree during publication, in declaration order. "
+            "An empty array requests no command validators."
+        ),
+        number=1,
+        json_schema_extra={"uniqueItems": True},
     )
 
 
@@ -3386,8 +3848,8 @@ class PreviewResourcePayload(ClosedModel):
     )
     validators: Field[list[CommandValidator]] = proto_field(
         description=(
-            "Command declarations supplied at publication, preserving declaration order. Empty "
-            "until the candidate is published."
+            "Command declarations fixed by this preview's publication plan, preserving "
+            "declaration order."
         ),
         number=14,
     )
@@ -3586,6 +4048,14 @@ class RefreshParams(ClosedModel):
         ),
         number=3,
     )
+    publication: Field[PublicationPlan | None] = proto_field(
+        default=None,
+        description=(
+            "Replacement publication plan for the refreshed preview. Null preserves the exact "
+            "plan stored by the earlier preview."
+        ),
+        number=4,
+    )
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
@@ -3637,7 +4107,7 @@ class RefreshResult(ProtocolRoot):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class PublishParams(ClosedModel):
-    "Publishes one retained candidate. Rift replays the chain's resolution, runs the declared command validators against the candidate, and advances the destination by compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration. Validators are declared here rather than at creation, so building a change does not pay for a test suite at every step."
+    "Publishes one retained candidate. Rift verifies the retained chain, runs the command validators fixed by the tip preview, and advances the destination by compare-and-swap: the accepted ref for an ordinary candidate, the target branch for an integration."
 
     preview: Field[core.PreviewId] = proto_field(
         description="The retained candidate to publish. Its chain publishes with it.",
@@ -3649,15 +4119,6 @@ class PublishParams(ClosedModel):
             "or extra ids refuse publication."
         ),
         number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
-    validators: Field[list[CommandValidator]] = proto_field(
-        description=(
-            "Caller-supplied acceptance checks run against the candidate before it is "
-            "published. The `edit` profile accepts an empty array; the `full` profile accepts "
-            "up to `Limits.max_validators` declarations."
-        ),
-        number=3,
         json_schema_extra={"uniqueItems": True},
     )
 
@@ -3779,6 +4240,10 @@ class IntegrateParams(ClosedModel):
         default=None,
         description="Accepted commit to integrate. Omission selects the connection's current accepted ref.",
         number=2,
+    )
+    publication: Field[PublicationPlan] = proto_field(
+        description="Command validators fixed for the retained integration preview.",
+        number=3,
     )
 
 
@@ -4300,6 +4765,16 @@ MODELS = (
     SymbolResourcePayload,
     DiffResourcePayload,
     Contract,
+    WorkspaceId,
+    SessionId,
+    ConnectionId,
+    ConnectAttemptId,
+    FeatureId,
+    ConnectRole,
+    ConnectRequest,
+    Connected,
+    ToolsChanged,
+    ConnectionEvent,
     DebugLimits,
     ExecutionLimits,
     Limits,
@@ -4349,6 +4824,7 @@ MODELS = (
     PreviewOperation,
     ResolvedOperation,
     CommandValidator,
+    PublicationPlan,
     ValidatorResult,
     CandidateValidation,
     CandidateSummary,
