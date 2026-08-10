@@ -50,8 +50,9 @@ gitrevisions has no way to name work that isn't committed yet, and that is usual
 
 Resource URIs percent-encode the UTF-8 revision as one query-parameter value. For example,
 `HEAD^{tree}` becomes `rev=HEAD%5E%7Btree%7D`; decoding yields the same `Revision` a tool accepts. The
-server passes the decoded value to Git after `--end-of-options` and verifies that it resolves to an
-object kind admitted by the operation.
+server passes the decoded value to the Git library's revision parser and verifies that it resolves to
+an object kind admitted by the operation. The leading-`-` restriction prevents option-like input from
+crossing implementations that also expose command syntax.
 
 ### Snapshot
 
@@ -229,8 +230,8 @@ defines that ownership boundary.
 
 An edit set is atomic. Every text range addresses the input state, and ranges in one set cannot
 overlap, and Rift orders the set by file and range before it crosses a seam. Where a later operation
-has to observe an earlier one, the caller chains candidates instead: each tool call takes the
-candidate it continues, so the second operation resolves against the first one's tree.
+has to observe an earlier one, the caller uses the resulting session commit as the next call's
+`expected_head`, so the second operation resolves against the first one's tree.
 
 Gitlink creation and update use `create_gitlink` and `set_gitlink`. Delete and rename also apply to a
 gitlink entry. Copy and executable-bit changes apply to regular files. The pinned snapshot supplies the
@@ -466,16 +467,15 @@ mid-construct, as it can while an agent is writing a file.
 ### ValidationReport
 
 A [`ValidationReport`](/docs/protocol/reference#ValidationReport) records one adapter's verdict over a
-candidate commit. It names the language, the files checked, the adapter diagnostics, and the coverage
+session commit or merged tree. It names the language, files checked, adapter diagnostics, and coverage
 of the affected program. Workspace validation policy selects required reports independently of source
 ownership. The default requires complete, valid reports from affected adapters that advertise
 validation; a repository can instead list exact `Language` values as fixed gates.
 
-The MCP surface combines those adapter reports with results from command validators declared when the
-preview is created and executed during publication. Its validation strength says whether the result
-contains mechanical checks, every available report, or a fixed required language set. The workspace
-registry stores the evidence with the preview, so the accepted result remains auditable while that
-preview record is retained.
+The MCP surface combines those adapter reports with command-validator results produced before
+integration. Its validation strength says whether the result contains mechanical checks, every
+available report, or a fixed required language set. The response carries the evidence, while a
+disposable cache may reuse it only for the same complete Git and execution-policy identity.
 
 ## Operations
 
@@ -519,7 +519,7 @@ family. An agent can request a prefix such as `quickfix` or `refactor.extract`.
 
 `applicability` records how the action was selected. `always` needs no caller-supplied fact before
 resolution. `conditional` exposes a condition outside the adapter's knowledge.
-`speculative` records inferred intent. Every branch still passes preview validation.
+`speculative` records inferred intent. Every resulting session commit still passes adapter validation.
 
 The descriptor lists the guarantees resolution must establish. `syntax_validated` covers parsing;
 `bindings_preserved` covers unchanged references; `references_updated` covers references that should
@@ -557,8 +557,8 @@ kinds. An adapter-specific condition retains its diagnostics.
 An `OperationEffect` explains the semantic consequence of exact edits: a declaration was created,
 removed, moved, or changed; references or imports were updated; source was rewritten; or formatting
 ran. `GuaranteeEvidence` then states the scope, verifier, method, and diagnostics for one advertised
-guarantee. These records let a preview show why an action is admissible without replacing the concrete
-`Edit` values that determine the candidate tree.
+guarantee. These records let a change result show why an action is admissible without replacing the
+concrete `Edit` values that determine the committed tree.
 
 Commit reversion stays on the MCP seam because it is a request envelope over versioning and edits. The
 `revert` tool selects an exact commit, its parent, and eligible paths. Rift computes a three-way

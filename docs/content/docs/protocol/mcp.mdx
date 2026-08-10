@@ -6,13 +6,13 @@ import { McpReference } from "@/components/protocol/mcp";
 
 Agents reach Rift through MCP tools and resources. A client begins by reading the repository resource,
 which reports the surface this workspace serves, its configured language adapters, and the limits on
-requests and retained records.
+requests and disposable caches.
 
 | Profile | Additional surface |
 | --- | --- |
-| `file` | Git tree, diff, file and text-match reads; concrete edit, patch, publish, and persist |
+| `file` | Git tree, diff, file and text-match reads; concrete edits, patches, and session commits |
 | `read` | adapter outline, search, structural match, symbol, actions, and retained facts |
-| `edit` | adapter-resolved candidate tools, formatting, validation, refresh, and integration |
+| `edit` | adapter-resolved changes, formatting, validation, Git merge reporting, and integration |
 | `full` | the edit fixtures with two language adapters and one embedded-language route |
 
 Profiles accumulate and record runtime conformance. The repository resource separately reports the
@@ -144,12 +144,14 @@ That URI is what `act` takes.
 
 ## Changes
 
-Each candidate-building tool performs one operation with typed arguments:
+Each change tool performs one operation with typed arguments. It also carries `expected_head`, the
+Git commit the caller observed at the session ref. Rift compares it before allocating or changing
+the session worktree. A different current head returns `stale_head` without creating a checkout.
 
-Every candidate request also carries one common publication envelope: `on`, `expected_accepted`, and
-zero or more `CommandValidator` declarations. Ordinary candidates fix the session's accepted ref as
-their destination; an integration candidate fixes its selected local branch. These values are stored
-with the ready preview and cannot be changed by `publish`.
+When resolution finds an effect that needs acknowledgement, it returns `refused` with ordered
+confirmation requirements and leaves the ref unchanged. The caller may retry the same operation and
+`expected_head` with exactly those confirmation IDs. Missing or extra IDs refuse the retry, so an
+acknowledgement cannot drift onto different Git state.
 
 | tool | what it does |
 | --- | --- |
@@ -157,13 +159,13 @@ with the ready preview and cannot be changed by `publish`.
 | `patch` | a unified diff, checked hunk by hunk against the state it resolves on |
 | `rewrite` | one `MatchQuery`, a replacement template, and an accepted match count |
 | `revert` | the three-way inverse of one commit against a selected parent |
-| `merge` | a three-way merge of one commit into the candidate |
+| `merge` | Git's three-way merge of one commit into the session worktree |
 | `rename` | a new name for a declaration, propagated to its references |
 | `move` | a new container or path, with imports and references updated |
 | `delete` | removal of a declaration, with or without reference analysis |
 | `change_signature` | a new callable shape, propagated to callers and overrides |
 | `act` | any other action an adapter offered, by its `rift://action/…` URI |
-| `integrate` | a merge of an accepted commit into a local branch, described under [Integration](#integration) |
+| `integrate` | a merge of the session head into a local branch, described under [Integration](#integration) |
 
 `rename`, `move`, `delete`, and `change_signature` use portable argument contracts, so their arguments
 are in the tool schema an agent already has. Everything else an adapter can do — extract, inline,
@@ -178,130 +180,91 @@ without reference analysis, which supports deleting newly created code. With a p
 classifies every remaining use and applies the selected disposition. Incomplete reference coverage
 refuses the operation before it can leave a dangling call behind.
 
-Nothing here publishes. Each tool resolves its operation, writes the result to an immutable candidate
-commit, validates that commit with the adapters, and returns a bounded `CandidateSummary` whose
-`PreviewResourceLink` opens the complete retained plan.
+The first change materializes and registers the session worktree at `expected_head`; later changes
+reuse it. Each successful tool writes that worktree, validates the resulting tree with affected
+adapters, [creates a Git commit](https://git-scm.com/docs/git-commit-tree), and
+[conditionally advances](https://git-scm.com/docs/git-update-ref)
+`refs/rift/sessions/<session-id>`. The response contains the previous and resulting commits, the diff,
+and bounded validation evidence. These links define Git's operation semantics; Rift calls equivalent
+library APIs.
 
 ### Composing operations
 
-A change that takes several steps is a chain. Every candidate tool takes `on`, the candidate it
-continues:
+A change that takes several steps is ordinary Git history on the session ref:
 
 ```
-edit(publication: { validators: [] }, …) -> preview: prv_9f2c…
-rename(on: prv_9f2c…, …)                 -> preview: prv_be71…
-act(on: prv_be71…, action: …)            -> preview: prv_04ad…
-publish(preview: prv_04ad…)               -> accepted
+edit(expected_head: B, …)   -> commit A, parent B
+rename(expected_head: A, …) -> commit C, parent A
+act(expected_head: C, …)    -> commit D, parent C
 ```
 
-Each step resolves against its predecessor's tree, so the rename sees the declaration the edit
-created. Before `act`, the caller reads the actions resource against that resulting candidate and
-passes back the selected `ActionOfferId`. Between steps, Rift formats and refreshes every adapter
-sharing the worktree, which makes the next adapter-resolved operation read the acknowledged state.
+Each step resolves against the current session tree, so the rename sees the declaration the edit
+created. Before `act`, the caller reads the actions resource at commit `C` and passes back the selected
+`ActionOfferId`. Rift formats and refreshes every adapter sharing the worktree before it creates each
+commit.
 
-The chain is the transaction: no ref moves until `publish`, and `publish` names the tip. Each link is
-also a real preview you can read, refresh, or abandon on its own — which an ordered array of changes
-inside one call never allowed.
-
-A root candidate supplies `publication`, whose validator array may be empty. A chained candidate
-inherits its parent's plan when it omits the field, while an explicit replacement belongs only to the
-new preview. Publishing the tip runs that tip's validators against the complete tip tree.
+The expected head serializes mutation without a retained request record. If a response is lost, the
+caller reads the session head and diff. Finding the returned commit in Git proves the operation
+completed; another head requires a fresh decision from the supervisor.
 
 ## Lifecycle
 
-A `PreviewId` is SHA-256 over the fixed request inputs. The hash starts with `rift.preview.v1`, then
-encodes the durable session ID, base, destination, expected head, parent candidate, canonical
-operation, and validator declarations with the
-[fixed binary framing](/docs/architecture#durable-identifiers). The public spelling is lowercase
-unpadded base32 with a `prv_` prefix. Sending the same request after reconnecting therefore returns
-the retained registry record and immutable preview worktree without another resolution or validation
-pass.
+A session begins when `Connect` creates or attaches its Git ref. Reads resolve that ref without
+creating the session's writable worktree. An adapter-backed read may use a disposable detached read
+worktree for the selected commit; it does not materialize the session worktree. The first change
+creates the registered session worktree, and change operations append commits to the ref. Closing
+every connection releases adapter state but leaves the ref and any materialized worktree available
+for another connection.
 
-`expected_accepted` separates resolution state from publication concurrency. It defaults to the
-current accepted head, must be an ancestor of the resolution base, and becomes the compare-and-swap
-value at publication. A merge repair resolves on a provisional two-parent commit while still advancing
-from the accepted source parent.
+Rift does not keep durable request outcomes. A process failure can leave one of three Git-visible
+states: the old session head, a new session commit, or mutable worktree/index changes that were not
+committed. The next request reports that state. It never infers completion from a separate journal.
 
-`refresh` reruns a retained candidate's operation on a newer base. It preserves the stored publication
-plan unless the request supplies a replacement for the new preview. The result counts the resolved
-records and files that moved, and comparing the two preview resources gives the exact ones. A portable
-refactor reruns the same typed call, which is why replaying it needs no matching rule. `act` still has to
-find its offer again, and Rift matches it by language, target, kind, argument contract, argument
-schema, and guarantees — zero or several matches refuse, as does a stale match.
+Session removal is an explicit local operation because its ref may be the only name for user work.
+It reports commits that would become unreachable, removes the registered worktree when present, and
+then removes the ref.
 
-`publish` verifies that the immutable worktree still has the HEAD and tree recorded for the preview,
-then runs its fixed command validators and compare-and-swap advances its fixed destination.
-`PreviewId` is the retry key. The workspace registry retains terminal success, rejection, and conflict
-results; repeating the same call returns that result.
+### Validation
 
-Registry transition phases, Git reflog reconciliation, and local recovery controls are implementation
-state rather than MCP methods or enums. When recovery cannot determine whether Git advanced before a
-crash, MCP returns `temporarily_unavailable` with a request id. A local operator resolves the preview
-through `rift preview resolve`, after which the ordinary resource and `publish` call work again.
-
-After a rejection the candidate commit and its evidence remain readable, and a repair can use that
-commit as the base of a new candidate.
-
-### Validation and persistence
-
-Adapter validation runs when a candidate is built. Workspace policy defaults to `require =
+Adapter validation runs after a change is applied. Workspace policy defaults to `require =
 "available"`, which runs affected adapters that advertise `validate`. A result with no such adapter
 reports validation strength `mechanical`. An explicit list such as
 `['rust', 'sql:postgresql', 'json']` requires complete, valid reports from those exact languages and
 reports strength `required`.
 
-Command validators run during `publish`, while the candidate's `PublicationPlan` fixes their
-declarations. Rift stores the plan with the ready preview and includes its canonical bytes in the
-preview ID. A test suite that takes four minutes would charge the same four minutes to every step if it
-ran during candidate creation, and publication needs a fresh check before advancing the ref. When user
-policy grants one, Rift runs the executable directly, without a shell, in a disposable validation
-workspace copied from the candidate, and retains its exit status and bounded output in the workspace
-registry.
-Writes inside the workspace disappear with it, and the command still reaches the host filesystem and
-network.
+Command validators run on the merged tree before integration advances its target. Their declarations
+come from `rift.toml` in that tree and remain requests until current user policy grants them. Rift runs
+the executable directly, without a shell, in a disposable validation workspace and returns its exit
+status and bounded output. Writes inside the workspace disappear with it, while the command retains
+the server's host access.
 
-A declaration is refused during preview creation unless its argv, resolved executable, carried paths,
-and timeout lie in the intersection of committed requests and user-owned grants. The caller names the
-guarantee a pass establishes and receives `GuaranteeEvidence` over the published chain. Validators
-must be repeat-safe because crash recovery can run an unrecorded invocation again.
+The repository resource reports the declarations admitted by current policy in execution order. This
+lets a supervisor inspect the exact checks an integration will run without interpreting `rift.toml` or
+machine policy itself.
 
-An accepted candidate exists as a Git commit before it touches the session worktree. `persist`
-selects paths from that commit.
-
-Rift computes every per-path outcome before writing. An oversized result writes nothing. Each path
-reports its materialization result. Cancellation can stop the call until the first write. After that
-point Rift holds the session write lock and finishes the bounded set, writing regular files through a
-same-directory temporary path and atomic rename.
-
-Atomicity stops at the path boundary. A process or host crash can leave some paths materialized and
-the rest unchanged. Repeating the same call converges: matching accepted entries report `unchanged`,
-eligible base entries are written, and independently changed entries report `skipped_drift`. The Git
-commit remains the durable source for every path, so a partial materialization needs no rollback
-journal.
-
-Gitlinks and their descendants return `skipped_nested_repository`. Persistence leaves child checkouts
-unchanged.
+Validation evidence may be cached under `.rift/cache` when its key contains the merged Git tree,
+executable digest, arguments, environment, carried-file digests, and limits. A missing entry reruns
+the validator, so policy may grant only repeat-safe commands.
 
 One workspace and every transaction in it cover one repository. A gitlink remains an opaque entry in
 the parent repository; its child repository is outside this connection.
 
 ### Integration
 
-`integrate` merges an accepted commit into a local target branch and validates the merge candidate,
-leaving the target unchanged. Two commits that are each valid can merge into a broken tree — `main`
-can rename a function the accepted commit added a call to — which is why the merge candidate is
-validated like any other. `refresh` rebuilds it against the target's current head, and `publish`
-advances the target.
+`integrate` merges the session head into a local target branch in a dedicated integration worktree.
+Rift calls Git's [merge API](https://git-scm.com/docs/api-merge), preserving repository merge drivers
+and Git's standard index stages. Two commits that are each valid can merge into a broken tree, so
+adapter and command validation run on the complete merged state before the target moves.
 
-A merge conflict returns a retained two-parent provisional commit. Non-conflicting paths contain the
-automatic merge, while each conflict path keeps the target entry so the candidate remains parseable.
-`MergeConflict` carries the base, source, and target entries. Repair that candidate with any ordinary
-candidate tool whose `on` is the provisional merge, publish the repair to the accepted ref, and
-integrate again.
+A merge conflict returns `merge_conflict`, the integration worktree, and Git's path statuses. The
+unmerged index and working files stay as Git produced them. Rift creates no provisional commit and
+does not choose a resolution. Semantic operations return `worktree_busy` until the supervisor uses
+Git-aware tooling to resolve or abort the merge.
 
-Publication advances a branch only when Git reports that no worktree has it checked out. A checked-out
-target returns `checked_out_target` with the validated commit for manual handling. Rift never writes
-the target worktree's ref, index, and files as a multi-step automatic operation.
+After a clean merge and validation, Rift creates the merge commit and asks Git to update the target
+only if it still holds the expected object ID. A moved target returns `target_moved` with the expected
+and current commits. A checked-out target returns `checked_out_target` with its worktree path, leaving
+its ref, index, and files unchanged.
 
 ## Execution and debugging
 
@@ -352,22 +315,21 @@ the lifecycle step that failed. Its `request_id` is the same random id recorded 
 the structured server log, so an operator can find the matching adapter and storage events without
 logging source or caller arguments.
 
-The error model includes recovery failures that require a fresh query or a local state command:
+The error model includes Git-state failures that require a fresh query or local supervisor action:
 
 | code | condition | retry |
 | --- | --- | --- |
 | `unsupported_path` | Git contains a path the protocol or host filesystem cannot represent safely | `never` for that snapshot |
 | `cursor_expired` | the cursor is valid but its immutable result generation was evicted | `refresh_snapshot` from the first page |
-| `state_corrupt` | the registry, Git state, and registered worktrees disagree and reconciliation cannot choose safely | `operator_action` |
-| `temporarily_unavailable` | the resource exists but Rift cannot give a safe answer yet | `same_request`, or `operator_action` when publication recovery is indeterminate |
+| `state_corrupt` | a Rift ref is malformed, or Git's registered-worktree record does not match its directory | `operator_action` |
+| `temporarily_unavailable` | a required adapter or disposable workspace is temporarily unavailable | `same_request` |
 
-`operator_action` tells an MCP client to stop retrying until a local command repairs or resolves the
-condition. The error carries the affected resource and request ID, while publication phases and
-recovery records remain internal to the server.
+`operator_action` tells an MCP client to stop retrying until local Git-aware tooling repairs or
+resolves the condition. The error carries the affected ref or worktree and request ID.
 
-A refused operation returns its failed preconditions and blockers in `RefusalReason`, while a rejected
-candidate returns its validation evidence. A publication conflict carries the head it expected and
-the one it found. Rift reached each of these decisions with evidence, so they are ordinary results;
-`ErrorData` covers requests that failed before reaching one.
+A refused operation returns its failed preconditions and blockers in `RefusalReason`, while rejected
+integration returns its validation evidence. A target race carries the object ID Rift expected and the
+one Git reported. A merge conflict carries the unmerged paths Git produced. These are ordinary
+results; `ErrorData` covers requests that failed before reaching one.
 
 <McpReference />

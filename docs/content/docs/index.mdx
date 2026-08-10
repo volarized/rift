@@ -10,10 +10,9 @@ client can rely on it.
 
 An agent such as Claude Code or Codex starts `rift mcp` in a Git worktree. That process resolves the
 canonical physical workspace path and forwards requests to that workspace's `rift server`. The server
-reads captured Git state, records preview and publication state in `.rift/db/registry`, and keeps
-semantic facts in process memory while it calls language adapters admitted by user-owned policy. A
-linked Git worktree is a separate Rift workspace because it owns another `.rift` directory and
-workspace ID.
+uses Git refs and registered worktrees for durable sessions, while semantic facts stay in process
+memory or a disposable cache. It calls language adapters admitted by user-owned policy. A linked Git
+worktree at another physical path is a separate Rift workspace even when both paths share Git objects.
 
 Most users only need the agent configuration that launches `rift mcp`. The remaining pages describe
 the server and its protocol for adapter authors, client implementers, and people debugging a

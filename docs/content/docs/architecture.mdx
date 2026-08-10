@@ -10,9 +10,9 @@ Rift exposes code discovery and editing operations to an agent such as Claude Co
 
 When an agent has Rift configured as one of its MCP servers, the `rift mcp` process starts in one Git
 working tree. This documentation calls that checkout and its reserved `.rift` directory a workspace.
-The random ID in `.rift/workspace-id` is its durable identity, while the canonical root path is its
-current location. Moving the complete directory preserves the workspace. A linked Git worktree has
-its own `.rift` and therefore remains a separate Rift workspace even when it shares Git objects.
+Its canonical physical path is its identity. Moving or copying the directory creates another
+workspace. A linked Git worktree at another path therefore remains separate even when it shares Git
+objects with the first checkout.
 
 The `rift server` coordinates between one or several `rift mcp` instances and configured language
 adapter processes for one workspace. A language
@@ -23,7 +23,7 @@ different configured processes. Each process can hold separate `AdapterState`s f
 and back them with separate runtime workers.
 
 <IsoDiagram
-  alt="Two agents each talk to a separate rift mcp process over stdio. Both processes call one Rift server for the workspace over a local socket. Committed rift.toml requests capabilities while user-owned policy grants host access and supplies hard limits. The server records preview and publication state in .rift/db/registry, creates Git worktrees under .rift/worktrees, keeps semantic facts in process memory, and calls configured adapters over gRPC."
+  alt="Two agents each talk to a separate rift mcp process over stdio. Both processes call one Rift server for the workspace over a local socket. Committed rift.toml requests capabilities while user-owned policy grants host access and supplies hard limits. Git refs hold durable sessions, while a session gets a registered worktree when it first edits. The server keeps semantic facts in process memory or a disposable cache and calls configured adapters over gRPC."
   chart={`
     flowchart LR
       agent1["agent 1"]:::agent -- "stdio" --> mcp1["rift mcp"]:::rift
@@ -32,13 +32,12 @@ and back them with separate runtime workers.
       mcp2 -- "gRPC over<br/>Unix socket" --> server
       request["rift.toml"]:::config -- "project requests<br/>+ lower ceilings" --> server
       policy["user policy"]:::config -- "host grants<br/>+ hard ceilings" --> server
-      server -- "transactions" --> db["repo/.rift/db/<br/>registry"]:::store
-      server -- "creates, writes,<br/>integrates" --> trees["repo/.rift/<br/>worktrees"]:::git
+      server -- "Git API:<br/>refs + worktrees" --> trees["Git repository<br/>+ repo/.rift/worktrees"]:::git
       server -- "runs declared<br/>validators" --> validator_workspace["validation<br/>workspace"]:::validator
       server -- "evaluates caller code" --> execution_workspace["execution<br/>workspace"]:::validator
       server -- "gRPC over<br/>Unix socket" --> adapters["adapters<br/>one per Language"]:::adapter
       adapters -- "open(2)" --> trees
-      adapters -- "live semantic state" --> memory["process<br/>memory"]:::store
+      adapters -- "semantic results" --> memory["process memory<br/>+ disposable cache"]:::store
   `}
 />
 
@@ -59,10 +58,10 @@ request.
 MCP's stdio transport gives each agent or subagent its own `rift mcp` subprocess. Those processes
 cannot share in-memory state, so they forward repository operations to the common server instead.
 
-The `rift server` keeps the state those clients must share: sessions, previews, worktrees, and semantic
-facts. It also owns the language adapters, so every client in the workspace drives the same processes.
-Linked Git workspaces have separate Rift servers and registries; shared-branch updates still coordinate
-through Git locks and compare-and-swap ref updates.
+The `rift server` coordinates live connections and adapters. Git holds each session through a ref and
+registers its worktree after the session starts editing, while the server keeps semantic results in
+memory. Linked Git workspaces have separate servers; updates to a shared ref still coordinate through
+Git's ref-locking rules.
 
 `rift mcp` validates the agent's JSON against `mcp.json`, negotiates a protocol contract with the
 server, converts the request to the Protobuf message named by that contract, and converts the response
@@ -85,10 +84,10 @@ uses the relative socket path. The relative name stays below Unix-domain socket 
 when the workspace has a long absolute path. It takes an exclusive `flock` on `start.lock`, checks the
 socket again, then spawns the server in a detached process group when no compatible server answers.
 
-The server opens `.rift/workspace-id`, acquires an exclusive OS lock on `.rift/lease`, and keeps that
-lock until exit. It writes its protocol major and a random process-generation value into the locked
-file. Those bytes identify the live owner when another launcher encounters the lock; stale bytes have
-no authority after the kernel releases it.
+The server acquires an exclusive OS lock on `.rift/lease` and keeps it until exit. It writes its
+protocol major and a random process-generation value into the locked file. Those bytes identify the
+live owner when another launcher encounters the lock; stale bytes have no authority after the kernel
+releases it.
 
 The `.rift` and `.rift/run` directories are mode `0700`, and `server.sock` is mode `0600`. A launcher
 unlinks a socket that refuses connection only while it holds `start.lock` and can acquire `.rift/lease`.
@@ -98,8 +97,7 @@ before `Connect`.
 The socket path carries no version because the workspace lease admits one server. A launcher that
 finds the lease held by another protocol major returns `unsupported_protocol` with the active and
 requested majors; it does not send an incompatible Protobuf message to `server.sock`. Compatible
-minor versions share the endpoint and negotiate during `Connect`. A new major migrates the registry
-only after the previous server has released the lease.
+minor versions share the endpoint and negotiate during `Connect`.
 
 After connecting, `rift mcp` sends the contract tuples it supports, each containing a major, minor,
 and schema digest, plus its feature set. The server selects one tuple whose digest exactly matches its
@@ -110,176 +108,148 @@ version; a changed field meaning, field number, or required behavior increments 
 The server exits after `server.idle-timeout` with no open connection. Adapter processes can retain
 large indexes, so an idle repository should release them. A state-mutating CLI command goes through
 the live server. An offline command such as `rift state reset` first asks that server to shut down,
-then acquires `.rift/lease` before touching the registry, refs, or worktrees.
+then acquires `.rift/lease` before removing Rift-owned refs and worktrees through the Git API.
 
 <Callout>
-  Windows named pipes don't have filesystem paths. Rift derives the pipe name from the workspace ID
-  and keeps its owner metadata under `.rift/run`; the pipe still checks the connecting user's identity.
+  Windows named pipes don't have filesystem paths. Rift derives the pipe name from a digest of the
+  canonical workspace path and keeps its owner metadata under `.rift/run`; the pipe still checks the
+  connecting user's identity.
 </Callout>
 
 ## Repository and runtime state
 
-Process memory holds live adapter workers, open handles, and semantic indexes reconstructed after
-startup. The durable registry records session-creation retry keys alongside sessions and previews. It
-also retains validation evidence, publication recovery, and bounded request logs. The reserved
-repository-local `.rift` directory holds that registry beside the physical Git worktrees it describes.
+Git is Rift's durable store. Commits hold session history, refs name its current heads, and registered
+worktrees provide the paths adapters open. Rift accesses those structures through a Git library API;
+the linked Git manuals define operation semantics and do not imply that the server spawns the Git
+command-line program.
 
-Each server process owns one semantic store for its workspace. All facts and coverage stay in that
-process and disappear when it exits. The existing Git repository remains the source of ordinary
-objects, refs, indexes, and reflogs; Rift uses those Git stores but creates no additional durable
-ledger inside `.git`.
+Each server process owns one semantic store for its workspace. Facts and coverage live in memory and
+may also be written to `.rift/cache`. Every cache entry is derived from Git object identity and its
+complete adapter context, so deleting the directory changes only the cost of the next semantic read.
 
-The `run` directory contains rendezvous files. The OS lock on `.rift/lease` identifies a live server,
-while the registry remains authoritative for retained resources. Startup can therefore replace a
-stale socket after it acquires both locks.
+The `run` directory contains rendezvous files. The OS lock on `.rift/lease` identifies the live
+server, and Git's own locks serialize updates to repository state.
 
 ```
 <workspace>/.rift/
-  workspace-id                         durable random workspace ID
   lease                                live server lock and owner metadata
-  db/registry                          sessions, previews, retry keys, recovery, and request logs
   run/server.sock                      stable Unix server endpoint
   run/start.lock                       serializes server startup
-  worktrees/session-f8py…/             session materialization
-  worktrees/preview-04ad…/              immutable candidate
+  worktrees/session-f8py…/             one edited session's Git worktree
+  worktrees/integration-f8py…/         pending Git merge for that session
   worktrees/read-dae86e1/               detached semantic read
   worktrees/exec-71c2…/                 one-shot execution
   worktrees/debug-e003…/                retained failed evaluation
-  state/<worktree-id>/<language>/       adapter-private caches and overlays
+  cache/<adapter>/<snapshot>/           disposable semantic and adapter data
 ```
 
 Rift reserves the root `.rift` path. Admission fails when Git tracks it, when it is a symlink, or when
 its owner and permissions do not match the current user. Rift adds `.rift/` to local Git exclude data
-without modifying committed `.gitignore`, and candidate edits cannot target it. Ordinary Git commands
-leave it alone; `git clean -ffdx` or manual deletion can still destroy its registry and worktrees.
+without modifying committed `.gitignore`, and edits cannot target it. Manual deletion can still
+remove materialized session worktrees, which is why `rift state reset` reports the affected refs
+before cleanup.
 
 Mutable-worktree capture repeats the tracked-path check. If an external checkout introduces a tracked
 `.rift`, the server stops admitting workspace operations until the collision is removed; it does not
 traverse or overwrite the new path.
 
-On first use Rift creates a random workspace ID in `.rift/workspace-id` and records the current
-canonical path in `.rift/db/registry`. `rift state reset` reports the previews and sessions that will
-be lost, requires confirmation, unregisters their worktrees, removes their session refs, replaces the
-registry, and creates a new workspace ID.
+`rift state reset` reports the session refs and worktrees it will remove, requires confirmation, and
+then removes them through the Git API. Runtime files and disposable caches are removed after the Git
+operations complete.
 
 ### Moving and copying a workspace
 
-A move carries `.rift`, including a live Unix socket, with the checkout. A client entering through the
-new root reaches the same server through the relative `.rift/run/server.sock` path. The server checks
-the canonical root supplied by `Connect` against the registry. When the previous path no longer
-contains the workspace ID, it records `relocating` with the old and new paths, repairs Git's
-administrative paths for every registered worktree, verifies their HEAD and tree values, then commits
-the new path. Each repair step is idempotent, so startup resumes an interrupted relocation.
+A physical path identifies a workspace, so a moved or copied directory starts another server and
+selects another workspace-policy file. The new server asks Git to inspect and, where supported,
+[repair linked-worktree registration](https://git-scm.com/docs/git-worktree#Documentation/git-worktree.txt-repair)
+before it admits a session. A repair failure leaves the affected worktree untouched and returns
+`state_corrupt` with its path.
 
-A copy leaves the previous path holding the same workspace ID. Rift refuses the copied state while
-that source still exists, because two registries would otherwise claim one identity without sharing a
-lease. Run `rift state reset` in the copy to discard its copied sessions and previews and mint a new
-identity. A move or copy also changes the path used to select workspace policy, so executable and host
-access grants must be made again for the new location.
+The previous server has no authority over the new path. A socket copied or moved under `.rift/run`
+is stale because its peer reports another canonical root. The launcher replaces it only while holding
+the new path's startup and server locks.
 
-Linked Git worktrees have independent `.rift` directories and workspace IDs. Their registries,
-policies, and servers remain separate while Git locks and compare-and-swap protect shared refs.
+Linked Git worktrees have independent physical paths, policies, and servers. When their repositories
+share refs, Git's reference transaction rules coordinate updates between them.
 
 ### Durable identifiers
 
-Rift gives random 128-bit values to workspaces and sessions. Their full protocol spellings are the 26
-lowercase characters of unpadded RFC 4648 base32, with `ws_` and `ses_` prefixes. A preview has a
-deterministic `prv_` identifier: SHA-256 over the fixed publication inputs, encoded as 52 characters
-with the same alphabet.
+The client gives each session a random 128-bit ID before `Connect`. Its protocol spelling is `ses_`
+followed by 26 lowercase characters of unpadded RFC 4648 base32. Rift uses the complete spelling in
+`refs/rift/sessions/<id>`. The first change projects that ref to
+`.rift/worktrees/session-<id>`.
 
-The preview hash starts with the ASCII bytes `rift.preview.v1\0`. Each field frame is a one-byte tag,
-a four-byte unsigned big-endian length, and the value bytes:
-
-| tag | value bytes |
-| --- | --- |
-| `1` | raw 16-byte session ID |
-| `2` | base Git object format and raw object ID |
-| `3` | UTF-8 destination ref |
-| `4` | expected-head Git object format and raw object ID |
-| `5` | raw 32-byte parent preview ID, or an empty value |
-| `6` | canonical operation encoded as `rift-json/1` |
-| `7` | ordered validator declarations encoded as `rift-json/1` |
-
-A Git object value starts with `1` for SHA-1 or `2` for SHA-256, followed by the corresponding raw
-object ID. The framing prevents adjacent strings or two Git hash formats from producing the same hash
-input.
-
-The registry and protocol carry full identifiers. A CLI may accept a shorter suffix when it matches
-exactly one record in the workspace. Filesystem names are deterministic projections: `ses_` becomes
-`session-` and `prv_` becomes `preview-`, with every base32 character retained. Rift does not recover
-identity from a directory name; the registry record remains authoritative.
+Git object IDs identify every committed source state. Rift carries the repository's object format
+with an ID, so SHA-1 and SHA-256 repositories remain distinct. The canonical path identifies the
+workspace, while a commit identifies a completed change.
 
 ## Sessions
 
-A session is a durable accepted history. `rift mcp` opens a `Connect` control stream before another
-RPC. The request either attaches a session selected by the local CLI or carries a random
-`connect_attempt_id` from the MCP process. The server commits a new random 128-bit session ID and the
-attempt mapping in one registry transaction, so a retry after a lost response returns the same
-session. Session attachment is not an MCP operation.
+A session begins as a Git ref. `rift mcp` opens a `Connect` control stream before another RPC and
+supplies the client-generated session ID. Rift creates `refs/rift/sessions/<id>` at the configured
+base when the ref is absent, or attaches when it already exists. Reads need no writable checkout, so
+connection alone creates no session worktree.
 
-The first stream event returns the session ID and a new connection ID. Later RPCs carry that
-connection ID in gRPC metadata. The ID is a coordination handle; peer identity on the Unix socket or
-named pipe supplies the same-user trust boundary. Connection IDs use a `con_` prefix, while creation
-attempts use `try_`; each contains 26 lowercase characters of unpadded RFC 4648 base32 after its
-prefix. Internally, a session owns:
+The first stream event returns the session ID, its ref head, and a new connection ID. Its `worktree`
+field is null until a change has materialized the registered checkout. Later RPCs carry the connection
+ID in gRPC metadata. The ID is a coordination handle; peer identity on the Unix socket or named pipe
+supplies the same-user trust boundary. Connection IDs use a `con_` prefix followed by 26 lowercase
+characters of unpadded RFC 4648 base32. A newly connected session has:
 
 ```
-id              ses_f8py...             random, repository-wide
+id              ses_f8py...             generated by the client
 base            B, the configured starting commit
-worktree        <workspace>/.rift/worktrees/session-f8py..., detached at B
-accepted ref    refs/rift/accepted/ses_f8py..., starting at B
+session ref     refs/rift/sessions/ses_f8py..., starting at B
+worktree        absent until the first change
 ```
 
 A session starts from the last commit, so it excludes uncommitted workspace changes. Reads can still
 select them through `rev: main-worktree`. Setting `session.base = "worktree"` instead records that
-diff as the accepted ref's initial commit. The session worktree remains a detached materialization of
-accepted state.
+diff as the session ref's initial commit.
 
 ### Reconnecting and closing
 
-When the server restarts, `rift mcp` reconnects with its session ID. The server reads the registry,
-verifies the session worktree and accepted ref, then rebuilds adapter state. Retrying one
-`connect_attempt_id` supersedes its previous control stream and returns a fresh connection ID.
+When the server restarts, `rift mcp` reconnects with its session ID. The server asks Git for the
+matching ref and inspects its registered worktree when one exists. Opening another control stream for
+the same client connection supersedes the earlier stream and returns a fresh connection ID.
 
 Adapter states opened for a session are shared across its active connections. The server closes them
 after the final connection and in-flight request release their references. Closing one control stream
-cancels that connection's queued work and releases its debug sessions and execution workspaces. A
-publication or `persist` call that passed its documented commit point continues to its durable result.
-Complete semantic generations remain in the server cache until eviction or server exit. The session
-remains in the registry with its worktree and accepted ref after every connection closes.
+cancels that connection's queued work and releases its debug sessions and execution workspaces. A Git
+ref update that reached its commit point finishes through the Git API. Complete semantic generations
+remain in the server cache until eviction or server exit. The session ref remains after every
+connection closes, as does its worktree after the session has created one.
 
 The connection fixtures exercise the interface at its failure points:
 
 | fixture | required observation |
 | --- | --- |
 | concurrent startup | Two `rift mcp` processes produce one lease owner and both receive connections. |
-| lost first event | Retrying one `connect_attempt_id` returns the same session with a fresh connection ID and closes the earlier stream. |
+| lost first event | Reconnecting with the same client-generated session ID returns that session with a fresh connection ID and closes the earlier stream. |
+| read-only session | Connect and read calls create the session ref and leave `worktree` null. |
+| first change | The expected head is checked before Git registers the session worktree. |
 | shared session | Closing one of two attached connections leaves the other connection's adapter state usable. |
 | final close | Connection-owned debug and execution workspaces are released; session adapter state closes after its last request. |
-| live move | Moving the complete workspace preserves the socket connection and repairs the registry path and Git worktree metadata. |
+| moved directory | Starting at the new canonical path creates another workspace and rechecks policy and Git worktree registration. |
 | incompatible server | A launcher reads the held lease's major and returns `unsupported_protocol` before it sends a message to the socket. |
 
-An untouched session may be collected after `session-retention`. An advanced, unintegrated session is
-never removed automatically because its accepted ref may be the only reference to user work. An
-integrated session becomes eligible only after retention, when its head is reachable from a non-Rift
-ref and no ready preview depends on it. `rift session keep` pins a session against collection.
+Rift does not collect session worktrees automatically because their refs may be the only names for
+user work. Cleanup is explicit:
 
 ```
 rift session list                   retained histories and their heads
 rift session attach ses_f8py...     launch a client attached to one session
-rift session keep ses_f8py...       prevent automatic collection
 rift session remove ses_f8py...     explicitly abandon one history
-rift preview list                  retained previews and terminal results
-rift preview remove prv_04ad...    remove one preview after dependency checks
 ```
 
-`rift session remove` reports commits that would lose their last ref and requires confirmation. All
-state-management commands follow `rift <object> <verb>`.
+`rift session remove` reports commits that would lose their last ref and requires confirmation. It
+removes the registered worktree when present, then removes the ref through Git. All state-management
+commands follow `rift <object> <verb>`.
 
 ### Reading across sessions
 
-Any session can read a commit or branch the repository has. A session may also name another local
-session worktree explicitly:
+Any session can read a commit or branch the repository has. After another session has edited, its
+local worktree can also be named explicitly:
 
 ```
 rift://file/src/api.rs?rev=worktrees/ses_f8py...
@@ -294,29 +264,23 @@ A worktree's lifetime depends on what made it:
 
 | worktree | created by | removed | written by |
 | --- | --- | --- | --- |
-| session `session-f8py…` | creating a session | explicit removal or eligible collection | `persist` |
-| preview `preview-04ad…` | any candidate tool — `edit`, `rename`, `act` | explicit removal or terminal-record collection | that operation's resolved edits |
+| session `session-f8py…` | first change operation | `rift session remove` | successful change operations |
+| integration `integration-f8py…` | integrating a session | success, explicit abort, or `rift state reset` | Git's merge operation and supervisor conflict resolution |
 | read `read-dae86e1` | a semantic read at a revision nothing has checked out | idle timeout, or the LRU cap | nobody |
 | execution `exec-71c2…` | `execute` | when the call returns | evaluated repository code |
 | debug `debug-e003…` | `debug_start` | `debug_stop`, idle expiry, connection close, or adapter loss | evaluated repository code |
 
-The registry owns every durable session and preview. Creation inserts a `creating` record
-before Rift creates its deterministic ref and worktree. Once their identities match that record, one
-registry transaction records the observed HEAD and tree and changes the resource to `ready`. Only a
-ready resource can serve a request. Removal changes the record to `removing`, unregisters and deletes the
-worktree and ref with idempotent Git operations, then records `deleted`; retention may remove that
-terminal record later.
-
-Startup resumes each incomplete transition by comparing the registry with `git worktree list
---porcelain` and the expected refs. A missing or changed worktree for a ready resource becomes
-`corrupt`, because reconstructing it could overwrite evidence of an external change. An unregistered
-directory under `.rift/worktrees` is quarantined from use and removed after the configured orphan
-grace period; Rift never adopts it. Disposable read, execution, and debugging worktrees have no
-durable owner after restart and can be removed immediately.
+Rift discovers durable worktrees through Git's
+[registered-worktree model](https://git-scm.com/docs/git-worktree) and recognizes sessions by the
+`refs/rift/sessions/` namespace. A session ref with no registered worktree is a read-only session that
+has not changed source. Rift does not infer a worktree from a directory name alone. A directory that
+Git does not register is unavailable to Rift; explicit state cleanup may remove it after showing the
+path. Disposable read, execution, and debugging worktrees can be removed after a restart because no
+live request owns them.
 
 Adapters open source with `open(2)`, so a real tree on disk is the interface. Source bytes stay on
-disk. Adapters return `Edit` values, and Rift is the only source writer. `git diff` therefore contains
-the session's complete source change.
+disk. Adapters return `Edit` values, and Rift is the only source writer inside a session worktree.
+Git's index and tree comparison therefore contains the session's complete source change.
 
 Worktree materialization and language runtime selection have separate owners. The server resolves a
 revision to an exact `Snapshot`, decides whether an existing physical tree represents it, and reuses
@@ -350,39 +314,29 @@ configured retry limit. Exhaustion returns `worktree_busy` and no snapshot. A su
 identifies the immutable tree Rift actually read, even when the live worktree moves immediately
 afterwards.
 
-Captured trees and preview commits use the repository's ordinary Git object database. Rift does not
-maintain an object quarantine. A dirty read or abandoned preview can therefore leave unreachable Git
-objects, which ordinary Git garbage collection may reclaim later.
+Captured trees and session commits use the repository's ordinary Git object database. Rift does not
+maintain an object quarantine. An interrupted capture can therefore leave unreachable Git objects,
+which Git may reclaim later.
 
 ## Durability and recovery
 
-Rift admits a workspace only when its state directories provide reliable file locks, atomic
-same-filesystem rename, durable flush, and the registry's locking contract. A network or virtual
-filesystem that cannot provide those operations returns `storage_failure` during admission, with the
-unsupported capability in the error evidence.
+Rift delegates repository durability to Git. It creates trees through the
+[index-to-tree operation](https://git-scm.com/docs/git-write-tree), creates commits through Git's
+[commit-object operation](https://git-scm.com/docs/git-commit-tree), and advances a session or target
+ref only when its old object ID still matches through a
+[conditional reference update](https://git-scm.com/docs/git-update-ref). The implementation calls
+equivalent library APIs and never parses human-oriented command output.
 
-Before a preview becomes ready, Rift flushes its candidate Git objects and durably commits the
-registry record. Publication commits its intent before it attempts Git compare-and-swap, flushes the
-updated ref before recording the terminal result, and reconciles any process death between those
-steps on startup.
+After a restart, the session ref supplies the committed state. A session with no registered worktree
+stays read-only until a change materializes one. When a worktree exists and its files or index differ
+from the ref, Rift preserves that mutable Git state for the supervisor. An unmerged index stays
+available for the same reason. Disposable caches and request worktrees can be rebuilt or removed.
 
-The registry carries its own format version. Startup migrates a supported older format under
-`.rift/lease` before it accepts a connection. A newer or unknown format blocks startup with its
-version in the diagnostic; Rift does not discard it or infer compatibility.
-
-These boundaries cover a server or adapter killed at any instruction and an ordinary host crash.
-Facts can be recomputed, and a torn session materialization or adapter cache can be rebuilt or marked
-corrupt from the registry and Git. Rift detects missing objects and mismatched worktrees before using
-them. Storage-media corruption, filesystem rollback from a machine snapshot, and manual changes under
-`.git` or `.rift` require `rift preview resolve`, resource removal, or `rift state reset`; startup does
-not guess which copy was newer.
-
-The recovery conformance runner kills the server after every registry, Git-ref, and worktree boundary
-in create, remove, publish, and reset. On restart, each fixture must reach its recorded terminal state,
-resume an incomplete idempotent step, or return `state_corrupt` without changing the registry or Git. A
-platform suite also cuts the server across an OS restart to verify the flush ordering. Adapter fixtures
-kill each process during a streamed read, returned edit, execution, and debugging call to verify the
-replay rules on the adapter page.
+The recovery conformance runner kills the server around worktree creation, object writes, commit
+creation, and ref updates. On restart, each fixture must expose the Git state that reached durable
+storage, refuse a stale expected head, or return `state_corrupt` without changing repository state.
+Adapter fixtures separately kill each process during a streamed read, returned edit, execution, and
+debugging call.
 
 ## Reads
 
@@ -436,7 +390,7 @@ it is not added to the Git tree.
 
 `execute` is one-shot. Rift calls the adapter's `Execute`, closes the adapter state, and removes the
 workspace after returning bounded output and diagnostics. Files written by evaluated code disappear
-with the workspace and never enter a candidate, the session worktree, or the accepted ref.
+with the workspace and never enter the session worktree or session ref.
 
 A debugging session uses the same preparation path but retains the execution workspace and adapter
 state. `debug_start` runs the block to normal completion or its first unhandled failure. A failed run
@@ -542,7 +496,7 @@ An implementation advertises execution only after these fixtures pass with a rea
 | --- | --- |
 | policy intersection | Unauthorized languages are absent from effective availability and allocate no workspace; partial debug operation advertisement is rejected. |
 | snapshot context | Imports and runtime selection come from the requested snapshot, including a dirty-worktree snapshot, while the block itself creates no repository entry. |
-| write discard | A block that rewrites tracked source and creates files changes neither the named snapshot, session worktree, candidate history, nor accepted ref. |
+| write discard | A block that rewrites tracked source and creates files changes neither the named snapshot nor the session worktree and ref. |
 | budgets | Code size and admission caps fail with `limit_exceeded`; stdout, stderr, and debug values truncate at their budgets while preserving complete byte counts and digests. |
 | timeout and cancellation | Deadline expiry and cancellation release every lease stage, including a call cancelled during materialization, `Open`, and adapter evaluation. |
 | frame bounds | A failure deeper than `max-debug-frames` and a frame wider than `max-debug-bindings` return bounded, innermost-first results. |
@@ -554,135 +508,86 @@ An implementation advertises execution only after these fixtures pass with a rea
 
 ## Writes
 
-Each candidate tool resolves one operation into a fresh candidate worktree, validates the result, and
-retains the plan under an identity derived from the durable session and request. A change that takes
-several steps chains them: every tool takes `on`, the candidate it continues, and each step resolves
-against its predecessor's tree. A root request supplies a `PublicationPlan`; a chained request inherits
-that plan when it omits the field or fixes a replacement on the new preview. The ready preview records
-the plan beside the candidate commit and fixed ref update. `publish` runs the tip preview's validators,
-while `persist` materializes selected paths from an accepted commit into the session worktree.
+Each change tool requires the Git commit it expects at the session ref. Rift takes the session write
+lock and compares that object ID before allocating anything. On the first change, it then creates and
+registers `.rift/worktrees/session-<id>` at the ref head; later changes reuse the same worktree. Rift
+resolves the operation there, applies its edits, refreshes the affected adapters, and creates a commit
+whose parent is the expected head. It advances the session ref only if Git still reports that object
+ID.
 
 <IsoDiagram
-  alt="A base commit B becomes an immutable preview worktree through one candidate tool. The workspace registry maps the preview ID to its commit and fixed publication inputs. Adapters validate the candidate. Publish runs repeat-safe validators and compare-and-swap updates the destination ref. From the accepted ref, persist materializes paths into the session worktree and integrate prepares a merge for a branch."
+  alt="A session ref begins at commit B without a worktree. The first change checks B and materializes the session worktree, then applies edits. Adapters refresh and validate the result before Git creates commit A and conditionally advances the session ref. Integration later merges A into a target branch."
   chart={`
     flowchart LR
-      base["base commit B"]:::commit -- "edit, rename,<br/>act, …" --> candidate["candidate<br/>commit"]:::commit
-      adapters["adapters"]:::adapter -- "Refresh<br/>+ Validate" --> candidate
-      candidate -- "ready preview<br/>HEAD + tree" --> db["workspace registry<br/>preview 04ad…"]:::store
-      validators["command<br/>validators"]:::validator -- "run at publish:<br/>exit status + output" --> candidate
-      candidate -- "publish<br/>compare-and-swap" --> accepted["refs/rift/accepted/<br/>ses_f8py…"]:::git
-      accepted -- "persist" --> session[".rift/worktrees/<br/>session-f8py…"]:::git
-      accepted -- "integrate<br/>three-way from B<br/>compare-and-swap" --> target["main"]:::git
+      base["session ref<br/>commit B"]:::commit -- "check expected head<br/>+ materialize on demand" --> tree["session<br/>worktree"]:::git
+      request["edit, rename,<br/>act, …"]:::agent --> tree
+      adapters["adapters"]:::adapter -- "Refresh<br/>+ Validate" --> tree
+      tree -- "write tree<br/>+ create commit" --> changed["commit A<br/>parent B"]:::commit
+      changed -- "conditional<br/>ref update" --> session["refs/rift/sessions/<br/>ses_f8py…"]:::git
+      session -- "Git merge API<br/>+ validation" --> target["target branch"]:::git
   `}
 />
 
-The [MCP page](/docs/protocol/mcp) has the surface; what matters here is what waits on what:
+The session write lock serializes worktree creation and later change tools because they share one
+index and working tree after materialization. Requests from different sessions can proceed together
+until they contend on an adapter limit or the same target ref. A retry after a lost response rereads
+the session head and inspects the worktree when present. Rift writes no response log, so the resulting
+commit or remaining worktree difference is the evidence of what happened.
 
-- **Candidates don't block each other.** Each one builds its own candidate worktree from a base
-  commit, so two in flight in one session run in parallel and neither touches the session tree. Two
-  steps of the same chain do serialize, because the second resolves on the first one's tree.
-- **`publish` claims one ready preview in the registry.** The preview's fixed inputs make
-  `PreviewId` the retry key. Validation and the Git compare-and-swap run once in the ordinary case;
-  crash recovery may repeat a validator whose completion was not recorded.
-- **`persist` takes the session's write lock**, because it's the only operation that writes to the
-  session worktree.
-
-Candidate creation and `persist` touch session-local state. Integration introduces cross-session
-contention by advancing a shared target ref.
-
-### Persisting accepted paths
-
-`persist` preflights the complete path set and response size before it writes. Once writing starts,
-Rift holds the session write lock and finishes the bounded set even if the MCP caller disconnects.
-Each regular file is written to a same-directory temporary path and atomically renamed; a deletion or
-mode change is applied as its own path operation.
-
-The filesystem has no transaction spanning several paths, so a server or host crash may leave a
-prefix of the set materialized. The accepted commit remains unchanged in Git. Repeating `persist`
-converges from that state: a path already matching the accepted entry is `unchanged`, an eligible old
-entry is written, and a path changed independently is `skipped_drift`. Rift keeps no rollback journal
-for a valid partial materialization.
-
-### Publication recovery and evidence
-
-The internal registry state machine moves from `ready` through `validating` and `publishing`, then to
-`published`, `rejected`, or `conflict`. It is not part of the MCP schema. MCP exposes the stable
-preview resource and ordinary `publish` result, while the registry records transition phases,
-validator evidence, and recovery data.
-
-Missing confirmation or a checked-out target leaves the preview ready. Validators run after the
-registry records `validating`; a crash may therefore run one again. User policy may admit only
-repeat-safe validation commands. A validation rejection and its bounded evidence become the terminal
-registry result for that preview.
-
-Before changing a ref, Rift records `publishing`, the destination, expected head, and candidate commit
-in one registry transaction. Git then performs one compare-and-swap update and writes
-`rift:publish:<preview-id>` in that ref's reflog. After success, Rift records `published`.
-
-Startup reconciles a publishing row before serving the preview. A destination at the candidate or a
-matching reflog entry proves publication. An unchanged expected head with no matching entry returns the
-preview to ready. A definite compare-and-swap loss records conflict. If reflog deletion or rewritten
-history removes the evidence needed to decide, MCP returns `temporarily_unavailable`; it does not
-expose an internal `indeterminate` state. The local operator resolves that row with:
-
-```
-rift preview resolve prv_04ad... --published
-rift preview resolve prv_04ad... --ready
-```
-
-Repeating `publish` returns a terminal registry result. Changing the destination, expected head, or
-validator declarations requires `refresh`, which creates a new preview and worktree.
+Repository configuration and user policy determine validation when it runs. Adapter validation runs
+after each change so the response can explain the resulting commit. Command validators run before
+integration, where they protect the branch the supervisor asked Rift to advance. Their results may be
+cached by complete Git tree and execution-policy identity; a missing cache entry reruns the command.
 
 ## Integration
 
-An accepted commit is reachable from the session's accepted ref. `integrate` merges it into a
-local target branch. Git derives the merge base from the accepted commit and target head:
+A completed change is reachable from the session ref. `integrate` merges its head into a local target
+branch. Git derives the merge base from the session and target commits:
 
 ```
 B ── X ── Y      main
  \
-  └── A          refs/rift/accepted/ses_f8py…
+  └── A          refs/rift/sessions/ses_f8py…
 ```
 
-Rift merges `A` into `Y` using `B`, in a candidate worktree. The merge result is a candidate like any
-other: adapters refresh onto it, `Validate` runs over the closure the merge touched, and any declared
-validators run. Two valid commits can form a broken merge: `Y` can rename a function that `A` added a
-call to. Validation therefore runs on the merge candidate.
+Rift creates `.rift/worktrees/integration-f8py…` at `Y` and asks Git's
+[merge API](https://git-scm.com/docs/api-merge) to merge `A`. The API performs the repository's merge
+drivers and leaves standard index stages for paths it cannot combine. Rift reports that Git state to
+the supervisor without constructing a replacement tree.
+
+When the merge succeeds, adapters validate the complete merged tree and Rift runs the configured
+command validators. Two valid commits can still form a broken merge: `Y` may rename a function that
+`A` started calling. After validation passes, Rift creates the merge commit and conditionally advances
+the target from `Y`. A moved target leaves the merge worktree available and returns both object IDs.
 
 | result | what happened |
 | --- | --- |
-| `prepared` | a conflict-free merge candidate and its validation were retained; no ref moved |
-| `merge_conflict` | a parseable provisional merge and the three entries for each conflict were retained |
-| `refreshed` | the retained contract was rebuilt against the current target head |
-| `integrated` | fresh validation passed and compare-and-swap advanced the target |
-| `rejected` | fresh validation failed; the retained evidence names the failure |
-| `refused` | repository state or policy prevented publication — `checked_out_target`, a missing confirmation, or an authorization failure — and a validated candidate is returned when available |
-| `conflict` | the target moved after the candidate was built |
+| `integrated` | Git merged the trees, validation passed, and the conditional ref update advanced the target |
+| `merge_conflict` | Git left an unmerged index; the result names the integration worktree and conflicting paths |
+| `rejected` | adapter or command validation failed; the target stayed at its expected commit |
+| `refused` | policy or repository state prevented the merge from starting |
+| `target_moved` | the target no longer held the object ID supplied to the conditional update |
 
-Compare-and-swap on the target is where two sessions actually contend. Both integrating into `main`
-serialize, and the loser re-merges against the head that won.
+The conditional target update is where two sessions actually contend. Git locks the ref and verifies
+its expected object ID. The losing session must ask the supervisor whether to merge again against the
+new head.
 
 ### Conflicts
 
-A conflicted result returns the base, source, and target entry for every conflicting path. Its
-two-parent provisional merge contains automatic resolutions and retains the target entry at each
-conflict. No conflict markers are written into any tree, because a tree full of `<<<<<<<` is a tree
-no adapter can parse and therefore a tree
-Rift can't validate or ask an adapter about.
+A conflicted result names each path and its Git conflict status, taken from the unmerged index. The
+index and working files stay exactly as Git produced them in the integration worktree. Rift does not
+choose a side, replace conflict markers, or create a provisional commit.
 
-Resolve the conflict with any candidate tool whose `on` is that provisional merge and whose
-`expected_accepted` is the conflict result's `source` — concrete edits, a patch, or an adapter action.
-The source must be an ancestor of the provisional merge, which gives publication a valid
-compare-and-swap base. Publish the repair to the accepted ref, then integrate again. The new merge is
-normally a fast-forward or a conflict-free merge because the repair commit descends from both
-parents.
+Semantic operations return `worktree_busy` while the index is unmerged. The supervisor can inspect
+the files and direct ordinary Git-aware tooling to resolve or abort the merge. After Git reports a
+fully merged index, the supervisor can ask Rift to validate and continue integration.
 
 ### Targets
 
-Rift advances a local branch only when Git reports that no worktree has it checked out. When the target
-is checked out, publication returns
-`checked_out_target` with the prepared commit and leaves the branch, index, and working files
-unchanged. The user can inspect the commit and merge it with ordinary Git.
+Rift advances a local branch only when Git reports that no other worktree has it checked out. When the
+target is checked out, integration returns `checked_out_target` and leaves its ref, index, and files
+unchanged. The supervisor receives the target path and session commit so it can choose what happens in
+that worktree.
 
 Updating a checked-out branch would require changing its ref, index, and files across separate
 filesystem operations. Git provides no transaction covering those three stores, so Rift does not
@@ -729,16 +634,15 @@ Analysis builds facts and coverage privately, then publishes both under a new im
 ID. A complete empty family therefore differs from a family with no coverage. Later analysis
 publishes another generation without changing the one being paged. An active page read pins its
 generation; between calls the generation follows the ordinary LRU policy, so its cursor can expire.
-A ready preview pins the semantic entries used to inspect it until the server exits.
 
 Nothing is analyzed when the server starts. The first semantic read of a snapshot triggers only the
 analysis it needs. `rift facts warm` warms the store explicitly for callers that prefer the up-front
 cost.
 
-The store is a cache. `facts.max-size` evicts least-recently-used generations with no reader or
-ready-preview pin. Server exit drops the complete store, so the first semantic read after restart runs
-the required adapters again. Git-backed reads and the durable preview registry remain available while
-that analysis warms.
+The store is a cache. `facts.max-size` evicts least-recently-used generations with no reader. Server
+exit drops the in-memory generations, so the first semantic read after restart loads a matching disk
+cache entry or runs the required adapters again. Git-backed reads and session history remain available
+while analysis warms.
 
 ## Scheduling and logs
 
@@ -748,25 +652,25 @@ order, then starts the next round. Adapter-wide and per-state in-flight
 limits still apply, so one session waiting on a large analysis cannot fill every adapter slot.
 Requests beyond the queue bound fail with `limit_exceeded` before allocating a worktree.
 
-Every request gets a random request id. The id travels in gRPC metadata, structured MCP errors, and
-the registry's bounded request log. Log records contain the session id, method, phase, duration,
-byte counts, result code, and adapter generation. Source text, code blocks, environment values, and
-debug bindings are redacted. Collection applies the configured byte and age bounds.
+Every request gets a random request ID. It travels in gRPC metadata, structured MCP errors, and the
+configured runtime log sink. Records contain the session ID, method, phase, duration, byte counts,
+result code, and adapter generation. Source text, code blocks, environment values, and debug bindings
+are redacted. Logs are operational output; deleting them cannot change repository or protocol state.
 
 A panic or adapter protocol failure terminates its request boundary. The server records the request
 id, releases the request's leases, and keeps unrelated sessions running.
 
 ## Paths Git doesn't track
 
-Candidate commits are built from the base tree plus the resolved edits, with Git plumbing. There's no
-index and no `git add` involved, so a file an `Edit` creates is in the candidate tree. Incidental
-files created by an adapter process stay outside the commit.
+Rift applies a resolved `Edit` to the session's Git index and worktree through the Git API. A file
+created by an edit enters the index explicitly, while incidental files created by an adapter process
+stay outside the commit.
 
 An edit on a path matched by `.gitignore` fails the `writable` precondition, and the refusal carries
-the path and the rule that matched it. The commit would otherwise carry a file that your own
-`git status` hides from you, which puts what Rift validated and what you can see out of step.
+the path and matching rule. This keeps the committed tree aligned with the paths Git presents as
+ordinary project changes.
 
-Command validators start in a validation workspace copied from the candidate, which contains tracked
+Command validators start in a validation workspace copied from the session commit, which contains tracked
 files only. A test suite that needs an untracked `.env.test` requests it through `validators.carry`.
 User-owned workspace policy has to grant the same path. Rift opens every path component without
 following symlinks and copies only a regular file or directory still contained by the workspace.

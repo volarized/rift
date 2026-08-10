@@ -31,17 +31,20 @@ major, an additive minor, and the SHA-256 digest of the generated descriptor and
 metadata. The server selects an exact tuple and returns the optional features both peers implement.
 Equal version numbers with different digests are incompatible.
 
-The first `ConnectionEvent` contains the selected contract and workspace ID. It also returns a random
-connection ID, plus the durable session ID for an MCP role. The control stream remains open while the
-logical connection exists; closing or superseding it releases resources owned by that connection.
+The first `ConnectionEvent` contains the selected contract and canonical workspace path. For an MCP
+role it also echoes the client-generated session ID, returns the commit held by that session's Git
+ref, and names its registered worktree when one exists. A random connection ID identifies later
+RPCs. The control stream remains open while the logical connection exists; closing or superseding it
+releases resources owned by that connection.
 Later RPCs carry the connection ID in `rift-connection-id` gRPC metadata. A missing ID is
 `invalid_request`, and an unknown or closed ID is `resource_not_found` before repository work begins.
 
-An MCP request may attach a known session. To create one, `rift mcp` supplies a random
-`connect_attempt_id`. The server commits the attempt mapping and new session in one registry
-transaction, so repeating an attempt after a lost response returns the same session. A successful
-retry receives a new connection ID and closes the earlier control stream for that attempt. The mapping
-remains at least as long as the created session is eligible for automatic collection.
+An MCP client generates a random session ID before it connects. The server creates the corresponding
+Git ref when it is absent and attaches when the ref already exists. The ref pins the configured base
+commit, which is enough for reads and gives the first change its `expected_head`. Rift creates the
+registered session worktree when that first change reaches mutation. Reconnecting with the same ID
+therefore reaches the same ref and receives a fresh connection ID whether or not a worktree has been
+materialized.
 
 A SCIP role creates no session. It uses the returned connection ID when calling
 `rift.scip.Projection.Read`. Local socket peer identity supplies the same-user trust boundary for both
@@ -86,9 +89,9 @@ The generated metadata assigns each tool to the phase where a caller uses it. Th
 [MCP page](/docs/protocol/mcp) renders those groups from the same metadata as the tool manifest, while
 the repository resource reports which members the current workspace serves.
 
-Tool parameters carry retained identities where the complete record lives behind a resource. A
-candidate chain continues and publishes through its `PreviewId`, while `act` resolves an
-`ActionOfferId`; portable refactors locate their target with an `Address`.
+Tool parameters carry Git object IDs where a completed change already exists. Change tools require
+the session head they expect, while `act` resolves an `ActionOfferId`; portable refactors locate their
+target with an `Address`.
 
 The manifest omits retained plan records. Action discovery keeps descriptors and per-offer argument
 schemas behind resources until the caller chooses one. Recursive search predicates use the versioned
@@ -112,9 +115,10 @@ uv run python -m unittest discover -s tests -v
 buf breaking --against '.git#tag=<latest-protocol-tag>'
 ```
 
-Removed Protobuf fields keep their numbers and names reserved. An additive MCP field stays optional
-for the rest of its major version. A newly required field, changed default, narrowed accepted value,
-or changed operation meaning increments the major version even when Protobuf itself would decode it.
+The source model generates the current contract. The release gate applies the breaking-change check
+while the major remains unchanged. A newly required field, changed default, narrowed accepted value,
+or changed operation meaning increments the major even when Protobuf itself would decode it. Released
+schemas carry the contracts shipped earlier.
 
 ## The SCIP seam
 
