@@ -227,7 +227,7 @@ class FileContent(ProtocolRoot):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class File(ClosedModel):
-    "One source entry at a revision: what it is called, what it holds, and which languages read it. Physical entries come from the Git tree. A generated regular entry comes from a retained adapter virtual publication. Bytes are read from the same URI that identifies the entry."
+    "One source entry at a revision: what it is called, what it holds, and which languages read it. Physical entries come from the Git tree. A generated regular entry comes from adapter virtual output. Bytes are read from the same URI that identifies the entry."
 
     model_config = closed_config(
         {
@@ -705,20 +705,6 @@ class DiffId(ProtocolRoot):
     """URI for one comparison: `rift://diff/<from>..<to>`. The two revisions use Git range spelling. Git forbids `..` in a ref name, so the separator is unambiguous.
 
     Attach `?cursor=` to continue a paged read."""
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern=r"^prv_[a-z2-7]{52}$",
-    examples=["prv_aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq"],
-)
-class PreviewId(ProtocolRoot):
-    """Identity of one retained candidate: `prv_` followed by lowercase unpadded RFC 4648
-    base32 of SHA-256 over the durable session, resolution base, destination, expected head,
-    parent preview, canonical operation, and publication plan. Repeating the same request returns
-    the retained preview."""
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
@@ -2442,7 +2428,7 @@ class AddressSource(ClosedModel):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class AddressMatch(ClosedModel):
-    "A result of a `StructuralQuery`, by the identity it came back with. That identity carries its source state; resolution returns `stale_match` when the candidate has moved."
+    "A result of a `StructuralQuery`, by the identity it came back with. That identity carries its source state; resolution returns `stale_match` when the session state has moved."
 
     kind: Field[Literal["match"]] = proto_field()
     match: Field[MatchId] = proto_field(
@@ -2981,7 +2967,7 @@ class Diagnostic(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class ValidationReport(ClosedModel):
-    "One adapter's verdict over a candidate snapshot. `coverage` states how much the adapter checked, while `valid` records whether the checked scope contains an error. Workspace validation policy decides which reports publication requires."
+    "One adapter's verdict over a resulting tree. `coverage` states how much the adapter checked, while `valid` records whether the checked scope contains an error. Repository validation policy decides which reports are required."
 
     language: Field[Language] = proto_field(
         description="The adapter that produced this verdict.", number=1
@@ -2992,8 +2978,8 @@ class ValidationReport(ClosedModel):
     )
     coverage: Field[Coverage] = proto_field(
         description=(
-            "How much of the affected program the adapter checked. Publication refuses "
-            "partial or unsupported coverage when workspace policy requires this language."
+            "How much of the affected program the adapter checked. The result is incomplete "
+            "when repository policy requires this language and coverage is partial or unsupported."
         ),
         number=3,
     )
@@ -3003,7 +2989,7 @@ class ValidationReport(ClosedModel):
         json_schema_extra={"uniqueItems": True},
     )
     diagnostics: Field[list[Diagnostic]] = proto_field(
-        description="Adapter findings produced while checking the candidate, sorted by file and source range.",
+        description="Adapter findings produced while checking the resulting tree, sorted by file and source range.",
         number=5,
     )
 
@@ -3032,7 +3018,7 @@ class ValidationReport(ClosedModel):
     },
 )
 class FormattingPolicy(str, Enum):
-    "How formatting participates in a change. The policy is part of the preview identity, so refresh and publish cannot widen its reach."
+    "How formatting participates in one session change."
 
     PRESERVE = "preserve"
     CHANGED_REGIONS = "changed_regions"
@@ -3041,7 +3027,7 @@ class FormattingPolicy(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class MatchCardinality(ClosedModel):
-    "How many matches an atomic rewrite accepts. Rift counts against the candidate state at that point in the ordered change list and refuses the whole preview when the count falls outside this interval."
+    "How many matches an atomic rewrite accepts. Rift counts against the expected session state and refuses the operation when the count falls outside this interval."
 
     minimum: Field[int] = proto_field(
         description="Fewest matches required.", ge=0, le=100000, number=1
@@ -3589,11 +3575,11 @@ class OperationVerifierAdapter(ClosedModel):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class OperationVerifierValidator(ClosedModel):
-    """One caller-supplied command validator checked the candidate."""
+    """One repository-declared command validator checked an integration tree."""
 
     kind: Field[Literal["validator"]] = proto_field()
     validator: Field[int] = proto_field(
-        description="Zero-based position in the preview's validator declarations.",
+        description="Zero-based position in repository validator declarations.",
         ge=0,
         le=4294967295,
         number=1,
@@ -3696,8 +3682,8 @@ class PreconditionValue(ProtocolRoot):
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "target_exists": "Every addressed symbol, node, match, or source range resolves at the candidate state.",
-            "state_matches": "The state used for discovery still matches the state being resolved or published.",
+            "target_exists": "Every addressed symbol, node, match, or source range resolves at the expected state.",
+            "state_matches": "The state used for discovery still matches the state being resolved.",
             "writable": "Every affected path is inside the project, owned by Rift, and permitted by host policy.",
             "references_complete": "The adapter completely classified the references on which the operation depends.",
             "no_remaining_usages": "No usage remains after the selected safe-delete policy is applied.",
@@ -3742,15 +3728,15 @@ class OperationPreconditionStatus(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class OperationPrecondition(ClosedModel):
-    "One executable condition checked during resolution and rechecked during publication. Expected and observed values carry explicit value tags."
+    "One executable condition checked while resolving an operation. Expected and observed values carry explicit value tags."
 
     kind: Field[OperationPreconditionKind] = proto_field(
         description="Condition being checked.",
         number=1,
         json_schema_extra={
             "rift:enumDescriptions": {
-                "target_exists": "Every addressed symbol, node, match, or source range resolves at the candidate state.",
-                "state_matches": "The state used for discovery still matches the state being resolved or published.",
+                "target_exists": "Every addressed symbol, node, match, or source range resolves at the expected state.",
+                "state_matches": "The state used for discovery still matches the state being resolved.",
                 "writable": "Every affected path is inside the project, owned by Rift, and permitted by host policy.",
                 "references_complete": "The adapter completely classified the references on which the operation depends.",
                 "no_remaining_usages": "No usage remains after the selected safe-delete policy is applied.",
@@ -3952,7 +3938,7 @@ class GuaranteeKind(str, Enum):
             "construction": "Rift established the property directly from its closed edit and transaction rules.",
             "adapter": "The language adapter or resolver checked the transformed program.",
             "static_analysis": "A named language analysis checked a property narrower than compilation.",
-            "validator": "A caller-supplied command validator checked the candidate.",
+            "validator": "A repository-declared command validator checked the integration tree.",
         }
     },
 )
@@ -3984,7 +3970,7 @@ class GuaranteeEvidence(ClosedModel):
                 "construction": "Rift established the property directly from its closed edit and transaction rules.",
                 "adapter": "The language adapter or resolver checked the transformed program.",
                 "static_analysis": "A named language analysis checked a property narrower than compilation.",
-                "validator": "A caller-supplied command validator checked the candidate.",
+                "validator": "A repository-declared command validator checked the integration tree.",
             }
         },
     )
@@ -4023,7 +4009,7 @@ class GuaranteeEvidence(ClosedModel):
             "unresolved_reference": "The adapter found a reference it could not classify or update.",
             "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
             "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
-            "command_validator": "A caller-supplied command validator will execute against the candidate.",
+            "command_validator": "A repository-declared command validator will execute against the integration tree.",
         }
     },
 )
@@ -4041,10 +4027,10 @@ class ConfirmationRequirementKind(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class ConfirmationRequirement(ClosedModel):
-    "One effect a caller must acknowledge before publication. Requirements are sorted by kind, source location, title, and detail, then numbered from zero. The acknowledgement is interpreted only with the preview named by the publish request."
+    "One effect a caller must acknowledge before a change commits. Requirements are sorted by kind, source location, title, and detail, then numbered from zero. An acknowledgement applies only to a retry of the same operation and expected head."
 
     id: Field[int] = proto_field(
-        description="Zero-based position in the preview's ordered confirmation list.",
+        description="Zero-based position in the refusal's ordered confirmation list.",
         ge=0,
         le=4294967295,
         number=1,
@@ -4063,7 +4049,7 @@ class ConfirmationRequirement(ClosedModel):
                 "unresolved_reference": "The adapter found a reference it could not classify or update.",
                 "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
                 "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
-                "command_validator": "A caller-supplied command validator will execute against the candidate.",
+                "command_validator": "A repository-declared command validator will execute against the integration tree.",
             }
         },
     )
@@ -4082,7 +4068,7 @@ class ConfirmationRequirement(ClosedModel):
     spans: Field[list[SourceSpan]] = proto_field(
         description=(
             "Source locations that demonstrate the effect. Empty where the condition applies "
-            "to the candidate as a whole."
+            "to the resulting tree as a whole."
         ),
         number=5,
     )
@@ -4122,7 +4108,7 @@ class ActionSupport(ClosedModel):
     schema_extra={
         "rift:enumDescriptions": {
             "always": (
-                "The adapter needs no caller-supplied fact before resolution. Preview validation "
+                "The adapter needs no caller-supplied fact before resolution. Result validation "
                 "and advertised guarantees still apply."
             ),
             "conditional": (
@@ -4131,7 +4117,7 @@ class ActionSupport(ClosedModel):
             ),
             "speculative": (
                 "The adapter inferred intent from incomplete target evidence. The caller inspects "
-                "the resolved plan before publication."
+                "the operation's effects before retrying with acknowledgements."
             ),
         }
     },
@@ -4172,7 +4158,7 @@ class ActionDescriptor(ClosedModel):
         json_schema_extra={
             "rift:enumDescriptions": {
                 "always": (
-                    "The adapter needs no caller-supplied fact before resolution. Preview validation "
+                    "The adapter needs no caller-supplied fact before resolution. Result validation "
                     "and advertised guarantees still apply."
                 ),
                 "conditional": (
@@ -4181,7 +4167,7 @@ class ActionDescriptor(ClosedModel):
                 ),
                 "speculative": (
                     "The adapter inferred intent from incomplete target evidence. The caller inspects "
-                    "the resolved plan before publication."
+                    "the operation's effects before retrying with acknowledgements."
                 ),
             }
         },
@@ -4625,7 +4611,6 @@ MODELS = (
     Edit,
     FileChange,
     DiffId,
-    PreviewId,
     OriginMapping,
     CoverageScope,
     Coverage,

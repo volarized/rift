@@ -1102,27 +1102,27 @@ class AnalyzeSummary(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Ask the adapter to validate the closure affected by a candidate change.\n Rift "
-            "has already applied the candidate and acknowledged its state through\n Refresh, "
-            "so the adapter reads the same files publication is considering."
+            "Ask the adapter to validate the closure affected by a session change.\n Rift "
+            "has already applied the change and acknowledged its state through\n Refresh, "
+            "so the adapter reads the same files Rift is preparing to commit."
         ),
         section="Validation",
     )
 )
 class ValidateRequest(ProtoModel):
-    """Ask the adapter to validate the closure affected by a candidate change.
-    Rift has already applied the candidate and acknowledged its state through
-    Refresh, so the adapter reads the same files publication is considering."""
+    """Ask the adapter to validate the closure affected by a session change.
+    Rift has already applied the change and acknowledged its state through
+    Refresh, so the adapter reads the same files Rift is preparing to commit."""
 
     state: Field[AdapterState] = proto_field(
-        default=..., number=1, description="Candidate state being checked."
+        default=..., number=1, description="Changed session state being checked."
     )
     changed: Field[list[str]] = proto_field(
         default=...,
         number=2,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
-            "Files changed by the candidate, as project-relative paths. The adapter\n expands "
+            "Files changed in the session worktree, as project-relative paths. The adapter\n expands "
             "these to the dependent files its own validity rules require."
         ),
     )
@@ -1194,20 +1194,20 @@ class ValidationSummary(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Ask the language formatter for concrete edits over the current candidate.\n Rift "
+            "Ask the language formatter for concrete edits over the current session state.\n Rift "
             "skips this RPC for FormattingPolicy.PRESERVE."
         ),
         section="Formatting",
     )
 )
 class FormatRequest(ProtoModel):
-    """Ask the language formatter for concrete edits over the current candidate.
+    """Ask the language formatter for concrete edits over the current session state.
     Rift skips this RPC for FormattingPolicy.PRESERVE."""
 
     state: Field[AdapterState] = proto_field(
         default=...,
         number=1,
-        description="Candidate state whose offsets the response must use.",
+        description="Session state whose offsets the response must use.",
     )
     policy: Field[core.FormattingPolicy] = proto_field(
         default=...,
@@ -1236,12 +1236,12 @@ class FormatRequest(ProtoModel):
 @proto_message(
     DirectMessage(
         ADAPTER,
-        description="Formatter output over one acknowledged candidate state.",
+        description="Formatter output over one acknowledged session state.",
         section="Formatting",
     )
 )
 class FormatResponse(ProtoModel):
-    """Formatter output over one acknowledged candidate state."""
+    """Formatter output over one acknowledged session state."""
 
     state: Field[AdapterState] = proto_field(
         default=..., number=1, description="State the formatter read."
@@ -1539,7 +1539,7 @@ class ResolveResponse(ProtoModel):
         number=6,
         description=(
             "Semantic consequences of the edits. Rift refreshes the adapter and\n reconstructs "
-            "candidate-state addresses before retaining the preview."
+            "resulting-state addresses before committing the change."
         ),
     )
     guarantees: Field[list[core.GuaranteeEvidence]] = proto_field(
@@ -1555,7 +1555,7 @@ class ResolveResponse(ProtoModel):
         description=(
             "Evaluate one caller-provided block in the project runtime selected for a pinned "
             "adapter state. Rift gives this call a disposable execution workspace, so evaluated "
-            "code never runs in a shared read, candidate, or connection worktree."
+            "code never runs in a shared read, session, or integration worktree."
         ),
         section="Execution",
     )
@@ -1976,7 +1976,7 @@ ADAPTER_PACKAGE = ProtoPackage(
                     ValidateRequest,
                     ValidateEvent,
                     description=(
-                        "Check a candidate after Rift has written it and refreshed adapter state.\n The "
+                        "Check a session change after Rift has written it and refreshed adapter state.\n The "
                         "stream carries diagnostics followed by one verdict over the affected\n source "
                         "closure."
                     ),
@@ -1987,7 +1987,7 @@ ADAPTER_PACKAGE = ProtoPackage(
                     FormatRequest,
                     FormatResponse,
                     description=(
-                        "Format the files or syntactic regions touched by a candidate. Rift applies\n the "
+                        "Format the files or syntactic regions touched by a session change. Rift applies\n the "
                         "returned text edits and refreshes adapter state before the next change."
                     ),
                 ),

@@ -444,14 +444,14 @@ message AnalyzeSummary {
   // Retention scope for every fact in this Analyze stream.
   rift.adapter.CacheScope cache_scope = 3;
 }
-// Ask the adapter to validate the closure affected by a candidate change.
-// Rift has already applied the candidate and acknowledged its state through
-// Refresh, so the adapter reads the same files publication is considering.
+// Ask the adapter to validate the closure affected by a session change.
+// Rift has already applied the change and acknowledged its state through
+// Refresh, so the adapter reads the same files Rift is preparing to commit.
 message ValidateRequest {
   option (section) = "Validation";
-  // Candidate state being checked.
+  // Changed session state being checked.
   rift.adapter.AdapterState state = 1;
-  // Files changed by the candidate, as project-relative paths. The adapter
+  // Files changed in the session worktree, as project-relative paths. The adapter
   // expands these to the dependent files its own validity rules require.
   repeated string changed = 2;
 }
@@ -478,11 +478,11 @@ message ValidationSummary {
   // Files included in that closure, as project-relative paths in byte order.
   repeated string files = 4;
 }
-// Ask the language formatter for concrete edits over the current candidate.
+// Ask the language formatter for concrete edits over the current session state.
 // Rift skips this RPC for FormattingPolicy.PRESERVE.
 message FormatRequest {
   option (section) = "Formatting";
-  // Candidate state whose offsets the response must use.
+  // Session state whose offsets the response must use.
   rift.adapter.AdapterState state = 1;
   // CHANGED_REGIONS or AFFECTED_FILES. PRESERVE is refused because it requires
   // no formatter work.
@@ -494,7 +494,7 @@ message FormatRequest {
   // to group spans for CHANGED_REGIONS.
   repeated string files = 4;
 }
-// Formatter output over one acknowledged candidate state.
+// Formatter output over one acknowledged session state.
 message FormatResponse {
   option (section) = "Formatting";
   // State the formatter read.
@@ -615,14 +615,14 @@ message ResolveResponse {
   // a failed condition is returned in Refusal instead.
   repeated rift.core.OperationPrecondition preconditions = 5;
   // Semantic consequences of the edits. Rift refreshes the adapter and
-  // reconstructs candidate-state addresses before retaining the preview.
+  // reconstructs resulting-state addresses before committing the change.
   repeated rift.core.OperationEffect effects = 6;
   // Scoped evidence for every guarantee advertised by the action descriptor.
   repeated rift.core.GuaranteeEvidence guarantees = 7;
 }
 // Evaluate one caller-provided block in the project runtime selected for a pinned adapter
 // state. Rift gives this call a disposable execution workspace, so evaluated code never runs in
-// a shared read, candidate, or connection worktree.
+// a shared read, session, or integration worktree.
 message ExecuteRequest {
   option (section) = "Execution";
   // Exact snapshot and adapter generation to evaluate against.
@@ -764,11 +764,11 @@ service Adapter {
   // connect, and what the adapter complains about. Facts stream per file and
   // the summary closes it.
   rpc Analyze (rift.adapter.AnalyzeRequest) returns (stream rift.adapter.AnalyzeEvent);
-  // Check a candidate after Rift has written it and refreshed adapter state.
+  // Check a session change after Rift has written it and refreshed adapter state.
   // The stream carries diagnostics followed by one verdict over the affected
   // source closure.
   rpc Validate (rift.adapter.ValidateRequest) returns (stream rift.adapter.ValidateEvent);
-  // Format the files or syntactic regions touched by a candidate. Rift applies
+  // Format the files or syntactic regions touched by a session change. Rift applies
   // the returned text edits and refreshes adapter state before the next change.
   rpc Format (rift.adapter.FormatRequest) returns (rift.adapter.FormatResponse);
   // Find code by structural shape: a call with two arguments, or a class

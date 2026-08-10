@@ -123,7 +123,7 @@ class SessionConfig(ConfigModel):
 
     base: SessionBase = Field(
         default=SessionBase.HEAD,
-        description="State captured as the session's initial accepted commit.",
+        description="State captured as the session ref's initial commit.",
     )
     integration: IntegrationMode = Field(
         default=IntegrationMode.MANUAL,
@@ -364,7 +364,7 @@ RequiredLanguages = Annotated[
 
 
 class ValidationConfig(ConfigModel):
-    """Adapter validation reports required before candidate publication."""
+    """Adapter validation reports required for session changes and integration."""
 
     require: Literal["available"] | RequiredLanguages = Field(
         default="available",
@@ -384,18 +384,15 @@ class ValidationConfig(ConfigModel):
         return self
 
 
-CommandPrefix = Annotated[list[str], Field(min_length=1)]
-
-
 class ValidatorsConfig(ConfigModel):
-    """Repository policy for caller-declared ``mcp.CommandValidator`` processes."""
+    """Repository-declared command checks requested before integration."""
 
-    allow: list[CommandPrefix] = Field(
+    commands: list[mcp.CommandValidator] = Field(
         default_factory=list,
-        description="Allowed literal prefixes of CommandValidator.argv.",
-        json_schema_extra={
-            "rift:prefixOf": _field_target(mcp.CommandValidator.argv),
-        },
+        description=(
+            "Exact command declarations, in execution order. Current user policy must grant "
+            "each declaration before Rift runs it."
+        ),
     )
     carry: list[core.ProjectPath] = Field(
         default_factory=list,
@@ -414,23 +411,20 @@ class ValidatorsConfig(ConfigModel):
 
     @model_validator(mode="after")
     def entries_are_well_formed(self) -> ValidatorsConfig:
-        prefixes = [tuple(prefix) for prefix in self.allow]
-        if any(not argument for prefix in prefixes for argument in prefix):
-            raise ValueError("validators.allow arguments must be non-empty")
-        if len(prefixes) != len(set(prefixes)):
-            raise ValueError("validators.allow prefixes must be unique")
+        ids = [command.id for command in self.commands]
+        if len(ids) != len(set(ids)):
+            raise ValueError("validators.commands ids must be unique")
+        if any(
+            command.timeout_ms > self.max_timeout.milliseconds
+            for command in self.commands
+        ):
+            raise ValueError(
+                "validators.commands timeout_ms exceeds validators.max-timeout"
+            )
         carried = [path.root for path in self.carry]
         if len(carried) != len(set(carried)):
             raise ValueError("validators.carry paths must be unique")
         return self
-
-    def permits(self, validator: mcp.CommandValidator) -> bool:
-        """Whether this repository policy admits one typed command declaration."""
-
-        within_timeout = validator.timeout_ms <= self.max_timeout.milliseconds
-        argv = validator.argv
-        allowed = any(argv[: len(prefix)] == prefix for prefix in self.allow)
-        return within_timeout and allowed
 
 
 class AdapterProcessConfig(ConfigModel):

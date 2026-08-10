@@ -9,8 +9,9 @@ RPC_CONNECT = Rpc(
     response=mcp.ConnectionEvent,
     response_stream=True,
     description=(
-        "Opens the control stream that owns one logical client connection. The first event "
-        "selects the wire contract and returns the connection identity required by later RPCs."
+        "Opens the control stream that owns one logical client connection. For an MCP role, the "
+        "first event returns the Git session ref head and its worktree when a change has already "
+        "materialized one."
     ),
 )
 
@@ -96,30 +97,30 @@ RPC_DEBUG_STOP = Rpc(
 RPC_EDIT = Rpc(
     name="Edit",
     request=mcp.EditParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
-        "Builds a candidate from an atomic set of concrete edits. Nothing is published: the "
-        "candidate is an immutable commit that `publish` can advance a ref to."
+        "Materializes the session worktree when needed, applies an atomic set of concrete edits, "
+        "validates the resulting tree, creates a Git commit, and conditionally advances the "
+        "session ref."
     ),
 )
 
 RPC_PATCH = Rpc(
     name="Patch",
     request=mcp.PatchParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
-        "Builds a candidate from a unified diff. Rift checks every hunk's context against the "
-        "state it resolves against. A patch written for older bytes is refused before any hunk "
-        "is applied."
+        "Checks the expected session head before materializing its worktree when needed, then "
+        "applies a unified diff and checks every hunk's context."
     ),
 )
 
 RPC_REWRITE = Rpc(
     name="Rewrite",
     request=mcp.RewriteParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
-        "Builds a candidate by replacing every match of one query. The cardinality is checked "
+        "Commits replacements for every match of one query. The cardinality is checked "
         "before expansion, so a pattern that matches more places than intended refuses instead "
         "of rewriting them."
     ),
@@ -128,23 +129,26 @@ RPC_REWRITE = Rpc(
 RPC_REVERT = Rpc(
     name="Revert",
     request=mcp.RevertParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
-        "Builds a candidate from the three-way inverse of one commit against a selected parent."
+        "Commits the three-way inverse of one commit against a selected parent."
     ),
 )
 
 RPC_MERGE = Rpc(
     name="Merge",
     request=mcp.MergeParams,
-    response=mcp.CandidateResult,
-    description="Builds a candidate by merging one exact commit into the candidate state.",
+    response=mcp.ChangeResult,
+    description=(
+        "Runs Git's three-way merge in the session worktree. A conflict preserves Git's "
+        "unmerged index and reports it to the supervisor."
+    ),
 )
 
 RPC_RENAME = Rpc(
     name="Rename",
     request=mcp.RenameParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
         "Changes what a declaration is called and rewrites every reference that names it. The "
         "adapter checks spelling, collisions, and binding changes. A reference outside the "
@@ -155,7 +159,7 @@ RPC_RENAME = Rpc(
 RPC_MOVE = Rpc(
     name="Move",
     request=mcp.MoveParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
         "Moves a declaration or file to another container or path and updates the imports and "
         "references that reach it."
@@ -165,7 +169,7 @@ RPC_MOVE = Rpc(
 RPC_DELETE = Rpc(
     name="Delete",
     request=mcp.DeleteParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
         "Removes a declaration. Without a policy this is a mechanical removal that analyses no "
         "references. With one, the adapter classifies every remaining use, applies the stated "
@@ -176,7 +180,7 @@ RPC_DELETE = Rpc(
 RPC_CHANGE_SIGNATURE = Rpc(
     name="ChangeSignature",
     request=mcp.ChangeSignatureParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
         "Changes the shape of a callable and propagates it to callers, overrides, and "
         "implementations. Unlike a rename, it rewrites argument lists, so it commonly raises a "
@@ -187,7 +191,7 @@ RPC_CHANGE_SIGNATURE = Rpc(
 RPC_ACT = Rpc(
     name="Act",
     request=mcp.ActParams,
-    response=mcp.CandidateResult,
+    response=mcp.ChangeResult,
     description=(
         "Resolves one action an adapter offered — a quick fix, an extraction, an inline, or an "
         "adapter-specific family. Arguments are validated against the schema the offer "
@@ -200,43 +204,9 @@ RPC_INTEGRATE = Rpc(
     request=mcp.IntegrateParams,
     response=mcp.IntegrateResult,
     description=(
-        "Merges the connection's accepted commit into a local branch and validates the result. "
-        "Two commits that are each valid can merge into a broken tree, so the merge candidate "
-        "is validated like any other. A conflict returns a parseable provisional merge."
-    ),
-)
-
-RPC_REFRESH = Rpc(
-    name="Refresh",
-    request=mcp.RefreshParams,
-    response=mcp.RefreshResult,
-    description=(
-        "Reruns a retained candidate's operation against a newer base and reports how much the "
-        "result moved. It preserves the stored publication plan unless the caller supplies a "
-        "replacement for the new preview."
-    ),
-)
-
-RPC_PUBLISH = Rpc(
-    name="Publish",
-    request=mcp.PublishParams,
-    response=mcp.PublishResult,
-    description=(
-        "Runs the retained preview's command validators and advances its "
-        "destination by compare-and-swap: the accepted ref for an ordinary candidate, the "
-        "target branch for an integration. A retry that finds the destination already holding "
-        "the candidate returns the same result."
-    ),
-)
-
-RPC_PERSIST = Rpc(
-    name="Persist",
-    request=mcp.PersistParams,
-    response=mcp.PersistResult,
-    description=(
-        "Materializes an accepted commit into the connection worktree. Each requested "
-        "path reports its own outcome, so drift, sparse checkout rules, nested "
-        "repositories, and deletion policy remain visible to the caller."
+        "Merges the session head into a local branch in a dedicated integration worktree. Git "
+        "conflicts remain in its standard index stages; Rift validates a clean merged tree and "
+        "conditionally advances the target ref."
     ),
 )
 
@@ -270,9 +240,6 @@ RIFT_SERVICE = Service(
         RPC_CHANGE_SIGNATURE,
         RPC_ACT,
         RPC_INTEGRATE,
-        RPC_REFRESH,
-        RPC_PUBLISH,
-        RPC_PERSIST,
         RPC_READRESOURCE,
     ),
 )
@@ -305,18 +272,9 @@ DOCUMENT = Document(
             name="changes",
             title="Changes",
             summary=(
-                "Build a candidate. Each tool resolves one operation against a base or against "
-                "the candidate named by `on`, writes an immutable commit, and validates it. "
-                "Nothing reaches a ref or the connection worktree until publication."
-            ),
-        ),
-        ToolGroup(
-            name="lifecycle",
-            title="Lifecycle",
-            summary=(
-                "Continue a retained candidate. `refresh` reruns it on a newer base. `publish` "
-                "advances a ref after replay and validation, while `persist` copies accepted "
-                "paths into the connection worktree."
+                "Check the expected session head, materialize its worktree when needed, resolve "
+                "one operation, validate the result, and append a Git commit. Integration uses "
+                "Git's merge state directly and never resolves conflicts for the supervisor."
             ),
         ),
         ToolGroup(
@@ -345,9 +303,6 @@ DOCUMENT = Document(
         Tool(name="change_signature", rpc=RPC_CHANGE_SIGNATURE, group="changes"),
         Tool(name="act", rpc=RPC_ACT, group="changes"),
         Tool(name="integrate", rpc=RPC_INTEGRATE, group="changes"),
-        Tool(name="refresh", rpc=RPC_REFRESH, group="lifecycle"),
-        Tool(name="publish", rpc=RPC_PUBLISH, group="lifecycle"),
-        Tool(name="persist", rpc=RPC_PERSIST, group="lifecycle"),
         Tool(name="execute", rpc=RPC_EXECUTE, group="execution"),
         Tool(name="debug_start", rpc=RPC_DEBUG_START, group="execution"),
         Tool(name="debug_get_frame", rpc=RPC_DEBUG_GET_FRAME, group="execution"),
@@ -358,8 +313,9 @@ DOCUMENT = Document(
             name="repository",
             description=(
                 "Reports the tools and resources this workspace serves, which languages have "
-                "adapters, the state answers resolve against, request limits, retention, and the "
-                "active conformance profile. Clients read it before calling another entry point."
+                "adapters, the state answers resolve against, request limits, effective command "
+                "validators, cache policy, and the active conformance profile. Clients read it "
+                "before calling another entry point."
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.RepositoryResourceUri,
@@ -398,17 +354,6 @@ DOCUMENT = Document(
             link=mcp.ResourceLink,
         ),
         Resource(
-            name="preview",
-            description=(
-                "Returns the retained plan behind one candidate, including the request it was "
-                "built from, its concrete edits, candidate diff, adapter and validator evidence, "
-                "and confirmations. Its `parent` reads back the chain the candidate belongs to."
-            ),
-            template=mcp.ResourceTemplate,
-            uri=mcp.PreviewResourceUri,
-            link=mcp.PreviewResourceLink,
-        ),
-        Resource(
             name="actions",
             description=(
                 "Returns the fixes and refactors an adapter offers at one address, or across one "
@@ -443,14 +388,13 @@ DOCUMENT = Document(
     axes=(
         Axis(
             name="Versioning",
-            summary="Revision selectors, resolved snapshots, commits, worktrees, diffs, and retained previews.",
+            summary="Revision selectors, resolved snapshots, commits, worktrees, and diffs.",
             identified_by=(
                 core.Revision,
                 core.Snapshot,
                 core.Commit,
                 core.Worktree,
                 core.DiffId,
-                core.PreviewId,
             ),
         ),
         Axis(
@@ -474,7 +418,6 @@ DOCUMENT = Document(
                 core.RegionRole,
                 core.FileChange,
                 core.OriginMapping,
-                mcp.PersistOutcome,
                 core.Capture,
                 core.StructuralMatchRanges,
                 core.LanguageRegion,
@@ -527,7 +470,7 @@ DOCUMENT = Document(
                 core.DiagnosticRelated,
                 core.Severity,
                 core.ValidationReport,
-                mcp.CandidateValidation,
+                mcp.ChangeValidation,
                 mcp.ValidatorResult,
                 core.CapturedText,
             ),
@@ -559,7 +502,6 @@ DOCUMENT = Document(
                 core.GuaranteeKind,
                 core.GuaranteeEvidence,
                 core.ConfirmationRequirement,
-                mcp.PreviewOperation,
                 mcp.EditParams,
                 mcp.PatchParams,
                 mcp.RewriteParams,
@@ -574,6 +516,7 @@ DOCUMENT = Document(
                 mcp.RefusalReason,
                 core.ActionSupport,
                 mcp.CommandValidator,
+                mcp.GitConflict,
             ),
         ),
         Axis(

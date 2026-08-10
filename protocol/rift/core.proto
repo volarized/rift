@@ -253,8 +253,7 @@ enum RelationshipFacet {
   // ORM entity and its table.
   RELATIONSHIP_FACET_BINDS = 29;
 }
-// How formatting participates in a change. The policy is part of the preview identity, so
-// refresh and publish cannot widen its reach.
+// How formatting participates in one session change.
 enum FormattingPolicy {
   // The caller did not set a value.
   FORMATTING_POLICY_UNSPECIFIED = 0;
@@ -422,8 +421,8 @@ message FileContent {
   }
 }
 // One source entry at a revision: what it is called, what it holds, and which languages read
-// it. Physical entries come from the Git tree. A generated regular entry comes from a retained
-// adapter virtual publication. Bytes are read from the same URI that identifies the entry.
+// it. Physical entries come from the Git tree. A generated regular entry comes from adapter
+// virtual output. Bytes are read from the same URI that identifies the entry.
 message File {
   // Project-relative source identity and the URI from which this record and its bytes are read.
   string id = 1;
@@ -1481,7 +1480,7 @@ message AddressSource {
   SourceSpan span = 1;
 }
 // A result of a `StructuralQuery`, by the identity it came back with. That identity carries its
-// source state; resolution returns `stale_match` when the candidate has moved.
+// source state; resolution returns `stale_match` when the session state has moved.
 message AddressMatch {
   // The match, and the state it was found in.
   string match = 1;
@@ -1776,25 +1775,25 @@ message Diagnostic {
   // Which adapter produced this. Null for a finding Rift itself raised.
   optional Language language = 10;
 }
-// One adapter's verdict over a candidate snapshot. `coverage` states how much the adapter
-// checked, while `valid` records whether the checked scope contains an error. Workspace
-// validation policy decides which reports publication requires.
+// One adapter's verdict over a resulting tree. `coverage` states how much the adapter checked,
+// while `valid` records whether the checked scope contains an error. Repository validation
+// policy decides which reports are required.
 message ValidationReport {
   // The adapter that produced this verdict.
   Language language = 1;
   // Whether this adapter accepted every file in `files` under the reported coverage.
   bool valid = 2;
-  // How much of the affected program the adapter checked. Publication refuses partial or
-  // unsupported coverage when workspace policy requires this language.
+  // How much of the affected program the adapter checked. The result is incomplete when
+  // repository policy requires this language and coverage is partial or unsupported.
   Coverage coverage = 3;
   // Affected files this verdict covers, sorted by project path.
   repeated string files = 4;
-  // Adapter findings produced while checking the candidate, sorted by file and source range.
+  // Adapter findings produced while checking the resulting tree, sorted by file and source
+  // range.
   repeated Diagnostic diagnostics = 5;
 }
-// How many matches an atomic rewrite accepts. Rift counts against the candidate state at that
-// point in the ordered change list and refuses the whole preview when the count falls outside
-// this interval.
+// How many matches an atomic rewrite accepts. Rift counts against the expected session state
+// and refuses the operation when the count falls outside this interval.
 message MatchCardinality {
   // Fewest matches required.
   int64 minimum = 1;
@@ -2016,9 +2015,9 @@ message OperationVerifierAdapter {
   // Adapter whose adapter performed the check.
   Language language = 1;
 }
-// One caller-supplied command validator checked the candidate.
+// One repository-declared command validator checked an integration tree.
 message OperationVerifierValidator {
-  // Zero-based position in the preview's validator declarations.
+  // Zero-based position in repository validator declarations.
   int64 validator = 1;
 }
 // The component that checked a precondition or established a guarantee.
@@ -2060,16 +2059,16 @@ message PreconditionValue {
     PreconditionValueText text = 5;
   }
 }
-// One executable condition checked during resolution and rechecked during publication. Expected
-// and observed values carry explicit value tags.
+// One executable condition checked while resolving an operation. Expected and observed values
+// carry explicit value tags.
 message OperationPrecondition {
   // Condition being checked.
   enum Kind {
     // The caller did not set a value.
     KIND_UNSPECIFIED = 0;
-    // Every addressed symbol, node, match, or source range resolves at the candidate state.
+    // Every addressed symbol, node, match, or source range resolves at the expected state.
     KIND_TARGET_EXISTS = 1;
-    // The state used for discovery still matches the state being resolved or published.
+    // The state used for discovery still matches the state being resolved.
     KIND_STATE_MATCHES = 2;
     // Every affected path is inside the project, owned by Rift, and permitted by host policy.
     KIND_WRITABLE = 3;
@@ -2184,7 +2183,7 @@ message GuaranteeEvidence {
     ADAPTER = 2;
     // A named language analysis checked a property narrower than compilation.
     STATIC_ANALYSIS = 3;
-    // A caller-supplied command validator checked the candidate.
+    // A repository-declared command validator checked the integration tree.
     VALIDATOR = 4;
   }
   GuaranteeKind kind = 1;
@@ -2198,9 +2197,9 @@ message GuaranteeEvidence {
   // Findings produced while establishing the guarantee.
   repeated Diagnostic diagnostics = 6;
 }
-// One effect a caller must acknowledge before publication. Requirements are sorted by kind,
-// source location, title, and detail, then numbered from zero. The acknowledgement is
-// interpreted only with the preview named by the publish request.
+// One effect a caller must acknowledge before a change commits. Requirements are sorted by
+// kind, source location, title, and detail, then numbered from zero. An acknowledgement applies
+// only to a retry of the same operation and expected head.
 message ConfirmationRequirement {
   // The condition that makes acknowledgement necessary.
   enum Kind {
@@ -2219,10 +2218,10 @@ message ConfirmationRequirement {
     BEHAVIOR_UNKNOWN = 5;
     // Formatting reaches outside the changed syntactic regions.
     FORMATTING_SCOPE = 6;
-    // A caller-supplied command validator will execute against the candidate.
+    // A repository-declared command validator will execute against the integration tree.
     COMMAND_VALIDATOR = 7;
   }
-  // Zero-based position in the preview's ordered confirmation list.
+  // Zero-based position in the refusal's ordered confirmation list.
   int64 id = 1;
   Kind kind = 2;
   // A short account of the effect being acknowledged.
@@ -2230,7 +2229,7 @@ message ConfirmationRequirement {
   // The concrete consequence, including the scope or unresolved item that triggered it.
   string detail = 4;
   // Source locations that demonstrate the effect. Empty where the condition applies to the
-  // candidate as a whole.
+  // resulting tree as a whole.
   repeated SourceSpan spans = 5;
 }
 // One adapter action family advertised for a language. The prefix supports planning. Discovery
@@ -2265,14 +2264,14 @@ message ActionDescriptor {
   enum Applicability {
     // The caller did not set a value.
     APPLICABILITY_UNSPECIFIED = 0;
-    // The adapter needs no caller-supplied fact before resolution. Preview validation and
+    // The adapter needs no caller-supplied fact before resolution. Result validation and
     // advertised guarantees still apply.
     ALWAYS = 1;
     // Correct only under a condition the adapter cannot establish. The condition appears in the
     // resolved preconditions or confirmations.
     CONDITIONAL = 2;
     // The adapter inferred intent from incomplete target evidence. The caller inspects the
-    // resolved plan before publication.
+    // operation's effects before retrying with acknowledgements.
     SPECULATIVE = 3;
   }
   // A property an action claims and must establish with scoped evidence when resolved.

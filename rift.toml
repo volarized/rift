@@ -34,6 +34,6 @@ max-debug-value = "1KiB"
 require = "available"
 
 [validators]
-allow = []
+commands = []
 carry = []
 max-timeout = "5m"
