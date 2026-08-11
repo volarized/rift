@@ -11,15 +11,16 @@ import { cn } from "@/lib/utils";
 const SHELL = "mx-auto w-full max-w-190 px-6 sm:px-7";
 const WIDE = "mx-auto w-full max-w-280 px-6 sm:px-7";
 
-/** Every section is a screen, less the header it scrolls under. */
-const SCREEN = "min-h-[calc(80svh)]";
+/** Most of a screen for the hero; a shallower band for every later section. */
+const HERO = "min-h-[80svh]";
+const SCREEN = "min-h-[60svh]";
 
 /** Inter 300 at display size — one statement per section, never more. */
 function Statement({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <p
       className={cn(
-        "m-0 max-w-165 font-sans leading-[1.28] font-light tracking-[-0.015em] text-4xl text-balance text-foreground",
+        "m-0 max-w-165 font-sans leading-[1.28] font-light tracking-[-0.015em] text-[2.75rem] text-balance text-foreground",
         className,
       )}
     >
@@ -28,12 +29,12 @@ function Statement({ children, className }: { children: React.ReactNode; classNa
   );
 }
 
-/** Inter 300, 16/1.6 — body copy. */
+/** Inter 300, 18/1.6 — body copy. */
 function Body({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <p
       className={cn(
-        "m-0 max-w-150 leading-relaxed font-light text-pretty text-muted-foreground",
+        "m-0 max-w-150 text-lg leading-relaxed font-light text-pretty text-muted-foreground",
         className,
       )}
     >
@@ -101,7 +102,7 @@ export default function HomePage() {
   return (
     <main className="flex flex-1 flex-col">
       {/* 1 — hero, standing on a warped ground plane */}
-      <section className={cn("relative flex items-center overflow-hidden", SCREEN)}>
+      <section className={cn("relative flex items-center overflow-hidden", HERO)}>
         <div
           className={cn(
             SHELL,
@@ -109,7 +110,7 @@ export default function HomePage() {
           )}
         >
           <div className="grid justify-items-start gap-5">
-            <h1 className="m-0 font-mono text-[52px] leading-none font-medium tracking-[-0.03em] sm:text-[64px]">
+            <h1 className="m-0 font-mono text-[60px] leading-none font-medium tracking-[-0.03em] sm:text-[76px]">
               rift
             </h1>
 
@@ -123,7 +124,7 @@ export default function HomePage() {
           <Logo
             bloom
             strokeWidth={0.24}
-            className="h-56 w-full max-w-56 justify-self-center text-foreground/70 sm:h-72 sm:max-w-72 md:justify-self-end"
+            className="h-64 w-full max-w-64 justify-self-center text-foreground/70 sm:h-80 sm:max-w-80 md:justify-self-end"
           />
         </div>
       </section>
@@ -137,7 +138,7 @@ export default function HomePage() {
           tilt={1.48}
           fit={0.8}
           opacity={0.15}
-          className="w-full min-w-96 justify-self-center sm:h-72 md:w-72"
+          className="w-full min-w-96 justify-self-center sm:h-80 md:w-80"
         />
         <div className="grid gap-5">
           <Statement>Agents depend on context and tooling.</Statement>
@@ -158,7 +159,7 @@ export default function HomePage() {
               </Statement>
             ) : null}
             <div className="grid gap-3">
-              <h3 className="m-0 font-mono font-medium tracking-[0.02em]">{item.title}</h3>
+              <h3 className="m-0 font-mono text-xl font-medium tracking-[0.02em]">{item.title}</h3>
               <Body>{item.body}</Body>
             </div>
           </div>
@@ -169,7 +170,7 @@ export default function HomePage() {
             <ExplodedObject
               kind={item.solid}
               className={cn(
-                "h-56 w-full max-w-64 justify-self-center sm:h-72 md:w-72",
+                "h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80",
                 index % 2 === 1 && "md:order-first",
               )}
             />
@@ -182,7 +183,7 @@ export default function HomePage() {
               fit={item.fit ?? 0.78}
               opacity={0.15}
               className={cn(
-                "h-56 w-full max-w-64 justify-self-center sm:h-72 md:w-72",
+                "h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80",
                 index % 2 === 1 && "md:order-first",
               )}
             />
@@ -201,7 +202,7 @@ export default function HomePage() {
             href="mailto:contact@volar.sh"
             className="flex items-center gap-2 text-sm font-medium w-0"
           >
-            <Button variant="outline" size="lg" className="w-fit">
+            <Button variant="outline" size="lg" className="w-fit text-base">
               Get in touch
               <ArrowRightIcon weight="bold" className="h-4 w-4" />
             </Button>
@@ -217,7 +218,7 @@ export default function HomePage() {
           spin={-0.55}
           fit={0.82}
           opacity={0.14}
-          className="h-56 w-full max-w-64 justify-self-center sm:h-72 md:w-72"
+          className="h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80"
         />
       </Section>
     </main>
