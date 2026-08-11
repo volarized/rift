@@ -1,0 +1,124 @@
+# Cuts a protocol version, MCP-style.
+#
+#   kind=rc    → tag <version>-RC + prerelease GitHub Release on current main.
+#                Spec content stays under the draft trees. No PR.
+#   kind=final → snapshot the generated artifacts into protocol/versions/<version>/,
+#                promote docs/content/docs/draft into a dated tree, stamp the
+#                version list, reset the draft changelog, and open a PR for
+#                review. Tagging the GA release is handled by the companion
+#                publish-release workflow after that PR merges.
+#
+# The version identifier is the release date, YYYY-MM-DD. A version is a
+# complete snapshot: the dated trees are copies of draft with links rewritten,
+# never diffs.
+#
+# The dispatch input reaches every shell through the VERSION environment
+# variable, never through inline `${{ }}` interpolation, so a crafted input
+# cannot splice into a command; the first step of each job rejects anything
+# that is not a bare date.
+name: cut-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Protocol version (YYYY-MM-DD)
+        required: true
+      kind:
+        description: rc or final
+        required: true
+        type: choice
+        options: [rc, final]
+
+env:
+  VERSION: ${{ inputs.version }}
+
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rc:
+    if: inputs.kind == 'rc'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate version
+        run: |
+          [[ "$VERSION" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::version must be YYYY-MM-DD"; exit 1; }
+      - name: Tag release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${VERSION}-RC" \
+            --prerelease \
+            --title "$VERSION release candidate" \
+            --notes "Release candidate for the $VERSION protocol version. The specification is available in draft form; changes may still land before the final release."
+
+  final:
+    if: inputs.kind == 'final'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate version
+        run: |
+          [[ "$VERSION" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::version must be YYYY-MM-DD"; exit 1; }
+          [[ ! -d "protocol/versions/$VERSION" ]] || { echo "::error::protocol/versions/$VERSION already exists"; exit 1; }
+          [[ ! -d "docs/content/docs/$VERSION" ]] || { echo "::error::docs/content/docs/$VERSION already exists"; exit 1; }
+      # The protocol tooling is uv-managed Python; this is the only workflow
+      # that runs it, so the setup lives here rather than in ci.yml.
+      - uses: astral-sh/setup-uv@v7
+      - name: Verify the generated contract
+        working-directory: protocol
+        run: |
+          uv run python -m rift.generate --check
+          uv run python -m unittest discover -s tests
+      - name: Snapshot the artifacts
+        working-directory: protocol
+        run: uv run python -m rift.snapshot "$VERSION"
+      - name: Promote draft docs to the dated tree
+        run: |
+          cp -r docs/content/docs/draft "docs/content/docs/$VERSION"
+          # A version is a snapshot, so every internal link points inside it.
+          grep -rl "/docs/draft/" "docs/content/docs/$VERSION" | xargs -r sed -i "s|/docs/draft/|/docs/$VERSION/|g"
+          sed -i "s|<Reference version=\"draft\" />|<Reference version=\"$VERSION\" />|" "docs/content/docs/$VERSION/protocol/reference.mdx"
+          # The promoted changelog is this version's record; the draft keeps accumulating.
+          sed -i "s|^title: Changelog$|title: Key Changes|" "docs/content/docs/$VERSION/changelog.mdx"
+          printf -- "---\ntitle: Changelog\n---\n\nChanges since the most recent release will accumulate here.\n" > docs/content/docs/draft/changelog.mdx
+          # Sidebar identity for the new root folder, and its place in the list.
+          python3 - "$VERSION" <<'PY'
+          import json, sys
+          version = sys.argv[1]
+          meta_path = f"docs/content/docs/{version}/meta.json"
+          meta = json.load(open(meta_path))
+          meta["title"] = version
+          json.dump(meta, open(meta_path, "w"), indent=2)
+          top_path = "docs/content/docs/meta.json"
+          top = json.load(open(top_path))
+          top["pages"] = [version, *[p for p in top["pages"] if p != version]]
+          json.dump(top, open(top_path, "w"), indent=2)
+          PY
+      - name: Stamp the version list
+        run: |
+          sed -i "s|const DATED_VERSIONS: string\[\] = \[|const DATED_VERSIONS: string[] = [\n  \"$VERSION\",|" docs/src/lib/versions.ts
+      - name: Open the release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "release/$VERSION"
+          git add -A
+          git commit -m "Add $VERSION Rift specification"
+          git push -u origin "release/$VERSION"
+          gh pr create \
+            --title "Add $VERSION Rift specification" \
+            --body "$(printf 'Cuts the %s protocol version: artifact snapshot under protocol/versions/, dated docs tree, version list stamp, draft changelog reset.\n\n- [ ] Spot-check the dated tree on the preview\n- [ ] Confirm the snapshot manifest digests\n- [ ] Confirm the version switcher lists %s first' "$VERSION" "$VERSION")"
