@@ -1,12 +1,12 @@
 /**
  * The documented protocol versions, MCP-style: dated snapshots plus the
- * in-progress draft. Dated trees read their artifacts from
- * `protocol/versions/<date>/`; the draft reads the live `protocol/` tree.
- * The cut-release workflow promotes the draft into a dated tree and adds its
- * entry to `DATED_VERSIONS`, newest first.
+ * in-progress draft. The cut-release workflow promotes the draft into a dated
+ * tree and adds its entry to `DATED_VERSIONS`, newest first.
+ *
+ * Pure constants only — the version banner imports this from a client
+ * component, so anything Node-only (the artifact directory lookup) lives in
+ * `protocol-dir.ts` instead.
  */
-
-import { join } from "node:path";
 
 export const DRAFT = "draft";
 
@@ -20,9 +20,3 @@ export const LATEST_VERSION: string | null = DATED_VERSIONS[0] ?? null;
 export const DOC_VERSIONS: string[] = [...DATED_VERSIONS, DRAFT];
 
 export type DocVersion = string;
-
-export function protocolDirFor(version: DocVersion): string {
-  return version === DRAFT
-    ? join(process.cwd(), "..", "protocol")
-    : join(process.cwd(), "..", "protocol", "versions", version);
-}

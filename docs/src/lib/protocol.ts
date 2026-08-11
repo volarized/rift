@@ -25,7 +25,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import traverse from "json-schema-traverse";
 import type { JSONSchema } from "json-schema-typed/draft-2020-12";
-import { type DocVersion, protocolDirFor } from "@/lib/versions";
+import { protocolDirFor } from "@/lib/protocol-dir";
+import type { DocVersion } from "@/lib/versions";
 
 /** A schema object. The draft allows a bare boolean; these documents never use one. */
 export type Schema = Exclude<JSONSchema, boolean>;

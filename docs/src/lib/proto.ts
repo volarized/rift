@@ -7,7 +7,8 @@
 
 import { isAbsolute, join } from "node:path";
 import protobuf from "protobufjs";
-import { type DocVersion, protocolDirFor } from "@/lib/versions";
+import { protocolDirFor } from "@/lib/protocol-dir";
+import type { DocVersion } from "@/lib/versions";
 
 // protobufjs bundles the well-known types it can inline, but not
 // descriptor.proto, which `adapter.proto` needs to declare its own options. It
