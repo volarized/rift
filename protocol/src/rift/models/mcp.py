@@ -1974,7 +1974,7 @@ class ErrorData(ClosedModel):
     },
 )
 class LimitEvidenceScope(str, Enum):
-    "Which side of the server the limit belongs to. The two fail at different seams: a `driver` limit is enforced by Rift around the request, while an `adapter` limit is enforced inside one adapter process."
+    "Which side of the server the limit belongs to: a `driver` limit is enforced by Rift around the request, while an `adapter` limit is enforced inside one adapter process."
 
     DRIVER = "driver"
     ADAPTER = "adapter"
@@ -1986,7 +1986,7 @@ class LimitEvidence(ClosedModel):
 
     scope: Field[LimitEvidenceScope] = proto_field(
         description=(
-            "Which side of the server the limit belongs to. The two fail at different seams: "
+            "Which side of the server the limit belongs to: "
             "a `driver` limit is enforced by Rift around the request, while an `adapter` limit "
             "is enforced inside one adapter process."
         ),

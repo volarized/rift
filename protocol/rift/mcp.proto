@@ -779,9 +779,8 @@ message ErrorData {
 // when the code is `limit_exceeded`; without it, choosing between retrying smaller, falling
 // back to another resource and giving up means reparsing the human message.
 message LimitEvidence {
-  // Which side of the server the limit belongs to. The two fail at different seams: a `driver`
-  // limit is enforced by Rift around the request, while an `adapter` limit is enforced inside
-  // one adapter process.
+  // Which side of the server the limit belongs to: a `driver` limit is enforced by Rift around
+  // the request, while an `adapter` limit is enforced inside one adapter process.
   enum Scope {
     // The caller did not set a value.
     SCOPE_UNSPECIFIED = 0;

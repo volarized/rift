@@ -454,7 +454,7 @@ class PathSelector(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class TextRange(ClosedModel):
-    "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from whatever its language toolchain counts in at the seam, so a rustc column and a tsc column arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead."
+    "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from whatever its language toolchain counts in before offsets leave the adapter, so a rustc column and a tsc column arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead."
 
     start: Field[int] = proto_field(
         description="First byte of the range, counted from the start of the file.",

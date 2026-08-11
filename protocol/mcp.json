@@ -514,7 +514,7 @@
       },
       {
         "name": "Protocol",
-        "summary": "Protocol versions, content digests, and extension namespaces shared across seams.",
+        "summary": "Protocol versions, content digests, and extension namespaces shared by the MCP and adapter surfaces.",
         "holds": [
           "ProtocolVersion",
           "Digest",
@@ -6127,7 +6127,7 @@
       "type": "object"
     },
     "LimitEvidenceScope": {
-      "description": "Which side of the server the limit belongs to. The two fail at different seams: a `driver` limit is enforced by Rift around the request, while an `adapter` limit is enforced inside one adapter process.",
+      "description": "Which side of the server the limit belongs to: a `driver` limit is enforced by Rift around the request, while an `adapter` limit is enforced inside one adapter process.",
       "enum": [
         "driver",
         "adapter"
@@ -12406,7 +12406,7 @@
     },
     "TextRange": {
       "additionalProperties": false,
-      "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from whatever its language toolchain counts in at the seam, so a rustc column and a tsc column arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead.",
+      "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from whatever its language toolchain counts in before offsets leave the adapter, so a rustc column and a tsc column arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead.",
       "properties": {
         "start": {
           "description": "First byte of the range, counted from the start of the file.",

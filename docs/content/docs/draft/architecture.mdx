@@ -18,12 +18,13 @@ the workspace throughout this documentation:
 The `rift server` coordinates between one or several `rift mcp` instances and one or several
 language adapters. A language adapter is a subprocess that talks to the server and gives Rift its
 introspection into a language's facts and operations. The server drives one adapter process for
-each exact `Language` pair — a name plus an optional dialect — so `sql` and `sql:postgresql` are
-two different adapters, and one process serves every session that needs it.
+each exact [`Language`](/docs/draft/protocol/reference#Language) pair — a name plus an optional
+dialect — so `sql` and `sql:postgresql` are two different adapters, and one process serves every
+session that needs it.
 
-Every seam in that picture — agent to `rift mcp`, `rift mcp` to server, server to adapter —
-speaks a contract generated from one protocol definition. A mismatch surfaces where each seam can
-afford it: `rift mcp` completes MCP `initialize` against a server whose contract it can't speak
+Every boundary in that picture — agent to `rift mcp`, `rift mcp` to server, server to adapter —
+speaks a contract generated from one protocol definition. A mismatch surfaces where each boundary
+can afford it: `rift mcp` completes MCP `initialize` against a server whose contract it can't speak
 and answers every call with `unsupported_protocol`, while an adapter that can't speak the
 workspace's contract fails admission before it serves anything.
 
@@ -46,29 +47,38 @@ workspace's contract fails admission before it serves anything.
 
 So, as said — the `rift mcp` instances talk to the `rift server`, which acts as the coordinator.
 But what if `rift mcp` doesn't see a server running? Quite simple: it launches one, and keeps it
-on a Unix domain socket, or a named pipe on Windows. The rendezvous lives under `.rift`, next to
-the projections; when several `rift mcp` processes start at once, exactly one ends up owning the
-server and the rest connect to it — a workspace never runs two. The endpoint admits only your own
-OS user — the server checks the peer's credentials on the socket and puts an owner-only security
-descriptor on the pipe — so another account on the machine can't reach your sessions or publish
-into your workspace.
+on a Unix domain socket, or a named pipe on Windows.
+
+The rendezvous lives under `.rift`, next to the projections; when several `rift mcp` processes
+start at once, exactly one ends up owning the server and the rest connect to it — a workspace
+never runs two. The endpoint admits only your own OS user — the server checks the peer's
+credentials on the socket and puts an owner-only security descriptor on the pipe — so another
+account on the machine can't reach your sessions or publish into your workspace.
 
 You might be asking what the actual reason for this is, and the answer is rooted in the MCP
 protocol itself. Assume your agent launches a couple of subagents. Each of them might also want to
 read or edit the codebase through Rift, and none of them can reach the `rift mcp` process the
 others are using — each gets its own, because MCP's stdio transport has the client launch its
-server as a subprocess. We use stdio to avoid managing ports.
+server as a subprocess.
+
+We use stdio to avoid managing ports.
 
 Adapters, analysis results and projections are expensive, and a `rift mcp` process that dies with
 its agent can't hold any of them. That's what forces a server behind them.
 
-On startup the server reads `rift.toml` from the workspace root and admits the workspace:
-the file names the adapter processes to run, what execution is allowed, what validation requires,
-and which validator commands exist. An edit to the file takes effect for later requests once it
-validates again; a change to `rift.toml` made through a session carries a `configuration`
-confirmation into `publish`, because publishing it changes which commands the server runs.
-Admission fails when two adapters claim the same language or
-the same output paths, and an invalid file keeps the workspace unusable until you fix it.
+On startup the server reads `rift.toml` from the workspace root and admits the workspace. The
+file decides:
+
+- which adapter processes to run
+- what execution is allowed
+- what validation requires
+- which validator commands exist
+
+An edit to the file takes effect for later requests once it validates again; a change to
+`rift.toml` made through a session carries a `configuration` confirmation into
+[`publish`](/docs/draft/protocol/mcp#tool-publish), because publishing it changes which commands
+the server runs. Admission fails when two adapters claim the same language or the same output
+paths, and an invalid file keeps the workspace unusable until you fix it.
 
 ## Sessions
 
@@ -79,8 +89,10 @@ retained session as a reader, without taking the connection slot — one writer 
 number of readers.
 
 Your agent exiting doesn't destroy anything. The session and its projection stay, and
-`session_continue` rebinds a fresh connection to them, which is how a crashed agent picks up work
-it had half finished. `session_list` shows what's retained and `session_remove` discards one.
+[`session_continue`](/docs/draft/protocol/mcp#tool-session_continue) rebinds a fresh connection
+to them, which is how a crashed agent picks up work it had half finished.
+[`session_list`](/docs/draft/protocol/mcp#tool-session_list) shows what's retained and
+[`session_remove`](/docs/draft/protocol/mcp#tool-session_remove) discards one.
 
 A server restart keeps every session that holds work — sessions and their changesets live under
 `.rift`, next to the projections, and a fresh `rift mcp` reconnects the way a crashed agent does,
@@ -109,11 +121,13 @@ the agent's next read — and every clean session shares that one view, which is
 second session on a large monorepo isn't a second checkout.
 
 The projection materializes the moment a session needs somewhere of its own: the first change it
-applies, or the first read of `rift://projection`, which hands the directory to a tool whose
-writes have to land in the changeset. Even then it stays a live view. Only a changed path detaches and keeps
-the session's version; everything around it carries on tracking the workspace, and changing a
-directory covers everything beneath it. Materializing a projection and restoring a clean one cost
-what the changed data costs, not what the repository costs.
+applies, or the first read of [`rift://projection`](/docs/draft/protocol/mcp#resource-projection),
+which hands the directory to a tool whose writes have to land in the changeset.
+
+Even then it stays a live view. Only a changed path detaches and keeps the session's version;
+everything around it carries on tracking the workspace, and changing a directory covers
+everything beneath it. Materializing a projection and restoring a clean one cost what the changed
+data costs, not what the repository costs.
 
 Materialization isn't permanent, either. A publish or restore that leaves the projection
 byte-identical to the workspace puts the session back on the shared view; the path keeps working,
@@ -158,7 +172,9 @@ validator command or a tool you launched yourself has no such escape.
 Your agent reads the projection through MCP. Language adapters analyze the same tree and return
 symbols, relationships, diagnostics, offered actions and validation results.
 
-A change through MCP — `edit`, `rename`, `act`, any of them — is resolved before Rift writes
+A change through MCP — [`edit`](/docs/draft/protocol/mcp#tool-edit),
+[`rename`](/docs/draft/protocol/mcp#tool-rename), [`act`](/docs/draft/protocol/mcp#tool-act), any
+of them — is resolved before Rift writes
 anything, and what happens next depends on which way it failed. If Rift ended up with
 no bytes to write, that's a refusal and the projection is untouched: the address was ambiguous,
 the pattern matched forty places where you said one, the language has no such operation. There is
@@ -171,15 +187,18 @@ writes into the projection is published with it.
 
 If Rift produced the edits and nobody would vouch for them, the change lands anyway and carries
 what's wrong with it. A validator didn't finish, an adapter couldn't classify every reference, the
-change deletes a file — each of those becomes a `ConfirmationRequirement` attached to that change.
+change deletes a file — each of those becomes a
+[`ConfirmationRequirement`](/docs/draft/protocol/reference#ConfirmationRequirement) attached to
+that change.
 This is the point of a scratchpad: a bad change you can look at is worth more than a refusal that
 tells you a validator was unhappy and leaves you to guess where.
 
 A path a tool wrote without going through MCP is a changed path with no change record: it makes
-the projection dirty, `publish` carries it, and `rift://changes` doesn't list it because nothing
-resolved it. `projection_restore` can name it if you know it — an ignored path like `target/`
-never shows up in a read — and a restore that names no paths drops every changed path, foreign
-ones included.
+the projection dirty, `publish` carries it, and
+[`rift://changes`](/docs/draft/protocol/mcp#resource-changes) doesn't list it because nothing
+resolved it. [`projection_restore`](/docs/draft/protocol/mcp#tool-projection_restore) can name it
+if you know it — an ignored path like `target/` never shows up in a read — and a restore that
+names no paths drops every changed path, foreign ones included.
 
 The `rift://changes` resource pages through everything the session has applied, oldest first, each
 entry carrying its edits, its semantic effects, its guarantee evidence, its validation strength
@@ -197,22 +216,25 @@ was tracking the workspace the whole time.
 
 The server serializes publication workspace-wide: one publication runs at a time, so a second
 session's publish waits, then sees the first one's writes as workspace changes to reconcile. A
-conflict or an unaccepted change leaves both the
-workspace and the projection exactly as they were. Validation already ran when each change
-applied — its verdict travels as that change's confirmations, so publication re-checks nothing.
-On success Rift writes every changed path, refreshes the projection, and empties the changeset.
-An interrupted publication finishes into either the new tree or the old one before the server
-accepts more work; while that recovery runs, calls answer `temporarily_unavailable`.
+conflict or an unaccepted change leaves both the workspace and the projection exactly as they
+were.
+
+Validation already ran when each change applied — its verdict travels as that change's
+confirmations, so publication re-checks nothing. On success Rift writes every changed path,
+refreshes the projection, and empties the changeset. An interrupted publication finishes into
+either the new tree or the old one before the server accepts more work; while that recovery runs,
+calls answer `temporarily_unavailable`.
 
 `projection_restore` goes the other way: it refreshes selected changed paths from the workspace and
 drops the changes that touched them, or does it for every changed path when you name none.
 
 ## Execution
 
-`execute` evaluates a block of agent-written code in a disposable copy of the projection that the
-server materializes and deletes, so what the code writes in place is thrown away. The copy is
-disposal, not a sandbox: the code runs with your permissions, and a block that names an absolute
-path writes wherever it names. A
-failed evaluation can keep its stack frames for inspection; they live in the adapter process,
+[`execute`](/docs/draft/protocol/mcp#tool-execute) evaluates a block of agent-written code in a
+disposable copy of the projection that the server materializes and deletes, so what the code
+writes in place is thrown away. The copy is disposal, not a sandbox: the code runs with your
+permissions, and a block that names an absolute path writes wherever it names.
+
+A failed evaluation can keep its stack frames for inspection; they live in the adapter process,
 which is why a server restart loses them while sessions and changesets survive. `rift.toml`
 decides which languages may execute at all.

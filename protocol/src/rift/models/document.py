@@ -544,7 +544,7 @@ DOCUMENT = Document(
         ),
         Axis(
             name="Protocol",
-            summary="Protocol versions, content digests, and extension namespaces shared across seams.",
+            summary="Protocol versions, content digests, and extension namespaces shared by the MCP and adapter surfaces.",
             holds=(
                 core.ProtocolVersion,
                 core.Digest,
