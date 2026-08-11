@@ -63,13 +63,17 @@ it had half finished. `session_list` shows what's retained and `session_remove` 
 A projection is a scratchpad copy of your workspace. Your agent works in it, gets things wrong in
 it, fixes them, and none of that reaches your files until you publish.
 
-It starts as a live view. A path nobody has touched follows the workspace, so a `git pull` in your
-own terminal shows up in the agent's reads without anything being copied. Once a session changes a
-path, that path detaches and keeps the session's version while everything around it carries on
-tracking the workspace. Changing a directory covers everything beneath it.
+A clean projection is the workspace, byte for byte, so Rift creates nothing when a session opens.
+Reads are served from the workspace tree itself — a `git pull` in your own terminal shows up in
+the agent's next read — and every clean session shares that one view, which is why opening a
+second session on a large monorepo isn't a second checkout.
 
-Creating a projection and restoring a clean one cost what the changed data costs, not what the
-repository costs, so opening a second session on a large monorepo isn't a second checkout.
+The projection materializes the moment a session needs somewhere of its own: the first change it
+applies, or the first read of `rift://root`, which hands the directory to a tool whose writes have
+to land in the changeset. Even then it stays a live view. Only a changed path detaches and keeps
+the session's version; everything around it carries on tracking the workspace, and changing a
+directory covers everything beneath it. Materializing a projection and restoring a clean one cost
+what the changed data costs, not what the repository costs.
 
 ## Rift FS
 
@@ -81,12 +85,14 @@ real directory, and Rift puts it at a predictable place below the workspace:
 ~/projects/charming-aurora/.rift/projections/ses_7k2mq4vx8ntbwpj3rfd6a9zcyh
 ```
 
-Adapters receive that absolute path over the adapter protocol when the server opens their state.
-Anything else reads it from the `rift://root` resource, which also names the workspace the
-projection came from. The path stays put for the session's life, so a shell you `cd` into keeps
-working across a server restart. Removing the session deletes the directory without waiting for
-whatever is still inside it — a lock there would let one abandoned `cargo watch` wedge cleanup
-forever.
+Adapters analyze whichever tree the server opened their state on — the workspace itself while the
+session is clean, the projection once it materializes — and receive that absolute path over the
+adapter protocol. Anything else reads the projection's path from the `rift://root` resource, which
+also names the workspace it came from. That read is the second materialization trigger: a tool
+pointed at the directory may write, and those writes have to land in the changeset rather than in
+your files. The path stays put for the session's life, so a shell you `cd` into keeps working
+across a server restart. Removing the session deletes the directory without waiting for whatever
+is still inside it — a lock there would let one abandoned `cargo watch` wedge cleanup forever.
 
 Your agent *can* work through that directory. It shouldn't: MCP reads carry semantic facts and
 coverage that a filesystem read can't, and a change made through MCP is validated and recorded.

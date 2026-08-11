@@ -45,7 +45,7 @@ Resources carry the larger and reusable payloads:
 | `rift://workspace{?cursor}` | projection state, per-language capabilities, limits, and validators |
 | `rift://root` | the projection's path on disk, and the workspace it came from |
 | `rift://changes{?cursor}` | every change this session applied, with its evidence |
-| `rift://fs{/path}{?start,length,cursor}` | directory entries, or a bounded range of file bytes |
+| `rift://fs{/path}{?start,length,cursor}` | a directory's entries — subdirectories and files — or a bounded range of file bytes |
 | `rift://symbol/{language}/{name}{?cursor}` | one symbol, its nodes, its edges, its diagnostics |
 | `rift://actions/{address}{?only,cursor}` | the actions an adapter offers at one address |
 | `rift://action/{token}` | one action and the JSON Schema of its arguments |
@@ -72,8 +72,8 @@ before writing anything, and the result is one of two things.
 
 **Refused**, when resolution produced no edits. The projection is untouched and `RefusalReason` says
 what stopped it: the address hit several targets, a `rewrite` matched outside its cardinality, no
-adapter implements the operation for that language, the offer belongs to a portable family that has
-its own tool.
+adapter implements the operation for that language, the offer carries a portable argument contract
+and resolves through its own tool.
 
 **Applied**, when it produced edits. The change lands and gets an id in the changeset, along with
 its edits, its semantic effects, its guarantee evidence, its diagnostics — and its confirmations,

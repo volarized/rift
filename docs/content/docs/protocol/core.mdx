@@ -14,11 +14,11 @@ no point copying it into every response:
 ```json
 {
   "dirty": true,
-  "unacknowledged": false
+  "unaccepted": false
 }
 ```
 
-`dirty` says the projection holds something your workspace doesn't. `unacknowledged` says the
+`dirty` says the projection holds something your workspace doesn't. `unaccepted` says the
 changeset holds a change carrying a confirmation nobody has accepted yet, which is the one thing
 that will stop `publish` on its own. The changes themselves come from the `rift://changes`
 resource.

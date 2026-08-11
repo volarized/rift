@@ -3,7 +3,7 @@ title: Adapter
 ---
 
 A language adapter is a subprocess the workspace server starts and talks to over gRPC on a Unix
-domain socket. It owns everything about a language; Rift owns sessions, source state, ordering and
+domain socket, or a named pipe on Windows. It owns everything about a language; Rift owns sessions, source state, ordering and
 publication, and never guesses at what an adapter can do.
 
 One process serves one exact `Language` — a name plus an optional dialect — and holds state for as
@@ -37,11 +37,17 @@ Capabilities are fixed for the process's life. Changing them means a new process
 
 ## State
 
-`Open` hands the adapter an absolute path to a projection, plus a `state_root` of its own that Rift
+`Open` hands the adapter an absolute path to a tree, plus a `state_root` of its own that Rift
 never reads — that's where `CARGO_TARGET_DIR` and friends should point. Every open state gets a
 distinct `state_root` and Rift never reuses one after `Close`. Several adapters can be given the
-same projection path at once, because a Svelte file and the TypeScript inside it are two adapters
-reading one tree.
+same path at once, because a Svelte file and the TypeScript inside it are two adapters reading one
+tree.
+
+While a session holds no changes, the tree is the workspace itself — a clean projection is
+byte-identical to it, so one open state serves every clean session. A session's first change
+materializes its projection and the server opens a new state rooted there; an adapter softens that
+re-analysis with a shared read-only cache outside `state_root`, where its toolchain supports safe
+sharing.
 
 The returned `AdapterState` is a generation counter, and that's the whole of its identity. `Open`
 mints the first value; `Refresh` and `SyncVirtual` advance it; a call carrying an older generation
@@ -53,7 +59,7 @@ retries rather than acting on offsets that have moved.
 tree to find out what happened, and rebuilding its state per edit would throw away the incremental
 work that makes it fast. Rift serializes refreshes for one adapter state.
 
-An adapter that produces source for another language publishes it through `VirtualSync`. Each event
+An adapter that produces source for another language publishes it through `SyncVirtual`. Each event
 names the unit it belongs to and the mappings back to the ranges it came from, so a diagnostic on
 generated TypeScript can be pointed at the Svelte a person can actually edit. Rift keeps those
 paths in a namespace of their own.
