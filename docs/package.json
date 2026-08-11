@@ -51,6 +51,7 @@
     "mermaid-parser-bundle": "^0.2.0",
     "postcss": "^8.5.25",
     "protobufjs": "^8.7.1",
+    "shadcn": "^4.16.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "wrangler": "^4.118.0"
