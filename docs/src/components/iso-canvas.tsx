@@ -4,8 +4,6 @@ import {
   CheckCircleIcon,
   DatabaseIcon,
   GearIcon,
-  GitBranchIcon,
-  GitCommitIcon,
   PlugsConnectedIcon,
   RobotIcon,
 } from "@phosphor-icons/react/dist/ssr";
@@ -86,8 +84,6 @@ const MARKS: Record<MarkName, (size: number) => React.ReactNode> = {
   ),
   agent: (size) => <RobotIcon size={size} weight="light" className="shrink-0" />,
   store: (size) => <DatabaseIcon size={size} weight="light" className="shrink-0" />,
-  git: (size) => <GitBranchIcon size={size} weight="light" className="shrink-0" />,
-  commit: (size) => <GitCommitIcon size={size} weight="light" className="shrink-0" />,
   adapter: (size) => <PlugsConnectedIcon size={size} weight="light" className="shrink-0" />,
   config: (size) => <GearIcon size={size} weight="light" className="shrink-0" />,
   validator: (size) => <CheckCircleIcon size={size} weight="light" className="shrink-0" />,

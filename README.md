@@ -1,16 +1,15 @@
 # Rift
 
-Rift exposes persistent filesystem projections and validated source transactions to agents over MCP
-and to local tools through a user-mounted filesystem. A workspace store owns current source state;
-Git is used only to import existing history and publish a squash integration. Language adapters
-provide the parsing, analysis, formatting, validation, and actions they implement.
+Rift gives each agent a writable projection of a workspace. Agents read semantic facts and make
+validated changes over MCP. Rift FS keeps the projection available to ordinary filesystem tools,
+and `publish` writes reviewed changes into the workspace.
 
-The target protocol and repository configuration are defined as Pydantic models in
-`protocol/src/rift/models`. Generation produces the MCP and `rift.toml` JSON Schemas and gRPC
-Protobuf files under `protocol/`, and checks the repository's own `rift.toml` against that model.
+The protocol and `rift.toml` models live in `protocol/src/rift/models`. Generate their JSON Schema
+and Protobuf outputs with:
 
 ```sh
+cd protocol
 uv run python -m rift.generate --check
 ```
 
-The architecture, configuration, protocol rationale, and generated reference live in `docs/`.
+Architecture and protocol documentation live in `docs/`.

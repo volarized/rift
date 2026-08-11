@@ -2,30 +2,24 @@
 title: Rift
 ---
 
-Rift is an agentic development toolkit for discovering and editing code.
+import { IsoDiagram } from "@/components/iso-diagram";
 
-The mechanism pages and generated reference describe the current contract. The Rust binary currently
-provides the CLI shell; the server and adapter runtime still have to implement that contract before a
-client can rely on it.
+Rift gives an agent a writable projection of any directory. The agent reads and changes code through
+MCP; language adapters provide semantic facts and refactors. When the work is ready, the agent
+publishes its changes into the directory.
 
-An agent such as Claude Code or Codex starts `rift mcp` in a workspace. That process resolves the
-canonical physical root and forwards requests to its single `rift server`. The server owns a
-persistent source store and mounts filesystem projections below `.rift/projections`, where editors,
-compilers, and language servers can use ordinary file APIs. Git is an import and squash-publication
-boundary, not the backing store or transaction log for live source. Rift keeps no second history
-graph.
+<IsoDiagram
+  alt="An agent connects through Rift MCP to a workspace server. The server coordinates Rift FS and language adapters, then publishes projection changes to the workspace."
+  chart={`
+    flowchart LR
+      agent["agent"]:::agent --> mcp["rift mcp"]:::rift
+      mcp --> server["workspace server"]:::rift
+      server --> fs["Rift FS"]:::store
+      server --> adapters["language adapters"]:::adapter
+      fs -- "publish" --> workspace["workspace"]:::store
+  `}
+/>
 
-The server watches the workspace-root `rift.toml` and starts the language adapters declared there.
-A physical Git checkout at another canonical path is a separate Rift workspace even when both paths
-share Git objects.
-
-Most users only need the agent configuration that launches `rift mcp`. The remaining pages describe
-the server and its protocol for adapter authors, client implementers, and people debugging a
-workspace:
-
-- [Architecture](/docs/architecture) defines the persistent store, mounted projections, filesystem
-  consistency, Git boundary, recovery, and adapter lifecycle.
-- [Configuration](/docs/configuration) shows how the workspace-root `rift.toml` controls the shared
-  server while CLI and environment settings stay local to one MCP process.
-- [Protocol](/docs/protocol) documents the MCP JSON surface, its gRPC mapping, the adapter service,
-  and the read-only SCIP export.
+The [architecture](/docs/architecture) defines the system's target behavior. [Configuration](/docs/configuration)
+controls workspace policy. The [protocol](/docs/protocol) specifies the boundaries used by MCP clients,
+language adapters, and SCIP consumers.

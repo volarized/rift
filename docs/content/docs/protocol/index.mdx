@@ -2,110 +2,23 @@
 title: Protocol
 ---
 
-Rift has three typed seams:
+MCP connects an agent to `rift mcp`. The adapter protocol connects the workspace server to language
+adapters. SCIP export serves tools that consume SCIP indexes.
 
-- `rift.mcp.Rift` serves agent tools, resources, sessions, filesystem projections, changes,
-  integration, execution, and recovery.
-- `rift.adapter.Adapter` lets language processes analyze and validate exact mounted snapshots.
-- `rift.scip.Index` exports one exact snapshot as a canonical SCIP stream.
+These boundaries share the [core model](/docs/protocol/core). The generated
+[reference](/docs/protocol/reference) is authoritative for fields, enums, and wire numbers.
 
-All three share `rift.core` identities. The source Pydantic models generate the JSON Schemas,
-Protobuf descriptors, public surface metadata, and this site's reference.
+## Session flow
 
-## Negotiation
+1. `rift mcp` starts or connects to the server for a workspace.
+2. `Connect` opens a session and returns its current projection state.
+3. Reads and changes use that projection.
+4. Changes name the head they observed.
+5. `publish` applies non-conflicting projection changes to the workspace.
 
-The workspace lease exposes the protocol major before a client opens the version-independent local
-socket. `Connect` sends supported `Contract` values in preference order. A contract matches only when
-major, minor, and schema digest all agree. The digest covers the generated descriptor and MCP
-conversion metadata, so equal numbers with different wire shapes are incompatible.
+Rift FS exposes the projection to adapters and filesystem tools when they need a path.
 
-The accepted control stream returns a connection id. Every later gRPC call carries it in
-`rift-connection-id` metadata. Local peer identity and the workspace lease provide the same-user trust
-boundary.
+## Compatibility
 
-## Source identities
-
-The core model separates three concerns:
-
-| Type | Meaning |
-| --- | --- |
-| `SnapshotId` | content address of a complete immutable store tree |
-| `ProjectionHead` | fresh opaque current-state token used for compare-and-swap |
-| `Projection` | stable mounted namespace identity |
-| `GitCommit` | Git object id used for history, gitlinks, and publication |
-
-`ProjectionState` combines the projection id, token, exact current snapshot, one pinned Git-backed
-base, and dirty flag. It contains no parent or sequence history.
-
-Tool selectors use tagged `Revision` values for Git, snapshot, or current projection state. Resource
-URIs use the corresponding `git:`, `snapshot:`, and `projection:` scalar namespaces. Omission in an
-MCP session selects that session's current projection.
-
-## MCP seam
-
-The MCP process translates stdio JSON to one application RPC at a time on the workspace server. It
-does not own source or Git state. The server returns the session's persistent mounted projection at
-connection time.
-
-Discovery reads exact snapshots. Mechanical operations use store trees. Semantic operations open an
-adapter against a filesystem projection. Bounded cursors and diff links pin the state they require;
-self-contained matches and offers do not.
-
-Every mutation compares an exact `ProjectionState`, resolves and validates in a private
-copy-on-write candidate, and swaps the public projection in one store transaction. Filesystem writes
-use the same current-state model. Neither path creates Git history.
-
-`rift://fs` exposes live projection paths and current states. `projection_open` and
-`projection_close` provide explicit read-only mounts for historical Git commits or retained
-snapshots. `projection_restore` discards reviewed unintegrated source.
-
-Integration squash-merges the exact current projection from its base and writes at most one Git
-commit. Unresolved integration creates an exceptional conventional Git recovery worktree;
-`recovery_list`, `recovery_continue`, and `recovery_abort` are the only protocol operations over it.
-
-See [MCP](/docs/protocol/mcp) for lifecycle details and the
-[reference](/docs/protocol/reference) for every field.
-
-## Adapter seam
-
-The server starts one configured adapter process per exact language and calls `Describe` once. An
-adapter state names a Rift projection, exact snapshot, and adapter-local generation. `Open` also
-provides the mounted root and native `state_root` for generated output.
-
-Adapters read source through ordinary filesystem APIs. They return semantic facts and typed edits;
-they never write public source as an RPC side effect. Candidate projections isolate formatting,
-resolution, and validation from the public session until the final compare-and-swap.
-
-No store or projection lock is held across adapter calls because adapters re-enter the server through
-the mount. See [Adapter](/docs/protocol/adapter).
-
-## SCIP seam
-
-A SCIP client connects with the read-only role and calls `rift.scip.Index.Read`. The request selects
-one exact Rift snapshot. The server streams one header, canonical documents, and canonical external
-symbols. SCIP is an export projection of semantic facts; “filesystem projection” always refers to the
-mounted namespaces under `.rift/projections`.
-
-See [SCIP](/docs/protocol/scip).
-
-## Generated artifacts
-
-The source model lives under `protocol/src/rift/models`. Generation writes:
-
-```text
-protocol/mcp.json
-protocol/rift.schema.json
-protocol/rift/core.proto
-protocol/rift/mcp.proto
-protocol/rift/adapter.proto
-protocol/rift/scip.proto
-```
-
-Run the check from `protocol/`:
-
-```sh
-uv run python -m rift.generate --check
-```
-
-The generated reference is normative for field names and wire types. The mechanism pages define the
-transaction, lifetime, recovery, and filesystem rules those fields participate in.
+Generated contracts carry a major version, minor version, and schema digest. Peers communicate when
+one descriptor matches exactly. Unknown fields are rejected.

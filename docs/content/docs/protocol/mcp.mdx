@@ -2,229 +2,65 @@
 title: MCP
 ---
 
-Rift's MCP surface maps JSON tools and resources to the `rift.mcp.Rift` gRPC service. The generated
-[reference](/docs/protocol/reference) defines fields and wire types. This page defines how calls
-compose with the persistent source store, mounted projections, and the narrow Git boundary.
+`rift mcp` maps MCP JSON to the local Rift service. One bridge process owns one session connection.
 
 ## Connection
 
-`rift mcp` creates a random session id and opens the server's `Connect` control stream. The first
-`Connected` response carries the selected contract, canonical workspace root, persistent session
-projection, exact `ProjectionState`, and a connection id required on later RPC metadata.
+The bridge starts or finds the server for the requested workspace, creates a session id, and opens
+`Connect`. `Connected` returns the workspace path, session, current `ProjectionState`, and a
+connection id used by later calls.
 
-The first connection for a session may supply `initial_revision` to import any local Git commit. Its
-omission uses `session.base` configuration. Reconnection requires the existing stored base and
-current state and does not resolve Git again. SCIP export clients connect without a writable session.
+One session admits one live connection. A disconnected session is retained and may be continued or
+removed. Rift FS exposes its projection when another process or adapter needs a path.
 
-One session id admits one live MCP connection. Closing the bridge closes adapter and ephemeral
-resource state but retains the session projection, current source, base, and scratch.
+## Reads
 
-## Resources
-
-Resources return one JSON payload inside MCP text content:
-
-| Resource | Purpose |
-| --- | --- |
-| `rift://repository{?rev,cursor}` | capabilities, limits, validators, and resolved source |
-| `rift://fs{?cursor}` | mounted session and explicit read projections |
-| `rift://file/{path}{?rev,start,length}` | one bounded file range |
-| `rift://symbol/{language}/{name}{?rev,cursor}` | one symbol and its semantic relationships |
-| `rift://diff{?from,to,cursor}` | file changes between two independently encoded revisions |
-| `rift://actions/{address}{?only,rev,cursor}` | actions available at an address |
-| `rift://action/{token}` | one action and its argument schema |
-
-Revision query values use the scalar spellings `git:main`, `snapshot:snap_…`, or
-`projection:prj_…`. Git revision bytes outside the URI-unreserved set use uppercase percent
-encoding and are decoded once. Tool parameters use the tagged `Revision` object. Omission in a
-session-scoped read selects that session's current state.
-
-Every resolved payload carries a content-only `Snapshot` through `ResolvedSnapshot`; a Git selector
-also reports the exact peeled commit in `imported_from`. `Snapshot` equality never depends on how the
-tree was reached.
-
-Copying an id does not pin source. Page cursors, returned file continuations, and diff links own
-bounded, connection-scoped pins until consumption, server-defined expiry, or connection close; no
-minimum lifetime is promised. A file read acquires the next-page pin before releasing the current
-one. Match and action ids are self-contained but non-pinning; reading one after collection returns
-`snapshot_not_found`. An action whose adapter generation is gone returns `stale_action`.
-
-`rift://fs` is the host-independent way to discover mount paths. It lists persistent session
-projections and explicit read projections only, with exact current snapshots, availability,
-mutability, scratch bytes, and open-handle counts. Its first page captures a connection-scoped,
-identity-sorted inventory; later cursors read that same capture. Reading it grants no cleanup
-authority. Private candidates and execution mounts are absent.
-
-A file resource echoes its request URI, exact `ResolvedSnapshot`, and complete `File` entry. Regular
-entries add `start`, actual `end`, `total_bytes`, and UTF-8 or canonical-base64 content. A partial
-answer returns `next` at exactly `end` with a `snapshot:` selector, so pagination cannot drift with a
-projection or Git ref. LFS pointers, symlinks, and gitlinks return their complete entry metadata with
-an empty range and no continuation.
-
-A requested file `start` beyond `total_bytes` is `invalid_request`. A request at EOF returns an
-empty UTF-8 range with no continuation.
-
-## Discovery
+The discovery tools read the current session projection:
 
 | Tool | Result |
 | --- | --- |
-| `tree` | project entries below one directory, without an adapter |
-| `outline` | adapter-owned declaration nesting for one file |
-| `search` | ranked files, nodes, or symbols with explicit coverage |
-| `match` | literal, regular-expression, or structural byte ranges |
+| `outline` | declarations in one file |
+| `search` | ranked files, nodes, or symbols |
+| `match` | literal, regular-expression, or structural matches |
 
-Mechanical reads and diffs use source-store trees. Semantic calls open or refresh an adapter against
-an exact mounted snapshot. A cursor binds request parameters, result order, and snapshot. Empty
-semantic results are meaningful only with their coverage: `complete`, `partial`, or `unsupported`.
+Resources provide larger or reusable payloads:
 
-`match` returns self-contained `MatchId` values. The actions resource returns `ActionOfferId` values
-bound to one snapshot and adapter-local offer. `act` accepts only adapter-specific families; rename,
-move, delete, and change-signature use their typed tools.
-
-## Projection tools
-
-`projection_open` resolves one tagged revision and mounts an immutable read projection. It reports
-the exact snapshot and peeled Git commit when applicable. `projection_close` withdraws the namespace
-from new opens and is accepted only from the connection that opened it. Connection cleanup performs
-the same withdrawal. Existing external handles retain only their inode version or captured
-directory enumeration; their final pin is released when they close. Session and internal
-projections cannot be closed through this tool.
-
-Ordinary writes to a session projection persist directly in the source store and mint a fresh
-`ProjectionHead`. They do not create a Git commit or ref. Scratch writes do not change the source
-head. Source/scratch classification and cross-layer rename rules are defined in the
-[architecture](/docs/architecture#source-and-scratch).
-
-`projection_restore` compares the exact dirty `ProjectionState` and resets current source to its
-pinned `base.snapshot` with a fresh head. Non-conflicting scratch remains; source paths atomically
-unlink conflicting scratch names while open scratch handles retain their unlinked inode versions. A
-clean projection returns `noop`.
-
-The synthetic root `.git` entry prevents Git from discovering the physical parent checkout. Normal
-projection operation therefore needs no Git index, status, add, commit, or restore workflow.
-
-## Change tools
-
-All semantic mutations carry `expected: ProjectionState`:
-
-| Tool | Operation |
+| Resource | Content |
 | --- | --- |
-| `edit` | one atomic set of concrete file and text edits |
-| `patch` | a UTF-8 unified diff with checked context |
-| `rewrite` | query, cardinality check, expansion, and atomic replacement |
-| `revert` | three-way inverse of one Git commit against an explicit parent |
-| `rename` | declaration rename and reference propagation |
-| `move` | declaration or file move and dependency updates |
-| `delete` | mechanical or policy-driven deletion |
-| `change_signature` | callable-shape and call-site propagation |
-| `act` | one adapter-specific action offer |
+| `rift://workspace{?cursor}` | projection state, capabilities, limits, and validators |
+| `rift://fs{/path}{?start,length,cursor}` | directory entries or bounded file content |
+| `rift://symbol/{language}/{name}{?cursor}` | semantic facts for one symbol |
+| `rift://actions/{address}{?only,cursor}` | actions offered at an address |
+| `rift://action/{token}` | one action and its argument schema |
 
-The state contains a fresh ABA-safe head, current snapshot, one retained Git-backed base, and dirty
-flag. Rift compares the complete state before adapter work and the head again at publication. The
-token detects A→B→A even when snapshot content repeats.
+Reads return the `ProjectionHead` they used. Cursors continue one captured result order and expire
+when the server releases it.
 
-One operation pins the expected state, forks a private copy-on-write candidate, resolves and
-validates the complete result, then briefly acquires the projection publication barrier. A matching
-head publishes the candidate in one store transaction with a fresh head. A concurrent FUSE or MCP
-write returns `stale_projection`; it is never overwritten. Refusal, cancellation, validation
-failure, or adapter failure changes no public source.
+## Changes
 
-`ChangeApplied` returns previous and current states, a snapshot-to-snapshot diff link, concrete
-edits, preconditions, effects, guarantees, diagnostics, and validation. The diff link owns its
-temporary pins. No change result contains a Git commit because normal source mutations do not touch
-Git.
+`edit`, `patch`, `rewrite`, `rename`, `move`, `delete`, `change_signature`, and `act` change the
+session projection. Each request supplies the expected `ProjectionHead`.
 
-A risky operation returns deterministic confirmation requirements bound to the operation and exact
-expected state. Any changed head, operation, arguments, or confirmation set invalidates them.
+Rift resolves and validates the complete operation before making it visible. The result is one of:
 
-Rift keeps no completed-response journal. If an applied response is lost, retrying the old state
-returns `stale_projection`; the caller reads current state. This is a deliberate consequence of
-keeping current state without Rift-side historization.
+- applied, with a fresh projection state and evidence;
+- refused, with a stable reason and diagnostics.
 
-## Sessions
+A stale head returns `projection_head_moved` with the current head. `projection_restore` restores
+selected changed paths from the workspace, or every changed path when none are selected. `publish`
+compares affected workspace paths and either writes all changes or returns the conflicting paths.
 
-Sessions retain one current projection, one Git-backed base snapshot, and disposable scratch.
+## Execution
 
-| Tool | Behavior |
-| --- | --- |
-| `session_list` | pages through session id, projection location/state, and active owner |
-| `session_continue` | replaces an untouched initial session with one inactive retained session |
-| `session_remove` | previews or confirms deletion against an exact source state |
+`execute` evaluates a code block in a disposable workspace derived from the session projection.
+`debug_start`, `debug_get_frame`, and `debug_stop` provide bounded post-mortem inspection. Writes
+made by evaluated code are discarded.
 
-Removal preview reports whether source is unintegrated, scratch bytes, and estimated reclaimable
-store bytes. Confirmation requires the same source head and no live connection, handle, mutation,
-debugger, recovery, or integration intent. Under the open-admission barrier it withdraws the
-namespace, rescans disposable scratch, and deletes the store-backed session. Scratch is generated,
-disposable state and is not separately CAS-guarded.
-There is no session Git ref to delete or orphan.
+Execution is enabled only when both workspace configuration and the language adapter allow it.
 
-## Validation and execution
+## Errors
 
-Adapter validation runs against a private candidate. Configured command validators run only during
-integration, in declaration order, against a disposable projection of the exact merged snapshot.
-Their working directory is the projection root; configured carry paths come from session scratch.
-
-Rift runs validator `argv` directly without a shell. A nonzero exit is a completed rejection.
-Failure to prepare the projection, launch, enforce timeout, or capture output is
-`validator_execution_failure`.
-
-`execute` and `debug_start` resolve one exact snapshot and use disposable projection scratch. The
-mount is not a host sandbox. Debug sessions retain bounded frames until stop, connection close, or
-idle expiry, then release their adapter, process, projection, and pins.
-
-## Integration
-
-`integrate` accepts a target branch, exact current `ProjectionState`, expected target commit, and
-commit subject. It computes the source delta from `expected.base.snapshot` to `expected.snapshot`,
-merges it onto the target tree, and validates the complete merged snapshot.
-
-If the merged tree already equals the target, `synchronized` creates no commit and simply rebases
-the projection to that target commit and tree. Otherwise Rift writes one squash commit whose sole
-parent is `expected_target`, compare-and-swaps the target, and rebases the projection to the merged
-tree as its new clean base. This is the only normal workflow that writes Git.
-
-The final transition compares both source head and target commit. A source write returns
-`stale_projection`; a target move returns `target_moved`; validation rejection returns its complete
-evidence. Integration refuses any target checked out in a Git worktree. Rift does not synchronize
-the physical root or modify an ordinary index.
-
-The architecture defines the transient integration intent and private transaction marker that make
-the Git-ref/store transition crash-recoverable without turning it into a history log.
-
-## Merge recovery
-
-A built-in clean integration never exposes Git. Conflicts or a custom merge-driver attribute create
-one conventional worktree below `.rift/recovery/<RecoveryId>` and one private recovery ref. Synthetic
-commits exist only to populate recovery index stages and never become public parents.
-
-`recovery_list` discovers active recoveries after restart or a lost response and rescans their index
-and worktree manifests. The user resolves files and stages the intended tree with ordinary Git in
-that directory. `recovery_continue` compares the reviewed manifest, requires no unmerged, unstaged,
-or untracked paths, imports the index tree, validates it, and repeats source and target CAS. Any
-recovery-only commit is ignored.
-
-An already-target-equivalent resolution returns `integration_synchronized`. Validation rejection or
-repository refusal retains the recovery and returns it with refreshed evidence; success removes it.
-An obsolete continuation returns expected and current source, target, and manifest values, using
-null when the target branch was deleted. `recovery_abort` previews the current manifest and removes
-the worktree, private ref, and pins only when confirmation carries the same manifest. A changed
-manifest fails with `recovery_moved`; a special file must be removed before continue or confirmed
-abort can succeed.
-
-## Failures
-
-Transport and server failures use `ErrorData`; domain decisions use typed result variants.
-
-| Code | Meaning | Next action |
-| --- | --- | --- |
-| `snapshot_not_found` | an exact unpinned snapshot was collected | resolve or import again |
-| `git_revision_not_found` | a Git selector or required local object is missing | fetch explicitly or choose another revision |
-| `projection_not_found` | the projection was closed or removed | read `rift://fs` |
-| `projection_unavailable` | the frontend or mount is not serving | remount or restart the server |
-| `projection_busy` | handles, mutations, or a barrier prevent cleanup | close the owner and retry |
-| `projection_head_moved` | cleanup state is stale | reread current state |
-| `recovery_moved` | recovery bytes changed after preview | list and review recoveries again |
-| `state_corrupt` | a store digest, reachability, or head invariant failed | run `rift state check` |
-| `unsupported_path` | a source path cannot be represented safely on this host | change it on a compatible host |
-
-An invalidation failure after a durable mutation is reported as committed-but-degraded with the new
-current state; it is never returned as an ordinary error implying that nothing changed.
+Domain refusals are normal tool results. `ErrorData` is reserved for invalid requests, expired
+cursors, stale heads, unavailable adapters, limits, timeouts, storage failures, and similar call
+failures. Its retry directive tells the caller whether to change the request, retry it, refresh the
+projection, or wait for operator action.

@@ -2,584 +2,63 @@
 title: Core
 ---
 
-import { Callout } from "fumadocs-ui/components/callout";
+The core schema contains values shared by MCP and language adapters. It describes projection
+concurrency, source structure, semantic facts, and changes.
 
-Rift resolves every request to a complete immutable source snapshot in its persistent store. Git is
-used to import existing history and publish an integration; it does not own live session state.
+## Projection state
 
-<Callout type="info" title="An initial commit is required">
-  A writable projection needs one committed Git tree as its retained base. An unborn repository is
-  refused until it has an initial commit.
-</Callout>
-
-The schema groups its definitions by the part of a request they describe. `rift:axes` records those
-groups in the generated contract, so the documentation and schema use the same ownership boundaries.
-This page explains revision state, source structure, semantic facts, discovery, coverage, and
-operations. The [reference](/docs/protocol/reference) also includes protocol machinery and MCP-only
-shapes.
-
-## Versioning
-
-A request can select a Git revision, a retained `SnapshotId`, or the current head of a filesystem
-projection. The server resolves the selector once, imports Git trees when necessary, and returns the
-exact store snapshot it read. Adapters receive a mounted projection for that snapshot through `Open`;
-they never choose revisions or allocate filesystems.
-
-### Revision
-
-MCP tools use a tagged `Revision` object:
-
-| Selector | Points at |
-| --- | --- |
-| *(omitted)* | current MCP session state |
-| `{ "kind": "git", "revision": "main" }` | one locally resolved Git commit |
-| `{ "kind": "snapshot", "snapshot": "snap_…" }` | one retained immutable source tree |
-| `{ "kind": "projection", "projection": "prj_…" }` | one projection head, resolved once |
-
-`GitRevision` follows [`gitrevisions(7)`](https://git-scm.com/docs/gitrevisions). Rift peels annotated
-tags, accepts only commits, and performs no implicit network fetch. A missing promisor object or
-shallow-history boundary returns `git_revision_not_found`.
-
-Resources encode the same namespaces in a scalar spelling: `git:main`, `snapshot:snap_…`, or
-`projection:prj_…`. Git bytes outside the URI-unreserved set use uppercase percent encoding. Diff
-URIs encode `from` and `to` independently:
-
-```text
-rift://diff?from=git:main&to=projection:prj_…
-```
-
-### Snapshot
-
-`SnapshotId` is SHA-256 over the domain-separated Merkle encoding defined in the
-[architecture](/docs/architecture#snapshot-encoding). It commits to regular-file bytes and mode,
-symlink target bytes, gitlink object ids, and the complete path tree. Scratch, empty directories,
-and synthetic mount entries are excluded. It carries no parent, time, or history.
-
-A [`Snapshot`](/docs/protocol/reference#Snapshot) contains only the content id:
+`ProjectionHead` is an opaque token for the current session view. `ProjectionState` contains:
 
 ```json
-{ "id": "snap_71d62c8d…" }
+{
+  "head": "ph_…",
+  "dirty": true
+}
 ```
 
-`ResolvedSnapshot` adds the exact peeled commit when a request selected a Git revision. Keeping that
-evidence outside `Snapshot` means two commits with the same tree still share one content identity.
+The head advances whenever the visible projection state changes. Reads use the current session
+projection, and changes carry the head they expect.
 
-The store owns all bytes needed to render a retained snapshot. Current states and bounded active
-resources pin exact snapshots. Copying an id out of a response does not pin it; a superseded unpinned
-snapshot can later return `snapshot_not_found`.
+## Paths and files
 
-`ProjectionState` adds a projection identity, fresh `ProjectionHead`, current `SnapshotId`, one
-`ProjectionBase`, and a dirty flag. The base pairs an imported Git commit with a complete pinned copy
-of its tree. `dirty` is true exactly when current differs from base. The head changes on every source
-mutation even when content returns to the same `SnapshotId`, preventing ABA races without creating
-Rift history.
+`ProjectPath` is a normalized UTF-8 path relative to the workspace root. It uses `/`, contains no
+`.` or `..` component, and never addresses `.rift`.
 
-## Execution
+`ProjectEntry` describes a directory, regular file, or symlink. Regular-file content records size
+and executable mode. Symlink targets are bytes. The filesystem resource carries file bytes as
+UTF-8 or base64 and lists directory entries.
 
-Execution and debugging reuse the same `Revision` to `Snapshot` resolution as semantic reads. A
-[`CodeBlock`](/docs/protocol/reference#CodeBlock) contains caller-provided source and a
-project-relative working directory. It is evaluated in the selected adapter's project runtime but is
-not part of the snapshot and is never written into the repository tree.
+Directories are derived from the path tree. Source changes cover regular files, symlinks, modes,
+and paths.
 
-[`ExecutionResult`](/docs/protocol/reference#ExecutionResult) distinguishes a language outcome from a
-protocol failure. `completed` and `failed` describe what the evaluated code did; cancellation,
-deadline expiry, adapter loss, and workspace failures use the ordinary MCP error contract. Standard
-output and error use `CapturedText`, whose bounded prefix, full byte count, truncation flag, and digest
-preserve the identity of output too large to return. Command-validator output and rendered debug
-values reuse the same type.
+## Source locations
 
-`ExecutionBudget` carries the exact wall-time and per-stream capture bounds selected by the
-workspace-root `rift.toml` for one adapter call. `DebugBudget` adds retained frame, binding, and
-rendered-value bounds. They are per-call requirements at the adapter seam, while `Limits.execution`
-reports the workspace ceilings to the MCP caller.
+`TextRange` uses half-open UTF-8 byte offsets. `SourceSpan` combines a file with a range. `NodeId`,
+`SymbolId`, `MatchId`, and `ActionOfferId` address facts in the session projection.
 
-A [`DebugFrame`](/docs/protocol/reference#DebugFrame) is a retained stack frame from one failed debug
-evaluation. Its source span points into the pinned repository snapshot where possible. Arguments and
-locals are bounded adapter-rendered `CapturedText` values. The interface does not define a portable
-runtime object graph.
+Opaque match and action ids are valid only for the projection head that produced them. A later head
+requires discovery again.
 
-## Filesystem
+## Semantic facts
 
-File and node identities use project-relative paths and byte offsets. Editing a file can change those
-identities.
+Adapters return:
 
-### Language
+- symbols and syntax nodes;
+- relationships between them;
+- signatures, types, and documentation;
+- diagnostics and coverage.
 
-`Language` is a structured pair:
+Coverage distinguishes “nothing matched” from “the adapter could not inspect enough source to
+know.” Consumers must use it when interpreting empty or partial results.
 
-```json
-{ "name": "python" }
-{ "name": "sql", "dialect": "postgresql" }
-{ "name": "css", "dialect": "scss" }
-```
+## Changes
 
-The optional dialect identifies syntax or semantics that require a distinct adapter. URI identities
-encode the pair as `name` or `name:dialect` in their first segment. The remaining node and symbol
-structure stays language-defined.
+`Edit` contains source operations such as text replacement, file creation, deletion, and movement.
+Higher-level operations resolve to an atomic edit set plus preconditions, effects, diagnostics, and
+validation evidence.
 
-### File
+Rift applies the set only while the supplied `ProjectionHead` is current. A successful change
+returns a fresh `ProjectionState`. A semantic refusal is a typed result; transport and
+infrastructure failures use `ErrorData`.
 
-Physically, a codebase is files. A file is identified by its path, relative to the project root:
-
-```
-rift://file/pkg/util.py
-```
-
-The URI contains the path. The resource returns the immutable source-store entry and file content.
-It also reports which languages read the file. The same resource reads `LICENSE` and adapter-owned
-source.
-
-An adapter's retained virtual publication also resolves as a regular, non-executable `File`. Its bytes
-come from the adapter overlay and do not create a `ProjectEntry` in the source-store tree listing.
-
-Symlink targets are arbitrary Git blob bytes up to 4096 bytes. `FileContentSymlink.target` carries
-canonical padded base64 so non-UTF-8 targets remain lossless; Rift never follows the target while
-resolving a protocol path.
-
-A submodule path is a Git `gitlink`. The parent tree stores one child commit at that path. Rift returns
-the gitlink as one `File` with `content.kind: "gitlink"`; `tree` does not list descendants, the file
-resource returns no content, and adapters cannot report source below it. Open the child repository as a
-separate Rift workspace to read or edit its files.
-
-The parent repository can create a gitlink with `create_gitlink` or change its child commit with
-`set_gitlink`. Adding or moving a submodule also changes the parent repository's `.gitmodules` file, so
-the caller places that text edit in the same atomic `edit` call. These edits change source entries;
-they do not fetch, check out, or mutate the child repository.
-
-Every protocol path is valid UTF-8, relative to the project root, and separated with `/`. An empty,
-`.` or `..` segment is invalid. Rift preserves the encoded Unicode and case exactly; it does not
-normalize either one. In a `rift://` URI, unreserved characters and segment separators remain
-literal, while every other UTF-8 byte uses uppercase percent-encoding. For example, `src/☃.ts`
-becomes `rift://file/src/%E2%98%83.ts`.
-
-Git can store names that a host filesystem or the protocol cannot represent. Before mounting a
-snapshot, Rift derives the host comparison key for every path and refuses aliases such as `A.ts` and
-`a.ts` on a case-insensitive volume. It also refuses invalid UTF-8, Windows reserved names,
-trailing-dot or trailing-space aliases, and paths the host cannot create. The repository can still
-open for unaffected Git operations; an operation that enumerates or touches such an entry returns
-`unsupported_path` with the original Git path bytes as bounded base64 evidence.
-
-Filesystem traversal opens one path component at a time relative to the workspace directory handle.
-Symlink following is disabled, and a resolved component cannot escape the workspace or enter a
-gitlink.
-
-The physical owner records every grammar present in a file. In `App.svelte`, `regions` can record that
-TypeScript starts at byte 412. The `languages` field is the sorted, distinct projection of those regions.
-
-Git stores file entries without storing their parent directories. `ProjectEntry` adds the derived
-directory branch needed by the MCP `tree` call. Its file branch carries the complete `File`; its
-directory branch carries only a `ProjectPath`. A directory therefore has no second resource identity
-and disappears when the selected snapshot contains no visible descendant.
-
-### Node
-
-Parsing turns those bytes into a
-[concrete syntax tree](https://en.wikipedia.org/wiki/Parse_tree): every token the source contains, in
-the shape the grammar gives it. A node is one node of that tree. Its identity contains the grammar and
-file, followed by the byte range it spans:
-
-```
-rift://node/python/pkg/util.py@1204-1266
-rift://node/sql:postgresql/db/schema.sql@40-88
-```
-
-The grammar determines the tree, so the language is part of the node identity. One physical file can
-contain several grammars.
-
-A container adapter owns `App.svelte`. It can publish the script block as a virtual TypeScript file.
-The two nodes then use different source units:
-
-```
-rift://node/svelte/App.svelte@100-200
-rift://node/typescript/__virtual__/App.svelte.ts@0-100
-```
-
-An exact `OriginMapping` links the virtual range back to `App.svelte`.
-
-A node also marks named regions. For a function, an operation can address its `body` independently
-from its `documentation`.
-
-A node may write a [symbol](#symbol). One symbol can have many nodes: its declaration and each
-reference. Nodes also represent syntax with no semantic identity, such as a JSON comma or CSS block.
-
-Static and data languages use the same model. A SQL adapter can emit `create_table` nodes and table
-symbols under `sql:postgresql`. A CSS adapter can emit `selector.class` nodes and custom-property
-symbols. JSON, TOML, and YAML adapters can provide full node trees, structural matching, formatting,
-and diagnostics without inventing symbols for values that have no stable semantic identity. Schema
-resolution or YAML anchors can add symbols when the language supplies that identity, and a key that
-becomes a symbol is what lets a `configures` edge reach the field it fills.
-
-### Edit
-
-A change to the code is a value before it is a write to disk. An
-[`Edit`](/docs/protocol/reference#Edit) can replace a byte range with new text. Other variants create,
-delete, rename, or copy a file, change its executable bit, and create or update a gitlink:
-
-```
-{ "kind": "replace",
-  "span": { "unit":  "rift://file/pkg/util.py",
-            "range": { "start": 1204, "end": 1266 } },
-  "text": "def load_config(path: Path) -> Config:" }
-```
-
-An adapter returns proposed source changes to Rift as `Edit` values. Rift inspects and applies them in
-a private copy-on-write candidate before the public session projection changes. The
-[adapter contract](/docs/protocol/adapter#source-ownership) defines that ownership boundary.
-
-An edit set is atomic. Every text range addresses the input state, and ranges in one set cannot
-overlap, and Rift orders the set by file and range before it crosses a seam. Where a later operation
-has to observe an earlier one, the caller uses the resulting `ProjectionState` as the next call's
-`expected` value, so the second operation resolves against the first one's exact tree and token.
-
-Gitlink creation and update use `create_gitlink` and `set_gitlink`. Delete and rename also apply to a
-gitlink entry. Copy and executable-bit changes apply to regular files. The pinned snapshot supplies the
-old entry for every operation.
-
-The same shape reads a change that already happened. A
-[`FileChange`](/docs/protocol/reference#FileChange) is the file entry on each side of a comparison and
-the edits between them. The same byte replacement can therefore appear in a diff or a proposed
-refactor:
-
-```
-before: rift://file/pkg/util.py   digest 3f8a…  1204 bytes
-after:  rift://file/pkg/util.py   digest 9c21…  1198 bytes
-edits:  [ { "kind": "replace", … } ]
-```
-
-The two entries determine the file-level change. A created file has an `after` entry. A deleted file
-has a `before` entry. A rename has different paths on each side. The nested edits then describe byte
-replacements within those entries. Read the whole comparison at
-[`rift://diff/main..feature-x`](/docs/protocol/mcp).
-
-## Semantic
-
-Semantic identities use `Language`, so moving a file preserves them when the language-defined name
-stays the same.
-
-### Symbol
-
-A symbol is an adapter-recognized entity at one revision. For example, the Python function
-`pkg.util.load_config` is one symbol. The server indexes symbols and the relationships returned by the
-adapter, so a caller can retrieve the function's callers.
-
-A symbol carries two classifications. `kind` is the word the adapter's own language uses — `trait`,
-`function`, `table` — and nothing portable can be built on it, because no two languages agree on the
-word. `facets` is the portable half, and it is a set rather than a choice: a Kotlin `object` carries
-`type`, `value`, and `member_container` at once, so a search for types and a search for singletons both
-find it.
-
-A facet says what a symbol can do, not only what it is. `extensible` marks a class you can inherit from
-and a method you can override; `abstract` marks a declaration whose implementation something else has
-to supply; `deprecated` marks what six languages spell six ways.
-
-Ownership is not lexical. `container` names the symbol this one belongs to, which for a Go method is
-the type in its receiver and for a Rust method the type its `impl` block is written for — neither of
-which encloses it in the source. Where a symbol is written is a question for [nodes](#node).
-
-A symbol carrying no facet at all is invisible to every portable filter, so a language without types
-still assigns one. A CSS class selector, a SQL sequence, and a `@keyframes` rule each name something
-that exists while the artifact runs, and each carries `value`. A SQL table carries `type` and
-`member_container`; its columns carry `member`.
-
-A symbol is identified by the URI that resolves it: the language, then the name the language itself
-gives the declaration.
-
-```
-rift://symbol/python/pkg.util.load_config
-rift://symbol/rust/serde::de::Deserialize
-rift://symbol/sql:postgresql/public.users
-```
-
-The URI follows the language's naming rules. A TypeScript module name includes its file path; a Rust
-module name follows the module tree. Nodes record where the symbol is written, so the symbol URI can
-survive a file move. The `origin` field records whether Rift can open the declaration and what can
-replace it. A dependency upgrade replaces a package symbol. Rebuilding can replace a generated one.
-
-Symbols live across revisions. That identity is the symbol itself, at whichever revision the request
-resolved; attach `?rev=` to pin it to one:
-
-```
-rift://symbol/python/pkg.util.load_config?rev=v1.2.0
-```
-
-### Relationship
-
-A [`Relationship`](/docs/protocol/reference#Relationship) is a directed edge between symbols. A call
-from `handler` to `load_config` is one such edge. Rift indexes these edges, so a caller query reads the
-index.
-
-An edge carries `evidence`: the nodes from which the adapter derived it.
-
-```
-from:     rift://symbol/python/pkg.api.handler
-to:       rift://symbol/python/pkg.util.load_config
-evidence: rift://node/python/pkg/api.py@880-899
-```
-
-`Node.symbol` links a syntax-tree node to semantic identity. `Relationship.evidence` links a semantic
-edge back to the node that established it. The symbol URI remains stable when only the file path
-changes.
-
-Edges carry portable facets the way symbols do, and `from` is the symbol the adapter read the edge out
-of. A decorated function carries `annotated_by` to its decorator, because the mention that established
-the edge is written inside the function.
-
-Two facets are fallbacks, and they divide on evidence. `references` covers a mention with a node behind
-it that nothing narrower fits. `depends_on` covers a need with no source location at all — a manifest
-entry, a build dependency.
-
-Not everything an edge reaches is something a language declares. A C header and a CSS stylesheet
-declare nothing of their own, so an adapter gives each a synthetic symbol carrying the `module` facet.
-`#include` and `@import` are then the same `imports` edge as a Python `import`.
-
-The adapter also reports how it derived each edge. In the `derivation` field, `resolution` comes from
-the adapter's name resolver or type checker. `syntax` comes from the parsed tree. `heuristic` marks a
-guess with a confidence value. Go and TypeScript satisfy interfaces structurally, with no declaration
-that says so, which is why an `implements` edge there is something the type checker computed rather
-than something the source states.
-
-## Discovery
-
-Callers use a `Filter` to test adapter facts. A `MatchQuery` selects text matching in Rift or
-structural matching in a language adapter.
-
-### Filter
-
-A [`Filter`](/docs/protocol/reference#Filter) asks by what the adapter knows. Each node has a tag.
-`field` tests a value, `relation` follows an edge, and `element` looks inside one entry of a list.
-`all` and `any` combine child nodes; `not` negates one. The tags make nesting explicit:
-
-```json
-{ "kind": "all", "all": [
-  { "kind": "field",
-    "field": { "field": "facets", "op": "contains", "value": "callable" } },
-  { "kind": "relation",
-    "relation": { "direction": "incoming", "facet": ["calls"],
-                  "target": { "kind": "field",
-                              "field": { "field": "facets", "op": "contains",
-                                         "value": "test" } } } } ] }
-```
-
-That reads "callables called from a test". The nested `target` performs the relationship join inside
-the query.
-
-`contains` tests one member of a list, and `in` tests for any of several, which is how one node asks
-for a symbol carrying any of four facets. The ordering and string operations have no meaning against a
-list, so Rift rejects them there.
-
-A symbol's `types` holds several entries, each a type and the role it plays. Testing `role` and the
-resolved symbol as two separate fields would accept a symbol whose return type came from one entry and
-whose `Config` came from another, so `element` scopes both tests to the same entry:
-
-```json
-{ "kind": "element",
-  "element": { "field": "types",
-               "where": { "kind": "all", "all": [
-                 { "kind": "field",
-                   "field": { "field": "role", "op": "eq", "value": "return" } },
-                 { "kind": "field",
-                   "field": { "field": "type.resolved", "op": "eq",
-                              "value": "rift://symbol/rust/crate::Config" } } ] } } }
-```
-
-That reads "functions that return `Config`".
-
-A `relation` node can traverse a cyclic graph, so `max_depth` bounds the walk. Only edges that compose
-carry a depth — `contains`, `calls`, `imports`, `extends` and the rest of the transitive set — because
-walking three `annotated_by` hops asks a question no graph answers. The `quantifier: "not_exists"` form
-selects symbols with no matching edge, and it applies after the depth bound, so `max_depth: 3` says
-nothing about the fourth hop.
-
-### MatchQuery
-
-A [`MatchQuery`](/docs/protocol/reference#MatchQuery) selects one of two engines. A `TextQuery` asks
-Rift to match a literal or regular expression over UTF-8 source. A `StructuralQuery` asks a language
-adapter to parse a source-shaped pattern. Keeping the union in the core model lets a match key carry
-the complete query that produced it.
-
-### StructuralQuery
-
-A [`StructuralQuery`](/docs/protocol/reference#StructuralQuery) asks by what the source looks like.
-The pattern is written in the target language's own syntax, with `$NAME` standing for one node and
-`$$$NAME` for a run of them:
-
-```
-{ "language": { "name": "python" },
-  "pattern": "requests.get($URL, timeout=$T)",
-  "constraints": [ { "capture": "T", "cardinality": "one", "text_regex": "^[0-9]+$" } ] }
-```
-
-The grammar parses the pattern, so whitespace and a trailing comma preserve the same match.
-
-A constraint combines a syntax match with adapter facts. For example, it can retain only calls whose
-target carries the `test` facet. Rift evaluates caller-supplied regular expressions with one engine.
-A second engine could accept different syntax, and backtracking could stall a shared adapter process.
-
-### PathSelector
-
-A [`PathSelector`](/docs/protocol/reference#PathSelector) limits either query to project-relative
-paths. It contains `include` and `exclude` lists of Git-style globs.
-
-```
-{ "include": ["src/**"], "exclude": ["src/generated/**"] }
-```
-
-Rift applies `exclude` after `include`. The example searches `src` while skipping its generated
-subtree.
-
-## Reachability
-
-Every answer reports how much source Rift inspected. This keeps an incomplete analysis from appearing
-as a complete empty result.
-
-### Coverage
-
-A [`Coverage`](/docs/protocol/reference#Coverage) value accompanies the returned facts and records the
-analysis state:
-
-```
-{ "state": "complete",    "scope": { "kind": "project" } }
-{ "state": "partial",     "scope": { "kind": "unit", "unit": "rift://file/src/app.ts" },
-                          "reason": "parse stopped at byte 4180" }
-{ "state": "unsupported", "scope": { "kind": "request" },
-                          "reason": "this adapter emits no origin mappings" }
-```
-
-Absence proves absence only under `complete`. Under `partial` the `reason` says what stopped analysis.
-The result's page cursor continues records already known, while repeating the same request at the same
-snapshot polls unfinished analysis. A page boundary does not change coverage. `unsupported` means the
-adapter cannot produce this family; `not_applicable` means the language has no corresponding concept.
-
-Coverage is recorded separately for each fact family. An adapter can resolve every symbol in a file
-while failing to type one of them, so one combined value would hide the incomplete type analysis.
-
-### Diagnostic
-
-A [`Diagnostic`](/docs/protocol/reference#Diagnostic) is one adapter finding under its original code,
-such as `TS2345`. Rift forwards the adapter's message unchanged.
-
-The `reliability` field is `recovered` when the parser repaired invalid source to continue, so facts in
-that region may be approximate. The `continuation` field marks a diagnostic caused by source that ends
-mid-construct, as it can while an agent is writing a file.
-
-### ValidationReport
-
-A [`ValidationReport`](/docs/protocol/reference#ValidationReport) records one adapter's verdict over a
-applied snapshot or merged tree. It names the language, files checked, adapter diagnostics, and coverage
-of the affected program. `validation.require` selects required reports independently of source
-ownership. The default requires complete, valid reports from affected adapters that advertise
-validation; a repository can instead list exact `Language` values as fixed gates.
-
-The MCP surface combines those adapter reports with command-validator results produced before
-integration. Its validation strength says whether the result contains mechanical checks, every
-available report, or a fixed required language set. The response carries the evidence, while a
-disposable cache may reuse it only for the same complete Git and execution-configuration identity.
-
-## Operations
-
-An operation carries an address and the snapshot used to compute it.
-
-### Address
-
-An [`Address`](/docs/protocol/reference#Address) names the code an operation applies to:
-
-```
-{ "kind": "symbol", "symbol": "rift://symbol/python/pkg.util.load_config" }
-{ "kind": "node",   "node": "rift://node/python/pkg/util.py@1204-1266", "region": "name" }
-{ "kind": "source", "span": { "unit": "rift://file/LICENSE",
-                              "range": { "start": 0, "end": 11 } } }
-```
-
-A symbol address lets a rename reach every node known to the adapter. A node address selects one
-syntax-tree node. A source address selects raw bytes, including bytes in `LICENSE` or in an unclaimed
-file.
-
-### ActionDescriptor
-
-An adapter describes a discovered operation before it computes the edits. An
-[`ActionDescriptor`](/docs/protocol/reference#ActionDescriptor) carries that description:
-
-```
-kind:          quickfix.import.add
-title:         Import `Config` from `pkg.config`
-applicability: always
-target:        rift://node/python/pkg/api.py@88-94
-guarantees:    [syntax_validated, bindings_preserved]
-```
-
-Computing an action's edits costs about as much as performing it, and only one of the actions offered
-gets picked, so listing and resolving are two calls.
-
-`kind` is a dotted name whose prefixes nest. Rift defines portable families for quick fixes, source
-organization, rename, move, safe delete, signature changes, extraction, inline, introduction,
-conversion, and generation. An adapter can refine a portable family or advertise a reverse-domain
-family. An agent can request a prefix such as `quickfix` or `refactor.extract`.
-
-`applicability` records how the action was selected. `always` needs no caller-supplied fact before
-resolution. `conditional` exposes a condition outside the adapter's knowledge.
-`speculative` records inferred intent. Every resulting source snapshot still passes adapter validation.
-
-The descriptor lists the guarantees resolution must establish. `syntax_validated` covers parsing;
-`bindings_preserved` covers unchanged references; `references_updated` covers references that should
-follow the action. `behavior_checked` names a specific static analysis or command validator and never
-claims general behavioral equivalence.
-
-### Portable action arguments
-
-Common refactors have shared argument contracts, and each contract is the argument type of the tool
-that carries its name. `RenameArguments` combines the new name with an `OperationScope`, while
-`MoveArguments` selects a semantic container or project path. `SafeDeleteArguments` defines the
-disposition of resolved uses. Its optional `policy` controls reference analysis: omitting it removes
-the declaration directly, while supplying it requires complete coverage and refuses an unresolved
-use.
-
-`ChangeSignatureArguments` carries a `SignatureChange`. Existing parameters retain identity through
-their source nodes, so reordering preserves the same parameter identities. The desired shape includes
-receiver, parameter order and defaults, return types, generic parameters, declared errors, language
-effects, and propagation through callers or overrides. Advertised extensions carry constructs that
-the portable shape cannot express.
-
-An action descriptor can carry an `ArgumentContract` with separate `name` and `version` fields.
-
-It also supplies a self-contained JSON Schema. The schema can impose language rules such as identifier
-spelling. Extract, inline, introduce, convert, generate, and language-specific actions use that schema
-without a portable contract.
-
-### Resolution evidence
-
-An `OperationPrecondition` records the expected and observed values for a check, the component that
-verified it, and the addresses or paths it covered. State equality, target existence, writability,
-reference completeness, remaining usages, destination legality, and name availability have portable
-kinds. An adapter-specific condition retains its diagnostics.
-
-An `OperationEffect` explains the semantic consequence of exact edits: a declaration was created,
-removed, moved, or changed; references or imports were updated; source was rewritten; or formatting
-ran. `GuaranteeEvidence` then states the scope, verifier, method, and diagnostics for one advertised
-guarantee. These records let a change result show why an action is admissible without replacing the
-concrete `Edit` values that determine the applied tree.
-
-Commit reversion stays on the MCP seam because it is a request envelope over versioning and edits. The
-`revert` tool selects an exact commit, its parent, and eligible paths. Rift computes a three-way
-inverse and returns the same preconditions, effects, edits, and validation evidence as every other
-operation.
-
-### Action and match identities
-
-An action or match points into one snapshot, and after the source moves its byte offsets can be stale.
-Both are therefore identified by a URI that carries the snapshot they were computed against, which
-Rift checks before applying anything addressed at one. The URI itself does not pin that snapshot.
-
-A [`MatchId`](/docs/protocol/reference#MatchId) is `rift://match/` followed by base64url of the
-snapshot, the matched span, and the complete `MatchQuery`, in RFC 8785 canonical JSON. One query
-produces at most one match for a given span, so those three fields identify the match. Rift stores
-nothing for the id: the same URI can be decoded after restart, but resolution returns
-`snapshot_not_found` if its snapshot has become unpinned and collectible.
-
-An [`ActionOfferId`](/docs/protocol/reference#ActionOfferId) is `rift://action/` followed by base64url
-of the snapshot, the language whose adapter minted the offer, and an opaque adapter token. The
-language selects the adapter, and the token binds its handle and adapter generation. Reading the URI
-returns the offer while both snapshot and adapter state remain live; otherwise it returns
-`snapshot_not_found` or `stale_action`.
-
-The `ActionDescriptor` carries the target once. Keeping it out of the identity prevents two target
-fields from disagreeing.
+The full field definitions are in the generated [reference](/docs/protocol/reference).

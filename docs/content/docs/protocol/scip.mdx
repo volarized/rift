@@ -2,180 +2,27 @@
 title: SCIP
 ---
 
-import { RiftMapping, ScipReference } from "@/components/protocol/scip";
+SCIP export streams semantic facts from one session view as a `scip.Index`.
 
-[SCIP](https://github.com/scip-code/scip) is a language-neutral Protobuf format for code indexes.
+## Request
 
-The Rift server exposes a read-only SCIP export over gRPC. A client calls
-`rift.scip.Index.Read` with a Rift snapshot and receives an ordered stream that reconstructs one
-`scip.Index`.
+`Read` receives a `ProjectionHead`. The server reads the corresponding adapter state and emits
+events in canonical SCIP order:
 
-MCP tools use Rift's native model. They don't advertise or transport the SCIP export.
+1. one header;
+2. documents in project-path byte order;
+3. external symbols in encoded-symbol order.
 
-Rift pins
-[`scip.proto` from SCIP v0.9.0](https://github.com/scip-code/scip/blob/v0.9.0/scip.proto).
-The official schema fixes field and enum numbers, aliases, reservations, and oneof membership. Rift's
-Pydantic model preserves those identities in the generated `scip` package.
+The header repeats the head, carries SCIP metadata, and reports semantic coverage.
 
-## API
+## Mapping
 
-The client first opens `rift.mcp.Rift.Connect` with role `scip`. It keeps that control stream open and
-places the returned connection ID in `rift-connection-id` metadata on `Index.Read`. The
-`rift.scip.Request.at` field identifies the exact Rift snapshot. Contract negotiation therefore
-finishes before the export reads source state.
+Rift maps source documents, occurrences, symbols, relationships, signatures, and documentation to
+their SCIP equivalents. Paths remain workspace-relative. Source ranges use SCIP line and character
+coordinates after conversion from Rift's UTF-8 byte ranges.
 
-The export reads derived semantic facts for the exact persistent store snapshot. When those facts are
-absent or evicted, Rift starts the required adapters against a read projection and rebuilds them
-before it emits the stream.
+`Omission` records a populated Rift field that the pinned SCIP schema cannot express. Each entry
+names the field, reason, count, and affected language. This keeps a successful export explicit about
+lost facts.
 
-The first `rift.scip.Event` carries a `Header` containing the resolved snapshot, index metadata,
-semantic coverage, and every populated Rift field omitted by the mapping. The remaining events carry
-`scip.Document` values in path order, followed by external `scip.SymbolInformation` values in symbol
-order.
-
-The stream keeps each gRPC message bounded while preserving the repeated-field order of `scip.Index`.
-The client places the header metadata in `Index.metadata`, appends each document to `Index.documents`,
-and appends each external symbol to `Index.external_symbols`.
-
-## Index and documents
-
-| SCIP target | Rift source | Rule |
-| --- | --- | --- |
-| `Index.metadata` | <RiftMapping text={"Rift build and workspace root"} /> | Emit first and once. The root is an absolute URI. |
-| `Index.documents` | <RiftMapping text={"Regular `File` records"} /> | Emit one document per project path. Exclude LFS pointers, symlinks, and gitlinks. Sort by path. |
-| `Index.external_symbols` | <RiftMapping text={"Referenced `Symbol` records without a defining document"} /> | Emit retained metadata when present. Sort by encoded symbol. |
-| `Metadata.version` | Pinned SCIP schema | Emit `UnspecifiedProtocolVersion`, the only upstream value. |
-| `Metadata.tool_info` | Rift build | Emit name `rift`, the build version, and no process arguments. |
-| `Metadata.text_document_encoding` | Rift source bytes | Emit `UTF8`. |
-| `Document.relative_path` | <RiftMapping text={"`File.id`"} /> | Decode its canonical `ProjectPath`. |
-| `Document.language` | <RiftMapping text={"Physical or virtual file owner's `Language`"} /> | Use the official SCIP spelling for a name without a dialect. Otherwise emit the canonical `name:dialect` spelling. |
-| `Document.occurrences` | <RiftMapping text={"`Node`, relationship evidence, and ranged `Diagnostic` records"} /> | Apply the occurrence rules below. |
-| `Document.symbols` | <RiftMapping text={"`Symbol` records declared or defined in the file"} /> | Emit one entry per encoded symbol. |
-| `Document.text` | File bytes | Leave empty for physical files. Include retained virtual text because no disk path can recover it. |
-| `Document.position_encoding` | <RiftMapping text={"`TextRange` byte coordinates"} /> | Emit `UTF8CodeUnitOffsetFromLineStart`. |
-
-A parent index stops at a gitlink. The child repository exports a separate index from its own Rift
-workspace.
-
-Different-language adapters may contribute symbol-bearing occurrences to one physical file. The
-physical owner supplies `Document.language`. Each symbol scheme includes a reversible encoding of its
-Rift `Language`. Symbol-less highlighting from a non-owner adapter is omitted because a SCIP
-occurrence carries no language.
-
-## Ranges
-
-Rift converts each half-open UTF-8 byte range with the exact file bytes. A same-line range becomes
-`SingleLineRange`. A range crossing a line boundary becomes `MultiLineRange`.
-
-Lines and columns are zero-based. Rift emits typed ranges only. It never emits the deprecated packed
-range fields.
-
-SCIP coordinates are signed `int32`. Rift refuses the projection if a converted line or column exceeds
-`2^31 - 1`. Truncation would identify different source.
-
-## Symbols
-
-`Symbol.document_local` selects SCIP's local or global grammar. The adapter derives this fact from
-language semantics. Rift does not infer it from the references present in one index.
-
-A local symbol uses `local <id>`. The ID is the unpadded base64url encoding of the canonical
-`Symbol.id` UTF-8 bytes. This encoding is deterministic, reversible, and injective. Rift refuses a
-projection if a document-local symbol has a declaration or occurrence in another document.
-
-| SCIP component | Rift source | Rule |
-| --- | --- | --- |
-| local ID | <RiftMapping text={"`Symbol.document_local` and `Symbol.id`"} /> | For a document-local symbol, encode `Symbol.id` as the local ID. |
-| scheme | <RiftMapping text={"`Symbol.language`"} /> | Base64url-encode the UTF-8 `name` or `name:dialect` spelling without padding and prefix it with `rift-`. |
-| package origin | <RiftMapping text={"`Symbol.origin`"} /> | Copy package manager, name, and version. |
-| standard library origin | Language and adapter metadata | Emit manager `stdlib`, language name, and adapter version. Use `.` for a missing version. |
-| workspace, generated, synthetic, or opaque origin | No portable package identity | Emit SCIP's `. . .` placeholders. Report lost opaque origin data. |
-| descriptors | <RiftMapping text={"`Symbol.container`, `Symbol.name`, `Symbol.id`, and `Symbol.facets`"} /> | Walk the container chain. Preserve a terminal `~N` collision suffix as the disambiguator. Verify injective encoded symbols. |
-
-Descriptor suffixes follow one ordered rule:
-
-| Rift facets | SCIP suffix |
-| --- | --- |
-| `parameter` | `Parameter` |
-| `type_parameter` | `TypeParameter` |
-| `macro` | `Macro` |
-| `namespace` or `module` | `Namespace` |
-| `type` or `member_container` | `Type` |
-| `callable` | `Method` |
-| no match | `Term` |
-
-<p>
-  <RiftMapping
-    text={"`SymbolInformation.documentation` preserves Markdown. Plain documentation is escaped into CommonMark. The first retained `Signature` supplies `signature_documentation`; additional overloads are reported as omissions. Signature links become occurrences over zero-based UTF-8 byte columns in the rendered text."}
-  />
-</p>
-
-<p>
-  <RiftMapping
-    text={"`SymbolInformation.kind` first uses an exact SCIP kind when the terminal component of `ExactKind` matches. Otherwise it applies this conservative order over facets: type parameter, parameter, macro, constructor, operator, variant, enumeration, property, namespace, module, member callable, callable, type, value, then unspecified. A `static` symbol takes the `Static` form of whichever kind that order picked, where SCIP has one."}
-  />
-</p>
-
-## Relationships
-
-SCIP relationships control navigation equivalence. General graph edges remain Rift facts.
-
-| <RiftMapping text={"`RelationshipFacet` value"} /> | SCIP flags |
-| --- | --- |
-| `has_type` | `is_type_definition` |
-| `extends`, `implements`, or `mixes_in` | `is_implementation` |
-| `overrides` | `is_implementation`, `is_reference` |
-| callable `implements` | `is_implementation`, `is_reference` |
-| every other facet | No SCIP relationship. Report populated lost fields. |
-
-That last row covers the edges SCIP has no flag for, and Rift has more of them than SCIP has flags:
-`annotated_by`, `augments`, `bounded_by`, `configures`, and `binds` all survive an export only as
-reported omissions.
-
-Rift never sets `is_definition`. Its `declares` facet means ownership, while SCIP uses the flag for an
-alternate or otherwise missing definition.
-
-## Occurrences and diagnostics
-
-For each node, Rift chooses the symbol name region, then the selection region, then the node range. An
-`enclosing` region becomes the typed enclosing range.
-
-Symbol roles combine as a bitset:
-
-| <RiftMapping text={"Rift evidence from `NodeFacet` and relationships"} /> | SCIP role |
-| --- | --- |
-| `definition` node | `Definition` |
-| `declaration` without `definition` | `ForwardDefinition` |
-| `import` node | `Import` |
-| generated node or symbol | `Generated` |
-| test node or symbol | `Test` |
-| evidence for a `writes` relationship | `WriteAccess` |
-| evidence for a `reads` relationship | `ReadAccess` |
-
-Rift maps syntax highlighting only when facets establish it. Comments, identifiers, parameters, types,
-macros, and callables have direct mappings. Other syntax remains `UnspecifiedSyntaxKind`.
-
-A diagnostic with a span joins an occurrence at that exact range. Rift creates a symbol-less occurrence
-when no node already owns the range. Severity, code, message, source language, and presentation tags map
-directly.
-
-A diagnostic without a span has no SCIP representation. Related locations, parser reliability,
-continuation state, and extensions also remain outside SCIP. The stream header reports populated
-losses.
-
-## Canonical form
-
-Rift applies the official canonical order. Documents sort by path. Occurrences sort by range, enclosing
-range, then symbol. Symbols and relationships sort by encoded symbol. Diagnostics sort by severity and
-message. Equal records merge.
-
-One snapshot must produce identical bytes. Conformance reconstructs the stream with the pinned
-descriptor, checks canonical symbol strings and ranges, runs the first-party lint rules, verifies
-mapping or omission for every populated Rift field, covers languages sharing a filesystem projection, and stops parent
-indexes at gitlinks.
-
-## Definitions
-
-The declarations below come from the generated `rift.scip` API and the pinned upstream `scip`
-package. They are rendered on this page because neither package is part of the MCP JSON schema.
-
-<ScipReference />
+The stream is read-only and uses the same adapter-derived state as MCP semantic reads.

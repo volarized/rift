@@ -177,12 +177,12 @@ function assertSameFamilies(label: string, actual: string[]): void {
 assertSameFamilies("ResourceTemplate", branchNames("ResourceTemplate"));
 assertSameFamilies("ResourceLink", branchNames("ResourceLink"));
 
-const repositoryProperties = Object.fromEntries(props(defs.RepositoryResourcePayload));
+const workspaceProperties = Object.fromEntries(props(defs.WorkspaceResourcePayload));
 const advertisedResources =
-  shape(repositoryProperties.resources?.items)?.enum?.filter(
+  shape(workspaceProperties.resources?.items)?.enum?.filter(
     (value): value is string => typeof value === "string",
   ) ?? [];
-assertSameFamilies("RepositoryResourcePayload.resources", advertisedResources);
+assertSameFamilies("WorkspaceResourcePayload.resources", advertisedResources);
 
 const readContents = Object.fromEntries(props(defs.ResourceReadResult)).contents;
 const readItems = shape(readContents?.items);

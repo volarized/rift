@@ -1,4 +1,4 @@
-/** Generated configuration contract and the repository config checked against it. */
+/** Generated configuration contract and the workspace config checked against it. */
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,11 +19,11 @@ interface ConfigDocument extends ConfigSchema {
   $defs: Record<string, ConfigSchema>;
 }
 
-const REPOSITORY = join(process.cwd(), "..");
+const WORKSPACE = join(process.cwd(), "..");
 
 export const configDocument = JSON.parse(
-  readFileSync(join(REPOSITORY, "protocol", "rift.schema.json"), "utf8"),
+  readFileSync(join(WORKSPACE, "protocol", "rift.schema.json"), "utf8"),
 ) as ConfigDocument;
 
 export const configDefs = configDocument.$defs;
-export const repositoryConfig = readFileSync(join(REPOSITORY, "rift.toml"), "utf8").trim();
+export const workspaceConfig = readFileSync(join(WORKSPACE, "rift.toml"), "utf8").trim();

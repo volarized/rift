@@ -17,7 +17,7 @@ const documented: TypeResolver = (name) => (name in defs ? hrefFor(name) : null)
  *
  * A span that is exactly a type name becomes a link to it. The descriptions
  * already write type names in backticks, so the alternative is a reader who
- * reads `Snapshot` and has to go looking. Exact and whole-span, because
+ * reads a protocol type and has to go looking. Exact and whole-span, because
  * `Cargo.lock` and `rift://file/pkg/util.py` are also written in backticks and
  * neither is a type.
  */

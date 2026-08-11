@@ -1,7 +1,7 @@
 import { Fragment, type ReactNode } from "react";
 import { Prose } from "@/components/protocol/prose";
 import { Constraints } from "@/components/protocol/type-expr";
-import { type ConfigSchema, configDefs, configDocument, repositoryConfig } from "@/lib/config";
+import { type ConfigSchema, configDefs, configDocument, workspaceConfig } from "@/lib/config";
 import { adapterOwned } from "@/lib/proto";
 import { branches, props, refName, sub } from "@/lib/protocol";
 import { hrefFor } from "@/lib/protocol-surface";
@@ -160,7 +160,7 @@ function dereference(schema: ConfigSchema): ConfigSchema {
 export function ConfigFile(): ReactNode {
   return (
     <pre className="overflow-x-auto">
-      <code className="language-toml">{repositoryConfig}</code>
+      <code className="language-toml">{workspaceConfig}</code>
     </pre>
   );
 }
