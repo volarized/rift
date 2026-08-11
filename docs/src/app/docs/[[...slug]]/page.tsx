@@ -28,7 +28,18 @@ export default async function Page(props: PageProps<"/docs/[[...slug]]">) {
     : page.data.toc;
 
   return (
-    <DocsPage toc={toc} full={page.data.full} tableOfContent={{ footer: <BackToTop /> }}>
+    <DocsPage
+      toc={toc}
+      full={page.data.full}
+      // `single: false` keeps the highlight tracking sections as they cross
+      // the upper half of the viewport; with no headings, keep the column but
+      // render nothing into it.
+      tableOfContent={
+        toc.length > 0
+          ? { single: false, footer: <BackToTop /> }
+          : { enabled: true, component: <></> }
+      }
+    >
       <DocsTitle>{page.data.title}</DocsTitle>
       <DocsDescription>{page.data.description}</DocsDescription>
       <DocsBody>
