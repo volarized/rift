@@ -20,7 +20,7 @@ function Statement({ children, className }: { children: React.ReactNode; classNa
   return (
     <p
       className={cn(
-        "m-0 max-w-165 font-sans leading-[1.28] font-light tracking-[-0.015em] text-[2.75rem] text-balance text-foreground",
+        "m-0 max-w-165 font-sans leading-[1.28] font-light tracking-[-0.015em] text-[2rem] text-balance text-foreground sm:text-[2.75rem]",
         className,
       )}
     >
@@ -112,7 +112,7 @@ export default function HomePage() {
           )}
         >
           <div className="grid justify-items-start gap-5">
-            <h1 className="m-0 font-mono text-[60px] leading-none font-medium tracking-[-0.03em] sm:text-[76px]">
+            <h1 className="m-0 font-mono text-[52px] leading-none font-medium tracking-[-0.03em] sm:text-[76px]">
               rift
             </h1>
 
@@ -140,7 +140,7 @@ export default function HomePage() {
           tilt={1.48}
           fit={0.8}
           opacity={0.15}
-          className="w-full min-w-96 justify-self-center sm:h-80 md:w-80"
+          className="h-64 w-full justify-self-center sm:h-80 sm:min-w-96 md:w-80"
         />
         <div className="grid gap-5">
           <Statement>Agents depend on context and tooling.</Statement>
@@ -161,7 +161,9 @@ export default function HomePage() {
               </Statement>
             ) : null}
             <div className="grid gap-3">
-              <h3 className="m-0 font-mono text-xl font-medium tracking-[0.02em]">{item.title}</h3>
+              <h3 className="m-0 font-mono text-lg font-medium tracking-[0.02em] sm:text-xl">
+                {item.title}
+              </h3>
               <Body>{item.body}</Body>
             </div>
           </div>
