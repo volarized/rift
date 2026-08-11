@@ -69,6 +69,7 @@ function Section({
  * states.
  */
 const DIFFERENCES: {
+  statement: string;
   title: string;
   body: string;
   solid?: ExplodedKind;
@@ -78,11 +79,13 @@ const DIFFERENCES: {
   fit?: number;
 }[] = [
   {
+    statement: "Full context awareness and introspection.",
     title: "Direct compiler integration",
     body: "rift talks to the language’s own compiler, so every read is typed and every edit is validated before it lands.",
     solid: "sphere",
   },
   {
+    statement: "Staged changes with verification.",
     title: "Reversible filesystem projections",
     body: "Every change an agent makes is staged in a Rift-owned projection.",
     line: "shimizu",
@@ -90,6 +93,7 @@ const DIFFERENCES: {
     tilt: 1.5,
   },
   {
+    statement: "Clear semantics and efficient edits.",
     title: "Structured reads and writes over MCP",
     body: "Tools and resources instead of shell transcripts. Agents work with code semantics and edit it structurally.",
     line: "tsucs1",
@@ -155,11 +159,7 @@ export default function HomePage() {
       {DIFFERENCES.map((item, index) => (
         <Section key={item.title} wide className="md:grid-cols-2 md:items-center text-base">
           <div className="grid max-w-165 gap-7">
-            {index === 0 ? (
-              <Statement className="max-w-125">
-                Designed with simplicity and minimalism in mind.
-              </Statement>
-            ) : null}
+            <Statement className="max-w-125">{item.statement}</Statement>
             <div className="grid gap-3">
               <h3 className="m-0 font-mono text-lg font-medium tracking-[0.02em] sm:text-xl">
                 {item.title}
