@@ -1,7 +1,8 @@
 import type { ReactNode } from "react";
 import { Prose } from "@/components/protocol/prose";
 import { Shape } from "@/components/protocol/shape";
-import { mcpResources, mcpToolGroups } from "@/lib/protocol-surface";
+import { surfaceFor } from "@/lib/protocol-surface";
+import type { DocVersion } from "@/lib/versions";
 
 /**
  * The MCP surface: what an agent can call, and what it gets back.
@@ -14,7 +15,8 @@ import { mcpResources, mcpToolGroups } from "@/lib/protocol-surface";
  * Tools are grouped by the family the schema puts them in, so a reader who came
  * for one operation lands among the ones it composes with.
  */
-export function McpReference(): ReactNode {
+export function McpReference({ version }: { version: DocVersion }): ReactNode {
+  const { mcpResources, mcpToolGroups } = surfaceFor(version);
   return (
     <>
       <h2 id="tools" className="scroll-m-28">
@@ -30,7 +32,7 @@ export function McpReference(): ReactNode {
             {group.title}
           </h3>
           <p>
-            <Prose text={group.summary} />
+            <Prose text={group.summary} version={version} />
           </p>
 
           {group.tools.map((tool) => (
@@ -40,11 +42,11 @@ export function McpReference(): ReactNode {
               </h4>
               {tool.description ? (
                 <p>
-                  <Prose text={tool.description} />
+                  <Prose text={tool.description} version={version} />
                 </p>
               ) : null}
-              <Shape label="Input" name={tool.params} />
-              <Shape label="Output" name={tool.result} />
+              <Shape label="Input" name={tool.params} version={version} />
+              <Shape label="Output" name={tool.result} version={version} />
             </section>
           ))}
         </section>
@@ -67,10 +69,10 @@ export function McpReference(): ReactNode {
           ) : null}
           {resource.description ? (
             <p>
-              <Prose text={resource.description} />
+              <Prose text={resource.description} version={version} />
             </p>
           ) : null}
-          <Shape label="URI" name={resource.uri} />
+          <Shape label="URI" name={resource.uri} version={version} />
         </section>
       ))}
     </>

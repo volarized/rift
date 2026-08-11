@@ -1,12 +1,7 @@
 import type { ReactNode } from "react";
 import { Definition } from "@/components/protocol/definition";
-import {
-  AXES,
-  axisOf,
-  axisSummary,
-  type ReferenceNode,
-  referenceTree,
-} from "@/lib/protocol-surface";
+import { type ReferenceNode, surfaceFor } from "@/lib/protocol-surface";
+import type { DocVersion } from "@/lib/versions";
 
 function flatten(nodes: ReferenceNode[], out: string[] = []): string[] {
   for (const node of nodes) {
@@ -25,10 +20,11 @@ function flatten(nodes: ReferenceNode[], out: string[] = []): string[] {
  * The nesting itself is carried by the table of contents, which is where an
  * outline of two hundred names is useful rather than something to scroll past.
  */
-export function Reference(): ReactNode {
+export function Reference({ version }: { version: DocVersion }): ReactNode {
+  const { axes, axisSummary, referenceTree } = surfaceFor(version);
   return (
     <>
-      {AXES.map((axis) => {
+      {axes.map((axis) => {
         const names = flatten(referenceTree[axis] ?? []);
         if (names.length === 0) return null;
         return (
@@ -38,7 +34,7 @@ export function Reference(): ReactNode {
             </h2>
             <p>{axisSummary[axis]}</p>
             {names.map((name) => (
-              <Definition key={name} name={name} />
+              <Definition key={name} name={name} version={version} />
             ))}
           </section>
         );
@@ -46,5 +42,3 @@ export function Reference(): ReactNode {
     </>
   );
 }
-
-export { axisOf };

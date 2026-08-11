@@ -3,17 +3,16 @@ import { PropertyTable } from "@/components/protocol/property-table";
 import { Prose } from "@/components/protocol/prose";
 import { Constraints, TypeExpr, TypeLink } from "@/components/protocol/type-expr";
 import {
-  backlinks,
   branches,
-  defs,
   enumDescriptions,
-  homeOf,
   isLossy,
   props,
+  protocolFor,
   refName,
   type Schema,
   sub,
 } from "@/lib/protocol";
+import type { DocVersion } from "@/lib/versions";
 
 /**
  * The property a union branch is tagged by. Most carry a `const`; eleven unions
@@ -32,7 +31,7 @@ function discriminant(branch: Schema): string | null {
   return null;
 }
 
-function Variants({ schema }: { schema: Schema }): ReactNode {
+function Variants({ schema, version }: { schema: Schema; version: DocVersion }): ReactNode {
   const union = branches(schema);
   if (!union) return null;
 
@@ -66,11 +65,11 @@ function Variants({ schema }: { schema: Schema }): ReactNode {
             return (
               // biome-ignore lint/suspicious/noArrayIndexKey: positional list over a fixed schema array
               <li key={index}>
-                <TypeExpr schema={branch} />
+                <TypeExpr schema={branch} version={version} />
                 {branch.description ? (
                   <>
                     {" — "}
-                    <Prose text={branch.description} />
+                    <Prose text={branch.description} version={version} />
                   </>
                 ) : null}
               </li>
@@ -86,10 +85,10 @@ function Variants({ schema }: { schema: Schema }): ReactNode {
                 </summary>
                 {branch.description ? (
                   <p>
-                    <Prose text={branch.description} />
+                    <Prose text={branch.description} version={version} />
                   </p>
                 ) : null}
-                <PropertyTable schema={branch} />
+                <PropertyTable schema={branch} version={version} />
               </details>
             </li>
           );
@@ -100,7 +99,7 @@ function Variants({ schema }: { schema: Schema }): ReactNode {
 }
 
 /** A definition's enum values, described one by one where the schema says what they mean. */
-function EnumValues({ schema }: { schema: Schema }): ReactNode {
+function EnumValues({ schema, version }: { schema: Schema; version: DocVersion }): ReactNode {
   if (!schema.enum) return null;
   const described = enumDescriptions(schema);
   const label = (value: unknown) => (typeof value === "string" ? value : JSON.stringify(value));
@@ -133,7 +132,7 @@ function EnumValues({ schema }: { schema: Schema }): ReactNode {
               {description ? (
                 <>
                   {" — "}
-                  <Prose text={description} />
+                  <Prose text={description} version={version} />
                 </>
               ) : null}
             </li>
@@ -145,7 +144,7 @@ function EnumValues({ schema }: { schema: Schema }): ReactNode {
 }
 
 /** The shape of a definition, whichever of the schema's forms it takes. */
-function Shape({ schema }: { schema: Schema }): ReactNode {
+function Shape({ schema, version }: { schema: Schema; version: DocVersion }): ReactNode {
   const alias = refName(schema);
   const mapValues = schema.properties ? undefined : sub(schema.additionalProperties);
   const items = sub(schema.items);
@@ -154,11 +153,11 @@ function Shape({ schema }: { schema: Schema }): ReactNode {
     <>
       {alias ? (
         <p>
-          Alias of <TypeLink name={alias} />.
+          Alias of <TypeLink name={alias} version={version} />.
         </p>
       ) : null}
 
-      <EnumValues schema={schema} />
+      <EnumValues schema={schema} version={version} />
 
       {"const" in schema && !schema.enum ? (
         <p>
@@ -166,29 +165,31 @@ function Shape({ schema }: { schema: Schema }): ReactNode {
         </p>
       ) : null}
 
-      <Variants schema={schema} />
-      <PropertyTable schema={schema} />
+      <Variants schema={schema} version={version} />
+      <PropertyTable schema={schema} version={version} />
 
       {mapValues ? (
         <p>
-          Map: <TypeExpr schema={sub(schema.propertyNames) ?? { type: "string" }} /> to{" "}
-          <TypeExpr schema={mapValues} />
+          Map:{" "}
+          <TypeExpr schema={sub(schema.propertyNames) ?? { type: "string" }} version={version} /> to{" "}
+          <TypeExpr schema={mapValues} version={version} />
         </p>
       ) : null}
 
       {schema.type === "array" && items ? (
         <>
           <p>
-            Items: <TypeExpr schema={items} />
+            Items: <TypeExpr schema={items} version={version} />
           </p>
-          {items.properties ? <PropertyTable schema={items} /> : null}
+          {items.properties ? <PropertyTable schema={items} version={version} /> : null}
         </>
       ) : null}
     </>
   );
 }
 
-export function Definition({ name }: { name: string }): ReactNode {
+export function Definition({ name, version }: { name: string; version: DocVersion }): ReactNode {
+  const { defs, backlinks, homeOf } = protocolFor(version);
   const schema = defs[name];
   const referrers = backlinks[name] ?? [];
   const examples = schema.examples ?? [];
@@ -208,12 +209,12 @@ export function Definition({ name }: { name: string }): ReactNode {
 
       {schema.description ? (
         <p>
-          <Prose text={schema.description} />
+          <Prose text={schema.description} version={version} />
         </p>
       ) : null}
 
       <Constraints schema={schema} />
-      <Shape schema={schema} />
+      <Shape schema={schema} version={version} />
 
       {examples.map((example, index) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: positional list over a fixed schema array
@@ -252,7 +253,7 @@ export function Definition({ name }: { name: string }): ReactNode {
             {referrers.map((referrer, index) => (
               <span key={referrer}>
                 {index > 0 ? " · " : null}
-                <TypeLink name={referrer} />
+                <TypeLink name={referrer} version={version} />
               </span>
             ))}
           </p>

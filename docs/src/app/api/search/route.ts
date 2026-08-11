@@ -1,5 +1,5 @@
 import { createFromSource } from "fumadocs-core/search/server";
-import { pageData } from "@/lib/protocol-surface";
+import { allPageData } from "@/lib/protocol-surface";
 import { source } from "@/lib/source";
 
 // `staticGET`, not `GET`: `output: "export"` cannot emit a dynamic Route
@@ -24,7 +24,7 @@ export const { staticGET: GET } = createFromSource(source, {
   // so remark sees the prose and nothing else — every tool, operation, and
   // type would be unsearchable. The derived half is appended here.
   buildIndex(page) {
-    const derived = pageData[page.url];
+    const derived = allPageData[page.url];
     const structured = page.data.structuredData;
 
     return {

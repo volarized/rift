@@ -1,15 +1,19 @@
 import { Fragment, type ReactNode } from "react";
 import { branches, refName, type Schema, sub } from "@/lib/protocol";
 import { hrefFor } from "@/lib/protocol-surface";
+import type { DocVersion } from "@/lib/versions";
 
 /**
  * A link to wherever a definition's heading lives. Each definition is rendered
  * once, on the page for the document that owns it, so a type used by both the
  * MCP surface and the adapter wire resolves to the same anchor from either.
  */
-export function TypeLink({ name }: { name: string }): ReactNode {
+export function TypeLink({ name, version }: { name: string; version: DocVersion }): ReactNode {
   return (
-    <a href={hrefFor(name)} className="font-mono text-[0.875em] no-underline hover:underline">
+    <a
+      href={hrefFor(version, name)}
+      className="font-mono text-[0.875em] no-underline hover:underline"
+    >
       {name}
     </a>
   );
@@ -54,11 +58,17 @@ function Joined<T>({
  * the caller into its own table, so a cell never grows a second table inside
  * itself.
  */
-export function TypeExpr({ schema }: { schema: Schema | undefined }): ReactNode {
+export function TypeExpr({
+  schema,
+  version,
+}: {
+  schema: Schema | undefined;
+  version: DocVersion;
+}): ReactNode {
   if (!schema) return <Literal value="any" />;
 
   const ref = refName(schema);
-  if (ref) return <TypeLink name={ref} />;
+  if (ref) return <TypeLink name={ref} version={version} />;
 
   if ("const" in schema) return <Literal value={schema.const} />;
   if (schema.enum) {
@@ -70,7 +80,11 @@ export function TypeExpr({ schema }: { schema: Schema | undefined }): ReactNode 
   const union = branches(schema);
   if (union) {
     return (
-      <Joined items={union.list} separator="|" render={(branch) => <TypeExpr schema={branch} />} />
+      <Joined
+        items={union.list}
+        separator="|"
+        render={(branch) => <TypeExpr schema={branch} version={version} />}
+      />
     );
   }
   if (schema.allOf) {
@@ -78,7 +92,7 @@ export function TypeExpr({ schema }: { schema: Schema | undefined }): ReactNode 
       <Joined
         items={schema.allOf}
         separator="&"
-        render={(branch) => <TypeExpr schema={sub(branch)} />}
+        render={(branch) => <TypeExpr schema={sub(branch)} version={version} />}
       />
     );
   }
@@ -89,7 +103,7 @@ export function TypeExpr({ schema }: { schema: Schema | undefined }): ReactNode 
     return (
       <>
         <span className="text-fd-muted-foreground">array of </span>
-        <TypeExpr schema={items} />
+        <TypeExpr schema={items} version={version} />
       </>
     );
   }
@@ -100,9 +114,9 @@ export function TypeExpr({ schema }: { schema: Schema | undefined }): ReactNode 
       return (
         <>
           <span className="text-fd-muted-foreground">map </span>
-          <TypeExpr schema={sub(schema.propertyNames) ?? { type: "string" }} />
+          <TypeExpr schema={sub(schema.propertyNames) ?? { type: "string" }} version={version} />
           <span className="text-fd-muted-foreground"> to </span>
-          <TypeExpr schema={values} />
+          <TypeExpr schema={values} version={version} />
         </>
       );
     }

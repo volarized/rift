@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Prose } from "@/components/protocol/prose";
 import { Constraints, TypeExpr } from "@/components/protocol/type-expr";
 import { props, type Schema, sub } from "@/lib/protocol";
+import type { DocVersion } from "@/lib/versions";
 
 /** The inline object hiding behind a property, if there is one. */
 function inlineObject(schema: Schema): Schema | null {
@@ -18,7 +19,13 @@ function inlineObject(schema: Schema): Schema | null {
  * the word `object` — there are only a handful of them in the schema, and each
  * is a real part of the contract.
  */
-export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
+export function PropertyTable({
+  schema,
+  version,
+}: {
+  schema: Schema;
+  version: DocVersion;
+}): ReactNode {
   const properties = props(schema);
   if (properties.length === 0) return null;
 
@@ -61,7 +68,7 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
                 <td>
                   <span className="grid gap-0.5">
                     <span>
-                      <TypeExpr schema={property} />
+                      <TypeExpr schema={property} version={version} />
                     </span>
                     {constraints}
                   </span>
@@ -95,13 +102,15 @@ export function PropertyTable({ schema }: { schema: Schema }): ReactNode {
                   </td>
                 ) : null}
                 <td>
-                  {property.description ? <Prose text={property.description} /> : null}
+                  {property.description ? (
+                    <Prose text={property.description} version={version} />
+                  ) : null}
                   {nested ? (
                     <details className="mt-2">
                       <summary className="cursor-pointer text-fd-muted-foreground text-sm">
                         nested object
                       </summary>
-                      <PropertyTable schema={nested} />
+                      <PropertyTable schema={nested} version={version} />
                     </details>
                   ) : null}
                   {!property.description && !nested ? (

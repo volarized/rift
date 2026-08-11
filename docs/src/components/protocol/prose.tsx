@@ -1,11 +1,16 @@
 import type { ReactNode } from "react";
-import { defs } from "@/lib/protocol";
+import { protocolFor } from "@/lib/protocol";
 import { hrefFor } from "@/lib/protocol-surface";
+import type { DocVersion } from "@/lib/versions";
 
 /** Where a type name written in prose points, or null if it names nothing documented. */
 export type TypeResolver = (name: string) => string | null;
 
-const documented: TypeResolver = (name) => (name in defs ? hrefFor(name) : null);
+/** The default resolver: a span that is exactly a documented type links to it. */
+export function documentedIn(version: DocVersion): TypeResolver {
+  const { defs } = protocolFor(version);
+  return (name) => (name in defs ? hrefFor(version, name) : null);
+}
 
 /**
  * Schema prose, with backtick spans rendered as code.
@@ -23,15 +28,18 @@ const documented: TypeResolver = (name) => (name in defs ? hrefFor(name) : null)
  */
 export function Prose({
   text,
-  resolve = documented,
+  version,
+  resolve,
 }: {
   text: string;
+  version?: DocVersion;
   resolve?: TypeResolver;
 }): ReactNode {
+  const resolver = resolve ?? (version ? documentedIn(version) : () => null);
   return text.split(/(`[^`]*`)/g).map((part, index) => {
     if (index % 2 === 1) {
       const content = part.slice(1, -1);
-      const href = resolve(content);
+      const href = resolver(content);
       return href ? (
         <a
           // biome-ignore lint/suspicious/noArrayIndexKey: split output is positional and stable

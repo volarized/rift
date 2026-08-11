@@ -3,7 +3,7 @@ import { DocsBody, DocsDescription, DocsPage, DocsTitle } from "fumadocs-ui/page
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { BackToTop } from "@/components/back-to-top";
-import { pageData } from "@/lib/protocol-surface";
+import { allPageData } from "@/lib/protocol-surface";
 import { source } from "@/lib/source";
 import { getMDXComponents } from "@/mdx-components";
 
@@ -21,7 +21,7 @@ export default async function Page(props: PageProps<"/docs/[[...slug]]">) {
   // A heading written in the MDX *and* claimed by the derivation would appear
   // twice and React would see two children with one key, so the MDX wins: it is
   // the half remark actually rendered an anchor for.
-  const derived = pageData[page.url];
+  const derived = allPageData[page.url];
   const seen = new Set(page.data.toc.map((item) => item.url));
   const toc = derived
     ? [...page.data.toc, ...derived.toc.filter((item) => !seen.has(item.url))]

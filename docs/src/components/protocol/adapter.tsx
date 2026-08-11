@@ -1,18 +1,20 @@
 import type { ReactNode } from "react";
-import { Prose } from "@/components/protocol/prose";
-import {
-  adapterOwned,
-  adapterServices,
-  type ProtoEnum,
-  type ProtoField,
-  type ProtoMessage,
-  protoEnumOwner,
-  protoMessages,
-  protoSections,
-  protoWrappers,
-} from "@/lib/proto";
-import { homeOf } from "@/lib/protocol";
+import { Prose, type TypeResolver } from "@/components/protocol/prose";
+import { type ProtoEnum, type ProtoField, type ProtoMessage, protoFor } from "@/lib/proto";
+import { protocolFor } from "@/lib/protocol";
 import { hrefFor } from "@/lib/protocol-surface";
+import type { DocVersion } from "@/lib/versions";
+
+/** A section heading's anchor. */
+export function sectionId(name: string): string {
+  return `sec-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+}
+
+interface AdapterView {
+  messagesByName: Map<string, ProtoMessage>;
+  resolve: TypeResolver;
+  wrappers: Set<string>;
+}
 
 /**
  * Where a proto type name points, or null if nothing on either page holds it.
@@ -24,16 +26,29 @@ import { hrefFor } from "@/lib/protocol-surface";
  * get no heading, so they get no link either, and a nested enum resolves to the
  * message it is declared in, which is the heading it is rendered under.
  */
-function hrefForProtoType(name: string): string | null {
-  if (protoWrappers.has(name)) return null;
-  const owner = protoEnumOwner[name];
-  if (owner) return `#msg-${owner}`;
-  if (adapterOwned.has(name)) return `#msg-${name}`;
-  return homeOf[name] === "core" ? hrefFor(name) : null;
+function viewFor(version: DocVersion): AdapterView {
+  const { adapterOwned, protoEnumOwner, protoMessages, protoWrappers } = protoFor(version);
+  const { homeOf } = protocolFor(version);
+
+  const resolve: TypeResolver = (name) => {
+    if (protoWrappers.has(name)) return null;
+    const owner = protoEnumOwner[name];
+    if (owner) return `#msg-${owner}`;
+    if (adapterOwned.has(name)) return `#msg-${name}`;
+    return homeOf[name] === "core" ? hrefFor(version, name) : null;
+  };
+
+  return {
+    messagesByName: new Map(
+      protoMessages.filter((message) => adapterOwned.has(message.name)).map((m) => [m.name, m]),
+    ),
+    resolve,
+    wrappers: protoWrappers,
+  };
 }
 
-function TypeRef({ name }: { name: string }): ReactNode {
-  const href = hrefForProtoType(name);
+function TypeRef({ name, view }: { name: string; view: AdapterView }): ReactNode {
+  const href = view.resolve(name);
   if (!href) return <code className="text-[0.875em]">{name}</code>;
   return (
     <a href={href} className="font-mono text-[0.875em] no-underline hover:underline">
@@ -47,9 +62,9 @@ function TypeRef({ name }: { name: string }): ReactNode {
  * field is a repeated `SymbolFacet` and reads better as one — and the wrapper
  * has no heading of its own to link to.
  */
-function FieldType({ field }: { field: ProtoField }): ReactNode {
-  const element = protoWrappers.has(field.type)
-    ? messagesByName.get(field.type)?.fields[0].type
+function FieldType({ field, view }: { field: ProtoField; view: AdapterView }): ReactNode {
+  const element = view.wrappers.has(field.type)
+    ? view.messagesByName.get(field.type)?.fields[0].type
     : undefined;
   return (
     <>
@@ -57,12 +72,12 @@ function FieldType({ field }: { field: ProtoField }): ReactNode {
         <span className="text-fd-muted-foreground">repeated </span>
       ) : null}
       {field.optional ? <span className="text-fd-muted-foreground">optional </span> : null}
-      <TypeRef name={element ?? field.type} />
+      <TypeRef name={element ?? field.type} view={view} />
     </>
   );
 }
 
-function Fields({ message }: { message: ProtoMessage }): ReactNode {
+function Fields({ message, view }: { message: ProtoMessage; view: AdapterView }): ReactNode {
   if (message.fields.length === 0) return null;
   return (
     <div className="my-4 overflow-x-auto">
@@ -88,11 +103,11 @@ function Fields({ message }: { message: ProtoMessage }): ReactNode {
                 ) : null}
               </td>
               <td className="whitespace-nowrap">
-                <FieldType field={field} />
+                <FieldType field={field} view={view} />
               </td>
               <td>
                 {field.comment ? (
-                  <Prose text={field.comment} resolve={hrefForProtoType} />
+                  <Prose text={field.comment} resolve={view.resolve} />
                 ) : (
                   <span className="text-fd-muted-foreground">—</span>
                 )}
@@ -105,16 +120,8 @@ function Fields({ message }: { message: ProtoMessage }): ReactNode {
   );
 }
 
-const messagesByName = new Map<string, ProtoMessage>(
-  protoMessages.filter((message) => adapterOwned.has(message.name)).map((m) => [m.name, m]),
-);
-/** A section heading's anchor. */
-export function sectionId(name: string): string {
-  return `sec-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
-}
-
 /** An enum's values, described one by one where the file says what they mean. */
-function EnumValues({ declared }: { declared: ProtoEnum }): ReactNode {
+function EnumValues({ declared, view }: { declared: ProtoEnum; view: AdapterView }): ReactNode {
   if (!declared.values.some((value) => value.comment)) {
     return (
       <p>
@@ -136,7 +143,7 @@ function EnumValues({ declared }: { declared: ProtoEnum }): ReactNode {
           {value.comment ? (
             <>
               {" — "}
-              <Prose text={value.comment} resolve={hrefForProtoType} />
+              <Prose text={value.comment} resolve={view.resolve} />
             </>
           ) : null}
         </li>
@@ -145,8 +152,8 @@ function EnumValues({ declared }: { declared: ProtoEnum }): ReactNode {
   );
 }
 
-function Declaration({ name }: { name: string }): ReactNode {
-  const message = messagesByName.get(name);
+function Declaration({ name, view }: { name: string; view: AdapterView }): ReactNode {
+  const message = view.messagesByName.get(name);
   if (!message) return null;
   return (
     <section>
@@ -155,19 +162,19 @@ function Declaration({ name }: { name: string }): ReactNode {
       </h3>
       {message.comment ? (
         <p>
-          <Prose text={message.comment} resolve={hrefForProtoType} />
+          <Prose text={message.comment} resolve={view.resolve} />
         </p>
       ) : null}
-      <Fields message={message} />
+      <Fields message={message} view={view} />
       {message.enums.map((declared) => (
         <div key={declared.name}>
           <h4 className="font-mono">{`${name}.${declared.name}`}</h4>
           {declared.comment ? (
             <p>
-              <Prose text={declared.comment} resolve={hrefForProtoType} />
+              <Prose text={declared.comment} resolve={view.resolve} />
             </p>
           ) : null}
-          <EnumValues declared={declared} />
+          <EnumValues declared={declared} view={view} />
         </div>
       ))}
     </section>
@@ -181,7 +188,9 @@ function Declaration({ name }: { name: string }): ReactNode {
  * what the seam is. Messages are grouped the way the file groups itself, so a
  * reader and an editor see the same shape.
  */
-export function AdapterReference(): ReactNode {
+export function AdapterReference({ version }: { version: DocVersion }): ReactNode {
+  const { adapterServices, protoSections } = protoFor(version);
+  const view = viewFor(version);
   const service = adapterServices[0];
 
   return (
@@ -212,7 +221,7 @@ export function AdapterReference(): ReactNode {
           </pre>
           {rpc.comment ? (
             <p>
-              <Prose text={rpc.comment} resolve={hrefForProtoType} />
+              <Prose text={rpc.comment} resolve={view.resolve} />
             </p>
           ) : null}
         </section>
@@ -224,7 +233,7 @@ export function AdapterReference(): ReactNode {
             {section.name}
           </h2>
           {section.types.map((name) => (
-            <Declaration key={name} name={name} />
+            <Declaration key={name} name={name} view={view} />
           ))}
         </div>
       ))}

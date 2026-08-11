@@ -2,8 +2,9 @@ import type { ReactNode } from "react";
 import { PropertyTable } from "@/components/protocol/property-table";
 import { Prose } from "@/components/protocol/prose";
 import { Constraints } from "@/components/protocol/type-expr";
-import { defs } from "@/lib/protocol";
+import { protocolFor } from "@/lib/protocol";
 import { hrefFor } from "@/lib/protocol-surface";
+import type { DocVersion } from "@/lib/versions";
 
 /**
  * One named type, shown where it is used rather than in a list somewhere else.
@@ -13,8 +14,16 @@ import { hrefFor } from "@/lib/protocol-surface";
  * is the same type with everything this view leaves out — its branches, its
  * examples, and what else refers to it.
  */
-export function Shape({ label, name }: { label: string; name: string }): ReactNode {
-  const schema = defs[name];
+export function Shape({
+  label,
+  name,
+  version,
+}: {
+  label: string;
+  name: string;
+  version: DocVersion;
+}): ReactNode {
+  const schema = protocolFor(version).defs[name];
   if (!schema) return null;
 
   return (
@@ -23,17 +32,17 @@ export function Shape({ label, name }: { label: string; name: string }): ReactNo
         <span className="mr-2 font-sans font-normal text-fd-muted-foreground text-sm uppercase tracking-wide">
           {label}
         </span>
-        <a href={hrefFor(name)} className="no-underline hover:underline">
+        <a href={hrefFor(version, name)} className="no-underline hover:underline">
           {name}
         </a>
       </h4>
       {schema.description ? (
         <p>
-          <Prose text={schema.description} />
+          <Prose text={schema.description} version={version} />
         </p>
       ) : null}
       <Constraints schema={schema} />
-      <PropertyTable schema={schema} />
+      <PropertyTable schema={schema} version={version} />
     </div>
   );
 }
