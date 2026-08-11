@@ -1,13 +1,10 @@
 import { ArrowRightIcon } from "@phosphor-icons/react/dist/ssr";
 import Link from "next/link";
 
-import { Command } from "@/components/command";
 import { type ExplodedKind, ExplodedObject } from "@/components/exploded-object";
-import { type IsoLayer, IsoStack } from "@/components/iso-stack";
 import { LineObject, type LineObjectKind } from "@/components/line-object";
 import { Logo } from "@/components/logo";
 import { Reveal } from "@/components/reveal";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -63,16 +60,6 @@ function Section({
   );
 }
 
-const LAYERS: IsoLayer[] = [
-  { label: "your codebase" },
-  { label: "your agent" },
-  { label: "rift", note: "the toolkit for your agent" },
-  {
-    label: "result",
-    note: "token-efficient reads and edits, with full introspection",
-  },
-];
-
 /**
  * One object per point: the compiler is the solid taken apart, the other two
  * are attractors — a reversible system and a dynamo that swaps between two
@@ -93,8 +80,8 @@ const DIFFERENCES: {
     solid: "sphere",
   },
   {
-    title: "Reversible, git-backed worktrees",
-    body: "Every change an agent makes is staged in a worktree.",
+    title: "Reversible filesystem projections",
+    body: "Every change an agent makes is staged in a Rift-owned projection.",
     line: "shimizu",
     // The butterfly stands in the x–z plane; turn it to face the camera.
     tilt: 1.5,
@@ -186,9 +173,9 @@ export default function HomePage() {
                 index % 2 === 1 && "md:order-first",
               )}
             />
-          ) : (
+          ) : item.line ? (
             <LineObject
-              kind={item.line!}
+              kind={item.line}
               reveal
               tilt={item.tilt}
               spin={item.spin}
@@ -199,7 +186,7 @@ export default function HomePage() {
                 index % 2 === 1 && "md:order-first",
               )}
             />
-          )}
+          ) : null}
         </Section>
       ))}
 

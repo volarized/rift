@@ -1,0 +1,1272 @@
+syntax = "proto3";
+// Generated from the Pydantic models under protocol/src/rift/models. Do not edit.
+// Internal messages produced when rift-mcp decodes MCP JSON values.
+package rift.mcp;
+import "rift/core.proto";
+import "google/protobuf/struct.proto";
+// Which indexed field produced a search hit.
+enum MatchedField {
+  // The caller did not set a value.
+  MATCHED_FIELD_UNSPECIFIED = 0;
+  // The symbol or file name matched.
+  MATCHED_FIELD_NAME = 1;
+  // The rendered signature matched.
+  MATCHED_FIELD_SIGNATURE = 2;
+  // The documentation text matched.
+  MATCHED_FIELD_DOCUMENTATION = 3;
+  // The text of the file matched.
+  MATCHED_FIELD_CONTENT = 4;
+  // The project path matched.
+  MATCHED_FIELD_PATH = 5;
+}
+// One family of Rift resources. The family fixes the URI shape a read accepts, the media type
+// it returns, and the payload model inside it.
+enum ResourceFamily {
+  // The caller did not set a value.
+  RESOURCE_FAMILY_UNSPECIFIED = 0;
+  // Workspace capabilities, projection state, and request limits.
+  RESOURCE_FAMILY_WORKSPACE = 1;
+  // One symbol, its nodes, its edges and its diagnostics.
+  RESOURCE_FAMILY_SYMBOL = 2;
+  // One directory page or file-content range.
+  RESOURCE_FAMILY_FS = 3;
+  // The fixes and refactors an adapter offers at one address, or across one file.
+  RESOURCE_FAMILY_ACTIONS = 4;
+  // One discovered action, with the schema of the arguments it takes.
+  RESOURCE_FAMILY_ACTION = 5;
+  // Where this session's projection lives on the filesystem.
+  RESOURCE_FAMILY_PROJECTION = 6;
+  // The changes this session has made, and what vouched for each.
+  RESOURCE_FAMILY_CHANGES = 7;
+}
+// Why a request failed, as a stable code a caller branches on. The code is the complete
+// classification. Domain results such as unsupported coverage and edit refusal use their typed
+// result values.
+enum ErrorCode {
+  // The caller did not set a value.
+  ERROR_CODE_UNSPECIFIED = 0;
+  // The request does not satisfy the schema, or names something the schema forbids: a `limit`
+  // above the advertised maximum, a filter field that does not exist. The same bytes fail
+  // identically.
+  ERROR_CODE_INVALID_REQUEST = 1;
+  // No version the caller offered is one the server implements. `protocol` lists the versions
+  // the server supports; the caller selects one it implements and reconnects, or surfaces the
+  // mismatch.
+  ERROR_CODE_UNSUPPORTED_PROTOCOL = 2;
+  // The connection cannot perform this operation: a path addresses through a symlink component,
+  // which following could take outside the workspace, or a debugging session belongs to another
+  // connection. The same request fails the same way.
+  ERROR_CODE_PERMISSION_DENIED = 3;
+  // The identity is well-formed and resolves to nothing — no such symbol, no such filesystem
+  // entry, or a debug session already stopped or expired. Retrying does not help.
+  ERROR_CODE_RESOURCE_NOT_FOUND = 4;
+  // The entry is known but its bytes cannot be read. Retrying does not help.
+  ERROR_CODE_CONTENT_UNAVAILABLE = 5;
+  // The cursor is malformed, or it was minted for a different request, order or page size.
+  // Start the query again from its first page.
+  ERROR_CODE_CURSOR_INVALID = 6;
+  // The caller cancelled, or the connection went away before the request finished. Sending it
+  // again is fine.
+  ERROR_CODE_CANCELLED = 7;
+  // The request ran past `max_request_ms`. A smaller one may succeed — a lower `limit`, a
+  // narrower path selector — and so may the same one once a cold adapter has warmed up.
+  ERROR_CODE_DEADLINE_EXCEEDED = 8;
+  // A request or a response crossed an advertised limit. `limit` says which one and by how
+  // much, so the request can be resized and sent again.
+  ERROR_CODE_LIMIT_EXCEEDED = 9;
+  // The session has an in-flight Rift FS mutation that prevents this operation. Retry after
+  // that mutation completes.
+  ERROR_CODE_PROJECTION_BUSY = 10;
+  // A configured adapter could serve this request, but its process failed to start or died. The
+  // server restarts it on demand, doubling a one-second delay after each failed start; `retry`
+  // says `same_request` until three consecutive starts fail, then `operator_action` until the
+  // configuration changes.
+  ERROR_CODE_ADAPTER_UNAVAILABLE = 11;
+  // An adapter contract is unusable. Causes include a malformed message, a field outside its
+  // range, ambiguous source or virtual claims, overlapping write claims, a virtual path
+  // collision, and a cycle in virtual-source routing. Correct the adapter configuration before
+  // retrying.
+  ERROR_CODE_ADAPTER_PROTOCOL_ERROR = 12;
+  // The adapter took the call and did not answer inside the server's per-call budget, which is
+  // at most `max_request_ms`. Retrying can work: a cold adapter on a large workspace is slow
+  // once and fast afterwards.
+  ERROR_CODE_ADAPTER_TIMEOUT = 13;
+  // Rift could not read or write workspace or projection files. Worth retrying only if the
+  // cause was transient, such as a disk that has since been cleared.
+  ERROR_CODE_STORAGE_FAILURE = 14;
+  // Rift could not launch the command validator, enforce its timeout, or capture its output.
+  // One retry is reasonable when the host failure was transient.
+  ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 15;
+  // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected to
+  // answer differently.
+  ERROR_CODE_INTERNAL_ERROR = 16;
+  // The workspace contains a path the protocol cannot represent safely.
+  ERROR_CODE_UNSUPPORTED_PATH = 17;
+  // The cursor is valid, but its captured result page set left the process-local cache. Start
+  // again from the first page.
+  ERROR_CODE_CURSOR_EXPIRED = 18;
+  // The resource exists but is in use. Another connection owns the session, a retained debugger
+  // blocks continuation, a disposable workspace is still releasing, or another publication
+  // holds the workspace. Retry after that owner or operation finishes.
+  ERROR_CODE_TEMPORARILY_UNAVAILABLE = 19;
+  // The workspace-root `rift.toml` does not satisfy its schema. New requests remain blocked
+  // until the file is valid.
+  ERROR_CODE_CONFIGURATION_INVALID = 20;
+  // The tool exists, but the workspace configuration and configured adapters cannot serve this
+  // operation for the requested language. Read the workspace resource again after `rift.toml`
+  // or adapter availability changes.
+  ERROR_CODE_CAPABILITY_UNAVAILABLE = 22;
+}
+// Stable retry instruction for one failed request. `deadline_exceeded` can permit the same
+// request; `invalid_request` requires changed input.
+enum RetryDirective {
+  // The caller did not set a value.
+  RETRY_DIRECTIVE_UNSPECIFIED = 0;
+  // The request fails the same way every time. Change it before sending it again.
+  RETRY_DIRECTIVE_NEVER = 1;
+  // Send the same bytes again. The cause was transient — a busy projection, an adapter still
+  // starting.
+  RETRY_DIRECTIVE_SAME_REQUEST = 2;
+  // Resolve the condition with a local state command or configuration change, then send the
+  // request again.
+  RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
+}
+// The total order a paginated answer comes back in, named in the request so a cursor can be
+// bound to it. Every order ends in the result's own identity, so two results that tie never
+// swap places between pages.
+enum ResultOrder {
+  // The caller did not set a value.
+  RESULT_ORDER_UNSPECIFIED = 0;
+  // Highest `score` first, then identity. Scores are comparable across every page of one
+  // request and nowhere else.
+  RESULT_ORDER_RELEVANCE = 1;
+  // By the file a result is written in, then its byte range, then identity. Two hits in one
+  // file come back in source order.
+  RESULT_ORDER_PATH = 2;
+  // By the result's canonical identity: a symbol URI, a file path, or an `ActionOfferId`.
+  // Adapter actions use this order because they carry no relevance score or common source path.
+  RESULT_ORDER_IDENTITY = 3;
+}
+// A copy of some source, and where it was copied from. A span points into a file that may
+// change afterwards; an excerpt is the bytes as they were when the answer was produced.
+message SourceExcerpt {
+  // The file and byte range the text was taken from.
+  rift.core.SourceSpan span = 1;
+  // The source bytes returned by the request.
+  string text = 2;
+}
+// Selects the adapter outline for one file. Outline nodes include declarations, definitions,
+// imports, exports, and the parent nodes needed to preserve their nesting.
+message OutlineParams {
+  enum Include {
+    // The caller did not set a value.
+    INCLUDE_UNSPECIFIED = 0;
+    // Attach the complete Symbol record, including signatures, types, documentation, and
+    // modifiers.
+    SYMBOL = 1;
+    // Attach the source covered by the outline node.
+    SOURCE = 2;
+    // Attach adapter findings whose primary span falls inside the outline node.
+    DIAGNOSTICS = 3;
+  }
+  // Project-relative file to outline.
+  string path = 1;
+  // Most outline nesting levels to return. Zero keeps top-level items; null includes every
+  // nested item.
+  optional int64 depth = 2;
+  // Optional payload attached to each outline item. Symbol identity and source structure are
+  // always present.
+  repeated Include include = 3;
+  // Most outline items in one page. The server may stop earlier at the response-byte limit.
+  optional int64 limit = 4;
+  // Continues the same file outline with every other parameter unchanged.
+  optional string cursor = 5;
+}
+// One declaration-oriented source node. Items are ordered by range start, then widest range,
+// then node identity, producing a stable source preorder.
+message OutlineItem {
+  // Source structure and parent identity for this outline node.
+  rift.core.Node node = 1;
+  // Complete symbol data, present when `include` contains `symbol` and `node.symbol` exists.
+  optional rift.core.Symbol symbol = 2;
+  // Source covered by the node, present when `include` contains `source`.
+  optional SourceExcerpt source = 3;
+  // Findings inside the node, present when `include` contains `diagnostics`.
+  repeated DiagnosticContext diagnostics = 4;
+}
+// One page of a file outline with explicit semantic coverage.
+message OutlineResult {
+  // File entry being outlined.
+  rift.core.File file = 2;
+  // Outline items on this page in stable source preorder.
+  repeated OutlineItem items = 3;
+  // Completeness of nodes, symbols, types, relationships, and diagnostics used to build the
+  // outline.
+  rift.core.SemanticCoverage coverage = 4;
+  // Cursor for the next outline page, or null after the final item.
+  optional string next_cursor = 5;
+}
+// What to search for. At least one of `query` and `filter` is required: `query` is lexical,
+// while `filter` is a predicate over adapter facts. `paths` narrows either form before
+// matching.
+message SearchParams {
+  // Which entity kinds may be returned. Type data is attached to the Symbol and Node records
+  // that bind it, and filters can search those attachments.
+  enum Target {
+    // The caller did not set a value.
+    TARGET_UNSPECIFIED = 0;
+    // Declarations the adapter resolved — a function, a class, a trait.
+    TARGET_SYMBOL = 1;
+    // Places in a syntax tree where a symbol is written. One symbol has many.
+    TARGET_NODE = 2;
+    // Entries of the workspace tree. The only target that returns results with no adapter
+    // installed.
+    TARGET_FILE = 3;
+    // Every kind above, in one ranked list.
+    TARGET_ALL = 4;
+  }
+  enum Include {
+    // The caller did not set a value.
+    INCLUDE_UNSPECIFIED = 0;
+    // The source around the hit, with the span it was copied from.
+    INCLUDE_SOURCE = 1;
+    // The rendered signatures of a symbol hit, filled into `Symbol.signatures`. Nothing to add
+    // for a node or a file.
+    INCLUDE_SIGNATURE = 2;
+    // The edges leading out of the hit.
+    INCLUDE_RELATIONSHIPS = 3;
+    // What the adapter reported at the hit.
+    INCLUDE_DIAGNOSTICS = 4;
+  }
+  Target target = 1;
+  // Which total order the page comes back in. The cursor is bound to it, so it cannot change
+  // between pages of one query.
+  ResultOrder order = 2;
+  // Text to match against file contents, symbol names, and rendered signatures. Matching is
+  // case-insensitive and identifier-aware — the query and the fields split on case and
+  // underscore boundaries, so `loadConfig` finds `load_config`. Scoring is server-defined and
+  // stable for one cursor's life.
+  optional string query = 3;
+  // A predicate over resolved fields and relationships. This is where adapter knowledge enters
+  // a search — implements this trait, called by that function, declared under `src/api`.
+  optional rift.core.Filter filter = 4;
+  // Files eligible for the search, selected by project-relative globs. Omitted selects every
+  // visible file.
+  optional rift.core.PathSelector paths = 5;
+  // Extra payload to attach to every hit. Each entry costs a lookup per hit, so the caller
+  // requests only what it will read.
+  repeated Include include = 6;
+  // Most hits to return in one page. `max_page_items` from the workspace resource caps it, and
+  // fewer may come back.
+  optional int64 limit = 7;
+  // Continues a previous search where its last page ended. Omit it for the first page;
+  // everything else in the request has to match what the cursor was minted for.
+  optional string cursor = 8;
+}
+// One search hit. Its file, node, or symbol payload carries the canonical identity.
+message SearchHit {
+  // What was found. A symbol, a node, or a file — whichever `target` allowed.
+  SearchHitTarget hit = 1;
+  // How well this hit matched. Scores are comparable across every page of one request and
+  // nowhere else.
+  double score = 2;
+  // Which indexed fields produced the match.
+  repeated MatchedField matched_by = 3;
+  // Edges from this hit, requested with `include: ["relationships"]`.
+  repeated rift.core.Relationship relationships = 4;
+  // The source around the hit, requested with `include: ["source"]`. Carries its span, so the
+  // caller can act on what it read without searching for it again.
+  optional SourceExcerpt source = 5;
+  // What the adapter reported here, requested with `include: ["diagnostics"]`.
+  repeated DiagnosticContext diagnostics = 6;
+}
+// JSON payload for one symbol in the session projection.
+message SymbolResourcePayload {
+  // The symbol this payload answers for, echoed back so a link and its content carry the same
+  // address.
+  string uri = 1;
+  // The declaration itself: its name, its kind in the language's own words, its origin, its
+  // types and its signatures.
+  rift.core.Symbol symbol = 3;
+  // Relations from produced declaration bytes to source ranges a caller can inspect or edit.
+  // Empty for a declaration read directly from physical source.
+  repeated rift.core.OriginMapping origin_mappings = 4;
+  // Every place this symbol is written — the declaration and each mention. This is the list a
+  // rename has to rewrite.
+  repeated rift.core.Node nodes = 5;
+  // Edges into and out of this symbol, each carrying the nodes from which the adapter derived
+  // it.
+  repeated rift.core.Relationship relationships = 6;
+  // The source at each node, so the declaration and its call sites can be read without a second
+  // round trip.
+  repeated SourceExcerpt source = 7;
+  // What the adapter reported at this symbol's nodes.
+  repeated DiagnosticContext diagnostics = 8;
+  // How complete each fact family is for this symbol. An empty `relationships` means the symbol
+  // has no edges only where that family is complete.
+  rift.core.SemanticCoverage coverage = 9;
+  // The same symbol URI carrying the cursor for the next page, or null on the last one. Nodes,
+  // edges and diagnostics are what page.
+  optional string next = 10;
+}
+// Opens one logical caller connection before another server RPC. The control stream
+// remains open for the connection lifetime.
+message ConnectRequest {
+  // How this connection will use the workspace server.
+  enum Role {
+    // The caller did not set a value.
+    ROLE_UNSPECIFIED = 0;
+    // An MCP bridge that creates a session and may reconnect to it while the process lives.
+    ROLE_MCP = 1;
+    // A read-only SCIP reader that takes no connection slot on the session it exports.
+    ROLE_SCIP = 2;
+  }
+  // Versions the caller implements, in preference order.
+  repeated string protocol_versions = 1;
+  // Optional behaviors implemented by the caller, sorted by identifier.
+  repeated string features = 2;
+  // Whether the connection serves MCP requests or a read-only SCIP projection.
+  Role role = 3;
+  // Process-generated persistent session to create or reconnect to. Required for an MCP role
+  // and null for a SCIP role. A live connection already using it makes Connect temporarily
+  // unavailable.
+  optional string session = 4;
+  // Canonical absolute UTF-8 path of the workspace served by this endpoint.
+  string canonical_root = 5;
+  // Caller build as it names itself in diagnostics.
+  string client_build = 6;
+}
+// The first response on an accepted control stream, including persistent projection state
+// for an MCP role.
+message Connected {
+  // The version the server accepted from the caller's list.
+  string protocol_version = 1;
+  // Features implemented by both peers, sorted by identifier.
+  repeated string features = 2;
+  // Canonical physical path that identifies this workspace.
+  string workspace = 3;
+  // Created or reconnected session for an MCP role; null for a SCIP role.
+  optional string session = 4;
+  // Exact current projection state, or null for a SCIP role.
+  optional rift.core.ProjectionState state = 8;
+  // Identity required in metadata on every later RPC.
+  string connection = 7;
+}
+// One retained MCP session and its projection.
+message SessionSummary {
+  // Persistent session identity.
+  string session = 1;
+  // Current projection state.
+  rift.core.ProjectionState state = 5;
+  // Whether one live MCP connection currently owns this session.
+  bool active = 4;
+  // Whether this is the calling connection's own session.
+  bool current = 6;
+}
+// Selects one page from a captured list of retained sessions in session-ID order.
+message SessionListParams {
+  // Most retained sessions to return on this page.
+  optional int64 limit = 1;
+  // Continues a captured session list with the same page size. A mismatched cursor returns
+  // `cursor_invalid`; one whose captured list the server dropped returns `cursor_expired`.
+  optional string cursor = 2;
+}
+// One page of retained sessions.
+message SessionListResult {
+  // Retained sessions on this page, sorted by session ID.
+  repeated SessionSummary sessions = 1;
+  // Cursor for the next page, or null after the final session.
+  optional string next_cursor = 2;
+}
+// Selects a retained session for the current MCP connection to continue. The current
+// session must be clean and hold no retained debugging session; the server removes the
+// vacated session with its projection directory. The retained session must have no live
+// connection. A changed current session returns `invalid_request`; a live target or
+// retained debugger returns `temporarily_unavailable`.
+message SessionContinueParams {
+  // Retained session to continue.
+  string session = 1;
+}
+// The active retained session now bound to the current MCP connection. The MCP process
+// replaces its in-memory session ID with this identity before it issues another call.
+message SessionContinueResult {
+  // Session state after the connection attached.
+  SessionSummary session = 1;
+}
+// Removes one inactive session and the projection it retains. A session with a live
+// connection — the caller's own included — returns `temporarily_unavailable`.
+message SessionRemoveParams {
+  // Retained session to remove.
+  string session = 1;
+}
+// The removed session and the projection state it held.
+message SessionRemoveResult {
+  // Session the result describes.
+  string session = 1;
+  // Exact projection state the session held when it was removed.
+  rift.core.ProjectionState state = 2;
+}
+// Workspace ceilings for retained debugging sessions. Null at
+// `ExecutionLimits.debug` means `rift.toml` disables debugging.
+message DebugLimits {
+  // Debugging sessions retained across all connections in this workspace. `debug_start` past
+  // this ceiling returns `temporarily_unavailable` until `debug_stop` or the idle timeout frees
+  // one.
+  int64 max_sessions = 1;
+  // Milliseconds without debug_get_frame or debug_stop after which Rift stops the session and
+  // releases its execution workspace.
+  int64 idle_timeout_ms = 2;
+  // The exact budget every `debug_start` receives — evaluation bounds, retained frames,
+  // bindings per frame, and rendered value bytes.
+  rift.core.DebugBudget budget = 3;
+}
+// Workspace ceilings for caller-provided code. Null at `Limits.execution` means
+// `rift.toml` disables execution, regardless of adapter capability.
+message ExecutionLimits {
+  // UTF-8 bytes accepted in one CodeBlock.source.
+  int64 max_code_bytes = 1;
+  // The exact evaluation budget every `execute` call receives — the advertised ceiling and the
+  // applied bound are one value.
+  rift.core.ExecutionBudget budget = 2;
+  // Evaluations running concurrently across all connections in the workspace. A call arriving
+  // with every concurrent evaluation in use returns `temporarily_unavailable`.
+  int64 max_concurrent = 4;
+  // Debugging ceilings, or null when debugging is disabled in `rift.toml`.
+  optional DebugLimits debug = 5;
+}
+// The ceilings this server enforces on MCP requests and responses. Rift chooses its internal
+// bounds, while `rift.toml` supplies the caller-code limits. A request or response that crosses
+// one fails with `limit_exceeded` carrying `LimitEvidence`.
+message Limits {
+  // Largest request body the server accepts, in bytes. A deep filter tree or a long structural
+  // pattern is the usual way to exceed it.
+  int64 max_request_bytes = 1;
+  // Largest serialized tool result or resource page Rift returns. Paginated answers stop before
+  // this boundary and provide a cursor; an indivisible result that cannot fit fails with
+  // `limit_exceeded`. Conforming `read` implementations advertise at most 65536 bytes, below
+  // the truncation boundary of common MCP harnesses.
+  int64 max_response_bytes = 2;
+  // Largest RFC 8785 JSON encoding of one indivisible item in a paginated answer, such as one
+  // Change, Edit, diagnostic, or validator result. Resolution fails with `limit_exceeded`
+  // before publishing a change when one item exceeds this value. Rift keeps it at or below
+  // 49152 bytes, leaving page space for identity and cursors.
+  int64 max_record_bytes = 3;
+  // Most source bytes one file resource page carries before UTF-8 or base64 serialization. Rift
+  // may return fewer bytes to preserve a UTF-8 boundary and stay within `max_response_bytes`.
+  int64 max_file_chunk_bytes = 4;
+  // Ceiling on `limit` for every paginated tool. Asking for more is `invalid_request`; asking
+  // for less than this still permits a shorter page.
+  int64 max_page_items = 5;
+  // How far a relationship filter may walk. Transitive callers of a widely used function fan
+  // out fast, and this is what stops one query from touching the whole graph.
+  int64 max_relation_depth = 6;
+  // Most concrete `Edit` values one resolved operation may contain across every change.
+  int64 max_edits = 8;
+  // How many workspace command checks run when a change applies. Zero when `rift.toml` declares
+  // none.
+  int64 max_validators = 9;
+  // Most concrete edits one atomic `rewrite` (`RewriteParams`) may produce after matching.
+  int64 max_rewrite_expansions = 10;
+  // Caller-code execution ceilings. Null means `rift.toml` disables execute and all debug
+  // tools; adapter capability alone never enables them.
+  optional ExecutionLimits execution = 11;
+  // Nesting levels accepted in one caller-supplied predicate or argument object, so a
+  // schema-valid request cannot be a stack overflow. Exceeded fails with `limit_exceeded`
+  // naming this limit.
+  int64 max_filter_depth = 12;
+  // Wall-clock the server allows one call, evaluation excluded — `execute` adds its own
+  // `max_timeout`. A call that runs past it fails with `deadline_exceeded`.
+  uint32 max_request_ms = 13;
+  // Captured result sets the server retains per connection, evicting the least recently read. A
+  // page requested after eviction fails with `cursor_expired`.
+  uint32 max_active_cursors = 14;
+}
+// Current workspace state and request limits. Each configured language advertises its
+// adapter support and effective caller-code availability.
+message WorkspaceResourcePayload {
+  // The URI this payload answers for.
+  string uri = 1;
+  // Current session projection state.
+  rift.core.ProjectionState state = 2;
+  // The version every other field in this payload is stated under.
+  string protocol_version = 3;
+  // The ceilings a request has to stay inside here.
+  Limits limits = 4;
+  // Configured languages and their capabilities, sorted by name and dialect with null first.
+  repeated LanguageSupport languages = 5;
+  // How complete each fact family is across the workspace. A family reported `unsupported` here
+  // remains unsupported in subsequent answers.
+  rift.core.SemanticCoverage coverage = 6;
+  // The MCP resource families this workspace serves.
+  repeated ResourceFamily resources = 8;
+  // The same resource carrying the cursor for the next page, or null on the last one.
+  optional string next = 9;
+  // The pattern grammars the `match` tool accepts here.
+  MatchSyntax matching = 11;
+  // Publication checks declared by the workspace-root `rift.toml`.
+  repeated CommandValidator validators = 13;
+}
+// Where this session's projection lives on the filesystem. Adapters receive the tree they
+// analyze over the adapter protocol; a caller that has to reach the projection through an
+// ordinary filesystem tool reads it here.
+message ProjectionResourcePayload {
+  // The URI this payload answers for.
+  string uri = 1;
+  // Absolute path of the projection directory, at `.rift/projections/<session>` for the
+  // session's life. Reading this resource materializes the projection, because a tool pointed
+  // here may write and those writes belong to the changeset.
+  string path = 2;
+  // Absolute path of the workspace this projection was taken from.
+  string workspace = 3;
+}
+// One page of search hits, and what the page is worth. `coverage` is what makes an empty page
+// readable: nothing matched, or Rift could not see far enough to know.
+message SearchResult {
+  // How much Rift could see while answering. An empty page means nothing matched only where
+  // this is complete.
+  rift.core.Coverage coverage = 2;
+  // The hits on this page, in the order the request asked for.
+  repeated SearchHit results = 3;
+  // Cursor for the next page, or null after the final result.
+  optional string next_cursor = 4;
+}
+// One adapter action discovered at an address: the URI that resolves it, and the portable
+// description the adapter returned. A listing page leaves `descriptor.arguments_schema` null,
+// because a page of offers carries as many schemas as it has entries and a caller reads one.
+// The single-offer resource always carries it.
+message ActionOffer {
+  // Identity of this offer. Hand it to `act`, or read it for the argument schema the action
+  // takes.
+  string action = 1;
+  // What the action does and what it applies to.
+  rift.core.ActionDescriptor descriptor = 2;
+}
+// One page of actions available at one address in the session projection.
+message ActionsResourcePayload {
+  // The address this page answers for, echoed back as it resolved.
+  string uri = 1;
+  // The actions on this page, each without its argument schema, sorted by `ActionOfferId`.
+  repeated ActionOffer offers = 3;
+  // Whether the adapter could answer here. A language with no action support returns an empty
+  // list with `unsupported` coverage and its reason.
+  rift.core.Coverage coverage = 4;
+  // The same address carrying the cursor for the next page, or null on the last one.
+  optional string next = 5;
+}
+// One discovered action and the arguments it accepts. This is the read that supplies
+// `arguments_schema`, so a caller fetches one schema for the action it chose rather than a
+// schema per offer on a page.
+message ActionResourcePayload {
+  // The offer this payload answers for, echoed back as it resolved.
+  string uri = 1;
+  // Language whose adapter minted the offer and resolves it.
+  rift.core.Language language = 3;
+  // The offer, with `descriptor.arguments_schema` present.
+  ActionOffer offer = 4;
+}
+// Evaluate code with one configured language adapter in a disposable copy of the
+// session projection.
+message ExecuteParams {
+  // Exact language and optional dialect selecting the adapter.
+  rift.core.Language language = 1;
+  // Source to evaluate and its project-relative working directory.
+  rift.core.CodeBlock block = 2;
+}
+// Bounded result of one execution. Writes made by evaluated code are absent because its
+// execution workspace is discarded.
+message ExecuteResult {
+  // Adapter that evaluated the block.
+  rift.core.Language language = 2;
+  // Runtime status, bounded output, and structured diagnostics.
+  rift.core.ExecutionResult result = 3;
+  // Exact bounds sent to the adapter for this evaluation.
+  rift.core.ExecutionBudget budget = 4;
+}
+// Public summary of an inspect-only debugging evaluation. Start runs the block to normal
+// completion or an unhandled failure; failed runs retain their stack for frame reads.
+message DebugSession {
+  // Server-minted public handle. The adapter-local DebugSessionKey never crosses MCP.
+  string id = 1;
+  // Adapter that owns the retained debug state.
+  rift.core.Language language = 3;
+  // Retained stack frames, innermost first. Zero after normal completion.
+  int64 frame_count = 4;
+  // How the debugging evaluation ended and its bounded output.
+  rift.core.ExecutionResult result = 5;
+  // Exact execution and retained-frame bounds applied to this session.
+  rift.core.DebugBudget budget = 6;
+}
+// Start an inspect-only debugging evaluation in a disposable execution workspace.
+message DebugStartParams {
+  // Exact language and optional dialect selecting the adapter.
+  rift.core.Language language = 1;
+  rift.core.CodeBlock block = 2;
+}
+// Read one retained stack frame without resuming or mutating the debugging session.
+message DebugGetFrameParams {
+  string session = 1;
+  // Zero-based stack depth, with the innermost retained frame first.
+  int64 depth = 2;
+}
+// One retained frame from a connection-bound debugging session.
+message DebugGetFrameResult {
+  string session = 1;
+  rift.core.DebugFrame frame = 2;
+}
+// Stop a debugging session and release its adapter state and execution workspace.
+message DebugStopParams {
+  string session = 1;
+}
+// Acknowledgement that a debugging session no longer retains runtime state.
+message DebugStopResult {
+  string session = 1;
+  optional int64 stopped = 2;
+}
+// A structural match with grammar-derived replacement ranges.
+message MatchHitStructural {
+  // The named captures this match bound, in the order the pattern declares them.
+  repeated rift.core.Capture captures = 1;
+  // Why this is a match, one step per line.
+  repeated string explanation = 2;
+  // Ranges the adapter says can be replaced whole: the matched node alone, or with the
+  // whitespace and punctuation on either side. Rewriting `foo(a, b)` out of a list needs one of
+  // the wider ones to avoid leaving a comma behind.
+  rift.core.StructuralMatchRanges replacement_ranges = 3;
+  // Facts the adapter carries that this model has no field for, under a reverse-domain key.
+  rift.core.Extensions extensions = 4;
+  // Identity of this match and the state it was found in. An edit addressed at it is checked
+  // against this before it lands.
+  string key = 5;
+}
+// A text match. Bytes matched bytes, with no tree behind them and nothing to say about what is
+// safe to replace.
+message MatchHitText {
+  // The named captures this match bound, in the order the pattern declares them.
+  repeated rift.core.Capture captures = 1;
+  // Why this is a match, one step per line.
+  repeated string explanation = 2;
+  // Identity of this match and the state it was found in. An edit addressed at it is checked
+  // against this before it lands.
+  string key = 3;
+}
+// One match, tagged by the engine that produced it. The tag equals `key.query.kind`. A
+// structural match carries grammar-derived replacement ranges. A text match carries source
+// captures only.
+message MatchHit {
+  oneof variant {
+    MatchHitStructural structural = 1;
+    MatchHitText text = 2;
+  }
+}
+// A match query and page size for the session projection.
+message MatchParams {
+  // What to look for, and which engine answers it.
+  rift.core.MatchQuery query = 1;
+  // Most matches to return in one page, capped by `max_page_items`.
+  optional int64 limit = 2;
+  // Continues a previous match where its last page ended. Omit it for the first page.
+  optional string cursor = 3;
+}
+// One page of matches. Matches sort by file bytes, range, and canonical key. A match key names
+// the file it was found in, so Rift rechecks that file before applying an edit addressed at it.
+message MatchResult {
+  // The matches on this page.
+  repeated MatchHit matches = 2;
+  // How much of the selected path set was searched. A file too large to read makes this partial
+  // with a reason.
+  rift.core.Coverage coverage = 3;
+  // Cursor for the next page, or null after the final result.
+  optional string next_cursor = 4;
+}
+// One `Diagnostic` as an MCP answer carries it: the fact the adapter minted, plus what Rift can
+// add without the adapter — where it lands in a line and column, and the source around it.
+message DiagnosticContext {
+  // Component that produced the diagnostic. Rift sets this after collecting adapter, validator,
+  // or apply output.
+  enum Source {
+    // The caller did not set a value.
+    SOURCE_UNSPECIFIED = 0;
+    // The language's own analysis.
+    ADAPTER = 1;
+    // A check Rift ran over a proposed change.
+    VALIDATOR = 2;
+    // Output from applying edits to the workspace.
+    APPLY = 3;
+  }
+  Source source = 1;
+  // The finding itself, exactly as the adapter minted it.
+  rift.core.Diagnostic diagnostic = 3;
+  // One-based line the finding starts on. Null where the diagnostic has no span — a
+  // whole-project error has nowhere to point.
+  optional int64 line = 4;
+  // One-based column within that line, counted in UTF-8 bytes. Null for the same reason as
+  // `line`.
+  optional int64 column = 5;
+  // The source the finding points at. Null where there is no span to copy from.
+  optional SourceExcerpt excerpt = 6;
+}
+// One cause in a failure chain. Entries appear from the outer operation to the concrete
+// failure.
+message ErrorCause {
+  // How this link classifies on its own.
+  ErrorCode code = 1;
+  // What happened, for a human reading a log.
+  string message = 2;
+  // What could be done about this cause. The request's outer directive governs the call.
+  RetryDirective retry = 3;
+}
+// The versions the server implements, carried when it rejects the caller's. Without it the
+// caller cannot pick a version to reconnect with.
+message ProtocolEvidence {
+  // Versions the server implements, newest first.
+  repeated string supported = 1;
+  // The versions the caller declared, echoed back in the order received.
+  repeated string requested = 2;
+}
+// The `data` object on every Rift MCP failure. `code` and `retry` are what a caller branches
+// on, `message` is for a human, and the remaining fields carry the evidence available for that
+// failure.
+message ErrorData {
+  // How far the request got before it failed. The same code means different things at different
+  // phases: `limit_exceeded` while reading is a response too big, and while validating it is a
+  // change set too large.
+  enum Phase {
+    // The caller did not set a value.
+    PHASE_UNSPECIFIED = 0;
+    // Working out what the workspace can do: capabilities, limits, which languages have
+    // adapters.
+    DISCOVERY = 1;
+    // Reading workspace or adapter data.
+    READ = 2;
+    // Turning an address, a cursor or an action key into the concrete thing it names at a
+    // state.
+    RESOLVE = 3;
+    // Checking a proposed change against the schema, the state it was pinned to, and the checks
+    // required by the workspace-root `rift.toml`.
+    VALIDATE = 4;
+    // Resolving the operation, writing the result into the projection, and validating the
+    // resulting tree.
+    CHANGE = 5;
+    // Publishing projection changes to the workspace.
+    PUBLISH = 6;
+    // Preparing an execution workspace and evaluating caller-provided code.
+    EXECUTE = 7;
+    // Starting, inspecting, or stopping a connection-bound debugging session.
+    DEBUG = 8;
+  }
+  // Why the request failed.
+  ErrorCode code = 1;
+  // Human-readable account of the failure. Machine-readable classification remains in the
+  // surrounding fields.
+  string message = 2;
+  // What the caller may do next.
+  RetryDirective retry = 3;
+  Phase phase = 4;
+  // What an adapter or configured command check reported while the request was failing. Empty
+  // where neither ran.
+  repeated DiagnosticContext diagnostics = 7;
+  // Which advertised limit was hit, and by how much. Present exactly when `code` is
+  // `limit_exceeded`, and forbidden otherwise.
+  optional LimitEvidence limit = 8;
+  // What led to this failure, outermost first. A code alone rarely says whether the cause is
+  // worth waiting out.
+  repeated ErrorCause causes = 9;
+  // The server's supported versions. Present exactly when `code` is `unsupported_protocol`, and
+  // forbidden otherwise.
+  optional ProtocolEvidence protocol = 10;
+}
+// Which advertised limit a `limit_exceeded` failure hit, and by how much. It is present exactly
+// when the code is `limit_exceeded`; without it, choosing between retrying smaller, falling
+// back to another resource and giving up means reparsing the human message.
+message LimitEvidence {
+  // Which side of the server the limit belongs to. The two fail at different seams: a `driver`
+  // limit is enforced by Rift around the request, while an `adapter` limit is enforced inside
+  // one adapter process.
+  enum Scope {
+    // The caller did not set a value.
+    SCOPE_UNSPECIFIED = 0;
+    // A field of `Limits`, advertised by the workspace resource.
+    DRIVER = 1;
+    // A field of the adapter's `AdapterLimits`, advertised in `Describe`.
+    ADAPTER = 2;
+  }
+  Scope scope = 1;
+  // The limit's field path below whichever message `scope` names, such as `max_page_items`,
+  // `execution.max_concurrent`, or `max_in_flight_per_state`.
+  string field = 2;
+  // The value in force when the request was rejected.
+  int64 limit = 3;
+  // What the request would have needed. Larger than `limit`, and the difference is what the
+  // caller has to close.
+  int64 required = 4;
+}
+// The grammar a `TextQuery` pattern is read in.
+message MatchSyntaxText {
+  string name = 1;
+  int64 version = 2;
+}
+// The grammar used by path selectors.
+message MatchSyntaxPath {
+  string name = 1;
+  int64 version = 2;
+}
+// The two pattern grammars this workspace accepts: one for text patterns and one for path
+// globs. Names remain stable; their version fields select syntax and matching semantics.
+message MatchSyntax {
+  MatchSyntaxText text = 1;
+  MatchSyntaxPath path = 2;
+}
+// A link to one Rift resource, as MCP carries it inside tool output. `name` selects the family,
+// which fixes the URI shape a read of `uri` accepts and the media type it returns.
+message ResourceLink {
+  // The resource to read. Hand it to `resources/read` unchanged.
+  string uri = 1;
+  // The resource family this link belongs to.
+  ResourceFamily name = 2;
+  // What a read of `uri` returns, as `application/vnd.rift.<family>+json`.
+  string mime_type = 3;
+}
+// One advertised MCP resource template, as `resources/templates/list` returns it. The family
+// fixes the template and the media type.
+message ResourceTemplate {
+  // The resource family being advertised.
+  ResourceFamily name = 1;
+  // What a read of a URI from this template returns, as `application/vnd.rift.<family>+json`.
+  string mime_type = 2;
+}
+// The URI passed to MCP `resources/read`. Each branch is one advertised Rift resource family.
+message ResourceReadParams {
+  // A URI matching one advertised resource family.
+  string uri = 1;
+}
+// One content block of an MCP resource read. `text` holds the family's payload as JSON —
+// `WorkspaceResourcePayload` for `rift://workspace`, `SymbolResourcePayload` for a symbol URI,
+// and so on — and `mimeType` names which. The `rift:contentTypes` map in the schema carries the
+// complete pairing.
+message ResourceContent {
+  // The URI that was read, as it resolved.
+  string uri = 1;
+  // Which payload `text` holds, as `application/vnd.rift.<family>+json`.
+  string mime_type = 3;
+  // The payload, serialized as JSON.
+  string text = 2;
+}
+// The result of one MCP resource read. Each Rift resource returns one JSON payload in `text`,
+// identified by `mimeType`. File bytes use UTF-8 or base64.
+message ResourceReadResult {
+  // The blocks this read produced. MCP allows several per read; each Rift resource returns one.
+  repeated ResourceContent contents = 1;
+}
+// A symbol hit: the declaration the adapter resolved, and a link to read the rest of what Rift
+// knows about it.
+message SearchHitTargetSymbol {
+  // The declaration that matched.
+  rift.core.Symbol symbol = 1;
+  // Link to the symbol resource that carries this symbol's nodes and relationships.
+  ResourceLink resource = 2;
+}
+// A node hit: one place in a syntax tree, without its enclosing symbol record.
+message SearchHitTargetNode {
+  // The syntax-tree node that matched, and the symbol written at it where there is one.
+  rift.core.Node node = 1;
+}
+// A file hit: one entry of the workspace tree. The only hit that needs no adapter.
+message SearchHitTargetFile {
+  // The tree entry that matched: what it holds, and which languages read it.
+  rift.core.File file = 1;
+}
+// What a search hit is. Tagged, so the payload correlation survives code generation.
+message SearchHitTarget {
+  oneof variant {
+    SearchHitTargetSymbol symbol = 1;
+    SearchHitTargetNode node = 2;
+    SearchHitTargetFile file = 3;
+  }
+}
+// Concrete filesystem edits supplied by the caller. Their ranges address the state this
+// operation resolves against, and replacements in one set may not overlap.
+message EditParams {
+  // Formatting applied after this operation's edits resolve.
+  rift.core.FormattingPolicy formatting = 3;
+  // An atomic effect set in canonical file-and-range order. Every text replacement addresses
+  // the state before this operation.
+  repeated rift.core.Edit edits = 4;
+}
+// A UTF-8 unified diff guarded by its context lines. A malformed patch — an absolute path, path
+// traversal, a binary patch, a broken header — is `invalid_request`; a hunk whose context
+// differs from the state it resolves against is a refusal carrying a failed `source_unchanged`
+// precondition.
+message PatchParams {
+  // Formatting applied after this operation's edits resolve.
+  rift.core.FormattingPolicy formatting = 3;
+  // Unified text diff with project-relative `a/` and `b/` paths.
+  string patch = 4;
+}
+// An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the
+// replacement, and either applies all resulting edits or refuses the operation.
+message RewriteParams {
+  // Which safe structural range is replaced. Text queries accept `exact` only because they have
+  // no grammar-owned trivia boundaries.
+  enum Range {
+    // The caller did not set a value.
+    RANGE_UNSPECIFIED = 0;
+    EXACT = 1;
+    LEADING = 2;
+    TRAILING = 3;
+    BOTH = 4;
+  }
+  // Formatting applied after this operation's edits resolve.
+  rift.core.FormattingPolicy formatting = 3;
+  // The text or structural pattern evaluated against the state this operation resolves against.
+  rift.core.MatchQuery query = 4;
+  // UTF-8 replacement template. `${NAME}` inserts the source bound by a named or numeric
+  // capture, `${0}` inserts the whole match, and `$$` inserts one dollar sign. An absent
+  // capture refuses the rewrite.
+  string replacement = 5;
+  Range range = 6;
+  // The accepted number of matches before expansion.
+  rift.core.MatchCardinality cardinality = 7;
+}
+// Changes what a declaration is called and rewrites the references that name it. The adapter
+// checks language spelling, collisions, and binding changes; a reference outside `scope`
+// refuses the operation rather than leaving it half done.
+message RenameParams {
+  // Formatting applied after this operation's edits resolve.
+  rift.core.FormattingPolicy formatting = 3;
+  // The declaration to rename.
+  rift.core.Address target = 4;
+  // The new name, and the source eligible for propagation.
+  rift.core.RenameArguments arguments = 5;
+}
+// Moves a declaration or file to another container or path and updates the imports and
+// references that reach it.
+message MoveParams {
+  // Formatting applied after this operation's edits resolve.
+  rift.core.FormattingPolicy formatting = 3;
+  // The declaration, file, or directory to move.
+  rift.core.Address target = 4;
+  // The destination, and the source eligible for import and reference updates.
+  rift.core.MoveArguments arguments = 5;
+}
+// Removes a declaration. Without a policy this is a mechanical removal that analyses no
+// references and claims no reference guarantee. With one, the adapter classifies every
+// remaining use, applies the stated disposition, and refuses the operation when reference
+// coverage is incomplete.
+message DeleteParams {
+  // Formatting applied after this operation's edits resolve.
+  rift.core.FormattingPolicy formatting = 3;
+  // The declaration, file, or directory to remove.
+  rift.core.Address target = 4;
+  // The disposition for each classified use, and the source it may be applied in.
+  rift.core.SafeDeleteArguments arguments = 5;
+}
+// Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument
+// lists: a new required parameter has to be supplied at every call site, which is why the
+// operation commonly raises a `behavior_unknown` confirmation.
+message ChangeSignatureParams {
+  // Formatting applied after this operation's edits resolve.
+  rift.core.FormattingPolicy formatting = 3;
+  // The callable whose signature changes.
+  rift.core.Address target = 4;
+  // The desired callable shape, its propagation, and the source it may reach.
+  rift.core.ChangeSignatureArguments arguments = 5;
+}
+// Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an
+// adapter offers that has no portable argument contract. Rift validates `arguments` against the
+// offer's advertised schema. An offer carrying a portable argument contract is refused here,
+// because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.
+message ActParams {
+  // Formatting applied after this operation's edits resolve.
+  rift.core.FormattingPolicy formatting = 3;
+  // The offer to resolve, as the actions resource returned it.
+  string action = 4;
+  // Arguments accepted by the offer's `ActionDescriptor.arguments_schema`. An action with no
+  // parameters receives an empty object.
+  google.protobuf.Struct arguments = 5;
+}
+// Restores changed paths from the current workspace.
+message ProjectionRestoreParams {
+  // Changed paths to restore. Null restores every changed path. Naming any path of a change
+  // restores every path that change touched — a change leaves the changeset whole.
+  repeated string paths = 2;
+}
+// What a passing run of one configured command establishes.
+message CommandValidatorGuarantees {
+  // Guarantee established when the validator passes.
+  rift.core.GuaranteeKind kind = 1;
+  // Source over which the command checks the property.
+  rift.core.CoverageScope scope = 2;
+  // Exact property the command checks and limits on interpreting a pass.
+  string detail = 3;
+}
+// A command from the workspace-root `rift.toml`, run without a shell inside the session's
+// projection directory. Whatever it writes there is published with the projection. The command
+// runs the tree it checks, so it executes unpublished changes.
+message CommandValidator {
+  // How workspace configuration presents this check.
+  enum Kind {
+    // The caller did not set a value.
+    KIND_UNSPECIFIED = 0;
+    KIND_TEST = 1;
+    KIND_LINT = 2;
+    KIND_BUILD = 3;
+    KIND_OTHER = 4;
+  }
+  // Whether Rift appends changed `ProjectPath` values to `argv` in byte order.
+  enum ChangedPaths {
+    // The caller did not set a value.
+    CHANGED_PATHS_UNSPECIFIED = 0;
+    CHANGED_PATHS_NONE = 1;
+    CHANGED_PATHS_APPEND = 2;
+  }
+  // Whether an identical tree and environment are expected to produce the same result.
+  enum Determinism {
+    // The caller did not set a value.
+    DETERMINISM_UNSPECIFIED = 0;
+    DETERMINISM_DETERMINISTIC = 1;
+    DETERMINISM_BEST_EFFORT = 2;
+  }
+  // Label shown with this validator. It is unique within `validators.commands`.
+  string id = 1;
+  Kind kind = 2;
+  // Executable followed by literal arguments. An absolute executable path is refused; a bare
+  // name resolves through the `PATH` of the merged environment the command runs with, and a
+  // relative path resolves below `working_directory` in the session projection. Rift performs
+  // no shell expansion.
+  repeated string argv = 3;
+  ChangedPaths changed_paths = 4;
+  // Directory below the projection root in which the process starts. The empty path selects the
+  // root.
+  string working_directory = 5;
+  // Environment values added on top of the environment the server inherited. Rift starts the
+  // command directly, without a shell, and supplies its working directory separately.
+  map<string, string> environment = 6;
+  // Wall-clock limit before Rift terminates the process.
+  int64 timeout_ms = 7;
+  // Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the
+  // omitted size. The upper bound keeps one escaped validator result inside one bounded result.
+  int64 output_limit_bytes = 8;
+  // Behavior or other properties this command is intended to check. A passing result turns each
+  // declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement`
+  // to the change.
+  repeated CommandValidatorGuarantees guarantees = 9;
+  Determinism determinism = 10;
+}
+// Bounded adapter-validation evidence for one applied session change.
+message ChangeValidation {
+  // How much semantic validation the result contains.
+  enum Strength {
+    // The caller did not set a value.
+    STRENGTH_UNSPECIFIED = 0;
+    // No affected adapter supplied a semantic validation report.
+    STRENGTH_MECHANICAL = 1;
+    // Every affected adapter that advertises validation supplied a complete report.
+    STRENGTH_AVAILABLE = 2;
+    // Every language named by `validation.require` supplied a complete report.
+    STRENGTH_REQUIRED = 3;
+  }
+  // Semantic validation strength established for the resulting tree.
+  Strength strength = 3;
+  // Adapter reports in language order.
+  repeated rift.core.ValidationReport adapter_reports = 4;
+}
+// One change in the projection's changeset, with everything Rift learned while resolving it.
+// A change carrying confirmations is recorded the same way as one carrying none; the
+// confirmations are what publication checks.
+message ChangeSummary {
+  // Identity of this change in the changeset.
+  string id = 1;
+  // Adapter validation of the resulting projection.
+  ChangeValidation validation = 3;
+  // Concrete edits in canonical file-and-range order.
+  repeated rift.core.Edit edits = 4;
+  // Semantic effects in adapter emission order.
+  repeated rift.core.OperationEffect effects = 6;
+  // Scoped guarantee evidence in guarantee-kind order.
+  repeated rift.core.GuaranteeEvidence guarantees = 7;
+  // Resolution findings in source order.
+  repeated rift.core.Diagnostic diagnostics = 8;
+  // Effects the caller has to accept before this change can be published, sorted by kind,
+  // source location, title, and detail. Empty where every affected adapter and validator
+  // vouched for the result.
+  repeated rift.core.ConfirmationRequirement confirmations = 10;
+  // Projection state after this change landed.
+  rift.core.ProjectionState current = 9;
+}
+// One page of the session's changeset, oldest change first. This is the read the caller makes
+// before publishing: every change it applied, what each one did, and which of them nobody
+// vouched for.
+message ChangesResourcePayload {
+  // The URI this payload answers for.
+  string uri = 1;
+  // Projection state the page was read from.
+  rift.core.ProjectionState state = 2;
+  // Changes on this page, in the order they were applied.
+  repeated ChangeSummary changes = 3;
+  // The same resource carrying the cursor for the next page, or null on the last one.
+  optional string next = 4;
+}
+// The operation resolved to edits and Rift wrote them into the projection.
+message ChangeApplied {
+  // The applied change and its evidence.
+  ChangeSummary summary = 1;
+}
+// Resolution produced no edits, so the projection is untouched.
+message RefusedResult {
+  // The condition the caller can act on.
+  rift.core.RefusalReason reason = 2;
+  // Conditions checked before refusal, including at least one failed entry for
+  // `unmet_precondition`.
+  repeated rift.core.OperationPrecondition preconditions = 3;
+  // Existing code, paths, or relationships that prevented a deterministic resolution.
+  repeated rift.core.OperationBlocker blockers = 4;
+  // Evidence that explains the refusal.
+  repeated rift.core.Diagnostic diagnostics = 5;
+}
+// An applied projection change or semantic refusal.
+message ChangeResult {
+  oneof variant {
+    ChangeApplied applied = 1;
+    RefusedResult refused = 2;
+  }
+}
+// Publishes the session projection into the workspace. Publication is the one step that
+// writes into the workspace, so it is where confirmations are settled: a change carrying
+// one is published only when this call names it.
+message PublishParams {
+  // Changes whose confirmations the caller accepts. A change carrying a confirmation and absent
+  // here is returned in `unaccepted` and nothing is written.
+  repeated string accept = 1;
+}
+// The result of publishing projection changes into the workspace.
+message PublishResult {
+  // Current projection state after the attempt.
+  rift.core.ProjectionState state = 2;
+  // Paths changed in both this projection and the workspace. Non-empty means nothing was
+  // written.
+  repeated string conflicts = 3;
+  // Changes carrying a confirmation that `accept` did not name, sorted by change identity.
+  // Non-empty means nothing was written.
+  repeated string unaccepted = 4;
+}
+// One filesystem entry from the session projection.
+message FsResourcePayload {
+  // How a filesystem resource entry is represented.
+  enum Encoding {
+    // The caller did not set a value.
+    ENCODING_UNSPECIFIED = 0;
+    ENCODING_DIRECTORY = 1;
+    ENCODING_UTF8 = 2;
+    ENCODING_BASE64 = 3;
+    ENCODING_NONE = 4;
+  }
+  // Exact resource request this payload answers.
+  string uri = 1;
+  // Directory, regular file, or symbolic link named by the URI.
+  rift.core.ProjectEntry entry = 3;
+  // How this entry's payload is represented.
+  Encoding encoding = 4;
+  // Directory children on this page — subdirectories and files alike, each one a complete
+  // `ProjectEntry`, sorted bytewise by path.
+  repeated rift.core.ProjectEntry entries = 5;
+  optional int64 start = 6;
+  optional int64 end = 7;
+  optional int64 total_bytes = 8;
+  optional string content = 9;
+  // SHA-256 of the complete file for a regular-file read, null for directories and symlinks.
+  // Compare it across pages of one range read: a changed digest means the file moved underneath
+  // the read, and the range starts over at zero.
+  optional string digest = 11;
+  // Continuation for the same entry.
+  optional string next = 10;
+}
+// Effective caller-code routing after Rift intersects `rift.toml` with one adapter's
+// advertised operations.
+message ExecutionAvailability {
+  // Whether execute may route to this language after workspace configuration and adapter
+  // capability are applied.
+  bool execute = 1;
+  // Whether all three debug tools may route to this language. True requires execute enablement
+  // and the complete adapter debug operation triplet.
+  bool debug = 2;
+}
+// Capabilities advertised by one configured language adapter. `execution` applies the
+// workspace configuration to its caller-code operations.
+message LanguageSupport {
+  // Language name and optional dialect handled by the adapter.
+  rift.core.Language language = 1;
+  // Implementation name and version the adapter advertises.
+  string adapter = 2;
+  // Optional operations implemented by the adapter, sorted by protocol order.
+  repeated rift.core.AdapterOperation operations = 3;
+  // Fact families the adapter may emit from Analyze, sorted by protocol order.
+  repeated rift.core.FactFamily fact_families = 4;
+  // Supported action families in kind-prefix order. Empty when `actions` is not advertised or
+  // the adapter has no action families.
+  repeated rift.core.ActionSupport action_kinds = 5;
+  // Effective workspace configuration and adapter capability for caller code.
+  ExecutionAvailability execution = 6;
+}
+// The Protobuf service exposed by the Rift server. `rift mcp` maps its JSON entry points to
+// these methods.
+service Rift {
+  // Opens one caller session and returns its writable projection. A session ID admits one live
+  // connection.
+  rpc Connect (rift.mcp.ConnectRequest) returns (stream rift.mcp.Connected);
+  // Lists retained sessions and their projection state.
+  rpc SessionList (rift.mcp.SessionListParams) returns (rift.mcp.SessionListResult);
+  // Rebinds the current connection to one retained session.
+  rpc SessionContinue (rift.mcp.SessionContinueParams) returns (rift.mcp.SessionContinueResult);
+  // Removes one inactive session and deletes its projection. A live one, the caller's own
+  // included, returns `temporarily_unavailable`.
+  rpc SessionRemove (rift.mcp.SessionRemoveParams) returns (rift.mcp.SessionRemoveResult);
+  // Reads the declaration structure of one file from its adapter.
+  rpc Outline (rift.mcp.OutlineParams) returns (rift.mcp.OutlineResult);
+  // Searches symbols, nodes, and files in the session projection.
+  rpc Search (rift.mcp.SearchParams) returns (rift.mcp.SearchResult);
+  // Finds literal, regular-expression, or structural matches.
+  rpc Match (rift.mcp.MatchParams) returns (rift.mcp.MatchResult);
+  // Evaluates code against the session projection in a disposable workspace.
+  rpc Execute (rift.mcp.ExecuteParams) returns (rift.mcp.ExecuteResult);
+  // Starts an inspect-only evaluation and retains bounded frames after a failure.
+  rpc DebugStart (rift.mcp.DebugStartParams) returns (rift.mcp.DebugSession);
+  // Reads one retained stack frame without resuming evaluation.
+  rpc DebugGetFrame (rift.mcp.DebugGetFrameParams) returns (rift.mcp.DebugGetFrameResult);
+  // Releases a debugging session, adapter state, and execution workspace.
+  rpc DebugStop (rift.mcp.DebugStopParams) returns (rift.mcp.DebugStopResult);
+  // Applies and validates an atomic edit set, and records the result in the changeset.
+  rpc Edit (rift.mcp.EditParams) returns (rift.mcp.ChangeResult);
+  // Applies a unified diff, and records the result in the changeset.
+  rpc Patch (rift.mcp.PatchParams) returns (rift.mcp.ChangeResult);
+  // Applies replacements for every match of one query. The cardinality is checked before
+  // expansion, so a pattern that matches more places than intended refuses instead of rewriting
+  // them.
+  rpc Rewrite (rift.mcp.RewriteParams) returns (rift.mcp.ChangeResult);
+  // Changes what a declaration is called and rewrites every reference that names it. The
+  // adapter checks spelling, collisions, and binding changes. A reference outside the scope
+  // refuses the whole operation.
+  rpc Rename (rift.mcp.RenameParams) returns (rift.mcp.ChangeResult);
+  // Moves a declaration or file to another container or path and updates the imports and
+  // references that reach it.
+  rpc Move (rift.mcp.MoveParams) returns (rift.mcp.ChangeResult);
+  // Removes a declaration. Without a policy this is a mechanical removal that analyses no
+  // references. With one, the adapter classifies every remaining use, applies the stated
+  // disposition, and refuses when reference coverage is incomplete.
+  rpc Delete (rift.mcp.DeleteParams) returns (rift.mcp.ChangeResult);
+  // Changes the shape of a callable and propagates it to callers, overrides, and
+  // implementations. Unlike a rename, it rewrites argument lists, so it commonly raises a
+  // `behavior_unknown` confirmation.
+  rpc ChangeSignature (rift.mcp.ChangeSignatureParams) returns (rift.mcp.ChangeResult);
+  // Resolves one action an adapter offered — a quick fix, an extraction, an inline, or an
+  // adapter-specific family. Arguments are validated against the schema the offer advertises.
+  // An offer carrying a portable argument contract is refused here and resolves through its own
+  // tool.
+  rpc Act (rift.mcp.ActParams) returns (rift.mcp.ChangeResult);
+  // Restores changed paths from the workspace and drops the changes that touched them.
+  rpc ProjectionRestore (rift.mcp.ProjectionRestoreParams) returns (rift.core.ProjectionState);
+  // Publishes the changeset into the workspace. A change carrying a confirmation is published
+  // only when the call accepts it, and a workspace path changed since the projection took it
+  // refuses the whole publication.
+  rpc Publish (rift.mcp.PublishParams) returns (rift.mcp.PublishResult);
+  rpc ReadResource (rift.mcp.ResourceReadParams) returns (rift.mcp.ResourceReadResult);
+}

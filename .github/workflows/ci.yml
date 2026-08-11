@@ -76,7 +76,11 @@ jobs:
       # so nothing else would *block* a vulnerable JS dependency from landing.
       # Baseline is clean as of the dependency upgrade PR; `--audit-level=high`
       # keeps moderates visible in the log without failing the build.
-      - run: bun audit --audit-level=high
+      # image-size (build-time transitive of fumadocs-core) has two open DoS
+      # advisories with no patched release — 2.0.2 is the newest version. The
+      # parsers never see untrusted bytes here: the build sizes this repo's own
+      # images. Drop the ignores once fumadocs picks up a fixed image-size.
+      - run: bun audit --audit-level=high --ignore=GHSA-w3rx-r6r6-pgpr --ignore=GHSA-5p2g-fcmc-qvqq
 
   rust:
     runs-on: ubuntu-latest

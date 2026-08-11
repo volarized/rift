@@ -1,0 +1,39 @@
+---
+title: Protocol
+---
+
+We've split the protocol definition into separate, logically aligned blocks:
+
+- Core model — logical entities used by both MCP and adapters
+- MCP — the tools and resources an agent calls
+- Adapter — the protocol between the Rift server and a language toolchain
+- SCIP — a read-only export for tools that consume SCIP indexes
+
+Each block is generated from the Pydantic models under `protocol/src/rift/models`, so the JSON
+Schema, the Protobuf files and the [reference](/docs/draft/protocol/reference) can't drift apart. The
+reference is authoritative for fields, enums and wire numbers; the pages here explain what the
+fields are for.
+
+## What a session does
+
+Your agent's `rift mcp` starts or finds the server for its workspace and opens `Connect`, which
+returns a session and the state of that session's projection. Everything after that reads or
+changes the projection, and `publish` is what carries the result into your files.
+
+There's no concurrency token anywhere in this. A session admits one live connection, so there's one
+MCP writer per projection, and the place where two writers can genuinely collide is the workspace —
+which `publish` checks directly by comparing the paths it's about to write.
+
+## Versioning
+
+The protocol is versioned by date, the way [MCP versions its own
+specification](https://modelcontextprotocol.io/specification/): an identifier is a release date,
+`YYYY-MM-DD`. A version is a complete snapshot of the generated contract — a peer implements
+whole versions, never parts, so there's no minor number and nothing to intersect: naming the
+version names everything the peer can decode. No version has been released yet; this draft
+tracks the contract as it is written, and the first release cuts the first dated version.
+
+`Connect` declares the versions the caller implements, in preference order, and the server
+answers each attempt independently: it accepts one of them — `Connected` names which — or rejects
+with `unsupported_protocol` whose `protocol` evidence lists the versions the server supports. The
+caller picks one it implements and reconnects, or surfaces the mismatch.

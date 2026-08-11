@@ -1,0 +1,66 @@
+---
+title: SCIP
+---
+
+Rift can export a session's semantic facts as a [SCIP](https://github.com/sourcegraph/scip) index,
+for the tools that already consume one.
+
+## Request
+
+The `Index` service rides the workspace rendezvous under `.rift` — the same socket every other
+connection uses, so a consumer finds it the way `rift mcp` does, and without a running server
+there is nothing to connect to.
+
+`Read` names a session, and the server streams that session's projection as it stands: one header,
+then documents in project-path byte order, then external symbols in byte order of their encoded
+symbol strings — the canonical `scip.Index` order, so a consumer can write the stream straight
+out. No event exceeds 4 MiB, matching stock gRPC receive limits; a document that can't fit alone
+is dropped and recorded as an omission. A session the server doesn't hold fails with `NOT_FOUND`.
+
+The read isn't isolated from anything. A `cargo build` writing into the same projection mid-stream
+can leave the index internally inconsistent, and the export won't stop it. This is a fallback
+surface for tools that can't speak MCP, and the right answer to a bad index is to read again.
+
+A projection takes one writer and any number of readers. An export attaches to a live or retained
+session as a reader: it leaves the connection slot free for the agent, reads the projection as it
+stands — dirty content included — without materializing it the way `rift://projection` does, and
+lets `session_remove` proceed. A removal mid-stream ends the stream with `ABORTED`, never `OK`,
+and the fix is the same read-again; a stream that ends `OK` carried the whole index.
+
+The header repeats the session, carries the SCIP metadata, and reports analysis coverage per
+language and fact family — so a consumer can tell an index that's missing relationships from one
+whose language genuinely has none.
+
+## Mapping
+
+Documents, occurrences, symbols, relationships, signatures and documentation map onto their SCIP
+equivalents. Paths stay workspace-relative, and `project_root` names the session projection
+directory as a file URI, so joining the two reads the exported bytes even for a dirty session.
+Ranges convert from Rift's UTF-8 byte offsets to SCIP line and character coordinates with
+`UTF8CodeUnitOffsetFromLineStart`, so the character axis stays in bytes.
+
+Some facts have nowhere to go. `Omission` records what didn't make it into the index and why — a
+populated field the pinned SCIP v0.9.0 schema has no place for, a file whose language has no
+adapter, a path SCIP's canonical form forbids — each with its count and, where one claims it, its
+language. A successful export that quietly dropped facts would be worse than one that failed.
+
+## Symbols
+
+A Rift symbol is `rift://symbol/{language}/{name}` — an adapter's stable qualified name that Rift
+treats as opaque. The export encodes it as a SCIP symbol without inventing structure it doesn't
+have:
+
+- scheme `rift`, then the package triple `. {language} .` — Rift's core model carries no package
+  identity, so manager and version take SCIP's `.` placeholder and the exact `Language` fills the
+  name slot
+- one term descriptor holding the whole qualified name, backtick-escaped when it steps outside
+  SCIP's simple-identifier characters; a `~N` disambiguator stays part of the identifier
+
+So `rift://symbol/python/frobnicate.Frobnicator.connect~2` becomes:
+
+```
+rift . python . `frobnicate.Frobnicator.connect~2`.
+```
+
+The encoding is reversible back to the `SymbolId`, and there are no locals: a Rift symbol is
+workspace-stable by contract, so every one exports as a global symbol.

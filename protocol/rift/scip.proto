@@ -1,0 +1,93 @@
+syntax = "proto3";
+// Generated from the Pydantic models under protocol/src/rift/models. Do not edit.
+// The Rift server's read-only SCIP export API.
+package rift.scip;
+import "rift/core.proto";
+import "scip/scip.proto";
+// One unit of Rift data absent from the projected index: a populated field the mapping dropped,
+// or a whole file the export could not carry.
+message Omission {
+  // Why a populated Rift value is absent from the SCIP index.
+  enum Reason {
+    // The server did not classify the omission.
+    REASON_UNSPECIFIED = 0;
+    // SCIP v0.9.0 has no field with the same meaning.
+    REASON_UNREPRESENTABLE = 1;
+    // No adapter serves the file's language, or its adapter was unavailable while the export
+    // ran.
+    REASON_NO_ANALYSIS = 2;
+    // SCIP cannot carry the path: a symbolic link, or a form the SCIP canonical-path rules
+    // forbid.
+    REASON_UNINDEXABLE_PATH = 3;
+    // The unit cannot fit one 4 MiB stream event on its own.
+    REASON_TOO_LARGE = 4;
+  }
+  // Core model and field path whose populated value was omitted, such as
+  // `Relationship.evidence`. Absent when the omission covers a whole file named by `path`.
+  optional string field = 1;
+  // Why the value has no place in the projected index.
+  rift.scip.Omission.Reason reason = 2;
+  // What was dropped, named concretely: the meaning SCIP lacks a field for, the language with
+  // no adapter, or the forbidden path form.
+  optional string detail = 3;
+  // How many populated values or files this record covers across the index.
+  uint64 count = 4;
+  // The exact `Language` whose facts were omitted. Absent when no language claims the unit, as
+  // for a path the export never analyzed.
+  rift.core.Language language = 5;
+  // The file the omission covers. Absent when `field` names the unit.
+  optional string path = 6;
+}
+// Selects a session projection to export as SCIP.
+message Request {
+  // Session whose projection is exported. The export reads the projection as it stands, dirty
+  // content included, so a write landing mid-stream can make the index inconsistent; a consumer
+  // that needs a whole one reads again.
+  string session = 2;
+}
+// Analysis coverage for one language over the whole projection.
+message LanguageCoverage {
+  // The exact `Language` the coverage is stated for.
+  rift.core.Language language = 1;
+  // The weakest per-file coverage the language's adapter reported for each fact family across
+  // the projection.
+  rift.core.SemanticCoverage coverage = 2;
+}
+// Identity and coverage emitted before index records.
+message Header {
+  // Session whose projection produced every following record.
+  string session = 2;
+  // The `metadata` of the projected `scip.Index`. `project_root` is the file URI of the session
+  // projection directory, `text_document_encoding` is UTF-8, and `tool_info` carries the name
+  // `rift` with the server build version.
+  .scip.Metadata metadata = 3;
+  // Analysis coverage per language, sorted by language name then dialect. It states what the
+  // underlying analysis established; what the SCIP mapping then dropped is in `omissions`.
+  repeated rift.scip.LanguageCoverage coverage = 4;
+  // Rift data absent from the index, sorted by language, field, path, and reason.
+  repeated rift.scip.Omission omissions = 5;
+}
+// One ordered part of a projected `scip.Index`. The server emits no event larger than 4 MiB, so
+// a consumer with stock gRPC limits can read the stream; a unit that cannot fit alone is
+// dropped and recorded as an `Omission`.
+message Event {
+  oneof value {
+    // The first event. A stream contains exactly one header.
+    rift.scip.Header header = 1;
+    // One index document in canonical path order.
+    .scip.Document document = 2;
+    // One external symbol after the final document, in byte order of the encoded SCIP symbol
+    // string.
+    .scip.SymbolInformation external_symbol = 3;
+  }
+}
+// Exports one Rift projection into the pinned SCIP schema. The service is served on the same
+// workspace rendezvous socket as the Rift server's other connections.
+service Index {
+  // Returns one header, then documents, then external symbols. The stream order is the
+  // canonical `scip.Index` order. `Read` fails with `NOT_FOUND` for a session the server does
+  // not hold and `INVALID_ARGUMENT` for a malformed `SessionId`. A session removed mid-stream
+  // terminates the stream with `ABORTED`; a stream that ends with `OK` carried the complete
+  // index.
+  rpc Read (rift.scip.Request) returns (stream rift.scip.Event);
+}

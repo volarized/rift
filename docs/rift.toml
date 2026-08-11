@@ -1,0 +1,20 @@
+#:schema ../protocol/rift.schema.json
+
+[execution]
+allow = []
+debug = []
+max_code = "16KiB"
+max_timeout = "30s"
+max_output = "8KiB"
+max_concurrent = 2
+max_debug_sessions = 2
+debug_idle_timeout = "5m"
+max_debug_frames = 64
+max_debug_bindings = 32
+max_debug_value = "1KiB"
+
+[validation]
+require = "available"
+
+[validators]
+commands = []

@@ -1,0 +1,215 @@
+---
+title: MCP
+---
+
+`rift mcp` is a thin process: it maps MCP JSON onto the local Rift service and owns one session
+connection for its lifetime. Nothing below is decided in that process; how the JSON is carried is
+all that's its own.
+
+A tool result rides `structuredContent`, typed by the tool's declared output schema, with the
+same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is such a result —
+`ChangeResult` saying refused, never `isError` — while `ErrorData` travels as the JSON-RPC error
+object's `data`, under code `-32000`.
+
+The connection is a serialized queue: `rift mcp` sends one application call at a time, in arrival
+order, so a long evaluation holds everything behind it — concurrent work wants a second session.
+MCP's cancellation notification drops a queued call outright; a running change completes or rolls
+back whole before the next call starts, the same all-or-nothing publication has.
+
+`rift mcp` completes MCP `initialize` even when the server's contract doesn't match its own. It
+declares `tools` and `resources` — without `subscribe` or `listChanged`, so the changeset is
+polled — and on a mismatch answers every call with `unsupported_protocol` and `retry:
+operator_action`, because a process that refuses to start gives the agent nothing to diagnose.
+
+## Connection
+
+`rift mcp` finds or starts the server for its workspace, mints a session id, and opens `Connect`.
+`Connected` comes back with the protocol version the server accepted from the caller's list, the
+workspace path, the session, its `ProjectionState`, and a connection id that every later call
+carries.
+
+A session takes one live connection. When your agent exits, the session and its projection stay
+put, and these tools deal with what's left behind:
+
+| Tool | What it does |
+| --- | --- |
+| `session_list` | retained sessions and the state of each projection |
+| `session_continue` | rebinds this connection to a retained session |
+| `session_remove` | discards a session and deletes its projection |
+
+`session_continue` refuses a session that already has a live connection, and refuses while the
+current session holds a retained debug session; both come back `temporarily_unavailable`, and
+`debug_stop` clears the second. It also refuses to abandon a current session that has changes of
+its own, which is `invalid_request` — picking up old work would otherwise silently throw away new
+work. The session you leave behind holds nothing, so Rift removes it.
+
+## Reads
+
+Your agent reads the projection through these tools:
+
+| Tool | Result |
+| --- | --- |
+| `outline` | declarations in one file, in source order |
+| `search` | ranked files, nodes, or symbols |
+| `match` | literal, regular-expression, or structural matches |
+
+`search` takes a lexical `query`, a `filter` over resolved adapter facts, or both — the filter is
+where adapter knowledge enters a search, so "implements this trait" and "called by that function"
+are one request rather than three.
+
+Resources carry the larger and reusable payloads:
+
+| Resource | Content |
+| --- | --- |
+| `rift://workspace{?cursor}` | projection state, per-language capabilities, limits, and validators |
+| `rift://projection` | the projection's path on disk, and the workspace it came from |
+| `rift://changes{?cursor}` | every change this session applied, with its evidence |
+| `rift://fs{/path}{?start,length,cursor}` | a directory's entries — subdirectories and files — or a bounded range of file bytes |
+| `rift://symbol/{language}/{name}{?cursor}` | one symbol, its nodes, its edges, its diagnostics |
+| `rift://actions/{address}{?only,cursor}` | the actions an adapter offers at one address |
+| `rift://action/{token}` | one action and the JSON Schema of its arguments |
+
+The split between the last two is about page size. A listing can hold many offers and each offer's
+argument schema is large, so the listing leaves the schema out and you fetch it for the one action
+you picked. An `{address}` is `symbol/{language}/{name}`, `node/{language}/{path}@{start}-{end}`,
+`match/{token}`, or `file/{path}` — the file form lists every action across one file.
+
+`rift://projection` is the one read with a side effect: it materializes a clean projection,
+because the tool you're about to point at that path may write, and those writes belong in the
+changeset rather than in your files.
+
+Paginated answers stop before `max_response_bytes` and hand back a cursor — except a file-range
+read, which continues by offset: the next request starts where the previous page ended, and the
+payload's `digest` says whether the file changed underneath the read, restarting the range at
+zero when it does. A cursor is bound to the request that minted it — same state, same order, same
+page size — and a mismatch is `cursor_invalid`: start over from the first page. The server keeps
+`max_active_cursors` captured sets per connection, evicting the least recently read; a page
+requested after eviction comes back as `cursor_expired` rather than a quietly different answer,
+so interleaving more paginations than the advertised limit is what costs you a restart.
+
+## Changes
+
+`edit`, `patch`, `rewrite`, `rename`, `move`, `delete`, `change_signature` and `act` all change the
+projection, and all return the same `ChangeResult`. A request whose shape is wrong — an absolute
+path, overlapping spans, a malformed patch header — fails as `invalid_request` before Rift
+resolves anything. Otherwise Rift resolves the whole operation before writing anything, and the
+result is one of two things.
+
+**Refused**, when resolution produced no edits. The projection is untouched and `RefusalReason` says
+what stopped it: the address hit several targets, a `rewrite` matched outside its cardinality, no
+adapter implements the operation for that language, the offer carries a portable argument contract
+and resolves through its own tool. A request whose shape was fine but whose bytes moved — patch
+context that no longer matches, a create over an existing path — refuses carrying the failed
+precondition. A `patch` whose context moved shows the shape:
+
+**Request:**
+
+```json
+{
+  "formatting": "preserve",
+  "patch": "--- a/src/config.ts\n+++ b/src/config.ts\n@@ -12,3 +12,3 @@\n export const defaults = {\n-  retries: 3,\n+  retries: 5,\n };\n"
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "refused",
+  "reason": "unmet_precondition",
+  "preconditions": [
+    {
+      "kind": "source_unchanged",
+      "status": "failed",
+      "verifier": { "kind": "rift" },
+      "addresses": [],
+      "paths": ["src/config.ts"],
+      "expected": { "kind": "text", "value": "  retries: 3," },
+      "observed": { "kind": "text", "value": "  retries: 4," },
+      "diagnostics": []
+    }
+  ],
+  "blockers": [],
+  "diagnostics": []
+}
+```
+
+**Applied**, when it produced edits. The change lands and gets an id in the changeset, along with
+its edits, its semantic effects, its guarantee evidence, its diagnostics, its validation, and its
+confirmations, where an adapter or validator wouldn't vouch for the result. Validation strength
+climbs from `mechanical` (no adapter report) through `available` (every advertising adapter
+reported) to `required` (every language the policy names reported). An unvalidated change is still
+a change you can read, run tests against, and either keep or restore.
+
+`projection_restore` refreshes selected changed paths from the workspace and drops the changes that
+touched them; naming no paths restores all of them. A change is dropped whole — naming one of its
+paths restores every path it touched, because restoring one path of a change without the others
+would leave a change record that no longer describes the tree.
+
+## Publication
+
+`publish` takes the list of change ids whose confirmations you accept, and writes nothing unless it
+can write everything:
+
+- a change carrying a confirmation you didn't accept comes back in `unaccepted`
+- a path this projection changed that the workspace changed too comes back in `conflicts`
+
+A `publish` that lost the race to a workspace edit:
+
+**Request:**
+
+```json
+{ "accept": ["chg_k2mq4vx6ntbwpj3rfd6a2zcyhe"] }
+```
+
+**Response:**
+
+```json
+{
+  "state": { "dirty": true, "unaccepted": false },
+  "conflicts": ["src/config.ts"],
+  "unaccepted": []
+}
+```
+
+Either way both trees are left as they were. Publication is serialized workspace-wide, so a
+`publish` that can't take the workspace inside the call budget fails with
+`temporarily_unavailable` and is worth sending again once the holder finishes. Reconciling a
+conflict happens where both trees
+live — on your disk: the workspace's copy sits at its real path, the projection's beside it under
+`.rift/projections`, so diff the two, re-apply what survives as an `edit`, and publish again. On
+success Rift writes every changed path, removes directories its deletions left empty — the
+workspace root excluded — refreshes the projection from the workspace, and empties the changeset.
+
+## Execution
+
+`execute` evaluates a block of code in a disposable copy of the projection, so what it writes in
+place is thrown away — the projection is the scratchpad your changes live in, and the copy keeps
+evaluated code from editing it by accident. The copy is disposal, not a sandbox: the code runs
+with your permissions. `debug_start`, `debug_get_frame` and `debug_stop` do the same for
+a failed evaluation, holding its stack frames for inspection until you stop the session or the
+idle timeout does. An edit doesn't end them — the frames pin the adapter state they failed on, and
+later changes open a new one — but a server restart does, because frames live in adapter memory.
+
+A workspace already at `max_concurrent` evaluations or `max_debug_sessions` debuggers refuses with
+`temporarily_unavailable` — nothing about the request is too big, you're waiting for a slot, and
+`debug_stop` or the idle timeout frees one.
+
+Both need `rift.toml` to allow the language and the adapter to advertise the operation. The
+`rift://workspace` resource reports what survives that intersection; a call that outruns a stale
+read of it comes back as `capability_unavailable`, and reading the resource again shows what
+changed.
+
+## Errors
+
+A refusal is a normal tool result — Rift understood you and declined. `ErrorData` is for the call
+itself failing: a request that doesn't fit the schema, an expired cursor, an adapter that isn't
+running, a limit crossed, a timeout, a storage failure.
+
+Every one carries a `retry` directive, which is the field to branch on — it rides each error
+instance rather than the code, because the same `storage_failure` can be transient once and
+permanent the next time. `never` means the same
+bytes will fail the same way. `same_request` means it was transient — an adapter still starting, a
+projection with a filesystem write in flight. `operator_action` means nothing will work until
+someone fixes the workspace, usually `rift.toml`. A `limit_exceeded` also carries which limit and
+by how much, so a request can be resized without parsing the message meant for a human.

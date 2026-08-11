@@ -1,45 +1,33 @@
-# docs
+# Documentation site
 
-This is a Next.js application generated with
-[Create Fumadocs](https://github.com/fuma-nama/fumadocs).
+This directory contains the Fumadocs site for Rift. Hand-written pages live under
+`content/docs`; reference components read the generated MCP and `rift.toml` JSON Schemas and
+Protobuf files from `../protocol`.
 
-Run development server:
+Install the JavaScript dependencies and start the development server:
 
-```bash
-npm run dev
-# or
-pnpm dev
-# or
-yarn dev
+```sh
+bun install
+bun run dev
 ```
 
-Open http://localhost:3000 with your browser to see the result.
+The site is then available at <http://localhost:3000>.
 
-## Explore
+When a Pydantic model, configuration field, or protocol description changes, regenerate the schemas
+and Protobuf files from the repository root before building the site:
 
-In the project, you can see:
+```sh
+cd protocol
+uv run python -m rift.generate
+```
 
-- `lib/source.ts`: Code for content source adapter, [`loader()`](https://fumadocs.dev/docs/headless/source-api) provides the interface to access your content.
-- `lib/layout.shared.tsx`: Shared options for layouts, optional but preferred to keep.
+Use these checks for documentation changes:
 
-| Route                     | Description                                            |
-| ------------------------- | ------------------------------------------------------ |
-| `app/(home)`              | The route group for your landing page and other pages. |
-| `app/docs`                | The documentation layout and pages.                    |
-| `app/api/search/route.ts` | The Route Handler for search.                          |
+```sh
+bun run lint
+bun run build
+```
 
-### Fumadocs MDX
-
-A `source.config.ts` config file has been included, you can customise different options like frontmatter schema.
-
-Read the [Introduction](https://fumadocs.dev/docs/mdx) for further details.
-
-## Learn More
-
-To learn more about Next.js and Fumadocs, take a look at the following
-resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js
-  features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-- [Fumadocs](https://fumadocs.vercel.app) - learn about Fumadocs
+`bun run pack` copies the static export into `dist/rift` with the deployment base path applied.
+Generated directories such as `.next`, `.source`, `out`, and `dist` aren't source files and shouldn't
+be edited directly.

@@ -1,0 +1,712 @@
+{
+  "$defs": {
+    "AdapterProcessConfig": {
+      "additionalProperties": false,
+      "description": "How Rift starts one configured adapter process.",
+      "properties": {
+        "command": {
+          "description": "Executable followed by literal arguments used to start the adapter process.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Command",
+          "type": "array"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment additions supplied to the adapter process.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "title": "Env",
+          "type": "object"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "title": "AdapterProcessConfig",
+      "type": "object"
+    },
+    "ByteSize": {
+      "description": "A non-negative byte size using binary units where a suffix is present.",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:B|KiB|MiB|GiB|TiB)$",
+      "title": "ByteSize",
+      "type": "string"
+    },
+    "CommandValidator": {
+      "additionalProperties": false,
+      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes.",
+      "properties": {
+        "id": {
+          "description": "Label shown with this validator. It is unique within `validators.commands`.",
+          "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
+          "rift:proto": {
+            "number": 1
+          },
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/CommandValidatorKind",
+          "rift:proto": {
+            "number": 2
+          }
+        },
+        "argv": {
+          "description": "Executable followed by literal arguments. An absolute executable path is refused; a bare name resolves through the `PATH` of the merged environment the command runs with, and a relative path resolves below `working_directory` in the session projection. Rift performs no shell expansion.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "rift:proto": {
+            "number": 3
+          },
+          "title": "Argv",
+          "type": "array"
+        },
+        "changed_paths": {
+          "$ref": "#/$defs/CommandValidatorChangedPaths",
+          "rift:proto": {
+            "number": 4
+          }
+        },
+        "working_directory": {
+          "$ref": "#/$defs/ProjectPath",
+          "description": "Directory below the projection root in which the process starts. The empty path selects the root.",
+          "rift:proto": {
+            "number": 5
+          }
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment values added on top of the environment the server inherited. Rift starts the command directly, without a shell, and supplies its working directory separately.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "rift:proto": {
+            "number": 6
+          },
+          "title": "Environment",
+          "type": "object"
+        },
+        "timeout_ms": {
+          "description": "Wall-clock limit before Rift terminates the process.",
+          "maximum": 3600000,
+          "minimum": 1,
+          "rift:proto": {
+            "number": 7
+          },
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "output_limit_bytes": {
+          "description": "Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the omitted size. The upper bound keeps one escaped validator result inside one bounded result.",
+          "maximum": 4096,
+          "minimum": 256,
+          "rift:proto": {
+            "number": 8
+          },
+          "title": "Output Limit Bytes",
+          "type": "integer"
+        },
+        "guarantees": {
+          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement` to the change.",
+          "items": {
+            "$ref": "#/$defs/CommandValidatorGuarantees"
+          },
+          "rift:proto": {
+            "number": 9
+          },
+          "title": "Guarantees",
+          "type": "array"
+        },
+        "determinism": {
+          "$ref": "#/$defs/CommandValidatorDeterminism",
+          "rift:proto": {
+            "number": 10
+          }
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "argv",
+        "changed_paths",
+        "working_directory",
+        "environment",
+        "timeout_ms",
+        "output_limit_bytes",
+        "guarantees",
+        "determinism"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.CommandValidator"
+      },
+      "title": "CommandValidator",
+      "type": "object"
+    },
+    "CommandValidatorChangedPaths": {
+      "description": "Whether Rift appends changed `ProjectPath` values to `argv` in byte order.",
+      "enum": [
+        "none",
+        "append"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "ChangedPaths",
+        "field": "changed_paths",
+        "number": 4,
+        "values": {
+          "append": {
+            "name": "CHANGED_PATHS_APPEND",
+            "number": 2
+          },
+          "none": {
+            "name": "CHANGED_PATHS_NONE",
+            "number": 1
+          }
+        }
+      },
+      "title": "CommandValidatorChangedPaths",
+      "type": "string"
+    },
+    "CommandValidatorDeterminism": {
+      "description": "Whether an identical tree and environment are expected to produce the same result.",
+      "enum": [
+        "deterministic",
+        "best_effort"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Determinism",
+        "field": "determinism",
+        "number": 10,
+        "values": {
+          "best_effort": {
+            "name": "DETERMINISM_BEST_EFFORT",
+            "number": 2
+          },
+          "deterministic": {
+            "name": "DETERMINISM_DETERMINISTIC",
+            "number": 1
+          }
+        }
+      },
+      "title": "CommandValidatorDeterminism",
+      "type": "string"
+    },
+    "CommandValidatorGuarantees": {
+      "additionalProperties": false,
+      "description": "What a passing run of one configured command establishes.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/GuaranteeKind",
+          "description": "Guarantee established when the validator passes.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/CoverageScope",
+          "description": "Source over which the command checks the property.",
+          "rift:proto": {
+            "number": 2
+          }
+        },
+        "detail": {
+          "description": "Exact property the command checks and limits on interpreting a pass.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "rift:proto": {
+            "number": 3
+          },
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "detail"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.CommandValidatorGuarantees"
+      },
+      "title": "CommandValidatorGuarantees",
+      "type": "object"
+    },
+    "CommandValidatorKind": {
+      "description": "How workspace configuration presents this check.",
+      "enum": [
+        "test",
+        "lint",
+        "build",
+        "other"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Kind",
+        "field": "kind",
+        "number": 2,
+        "values": {
+          "build": {
+            "name": "KIND_BUILD",
+            "number": 3
+          },
+          "lint": {
+            "name": "KIND_LINT",
+            "number": 2
+          },
+          "other": {
+            "name": "KIND_OTHER",
+            "number": 4
+          },
+          "test": {
+            "name": "KIND_TEST",
+            "number": 1
+          }
+        }
+      },
+      "title": "CommandValidatorKind",
+      "type": "string"
+    },
+    "CoverageReach": {
+      "description": "How far the claim reaches.",
+      "enum": [
+        "request",
+        "project",
+        "dependencies",
+        "all"
+      ],
+      "rift:enumDescriptions": {
+        "all": "Everything the adapter could see: the workspace, its dependencies, and the standard library.",
+        "dependencies": "Installed packages outside the workspace source.",
+        "project": "Every file in the workspace, dependencies left out.",
+        "request": "Only what this request asked for. The adapter answered the question put to it and claims nothing past it."
+      },
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "enum": "Kind",
+        "field": "kind",
+        "number": 1,
+        "values": {
+          "all": {
+            "name": "ALL",
+            "number": 4
+          },
+          "dependencies": {
+            "name": "DEPENDENCIES",
+            "number": 3
+          },
+          "project": {
+            "name": "PROJECT",
+            "number": 2
+          },
+          "request": {
+            "name": "REQUEST",
+            "number": 1
+          }
+        }
+      },
+      "title": "CoverageReach",
+      "type": "string"
+    },
+    "CoverageScope": {
+      "description": "What a completeness statement covers \u2014 everything the request asked for, one file, or a standing scope the answer holds over.",
+      "discriminator": {
+        "mapping": {
+          "reach": "#/$defs/CoverageScopeKind",
+          "unit": "#/$defs/CoverageScopeUnit"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/CoverageScopeKind"
+        },
+        {
+          "$ref": "#/$defs/CoverageScopeUnit"
+        }
+      ],
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "oneof": "variant",
+        "type": "rift.core.CoverageScope",
+        "variants": [
+          {
+            "field": "reach",
+            "number": 1,
+            "tag": "reach",
+            "type": "CoverageScopeKind"
+          },
+          {
+            "field": "unit",
+            "number": 2,
+            "tag": "unit",
+            "type": "CoverageScopeUnit"
+          }
+        ]
+      },
+      "title": "CoverageScope"
+    },
+    "CoverageScopeKind": {
+      "additionalProperties": false,
+      "description": "A standing scope identified by its name.",
+      "properties": {
+        "kind": {
+          "const": "reach",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reach": {
+          "$ref": "#/$defs/CoverageReach",
+          "rift:proto": {
+            "number": 1
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "reach"
+      ],
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "type": "rift.core.CoverageScopeKind"
+      },
+      "title": "CoverageScopeKind",
+      "type": "object"
+    },
+    "CoverageScopeUnit": {
+      "additionalProperties": false,
+      "description": "One file. The claim holds for that path and says nothing about any other.",
+      "properties": {
+        "kind": {
+          "const": "unit",
+          "title": "Kind",
+          "type": "string"
+        },
+        "unit": {
+          "$ref": "#/$defs/FileId",
+          "description": "The file the claim is about.",
+          "rift:proto": {
+            "number": 1
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "unit"
+      ],
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "type": "rift.core.CoverageScopeUnit"
+      },
+      "title": "CoverageScopeUnit",
+      "type": "object"
+    },
+    "Duration": {
+      "description": "A non-negative duration with one explicit unit.",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
+      "title": "Duration",
+      "type": "string"
+    },
+    "ExecutionConfig": {
+      "additionalProperties": false,
+      "description": "Workspace enablement and limits for caller-provided code.",
+      "properties": {
+        "allow": {
+          "description": "Exact languages enabled for execute when their adapters advertise the execute operation. Empty disables caller-provided code.",
+          "items": {
+            "$ref": "#/$defs/LanguageSelector"
+          },
+          "rift:selectsType": "Language",
+          "title": "Allow",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "debug": {
+          "description": "Subset of allow enabled for debugging when all three debug operations are advertised. Empty disables debugging.",
+          "items": {
+            "$ref": "#/$defs/LanguageSelector"
+          },
+          "rift:selectsType": "Language",
+          "title": "Debug",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "max_code": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16KiB",
+          "description": "Maximum UTF-8 bytes in one CodeBlock.source.",
+          "rift:bounds": {
+            "field": "source",
+            "model": "CodeBlock"
+          },
+          "rift:conversion": "UTF-8 byte length",
+          "rift:range": {
+            "max": "32KiB",
+            "min": "1B"
+          }
+        },
+        "max_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "Wall-clock bound applied to each execution and debugging evaluation.",
+          "rift:bounds": {
+            "field": "timeout_ms",
+            "model": "ExecutionBudget"
+          },
+          "rift:conversion": "Duration.milliseconds",
+          "rift:range": {
+            "max": "1d",
+            "min": "1ms"
+          }
+        },
+        "max_output": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "8KiB",
+          "description": "Captured prefix bound applied separately to stdout and stderr.",
+          "rift:bounds": {
+            "field": "output_bytes",
+            "model": "ExecutionBudget"
+          },
+          "rift:conversion": "ByteSize.bytes",
+          "rift:range": {
+            "max": "16KiB",
+            "min": "0B"
+          }
+        },
+        "max_concurrent": {
+          "default": 2,
+          "description": "Evaluations admitted concurrently across the workspace.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Max Concurrent",
+          "type": "integer"
+        },
+        "max_debug_sessions": {
+          "default": 2,
+          "description": "Retained debugging sessions admitted across the workspace.",
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Max Debug Sessions",
+          "type": "integer"
+        },
+        "debug_idle_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "5m",
+          "description": "Idle time before Rift stops a debugging session and releases its lease.",
+          "rift:range": {
+            "max": "1d",
+            "min": "1ms"
+          }
+        },
+        "max_debug_frames": {
+          "default": 64,
+          "description": "Stack frames one failed debugging evaluation may retain.",
+          "maximum": 256,
+          "minimum": 1,
+          "rift:bounds": {
+            "field": "frames",
+            "model": "DebugBudget"
+          },
+          "title": "Max Debug Frames",
+          "type": "integer"
+        },
+        "max_debug_bindings": {
+          "default": 32,
+          "description": "Arguments plus locals returned for one debug frame.",
+          "maximum": 128,
+          "minimum": 1,
+          "rift:bounds": {
+            "field": "bindings_per_frame",
+            "model": "DebugBudget"
+          },
+          "title": "Max Debug Bindings",
+          "type": "integer"
+        },
+        "max_debug_value": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1KiB",
+          "description": "Captured UTF-8 bytes in each adapter-rendered debug binding value.",
+          "rift:bounds": {
+            "field": "value_bytes",
+            "model": "DebugBudget"
+          },
+          "rift:conversion": "ByteSize.bytes",
+          "rift:range": {
+            "max": "8KiB",
+            "min": "0B"
+          }
+        }
+      },
+      "title": "ExecutionConfig",
+      "type": "object"
+    },
+    "FileId": {
+      "description": "Identity of one file in the session projection. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+      "examples": [
+        "rift://file/pkg/util.py",
+        "rift://file/src/%E2%98%83.ts",
+        "rift://file/src/config.ts"
+      ],
+      "maxLength": 8192,
+      "minLength": 13,
+      "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "package": "rift.core",
+        "scalar": "string"
+      },
+      "title": "FileId",
+      "type": "string"
+    },
+    "GuaranteeKind": {
+      "description": "A property an action claims and must establish with scoped evidence when resolved.",
+      "enum": [
+        "syntax_validated",
+        "bindings_preserved",
+        "references_updated",
+        "behavior_checked"
+      ],
+      "rift:enumDescriptions": {
+        "behavior_checked": "A named static analysis or command validator checked a stated behavioral property. The evidence is limited to that named property and scope.",
+        "bindings_preserved": "Unchanged references in scope resolve to the same symbols before and after the action.",
+        "references_updated": "Every resolved reference in scope that should follow the operation now reaches its intended target.",
+        "syntax_validated": "The language parser accepts the affected source under the stated scope."
+      },
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "enum": "GuaranteeKind",
+        "type": "rift.core.GuaranteeKind",
+        "values": {
+          "behavior_checked": {
+            "name": "GUARANTEE_KIND_BEHAVIOR_CHECKED",
+            "number": 4
+          },
+          "bindings_preserved": {
+            "name": "GUARANTEE_KIND_BINDINGS_PRESERVED",
+            "number": 2
+          },
+          "references_updated": {
+            "name": "GUARANTEE_KIND_REFERENCES_UPDATED",
+            "number": 3
+          },
+          "syntax_validated": {
+            "name": "GUARANTEE_KIND_SYNTAX_VALIDATED",
+            "number": 1
+          }
+        }
+      },
+      "title": "GuaranteeKind",
+      "type": "string"
+    },
+    "LanguageSelector": {
+      "description": "The TOML spelling of the same exact language pair represented by ``core.Language``.",
+      "pattern": "^[a-z][a-z0-9._-]{0,63}(?::[a-z][a-z0-9._-]{0,63})?$",
+      "title": "LanguageSelector",
+      "type": "string"
+    },
+    "ProjectPath": {
+      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC \u2014 Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments, and\n`.` or `..` segments are refused before the filesystem is touched. The limit is 1000 UTF-8\nbytes, not characters. A workspace holding two entries whose NFC forms are equal fails the\nread that touches them with `content_unavailable`.",
+      "examples": [
+        "",
+        "src/config.ts",
+        "packages/api/Cargo.toml"
+      ],
+      "maxLength": 1000,
+      "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "package": "rift.core",
+        "scalar": "string"
+      },
+      "title": "ProjectPath",
+      "type": "string"
+    },
+    "ValidationConfig": {
+      "additionalProperties": false,
+      "description": "Adapter validation reports required for projection changes and publication.",
+      "properties": {
+        "require": {
+          "anyOf": [
+            {
+              "enum": [
+                "available",
+                "none"
+              ],
+              "type": "string"
+            },
+            {
+              "items": {
+                "$ref": "#/$defs/LanguageSelector"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          ],
+          "default": "available",
+          "description": "`available` requires every affected adapter that advertises validation; `none` requires no adapter reports; an explicit list requires those exact core.Language pairs.",
+          "rift:selectsType": "Language",
+          "title": "Require"
+        }
+      },
+      "title": "ValidationConfig",
+      "type": "object"
+    },
+    "ValidatorsConfig": {
+      "additionalProperties": false,
+      "description": "Workspace command checks run in the projection each time a change applies.",
+      "properties": {
+        "commands": {
+          "description": "Exact command declarations, in execution order.",
+          "items": {
+            "$ref": "#/$defs/CommandValidator"
+          },
+          "title": "Commands",
+          "type": "array"
+        }
+      },
+      "title": "ValidatorsConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The typed rift.toml file. Configuration reuses protocol enums and paths, and carries machine-checked links to the fields it bounds.",
+  "properties": {
+    "execution": {
+      "$ref": "#/$defs/ExecutionConfig"
+    },
+    "validation": {
+      "$ref": "#/$defs/ValidationConfig"
+    },
+    "validators": {
+      "$ref": "#/$defs/ValidatorsConfig"
+    },
+    "adapters": {
+      "additionalProperties": {
+        "$ref": "#/$defs/AdapterProcessConfig"
+      },
+      "description": "Configured adapter processes keyed by workspace-local process name. Each process answers Describe with its exact core.Language and adapter capabilities.",
+      "propertyNames": {
+        "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+      },
+      "rift:describesAs": "Capabilities",
+      "title": "Adapters",
+      "type": "object"
+    }
+  },
+  "title": "Rift workspace configuration",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volar.sh/rift/protocol/rift.schema.json"
+}
