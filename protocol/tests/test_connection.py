@@ -20,9 +20,7 @@ def state(*, dirty: bool = False, unaccepted: bool = False) -> core.ProjectionSt
 
 
 class ConnectionContractTests(TestCase):
-    @staticmethod
-    def contract() -> mcp.Contract:
-        return mcp.Contract(major=1, minor=0, schema_digest="0" * 64)
+
 
     def test_connect_is_the_control_stream(self) -> None:
         connect = RIFT_SERVICE.rpcs[0]
@@ -33,7 +31,7 @@ class ConnectionContractTests(TestCase):
 
     def test_mcp_connection_owns_one_projection(self) -> None:
         request = mcp.ConnectRequest(
-            contracts=[self.contract()],
+            protocol_versions=["2026-08-04"],
             features=[],
             role="mcp",
             session=SESSION,
@@ -41,7 +39,7 @@ class ConnectionContractTests(TestCase):
             client_build="test",
         )
         connected = mcp.Connected(
-            contract=self.contract(),
+            protocol_version="2026-08-04",
             features=[],
             workspace="/workspace",
             session=SESSION,
@@ -54,14 +52,14 @@ class ConnectionContractTests(TestCase):
 
     def test_scip_connection_has_no_session(self) -> None:
         request = mcp.ConnectRequest(
-            contracts=[self.contract()],
+            protocol_versions=["2026-08-04"],
             features=[],
             role="scip",
             canonical_root="/workspace",
             client_build="test",
         )
         connected = mcp.Connected(
-            contract=self.contract(),
+            protocol_version="2026-08-04",
             features=[],
             workspace="/workspace",
             connection=CONNECTION,
@@ -70,13 +68,12 @@ class ConnectionContractTests(TestCase):
         self.assertIsNone(request.session)
         self.assertIsNone(connected.state)
 
-    def test_contract_carries_a_checkable_minor(self) -> None:
-        older = mcp.Contract(major=1, minor=2, schema_digest="0" * 64)
-        newer = mcp.Contract(major=1, minor=7, schema_digest="1" * 64)
+    def test_protocol_version_is_one_dated_snapshot(self) -> None:
+        core.ProtocolVersion.model_validate("2026-08-04")
 
-        self.assertEqual(older.major.root, newer.major.root)
-        self.assertLess(older.minor, newer.minor)
-        self.assertNotEqual(older.schema_digest.root, newer.schema_digest.root)
+        for bad in ("v1.2", "2026-8-4", "1", ""):
+            with self.assertRaises(ValidationError):
+                core.ProtocolVersion.model_validate(bad)
 
 
 class ProjectionContractTests(TestCase):
@@ -187,7 +184,7 @@ class ProjectionContractTests(TestCase):
 
 class ChangesetContractTests(TestCase):
     def test_refusal_reasons_all_mean_no_edits_were_produced(self) -> None:
-        reasons = {reason.value for reason in mcp.RefusalReason}
+        reasons = {reason.value for reason in core.RefusalReason}
 
         self.assertNotIn("confirmation_required", reasons)
         self.assertNotIn("validation_incomplete", reasons)

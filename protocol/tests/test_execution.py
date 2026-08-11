@@ -25,7 +25,7 @@ class ExecutionContractTests(TestCase):
             action_kinds=[],
             extension_values=[],
             limits=adapter.AdapterLimits(
-                max_message_bytes=65_536,
+                max_message_bytes=4_194_304,
                 max_in_flight=4,
                 max_in_flight_per_state=1,
                 max_states=4,
@@ -34,13 +34,7 @@ class ExecutionContractTests(TestCase):
                 executes_workspace_code=True,
                 spawns_subprocesses=True,
             ),
-            contracts=[
-                adapter.AdapterContract(
-                    major=1,
-                    minor=0,
-                    schema_digest="0" * 64,
-                )
-            ],
+            protocol_versions=["2026-08-04"],
         )
 
     def test_default_configuration_admits_no_execution(self) -> None:
@@ -123,15 +117,15 @@ class ExecutionContractTests(TestCase):
             {
                 "allow": ["python"],
                 "debug": ["python"],
-                "max-code": "4KiB",
-                "max-timeout": "2s",
-                "max-output": "1KiB",
-                "max-concurrent": 3,
-                "max-debug-sessions": 2,
-                "debug-idle-timeout": "30s",
-                "max-debug-frames": 8,
-                "max-debug-bindings": 12,
-                "max-debug-value": "256B",
+                "max_code": "4KiB",
+                "max_timeout": "2s",
+                "max_output": "1KiB",
+                "max_concurrent": 3,
+                "max_debug_sessions": 2,
+                "debug_idle_timeout": "30s",
+                "max_debug_frames": 8,
+                "max_debug_bindings": 12,
+                "max_debug_value": "256B",
             }
         )
 
@@ -152,15 +146,19 @@ class ExecutionContractTests(TestCase):
             execution.advertised_limits(),
             mcp.ExecutionLimits(
                 max_code_bytes=4_096,
-                max_timeout_ms=2_000,
-                max_output_bytes=1_024,
+                budget=core.ExecutionBudget(timeout_ms=2_000, output_bytes=1_024),
                 max_concurrent=3,
                 debug=mcp.DebugLimits(
                     max_sessions=2,
                     idle_timeout_ms=30_000,
-                    max_frames=8,
-                    max_bindings_per_frame=12,
-                    max_value_bytes=256,
+                    budget=core.DebugBudget(
+                        execution=core.ExecutionBudget(
+                            timeout_ms=2_000, output_bytes=1_024
+                        ),
+                        frames=8,
+                        bindings_per_frame=12,
+                        value_bytes=256,
+                    ),
                 ),
             ),
         )
