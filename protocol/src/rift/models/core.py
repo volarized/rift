@@ -31,9 +31,7 @@ def validate_base64url(value: str) -> None:
 class ProtocolVersion(ProtocolRoot):
     """One protocol version, named by its release date as `YYYY-MM-DD`. A version is a
     complete snapshot of the generated contract, so a peer implements whole versions, never
-    parts, and there is no minor number. The workspace rendezvous under `.rift` advertises
-    the server's supported versions before the caller opens the version-independent server
-    socket."""
+    parts, and there is no minor number."""
 
 
 @scalar(

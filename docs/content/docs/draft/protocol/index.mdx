@@ -36,6 +36,4 @@ tracks the contract as it is written, and the first release cuts the first dated
 `Connect` declares the versions the caller implements, in preference order, and the server
 answers each attempt independently: it accepts one of them — `Connected` names which — or rejects
 with `unsupported_protocol` whose `protocol` evidence lists the versions the server supports. The
-caller picks one it implements and reconnects, or surfaces the mismatch. The rendezvous under
-`.rift` advertises the server's supported versions, so a caller can check before opening the
-socket.
+caller picks one it implements and reconnects, or surfaces the mismatch.

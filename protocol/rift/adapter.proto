@@ -60,7 +60,7 @@ message Capabilities {
   rift.adapter.AdapterLimits limits = 12;
   // Execution behavior this adapter declares, for the operator's information.
   rift.adapter.RuntimeRequirements runtime = 13;
-  // Versions the adapter implements, in preference order.
+  // Versions the adapter implements, at least one, in preference order.
   repeated string protocol_versions = 14;
 }
 // A deterministic claim on physical files, re-evaluated after every path or

@@ -720,8 +720,8 @@ message ErrorCause {
 message ProtocolEvidence {
   // Versions the server implements, newest first.
   repeated string supported = 1;
-  // The version the caller declared, echoed back.
-  string requested = 2;
+  // The versions the caller declared, echoed back in the order received.
+  repeated string requested = 2;
 }
 // The `data` object on every Rift MCP failure. `code` and `retry` are what a caller branches
 // on, `message` is for a human, and the remaining fields carry the evidence available for that

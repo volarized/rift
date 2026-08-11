@@ -39,8 +39,8 @@ has to be complete:
 - the syntax and symbol kinds it emits, and the portable facets each one carries
 - the optional RPCs it implements and the fact families `Analyze` can produce
 - the action families it can offer, its limits, and what its runtime does to the host
-- the generated contracts it speaks, in preference order, and any versioned extension values it
-  emits
+- the protocol versions it implements, at least one, in preference order, and any versioned
+  extension values it emits
 
 The kinds matter more than they look. A filter can only negate on a facet somebody advertised, so
 an adapter that never declares `test` makes "not a test" unanswerable for its language.
@@ -54,9 +54,9 @@ Write claims are how build output stays out of analysis. An adapter naming `targ
 could write the same path is a workspace admission error, because one of them has to redirect that
 output into its private `state_root` instead.
 
-`Describe` and its response stay decodable across protocol revisions, so a contract mismatch
+`Describe` and its response stay decodable across protocol versions, so a contract mismatch
 surfaces as a clean workspace-admission failure rather than a decode error — the selection itself
-happens at `Open`, which pins one revision from the advertised list.
+happens at `Open`, which pins one version from the advertised list.
 
 Capabilities are fixed for the process's life; changing them means a new process. A process that
 dies takes its states with it: the server re-runs `Describe` on the replacement, reopens states

@@ -95,7 +95,7 @@ class Capabilities(ProtoModel):
     protocol_versions: Field[list[core.ProtocolVersion]] = proto_field(
         default=...,
         number=14,
-        description="Versions the adapter implements, in preference order.",
+        description="Versions the adapter implements, at least one, in preference order.",
     )
 
     @model_validator(mode="after")

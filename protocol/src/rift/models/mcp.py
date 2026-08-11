@@ -1871,8 +1871,9 @@ class ProtocolEvidence(ClosedModel):
         number=1,
         json_schema_extra={"uniqueItems": True},
     )
-    requested: Field[core.ProtocolVersion] = proto_field(
-        description="The version the caller declared, echoed back.",
+    requested: Field[list[core.ProtocolVersion]] = proto_field(
+        description="The versions the caller declared, echoed back in the order received.",
+        min_length=1,
         number=2,
     )
 

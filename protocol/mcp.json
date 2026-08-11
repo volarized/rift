@@ -8660,11 +8660,16 @@
           "uniqueItems": true
         },
         "requested": {
-          "$ref": "#/$defs/ProtocolVersion",
-          "description": "The version the caller declared, echoed back.",
+          "description": "The versions the caller declared, echoed back in the order received.",
+          "items": {
+            "$ref": "#/$defs/ProtocolVersion"
+          },
+          "minItems": 1,
           "rift:proto": {
             "number": 2
-          }
+          },
+          "title": "Requested",
+          "type": "array"
         }
       },
       "required": [
@@ -8679,7 +8684,7 @@
       "type": "object"
     },
     "ProtocolVersion": {
-      "description": "One protocol version, named by its release date as `YYYY-MM-DD`. A version is a\ncomplete snapshot of the generated contract, so a peer implements whole versions, never\nparts, and there is no minor number. The workspace rendezvous under `.rift` advertises\nthe server's supported versions before the caller opens the version-independent server\nsocket.",
+      "description": "One protocol version, named by its release date as `YYYY-MM-DD`. A version is a\ncomplete snapshot of the generated contract, so a peer implements whole versions, never\nparts, and there is no minor number.",
       "examples": [
         "2026-08-04"
       ],

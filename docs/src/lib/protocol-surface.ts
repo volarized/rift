@@ -141,37 +141,12 @@ function build(version: DocVersion): Surface {
     return { name, title, summary, tools };
   });
 
-  // Resource URI templates live as consts inside `ResourceTemplate`'s union, one
-  // branch per resource, tagged by the same `name` the seam uses.
-  function uriTemplateFor(resource: string): string | undefined {
-    for (const branch of defs.ResourceTemplate?.oneOf ?? []) {
-      const resolved = shape(branch);
-      if (!resolved) continue;
-      const properties = Object.fromEntries(props(resolved));
-      if (properties.name?.const === resource) {
-        const template = properties.uriTemplate?.const;
-        return typeof template === "string" ? template : undefined;
-      }
-    }
-    return undefined;
-  }
-
   const mcpResources: ResourceEntry[] = seam("mcp", "mcp.resources").map(([name, member]) => {
     const uri = role(member, "uri");
     const link = role(member, "link");
     if (!uri || !link) throw new Error(`resource \`${name}\` is missing a uri or link type`);
-    const uriTemplate = uriTemplateFor(name);
-    if (!uriTemplate) throw new Error(`resource \`${name}\` is missing a ResourceTemplate branch`);
-    return { name, description: member.description, uriTemplate, uri, link };
+    return { name, description: member.description, uri, link };
   });
-
-  function branchNames(name: string): string[] {
-    return (defs[name]?.oneOf ?? []).flatMap((branch) => {
-      const resolved = shape(branch);
-      const value = resolved ? Object.fromEntries(props(resolved)).name?.const : undefined;
-      return typeof value === "string" ? [value] : [];
-    });
-  }
 
   function assertSameFamilies(label: string, actual: string[]): void {
     const expected = mcpResources.map((resource) => resource.name).sort();
@@ -183,8 +158,12 @@ function build(version: DocVersion): Surface {
     }
   }
 
-  assertSameFamilies("ResourceTemplate", branchNames("ResourceTemplate"));
-  assertSameFamilies("ResourceLink", branchNames("ResourceLink"));
+  // `ResourceFamily` is the enum every template, link, and payload keys on, so
+  // the seam and the enum have to agree exactly.
+  const familyValues = (defs.ResourceFamily?.enum ?? []).filter(
+    (value): value is string => typeof value === "string",
+  );
+  assertSameFamilies("ResourceFamily", familyValues);
 
   const workspaceProperties = Object.fromEntries(props(defs.WorkspaceResourcePayload));
   const advertisedResources =
@@ -193,17 +172,16 @@ function build(version: DocVersion): Surface {
     ) ?? [];
   assertSameFamilies("WorkspaceResourcePayload.resources", advertisedResources);
 
-  const readContents = Object.fromEntries(props(defs.ResourceReadResult)).contents;
-  const readItems = shape(readContents?.items);
-  const readFamilies = (readItems?.oneOf ?? []).flatMap((branch) => {
-    const resolved = shape(branch);
-    if (!resolved) return [];
-    const mime = Object.fromEntries(props(resolved)).mimeType?.const;
-    const match =
-      typeof mime === "string" ? /^application\/vnd\.rift\.([a-z_]+)\+json$/.exec(mime) : null;
+  // Per-family payloads are declared by `ResourceContent`'s content-type map:
+  // `application/vnd.rift.<family>+json` names the definition a read returns.
+  const contentTypes = (
+    defs.ResourceContent as Schema & { "rift:contentTypes"?: Record<string, string> }
+  )["rift:contentTypes"];
+  const readFamilies = Object.keys(contentTypes ?? {}).flatMap((mime) => {
+    const match = /^application\/vnd\.rift\.([a-z_]+)\+json$/.exec(mime);
     return match ? [match[1]] : [];
   });
-  assertSameFamilies("ResourceReadResult", readFamilies);
+  assertSameFamilies("ResourceContent content types", readFamilies);
 
   // -------------------------------------------------------------------------
   // The reference, grouped by axis and nested by reference
