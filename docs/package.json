@@ -9,6 +9,7 @@
     "dev": "next dev --turbo",
     "start": "next start",
     "logo": "node scripts/logo.mjs",
+    "og": "node scripts/og.mjs",
     "format": "biome format --write .",
     "lint": "biome lint .",
     "check": "biome check --write .",
