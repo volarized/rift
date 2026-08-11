@@ -1,20 +1,44 @@
 from __future__ import annotations
 
+import base64
+from urllib.parse import parse_qs, quote, unquote_to_bytes
+
 from pydantic import field_validator, model_validator
 
 from . import core
 from .base import *
 
 
+def _raw_resource_query(uri: str) -> dict[str, str]:
+    query = uri.partition("?")[2]
+    if not query:
+        return {}
+    values: dict[str, str] = {}
+    for item in query.split("&"):
+        key, separator, value = item.partition("=")
+        if not separator or key in values:
+            raise ValueError("resource query must contain unique key/value pairs")
+        values[key] = value
+    return values
+
+
 @scalar(
     owner=MCP,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
+    pattern=r"^[A-Za-z0-9_-]+$",
     min_length=1,
     max_length=4096,
 )
 class Cursor(ProtocolRoot):
-    """An opaque string that continues a paginated answer from where the last page ended. It binds the request, state, order, and page size. A mismatch returns `cursor_invalid`."""
+    """An opaque base64url string that continues a paginated answer from where the last page
+    ended. It binds the request, state, order, and page size. Padding is omitted. A mismatch
+    returns `cursor_invalid`."""
+
+    @model_validator(mode="after")
+    def value_is_canonical_base64url(self) -> Cursor:
+        core.validate_base64url(self.root)
+        return self
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -68,7 +92,9 @@ class TreeParams(ClosedModel):
         number=5,
     )
     rev: Field[core.Revision | None] = proto_field(
-        default=None, description="Revision whose tree is listed.", number=6
+        default=None,
+        description="Revision whose tree is listed. Omission selects the current session state.",
+        number=6,
     )
 
 
@@ -76,7 +102,7 @@ class TreeParams(ClosedModel):
 class TreeResult(ClosedModel):
     "One page of a project tree, ordered by project-path UTF-8 bytes. A directory precedes a file at the same path, though a valid snapshot normally contains only one."
 
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description="Snapshot whose paths were listed.", number=1
     )
     entries: Field[list[core.ProjectEntry]] = proto_field(
@@ -149,7 +175,7 @@ class OutlineParams(ClosedModel):
     )
     rev: Field[core.Revision | None] = proto_field(
         default=None,
-        description="Revision whose file and semantic facts are read.",
+        description="Revision whose file and semantic facts are read. Omission selects the current session state.",
         number=6,
     )
 
@@ -183,7 +209,7 @@ class OutlineItem(ClosedModel):
 class OutlineResult(ClosedModel):
     """One page of a file outline with explicit semantic coverage."""
 
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description="Snapshot from which the file and semantic facts were read.",
         number=1,
     )
@@ -226,7 +252,7 @@ class OutlineResult(ClosedModel):
     },
 )
 class SearchParamsTarget(str, Enum):
-    "Which entity kinds may be returned. Type data is attached to the Symbol and Node views that bind it, and filters can search those attachments."
+    "Which entity kinds may be returned. Type data is attached to the Symbol and Node records that bind it, and filters can search those attachments."
 
     SYMBOL = "symbol"
     NODE = "node"
@@ -286,7 +312,7 @@ class SearchParams(ClosedModel):
     target: Field[SearchParamsTarget] = proto_field(
         description=(
             "Which entity kinds may be returned. Type data is attached to the Symbol and Node "
-            "views that bind it, and filters can search those attachments."
+            "records that bind it, and filters can search those attachments."
         ),
         number=1,
         json_schema_extra={
@@ -360,7 +386,7 @@ class SearchParams(ClosedModel):
     )
     rev: Field[core.Revision | None] = proto_field(
         default=None,
-        description="Which revision to answer against. Absent, the default branch at its latest commit.",
+        description="Which revision to answer against. Omission selects the current session state.",
         number=9,
     )
 
@@ -522,6 +548,26 @@ class FileResourceLink(ClosedModel):
     )
 
 
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class FsResourceLink(ClosedModel):
+    """A link to the live filesystem-projection inventory."""
+
+    type: Field[Literal["resource_link"]] = proto_field(
+        description="MCP's tag for a link to a resource inside tool output."
+    )
+    uri: Field[FsResourceUri] = proto_field(
+        description="Filesystem inventory page to read.", number=1
+    )
+    name: Field[Literal["fs"]] = proto_field(
+        description="The resource family this link belongs to.", number=2
+    )
+    mimeType: Field[Literal["application/vnd.rift.fs+json"]] = proto_field(
+        description="What a read returns: `FsResourcePayload` as JSON.",
+        number=3,
+        proto_name="mime_type",
+    )
+
+
 @union(
     owner=MCP,
     oneof="variant",
@@ -533,6 +579,7 @@ class FileResourceLink(ClosedModel):
         Variant("file", "file", 4, FileResourceLink),
         Variant("actions", "actions", 5, ActionsResourceLink),
         Variant("action", "action", 6, ActionResourceLink),
+        Variant("fs", "fs", 7, FsResourceLink),
     ),
 )
 class ResourceLink(ProtocolRoot):
@@ -547,10 +594,10 @@ class SymbolResourcePayload(ClosedModel):
         description="The symbol this payload answers for, echoed back so a link and its content carry the same address.",
         number=1,
     )
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description=(
-            "The snapshot this answer was resolved against. Pass it back as `rev` when a "
-            "later call has to agree with this one."
+            "The snapshot this answer resolved against. Select its id with a tagged snapshot "
+            "revision while that tree remains pinned."
         ),
         number=2,
     )
@@ -607,16 +654,16 @@ class SymbolResourcePayload(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class DiffResourcePayload(ClosedModel):
-    "One page of a comparison. `from` and `to` record the resolved revisions. Git answers without an adapter, so the comparison works for every file."
+    "One page of a store-tree comparison. `from` and `to` record the resolved revisions. No adapter is needed, so the comparison works for every file."
 
     uri: Field[core.DiffId] = proto_field(
         description="The comparison this payload answers for, echoed back with the cursor that produced this page.",
         number=1,
     )
-    from_: Field[core.Snapshot] = proto_field(
+    from_: Field[core.ResolvedSnapshot] = proto_field(
         alias="from", description="The old side, as it resolved.", number=2
     )
-    to: Field[core.Snapshot] = proto_field(
+    to: Field[core.ResolvedSnapshot] = proto_field(
         description="The new side, as it resolved.", number=3
     )
     files: Field[list[core.FileChange]] = proto_field(
@@ -629,6 +676,113 @@ class DiffResourcePayload(ClosedModel):
     next: Field[core.DiffId | None] = proto_field(
         description="The same comparison carrying the cursor for the next page, or null on the last one.",
         number=6,
+    )
+
+
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.enum(
+        "ProjectionKind",
+        (
+            EnumValue("session", "PROJECTION_KIND_SESSION", 1),
+            EnumValue("read", "PROJECTION_KIND_READ", 2),
+        ),
+        named=True,
+    ),
+    schema_extra={
+        "rift:enumDescriptions": {
+            "session": "Persistent writable source state owned by one session.",
+            "read": "Explicitly opened immutable snapshot for external read-only tools.",
+        }
+    },
+)
+class ProjectionKind(str, Enum):
+    """Lifecycle and write policy of one filesystem projection."""
+
+    SESSION = "session"
+    READ = "read"
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class FilesystemProjectionSummary(ClosedModel):
+    """One externally addressable session or explicitly opened read projection."""
+
+    location: Field[ProjectionLocation] = proto_field(
+        description="Mounted identity and absolute path.", number=1
+    )
+    kind: Field[ProjectionKind] = proto_field(
+        description="Lifecycle and write policy.", number=2
+    )
+    snapshot: Field[core.Snapshot] = proto_field(
+        description="Exact source tree currently rendered.", number=3
+    )
+    state: Field[core.ProjectionState | None] = proto_field(
+        default=None,
+        description="Mutable session state, or null for immutable and disposable projections.",
+        number=4,
+    )
+    writable: Field[bool] = proto_field(
+        description="Whether ordinary filesystem writes are accepted.", number=5
+    )
+    scratch_bytes: Field[int] = proto_field(
+        description="Bytes in its non-source scratch layer, excluding shared adapter state.",
+        ge=0,
+        le=9007199254740991,
+        number=6,
+    )
+    open_handles: Field[int] = proto_field(
+        description="Open file and directory handles currently pinning this projection.",
+        ge=0,
+        le=4294967295,
+        number=7,
+        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
+    )
+    available: Field[bool] = proto_field(
+        description="Whether the frontend currently accepts new opens and coherent reads.",
+        number=8,
+    )
+    degradation: Field[list[core.Diagnostic]] = proto_field(
+        description="Frontend invalidation or notification failures while unavailable.",
+        number=9,
+    )
+
+    @model_validator(mode="after")
+    def state_matches_location(self) -> FilesystemProjectionSummary:
+        if self.kind is ProjectionKind.SESSION:
+            if self.state is None or not self.writable:
+                raise ValueError("session projections require writable current state")
+            if self.state.projection != self.location.projection:
+                raise ValueError(
+                    "projection location and state must name the same projection"
+                )
+            if self.state.snapshot != self.snapshot.id:
+                raise ValueError(
+                    "projection state and snapshot must name the same tree"
+                )
+        elif self.state is not None or self.writable:
+            raise ValueError(
+                "read projections are immutable and have no ProjectionState"
+            )
+        if self.available == bool(self.degradation):
+            raise ValueError("degradation must be non-empty exactly while unavailable")
+        return self
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class FsResourcePayload(ClosedModel):
+    """One page of a connection-scoped captured Rift filesystem inventory. The first page
+    captures externally addressable projections in identity order; its cursor reads that same
+    capture and grants no close authority."""
+
+    uri: Field[FsResourceUri] = proto_field(
+        description="Resource page that produced this payload.", number=1
+    )
+    projections: Field[list[FilesystemProjectionSummary]] = proto_field(
+        description="Live projections in identity order.", number=2
+    )
+    next: Field[FsResourceUri | None] = proto_field(
+        description="Next captured page, or null after the final projection.", number=3
     )
 
 
@@ -674,10 +828,72 @@ class WorkspacePath(ProtocolRoot):
     public=False,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
+    min_length=1,
+    max_length=32768,
+    examples=[
+        "/home/alice/projects/rift/.rift/projections/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "C:\\Users\\alice\\projects\\rift\\.rift\\projections\\prj_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ],
+)
+class ProjectionPath(ProtocolRoot):
+    """Canonical absolute path of one mounted Rift filesystem projection on this host."""
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ProjectionLocation(ClosedModel):
+    """One mounted Rift filesystem projection, with its store identity and host path."""
+
+    projection: Field[core.Projection] = proto_field(
+        description="Stable projection identity accepted by a namespaced `Revision` selector.",
+        number=1,
+    )
+    path: Field[ProjectionPath] = proto_field(
+        description="Canonical absolute path through which ordinary filesystem tools reach it.",
+        number=2,
+    )
+
+
+@scalar(
+    owner=MCP,
+    public=False,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    min_length=1,
+    max_length=32768,
+    examples=[
+        "/home/alice/projects/rift/.rift/recovery/rec_aaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+)
+class GitWorktreePath(ProtocolRoot):
+    """Canonical absolute path of an exceptional conventional Git recovery worktree."""
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class GitWorktreeLocation(ClosedModel):
+    """Conventional Git worktree created only for unresolved integration recovery."""
+
+    path: Field[GitWorktreePath] = proto_field(
+        description="Canonical absolute path accepted by `git -C`.", number=1
+    )
+    ref: Field[str] = proto_field(
+        description="Private `refs/rift/recovery/<RecoveryId>` ref associated with this path.",
+        min_length=1,
+        max_length=1024,
+        number=2,
+    )
+
+
+@scalar(
+    owner=MCP,
+    public=False,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
     pattern=r"^ses_[a-z2-7]{26}$",
 )
 class SessionId(ProtocolRoot):
-    """Client-generated random 128-bit identity of one Git session ref and its optional materialized worktree."""
+    """Random 128-bit identity generated and retained in memory by one `rift mcp` process. It
+    names one persistent filesystem projection. The server admits at most one live MCP
+    connection for the identity."""
 
 
 @scalar(
@@ -716,7 +932,7 @@ class FeatureId(ProtocolRoot):
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "mcp": "An MCP bridge that creates or attaches a durable session.",
+            "mcp": "An MCP bridge that creates a session and may reconnect to it while the process lives.",
             "scip": "A read-only SCIP projection client with no session.",
         }
     },
@@ -769,8 +985,9 @@ class ConnectRequest(ClosedModel):
     session: Field[SessionId | None] = proto_field(
         default=None,
         description=(
-            "Client-generated Git session ref to create or attach. Required for an MCP role "
-            "and null for a SCIP role."
+            "Process-generated persistent session to create or reconnect to. Required for an MCP "
+            "role and null for a SCIP role. A live connection already using it makes Connect "
+            "temporarily unavailable."
         ),
         number=4,
     )
@@ -787,13 +1004,23 @@ class ConnectRequest(ClosedModel):
         max_length=256,
         number=6,
     )
+    initial_revision: Field[core.GitRevision | None] = proto_field(
+        default=None,
+        description=(
+            "Git revision imported as the base of a newly created MCP session. Omission uses "
+            "`session.base` configuration. Reconnection and SCIP roles require null."
+        ),
+        number=7,
+    )
 
     @model_validator(mode="after")
     def role_has_valid_session_fields(self) -> ConnectRequest:
         if self.role == ConnectRole.MCP and self.session is None:
-            raise ValueError("MCP connections require a client-generated session")
+            raise ValueError("MCP connections require a process-generated session")
         if self.role == ConnectRole.SCIP and self.session is not None:
             raise ValueError("SCIP connections cannot carry a session")
+        if self.role == ConnectRole.SCIP and self.initial_revision is not None:
+            raise ValueError("SCIP connections cannot create a session base")
         return self
 
 
@@ -815,20 +1042,24 @@ class ConnectRequest(ClosedModel):
                 },
                 "then": {
                     "properties": {
-                        "session_head": {"type": "null"},
-                        "worktree": {"type": "null"},
+                        "projection": {"type": "null"},
+                        "state": {"type": "null"},
                     }
                 },
                 "else": {
-                    "properties": {"session_head": {"not": {"type": "null"}}},
-                    "required": ["session_head"],
+                    "properties": {
+                        "projection": {"not": {"type": "null"}},
+                        "state": {"not": {"type": "null"}},
+                    },
+                    "required": ["projection", "state"],
                 },
             }
         ]
     },
 )
 class Connected(ClosedModel):
-    """The first event on an accepted control stream, including the session ref state for an MCP role."""
+    """The first response on an accepted control stream, including persistent projection state
+    for an MCP role."""
 
     contract: Field[Contract] = proto_field(
         description="Exact generated contract selected for this connection.", number=1
@@ -843,20 +1074,18 @@ class Connected(ClosedModel):
     )
     session: Field[SessionId | None] = proto_field(
         default=None,
-        description="Created or attached Git session ref for an MCP role; null for a SCIP role.",
+        description="Created or reconnected session for an MCP role; null for a SCIP role.",
         number=4,
     )
-    session_head: Field[core.Commit | None] = proto_field(
+    projection: Field[ProjectionLocation | None] = proto_field(
         default=None,
-        description="Commit held by the session ref; null for a SCIP role.",
-        number=5,
-    )
-    worktree: Field[core.Worktree | None] = proto_field(
-        default=None,
-        description=(
-            "Registered session worktree, or null until the first change operation materializes it."
-        ),
+        description="Mounted persistent session projection, or null for a SCIP role.",
         number=6,
+    )
+    state: Field[core.ProjectionState | None] = proto_field(
+        default=None,
+        description="Exact current projection state, or null for a SCIP role.",
+        number=8,
     )
     connection: Field[ConnectionId] = proto_field(
         description="Identity required in metadata on every later RPC.", number=7
@@ -865,44 +1094,230 @@ class Connected(ClosedModel):
     @model_validator(mode="after")
     def session_state_is_correlated(self) -> Connected:
         if self.session is None:
-            if self.session_head is not None or self.worktree is not None:
+            if self.projection is not None or self.state is not None:
                 raise ValueError("SCIP connections cannot carry session state")
-        elif self.session_head is None:
-            raise ValueError("MCP connections require the session ref head")
+        elif self.projection is None or self.state is None:
+            raise ValueError("MCP connections require the session projection and state")
+        elif self.state.projection != self.projection.projection:
+            raise ValueError(
+                "projection location and state must name the same projection"
+            )
         return self
 
 
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ToolsChanged(ClosedModel):
-    """Signals that adapter or policy changes altered the MCP tool manifest."""
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class SessionSummary(ClosedModel):
+    """One retained store-backed session that an MCP connection may continue or remove."""
 
-    generation: Field[int] = proto_field(
-        description="Monotonic server-process generation for the new manifest.",
-        ge=1,
-        le=18446744073709551615,
+    session: Field[SessionId] = proto_field(
+        description="Persistent session identity.",
         number=1,
-        proto_type=ProtoFieldDescriptor.TYPE_UINT64,
+    )
+    projection: Field[ProjectionLocation] = proto_field(
+        description="Mounted persistent filesystem projection owned by this session.",
+        number=3,
+    )
+    state: Field[core.ProjectionState] = proto_field(
+        description="Exact current source state and concurrency token of the projection.",
+        number=5,
+    )
+    active: Field[bool] = proto_field(
+        description="Whether one live MCP connection currently owns this session.",
+        number=4,
+    )
+
+    @model_validator(mode="after")
+    def projection_is_correlated(self) -> SessionSummary:
+        if self.state.projection != self.projection.projection:
+            raise ValueError(
+                "projection location and state must name the same projection"
+            )
+        return self
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class SessionListParams(ClosedModel):
+    """Selects one page from a captured list of retained sessions in session-ID order."""
+
+    limit: Field[int] = proto_field(
+        default=100,
+        description="Most retained sessions to return on this page.",
+        ge=1,
+        le=1000,
+        number=1,
+    )
+    cursor: Field[Cursor | None] = proto_field(
+        default=None,
+        description=(
+            "Continues a captured session list with the same page size. The cursor expires when "
+            "the server can no longer retain that list."
+        ),
+        number=2,
     )
 
 
-@union(
-    owner=MCP,
-    public=False,
-    oneof="event",
-    variants=(
-        Variant(None, "connected", 1, Connected),
-        Variant(None, "tools_changed", 2, ToolsChanged),
-    ),
-)
-class ConnectionEvent(ProtocolRoot):
-    """One event on the connection control stream. `connected` appears first and once; later
-    events report live capability changes."""
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class SessionListResult(ClosedModel):
+    """One page of retained sessions."""
+
+    sessions: Field[list[SessionSummary]] = proto_field(
+        description="Retained sessions on this page, sorted by session ID.", number=1
+    )
+    next_cursor: Field[Cursor | None] = proto_field(
+        description="Cursor for the next page, or null after the final session.",
+        number=2,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class SessionContinueParams(ClosedModel):
+    """Selects a retained session for the current MCP connection to continue. The current initial
+    session must have its original clean projection and no retained debugging session. The
+    retained session must have no live connection. A changed initial session returns
+    `invalid_request`; an active session or retained debugger returns `temporarily_unavailable`."""
+
+    session: Field[SessionId] = proto_field(
+        description="Retained session to continue.", number=1
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class SessionContinueResult(ClosedModel):
+    """The active retained session now bound to the current MCP connection. The MCP process
+    replaces its in-memory session ID with this identity before it sends another call."""
+
+    session: Field[SessionSummary] = proto_field(
+        description="Session state after the connection attached.", number=1
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class SessionRemoveParams(ClosedModel):
+    """Previews or confirms removal of one retained session at an exact projection state. A
+    session with a live connection returns `temporarily_unavailable`. A changed projection fails
+    with `projection_head_moved`, so confirmation cannot discard writes the preview did not observe."""
+
+    session: Field[SessionId] = proto_field(
+        description="Retained session to inspect or remove.", number=1
+    )
+    expected: Field[core.ProjectionState] = proto_field(
+        description="Projection state observed by the caller. Its head token prevents ABA races.",
+        number=2,
+    )
+    confirm: Field[bool] = proto_field(
+        default=False,
+        description="False previews the removal. True applies the same plan when the head still matches.",
+        number=3,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class SessionRemoveResult(ClosedModel):
+    """The projection affected by a session-removal preview or confirmation."""
+
+    session: Field[SessionId] = proto_field(
+        description="Session the result describes.", number=1
+    )
+    state: Field[core.ProjectionState] = proto_field(
+        description="Exact projection state checked by this preview or confirmation.",
+        number=2,
+    )
+    projection: Field[ProjectionLocation] = proto_field(
+        description="Projection unmounted and removed by confirmation, or selected by preview.",
+        number=3,
+    )
+    scratch_bytes: Field[int] = proto_field(
+        description=(
+            "Estimated disposable scratch bytes for preview, or actual bytes deleted after "
+            "confirmation verified no handles and withdrew the namespace."
+        ),
+        ge=0,
+        le=9007199254740991,
+        number=4,
+    )
+    removed: Field[bool] = proto_field(
+        description="True after confirmation removed the projection; false for a preview.",
+        number=5,
+    )
+    unintegrated: Field[bool] = proto_field(
+        description="Whether current source differs from the projection's retained Git base.",
+        number=6,
+    )
+    reclaimable_bytes: Field[int] = proto_field(
+        description="Estimated store bytes made collectible after removal and final pin release.",
+        ge=0,
+        le=9007199254740991,
+        number=7,
+    )
+
+    @model_validator(mode="after")
+    def projection_is_correlated(self) -> SessionRemoveResult:
+        if self.state.projection != self.projection.projection:
+            raise ValueError(
+                "projection location and state must name the same projection"
+            )
+        if self.unintegrated != self.state.dirty:
+            raise ValueError("unintegrated must equal the projection dirty state")
+        return self
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ProjectionOpenParams(ClosedModel):
+    """Opens an immutable snapshot as a mounted read projection for external tools. The
+    projection is owned by this connection and remains pinned until `projection_close` or
+    connection cleanup."""
+
+    at: Field[core.Revision] = proto_field(
+        description="Git commit, retained snapshot, or current projection state to resolve once.",
+        number=1,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ProjectionOpenResult(ClosedModel):
+    """New read-only filesystem projection and the exact snapshot it pins."""
+
+    location: Field[ProjectionLocation] = proto_field(
+        description="Mounted path available to ordinary filesystem tools.", number=1
+    )
+    snapshot: Field[core.Snapshot] = proto_field(
+        description="Exact immutable source tree rendered at that path.", number=2
+    )
+    imported_from: Field[core.GitCommit | None] = proto_field(
+        default=None,
+        description="Exact peeled commit when `at` used a Git revision, otherwise null.",
+        number=3,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ProjectionCloseParams(ClosedModel):
+    """Releases one explicit read projection. Session and internal projections cannot be closed
+    through this operation, and another connection cannot close the caller's projection."""
+
+    projection: Field[core.Projection] = proto_field(
+        description="Read projection returned by `projection_open`.", number=1
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ProjectionCloseResult(ClosedModel):
+    """Confirmation that the read namespace no longer accepts opens. Existing handles retain
+    only their inode version or captured directory enumeration; the final projection pin is
+    released after they close."""
+
+    projection: Field[core.Projection] = proto_field(
+        description="Projection that was closed.", number=1
+    )
+    closed: Field[Literal[True]] = proto_field(
+        description="The projection no longer accepts new opens.", number=2
+    )
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class DebugLimits(ClosedModel):
-    """Workspace policy ceilings for retained debugging sessions. Null at
-    `ExecutionLimits.debug` means policy disables debugging."""
+    """Workspace ceilings for retained debugging sessions. Null at
+    `ExecutionLimits.debug` means `rift.toml` disables debugging."""
 
     max_sessions: Field[int] = proto_field(
         description="Debugging sessions retained across all connections in this workspace.",
@@ -941,8 +1356,8 @@ class DebugLimits(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ExecutionLimits(ClosedModel):
-    """Workspace policy ceilings for caller-provided code. Null at `Limits.execution` means
-    policy disables execution, regardless of adapter capability."""
+    """Workspace ceilings for caller-provided code. Null at `Limits.execution` means
+    `rift.toml` disables execution, regardless of adapter capability."""
 
     max_code_bytes: Field[int] = proto_field(
         description="UTF-8 bytes accepted in one CodeBlock.source.",
@@ -969,14 +1384,14 @@ class ExecutionLimits(ClosedModel):
         number=4,
     )
     debug: Field[DebugLimits | None] = proto_field(
-        description="Debugging ceilings, or null when debugging policy is disabled.",
+        description="Debugging ceilings, or null when debugging is disabled in `rift.toml`.",
         number=5,
     )
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class Limits(ClosedModel):
-    "The ceilings this server enforces on MCP requests and responses. They come from host policy at launch, so two workspaces running the same Rift can differ. A request over one of them, or a response that would be, fails with `limit_exceeded` carrying `LimitEvidence`."
+    "The ceilings this server enforces on MCP requests and responses. Rift chooses its internal bounds, while `rift.toml` supplies the caller-code limits. A request or response that crosses one fails with `limit_exceeded` carrying `LimitEvidence`."
 
     max_request_bytes: Field[int] = proto_field(
         description=(
@@ -1001,9 +1416,8 @@ class Limits(ClosedModel):
         description=(
             "Largest RFC 8785 JSON encoding of one indivisible item in a paginated answer, "
             "such as one Change, Edit, diagnostic, or validator result. Resolution fails with "
-            "`limit_exceeded` before committing a change when one item exceeds this value. "
-            "Host policy sets it at or below 49152 bytes, leaving page space for identity and "
-            "cursors."
+            "`limit_exceeded` before publishing a change when one item exceeds this value. "
+            "Rift keeps it at or below 49152 bytes, leaving page space for identity and cursors."
         ),
         ge=1024,
         le=49152,
@@ -1053,7 +1467,7 @@ class Limits(ClosedModel):
     max_validators: Field[int] = proto_field(
         description=(
             "How many repository-declared command checks may run before one integration. "
-            "Zero when repository or user policy admits none."
+            "Zero when `rift.toml` declares none."
         ),
         ge=0,
         le=4294967295,
@@ -1067,10 +1481,22 @@ class Limits(ClosedModel):
     )
     execution: Field[ExecutionLimits | None] = proto_field(
         description=(
-            "Caller-code execution ceilings. Null means host policy disables execute and all "
+            "Caller-code execution ceilings. Null means `rift.toml` disables execute and all "
             "debug tools; adapter capability alone never enables them."
         ),
         number=11,
+    )
+    max_store_bytes: Field[int] = proto_field(
+        description="Workspace ceiling for authoritative source, scratch, pins, and integration intents.",
+        ge=1048576,
+        le=9007199254740991,
+        number=12,
+    )
+    max_store_entries: Field[int] = proto_field(
+        description="Workspace ceiling for source, scratch, pin, and intent records.",
+        ge=1024,
+        le=9007199254740991,
+        number=13,
     )
 
 
@@ -1078,95 +1504,85 @@ class Limits(ClosedModel):
     owner=MCP,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^rift://repository(\?(rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(&cursor=[^&#]+)?|cursor=[^&#]+))?$",
+    pattern=r"^rift://repository(\?(rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26})(&cursor=[A-Za-z0-9_-]{1,4096})?|cursor=[A-Za-z0-9_-]{1,4096}))?$",
+    max_length=8192,
 )
 class RepositoryResourceUri(ProtocolRoot):
-    """Paginated workspace metadata and capabilities at one revision."""
+    """Paginated workspace metadata and capabilities alongside one resolved source state. An
+    omitted `rev` selects the current session state."""
+
+    @model_validator(mode="after")
+    def query_is_canonical(self) -> RepositoryResourceUri:
+        query = _raw_resource_query(self.root)
+        revision = query.get("rev")
+        if revision is not None:
+            core.validate_resource_revision(revision)
+        cursor = query.get("cursor")
+        if cursor is not None:
+            Cursor.model_validate(cursor)
+        return self
 
 
 @scalar(
     owner=MCP,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(?:\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256}(?:&start=[0-9]+&length=[1-9][0-9]*)?|\?start=[0-9]+&length=[1-9][0-9]*)?$",
+    pattern=r"^rift://fs(?:\?cursor=[A-Za-z0-9_-]{1,4096})?$",
+    max_length=4113,
+)
+class FsResourceUri(ProtocolRoot):
+    """URI for one page of filesystem projections currently exposed below
+    `.rift/projections`. It reports live namespaces, not past projection states."""
+
+    @model_validator(mode="after")
+    def cursor_is_canonical(self) -> FsResourceUri:
+        cursor = _raw_resource_query(self.root).get("cursor")
+        if cursor is not None:
+            Cursor.model_validate(cursor)
+        return self
+
+
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(?:\?rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26})(?:&start=[0-9]+&length=[1-9][0-9]*)?|\?start=[0-9]+&length=[1-9][0-9]*)?$",
     min_length=13,
-    max_length=1200,
+    max_length=8192,
 )
 class FileResourceUri(ProtocolRoot):
-    """URI for one file content range. `start` and `length` are byte coordinates and appear together. Their absence starts at byte zero with the server's advertised chunk bound."""
+    """URI for one file content range. An omitted `rev` selects the current session state.
+    `start` and `length` are byte coordinates and appear together. Their absence starts at byte
+    zero with the server's advertised chunk bound."""
 
-
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.enum(
-        "Tools",
-        (
-            EnumValue("tree", "TOOLS_TREE", 1),
-            EnumValue("outline", "TOOLS_OUTLINE", 2),
-            EnumValue("search", "TOOLS_SEARCH", 3),
-            EnumValue("match", "TOOLS_MATCH", 4),
-            EnumValue("edit", "TOOLS_EDIT", 5),
-            EnumValue("patch", "TOOLS_PATCH", 6),
-            EnumValue("rewrite", "TOOLS_REWRITE", 7),
-            EnumValue("revert", "TOOLS_REVERT", 8),
-            EnumValue("merge", "TOOLS_MERGE", 9),
-            EnumValue("rename", "TOOLS_RENAME", 10),
-            EnumValue("move", "TOOLS_MOVE", 11),
-            EnumValue("delete", "TOOLS_DELETE", 12),
-            EnumValue("change_signature", "TOOLS_CHANGE_SIGNATURE", 13),
-            EnumValue("act", "TOOLS_ACT", 14),
-            EnumValue("integrate", "TOOLS_INTEGRATE", 15),
-            EnumValue("execute", "TOOLS_EXECUTE", 16),
-            EnumValue("debug_start", "TOOLS_DEBUG_START", 17),
-            EnumValue("debug_get_frame", "TOOLS_DEBUG_GET_FRAME", 18),
-            EnumValue("debug_stop", "TOOLS_DEBUG_STOP", 19),
-        ),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "tree": "Snapshot-pinned project tree listing over every file, without an adapter.",
-            "outline": "Adapter-owned declaration structure and diagnostics for one file.",
-            "search": "Ranked lookup of symbols, nodes and files.",
-            "match": "Literal, regular-expression and structural matching, with a key per hit.",
-            "edit": "Commits concrete edits to the session ref.",
-            "patch": "Commits a unified diff to the session ref.",
-            "rewrite": "Commits replacements for every accepted match of one query.",
-            "revert": "Commits the three-way inverse of one commit.",
-            "merge": "Runs Git's merge operation in the session worktree.",
-            "rename": "Changes what a declaration is called and rewrites its references.",
-            "move": "Moves a declaration or file and updates imports and references.",
-            "delete": "Removes a declaration, mechanically or with a reference-aware policy.",
-            "change_signature": "Changes a callable's shape and propagates it to callers and overrides.",
-            "act": "Resolves one discovered adapter action that has no portable contract.",
-            "integrate": "Merges the session head into a local branch and reports Git conflicts.",
-            "execute": "Evaluates a code block in one adapter's revision-specific project runtime.",
-            "debug_start": "Starts an inspect-only debugging evaluation.",
-            "debug_get_frame": "Reads one retained stack frame from a debugging session.",
-            "debug_stop": "Releases a debugging session and its execution workspace.",
-        }
-    },
-)
-class RepositoryResourcePayloadToolsItemTools(str, Enum):
-    TREE = "tree"
-    OUTLINE = "outline"
-    SEARCH = "search"
-    MATCH = "match"
-    EDIT = "edit"
-    PATCH = "patch"
-    REWRITE = "rewrite"
-    REVERT = "revert"
-    MERGE = "merge"
-    RENAME = "rename"
-    MOVE = "move"
-    DELETE = "delete"
-    CHANGE_SIGNATURE = "change_signature"
-    ACT = "act"
-    INTEGRATE = "integrate"
-    EXECUTE = "execute"
-    DEBUG_START = "debug_start"
-    DEBUG_GET_FRAME = "debug_get_frame"
-    DEBUG_STOP = "debug_stop"
+    @model_validator(mode="after")
+    def range_is_bounded(self) -> FileResourceUri:
+        encoded_path = self.root.removeprefix("rift://file/").partition("?")[0]
+        decoded_path = unquote_to_bytes(encoded_path).decode("utf-8")
+        core.ProjectPath.model_validate(decoded_path)
+        canonical = quote(decoded_path, safe="/!$&'()*+,;=:@-._~")
+        if canonical != encoded_path:
+            raise ValueError("file path must use canonical URI encoding")
+        raw_query = _raw_resource_query(self.root)
+        revision = raw_query.get("rev")
+        if revision is not None:
+            core.validate_resource_revision(revision)
+        query = self.root.partition("?")[2]
+        if not query:
+            return self
+        values = parse_qs(query, keep_blank_values=True, strict_parsing=True)
+        if "start" in values:
+            if values["start"][0] != str(int(values["start"][0])):
+                raise ValueError("file range start must use canonical decimal")
+            if values["length"][0] != str(int(values["length"][0])):
+                raise ValueError("file range length must use canonical decimal")
+            start = int(values["start"][0])
+            length = int(values["length"][0])
+            if start > 9007199254740991 or length > 9007199254740991:
+                raise ValueError("file range exceeds exact protocol integers")
+            if start + length > 9007199254740991:
+                raise ValueError("file range end exceeds exact protocol integers")
+        return self
 
 
 @definition(
@@ -1181,16 +1597,18 @@ class RepositoryResourcePayloadToolsItemTools(str, Enum):
             EnumValue("file", "RESOURCES_FILE", 4),
             EnumValue("actions", "RESOURCES_ACTIONS", 5),
             EnumValue("action", "RESOURCES_ACTION", 6),
+            EnumValue("fs", "RESOURCES_FS", 7),
         ),
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "repository": "Workspace capabilities, resolved state, request limits, and cache policy.",
+            "repository": "Workspace capabilities, resolved state, and request limits.",
             "symbol": "One symbol, its nodes, its edges and its diagnostics.",
             "diff": "What changed between two revisions.",
             "file": "One file's tree entry and its bytes.",
             "actions": "The fixes and refactors an adapter offers at one address, or across one file.",
             "action": "One discovered action, with the schema of the arguments it takes.",
+            "fs": "Mounted filesystem projections and their current source state.",
         }
     },
 )
@@ -1201,6 +1619,7 @@ class RepositoryResourcePayloadResourcesItemResources(str, Enum):
     FILE = "file"
     ACTIONS = "actions"
     ACTION = "action"
+    FS = "fs"
 
 
 @definition(
@@ -1222,7 +1641,7 @@ class RepositoryResourcePayloadResourcesItemResources(str, Enum):
     },
 )
 class RepositoryResourcePayloadObjectFormat(str, Enum):
-    "Git object hash used by this repository. It determines whether a `Commit` contains 40 or 64 hexadecimal characters."
+    "Git object hash used by this repository. It determines whether a `GitCommit` contains 40 or 64 hexadecimal characters."
 
     SHA1 = "sha1"
     SHA256 = "sha256"
@@ -1230,16 +1649,17 @@ class RepositoryResourcePayloadObjectFormat(str, Enum):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class RepositoryResourcePayload(ClosedModel):
-    "Capability manifest for one repository workspace, including configured languages, adapter support, resolved state, and request limits."
+    """Current repository state and request limits. Each configured language reports its
+    adapter support and effective caller-code availability."""
 
     uri: Field[RepositoryResourceUri] = proto_field(
         description="The URI this payload answers for, echoed back with the revision and cursor it resolved.",
         number=1,
     )
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description=(
-            "The snapshot this answer was resolved against. Pass it back as `rev` when a "
-            "later call has to agree with this one."
+            "The snapshot this answer was resolved against. Use a `Revision` with kind "
+            "`snapshot` and this id when a later call must select the same retained tree."
         ),
         number=2,
     )
@@ -1264,16 +1684,6 @@ class RepositoryResourcePayload(ClosedModel):
         ),
         number=6,
     )
-    tools: Field[list[RepositoryResourcePayloadToolsItemTools]] = proto_field(
-        description=(
-            "The MCP tools this workspace serves. A tool the profile or host policy does not "
-            "reach is absent from this list and from `tools/list`. Execute appears when at "
-            "least one LanguageSupport.execution.execute is true; the debug triplet appears "
-            "together when at least one LanguageSupport.execution.debug is true."
-        ),
-        number=7,
-        json_schema_extra={"uniqueItems": True},
-    )
     resources: Field[list[RepositoryResourcePayloadResourcesItemResources]] = (
         proto_field(
             description="The MCP resource families this workspace serves.",
@@ -1288,7 +1698,7 @@ class RepositoryResourcePayload(ClosedModel):
     object_format: Field[RepositoryResourcePayloadObjectFormat] = proto_field(
         description=(
             "Which hash git uses for object IDs in this repository. It decides how long a "
-            "`Commit` is, so a client that validates one has to read this first."
+            "`GitCommit` is, so a client that validates one has to read this first."
         ),
         number=10,
         json_schema_extra={
@@ -1301,18 +1711,8 @@ class RepositoryResourcePayload(ClosedModel):
     matching: Field[MatchSyntax] = proto_field(
         description="The pattern grammars the `match` tool accepts here.", number=11
     )
-    profile: Field[ConformanceProfile] = proto_field(
-        description=(
-            "The tier this workspace passes on this host. `edit` gates session changes and "
-            "integration; `full` also gates command validators and caller-code execution."
-        ),
-        number=12,
-    )
     validators: Field[list[CommandValidator]] = proto_field(
-        description=(
-            "Repository-declared integration checks admitted by current user policy, in "
-            "execution order. Empty when none are effective."
-        ),
+        description="Integration checks declared by the workspace-root `rift.toml`, in execution order.",
         number=13,
     )
 
@@ -1321,10 +1721,10 @@ class RepositoryResourcePayload(ClosedModel):
 class SearchResult(ClosedModel):
     "One page of search hits, and what the page is worth. `coverage` is what makes an empty page readable: nothing matched, or Rift could not see far enough to know."
 
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description=(
-            "The snapshot this answer was resolved against. Pass it back as `rev` when a "
-            "later call has to agree with this one."
+            "The snapshot this answer resolved against. Select its id with a tagged snapshot "
+            "revision while that tree remains pinned."
         ),
         number=1,
     )
@@ -1365,16 +1765,44 @@ class ActionOffer(ClosedModel):
     owner=MCP,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^rift://actions/(?:symbol|node|match|file)/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}(\?(?:only|rev|cursor)=[^&#]+(&(?:only|rev|cursor)=[^&#]+){0,2})?$",
+    pattern=r"^rift://actions/(?:symbol|node|match|file)/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}(?:\?only=[a-z][a-z0-9_.-]*(?:&rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26}))?(?:&cursor=[A-Za-z0-9_-]{1,4096})?|\?rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26})(?:&cursor=[A-Za-z0-9_-]{1,4096})?|\?cursor=[A-Za-z0-9_-]{1,4096})?$",
     min_length=22,
-    max_length=8448,
+    max_length=32768,
     examples=[
         "rift://actions/file/src/api.rs?only=quickfix",
         "rift://actions/symbol/python/pkg.util.load_config",
     ],
 )
 class ActionsResourceUri(ProtocolRoot):
-    """URI for the actions an adapter offers at one place. The path after `rift://actions/` is the address: `symbol/<language>/<name>`, `node/<language>/<path>@<start>-<end>`, `match/<token>`, or `file/<path>` for every offer in one file. A file address is what asks for the fixes across a file whose diagnostics an agent is working through. `?only=` keeps one kind prefix, `?rev=` selects the revision, and `?cursor=` continues the page."""
+    """URI for the actions an adapter offers at one place. The path after `rift://actions/` is the address: `symbol/<language>/<name>`, `node/<language>/<path>@<start>-<end>`, `match/<token>`, or `file/<path>` for every offer in one file. A file address is what asks for the fixes across a file whose diagnostics an agent is working through. `?only=` keeps one kind prefix, `?rev=` selects the revision, and `?cursor=` continues the page. An omitted `rev` selects the current session state."""
+
+    @model_validator(mode="after")
+    def address_is_well_formed(self) -> ActionsResourceUri:
+        address = self.root.removeprefix("rift://actions/").partition("?")[0]
+        kind, separator, body = address.partition("/")
+        if not separator:
+            raise ValueError("actions URI requires an address kind")
+        if kind == "node":
+            core.NodeId.model_validate(f"rift://node/{body}")
+        elif kind == "file":
+            core.FileId.model_validate(f"rift://file/{body}")
+        elif kind == "symbol":
+            core.SymbolId.model_validate(f"rift://symbol/{body}")
+        elif kind == "match":
+            core.MatchId.model_validate(f"rift://match/{body}")
+        else:
+            raise ValueError("unknown actions address kind")
+        query = _raw_resource_query(self.root)
+        revision = query.get("rev")
+        if revision is not None:
+            core.validate_resource_revision(revision)
+        cursor = query.get("cursor")
+        if cursor is not None:
+            Cursor.model_validate(cursor)
+        only = query.get("only")
+        if only is not None:
+            core.ActionKind.model_validate(only)
+        return self
 
 
 @scalar(
@@ -1389,6 +1817,11 @@ class ActionsResourceUri(ProtocolRoot):
 class ActionResourceUri(ProtocolRoot):
     """URI for one discovered action. It is the `ActionOfferId` a listing returned, and reading it returns the same offer with the JSON Schema of the arguments the action takes."""
 
+    @model_validator(mode="after")
+    def identity_is_canonical(self) -> ActionResourceUri:
+        core.ActionOfferId.model_validate(self.root)
+        return self
+
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ActionsResourcePayload(ClosedModel):
@@ -1398,10 +1831,10 @@ class ActionsResourcePayload(ClosedModel):
         description="The address this page answers for, echoed back as it resolved.",
         number=1,
     )
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description=(
-            "The snapshot this answer was resolved against. Pass it back as `rev` when a "
-            "later call has to agree with this one."
+            "The snapshot this answer resolved against. Select its id with a tagged snapshot "
+            "revision while that tree remains pinned."
         ),
         number=2,
     )
@@ -1430,7 +1863,7 @@ class ActionResourcePayload(ClosedModel):
         description="The offer this payload answers for, echoed back as it resolved.",
         number=1,
     )
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description="The snapshot this offer was discovered in.", number=2
     )
     language: Field[core.Language] = proto_field(
@@ -1457,7 +1890,7 @@ class ExecuteParams(ClosedModel):
     )
     rev: Field[core.Revision | None] = proto_field(
         default=None,
-        description="Revision whose project source and runtime configuration provide context.",
+        description="Revision whose project source and runtime files provide context. Omission selects the current session state. Rift configuration remains the physical workspace root's `rift.toml`.",
         number=3,
     )
 
@@ -1467,7 +1900,7 @@ class ExecuteResult(ClosedModel):
     """Bounded result of one execution. Writes made by evaluated code are absent because its
     execution workspace is discarded."""
 
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description="Exact snapshot used to prepare the execution workspace.", number=1
     )
     language: Field[core.Language] = proto_field(
@@ -1501,7 +1934,7 @@ class DebugSession(ClosedModel):
         description="Server-minted public handle. The adapter-local DebugSessionKey never crosses MCP.",
         number=1,
     )
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description="Snapshot retained by the session's execution workspace.", number=2
     )
     language: Field[core.Language] = proto_field(
@@ -1543,7 +1976,7 @@ class DebugStartParams(ClosedModel):
     block: Field[core.CodeBlock] = proto_field(number=2)
     rev: Field[core.Revision | None] = proto_field(
         default=None,
-        description="Revision whose project source and runtime configuration provide context.",
+        description="Revision whose project source and runtime files provide context. Omission selects the current session state. Rift configuration remains the physical workspace root's `rift.toml`.",
         number=3,
     )
 
@@ -1674,7 +2107,7 @@ class MatchParams(ClosedModel):
     )
     rev: Field[core.Revision | None] = proto_field(
         default=None,
-        description="Which revision to answer against. Absent, the default branch at its latest commit.",
+        description="Which revision to answer against. Omission selects the current session state.",
         number=4,
     )
 
@@ -1683,10 +2116,10 @@ class MatchParams(ClosedModel):
 class MatchResult(ClosedModel):
     "One page of matches and the state they were found in. Matches sort by file bytes, range, and canonical key. Rift checks the key against `at` before applying an addressed edit."
 
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description=(
-            "The snapshot this answer was resolved against. Pass it back as `rev` when a "
-            "later call has to agree with this one."
+            "The snapshot this answer resolved against. Select its id with a tagged snapshot "
+            "revision while that tree remains pinned."
         ),
         number=1,
     )
@@ -1752,7 +2185,7 @@ class DiagnosticContext(ClosedModel):
             }
         },
     )
-    at: Field[core.Snapshot] = proto_field(
+    at: Field[core.ResolvedSnapshot] = proto_field(
         description="The state this answer was resolved against.", number=2
     )
     diagnostic: Field[core.Diagnostic] = proto_field(
@@ -1802,7 +2235,7 @@ class DiagnosticContext(ClosedModel):
             EnumValue("cancelled", "ERROR_CODE_CANCELLED", 11),
             EnumValue("deadline_exceeded", "ERROR_CODE_DEADLINE_EXCEEDED", 12),
             EnumValue("limit_exceeded", "ERROR_CODE_LIMIT_EXCEEDED", 13),
-            EnumValue("worktree_busy", "ERROR_CODE_WORKTREE_BUSY", 14),
+            EnumValue("projection_busy", "ERROR_CODE_PROJECTION_BUSY", 14),
             EnumValue("adapter_unavailable", "ERROR_CODE_ADAPTER_UNAVAILABLE", 15),
             EnumValue(
                 "adapter_protocol_error", "ERROR_CODE_ADAPTER_PROTOCOL_ERROR", 16
@@ -1823,6 +2256,29 @@ class DiagnosticContext(ClosedModel):
                 "ERROR_CODE_TEMPORARILY_UNAVAILABLE",
                 24,
             ),
+            EnumValue(
+                "configuration_invalid",
+                "ERROR_CODE_CONFIGURATION_INVALID",
+                25,
+            ),
+            EnumValue("projection_head_moved", "ERROR_CODE_PROJECTION_HEAD_MOVED", 26),
+            EnumValue(
+                "capability_unavailable",
+                "ERROR_CODE_CAPABILITY_UNAVAILABLE",
+                27,
+            ),
+            EnumValue(
+                "git_revision_not_found",
+                "ERROR_CODE_GIT_REVISION_NOT_FOUND",
+                28,
+            ),
+            EnumValue("projection_not_found", "ERROR_CODE_PROJECTION_NOT_FOUND", 29),
+            EnumValue(
+                "projection_unavailable",
+                "ERROR_CODE_PROJECTION_UNAVAILABLE",
+                30,
+            ),
+            EnumValue("recovery_moved", "ERROR_CODE_RECOVERY_MOVED", 31),
         ),
         named=True,
     ),
@@ -1838,19 +2294,18 @@ class DiagnosticContext(ClosedModel):
                 "the client's supported contract."
             ),
             "permission_denied": (
-                "Host policy refused — a path outside the workspace, a revision this deployment "
-                "does not expose, a language not authorized for execution, or a debugging session "
-                "owned by another connection. The same request fails the same way."
+                "The connection cannot perform this operation: a path leaves the workspace, or a "
+                "debugging session belongs to another connection. The same request fails the "
+                "same way."
             ),
             "snapshot_not_found": (
-                "The revision does not resolve here: a deleted branch, a commit never fetched, a "
-                "working tree that has been removed. Retrying helps only once the revision "
-                "exists."
+                "The exact Rift snapshot is no longer retained. Current heads and live resources "
+                "pin their snapshots; a copied identifier alone does not. Re-read or re-import it."
             ),
             "semantic_snapshot_mismatch": (
-                "The snapshot passed back is no longer one the server can answer from — the "
-                "working tree moved under it, or the adapter that held its facts was restarted. "
-                "Re-read the current snapshot and rebuild whatever was pinned to the old one."
+                "The exact source snapshot still exists, but the adapter state supplied with a "
+                "semantic identity belongs to another snapshot. Re-read semantic facts against "
+                "the selected snapshot."
             ),
             "semantic_snapshot_unavailable": (
                 "The revision resolves, but Rift has no index for it yet: the adapters are still "
@@ -1888,14 +2343,14 @@ class DiagnosticContext(ClosedModel):
                 "A request or a response crossed an advertised limit. `limit` says which one and "
                 "by how much, so the request can be resized and sent again."
             ),
-            "worktree_busy": (
-                "The required worktree is locked, has an unmerged index, or is otherwise not in "
-                "the Git state this operation requires. Inspect or finish that Git operation first."
+            "projection_busy": (
+                "The required projection has an open writable handle, in-flight mutation, or "
+                "operation barrier that prevents removal or recovery. The error identifies the "
+                "projection. Retry after the owner completes or closes it."
             ),
             "adapter_unavailable": (
-                "No adapter is running for the language the request names: none is installed, or "
-                "the one that was has died. A structural query against a language with no adapter "
-                "lands here."
+                "A configured adapter could serve this request, but its process failed to start or "
+                "died. Retrying can succeed after the process restarts."
             ),
             "adapter_protocol_error": (
                 "An adapter contract is unusable. Causes include a malformed message, a field "
@@ -1908,9 +2363,9 @@ class DiagnosticContext(ClosedModel):
                 "work: a cold adapter on a large workspace is slow once and fast afterwards."
             ),
             "storage_failure": (
-                "Rift could not read or write workspace state — Git objects, refs, worktrees, "
-                "or the repository-local control directory. Worth retrying only if the cause was "
-                "transient, such as a disk that has since been cleared."
+                "Rift could not read or write the persistent store, mounted projection, Git "
+                "objects or refs, or the repository-local control directory. Worth retrying only "
+                "if the cause was transient, such as a disk that has since been cleared."
             ),
             "validator_execution_failure": (
                 "Rift could not prepare the validation workspace, launch the command validator, "
@@ -1926,16 +2381,44 @@ class DiagnosticContext(ClosedModel):
                 "The same snapshot remains unusable until that path changes."
             ),
             "cursor_expired": (
-                "The cursor is valid, but its immutable result generation left the process-local "
+                "The cursor is valid, but its captured result page set left the process-local "
                 "cache. Start again from the first page."
             ),
             "state_corrupt": (
-                "A Rift ref is malformed, or Git's registered-worktree record does not match the "
-                "physical directory. A local state command must resolve it."
+                "A projection head names a missing tree or blob, a digest is wrong, or a store "
+                "invariant failed. Rift stops mutations until a local state check repairs or "
+                "exports the readable state."
             ),
             "temporarily_unavailable": (
-                "The resource exists, but Rift cannot produce a safe answer yet. Recovery can "
-                "require a local operator decision before a retry."
+                "The resource exists but is in use. Another connection owns the session, a "
+                "retained debugger blocks continuation, or a disposable workspace is still "
+                "releasing. Retry after that owner or operation finishes."
+            ),
+            "configuration_invalid": (
+                "The workspace-root `rift.toml` does not satisfy its schema. New requests remain "
+                "blocked until the file is valid."
+            ),
+            "projection_head_moved": (
+                "A cleanup or recovery request names a projection token that is no longer "
+                "current. Read the projection again before retrying."
+            ),
+            "capability_unavailable": (
+                "The tool exists, but the workspace configuration and configured adapters cannot "
+                "serve this operation for the requested language. Read the repository resource "
+                "again after `rift.toml` or adapter availability changes."
+            ),
+            "git_revision_not_found": (
+                "A Git selector does not resolve locally to a commit, or a required object is "
+                "missing from a shallow or partial repository. Rift never fetches implicitly."
+            ),
+            "projection_not_found": "The named filesystem projection no longer exists.",
+            "projection_unavailable": (
+                "The projection exists, but its filesystem frontend or mount is not serving. "
+                "Retry after the server reconnects or remounts it."
+            ),
+            "recovery_moved": (
+                "A recovery cleanup request names an index/worktree manifest that is no longer "
+                "current. List recoveries again and review the changed bytes before retrying."
             ),
         }
     },
@@ -1956,7 +2439,7 @@ class ErrorCode(str, Enum):
     CANCELLED = "cancelled"
     DEADLINE_EXCEEDED = "deadline_exceeded"
     LIMIT_EXCEEDED = "limit_exceeded"
-    WORKTREE_BUSY = "worktree_busy"
+    PROJECTION_BUSY = "projection_busy"
     ADAPTER_UNAVAILABLE = "adapter_unavailable"
     ADAPTER_PROTOCOL_ERROR = "adapter_protocol_error"
     ADAPTER_TIMEOUT = "adapter_timeout"
@@ -1967,6 +2450,13 @@ class ErrorCode(str, Enum):
     CURSOR_EXPIRED = "cursor_expired"
     STATE_CORRUPT = "state_corrupt"
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+    CONFIGURATION_INVALID = "configuration_invalid"
+    PROJECTION_HEAD_MOVED = "projection_head_moved"
+    CAPABILITY_UNAVAILABLE = "capability_unavailable"
+    GIT_REVISION_NOT_FOUND = "git_revision_not_found"
+    PROJECTION_NOT_FOUND = "projection_not_found"
+    PROJECTION_UNAVAILABLE = "projection_unavailable"
+    RECOVERY_MOVED = "recovery_moved"
 
 
 @definition(
@@ -1986,7 +2476,7 @@ class ErrorCode(str, Enum):
         "rift:enumDescriptions": {
             "never": "The request fails the same way every time. Change it or give up.",
             "same_request": (
-                "Send the same bytes again. The cause was transient — a busy working tree, an "
+                "Send the same bytes again. The cause was transient — a busy projection, an "
                 "adapter still starting."
             ),
             "refresh_snapshot": (
@@ -1994,7 +2484,7 @@ class ErrorCode(str, Enum):
                 "was pinned to the old one, then ask again."
             ),
             "operator_action": (
-                "A local state command or policy change must resolve the condition before another "
+                "A local state command or configuration change must resolve the condition before another "
                 "request can succeed."
             ),
         }
@@ -2051,9 +2541,9 @@ class ErrorCause(ClosedModel):
             "resolve": "Turning an address, a cursor or an action key into the concrete thing it names at a state.",
             "validate": (
                 "Checking a proposed change against the schema, the state it was pinned to, and "
-                "the checks required by repository and user policy."
+                "the checks required by the workspace-root `rift.toml`."
             ),
-            "change": "Checking the session ref, materializing its worktree when needed, resolving the operation, and conditionally advancing the ref.",
+            "change": "Checking the projection token, resolving in a private candidate, validating, and conditionally advancing the projection.",
             "integrate": "Merging the session head, validating the merged tree, and conditionally advancing a target branch.",
             "execute": "Preparing an execution workspace and evaluating caller-provided code.",
             "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
@@ -2075,7 +2565,7 @@ class ErrorDataPhase(str, Enum):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ErrorData(ClosedModel):
-    "The `data` object on every Rift MCP failure. `code` and `retry` are what a caller branches on, `message` is for a human, and `phase`, `diagnostics`, `limit` and `causes` are the evidence behind the code."
+    "The `data` object on every Rift MCP failure. `code` and `retry` are what a caller branches on, `message` is for a human, and the remaining fields carry the evidence available for that failure."
 
     model_config = closed_config(
         {
@@ -2087,7 +2577,15 @@ class ErrorData(ClosedModel):
                     },
                     "then": {"required": ["limit"]},
                     "else": {"not": {"required": ["limit"]}},
-                }
+                },
+                {
+                    "if": {
+                        "required": ["code"],
+                        "properties": {"code": {"const": "projection_busy"}},
+                    },
+                    "then": {"required": ["projection"]},
+                    "else": {"not": {"required": ["projection"]}},
+                },
             ]
         }
     )
@@ -2122,9 +2620,9 @@ class ErrorData(ClosedModel):
                 "resolve": "Turning an address, a cursor or an action key into the concrete thing it names at a state.",
                 "validate": (
                     "Checking a proposed change against the schema, the state it was pinned to, and "
-                    "the checks required by repository and user policy."
+                    "the checks required by the workspace-root `rift.toml`."
                 ),
-                "change": "Checking the session ref, materializing its worktree when needed, resolving the operation, and conditionally advancing the ref.",
+                "change": "Checking the projection token, resolving in a private candidate, validating, and conditionally advancing the projection.",
                 "integrate": "Merging the session head, validating the merged tree, and conditionally advancing a target branch.",
                 "execute": "Preparing an execution workspace and evaluating caller-provided code.",
                 "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
@@ -2167,6 +2665,14 @@ class ErrorData(ClosedModel):
         ),
         number=9,
     )
+    projection: Field[ProjectionLocation | None] = proto_field(
+        default=None,
+        description=(
+            "Projection with open or in-flight filesystem mutations. Present exactly when `code` is `projection_busy` "
+            "and forbidden otherwise."
+        ),
+        number=10,
+    )
 
 
 @definition(
@@ -2185,7 +2691,7 @@ class ErrorData(ClosedModel):
     },
 )
 class LimitEvidenceScope(str, Enum):
-    "Which side of the server the limit belongs to. The two fail at different seams: a `driver` limit is host policy the caller can work within, an `adapter` limit is one adapter process running out of room."
+    "Which side of the server the limit belongs to. The two fail at different seams: a `driver` limit is enforced by Rift around the request, while an `adapter` limit is enforced inside one adapter process."
 
     DRIVER = "driver"
     ADAPTER = "adapter"
@@ -2198,8 +2704,8 @@ class LimitEvidence(ClosedModel):
     scope: Field[LimitEvidenceScope] = proto_field(
         description=(
             "Which side of the server the limit belongs to. The two fail at different seams: "
-            "a `driver` limit is host policy the caller can work within, an `adapter` limit "
-            "is one adapter process running out of room."
+            "a `driver` limit is enforced by Rift around the request, while an `adapter` limit "
+            "is enforced inside one adapter process."
         ),
         number=1,
         json_schema_extra={
@@ -2279,7 +2785,8 @@ class MatchSyntax(ClosedModel):
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class RepositoryResourceTemplate(ClosedModel):
-    """The repository resource. It takes no path, only an optional revision and cursor."""
+    """The repository resource. It takes no path, only an optional revision and cursor. An
+    omitted revision selects the current session state."""
 
     uriTemplate: Field[Literal["rift://repository{?rev,cursor}"]] = proto_field(
         description="The template, in RFC 6570 form. What follows `?` is optional."
@@ -2297,7 +2804,8 @@ class RepositoryResourceTemplate(ClosedModel):
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class SymbolResourceTemplate(ClosedModel):
-    """The symbol resource, addressed by language and the name that language gives the declaration."""
+    """The symbol resource, addressed by language and the name that language gives the
+    declaration. An omitted revision selects the current session state."""
 
     uriTemplate: Field[Literal["rift://symbol/{language}/{name}{?rev,cursor}"]] = (
         proto_field(
@@ -2317,10 +2825,10 @@ class SymbolResourceTemplate(ClosedModel):
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class DiffResourceTemplate(ClosedModel):
-    """The diff resource, addressed by two revisions in git's own range spelling."""
+    """The diff resource, addressed by two independently namespaced revisions."""
 
-    uriTemplate: Field[Literal["rift://diff/{from}..{to}{?cursor}"]] = proto_field(
-        description="The template, in RFC 6570 form. What follows `?` is optional."
+    uriTemplate: Field[Literal["rift://diff{?from,to,cursor}"]] = proto_field(
+        description="The template, in RFC 6570 form. `from` and `to` are required when read."
     )
     name: Field[Literal["diff"]] = proto_field(
         description="The resource family, as `resources/templates/list` advertises it.",
@@ -2335,7 +2843,8 @@ class DiffResourceTemplate(ClosedModel):
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class FileResourceTemplate(ClosedModel):
-    """The file resource, addressed by a path relative to the project root."""
+    """The file resource, addressed by a path relative to the project root. An omitted revision
+    selects the current session state."""
 
     uriTemplate: Field[Literal["rift://file/{path}{?rev,start,length}"]] = proto_field(
         description="The template, in RFC 6570 form. What follows `?` is optional."
@@ -2352,8 +2861,27 @@ class FileResourceTemplate(ClosedModel):
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class FsResourceTemplate(ClosedModel):
+    """The live filesystem-projection inventory, paged by an optional cursor."""
+
+    uriTemplate: Field[Literal["rift://fs{?cursor}"]] = proto_field(
+        description="The template in RFC 6570 form."
+    )
+    name: Field[Literal["fs"]] = proto_field(
+        description="The resource family advertised by `resources/templates/list`.",
+        number=1,
+    )
+    mimeType: Field[Literal["application/vnd.rift.fs+json"]] = proto_field(
+        description="A read returns `FsResourcePayload` as JSON.",
+        number=2,
+        proto_name="mime_type",
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class ActionsResourceTemplate(ClosedModel):
-    """The actions resource, addressed by the place to ask about."""
+    """The actions resource, addressed by the place to ask about. An omitted revision selects
+    the current session state."""
 
     uriTemplate: Field[Literal["rift://actions/{address}{?only,rev,cursor}"]] = (
         proto_field(
@@ -2420,6 +2948,7 @@ class ActionResourceTemplate(ClosedModel):
             ActionsResourceTemplate,
         ),
         Variant("rift://action/{token}", "action", 6, ActionResourceTemplate),
+        Variant("rift://fs{?cursor}", "fs", 7, FsResourceTemplate),
     ),
 )
 class ResourceTemplate(ProtocolRoot):
@@ -2437,6 +2966,7 @@ class ResourceReadParams(ClosedModel):
         | FileResourceUri
         | ActionsResourceUri
         | ActionResourceUri
+        | FsResourceUri
     ] = proto_field(
         description="A URI matching one branch of `ResourceTemplate`.",
         number=1,
@@ -2525,6 +3055,26 @@ class FileResourceContent(ClosedModel):
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class FsResourceContent(ClosedModel):
+    """What a read of `rift://fs` returns."""
+
+    uri: Field[FsResourceUri] = proto_field(
+        description="Inventory page that was read.", number=1
+    )
+    mimeType: Field[Literal["application/vnd.rift.fs+json"]] = proto_field(
+        description="Which payload `text` holds."
+    )
+    text: Field[str] = proto_field(
+        description="An `FsResourcePayload`, serialized as JSON.",
+        number=2,
+        json_schema_extra={
+            "contentMediaType": "application/vnd.rift.fs+json",
+            "rift:contentType": "FsResourcePayload",
+        },
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class ActionsResourceContent(ClosedModel):
     """What a read of a `rift://actions/…` URI returns."""
 
@@ -2582,6 +3132,7 @@ class ActionResourceContent(ClosedModel):
             "application/vnd.rift.actions+json", "actions", 5, ActionsResourceContent
         ),
         Variant("application/vnd.rift.action+json", "action", 6, ActionResourceContent),
+        Variant("application/vnd.rift.fs+json", "fs", 7, FsResourceContent),
     ),
     public=False,
 )
@@ -2618,7 +3169,7 @@ class SearchHitTargetSymbol(ClosedModel):
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class SearchHitTargetNode(ClosedModel):
-    """A node hit: one place in a syntax tree, without the symbol view around it."""
+    """A node hit: one place in a syntax tree, without its enclosing symbol record."""
 
     target: Field[Literal["node"]] = proto_field(description="Tags this as a node hit.")
     node: Field[core.Node] = proto_field(
@@ -2661,17 +3212,17 @@ class SearchHitTarget(ProtocolRoot):
 class EditParams(ClosedModel):
     "Concrete filesystem edits supplied by the caller. Their ranges address the state this operation resolves against, and replacements in one set may not overlap."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -2699,17 +3250,17 @@ class EditParams(ClosedModel):
 class PatchParams(ClosedModel):
     "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the state it resolves against."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -2758,17 +3309,17 @@ class RewriteRange(str, Enum):
 class RewriteParams(ClosedModel):
     "An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the replacement, and either applies all resulting edits or refuses the operation."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -2810,17 +3361,17 @@ class RewriteParams(ClosedModel):
 class RevertParams(ClosedModel):
     "A validated three-way inverse of one commit. Rift computes the difference from `parent` to `revision`, applies its inverse, and refuses overlapping changes it cannot merge without guessing."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -2829,10 +3380,10 @@ class RevertParams(ClosedModel):
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
-    revision: Field[core.Commit] = proto_field(
+    revision: Field[core.GitCommit] = proto_field(
         description="Exact commit whose changes are inverted.", number=4
     )
-    parent: Field[core.Commit | None] = proto_field(
+    parent: Field[core.GitCommit | None] = proto_field(
         default=None,
         description=(
             "Parent against which the commit's change is defined. Required for ordinary and "
@@ -2857,50 +3408,20 @@ class RevertParams(ClosedModel):
     proto=Proto.message(),
     schema_extra={},
 )
-class MergeParams(ClosedModel):
-    """A three-way merge of one exact commit into the state this operation resolves against."""
-
-    expected_head: Field[core.Commit] = proto_field(
-        description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
-        ),
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
-    revision: Field[core.Commit] = proto_field(
-        description="Commit merged into the session worktree.", number=3
-    )
-
-
-@definition(
-    owner=MCP,
-    public=True,
-    proto=Proto.message(),
-    schema_extra={},
-)
 class RenameParams(ClosedModel):
     "Changes what a declaration is called and rewrites the references that name it. The adapter checks language spelling, collisions, and binding changes; a reference outside `scope` refuses the operation rather than leaving it half done."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -2927,17 +3448,17 @@ class RenameParams(ClosedModel):
 class MoveParams(ClosedModel):
     "Moves a declaration or file to another container or path and updates the imports and references that reach it."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -2964,17 +3485,17 @@ class MoveParams(ClosedModel):
 class DeleteParams(ClosedModel):
     "Removes a declaration. Without a policy this is a mechanical removal that analyses no references and claims no reference guarantee. With one, the adapter classifies every remaining use, applies the stated disposition, and refuses the operation when reference coverage is incomplete."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -3001,17 +3522,17 @@ class DeleteParams(ClosedModel):
 class ChangeSignatureParams(ClosedModel):
     "Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument lists: a new required parameter has to be supplied at every call site, which is why the operation commonly raises a `behavior_unknown` confirmation."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -3038,17 +3559,17 @@ class ChangeSignatureParams(ClosedModel):
 class ActParams(ClosedModel):
     "Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an adapter offers that has no portable contract. Rift validates `arguments` against the offer's advertised schema. An offer whose kind belongs to a portable family is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points."
 
-    expected_head: Field[core.Commit] = proto_field(
+    expected: Field[core.ProjectionState] = proto_field(
         description=(
-            "Session-ref head this operation must replace. Rift refuses stale requests before "
-            "creating or changing the session worktree or moving the ref."
+            "Exact projection state this operation must replace. Rift refuses a stale token before "
+            "resolving edits, invoking an adapter, or publishing source state."
         ),
         number=1,
     )
     confirmations: Field[list[int]] = proto_field(
         default_factory=list,
         description=(
-            "Confirmation ids returned by an earlier refusal for this same expected head and "
+            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
             "operation. Missing or extra ids refuse the retry."
         ),
         number=2,
@@ -3071,8 +3592,19 @@ class ActParams(ClosedModel):
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ProjectionRestoreParams(ClosedModel):
+    """Discards all source changes since the current session base and restores its pinned base
+    snapshot. Scratch remains intact."""
+
+    expected: Field[core.ProjectionState] = proto_field(
+        description="Exact dirty state the caller reviewed and intends to discard.",
+        number=1,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ResolvedOperation(ClosedModel):
-    "Bounded summary of one operation after it resolves against the materialized session worktree."
+    "Bounded summary of one operation after it resolves against the current session projection."
 
     owners: Field[list[core.Language]] = proto_field(
         description=(
@@ -3202,7 +3734,7 @@ class CommandValidatorDeterminism(str, Enum):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class CommandValidator(ClosedModel):
-    "A repository-declared integration check executed directly, without a shell, in a disposable validation workspace materialized from the complete merged tree. Current user policy must grant the declaration. The workspace is only the process working directory; it does not isolate the command from the host."
+    "An integration check from the workspace-root `rift.toml`, executed directly without a shell in a disposable validation workspace materialized from the complete merged tree. The workspace is the process working directory and does not isolate the command from the host."
 
     id: Field[str] = proto_field(
         description=(
@@ -3233,9 +3765,8 @@ class CommandValidator(ClosedModel):
     )
     environment: Field[dict[str, str]] = proto_field(
         description=(
-            "Repository-requested environment additions. Rift supplies a policy-controlled PATH, "
-            "private HOME and temporary directories, and a UTF-8 locale; it removes host "
-            "secrets and every other inherited variable."
+            "Environment additions declared for the command. Rift starts it directly without a "
+            "shell and supplies its working directory separately."
         ),
         number=6,
         json_schema_extra={"propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
@@ -3375,7 +3906,7 @@ class ValidatorResult(ProtocolRoot):
         "rift:enumDescriptions": {
             "mechanical": "No affected adapter supplied a semantic validation report.",
             "available": "Every affected adapter that advertises validation supplied a complete report.",
-            "required": "Every language named by repository validation policy supplied a complete report.",
+            "required": "Every language named by `validation.require` supplied a complete report.",
         }
     },
 )
@@ -3389,14 +3920,14 @@ class ValidationStrength(str, Enum):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ChangeValidation(ClosedModel):
-    """Bounded adapter-validation evidence for one committed session change."""
+    """Bounded adapter-validation evidence for one applied session change."""
 
     valid: Field[bool] = proto_field(
         description="Whether every completed adapter report accepted the resulting tree.",
         number=1,
     )
     complete: Field[bool] = proto_field(
-        description="Whether every adapter required by repository policy returned complete coverage.",
+        description="Whether every adapter required by `validation.require` returned complete coverage.",
         number=2,
     )
     strength: Field[ValidationStrength] = proto_field(
@@ -3410,65 +3941,170 @@ class ChangeValidation(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ChangeSummary(ClosedModel):
-    """Git identity, diff, resolution evidence, and validation for one committed change."""
+    """Projection transition, immutable diff, resolution evidence, and validation for one
+    applied store change."""
 
-    previous: Field[core.Commit] = proto_field(
-        description="Session-ref head replaced by this operation.", number=1
-    )
-    commit: Field[core.Commit] = proto_field(
-        description="Commit now held by the session ref.", number=2
+    previous: Field[core.ProjectionState] = proto_field(
+        description="Exact projection state against which this operation resolved.",
+        number=1,
     )
     diff: Field[DiffResourceLink] = proto_field(
-        description="Link to the Git diff from `previous` to `commit`.", number=3
+        description=(
+            "Store-tree diff using immutable `snapshot:` selectors for `previous.snapshot` "
+            "and `current.snapshot`."
+        ),
+        number=2,
     )
     resolved: Field[ResolvedOperation] = proto_field(
-        description="Bounded evidence from resolving the requested operation.", number=4
+        description="Bounded evidence from resolving the requested operation.", number=3
     )
     validation: Field[ChangeValidation] = proto_field(
-        description="Adapter validation of the resulting commit.", number=5
+        description="Adapter validation of the resulting snapshot.", number=4
     )
     edits: Field[list[core.Edit]] = proto_field(
-        description="Concrete edits in canonical file-and-range order.", number=6
+        description="Concrete edits in canonical file-and-range order.", number=5
     )
     preconditions: Field[list[core.OperationPrecondition]] = proto_field(
-        description="Satisfied preconditions in check order.", number=7
+        description="Satisfied preconditions in check order.", number=6
     )
     effects: Field[list[core.OperationEffect]] = proto_field(
-        description="Semantic effects in adapter emission order.", number=8
+        description="Semantic effects in adapter emission order.", number=7
     )
     guarantees: Field[list[core.GuaranteeEvidence]] = proto_field(
-        description="Scoped guarantee evidence in guarantee-kind order.", number=9
+        description="Scoped guarantee evidence in guarantee-kind order.", number=8
     )
     diagnostics: Field[list[core.Diagnostic]] = proto_field(
-        description="Resolution findings in source order.", number=10
+        description="Resolution findings in source order.", number=9
     )
+    current: Field[core.ProjectionState] = proto_field(
+        description="Published current projection state with a fresh head token.",
+        number=10,
+    )
+    degradation: Field[list[core.Diagnostic]] = proto_field(
+        description=(
+            "Post-publication invalidation or notification failures. Non-empty means source "
+            "was durably applied but the projection is unavailable until remount."
+        ),
+        number=11,
+    )
+
+    @model_validator(mode="after")
+    def projection_transition_is_correlated(self) -> ChangeSummary:
+        if not self.validation.valid:
+            raise ValueError("an applied change requires valid adapter evidence")
+        if self.previous.projection != self.current.projection:
+            raise ValueError("change states must belong to the same projection")
+        if self.previous.base != self.current.base:
+            raise ValueError("ordinary changes cannot replace the projection base")
+        if self.previous.head == self.current.head:
+            raise ValueError("applied changes require a fresh projection head")
+        if self.previous.snapshot == self.current.snapshot:
+            raise ValueError("applied changes require a changed source snapshot")
+        expected_diff = (
+            f"rift://diff?from=snapshot:{self.previous.snapshot.root}"
+            f"&to=snapshot:{self.current.snapshot.root}"
+        )
+        if self.diff.uri.root != expected_diff:
+            raise ValueError("change diff must compare its two immutable snapshots")
+        return self
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ChangeCommitted(ClosedModel):
-    """The operation created a commit and advanced the session ref."""
+class ChangeApplied(ClosedModel):
+    """The operation atomically replaced the current projection state."""
 
-    status: Field[Literal["committed"]] = proto_field(
-        description="Identifies a committed session change.", default="committed"
+    status: Field[Literal["applied"]] = proto_field(
+        description="Identifies an applied store change.", default="applied"
     )
     summary: Field[ChangeSummary] = proto_field(
-        description="The committed change and its evidence.", number=1
+        description="The applied change and its evidence.", number=1
     )
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class StaleHeadResult(ClosedModel):
-    """The session ref did not hold the commit supplied as `expected_head`."""
+class StaleProjectionResult(ClosedModel):
+    """The current projection did not have the exact state supplied as `expected`."""
 
-    status: Field[Literal["stale_head"]] = proto_field(
-        description="Identifies a session-ref compare failure.", default="stale_head"
+    status: Field[Literal["stale_projection"]] = proto_field(
+        description="Identifies a projection compare-and-swap failure.",
+        default="stale_projection",
     )
-    expected: Field[core.Commit] = proto_field(
-        description="Commit supplied by the caller.", number=1
+    expected: Field[core.ProjectionState] = proto_field(
+        description="Exact projection state supplied by the caller.", number=1
     )
-    current: Field[core.Commit] = proto_field(
-        description="Commit currently held by the session ref.", number=2
+    current: Field[core.ProjectionState] = proto_field(
+        description="Exact current projection state.", number=2
     )
+
+    @model_validator(mode="after")
+    def states_name_the_same_projection(self) -> StaleProjectionResult:
+        if self.expected.projection != self.current.projection:
+            raise ValueError("stale states must belong to the same projection")
+        if self.expected.head == self.current.head:
+            raise ValueError("stale result requires a different projection head")
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ProjectionUnchanged(ClosedModel):
+    """The projection already matched its retained base, so restore changed nothing."""
+
+    status: Field[Literal["noop"]] = proto_field(default="noop")
+    state: Field[core.ProjectionState] = proto_field(
+        description="Unchanged projection state.", number=1
+    )
+
+    @model_validator(mode="after")
+    def state_is_clean(self) -> ProjectionUnchanged:
+        if self.state.dirty or self.state.snapshot != self.state.base.snapshot:
+            raise ValueError("unchanged restore result requires a clean base state")
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ProjectionRestored(ClosedModel):
+    """Unintegrated source changes were discarded in one projection transaction."""
+
+    status: Field[Literal["restored"]] = proto_field(default="restored")
+    previous: Field[core.ProjectionState] = proto_field(
+        description="Dirty state discarded by this operation.", number=1
+    )
+    current: Field[core.ProjectionState] = proto_field(
+        description="Clean current state at the same retained base with a fresh token.",
+        number=2,
+    )
+    degradation: Field[list[core.Diagnostic]] = proto_field(
+        description="Post-publication projection invalidation or notification failures.",
+        number=3,
+    )
+
+    @model_validator(mode="after")
+    def transition_is_correlated(self) -> ProjectionRestored:
+        if self.previous.projection != self.current.projection:
+            raise ValueError("restore states must belong to the same projection")
+        if not self.previous.dirty:
+            raise ValueError("restore must discard a dirty previous state")
+        if self.previous.base != self.current.base or self.current.dirty:
+            raise ValueError("restore must return a clean state at the same base")
+        if self.current.snapshot != self.current.base.snapshot:
+            raise ValueError("restored state must render its base snapshot")
+        if self.previous.head == self.current.head:
+            raise ValueError("restore must mint a fresh projection head")
+        return self
+
+
+@union(
+    owner=MCP,
+    oneof="variant",
+    discriminator="status",
+    variants=(
+        Variant("restored", "restored", 1, ProjectionRestored),
+        Variant("noop", "noop", 2, ProjectionUnchanged),
+        Variant("stale_projection", "stale_projection", 3, StaleProjectionResult),
+    ),
+)
+class ProjectionRestoreResult(ProtocolRoot):
+    """A restored projection, clean no-op, or stale projection comparison."""
 
 
 @definition(
@@ -3495,7 +4131,6 @@ class StaleHeadResult(ClosedModel):
             ),
             EnumValue("portable_family", "REFUSAL_REASON_PORTABLE_FAMILY", 11),
             EnumValue("checked_out_target", "REFUSAL_REASON_CHECKED_OUT_TARGET", 12),
-            EnumValue("dirty_target", "REFUSAL_REASON_DIRTY_TARGET", 13),
         ),
         named=True,
     ),
@@ -3512,8 +4147,7 @@ class StaleHeadResult(ClosedModel):
             "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
             "validation_incomplete": "Required adapter or command validation did not complete.",
             "portable_family": "The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
-            "checked_out_target": "The integration target is checked out and automatic integration is disabled.",
-            "dirty_target": "The checked-out integration target has local changes.",
+            "checked_out_target": "The integration target is checked out in a Git worktree. Rift never changes a checked-out ref, index, or working tree.",
         }
     },
 )
@@ -3532,7 +4166,6 @@ class RefusalReason(str, Enum):
     VALIDATION_INCOMPLETE = "validation_incomplete"
     PORTABLE_FAMILY = "portable_family"
     CHECKED_OUT_TARGET = "checked_out_target"
-    DIRTY_TARGET = "dirty_target"
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
@@ -3564,7 +4197,7 @@ class RefusedResult(ClosedModel):
     )
     confirmations: Field[list[core.ConfirmationRequirement]] = proto_field(
         description=(
-            "Acknowledgements required for a retry of the same operation and expected head. "
+            "Acknowledgements required for a retry of the same operation and expected projection state. "
             "Empty unless `reason` is `confirmation_required`."
         ),
         number=6,
@@ -3579,7 +4212,8 @@ class RefusedResult(ClosedModel):
     examples=["refs/heads/main", "refs/heads/release/1.x"],
 )
 class IntegrationTarget(ProtocolRoot):
-    """A local branch ref that integration may compare-and-swap."""
+    """A local branch ref that integration may compare-and-swap. The schema is a safe prefilter;
+    the server also requires Git's authoritative ref-format validator to accept the complete name."""
 
 
 @definition(
@@ -3634,26 +4268,114 @@ class GitConflict(ClosedModel):
     )
 
 
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ChangeMergeConflict(ClosedModel):
-    """Git left the session worktree and index in an unmerged state."""
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rec_[a-z2-7]{26}$",
+)
+class RecoveryId(ProtocolRoot):
+    """Identity of one retained conventional Git merge recovery."""
 
-    status: Field[Literal["merge_conflict"]] = proto_field(
-        description="Identifies an unresolved Git merge.", default="merge_conflict"
+
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.enum(
+        "RecoveryReason",
+        (
+            EnumValue("conflicts", "RECOVERY_REASON_CONFLICTS", 1),
+            EnumValue("custom_driver", "RECOVERY_REASON_CUSTOM_DRIVER", 2),
+        ),
+        named=True,
+    ),
+    schema_extra={
+        "rift:enumDescriptions": {
+            "conflicts": "Built-in three-way merging produced unmerged index entries.",
+            "custom_driver": "Repository attributes selected a custom merge driver Rift will not execute.",
+        }
+    },
+)
+class RecoveryReason(str, Enum):
+    """Why integration requires a conventional Git worktree."""
+
+    CONFLICTS = "conflicts"
+    CUSTOM_DRIVER = "custom_driver"
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class RecoveryManifest(ClosedModel):
+    """Content guard for one conventional recovery. Rift rescans the index and worktree under
+    Git locks before continue or abort; equal digests mean the reviewed bytes are unchanged."""
+
+    recovery: Field[RecoveryId] = proto_field(number=1)
+    index: Field[core.Digest] = proto_field(
+        description="SHA-256 of canonical index entries and stages.", number=2
     )
-    previous: Field[core.Commit] = proto_field(
-        description="Session head used as the current side of the merge.", number=1
-    )
-    source: Field[core.Commit] = proto_field(
-        description="Commit supplied as the other side of the merge.", number=2
-    )
-    worktree: Field[core.Worktree] = proto_field(
-        description="Session worktree containing Git's unmerged index and working files.",
+    worktree: Field[core.Digest] = proto_field(
+        description="SHA-256 of canonical tracked and untracked worktree entries.",
         number=3,
     )
-    conflicts: Field[list[GitConflict]] = proto_field(
-        description="Conflicting paths in project-path order.", min_length=1, number=4
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class GitRecovery(ClosedModel):
+    """Exceptional conventional Git worktree retained for a merge Rift could not complete.
+    Normal filesystem projections do not expose Git administrative state."""
+
+    recovery: Field[RecoveryId] = proto_field(
+        description="Identity supplied to recovery continue or abort.", number=1
     )
+    worktree: Field[GitWorktreeLocation] = proto_field(
+        description="Durable worktree in `.rift/recovery` for ordinary Git conflict resolution.",
+        number=2,
+    )
+    operation: Field[core.Digest] = proto_field(
+        description=(
+            "Deterministic identity of the exact source state, target guard, and request. An "
+            "exact retry returns this active recovery instead of allocating another."
+        ),
+        number=3,
+    )
+    expected_source: Field[core.ProjectionState] = proto_field(
+        description="Projection state that continuation must still observe.", number=4
+    )
+    target: Field[IntegrationTarget] = proto_field(
+        description="Local branch guarded by this recovery.", number=5
+    )
+    expected_target: Field[core.GitCommit] = proto_field(
+        description="Target head continuation must still observe.", number=6
+    )
+    reason: Field[RecoveryReason] = proto_field(number=7)
+    conflicts: Field[list[GitConflict]] = proto_field(
+        description="Unmerged paths in project-path order; empty for custom-driver handoff.",
+        number=8,
+    )
+    driver_paths: Field[list[core.ProjectPath]] = proto_field(
+        description="Paths selecting a custom driver; empty for a built-in merge conflict.",
+        number=9,
+    )
+    manifest: Field[RecoveryManifest] = proto_field(
+        description="Exact recovery bytes most recently scanned by Rift.", number=10
+    )
+
+    @model_validator(mode="after")
+    def reason_has_evidence(self) -> GitRecovery:
+        if self.worktree.ref != f"refs/rift/recovery/{self.recovery.root}":
+            raise ValueError("recovery worktree must use its private recovery ref")
+        if self.manifest.recovery != self.recovery:
+            raise ValueError("recovery manifest must name this recovery")
+        if not self.expected_source.dirty:
+            raise ValueError("merge recovery requires unintegrated source")
+        if self.reason is RecoveryReason.CONFLICTS and not self.conflicts:
+            raise ValueError("conflict recovery requires conflict paths")
+        if self.reason is RecoveryReason.CONFLICTS and self.driver_paths:
+            raise ValueError("conflict recovery cannot carry custom-driver paths")
+        if self.reason is RecoveryReason.CUSTOM_DRIVER and not self.driver_paths:
+            raise ValueError("custom-driver recovery requires driver paths")
+        if self.reason is RecoveryReason.CUSTOM_DRIVER and self.conflicts:
+            raise ValueError("custom-driver recovery cannot carry conflict paths")
+        return self
 
 
 @union(
@@ -3661,31 +4383,36 @@ class ChangeMergeConflict(ClosedModel):
     oneof="variant",
     discriminator="status",
     variants=(
-        Variant("committed", "committed", 1, ChangeCommitted),
-        Variant("merge_conflict", "merge_conflict", 2, ChangeMergeConflict),
-        Variant("refused", "refused", 3, RefusedResult),
-        Variant("stale_head", "stale_head", 4, StaleHeadResult),
+        Variant("applied", "applied", 1, ChangeApplied),
+        Variant("refused", "refused", 2, RefusedResult),
+        Variant("stale_projection", "stale_projection", 3, StaleProjectionResult),
     ),
 )
 class ChangeResult(ProtocolRoot):
-    """A committed session change, Git merge state, domain refusal, or stale-head result."""
+    """An applied store change, domain refusal, or stale-projection result."""
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class IntegrateParams(ClosedModel):
-    """Merges the session head into one local branch with a conditional target update."""
+    """Squash-integrates one exact current projection into a local branch."""
 
     target: Field[IntegrationTarget] = proto_field(
-        description="Local branch that receives the merged session history.", number=1
+        description="Local branch that receives the merged source tree.", number=1
     )
-    source: Field[core.Commit | None] = proto_field(
-        default=None,
-        description="Session commit to merge. Omission selects the current session head.",
+    expected: Field[core.ProjectionState] = proto_field(
+        description="Exact current source and retained base to integrate.",
         number=2,
     )
-    expected_target: Field[core.Commit] = proto_field(
+    expected_target: Field[core.GitCommit] = proto_field(
         description="Target head that the final conditional ref update must replace.",
         number=3,
+    )
+    message: Field[str] = proto_field(
+        description="Subject for the single squash commit. Newlines and NUL are refused.",
+        min_length=1,
+        max_length=256,
+        pattern=r"^[^\u0000\r\n]+$",
+        number=4,
     )
 
 
@@ -3701,14 +4428,15 @@ class IntegrationValidation(ClosedModel):
         number=2,
     )
     valid: Field[bool] = proto_field(
-        description="Whether adapter policy passed and every command validator passed.",
+        description="Whether configured adapter validation and every command validator passed.",
         number=3,
     )
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class IntegrationSucceeded(ClosedModel):
-    """Git merged the trees, validation passed, and the target ref advanced."""
+    """The merged tree passed validation, one squash commit advanced the target, and the
+    projection was rebased to that published tree."""
 
     status: Field[Literal["integrated"]] = proto_field(
         description="Identifies successful integration.", default="integrated"
@@ -3716,47 +4444,112 @@ class IntegrationSucceeded(ClosedModel):
     target: Field[IntegrationTarget] = proto_field(
         description="Local branch advanced by integration.", number=1
     )
-    previous: Field[core.Commit] = proto_field(
+    previous_target: Field[core.GitCommit] = proto_field(
         description="Target head replaced by the conditional update.", number=2
     )
-    source: Field[core.Commit] = proto_field(
-        description="Session commit merged into the target.", number=3
+    previous_state: Field[core.ProjectionState] = proto_field(
+        description="Exact projection state supplied to integration.", number=3
     )
-    integrated: Field[core.Commit] = proto_field(
-        description="Merge commit now held by the target ref.", number=4
+    integrated: Field[core.GitCommit] = proto_field(
+        description="Single-parent squash commit now held by the target ref.", number=4
     )
     validation: Field[IntegrationValidation] = proto_field(
         description="Validation evidence for the merged tree.", number=5
     )
+    current_state: Field[core.ProjectionState] = proto_field(
+        description="Clean projection rebased to the integrated tree with a fresh token.",
+        number=6,
+    )
+    diff: Field[DiffResourceLink] = proto_field(
+        description="Pinned snapshot comparison from the supplied source to the merged tree.",
+        number=7,
+    )
+    degradation: Field[list[core.Diagnostic]] = proto_field(
+        description="Post-publication projection invalidation or notification failures.",
+        number=8,
+    )
+
+    @model_validator(mode="after")
+    def publication_is_correlated(self) -> IntegrationSucceeded:
+        if not self.validation.valid:
+            raise ValueError("successful integration requires valid evidence")
+        if self.previous_state.projection != self.current_state.projection:
+            raise ValueError("integration states must belong to the same projection")
+        if not self.previous_state.dirty:
+            raise ValueError("commit-producing integration requires dirty source")
+        if self.previous_state.head == self.current_state.head:
+            raise ValueError("integration rebase must mint a fresh projection head")
+        if self.current_state.dirty:
+            raise ValueError("successful integration must return a clean projection")
+        if self.current_state.base.commit != self.integrated:
+            raise ValueError("integrated commit must become the projection base")
+        if self.current_state.base.snapshot != self.current_state.snapshot:
+            raise ValueError("clean integration state must render its base snapshot")
+        expected_diff = (
+            f"rift://diff?from=snapshot:{self.previous_state.snapshot.root}"
+            f"&to=snapshot:{self.current_state.snapshot.root}"
+        )
+        if self.diff.uri.root != expected_diff:
+            raise ValueError(
+                "integration diff must compare its two immutable snapshots"
+            )
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class IntegrationSynchronized(ClosedModel):
+    """The merged tree already matched the target tree. No commit was created; Rift only
+    rebased the exact projection to the existing target commit and tree."""
+
+    status: Field[Literal["synchronized"]] = proto_field(default="synchronized")
+    target: Field[IntegrationTarget] = proto_field(number=1)
+    target_head: Field[core.GitCommit] = proto_field(number=2)
+    previous_state: Field[core.ProjectionState] = proto_field(number=3)
+    current_state: Field[core.ProjectionState] = proto_field(number=4)
+    validation: Field[IntegrationValidation] = proto_field(
+        description="Validation evidence for the already-target-equivalent merged tree.",
+        number=5,
+    )
+    degradation: Field[list[core.Diagnostic]] = proto_field(
+        description="Post-rebase projection invalidation or notification failures.",
+        number=6,
+    )
+
+    @model_validator(mode="after")
+    def synchronization_is_correlated(self) -> IntegrationSynchronized:
+        if not self.validation.valid:
+            raise ValueError("synchronization requires valid evidence")
+        if self.previous_state.projection != self.current_state.projection:
+            raise ValueError("integration states must belong to the same projection")
+        if self.previous_state.head == self.current_state.head:
+            raise ValueError("integration rebase must mint a fresh projection head")
+        if self.current_state.dirty:
+            raise ValueError("synchronization must return a clean projection")
+        if self.current_state.base.commit != self.target_head:
+            raise ValueError("target commit must become the projection base")
+        if self.current_state.base.snapshot != self.current_state.snapshot:
+            raise ValueError("clean integration state must render its base snapshot")
+        return self
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class IntegrationMergeConflict(ClosedModel):
-    """Git preserved an unmerged index and working files in the integration worktree."""
+    """Git reported an unresolved merge. Rift retained a conventional recovery worktree and
+    left the session projection and target ref unchanged."""
 
     status: Field[Literal["merge_conflict"]] = proto_field(
         description="Identifies an unresolved Git merge.", default="merge_conflict"
     )
-    target: Field[IntegrationTarget] = proto_field(
-        description="Local branch used as the current side of the merge.", number=1
-    )
-    target_head: Field[core.Commit] = proto_field(
-        description="Target commit used by Git.", number=2
-    )
-    source: Field[core.Commit] = proto_field(
-        description="Session commit used as the other side of the merge.", number=3
-    )
-    worktree: Field[core.Worktree] = proto_field(
-        description="Integration worktree containing Git's unmerged state.", number=4
-    )
-    conflicts: Field[list[GitConflict]] = proto_field(
-        description="Conflicting paths in project-path order.", min_length=1, number=5
+    recovery: Field[GitRecovery] = proto_field(
+        description="Retained, discoverable recovery to resolve and continue or abort.",
+        number=1,
     )
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class IntegrationRejected(ClosedModel):
-    """Validation rejected a clean Git merge, so the target ref did not move."""
+    """Validation rejected a clean merge in a disposable projection. Rift discarded the
+    candidate and left the target ref unchanged."""
 
     status: Field[Literal["rejected"]] = proto_field(
         description="Identifies integration rejected by validation.", default="rejected"
@@ -3764,23 +4557,26 @@ class IntegrationRejected(ClosedModel):
     target: Field[IntegrationTarget] = proto_field(
         description="Local branch that remained unchanged.", number=1
     )
-    target_head: Field[core.Commit] = proto_field(
+    target_head: Field[core.GitCommit] = proto_field(
         description="Target commit used by Git.", number=2
     )
-    source: Field[core.Commit] = proto_field(
-        description="Session commit merged for validation.", number=3
-    )
-    worktree: Field[core.Worktree] = proto_field(
-        description="Integration worktree containing the clean merged tree.", number=4
+    source: Field[core.ProjectionState] = proto_field(
+        description="Exact session state merged for validation.", number=3
     )
     validation: Field[IntegrationValidation] = proto_field(
-        description="Evidence that rejected integration.", number=5
+        description="Evidence that rejected integration.", number=4
     )
+
+    @model_validator(mode="after")
+    def validation_is_rejected(self) -> IntegrationRejected:
+        if self.validation.valid:
+            raise ValueError("rejected integration requires invalid evidence")
+        return self
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class IntegrationRefused(ClosedModel):
-    """Policy or repository state prevented Git integration from starting."""
+    """Workspace configuration or repository state prevented Git integration from starting."""
 
     status: Field[Literal["refused"]] = proto_field(
         description="Identifies a refused integration.", default="refused"
@@ -3788,29 +4584,26 @@ class IntegrationRefused(ClosedModel):
     target: Field[IntegrationTarget] = proto_field(
         description="Local branch Rift was asked to integrate.", number=1
     )
-    source: Field[core.Commit] = proto_field(
-        description="Session commit selected for integration.", number=2
+    source: Field[core.ProjectionState] = proto_field(
+        description="Exact session state selected for integration.", number=2
     )
-    expected_target: Field[core.Commit] = proto_field(
+    expected_target: Field[core.GitCommit] = proto_field(
         description="Target commit supplied by the caller.", number=3
     )
     reason: Field[RefusalReason] = proto_field(
-        description="Policy or repository condition that prevented integration.",
+        description="Configuration or repository condition that prevented integration.",
         number=4,
     )
-    worktree: Field[core.Worktree | None] = proto_field(
-        default=None,
-        description="Checked-out target worktree when that state caused the refusal.",
-        number=5,
-    )
     diagnostics: Field[list[core.Diagnostic]] = proto_field(
-        description="Evidence that explains the refusal.", number=6
+        description="Evidence that explains the refusal, including a checked-out path when relevant.",
+        number=5,
     )
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class IntegrationTargetMoved(ClosedModel):
-    """The target ref moved before Rift could conditionally advance it."""
+    """The target ref moved before Rift could conditionally advance it. Rift discarded the
+    integration candidate."""
 
     status: Field[Literal["target_moved"]] = proto_field(
         description="Identifies a failed conditional target update.",
@@ -3819,18 +4612,17 @@ class IntegrationTargetMoved(ClosedModel):
     target: Field[IntegrationTarget] = proto_field(
         description="Local branch that changed concurrently.", number=1
     )
-    expected: Field[core.Commit] = proto_field(
+    expected: Field[core.GitCommit] = proto_field(
         description="Target commit supplied by the caller.", number=2
     )
-    current: Field[core.Commit] = proto_field(
-        description="Target commit observed during the conditional update.", number=3
+    current: Field[core.GitCommit | None] = proto_field(
+        default=None,
+        description="Target commit observed during the conditional update, or null if deleted.",
+        number=3,
     )
-    source: Field[core.Commit] = proto_field(
-        description="Session commit merged in the integration worktree.", number=4
-    )
-    worktree: Field[core.Worktree] = proto_field(
-        description="Integration worktree preserved for supervisor inspection.",
-        number=5,
+    source: Field[core.ProjectionState] = proto_field(
+        description="Exact session state used for the discarded integration attempt.",
+        number=4,
     )
 
 
@@ -3840,62 +4632,278 @@ class IntegrationTargetMoved(ClosedModel):
     discriminator="status",
     variants=(
         Variant("integrated", "integrated", 1, IntegrationSucceeded),
-        Variant("merge_conflict", "merge_conflict", 2, IntegrationMergeConflict),
-        Variant("rejected", "rejected", 3, IntegrationRejected),
-        Variant("refused", "refused", 4, IntegrationRefused),
-        Variant("target_moved", "target_moved", 5, IntegrationTargetMoved),
+        Variant("synchronized", "synchronized", 2, IntegrationSynchronized),
+        Variant("merge_conflict", "merge_conflict", 3, IntegrationMergeConflict),
+        Variant("rejected", "rejected", 4, IntegrationRejected),
+        Variant("refused", "refused", 5, IntegrationRefused),
+        Variant("target_moved", "target_moved", 6, IntegrationTargetMoved),
+        Variant("stale_projection", "stale_projection", 7, StaleProjectionResult),
     ),
 )
 class IntegrateResult(ProtocolRoot):
     """The complete decision from one Git integration attempt."""
 
 
-@definition(
-    owner=MCP,
-    public=True,
-    proto=Proto.enum(
-        "ConformanceProfile",
-        (
-            EnumValue("read", "CONFORMANCE_PROFILE_READ", 1),
-            EnumValue("edit", "CONFORMANCE_PROFILE_EDIT", 2),
-            EnumValue("full", "CONFORMANCE_PROFILE_FULL", 3),
-        ),
-        named=True,
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "read": (
-                "Serves the read tools plus repository, symbol, diff, and file resources. "
-                "Fixtures reconstruct file bytes, verify language summaries and match tags, "
-                "replay cursors, reject stale state, preserve coverage, and stop at gitlinks. "
-                "Fixtures cover shared-worktree languages and retained virtual files. Mechanical "
-                "reads and warm cached semantic reads run with adapters stopped. Fixed "
-                "repositories record latency, bytes, tokens, and adapter memory."
-            ),
-            "edit": (
-                "Adds session change tools, integration, adapter formatting, and adapter "
-                "validation. Fixtures exercise every change and advertised action family, "
-                "ref-only read sessions, first-change worktree materialization, expected-head "
-                "races, Git merge conflicts and target races, cancellation, lost-response "
-                "recovery from Git state, and process restart. Command validators remain "
-                "unavailable and `max_validators` is zero."
-            ),
-            "full": (
-                "Adds repository-declared command validators and caller-code execution. Fixtures "
-                "verify direct execution without shell expansion, disposable-workspace cleanup, "
-                "environment construction, timeouts, bounded output capture, and restartable "
-                "adapter processes. A release claim also runs the suite with two different "
-                "language adapters and one embedded-language repository."
-            ),
-        }
-    },
-)
-class ConformanceProfile(str, Enum):
-    "Runtime conformance level verified for this workspace. Profiles accumulate. Shared checks validate schemas and examples, reference reachability, axis ownership, generated Protobuf output, adapter service compilation, and the handshake. Runtime fixtures cover ordering, limits, typed failures, the shared-worktree barrier, and topological virtual-source sync. `Contract` identifies the schema under test."
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class RecoveryContinueParams(ClosedModel):
+    """Imports a conflict resolution from one retained conventional Git worktree. The index
+    must have no unmerged entries and the worktree must have no unstaged or untracked paths.
+    Rift imports only the reviewed index tree."""
 
-    READ = "read"
-    EDIT = "edit"
-    FULL = "full"
+    expected: Field[RecoveryManifest] = proto_field(
+        description="Exact staged index and worktree bytes reviewed by the caller.",
+        number=1,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ConsumedRecovery(ClosedModel):
+    """Exact recovery guards consumed by successful continuation. It is response evidence and
+    does not assert that the conventional worktree or private ref still exists."""
+
+    recovery: Field[RecoveryId] = proto_field(number=1)
+    expected_source: Field[core.ProjectionState] = proto_field(number=2)
+    target: Field[IntegrationTarget] = proto_field(number=3)
+    expected_target: Field[core.GitCommit] = proto_field(number=4)
+    manifest: Field[RecoveryManifest] = proto_field(number=5)
+
+    @model_validator(mode="after")
+    def manifest_names_recovery(self) -> ConsumedRecovery:
+        if self.manifest.recovery != self.recovery:
+            raise ValueError("consumed manifest must name this recovery")
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RecoveryIntegrationContinued(ClosedModel):
+    """A resolved integration merge was imported, validated, and published to its target ref."""
+
+    status: Field[Literal["integration_continued"]] = proto_field(
+        default="integration_continued"
+    )
+    recovery: Field[ConsumedRecovery] = proto_field(number=1)
+    integration: Field[IntegrationSucceeded] = proto_field(
+        description="Completed target update and validation evidence.", number=2
+    )
+
+    @model_validator(mode="after")
+    def result_matches_recovery(self) -> RecoveryIntegrationContinued:
+        if self.integration.previous_state != self.recovery.expected_source:
+            raise ValueError("integration source must match the consumed recovery")
+        if self.integration.target != self.recovery.target:
+            raise ValueError("integration target must match the consumed recovery")
+        if self.integration.previous_target != self.recovery.expected_target:
+            raise ValueError("integration target head must match the consumed recovery")
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RecoveryIntegrationSynchronized(ClosedModel):
+    """The reviewed resolution already matched the target tree. Rift rebased the source and
+    removed the recovery without creating a commit."""
+
+    status: Field[Literal["integration_synchronized"]] = proto_field(
+        default="integration_synchronized"
+    )
+    recovery: Field[ConsumedRecovery] = proto_field(number=1)
+    integration: Field[IntegrationSynchronized] = proto_field(number=2)
+
+    @model_validator(mode="after")
+    def result_matches_recovery(self) -> RecoveryIntegrationSynchronized:
+        if self.integration.previous_state != self.recovery.expected_source:
+            raise ValueError("synchronization source must match the consumed recovery")
+        if self.integration.target != self.recovery.target:
+            raise ValueError("synchronization target must match the consumed recovery")
+        if self.integration.target_head != self.recovery.expected_target:
+            raise ValueError(
+                "synchronization target head must match the consumed recovery"
+            )
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RecoveryIntegrationRejected(ClosedModel):
+    """Validation rejected the reviewed resolution. The recovery remains available for more
+    edits or explicit abort."""
+
+    status: Field[Literal["integration_rejected"]] = proto_field(
+        default="integration_rejected"
+    )
+    recovery: Field[GitRecovery] = proto_field(
+        description="Retained recovery with its rescanned current manifest.", number=1
+    )
+    integration: Field[IntegrationRejected] = proto_field(number=2)
+
+    @model_validator(mode="after")
+    def result_matches_recovery(self) -> RecoveryIntegrationRejected:
+        if self.integration.source != self.recovery.expected_source:
+            raise ValueError("rejection source must match the retained recovery")
+        if self.integration.target != self.recovery.target:
+            raise ValueError("rejection target must match the retained recovery")
+        if self.integration.target_head != self.recovery.expected_target:
+            raise ValueError("rejection target head must match the retained recovery")
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RecoveryIntegrationRefused(ClosedModel):
+    """Repository state prevented publication of the reviewed resolution. The recovery remains
+    available for retry or explicit abort."""
+
+    status: Field[Literal["integration_refused"]] = proto_field(
+        default="integration_refused"
+    )
+    recovery: Field[GitRecovery] = proto_field(
+        description="Retained recovery with its rescanned current manifest.", number=1
+    )
+    integration: Field[IntegrationRefused] = proto_field(number=2)
+
+    @model_validator(mode="after")
+    def result_matches_recovery(self) -> RecoveryIntegrationRefused:
+        if self.integration.source != self.recovery.expected_source:
+            raise ValueError("refusal source must match the retained recovery")
+        if self.integration.target != self.recovery.target:
+            raise ValueError("refusal target must match the retained recovery")
+        if self.integration.expected_target != self.recovery.expected_target:
+            raise ValueError("refusal target head must match the retained recovery")
+        return self
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RecoveryObsolete(ClosedModel):
+    """The source projection, target ref, or recovery bytes moved before continuation. Nothing
+    was published; the exact current values let the caller choose whether to abort or restart."""
+
+    status: Field[Literal["obsolete"]] = proto_field(default="obsolete")
+    recovery: Field[RecoveryId] = proto_field(number=1)
+    expected_source: Field[core.ProjectionState] = proto_field(number=2)
+    current_source: Field[core.ProjectionState] = proto_field(number=3)
+    target: Field[IntegrationTarget] = proto_field(number=4)
+    expected_target: Field[core.GitCommit] = proto_field(number=5)
+    current_target: Field[core.GitCommit | None] = proto_field(
+        default=None,
+        description="Current target commit, or null if the guarded branch was deleted.",
+        number=6,
+    )
+    expected_manifest: Field[RecoveryManifest] = proto_field(number=7)
+    current_manifest: Field[RecoveryManifest] = proto_field(number=8)
+
+    @model_validator(mode="after")
+    def values_are_correlated(self) -> RecoveryObsolete:
+        if self.expected_source.projection != self.current_source.projection:
+            raise ValueError("recovery source states must name the same projection")
+        if self.expected_manifest.recovery != self.recovery:
+            raise ValueError("expected manifest must name this recovery")
+        if self.current_manifest.recovery != self.recovery:
+            raise ValueError("current manifest must name this recovery")
+        if (
+            self.expected_source == self.current_source
+            and self.expected_target == self.current_target
+            and self.expected_manifest == self.current_manifest
+        ):
+            raise ValueError("obsolete recovery requires at least one changed guard")
+        return self
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class RecoveryListParams(ClosedModel):
+    """Selects one captured page of active recoveries in recovery-id order."""
+
+    limit: Field[int] = proto_field(default=100, ge=1, le=1000, number=1)
+    cursor: Field[Cursor | None] = proto_field(default=None, number=2)
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class RecoveryListResult(ClosedModel):
+    """One page of durable merge recoveries. Listing rescans each conventional worktree and
+    returns the manifest a caller can review and pass to continue or abort."""
+
+    recoveries: Field[list[GitRecovery]] = proto_field(number=1)
+    next_cursor: Field[Cursor | None] = proto_field(default=None, number=2)
+
+
+@union(
+    owner=MCP,
+    oneof="variant",
+    discriminator="status",
+    variants=(
+        Variant(
+            "integration_continued",
+            "integration_continued",
+            1,
+            RecoveryIntegrationContinued,
+        ),
+        Variant("obsolete", "obsolete", 2, RecoveryObsolete),
+        Variant(
+            "integration_synchronized",
+            "integration_synchronized",
+            3,
+            RecoveryIntegrationSynchronized,
+        ),
+        Variant(
+            "integration_rejected",
+            "integration_rejected",
+            4,
+            RecoveryIntegrationRejected,
+        ),
+        Variant(
+            "integration_refused",
+            "integration_refused",
+            5,
+            RecoveryIntegrationRefused,
+        ),
+    ),
+)
+class RecoveryContinueResult(ProtocolRoot):
+    """A completed integration or failed saved-state comparison."""
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class RecoveryAbortParams(ClosedModel):
+    """Previews or removes one retained recovery without changing source or a public Git ref.
+    The manifest prevents deleting recovery edits the caller did not review. A mismatch fails
+    with `recovery_moved`; an unrepresentable special file fails with `unsupported_path`."""
+
+    expected: Field[RecoveryManifest] = proto_field(number=1)
+    confirm: Field[bool] = proto_field(default=False, number=2)
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RecoveryAbortPreview(ClosedModel):
+    """The recovery still exists and no cleanup was performed."""
+
+    status: Field[Literal["preview"]] = proto_field(default="preview")
+    recovery: Field[GitRecovery] = proto_field(number=1)
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RecoveryAborted(ClosedModel):
+    """The reviewed worktree, private ref, and recovery pins were removed."""
+
+    status: Field[Literal["aborted"]] = proto_field(default="aborted")
+    recovery: Field[RecoveryId] = proto_field(number=1)
+    manifest: Field[RecoveryManifest] = proto_field(
+        description="Exact final manifest accepted before cleanup.", number=2
+    )
+
+    @model_validator(mode="after")
+    def manifest_names_recovery(self) -> RecoveryAborted:
+        if self.manifest.recovery != self.recovery:
+            raise ValueError("aborted manifest must name this recovery")
+        return self
+
+
+@union(
+    owner=MCP,
+    oneof="variant",
+    discriminator="status",
+    variants=(
+        Variant("preview", "preview", 1, RecoveryAbortPreview),
+        Variant("aborted", "aborted", 2, RecoveryAborted),
+    ),
+)
+class RecoveryAbortResult(ProtocolRoot):
+    """A recovery cleanup preview or completed cleanup."""
 
 
 @definition(
@@ -3936,59 +4944,118 @@ class ResultOrder(str, Enum):
     IDENTITY = "identity"
 
 
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.message(placement=Placement("content", 1)),
-    schema_extra={},
-)
-class FileResourcePayloadUtf8FileContent(ClosedModel):
-    kind: Field[Literal["regular"]] = proto_field(default="regular", number=1)
+def _file_resource_path(uri: FileResourceUri | core.FileId) -> str:
+    prefix = "rift://file/"
+    return uri.root.removeprefix(prefix).partition("?")[0]
 
 
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.message(placement=Placement("file", 2)),
-    schema_extra={},
-)
-class FileResourcePayloadUtf8File(ClosedModel):
-    content: Field[FileResourcePayloadUtf8FileContent | None] = proto_field(
-        default=None, number=1
-    )
+def _file_resource_query(uri: FileResourceUri) -> dict[str, list[str]]:
+    query = uri.root.partition("?")[2]
+    if not query:
+        return {}
+    return parse_qs(query, keep_blank_values=True, strict_parsing=True)
+
+
+def _validate_file_identity(
+    uri: FileResourceUri, at: core.ResolvedSnapshot, file: core.File
+) -> None:
+    if _file_resource_path(uri) != _file_resource_path(file.id):
+        raise ValueError("file payload URI and entry must name the same path")
+    revision = _file_resource_query(uri).get("rev", [None])[0]
+    if (
+        revision is not None
+        and revision.startswith("snapshot:")
+        and revision != f"snapshot:{at.snapshot.id.root}"
+    ):
+        raise ValueError("file payload must resolve its snapshot selector exactly")
+
+
+def _validate_regular_file_payload(
+    *,
+    uri: FileResourceUri,
+    at: core.ResolvedSnapshot,
+    file: core.File,
+    start: int,
+    end: int,
+    total_bytes: int,
+    content_bytes: int,
+    next_uri: FileResourceUri | None,
+) -> None:
+    _validate_file_identity(uri, at, file)
+    entry = file.content.root
+    if entry.kind != "regular":
+        raise ValueError("text or base64 encoding requires a regular entry")
+    if total_bytes != entry.size:
+        raise ValueError("total_bytes must equal the regular entry size")
+    if not start <= end <= total_bytes:
+        raise ValueError("file range must satisfy start <= end <= total_bytes")
+    if content_bytes != end - start:
+        raise ValueError("content byte length must equal end - start")
+
+    request = _file_resource_query(uri)
+    requested_start = int(request.get("start", ["0"])[0])
+    if start != requested_start:
+        raise ValueError("payload start must equal the requested start")
+    if "length" in request and end - start > int(request["length"][0]):
+        raise ValueError("payload exceeds the requested range length")
+
+    if end == total_bytes:
+        if next_uri is not None:
+            raise ValueError("EOF payload cannot carry a continuation")
+        return
+    if next_uri is None:
+        raise ValueError("a partial file payload requires a continuation")
+    if _file_resource_path(next_uri) != _file_resource_path(uri):
+        raise ValueError("file continuation must keep the same path")
+    continuation = _file_resource_query(next_uri)
+    expected_revision = f"snapshot:{at.snapshot.id.root}"
+    if continuation.get("rev") != [expected_revision]:
+        raise ValueError("file continuation must pin the resolved snapshot")
+    if continuation.get("start") != [str(end)]:
+        raise ValueError("file continuation must begin at end")
+    if "length" not in continuation:
+        raise ValueError("file continuation must carry an explicit length")
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class FileResourcePayloadUtf8(ClosedModel):
-    """A range whose bytes decode as UTF-8. Start and end fall on UTF-8 code-point boundaries."""
+    """A regular-file range whose bytes decode as UTF-8. Start and end fall on UTF-8
+    code-point boundaries."""
 
     encoding: Field[Literal["utf8"]] = proto_field(default="utf8")
-    content: Field[str | None] = proto_field(default=None, number=1)
-    file: Field[FileResourcePayloadUtf8File | None] = proto_field(
-        default=None, number=2
+    uri: Field[FileResourceUri] = proto_field(
+        description="Exact resource request this payload answers.", number=1
+    )
+    at: Field[core.ResolvedSnapshot] = proto_field(
+        description="Exact source snapshot from which the entry and bytes were read.",
+        number=2,
+    )
+    file: Field[core.File] = proto_field(
+        description="Complete regular source-store entry.", number=3
+    )
+    start: Field[int] = proto_field(ge=0, le=9007199254740991, number=4)
+    end: Field[int] = proto_field(ge=0, le=9007199254740991, number=5)
+    total_bytes: Field[int] = proto_field(ge=0, le=9007199254740991, number=6)
+    content: Field[str] = proto_field(number=7)
+    next: Field[FileResourceUri | None] = proto_field(
+        default=None,
+        description="Next exact-snapshot range beginning at `end`, or null at EOF.",
+        number=8,
     )
 
-
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.message(placement=Placement("content", 1)),
-    schema_extra={},
-)
-class FileResourcePayloadBase64FileContent(ClosedModel):
-    kind: Field[Literal["regular"]] = proto_field(default="regular", number=1)
-
-
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.message(placement=Placement("file", 2)),
-    schema_extra={},
-)
-class FileResourcePayloadBase64File(ClosedModel):
-    content: Field[FileResourcePayloadBase64FileContent | None] = proto_field(
-        default=None, number=1
-    )
+    @model_validator(mode="after")
+    def range_is_correlated(self) -> FileResourcePayloadUtf8:
+        _validate_regular_file_payload(
+            uri=self.uri,
+            at=self.at,
+            file=self.file,
+            start=self.start,
+            end=self.end,
+            total_bytes=self.total_bytes,
+            content_bytes=len(self.content.encode("utf-8")),
+            next_uri=self.next,
+        )
+        return self
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
@@ -3996,73 +5063,87 @@ class FileResourcePayloadBase64(ClosedModel):
     """A range carried as canonical base64 because its bytes do not form valid UTF-8."""
 
     encoding: Field[Literal["base64"]] = proto_field(default="base64")
-    content: Field[str | None] = proto_field(
-        default=None,
+    uri: Field[FileResourceUri] = proto_field(
+        description="Exact resource request this payload answers.", number=1
+    )
+    at: Field[core.ResolvedSnapshot] = proto_field(
+        description="Exact source snapshot from which the entry and bytes were read.",
+        number=2,
+    )
+    file: Field[core.File] = proto_field(
+        description="Complete regular source-store entry.", number=3
+    )
+    start: Field[int] = proto_field(ge=0, le=9007199254740991, number=4)
+    end: Field[int] = proto_field(ge=0, le=9007199254740991, number=5)
+    total_bytes: Field[int] = proto_field(ge=0, le=9007199254740991, number=6)
+    content: Field[str] = proto_field(
         pattern="^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
-        number=1,
+        number=7,
     )
-    file: Field[FileResourcePayloadBase64File | None] = proto_field(
-        default=None, number=2
-    )
-
-
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.enum(
-        "Kind",
-        (
-            EnumValue("lfs_pointer", "LFS_POINTER", 1),
-            EnumValue("symlink", "SYMLINK", 2),
-            EnumValue("gitlink", "GITLINK", 3),
-        ),
-        placement=Placement("kind", 1),
-    ),
-    schema_extra={},
-)
-class FileResourcePayloadNoneFileContentKind(str, Enum):
-    LFS_POINTER = "lfs_pointer"
-    SYMLINK = "symlink"
-    GITLINK = "gitlink"
-
-
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.message(placement=Placement("content", 1)),
-    schema_extra={},
-)
-class FileResourcePayloadNoneFileContent(ClosedModel):
-    kind: Field[FileResourcePayloadNoneFileContentKind | None] = proto_field(
-        default=None, number=1
+    next: Field[FileResourceUri | None] = proto_field(
+        default=None,
+        description="Next exact-snapshot range beginning at `end`, or null at EOF.",
+        number=8,
     )
 
-
-@definition(
-    owner=MCP,
-    public=False,
-    proto=Proto.message(placement=Placement("file", 6)),
-    schema_extra={},
-)
-class FileResourcePayloadNoneFile(ClosedModel):
-    content: Field[FileResourcePayloadNoneFileContent | None] = proto_field(
-        default=None, number=1
-    )
+    @model_validator(mode="after")
+    def range_is_correlated(self) -> FileResourcePayloadBase64:
+        decoded = base64.b64decode(self.content, validate=True)
+        if base64.b64encode(decoded).decode("ascii") != self.content:
+            raise ValueError("file content must use canonical padded base64")
+        try:
+            decoded.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            raise ValueError("valid UTF-8 file ranges must use utf8 encoding")
+        _validate_regular_file_payload(
+            uri=self.uri,
+            at=self.at,
+            file=self.file,
+            start=self.start,
+            end=self.end,
+            total_bytes=self.total_bytes,
+            content_bytes=len(decoded),
+            next_uri=self.next,
+        )
+        return self
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class FileResourcePayloadNone(ClosedModel):
-    """A non-regular tree entry. Its empty interval carries no bytes and has no continuation."""
+    """A complete non-regular source-store entry. Its empty interval carries no bytes and has
+    no continuation."""
 
     encoding: Field[Literal["none"]] = proto_field(default="none")
-    start: Field[Literal[0]] = proto_field(default=0, number=1)
-    end: Field[Literal[0]] = proto_field(default=0, number=2)
-    total_bytes: Field[Literal[0]] = proto_field(default=0, number=3)
-    content: Field[None] = proto_field(default=None, number=4)
-    next: Field[None] = proto_field(default=None, number=5)
-    file: Field[FileResourcePayloadNoneFile | None] = proto_field(
-        default=None, number=6
+    uri: Field[FileResourceUri] = proto_field(
+        description="Exact resource request this payload answers.", number=1
     )
+    at: Field[core.ResolvedSnapshot] = proto_field(
+        description="Exact source snapshot from which the entry was read.", number=2
+    )
+    file: Field[core.File] = proto_field(
+        description="Complete LFS-pointer, symlink, or gitlink entry.", number=3
+    )
+    start: Field[Literal[0]] = proto_field(default=0, number=4)
+    end: Field[Literal[0]] = proto_field(default=0, number=5)
+    total_bytes: Field[Literal[0]] = proto_field(default=0, number=6)
+    content: Field[None] = proto_field(default=None, number=7)
+    next: Field[None] = proto_field(default=None, number=8)
+
+    @model_validator(mode="after")
+    def entry_is_non_regular(self) -> FileResourcePayloadNone:
+        if self.file.content.root.kind == "regular":
+            raise ValueError("none encoding requires a non-regular entry")
+        _validate_file_identity(self.uri, self.at, self.file)
+        values = parse_qs(
+            self.uri.root.partition("?")[2],
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+        if int(values.get("start", ["0"])[0]) != 0:
+            raise ValueError("non-regular file reads must start at zero")
+        return self
 
 
 @union(
@@ -4076,25 +5157,24 @@ class FileResourcePayloadNone(ClosedModel):
     ),
 )
 class FileResourcePayload(ProtocolRoot):
-    "One bounded byte range from a file at one state. Regular files carry UTF-8 text where the selected bytes form valid UTF-8 and base64 otherwise. `next` continues at `end` until the complete file has been read."
+    "One complete source-store entry and a bounded byte range at an exact resolved snapshot. Regular files carry UTF-8 text where the selected bytes form valid UTF-8 and canonical base64 otherwise. `next` uses a `snapshot:` selector and continues at `end`; non-regular entries carry their complete metadata and no bytes."
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ExecutionAvailability(ClosedModel):
-    """Effective caller-code capability after intersecting repository policy with one adapter's
-    advertised operations. These values, rather than adapter capability alone, govern routing."""
+    """Effective caller-code routing after Rift intersects `rift.toml` with one adapter's
+    advertised operations."""
 
     execute: Field[bool] = proto_field(
         description=(
-            "Whether execute may route to this language after policy, adapter capability, and "
-            "host conformance intersect."
+            "Whether execute may route to this language after workspace configuration and adapter capability are applied."
         ),
         number=1,
     )
     debug: Field[bool] = proto_field(
         description=(
             "Whether all three debug tools may route to this language. True requires execute "
-            "authorization, the complete adapter debug operation triplet, and host conformance."
+            "enablement and the complete adapter debug operation triplet."
         ),
         number=2,
     )
@@ -4102,7 +5182,8 @@ class ExecutionAvailability(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class LanguageSupport(ClosedModel):
-    """Adapter identity and advertised capability sets for one language in this workspace."""
+    """Capabilities reported by one configured language adapter. `execution` applies the
+    workspace configuration to its caller-code operations."""
 
     language: Field[core.Language] = proto_field(
         description="Language name and optional dialect handled by the adapter.",
@@ -4132,7 +5213,7 @@ class LanguageSupport(ClosedModel):
         number=5,
     )
     execution: Field[ExecutionAvailability] = proto_field(
-        description="Effective host-policy and adapter-capability intersection for caller code.",
+        description="Effective workspace configuration and adapter capability for caller code.",
         number=6,
     )
 
@@ -4149,23 +5230,41 @@ MODELS = (
     SearchHit,
     ActionsResourceLink,
     ActionResourceLink,
+    FsResourceLink,
     ResourceLink,
     SymbolResourcePayload,
     DiffResourcePayload,
+    ProjectionKind,
+    FilesystemProjectionSummary,
+    FsResourcePayload,
     Contract,
     WorkspacePath,
+    ProjectionPath,
+    ProjectionLocation,
+    GitWorktreePath,
+    GitWorktreeLocation,
     SessionId,
     ConnectionId,
     FeatureId,
     ConnectRole,
     ConnectRequest,
     Connected,
-    ToolsChanged,
-    ConnectionEvent,
+    SessionSummary,
+    SessionListParams,
+    SessionListResult,
+    SessionContinueParams,
+    SessionContinueResult,
+    SessionRemoveParams,
+    SessionRemoveResult,
+    ProjectionOpenParams,
+    ProjectionOpenResult,
+    ProjectionCloseParams,
+    ProjectionCloseResult,
     DebugLimits,
     ExecutionLimits,
     Limits,
     RepositoryResourceUri,
+    FsResourceUri,
     FileResourceUri,
     RepositoryResourcePayload,
     SearchResult,
@@ -4201,24 +5300,32 @@ MODELS = (
     PatchParams,
     RewriteParams,
     RevertParams,
-    MergeParams,
     RenameParams,
     MoveParams,
     DeleteParams,
     ChangeSignatureParams,
     ActParams,
+    ProjectionRestoreParams,
     ResolvedOperation,
     CommandValidator,
     ValidatorResult,
     ChangeValidation,
     ChangeSummary,
+    ProjectionRestoreResult,
     RefusalReason,
     ChangeResult,
     IntegrationTarget,
     IntegrateParams,
     GitConflict,
+    RecoveryId,
+    GitRecovery,
     IntegrateResult,
-    ConformanceProfile,
+    RecoveryListParams,
+    RecoveryListResult,
+    RecoveryContinueParams,
+    RecoveryContinueResult,
+    RecoveryAbortParams,
+    RecoveryAbortResult,
     ResultOrder,
     FileResourcePayload,
     ExecutionAvailability,

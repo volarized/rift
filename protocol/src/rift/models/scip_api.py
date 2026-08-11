@@ -118,15 +118,15 @@ SCIP_API_PACKAGE = ProtoPackage(
     file=ProtoFile(
         "rift/scip.proto",
         RIFT_SCIP,
-        description="The Rift server's read-only SCIP projection API.",
+        description="The Rift server's read-only SCIP export API.",
         imports=("rift/core.proto", "scip/scip.proto"),
     ),
     models=(Omission, Request, Header, Event),
     enums=(),
     services=(
         Service(
-            "Projection",
-            "Projects one Rift snapshot into the pinned SCIP schema.",
+            "Index",
+            "Exports one Rift snapshot into the pinned SCIP schema.",
             (
                 Rpc(
                     "Read",

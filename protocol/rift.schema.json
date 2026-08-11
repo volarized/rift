@@ -2,7 +2,7 @@
   "$defs": {
     "AdapterProcessConfig": {
       "additionalProperties": false,
-      "description": "How Rift starts one configured adapter process and bounds its advertised state capacity.",
+      "description": "How Rift starts one configured adapter process.",
       "properties": {
         "command": {
           "description": "Executable followed by literal arguments used to start the adapter process.",
@@ -23,31 +23,6 @@
           },
           "title": "Env",
           "type": "object"
-        },
-        "state-cap": {
-          "anyOf": [
-            {
-              "maximum": 4294967295,
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Optional repository-side cap on adapter.AdapterLimits.max_states; Rift uses the smaller bound.",
-          "rift:bounds": {
-            "field": "max_states",
-            "model": "AdapterLimits"
-          },
-          "rift:operation": "minimum",
-          "title": "State-Cap"
-        },
-        "startup-timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "60s",
-          "description": "Time allowed for the process to start serving and answer Describe."
         }
       },
       "required": [
@@ -64,7 +39,7 @@
     },
     "CommandValidator": {
       "additionalProperties": false,
-      "description": "A repository-declared integration check executed directly, without a shell, in a disposable validation workspace materialized from the complete merged tree. Current user policy must grant the declaration. The workspace is only the process working directory; it does not isolate the command from the host.",
+      "description": "An integration check from the workspace-root `rift.toml`, executed directly without a shell in a disposable validation workspace materialized from the complete merged tree. The workspace is the process working directory and does not isolate the command from the host.",
       "properties": {
         "id": {
           "description": "Repository label shown with this validator. It is unique within `validators.commands`.",
@@ -110,7 +85,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Repository-requested environment additions. Rift supplies a policy-controlled PATH, private HOME and temporary directories, and a UTF-8 locale; it removes host secrets and every other inherited variable.",
+          "description": "Environment additions declared for the command. Rift starts it directly without a shell and supplies its working directory separately.",
           "propertyNames": {
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
           },
@@ -303,40 +278,6 @@
       "title": "CommandValidatorKind",
       "type": "string"
     },
-    "ConformanceProfile": {
-      "description": "Runtime conformance level verified for this workspace. Profiles accumulate. Shared checks validate schemas and examples, reference reachability, axis ownership, generated Protobuf output, adapter service compilation, and the handshake. Runtime fixtures cover ordering, limits, typed failures, the shared-worktree barrier, and topological virtual-source sync. `Contract` identifies the schema under test.",
-      "enum": [
-        "read",
-        "edit",
-        "full"
-      ],
-      "rift:enumDescriptions": {
-        "edit": "Adds session change tools, integration, adapter formatting, and adapter validation. Fixtures exercise every change and advertised action family, ref-only read sessions, first-change worktree materialization, expected-head races, Git merge conflicts and target races, cancellation, lost-response recovery from Git state, and process restart. Command validators remain unavailable and `max_validators` is zero.",
-        "full": "Adds repository-declared command validators and caller-code execution. Fixtures verify direct execution without shell expansion, disposable-workspace cleanup, environment construction, timeouts, bounded output capture, and restartable adapter processes. A release claim also runs the suite with two different language adapters and one embedded-language repository.",
-        "read": "Serves the read tools plus repository, symbol, diff, and file resources. Fixtures reconstruct file bytes, verify language summaries and match tags, replay cursors, reject stale state, preserve coverage, and stop at gitlinks. Fixtures cover shared-worktree languages and retained virtual files. Mechanical reads and warm cached semantic reads run with adapters stopped. Fixed repositories record latency, bytes, tokens, and adapter memory."
-      },
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "enum": "ConformanceProfile",
-        "type": "rift.mcp.ConformanceProfile",
-        "values": {
-          "edit": {
-            "name": "CONFORMANCE_PROFILE_EDIT",
-            "number": 2
-          },
-          "full": {
-            "name": "CONFORMANCE_PROFILE_FULL",
-            "number": 3
-          },
-          "read": {
-            "name": "CONFORMANCE_PROFILE_READ",
-            "number": 1
-          }
-        }
-      },
-      "title": "ConformanceProfile",
-      "type": "string"
-    },
     "CoverageScope": {
       "anyOf": [
         {
@@ -466,10 +407,10 @@
     },
     "ExecutionConfig": {
       "additionalProperties": false,
-      "description": "Repository authorization and resource policy for caller-provided code.",
+      "description": "Workspace enablement and limits for caller-provided code.",
       "properties": {
         "allow": {
-          "description": "Exact languages authorized for execute when their adapters advertise the execute operation. Empty disables caller-provided code.",
+          "description": "Exact languages enabled for execute when their adapters advertise the execute operation. Empty disables caller-provided code.",
           "items": {
             "$ref": "#/$defs/LanguageSelector"
           },
@@ -479,7 +420,7 @@
           "uniqueItems": true
         },
         "debug": {
-          "description": "Subset of allow authorized for debugging when all three debug operations are advertised. Empty disables debugging.",
+          "description": "Subset of allow enabled for debugging when all three debug operations are advertised. Empty disables debugging.",
           "items": {
             "$ref": "#/$defs/LanguageSelector"
           },
@@ -577,29 +518,16 @@
       "title": "ExecutionConfig",
       "type": "object"
     },
-    "FactsConfig": {
-      "additionalProperties": false,
-      "description": "Retention bound for adapter facts cached by snapshot.",
-      "properties": {
-        "max-size": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "4GiB",
-          "description": "Maximum size of the semantic fact cache before least-recently-used eviction."
-        }
-      },
-      "title": "FactsConfig",
-      "type": "object"
-    },
     "FileId": {
       "description": "Identity of one file, and the URI that resolves it. The path after `rift://file/` is a `ProjectPath`: unreserved URI characters remain literal, `/` separates segments, and every other UTF-8 byte uses uppercase percent-encoding. Decoding to an absolute path or a `.` or `..` segment is refused. A revision can be attached as `?rev=`.",
       "examples": [
         "rift://file/pkg/util.py",
         "rift://file/src/%E2%98%83.ts",
-        "rift://file/src/config.ts?rev=main"
+        "rift://file/src/config.ts?rev=git:main"
       ],
-      "maxLength": 1024,
+      "maxLength": 8192,
       "minLength": 13,
-      "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(\\?rev=[A-Za-z0-9._~%!$&'()*+,;:@/-]{1,256})?$",
+      "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(\\?rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26}))?$",
       "rift:package": "rift.core",
       "rift:proto": {
         "package": "rift.core",
@@ -648,36 +576,14 @@
       "title": "GuaranteeKind",
       "type": "string"
     },
-    "IntegrationMode": {
-      "description": "Whether Rift may advance a branch checked out in a clean working tree.",
-      "enum": [
-        "manual",
-        "auto"
-      ],
-      "title": "IntegrationMode",
-      "type": "string"
-    },
     "LanguageSelector": {
       "description": "The TOML spelling of the same exact language pair represented by ``core.Language``.",
       "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}(?::[A-Za-z][A-Za-z0-9._-]{0,63})?$",
       "title": "LanguageSelector",
       "type": "string"
     },
-    "ProfileConfig": {
-      "additionalProperties": false,
-      "description": "Repository-side ceiling over the conformance profile advertised to callers.",
-      "properties": {
-        "max": {
-          "$ref": "#/$defs/ConformanceProfile",
-          "default": "edit",
-          "description": "Highest conformance profile this repository permits Rift to advertise."
-        }
-      },
-      "title": "ProfileConfig",
-      "type": "object"
-    },
     "ProjectPath": {
-      "description": "One path below the project root, using forward slashes and UTF-8. The empty path names the root itself. Absolute paths, backslashes, control characters, empty segments, and `.` or `..` segments are refused before the filesystem is touched.",
+      "description": "One path below the project root, using forward slashes and UTF-8. The empty path names\nthe root itself. Absolute paths, backslashes, control characters, empty segments, and `.` or\n`..` segments are refused before the filesystem is touched. The limit is 1000 UTF-8 bytes,\nnot characters.",
       "examples": [
         "",
         "src/config.ts",
@@ -693,62 +599,22 @@
       "title": "ProjectPath",
       "type": "string"
     },
-    "ReadsConfig": {
-      "additionalProperties": false,
-      "description": "Bounds for detached worktrees materialized by adapter-backed revision reads.",
-      "properties": {
-        "max-worktrees": {
-          "default": 2,
-          "description": "Maximum detached read worktrees retained at once; zero disables materialization.",
-          "maximum": 64,
-          "minimum": 0,
-          "title": "Max-Worktrees",
-          "type": "integer"
-        },
-        "worktree-idle-timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "5m",
-          "description": "Time an unreferenced detached read worktree remains available for reuse."
-        }
-      },
-      "title": "ReadsConfig",
-      "type": "object"
-    },
-    "ServerConfig": {
-      "additionalProperties": false,
-      "description": "Lifecycle policy for the repository's shared Rift server.",
-      "properties": {
-        "idle-timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "10m",
-          "description": "Time with no open connection after which the server exits."
-        }
-      },
-      "title": "ServerConfig",
-      "type": "object"
-    },
     "SessionBase": {
-      "description": "Source state from which a new connection starts.",
+      "description": "Source state from which a new MCP process starts its session.",
       "enum": [
-        "head",
-        "worktree"
+        "head"
       ],
       "title": "SessionBase",
       "type": "string"
     },
     "SessionConfig": {
       "additionalProperties": false,
-      "description": "Initial state and integration policy for each connection-bound session.",
+      "description": "Initial state for each MCP session.",
       "properties": {
         "base": {
           "$ref": "#/$defs/SessionBase",
           "default": "head",
-          "description": "State captured as the session ref's initial commit."
-        },
-        "integration": {
-          "$ref": "#/$defs/IntegrationMode",
-          "default": "manual",
-          "description": "Whether integration may advance and update a clean checked-out branch."
+          "description": "State imported into the session projection. `head` imports the resolved HEAD tree."
         }
       },
       "title": "SessionConfig",
@@ -787,7 +653,7 @@
       "description": "Repository-declared command checks requested before integration.",
       "properties": {
         "commands": {
-          "description": "Exact command declarations, in execution order. Current user policy must grant each declaration before Rift runs it.",
+          "description": "Exact command declarations, in execution order.",
           "items": {
             "$ref": "#/$defs/CommandValidator"
           },
@@ -802,16 +668,6 @@
           "title": "Carry",
           "type": "array",
           "uniqueItems": true
-        },
-        "max-timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "5m",
-          "description": "Upper bound on CommandValidator.timeout_ms after conversion to milliseconds.",
-          "rift:bounds": {
-            "field": "timeout_ms",
-            "model": "CommandValidator"
-          },
-          "rift:conversion": "Duration.milliseconds"
         }
       },
       "title": "ValidatorsConfig",
@@ -821,20 +677,8 @@
   "additionalProperties": false,
   "description": "The typed rift.toml file. Configuration reuses protocol enums and paths, and carries machine-checked links to the fields it bounds.",
   "properties": {
-    "server": {
-      "$ref": "#/$defs/ServerConfig"
-    },
     "session": {
       "$ref": "#/$defs/SessionConfig"
-    },
-    "reads": {
-      "$ref": "#/$defs/ReadsConfig"
-    },
-    "facts": {
-      "$ref": "#/$defs/FactsConfig"
-    },
-    "profile": {
-      "$ref": "#/$defs/ProfileConfig"
     },
     "execution": {
       "$ref": "#/$defs/ExecutionConfig"

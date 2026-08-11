@@ -27,6 +27,7 @@ from pydantic import (
     ConfigDict,
     GetJsonSchemaHandler,
     RootModel,
+    model_validator,
 )
 from pydantic import (
     Field as schema_field,
@@ -539,22 +540,39 @@ def definition(
 def _root_model(cls: type[Any], annotation: Any) -> type[Any]:
     """Rebuild one authored root definition as the Pydantic model it describes.
 
-    The authored class carries a name and a docstring; Pydantic needs
-    `RootModel[...]` parametrized with the value type. Building it here is what
-    keeps the value type out of a string in the model files, where a regex would
-    have to survive two rounds of escaping and no checker would read it.
+    The authored class carries a name, docstring, and optional model validators;
+    Pydantic needs `RootModel[...]` parametrized with the value type. Building
+    it here keeps the value type out of a string in the model files, where a
+    regex would have to survive two rounds of escaping and no checker would read
+    it. Validators are redecorated on the rebuilt class so scalar and union
+    semantic checks cannot disappear silently.
     """
+
+    namespace: dict[str, Any] = {
+        "__doc__": cls.__doc__,
+        "__module__": cls.__module__,
+        "__qualname__": cls.__qualname__,
+    }
+
+    decorators = cls.__pydantic_decorators__
+    unsupported = {
+        "field validators": decorators.field_validators,
+        "field serializers": decorators.field_serializers,
+        "model serializers": decorators.model_serializers,
+        "computed fields": decorators.computed_fields,
+    }
+    for kind, authored in unsupported.items():
+        if authored:
+            raise TypeError(f"{cls.__name__} root definition cannot carry {kind}")
+    for name, decorator in decorators.model_validators.items():
+        namespace[name] = model_validator(mode=decorator.info.mode)(decorator.func)
 
     return cast(
         type[Any],
         type(
             cls.__name__,
             (ProtocolRoot[annotation],),
-            {
-                "__doc__": cls.__doc__,
-                "__module__": cls.__module__,
-                "__qualname__": cls.__qualname__,
-            },
+            namespace,
         ),
     )
 

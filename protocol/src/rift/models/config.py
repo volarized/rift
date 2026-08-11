@@ -95,75 +95,17 @@ class LanguageSelector(RootModel[str]):
 
 
 class SessionBase(str, Enum):
-    """Source state from which a new connection starts."""
+    """Source state from which a new MCP process starts its session."""
 
     HEAD = "head"
-    WORKTREE = "worktree"
-
-
-class IntegrationMode(str, Enum):
-    """Whether Rift may advance a branch checked out in a clean working tree."""
-
-    MANUAL = "manual"
-    AUTO = "auto"
-
-
-class ServerConfig(ConfigModel):
-    """Lifecycle policy for the repository's shared Rift server."""
-
-    idle_timeout: Duration = Field(
-        default=Duration("10m"),
-        alias="idle-timeout",
-        description="Time with no open connection after which the server exits.",
-    )
 
 
 class SessionConfig(ConfigModel):
-    """Initial state and integration policy for each connection-bound session."""
+    """Initial state for each MCP session."""
 
     base: SessionBase = Field(
         default=SessionBase.HEAD,
-        description="State captured as the session ref's initial commit.",
-    )
-    integration: IntegrationMode = Field(
-        default=IntegrationMode.MANUAL,
-        description="Whether integration may advance and update a clean checked-out branch.",
-    )
-
-
-class ReadsConfig(ConfigModel):
-    """Bounds for detached worktrees materialized by adapter-backed revision reads."""
-
-    max_worktrees: int = Field(
-        default=2,
-        alias="max-worktrees",
-        ge=0,
-        le=64,
-        description="Maximum detached read worktrees retained at once; zero disables materialization.",
-    )
-    worktree_idle_timeout: Duration = Field(
-        default=Duration("5m"),
-        alias="worktree-idle-timeout",
-        description="Time an unreferenced detached read worktree remains available for reuse.",
-    )
-
-
-class FactsConfig(ConfigModel):
-    """Retention bound for adapter facts cached by snapshot."""
-
-    max_size: ByteSize = Field(
-        default=ByteSize("4GiB"),
-        alias="max-size",
-        description="Maximum size of the semantic fact cache before least-recently-used eviction.",
-    )
-
-
-class ProfileConfig(ConfigModel):
-    """Repository-side ceiling over the conformance profile advertised to callers."""
-
-    max: mcp.ConformanceProfile = Field(
-        default=mcp.ConformanceProfile.EDIT,
-        description="Highest conformance profile this repository permits Rift to advertise.",
+        description="State imported into the session projection. `head` imports the resolved HEAD tree.",
     )
 
 
@@ -174,12 +116,12 @@ AllowedLanguages = Annotated[
 
 
 class ExecutionConfig(ConfigModel):
-    """Repository authorization and resource policy for caller-provided code."""
+    """Workspace enablement and limits for caller-provided code."""
 
     allow: AllowedLanguages = Field(
         default_factory=list,
         description=(
-            "Exact languages authorized for execute when their adapters advertise the execute "
+            "Exact languages enabled for execute when their adapters advertise the execute "
             "operation. Empty disables caller-provided code."
         ),
         json_schema_extra={"rift:selectsType": core.Language.__name__},
@@ -187,7 +129,7 @@ class ExecutionConfig(ConfigModel):
     debug: AllowedLanguages = Field(
         default_factory=list,
         description=(
-            "Subset of allow authorized for debugging when all three debug operations are "
+            "Subset of allow enabled for debugging when all three debug operations are "
             "advertised. Empty disables debugging."
         ),
         json_schema_extra={"rift:selectsType": core.Language.__name__},
@@ -267,7 +209,7 @@ class ExecutionConfig(ConfigModel):
     )
 
     @model_validator(mode="after")
-    def policy_is_well_formed(self) -> ExecutionConfig:
+    def configuration_is_well_formed(self) -> ExecutionConfig:
         allowed = [language.root for language in self.allow]
         debugged = [language.root for language in self.debug]
         if len(allowed) != len(set(allowed)):
@@ -299,7 +241,7 @@ class ExecutionConfig(ConfigModel):
     def permits_execution(
         self, language: core.Language, operations: list[core.AdapterOperation]
     ) -> bool:
-        """Whether policy and adapter capability jointly admit execute."""
+        """Whether workspace configuration and adapter capability admit execute."""
 
         allowed = {entry.root for entry in self.allow}
         return (
@@ -310,7 +252,7 @@ class ExecutionConfig(ConfigModel):
     def permits_debugging(
         self, language: core.Language, operations: list[core.AdapterOperation]
     ) -> bool:
-        """Whether policy and the complete adapter operation triplet admit debugging."""
+        """Whether workspace configuration and the complete adapter operation triplet admit debugging."""
 
         debugged = {entry.root for entry in self.debug}
         required = {
@@ -335,7 +277,7 @@ class ExecutionConfig(ConfigModel):
         )
 
     def advertised_limits(self) -> mcp.ExecutionLimits | None:
-        """Public ceilings, or null when no language is authorized to execute."""
+        """Public ceilings, or null when no language is enabled for execution."""
 
         if not self.allow:
             return None
@@ -389,24 +331,12 @@ class ValidatorsConfig(ConfigModel):
 
     commands: list[mcp.CommandValidator] = Field(
         default_factory=list,
-        description=(
-            "Exact command declarations, in execution order. Current user policy must grant "
-            "each declaration before Rift runs it."
-        ),
+        description="Exact command declarations, in execution order.",
     )
     carry: list[core.ProjectPath] = Field(
         default_factory=list,
         description="Ignored project paths copied into each disposable validation workspace.",
         json_schema_extra={"uniqueItems": True},
-    )
-    max_timeout: Duration = Field(
-        default=Duration("5m"),
-        alias="max-timeout",
-        description="Upper bound on CommandValidator.timeout_ms after conversion to milliseconds.",
-        json_schema_extra={
-            "rift:bounds": _field_target(mcp.CommandValidator.timeout_ms),
-            "rift:conversion": "Duration.milliseconds",
-        },
     )
 
     @model_validator(mode="after")
@@ -414,13 +344,6 @@ class ValidatorsConfig(ConfigModel):
         ids = [command.id for command in self.commands]
         if len(ids) != len(set(ids)):
             raise ValueError("validators.commands ids must be unique")
-        if any(
-            command.timeout_ms > self.max_timeout.milliseconds
-            for command in self.commands
-        ):
-            raise ValueError(
-                "validators.commands timeout_ms exceeds validators.max-timeout"
-            )
         carried = [path.root for path in self.carry]
         if len(carried) != len(set(carried)):
             raise ValueError("validators.carry paths must be unique")
@@ -428,7 +351,7 @@ class ValidatorsConfig(ConfigModel):
 
 
 class AdapterProcessConfig(ConfigModel):
-    """How Rift starts one configured adapter process and bounds its advertised state capacity."""
+    """How Rift starts one configured adapter process."""
 
     command: list[str] = Field(
         min_length=1,
@@ -438,25 +361,6 @@ class AdapterProcessConfig(ConfigModel):
         default_factory=dict,
         description="Environment additions supplied to the adapter process.",
         json_schema_extra={"propertyNames": {"pattern": ENVIRONMENT_NAME_PATTERN}},
-    )
-    state_cap: int | None = Field(
-        default=None,
-        alias="state-cap",
-        ge=1,
-        le=4294967295,
-        description=(
-            "Optional repository-side cap on adapter.AdapterLimits.max_states; Rift uses the "
-            "smaller bound."
-        ),
-        json_schema_extra={
-            "rift:bounds": _field_target(adapter.AdapterLimits.max_states),
-            "rift:operation": "minimum",
-        },
-    )
-    startup_timeout: Duration = Field(
-        default=Duration("60s"),
-        alias="startup-timeout",
-        description="Time allowed for the process to start serving and answer Describe.",
     )
 
     @model_validator(mode="after")
@@ -472,20 +376,11 @@ class AdapterProcessConfig(ConfigModel):
             raise ValueError(f"invalid adapter environment names: {invalid!r}")
         return self
 
-    def effective_state_cap(self, advertised: adapter.AdapterLimits) -> int:
-        """Combine repository policy with the adapter's typed advertised limit."""
-
-        return min(advertised.max_states, self.state_cap or advertised.max_states)
-
 
 class RiftConfig(ConfigModel):
-    """Complete committed ``rift.toml`` configuration for one repository."""
+    """Workspace behavior loaded from the physical root's ``rift.toml``."""
 
-    server: ServerConfig = Field(default_factory=ServerConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
-    reads: ReadsConfig = Field(default_factory=ReadsConfig)
-    facts: FactsConfig = Field(default_factory=FactsConfig)
-    profile: ProfileConfig = Field(default_factory=ProfileConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     validators: ValidatorsConfig = Field(default_factory=ValidatorsConfig)
@@ -518,13 +413,8 @@ __all__ = [
     "ByteSize",
     "Duration",
     "ExecutionConfig",
-    "FactsConfig",
-    "IntegrationMode",
     "LanguageSelector",
-    "ProfileConfig",
-    "ReadsConfig",
     "RiftConfig",
-    "ServerConfig",
     "SessionBase",
     "SessionConfig",
     "ValidationConfig",

@@ -1,6 +1,6 @@
 syntax = "proto3";
 // Generated from the Pydantic models under protocol/src/rift/models. Do not edit.
-// The Rift server's read-only SCIP projection API.
+// The Rift server's read-only SCIP export API.
 package rift.scip;
 import "rift/core.proto";
 import "scip/scip.proto";
@@ -49,8 +49,8 @@ message Event {
     .scip.SymbolInformation external_symbol = 3;
   }
 }
-// Projects one Rift snapshot into the pinned SCIP schema.
-service Projection {
+// Exports one Rift snapshot into the pinned SCIP schema.
+service Index {
   // Returns one header, then documents, then external symbols. The stream order is the
   // canonical `scip.Index` order.
   rpc Read (rift.scip.Request) returns (stream rift.scip.Event);

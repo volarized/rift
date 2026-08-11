@@ -337,33 +337,65 @@ enum ExecutionStatus {
   // The language runtime rejected the block or raised an unhandled failure.
   EXECUTION_STATUS_FAILED = 2;
 }
-// A commit. Nothing about it can change, so the object ID is the whole of the state.
-message SnapshotCommit {
-  // The object ID the revision resolved to.
-  string commit = 1;
-}
-// A working tree, which changes under you while you read it. It is reported as the commit it
-// sits on plus a digest of what differs, so a second call can tell whether the disk moved.
-message SnapshotWorktree {
-  // Which working tree on disk, in the spelling git uses to reach one from another.
-  string worktree = 1;
-  // The commit this working tree sits on.
-  string base = 2;
-  // What makes this snapshot an identity: two reads of one dirty tree on the same `base` are
-  // otherwise indistinguishable. The changed set has no bound. This field is SHA-256 over each
-  // differing path with the digest of its content, in RFC 8785 canonical JSON. A clean tree
-  // digests the empty set.
-  string changes = 3;
-}
-// What a `Revision` resolved to, reported beside every answer so a second call can ask the same
-// question again and get the same state.
-//
-// A commit names its immutable tree. A working-tree snapshot names its base commit and digests
-// the changed set, leaving every unedited file's identity in the base.
+// An exact immutable source tree. Current projection heads and explicit active resources
+// pin snapshots. A value merely copied by a client does not; an unpinned value may later return
+// `snapshot_not_found`. Git provenance belongs to the operation that resolved a revision, not
+// to this content identity.
 message Snapshot {
+  // Complete source-tree content identity in Rift's persistent store.
+  string id = 1;
+}
+// One immutable snapshot plus the exact Git commit selected during this resolution, if
+// the request used a Git revision. Provenance is response evidence and does not participate in
+// snapshot identity.
+message ResolvedSnapshot {
+  // Exact source tree selected by the request.
+  Snapshot snapshot = 1;
+  // Peeled Git commit selected by a Git revision, otherwise null.
+  optional string imported_from = 2;
+}
+// The single Git-backed baseline retained for one writable projection. `snapshot` is a
+// complete store copy of `commit`'s tree, so restore and merging do not depend on Git retaining
+// the object's blobs. This is current state, not a history node.
+message ProjectionBase {
+  // Pinned source tree used by restore and three-way integration.
+  string snapshot = 1;
+  // Git commit whose tree was imported into `snapshot`.
+  string commit = 2;
+}
+// Complete current state of one writable filesystem projection. It is a compare-and-swap
+// value, not a history record.
+message ProjectionState {
+  // Filesystem projection this state belongs to.
+  string projection = 1;
+  // Fresh ABA-safe token for this current state.
+  string head = 2;
+  // Complete immutable source tree rendered by the projection.
+  string snapshot = 3;
+  // Single pinned baseline used by restore and integration.
+  ProjectionBase base = 4;
+  // Whether `snapshot` differs from `base.snapshot`.
+  bool dirty = 5;
+}
+message RevisionGit {
+  // Git revision to resolve locally and import atomically.
+  string revision = 1;
+}
+message RevisionSnapshot {
+  // Retained immutable source tree to read.
+  string snapshot = 1;
+}
+message RevisionProjection {
+  // Projection whose current head to resolve once.
+  string projection = 1;
+}
+// Tagged source selector. Git, snapshot, and current-projection namespaces cannot collide.
+// Omission in a session-scoped request selects that session's current projection.
+message Revision {
   oneof variant {
-    SnapshotCommit commit = 1;
-    SnapshotWorktree worktree = 2;
+    RevisionGit git = 1;
+    RevisionSnapshot snapshot = 2;
+    RevisionProjection projection = 3;
   }
 }
 // A byte range of one file and the language used to parse it. The owner of `App.svelte` can
@@ -378,8 +410,8 @@ message LanguageRegion {
 // A physical or virtual file with bytes in it. Every node and symbol with readable source comes
 // from this kind.
 message FileContentRegular {
-  // SHA-256 of the bytes. The same value `Snapshot.changes` digests for a file that differs
-  // from its base.
+  // SHA-256 root of the canonical fixed-chunk Merkle encoding for the complete raw file bytes.
+  // The architecture defines the byte-exact encoding.
   string digest = 1;
   // Size in bytes.
   int64 size = 2;
@@ -395,10 +427,10 @@ message FileContentLfsPointer {
   // Size in bytes of the content the pointer names.
   int64 size = 2;
 }
-// A symbolic link. The entry is the path it points at, reported as git recorded it, because the
-// target may not exist in this checkout at all.
+// A symbolic link. Git records its target as arbitrary bytes, so the protocol carries canonical
+// base64 rather than assuming UTF-8.
 message FileContentSymlink {
-  // The path the link points at, as recorded. Rift does not follow it.
+  // Canonical padded base64 of the raw target bytes. Rift does not follow the target.
   string target = 1;
 }
 // A submodule boundary: the parent repository records one child commit at this path. Tree,
@@ -421,8 +453,9 @@ message FileContent {
   }
 }
 // One source entry at a revision: what it is called, what it holds, and which languages read
-// it. Physical entries come from the Git tree. A generated regular entry comes from adapter
-// virtual output. Bytes are read from the same URI that identifies the entry.
+// it. Physical entries come from the immutable source-store tree. A generated regular entry
+// comes from adapter virtual output. Bytes are read from the same URI that identifies the
+// entry.
 message File {
   // Project-relative source identity and the URI from which this record and its bytes are read.
   string id = 1;
@@ -443,14 +476,15 @@ message ProjectEntryDirectory {
   // Project-relative directory path. The empty path names the project root.
   string path = 1;
 }
-// A physical Git tree entry with content and language ownership metadata. Generated virtual
+// A physical source-store entry with content and language ownership metadata. Generated virtual
 // files remain outside the project tree listing.
 message ProjectEntryFile {
   // The file represented by this tree node.
   File file = 1;
 }
-// One visible node in a project tree. Rift walks Git tree objects at the requested snapshot,
-// returning a directory path or the complete `File` for a content-bearing entry.
+// One visible node in a project tree. Rift walks the immutable store tree at the requested
+// snapshot, returning a derived directory path or the complete `File` for a content-bearing
+// entry.
 message ProjectEntry {
   oneof variant {
     ProjectEntryDirectory directory = 1;
@@ -1776,15 +1810,15 @@ message Diagnostic {
   optional Language language = 10;
 }
 // One adapter's verdict over a resulting tree. `coverage` states how much the adapter checked,
-// while `valid` records whether the checked scope contains an error. Repository validation
-// policy decides which reports are required.
+// while `valid` records whether the checked scope contains an error. `validation.require` in
+// the workspace-root `rift.toml` decides which reports are required.
 message ValidationReport {
   // The adapter that produced this verdict.
   Language language = 1;
   // Whether this adapter accepted every file in `files` under the reported coverage.
   bool valid = 2;
   // How much of the affected program the adapter checked. The result is incomplete when
-  // repository policy requires this language and coverage is partial or unsupported.
+  // `validation.require` names this language and coverage is partial or unsupported.
   Coverage coverage = 3;
   // Affected files this verdict covers, sorted by project path.
   repeated string files = 4;
@@ -2070,7 +2104,7 @@ message OperationPrecondition {
     KIND_TARGET_EXISTS = 1;
     // The state used for discovery still matches the state being resolved.
     KIND_STATE_MATCHES = 2;
-    // Every affected path is inside the project, owned by Rift, and permitted by host policy.
+    // Every affected path is inside the project and writable through Rift's workspace handle.
     KIND_WRITABLE = 3;
     // The adapter completely classified the references on which the operation depends.
     KIND_REFERENCES_COMPLETE = 4;
@@ -2146,8 +2180,8 @@ message OperationEffect {
   Kind kind = 1;
   // Subjects in the state before this change. Empty for creation.
   repeated Address before = 2;
-  // Subjects after Rift applies the change and every adapter sharing the worktree acknowledges
-  // the new snapshot. Empty for deletion.
+  // Subjects after Rift applies the change and every adapter sharing the projection
+  // acknowledges the new snapshot. Empty for deletion.
   repeated Address after = 3;
   // Source locations demonstrating the effect, pinned to their respective before or after
   // address state.
@@ -2207,8 +2241,7 @@ message ConfirmationRequirement {
     UNSPECIFIED = 0;
     // The change deletes source or replaces an existing file.
     DESTRUCTIVE = 1;
-    // The change reaches more files or symbols than host policy permits without
-    // acknowledgement.
+    // The change reaches enough files or symbols to require explicit acknowledgement.
     LARGE_SCOPE = 2;
     // The change touches source marked as generated.
     GENERATED_CODE = 3;

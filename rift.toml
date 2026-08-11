@@ -1,21 +1,7 @@
 #:schema ./protocol/rift.schema.json
 
-[server]
-idle-timeout = "10m"
-
 [session]
 base = "head"
-integration = "manual"
-
-[reads]
-max-worktrees = 2
-worktree-idle-timeout = "5m"
-
-[facts]
-max-size = "4GiB"
-
-[profile]
-max = "edit"
 
 [execution]
 allow = []
@@ -36,4 +22,3 @@ require = "available"
 [validators]
 commands = []
 carry = []
-max-timeout = "5m"

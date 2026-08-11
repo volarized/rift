@@ -304,12 +304,12 @@ class AuxiliaryClaim(ProtoModel):
             "Paths inside the workspace that this adapter writes to. Rift\n classifies each "
             "claimed subtree as adapter output and excludes it from\n source analysis, "
             "snapshot diffs, and agent results.\n Write claims are exclusive across adapters "
-            "sharing a connection worktree. Rift\n refuses workspace admission when two "
+            "sharing a connection projection. Rift\n refuses workspace admission when two "
             "adapters can write the same path; one\n of them must redirect that output to its "
             "private state_root.\n\n CARGO_TARGET_DIR, GOCACHE, PYTHONPYCACHEPREFIX, and "
-            "tsBuildInfoFile can point\n at `state_root`. Declare output that remains in the "
-            "tree: `cargo`\n rewrites Cargo.lock at the workspace root, npm insists on "
-            "`node_modules` next\n to the package it belongs to.\n\n Selectors follow "
+            "tsBuildInfoFile can point\n at `state_root`. Declare generated output that must remain "
+            "beside source, such as npm's `node_modules`; an already tracked source path remains "
+            "source even when a claim matches it.\n\n Selectors follow "
             "SourceClaim's bytewise rules. A directory name matches the\n directory and "
             "everything beneath it."
         ),
@@ -320,14 +320,13 @@ class WriteClaim(ProtoModel):
     """Paths inside the workspace that this adapter writes to. Rift
     classifies each claimed subtree as adapter output and excludes it from
     source analysis, snapshot diffs, and agent results.
-    Write claims are exclusive across adapters sharing a connection worktree. Rift
+    Write claims are exclusive across adapters sharing a connection projection. Rift
     refuses workspace admission when two adapters can write the same path; one
     of them must redirect that output to its private state_root.
 
     CARGO_TARGET_DIR, GOCACHE, PYTHONPYCACHEPREFIX, and tsBuildInfoFile can point
-    at `state_root`. Declare output that remains in the tree: `cargo`
-    rewrites Cargo.lock at the workspace root, npm insists on `node_modules` next
-    to the package it belongs to.
+    at `state_root`. Declare generated output that must remain beside source, such as npm's
+    `node_modules`; an already tracked source path remains source even when a claim matches it.
 
     Selectors follow SourceClaim's bytewise rules. A directory name matches the
     directory and everything beneath it."""
@@ -478,14 +477,14 @@ class ExtensionDescriptor(ProtoModel):
         ADAPTER,
         description=(
             "Bounds this adapter advertises. One process holds state for several "
-            "server-owned\n worktrees, so each state receives its own in-flight limit."
+            "server-owned\n projections, so each state receives its own in-flight limit."
         ),
         section="Capabilities",
     )
 )
 class AdapterLimits(ProtoModel):
     """Bounds this adapter advertises. One process holds state for several server-owned
-    worktrees, so each state receives its own in-flight limit."""
+    projections, so each state receives its own in-flight limit."""
 
     max_message_bytes: Field[int] = proto_field(
         default=...,
@@ -510,7 +509,7 @@ class AdapterLimits(ProtoModel):
         number=4,
         proto_type=ProtoFieldDescriptor.TYPE_UINT32,
         description=(
-            "Server-owned worktree states this adapter will hold at once. Each can retain a "
+            "Server-owned projection states this adapter will hold at once. Each can retain a "
             "parsed tree, index, and runtime worker, so the bound controls resource use."
         ),
     )
@@ -520,7 +519,7 @@ class AdapterLimits(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Execution behavior reported by an adapter process for host policy and audit.\n "
+            "Execution behavior reported by an adapter process for server admission and diagnostics.\n "
             "Rift does not isolate the process or its workers from the host. These requirements\n "
             "do not select the project runtime used for one adapter state."
         ),
@@ -528,7 +527,7 @@ class AdapterLimits(ProtoModel):
     )
 )
 class RuntimeRequirements(ProtoModel):
-    """Execution behavior reported by an adapter process for host policy and audit.
+    """Execution behavior reported by an adapter process for server admission and diagnostics.
     Rift does not isolate the process or its workers from the host. These requirements
     do not select the project runtime used for one adapter state."""
 
@@ -553,7 +552,7 @@ class RuntimeRequirements(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "One adapter's state for a server-owned Git worktree. Every call that reads code\n"
+            "One adapter's state for a server-owned filesystem projection. Every call that reads code\n"
             " carries it. The adapter may back different states with different project\n"
             " runtimes. A call naming an earlier state receives `StaleState`."
         ),
@@ -561,19 +560,14 @@ class RuntimeRequirements(ProtoModel):
     )
 )
 class AdapterState(ProtoModel):
-    """One adapter's state for a server-owned Git worktree. Every call that reads code
+    """One adapter's state for a server-owned filesystem projection. Every call that reads code
     carries it. The adapter may back different states with different project runtimes.
     A call naming an earlier state receives `StaleState`."""
 
-    tree: Field[str] = proto_field(
+    projection: Field[core.Projection] = proto_field(
         default=...,
         number=1,
-        proto_type=ProtoFieldDescriptor.TYPE_STRING,
-        description=(
-            "Absolute path of the Git worktree this state describes.\n The path is unique "
-            "within this adapter process. Another language adapter\n can hold the same path "
-            "with its own adapter state and state_root."
-        ),
+        description="Stable filesystem projection identity this adapter state reads.",
     )
     snapshot: Field[core.Snapshot] = proto_field(
         default=..., number=2, description="The state the files in it hold."
@@ -585,7 +579,7 @@ class AdapterState(ProtoModel):
         description=(
             "Adapter-local state generation. Open mints the first value;\n Refresh and "
             "SyncVirtual advance it. Calls carrying an earlier generation\n receive StaleState "
-            "even when the Git snapshot is unchanged."
+            "even when the source snapshot is unchanged."
         ),
     )
 
@@ -594,9 +588,9 @@ class AdapterState(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Open a complete server-owned working tree in the adapter. Rift resolved the\n"
-            " requested revision and either reused an exact physical tree or allocated this\n"
-            " one before the call. The adapter does not allocate or switch Git worktrees. It\n"
+            "Open one complete server-owned filesystem projection in the adapter. Rift resolved\n"
+            " the requested revision and mounted this exact snapshot before the call. The adapter\n"
+            " does not allocate or rebind projections. It\n"
             " may inspect revision-local configuration and select or start the project runtime\n"
             " for this state."
         ),
@@ -604,21 +598,15 @@ class AdapterState(ProtoModel):
     )
 )
 class OpenRequest(ProtoModel):
-    """Open a complete server-owned working tree in the adapter. Rift resolved the
-    requested revision and either reused an exact physical tree or allocated this one
-    before the call. The adapter does not allocate or switch Git worktrees. It may inspect
+    """Open one complete server-owned filesystem projection in the adapter. Rift resolved the
+    requested revision and mounted this exact snapshot before the call. The adapter does not
+    allocate or rebind projections. It may inspect
     revision-local configuration and select or start the project runtime for this state."""
 
-    tree: Field[str] = proto_field(
+    projection: Field[core.Projection] = proto_field(
         default=...,
         number=1,
-        proto_type=ProtoFieldDescriptor.TYPE_STRING,
-        description=(
-            "Absolute path to the tree Rift selected for the exact snapshot, and the "
-            "identity this adapter process uses for it. Other language adapters can "
-            "receive the same path. Adapter writes go to `state_root` or a declared "
-            "WriteClaim."
-        ),
+        description="Stable identity of the projection supplied to this adapter state.",
     )
     state_root: Field[str] = proto_field(
         default=...,
@@ -640,13 +628,22 @@ class OpenRequest(ProtoModel):
         number=4,
         description="Exact contract selected from the adapter's `Capabilities.contracts`.",
     )
+    root: Field[str] = proto_field(
+        default=...,
+        number=5,
+        proto_type=ProtoFieldDescriptor.TYPE_STRING,
+        description=(
+            "Absolute mounted path for `projection`. Other adapters can receive the same path. "
+            "Adapter output goes to `state_root` or a declared WriteClaim scratch subtree."
+        ),
+    )
 
 
 @proto_message(
     DirectMessage(
         ADAPTER,
         description=(
-            "Rift rewrote the tree in place under the connection-wide write barrier. It sends\n"
+            "Rift rebound the projection to an exact snapshot under its write barrier. It sends\n"
             " this call to every language adapter holding the shared path. Paths are\n "
             "project-relative and cover every file Rift touched; each adapter decides\n which "
             "changes affect its adapter. Content is on disk before this call. The adapter\n "
@@ -656,7 +653,7 @@ class OpenRequest(ProtoModel):
     )
 )
 class RefreshRequest(ProtoModel):
-    """Rift rewrote the tree in place under the connection-wide write barrier. It sends
+    """Rift rebound the projection to an exact snapshot under its write barrier. It sends
     this call to every language adapter holding the shared path. Paths are
     project-relative and cover every file Rift touched; each adapter decides
     which changes affect its adapter. Content is on disk before this call. The adapter
@@ -671,7 +668,9 @@ class RefreshRequest(ProtoModel):
         ),
     )
     to: Field[core.Snapshot] = proto_field(
-        default=..., number=2, description="The state the tree holds now."
+        default=...,
+        number=2,
+        description="The exact source snapshot the projection holds now.",
     )
     written: Field[list[str]] = proto_field(
         default=...,
@@ -735,16 +734,14 @@ class VirtualSyncEvent(ProtoModel):
 @proto_message(
     DirectMessage(
         ADAPTER,
-        description="Release adapter state for this tree so Rift can delete it.",
+        description="Release adapter state for this projection so Rift can unmount or rebind it.",
         section="Adapter state",
     )
 )
 class CloseRequest(ProtoModel):
-    """Release adapter state for this tree so Rift can delete it."""
+    """Release adapter state for this projection so Rift can unmount or rebind it."""
 
-    tree: Field[str] = proto_field(
-        default=..., number=1, proto_type=ProtoFieldDescriptor.TYPE_STRING
-    )
+    projection: Field[core.Projection] = proto_field(default=..., number=1)
 
 
 @proto_message(
@@ -831,7 +828,7 @@ class AnalyzeEvent(ProtoModel):
         ADAPTER,
         description=(
             "Metadata for one physical or synced virtual source unit this adapter owns.\n Rift "
-            "resolves the URI against the parent Git tree or the virtual overlay at\n this "
+            "resolves the URI against the immutable source-store tree or the virtual overlay at\n this "
             "AdapterState generation."
         ),
         section="Analysis",
@@ -839,7 +836,7 @@ class AnalyzeEvent(ProtoModel):
 )
 class SourceUnit(ProtoModel):
     """Metadata for one physical or synced virtual source unit this adapter owns.
-    Rift resolves the URI against the parent Git tree or the virtual overlay at
+    Rift resolves the URI against the immutable source-store tree or the virtual overlay at
     this AdapterState generation."""
 
     unit: Field[str] = proto_field(
@@ -1102,27 +1099,27 @@ class AnalyzeSummary(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Ask the adapter to validate the closure affected by a session change.\n Rift "
-            "has already applied the change and acknowledged its state through\n Refresh, "
-            "so the adapter reads the same files Rift is preparing to commit."
+            "Ask the adapter to validate the closure affected by a candidate change.\n Rift "
+            "has applied the change only in the private candidate and acknowledged that state "
+            "through Refresh, so the adapter reads the exact files Rift may publish."
         ),
         section="Validation",
     )
 )
 class ValidateRequest(ProtoModel):
-    """Ask the adapter to validate the closure affected by a session change.
-    Rift has already applied the change and acknowledged its state through
-    Refresh, so the adapter reads the same files Rift is preparing to commit."""
+    """Ask the adapter to validate the closure affected by a candidate change.
+    Rift has applied the change only in the private candidate and acknowledged that state through
+    Refresh, so the adapter reads the exact files Rift may publish."""
 
     state: Field[AdapterState] = proto_field(
-        default=..., number=1, description="Changed session state being checked."
+        default=..., number=1, description="Private candidate state being checked."
     )
     changed: Field[list[str]] = proto_field(
         default=...,
         number=2,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
-            "Files changed in the session worktree, as project-relative paths. The adapter\n expands "
+            "Files changed in the candidate projection, as project-relative paths. The adapter\n expands "
             "these to the dependent files its own validity rules require."
         ),
     )
@@ -1492,14 +1489,14 @@ class ResolveRequest(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "What the action changes. Rift applies these to the worktree; the adapter's\n own "
+            "What the action changes. Rift applies these to the projection; the adapter's\n own "
             "tree is untouched and will next hear about the change through Refresh."
         ),
         section="Actions",
     )
 )
 class ResolveResponse(ProtoModel):
-    """What the action changes. Rift applies these to the worktree; the adapter's
+    """What the action changes. Rift applies these to the projection; the adapter's
     own tree is untouched and will next hear about the change through Refresh."""
 
     state: Field[AdapterState] = proto_field(
@@ -1539,7 +1536,7 @@ class ResolveResponse(ProtoModel):
         number=6,
         description=(
             "Semantic consequences of the edits. Rift refreshes the adapter and\n reconstructs "
-            "resulting-state addresses before committing the change."
+            "resulting-state addresses before publishing the change."
         ),
     )
     guarantees: Field[list[core.GuaranteeEvidence]] = proto_field(
@@ -1555,7 +1552,7 @@ class ResolveResponse(ProtoModel):
         description=(
             "Evaluate one caller-provided block in the project runtime selected for a pinned "
             "adapter state. Rift gives this call a disposable execution workspace, so evaluated "
-            "code never runs in a shared read, session, or integration worktree."
+            "code never runs in a shared read, session, or integration projection."
         ),
         section="Execution",
     )
@@ -1577,7 +1574,7 @@ class ExecuteRequest(ProtoModel):
     budget: Field[core.ExecutionBudget] = proto_field(
         default=...,
         number=3,
-        description="Exact host-policy bounds the adapter must enforce for this evaluation.",
+        description="Exact workspace-configured bounds the adapter must enforce for this evaluation.",
     )
 
 
@@ -1678,7 +1675,7 @@ class DebugStartRequest(ProtoModel):
     budget: Field[core.DebugBudget] = proto_field(
         default=...,
         number=3,
-        description="Exact host-policy bounds for evaluation, retained frames, and bindings.",
+        description="Exact workspace-configured bounds for evaluation, retained frames, and bindings.",
     )
 
 
@@ -1900,7 +1897,7 @@ ADAPTER_PACKAGE = ProtoPackage(
             "Adapter",
             (
                 "Everything Rift can ask one language for. The adapter answers `Describe`\n once, "
-                "then holds state for worktrees and answers questions about their code. Optional\n "
+                "then holds state for projections and answers questions about their code. Optional\n "
                 "calls are advertised in `Capabilities.operations`; an unimplemented call returns\n"
                 " gRPC `UNIMPLEMENTED`. Rift issues only advertised optional calls. Returning\n "
                 "`UNIMPLEMENTED` from an advertised call is an adapter protocol error."
@@ -1920,7 +1917,7 @@ ADAPTER_PACKAGE = ProtoPackage(
                     OpenRequest,
                     AdapterState,
                     description=(
-                        "Here is the server-owned worktree for an exact snapshot. The tree exists "
+                        "Here is the server-owned projection for an exact snapshot. The tree exists "
                         "before this call, so the adapter can inspect complete source, select any "
                         "revision-appropriate runtime worker, and initialize state."
                     ),

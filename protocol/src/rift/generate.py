@@ -547,9 +547,9 @@ def file_from_package(package: ProtoPackage) -> FileSpec:
             "The Rift server owns at most one configured adapter process per exact Language and calls "
             "it over gRPC on a Unix domain socket. The process can hold states for several snapshots "
             "and back them with separate runtime workers. Rift resolves revisions and supplies "
-            "server-owned worktrees; adapters never allocate or switch them. Different-language "
+            "server-owned projections; adapters never allocate or switch them. Different-language "
             "adapters may open the same tree. Rift serializes source writes, then refreshes every "
-            "adapter that holds the worktree."
+            "adapter that holds the projection."
         )
     if not description and spec.namespace.package == "scip":
         release = spec.upstream_release

@@ -6,12 +6,47 @@ from .surface import Axis, Document, Resource, Rpc, Service, Tool, ToolGroup
 RPC_CONNECT = Rpc(
     name="Connect",
     request=mcp.ConnectRequest,
-    response=mcp.ConnectionEvent,
+    response=mcp.Connected,
     response_stream=True,
     description=(
         "Opens the control stream that owns one logical client connection. For an MCP role, the "
-        "first event returns the Git session ref head and its worktree when a change has already "
-        "materialized one."
+        "first response returns the always-mounted persistent session "
+        "projection. A session ID admits one live connection."
+    ),
+)
+
+RPC_SESSION_LIST = Rpc(
+    name="SessionList",
+    request=mcp.SessionListParams,
+    response=mcp.SessionListResult,
+    description=(
+        "Lists retained sessions for this workspace. Each entry reports its projection path, "
+        "exact current state and base, and live owner."
+    ),
+)
+
+RPC_SESSION_CONTINUE = Rpc(
+    name="SessionContinue",
+    request=mcp.SessionContinueParams,
+    response=mcp.SessionContinueResult,
+    description=(
+        "Rebinds the current MCP connection to one retained session. The connection's initial "
+        "session must still be unchanged; Rift then removes it and continues the selected "
+        "projection. The MCP process remembers the selected ID for reconnects. "
+        "A changed initial session returns `invalid_request`; an active session or retained "
+        "debugger returns `temporarily_unavailable`."
+    ),
+)
+
+RPC_SESSION_REMOVE = Rpc(
+    name="SessionRemove",
+    request=mcp.SessionRemoveParams,
+    response=mcp.SessionRemoveResult,
+    description=(
+        "Previews or confirms removal of one inactive session. Confirmation removes its "
+        "projection and compares the exact observed projection state. "
+        "An active session returns `temporarily_unavailable`; open handles and in-flight "
+        "filesystem mutations return `projection_busy`."
     ),
 )
 
@@ -20,7 +55,7 @@ RPC_TREE = Rpc(
     request=mcp.TreeParams,
     response=mcp.TreeResult,
     description=(
-        "Lists the project tree at one snapshot. Rift derives directories from Git paths "
+        "Lists the project tree at one snapshot. Rift derives directories from source paths "
         "and answers without starting a language adapter. A depth of one is an `ls`; an "
         "unbounded depth with path selectors is a recursive tree, glob, or file find."
     ),
@@ -99,9 +134,9 @@ RPC_EDIT = Rpc(
     request=mcp.EditParams,
     response=mcp.ChangeResult,
     description=(
-        "Materializes the session worktree when needed, applies an atomic set of concrete edits, "
-        "validates the resulting tree, creates a Git commit, and conditionally advances the "
-        "session ref."
+        "Checks the exact projection token, applies an atomic edit set in a private candidate, "
+        "validates it, and conditionally swaps the public "
+        "projection state."
     ),
 )
 
@@ -110,8 +145,8 @@ RPC_PATCH = Rpc(
     request=mcp.PatchParams,
     response=mcp.ChangeResult,
     description=(
-        "Checks the expected session head before materializing its worktree when needed, then "
-        "applies a unified diff and checks every hunk's context."
+        "Checks the exact projection token, then applies a unified diff in a private candidate "
+        "and checks every hunk's context."
     ),
 )
 
@@ -120,7 +155,7 @@ RPC_REWRITE = Rpc(
     request=mcp.RewriteParams,
     response=mcp.ChangeResult,
     description=(
-        "Commits replacements for every match of one query. The cardinality is checked "
+        "Applies replacements for every match of one query. The cardinality is checked "
         "before expansion, so a pattern that matches more places than intended refuses instead "
         "of rewriting them."
     ),
@@ -131,17 +166,7 @@ RPC_REVERT = Rpc(
     request=mcp.RevertParams,
     response=mcp.ChangeResult,
     description=(
-        "Commits the three-way inverse of one commit against a selected parent."
-    ),
-)
-
-RPC_MERGE = Rpc(
-    name="Merge",
-    request=mcp.MergeParams,
-    response=mcp.ChangeResult,
-    description=(
-        "Runs Git's three-way merge in the session worktree. A conflict preserves Git's "
-        "unmerged index and reports it to the supervisor."
+        "Applies the three-way inverse of one commit against a selected parent."
     ),
 )
 
@@ -204,10 +229,55 @@ RPC_INTEGRATE = Rpc(
     request=mcp.IntegrateParams,
     response=mcp.IntegrateResult,
     description=(
-        "Merges the session head into a local branch in a dedicated integration worktree. Git "
-        "conflicts remain in its standard index stages; Rift validates a clean merged tree and "
-        "conditionally advances the target ref."
+        "Merges the exact current projection from its retained base onto a guarded target, "
+        "validates the merged snapshot, writes at most one squash commit, and conditionally "
+        "advances the target. A conflict creates an exceptional conventional Git recovery worktree."
     ),
+)
+
+RPC_PROJECTION_OPEN = Rpc(
+    name="ProjectionOpen",
+    request=mcp.ProjectionOpenParams,
+    response=mcp.ProjectionOpenResult,
+    description="Mounts one exact revision as an explicitly pinned read-only filesystem projection.",
+)
+
+RPC_PROJECTION_CLOSE = Rpc(
+    name="ProjectionClose",
+    request=mcp.ProjectionCloseParams,
+    response=mcp.ProjectionCloseResult,
+    description="Withdraws an explicit read projection; open handles keep only their inode pins.",
+)
+
+RPC_PROJECTION_RESTORE = Rpc(
+    name="ProjectionRestore",
+    request=mcp.ProjectionRestoreParams,
+    response=mcp.ProjectionRestoreResult,
+    description="Discards reviewed unintegrated source changes and restores the pinned session base.",
+)
+
+RPC_RECOVERY_LIST = Rpc(
+    name="RecoveryList",
+    request=mcp.RecoveryListParams,
+    response=mcp.RecoveryListResult,
+    description="Lists durable unresolved integrations and rescans their exact recovery manifests.",
+)
+
+RPC_RECOVERY_CONTINUE = Rpc(
+    name="RecoveryContinue",
+    request=mcp.RecoveryContinueParams,
+    response=mcp.RecoveryContinueResult,
+    description=(
+        "Imports and validates the staged tree of a resolved exceptional Git worktree, then "
+        "performs the saved source and target compare-and-swaps."
+    ),
+)
+
+RPC_RECOVERY_ABORT = Rpc(
+    name="RecoveryAbort",
+    request=mcp.RecoveryAbortParams,
+    response=mcp.RecoveryAbortResult,
+    description="Previews or removes a retained Git recovery against its exact manifest.",
 )
 
 RPC_READRESOURCE = Rpc(
@@ -221,6 +291,11 @@ RIFT_SERVICE = Service(
     description="The Protobuf service exposed by the Rift server. `rift mcp` maps its JSON entry points to these methods.",
     rpcs=(
         RPC_CONNECT,
+        RPC_SESSION_LIST,
+        RPC_SESSION_CONTINUE,
+        RPC_SESSION_REMOVE,
+        RPC_PROJECTION_OPEN,
+        RPC_PROJECTION_CLOSE,
         RPC_TREE,
         RPC_OUTLINE,
         RPC_SEARCH,
@@ -233,13 +308,16 @@ RIFT_SERVICE = Service(
         RPC_PATCH,
         RPC_REWRITE,
         RPC_REVERT,
-        RPC_MERGE,
         RPC_RENAME,
         RPC_MOVE,
         RPC_DELETE,
         RPC_CHANGE_SIGNATURE,
         RPC_ACT,
+        RPC_PROJECTION_RESTORE,
         RPC_INTEGRATE,
+        RPC_RECOVERY_LIST,
+        RPC_RECOVERY_CONTINUE,
+        RPC_RECOVERY_ABORT,
         RPC_READRESOURCE,
     ),
 )
@@ -254,11 +332,20 @@ DOCUMENT = Document(
     ),
     entry_points_description=(
         "The internal connection stream establishes the gRPC context used by later calls. Tools "
-        "map MCP request and result JSON to Rift service methods. Each resource entry maps one "
-        "URI family to the types that carry it."
+        "map MCP request and result JSON to Rift service methods. The MCP process queues those "
+        "calls and sends one application RPC at a time. Each resource entry maps one URI family "
+        "to the types that carry it."
     ),
     service=RIFT_SERVICE,
     tool_groups=(
+        ToolGroup(
+            name="sessions",
+            title="Sessions",
+            summary=(
+                "List store-backed sessions, bind the current connection to one persistent "
+                "projection, open read projections, or release retained state."
+            ),
+        ),
         ToolGroup(
             name="discovery",
             title="Discovery",
@@ -272,9 +359,9 @@ DOCUMENT = Document(
             name="changes",
             title="Changes",
             summary=(
-                "Check the expected session head, materialize its worktree when needed, resolve "
-                "one operation, validate the result, and append a Git commit. Integration uses "
-                "Git's merge state directly and never resolves conflicts for the supervisor."
+                "Check an exact projection token, resolve and validate in a private candidate, "
+                "then swap the public projection. Git is touched only by integration; unresolved "
+                "integration merges use explicit Git recovery."
             ),
         ),
         ToolGroup(
@@ -282,12 +369,17 @@ DOCUMENT = Document(
             title="Execution",
             summary=(
                 "Evaluate caller-provided code against an exact snapshot in a disposable "
-                "workspace, and inspect the frames a failed evaluation left behind. Host policy "
-                "authorizes these per language before they are advertised at all."
+                "workspace, and inspect the frames a failed evaluation left behind. Each call "
+                "checks the current workspace configuration and per-language availability."
             ),
         ),
     ),
     tools=(
+        Tool(name="session_list", rpc=RPC_SESSION_LIST, group="sessions"),
+        Tool(name="session_continue", rpc=RPC_SESSION_CONTINUE, group="sessions"),
+        Tool(name="session_remove", rpc=RPC_SESSION_REMOVE, group="sessions"),
+        Tool(name="projection_open", rpc=RPC_PROJECTION_OPEN, group="sessions"),
+        Tool(name="projection_close", rpc=RPC_PROJECTION_CLOSE, group="sessions"),
         Tool(name="tree", rpc=RPC_TREE, group="discovery"),
         Tool(name="outline", rpc=RPC_OUTLINE, group="discovery"),
         Tool(name="search", rpc=RPC_SEARCH, group="discovery"),
@@ -296,13 +388,16 @@ DOCUMENT = Document(
         Tool(name="patch", rpc=RPC_PATCH, group="changes"),
         Tool(name="rewrite", rpc=RPC_REWRITE, group="changes"),
         Tool(name="revert", rpc=RPC_REVERT, group="changes"),
-        Tool(name="merge", rpc=RPC_MERGE, group="changes"),
         Tool(name="rename", rpc=RPC_RENAME, group="changes"),
         Tool(name="move", rpc=RPC_MOVE, group="changes"),
         Tool(name="delete", rpc=RPC_DELETE, group="changes"),
         Tool(name="change_signature", rpc=RPC_CHANGE_SIGNATURE, group="changes"),
         Tool(name="act", rpc=RPC_ACT, group="changes"),
+        Tool(name="projection_restore", rpc=RPC_PROJECTION_RESTORE, group="changes"),
         Tool(name="integrate", rpc=RPC_INTEGRATE, group="changes"),
+        Tool(name="recovery_list", rpc=RPC_RECOVERY_LIST, group="changes"),
+        Tool(name="recovery_continue", rpc=RPC_RECOVERY_CONTINUE, group="changes"),
+        Tool(name="recovery_abort", rpc=RPC_RECOVERY_ABORT, group="changes"),
         Tool(name="execute", rpc=RPC_EXECUTE, group="execution"),
         Tool(name="debug_start", rpc=RPC_DEBUG_START, group="execution"),
         Tool(name="debug_get_frame", rpc=RPC_DEBUG_GET_FRAME, group="execution"),
@@ -312,10 +407,9 @@ DOCUMENT = Document(
         Resource(
             name="repository",
             description=(
-                "Reports the tools and resources this workspace serves, which languages have "
-                "adapters, the state answers resolve against, request limits, effective command "
-                "validators, cache policy, and the active conformance profile. Clients read it "
-                "before calling another entry point."
+                "Reports current per-language availability, the resource families this workspace "
+                "serves, the state answers resolve against, request limits, and configured command "
+                "validators. Clients read it before calling another entry point."
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.RepositoryResourceUri,
@@ -336,7 +430,7 @@ DOCUMENT = Document(
             name="diff",
             description=(
                 "What changed between two revisions, a page of files at a time: the entry on each "
-                "side and the edits between them. Git answers it without an adapter, so it works "
+                "side and the edits between them. The source store answers without an adapter, so it works "
                 "for a language Rift has no adapter for."
             ),
             template=mcp.ResourceTemplate,
@@ -351,6 +445,18 @@ DOCUMENT = Document(
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.FileResourceUri,
+            link=mcp.ResourceLink,
+        ),
+        Resource(
+            name="fs",
+            description=(
+                "Lists live Rift-provided filesystem projections, their mounted paths, exact "
+                "source snapshots, availability, mutability, scratch usage, and open-handle "
+                "counts. Pagination captures one connection-scoped inventory; reading grants no "
+                "close authority and retains no projection history."
+            ),
+            template=mcp.ResourceTemplate,
+            uri=mcp.FsResourceUri,
             link=mcp.ResourceLink,
         ),
         Resource(
@@ -388,12 +494,17 @@ DOCUMENT = Document(
     axes=(
         Axis(
             name="Versioning",
-            summary="Revision selectors, resolved snapshots, commits, worktrees, and diffs.",
+            summary="Revision selectors, immutable snapshots, projection states, Git commits, and diffs.",
             identified_by=(
+                core.GitRevision,
                 core.Revision,
+                core.SnapshotId,
                 core.Snapshot,
-                core.Commit,
-                core.Worktree,
+                core.ResolvedSnapshot,
+                core.ProjectionState,
+                core.ProjectionHead,
+                core.GitCommit,
+                core.Projection,
                 core.DiffId,
             ),
         ),
@@ -506,7 +617,6 @@ DOCUMENT = Document(
                 mcp.PatchParams,
                 mcp.RewriteParams,
                 mcp.RevertParams,
-                mcp.MergeParams,
                 mcp.RenameParams,
                 mcp.MoveParams,
                 mcp.DeleteParams,
@@ -553,7 +663,7 @@ DOCUMENT = Document(
             ),
             identified_by=(
                 mcp.ConnectRequest,
-                mcp.ConnectionEvent,
+                mcp.Connected,
             ),
         ),
         Axis(
