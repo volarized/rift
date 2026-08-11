@@ -36,23 +36,23 @@ class ExecutionContractTests(TestCase):
             ),
             contracts=[
                 adapter.AdapterContract(
-                    major=2,
+                    major=1,
                     minor=0,
                     schema_digest="0" * 64,
                 )
             ],
         )
 
-    def test_default_policy_advertises_and_admits_nothing(self) -> None:
-        policy = config.ExecutionConfig()
+    def test_default_configuration_admits_no_execution(self) -> None:
+        execution = config.ExecutionConfig()
         language = core.Language(name="python")
 
-        self.assertIsNone(policy.advertised_limits())
+        self.assertIsNone(execution.advertised_limits())
         self.assertFalse(
-            policy.permits_execution(language, [core.AdapterOperation.EXECUTE])
+            execution.permits_execution(language, [core.AdapterOperation.EXECUTE])
         )
         self.assertFalse(
-            policy.permits_debugging(
+            execution.permits_debugging(
                 language,
                 [
                     core.AdapterOperation.DEBUG_START,
@@ -62,24 +62,26 @@ class ExecutionContractTests(TestCase):
             )
         )
 
-    def test_debug_authorization_is_a_subset_of_execution(self) -> None:
+    def test_debug_enablement_is_a_subset_of_execution(self) -> None:
         with self.assertRaises(ValidationError):
             config.ExecutionConfig.model_validate(
                 {"allow": ["python"], "debug": ["typescript"]}
             )
 
-    def test_execution_admission_intersects_policy_and_adapter_operations(self) -> None:
-        policy = config.ExecutionConfig.model_validate(
+    def test_execution_admission_intersects_configuration_and_adapter_operations(
+        self,
+    ) -> None:
+        execution = config.ExecutionConfig.model_validate(
             {"allow": ["python"], "debug": ["python"]}
         )
         language = core.Language(name="python")
 
-        self.assertFalse(policy.permits_execution(language, []))
+        self.assertFalse(execution.permits_execution(language, []))
         self.assertTrue(
-            policy.permits_execution(language, [core.AdapterOperation.EXECUTE])
+            execution.permits_execution(language, [core.AdapterOperation.EXECUTE])
         )
         self.assertFalse(
-            policy.permits_debugging(
+            execution.permits_debugging(
                 language,
                 [
                     core.AdapterOperation.DEBUG_START,
@@ -88,7 +90,7 @@ class ExecutionContractTests(TestCase):
             )
         )
         self.assertTrue(
-            policy.permits_debugging(
+            execution.permits_debugging(
                 language,
                 [
                     core.AdapterOperation.DEBUG_START,
@@ -116,8 +118,8 @@ class ExecutionContractTests(TestCase):
         )
         self.assertEqual(len(complete.operations), 3)
 
-    def test_policy_produces_adapter_budgets_and_public_limits(self) -> None:
-        policy = config.ExecutionConfig.model_validate(
+    def test_configuration_produces_adapter_budgets_and_public_limits(self) -> None:
+        execution = config.ExecutionConfig.model_validate(
             {
                 "allow": ["python"],
                 "debug": ["python"],
@@ -134,11 +136,11 @@ class ExecutionContractTests(TestCase):
         )
 
         self.assertEqual(
-            policy.execution_budget(),
+            execution.execution_budget(),
             core.ExecutionBudget(timeout_ms=2_000, output_bytes=1_024),
         )
         self.assertEqual(
-            policy.debug_budget(),
+            execution.debug_budget(),
             core.DebugBudget(
                 execution=core.ExecutionBudget(timeout_ms=2_000, output_bytes=1_024),
                 frames=8,
@@ -147,7 +149,7 @@ class ExecutionContractTests(TestCase):
             ),
         )
         self.assertEqual(
-            policy.advertised_limits(),
+            execution.advertised_limits(),
             mcp.ExecutionLimits(
                 max_code_bytes=4_096,
                 max_timeout_ms=2_000,
