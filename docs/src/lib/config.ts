@@ -26,4 +26,4 @@ export const configDocument = JSON.parse(
 ) as ConfigDocument;
 
 export const configDefs = configDocument.$defs;
-export const workspaceConfig = readFileSync(join(WORKSPACE, "rift.toml"), "utf8").trim();
+export const workspaceConfig = readFileSync(join(WORKSPACE, "docs", "rift.toml"), "utf8").trim();

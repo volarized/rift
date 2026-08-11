@@ -1,4 +1,4 @@
-#:schema ./protocol/rift.schema.json
+#:schema ../protocol/rift.schema.json
 
 [execution]
 allow = []

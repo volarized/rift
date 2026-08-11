@@ -18,7 +18,7 @@ WORKSPACE = Path(__file__).parents[2]
 
 class RiftConfigTests(TestCase):
     def test_workspace_file_is_the_typed_model(self) -> None:
-        parsed = validate_rift_toml(WORKSPACE / "rift.toml")
+        parsed = validate_rift_toml(WORKSPACE / "docs" / "rift.toml")
 
         self.assertEqual(parsed.validators.commands, [])
         self.assertEqual(parsed.execution.allow, [])

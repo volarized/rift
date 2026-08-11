@@ -1089,7 +1089,7 @@ def main() -> int:
     proto_content = {value.path: serde.serialize(value) for value in files}
     schema = validate_json_schema(json_content)
     validate_config_schema(config_content)
-    validate_rift_toml(PROTOCOL.parent / "rift.toml")
+    validate_rift_toml(PROTOCOL.parent / "docs" / "rift.toml")
     validate_proto(proto_content, schema)
 
     ok = write_or_check(PROTOCOL / "mcp.json", json_content, args.check)
