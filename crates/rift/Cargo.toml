@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Git-native, compiler-grounded read and deterministic edit substrate for agents"
+description = "Persistent filesystem projections and validated source transactions for agents"
 
 [lints]
 workspace = true

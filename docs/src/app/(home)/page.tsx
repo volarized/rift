@@ -61,7 +61,7 @@ function Section({
 }
 
 /**
- * One object per point: the adapter is the solid taken apart, the other two
+ * One object per point: the compiler is the solid taken apart, the other two
  * are attractors — a reversible system and a dynamo that swaps between two
  * states.
  */
@@ -75,20 +75,20 @@ const DIFFERENCES: {
   fit?: number;
 }[] = [
   {
-    title: "Language adapters",
-    body: "Describe returns the adapter’s exact language, optional dialect, implemented operations, and emitted fact families.",
+    title: "Direct compiler integration",
+    body: "rift talks to the language’s own compiler, so every read is typed and every edit is validated before it lands.",
     solid: "sphere",
   },
   {
-    title: "Candidate worktrees",
-    body: "Apply resolves edits in an isolated worktree and stores the result as a Git commit before publication.",
+    title: "Reversible filesystem projections",
+    body: "Every change an agent makes is staged in a Rift-owned projection.",
     line: "shimizu",
     // The butterfly stands in the x–z plane; turn it to face the camera.
     tilt: 1.5,
   },
   {
-    title: "MCP values",
-    body: "Tools return typed files, nodes, symbols, edits, and validation evidence through the generated JSON Schema.",
+    title: "Structured reads and writes over MCP",
+    body: "Tools and resources instead of shell transcripts. Agents work with code semantics and edit it structurally.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
@@ -114,7 +114,7 @@ export default function HomePage() {
             </h1>
 
             <Body className="max-w-115">
-              Snapshot-pinned code reads and validated change transactions for agents.
+              Agentic development toolkit for reading, discovering and editing codebases.
             </Body>
           </div>
 
@@ -140,9 +140,9 @@ export default function HomePage() {
           className="w-full min-w-96 justify-self-center sm:h-72 md:w-72"
         />
         <div className="grid gap-5">
-          <Statement>Every answer names the Git state it read.</Statement>
+          <Statement>Agents depend on context and tooling.</Statement>
           <Body className="text-balance">
-            Commit snapshots and working-tree snapshots let a later call detect moved source.
+            rift provides typesafe, token-efficient, compiler-backed reads and edits.
           </Body>
         </div>
       </Section>
@@ -154,7 +154,7 @@ export default function HomePage() {
           <div className="grid max-w-165 gap-7">
             {index === 0 ? (
               <Statement className="max-w-125">
-                Adapters declare the operations they implement.
+                Designed with simplicity and minimalism in mind.
               </Statement>
             ) : null}
             <div className="grid gap-3">
@@ -195,14 +195,14 @@ export default function HomePage() {
       <Section wide className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
           <Statement className="max-w-125">
-            The generated reference lists each request, response, and wire mapping.
+            Coming soon, reach out if you want to get involved.
           </Statement>
           <Link
-            href="/docs/protocol/reference"
+            href="mailto:contact@volar.sh"
             className="flex items-center gap-2 text-sm font-medium w-0"
           >
             <Button variant="outline" size="lg" className="w-fit">
-              Open the reference
+              Get in touch
               <ArrowRightIcon weight="bold" className="h-4 w-4" />
             </Button>
           </Link>
