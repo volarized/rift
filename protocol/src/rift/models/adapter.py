@@ -612,6 +612,9 @@ class OpenRequest(ProtoModel):
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
             "Absolute Rift FS path for `projection`. Other adapters can receive the same path. "
+            "While a session holds no changes this is the workspace tree itself, and one state "
+            "may serve every clean session; a session's first change opens a new state rooted "
+            "at its materialized projection. "
             "Adapter output goes to `state_root` or a declared WriteClaim scratch subtree."
         ),
     )
@@ -1066,27 +1069,27 @@ class AnalyzeSummary(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Ask the adapter to validate the closure affected by a candidate change.\n Rift "
-            "has applied the change only in the private candidate and acknowledged that state "
+            "Ask the adapter to validate the closure affected by one applied change.\n Rift "
+            "has written the change into the projection and acknowledged that state "
             "through Refresh, so the adapter reads the exact files Rift may publish."
         ),
         section="Validation",
     )
 )
 class ValidateRequest(ProtoModel):
-    """Ask the adapter to validate the closure affected by a candidate change.
-    Rift has applied the change only in the private candidate and acknowledged that state through
+    """Ask the adapter to validate the closure affected by one applied change.
+    Rift has written the change into the projection and acknowledged that state through
     Refresh, so the adapter reads the exact files Rift may publish."""
 
     state: Field[AdapterState] = proto_field(
-        default=..., number=1, description="Private candidate state being checked."
+        default=..., number=1, description="Projection state being checked."
     )
     changed: Field[list[str]] = proto_field(
         default=...,
         number=2,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
-            "Files changed in the candidate projection, as project-relative paths. The adapter\n expands "
+            "Files changed in the projection, as `rift://file/<path>`. The adapter\n expands "
             "these to the dependent files its own validity rules require."
         ),
     )
@@ -1150,7 +1153,7 @@ class ValidationSummary(ProtoModel):
         default=...,
         number=4,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
-        description="Files included in that closure, as project-relative paths in byte order.",
+        description="Files included in that closure, as `rift://file/<path>` in byte order.",
     )
 
 
@@ -1191,8 +1194,8 @@ class FormatRequest(ProtoModel):
         number=4,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
-            "Changed files owned by this adapter. Required for AFFECTED_FILES and used\n to "
-            "group spans for CHANGED_REGIONS."
+            "Changed files owned by this adapter, as `rift://file/<path>`. Required for\n "
+            "AFFECTED_FILES and used to group spans for CHANGED_REGIONS."
         ),
     )
 
@@ -1277,7 +1280,7 @@ class Matches(ProtoModel):
         ADAPTER,
         description=(
             "One match, as the adapter found it. It carries no identity of its own: a\n "
-            "`MatchKey` is the query and the span it matched, and Rift already holds\n the "
+            "`MatchId` is the query and the span it matched, and Rift already holds\n the "
             "first, so the span below completes it."
         ),
         section="Matching",
@@ -1285,7 +1288,7 @@ class Matches(ProtoModel):
 )
 class StructuralMatch(ProtoModel):
     """One match, as the adapter found it. It carries no identity of its own: a
-    `MatchKey` is the query and the span it matched, and Rift already holds
+    `MatchId` is the query and the span it matched, and Rift already holds
     the first, so the span below completes it."""
 
     span: Field[core.SourceSpan] = proto_field(
@@ -1391,7 +1394,7 @@ class ActionsResponse(ProtoModel):
         ADAPTER,
         description=(
             "An adapter action token and its portable descriptor. Rift combines the token,\n "
-            "Capabilities.language, and ActionsResponse.state to build an ActionKey. The\n "
+            "Capabilities.language, and ActionsResponse.state to build an ActionOfferId. The\n "
             "descriptor crosses into MCP unchanged."
         ),
         section="Actions",
@@ -1399,7 +1402,7 @@ class ActionsResponse(ProtoModel):
 )
 class ActionOffer(ProtoModel):
     """An adapter action token and its portable descriptor. Rift combines the token,
-    Capabilities.language, and ActionsResponse.state to build an ActionKey. The
+    Capabilities.language, and ActionsResponse.state to build an ActionOfferId. The
     descriptor crosses into MCP unchanged."""
 
     token: Field[str] = proto_field(

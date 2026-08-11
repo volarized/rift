@@ -32,7 +32,7 @@ RPC_SESSION_REMOVE = Rpc(
     name="SessionRemove",
     request=mcp.SessionRemoveParams,
     response=mcp.SessionRemoveResult,
-    description=("Previews or removes one inactive session."),
+    description=("Removes one inactive session and deletes its projection."),
 )
 
 RPC_OUTLINE = Rpc(
@@ -165,7 +165,8 @@ RPC_ACT = Rpc(
     description=(
         "Resolves one action an adapter offered — a quick fix, an extraction, an inline, or an "
         "adapter-specific family. Arguments are validated against the schema the offer "
-        "advertises. A portable family is refused here and resolves through its own tool."
+        "advertises. An offer carrying a portable argument contract is refused here and "
+        "resolves through its own tool."
     ),
 )
 
@@ -305,7 +306,7 @@ DOCUMENT = Document(
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.RootResourceUri,
-            link=mcp.RootResourceLink,
+            link=mcp.ResourceLink,
         ),
         Resource(
             name="changes",
@@ -315,7 +316,7 @@ DOCUMENT = Document(
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.ChangesResourceUri,
-            link=mcp.ChangesResourceLink,
+            link=mcp.ResourceLink,
         ),
         Resource(
             name="symbol",
@@ -323,13 +324,14 @@ DOCUMENT = Document(
                 "Returns one symbol and its semantic facts from the session projection."
             ),
             template=mcp.ResourceTemplate,
-            uri=core.SymbolId,
+            uri=mcp.SymbolResourceUri,
             link=mcp.ResourceLink,
         ),
         Resource(
             name="fs",
             description=(
-                "Returns a directory page or bounded file-content range from the session projection."
+                "Returns one page of a directory's entries — subdirectories and files — or a "
+                "bounded file-content range from the session projection."
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.FsResourceUri,
@@ -345,7 +347,7 @@ DOCUMENT = Document(
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.ActionsResourceUri,
-            link=mcp.ActionsResourceLink,
+            link=mcp.ResourceLink,
         ),
         Resource(
             name="action",
@@ -356,7 +358,7 @@ DOCUMENT = Document(
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.ActionResourceUri,
-            link=mcp.ActionResourceLink,
+            link=mcp.ResourceLink,
         ),
     ),
     resource_read=RPC_READRESOURCE,

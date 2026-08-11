@@ -322,12 +322,14 @@ function references(value: unknown, found = new Set<string>()): Set<string> {
     if (target) found.add(target);
   }
   for (const [key, child] of Object.entries(node)) {
-    if (
-      (key === "rift:contentType" || key === "rift:arguments") &&
-      typeof child === "string" &&
-      child in defs
-    ) {
+    if (key === "rift:arguments" && typeof child === "string" && child in defs) {
       found.add(child);
+      continue;
+    }
+    if (key === "rift:contentTypes" && child && typeof child === "object") {
+      for (const target of Object.values(child)) {
+        if (typeof target === "string" && target in defs) found.add(target);
+      }
       continue;
     }
     if (key !== "examples" && key !== "default") references(child, found);

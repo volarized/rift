@@ -256,8 +256,10 @@ message OpenRequest {
   string state_root = 2;
   // Exact contract selected from the adapter's `Capabilities.contracts`.
   rift.adapter.AdapterContract contract = 4;
-  // Absolute Rift FS path for `projection`. Other adapters can receive the same path. Adapter
-  // output goes to `state_root` or a declared WriteClaim scratch subtree.
+  // Absolute Rift FS path for `projection`. Other adapters can receive the same path. While a
+  // session holds no changes this is the workspace tree itself, and one state may serve every
+  // clean session; a session's first change opens a new state rooted at its materialized
+  // projection. Adapter output goes to `state_root` or a declared WriteClaim scratch subtree.
   string root = 5;
 }
 // Rift changed files in a projection. It sends this call to every language
@@ -426,14 +428,14 @@ message AnalyzeSummary {
   // Retention scope for every fact in this Analyze stream.
   rift.adapter.CacheScope cache_scope = 3;
 }
-// Ask the adapter to validate the closure affected by a candidate change.
-// Rift has applied the change only in the private candidate and acknowledged that state through
-// Refresh, so the adapter reads the exact files Rift may publish.
+// Ask the adapter to validate the closure affected by one applied change.
+// Rift has written the change into the projection and acknowledged that state through Refresh,
+// so the adapter reads the exact files Rift may publish.
 message ValidateRequest {
   option (section) = "Validation";
-  // Private candidate state being checked.
+  // Projection state being checked.
   rift.adapter.AdapterState state = 1;
-  // Files changed in the candidate projection, as project-relative paths. The adapter
+  // Files changed in the projection, as `rift://file/<path>`. The adapter
   // expands these to the dependent files its own validity rules require.
   repeated string changed = 2;
 }
@@ -457,7 +459,7 @@ message ValidationSummary {
   bool valid = 2;
   // How completely the adapter checked the affected source closure.
   rift.core.Coverage coverage = 3;
-  // Files included in that closure, as project-relative paths in byte order.
+  // Files included in that closure, as `rift://file/<path>` in byte order.
   repeated string files = 4;
 }
 // Ask the language formatter for concrete edits over the current session state.
@@ -472,8 +474,8 @@ message FormatRequest {
   // Text ranges changed by the resolved operation. Required for
   // CHANGED_REGIONS and ignored for AFFECTED_FILES.
   repeated rift.core.SourceSpan spans = 3;
-  // Changed files owned by this adapter. Required for AFFECTED_FILES and used
-  // to group spans for CHANGED_REGIONS.
+  // Changed files owned by this adapter, as `rift://file/<path>`. Required for
+  // AFFECTED_FILES and used to group spans for CHANGED_REGIONS.
   repeated string files = 4;
 }
 // Formatter output over one acknowledged session state.
@@ -511,7 +513,7 @@ message Matches {
   repeated rift.adapter.StructuralMatch items = 1;
 }
 // One match, as the adapter found it. It carries no identity of its own: a
-// `MatchKey` is the query and the span it matched, and Rift already holds
+// `MatchId` is the query and the span it matched, and Rift already holds
 // the first, so the span below completes it.
 message StructuralMatch {
   option (section) = "Matching";
@@ -556,7 +558,7 @@ message ActionsResponse {
   rift.core.Coverage coverage = 3;
 }
 // An adapter action token and its portable descriptor. Rift combines the token,
-// Capabilities.language, and ActionsResponse.state to build an ActionKey. The
+// Capabilities.language, and ActionsResponse.state to build an ActionOfferId. The
 // descriptor crosses into MCP unchanged.
 message ActionOffer {
   option (section) = "Actions";

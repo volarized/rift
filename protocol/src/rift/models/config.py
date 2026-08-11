@@ -292,11 +292,12 @@ RequiredLanguages = Annotated[
 class ValidationConfig(ConfigModel):
     """Adapter validation reports required for projection changes and publication."""
 
-    require: Literal["available"] | RequiredLanguages = Field(
+    require: Literal["available", "none"] | RequiredLanguages = Field(
         default="available",
         description=(
-            "`available` requires every affected adapter that advertises validation; an explicit "
-            "list requires those exact core.Language pairs."
+            "`available` requires every affected adapter that advertises validation; `none` "
+            "requires no adapter reports; an explicit list requires those exact core.Language "
+            "pairs."
         ),
         json_schema_extra={"rift:selectsType": core.Language.__name__},
     )

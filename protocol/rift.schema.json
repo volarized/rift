@@ -39,7 +39,7 @@
     },
     "CommandValidator": {
       "additionalProperties": false,
-      "description": "A command from the workspace-root `rift.toml`, run without a shell against a disposable copy of the changed tree.",
+      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there joins the changeset.",
       "properties": {
         "id": {
           "description": "Label shown with this validator. It is unique within `validators.commands`.",
@@ -278,59 +278,7 @@
       "title": "CommandValidatorKind",
       "type": "string"
     },
-    "CoverageScope": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/CoverageScopeKind"
-        },
-        {
-          "$ref": "#/$defs/CoverageScopeUnit"
-        }
-      ],
-      "description": "What a completeness statement covers \u2014 everything the request asked for, one file, or a standing scope the answer holds over.",
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "oneof": "variant",
-        "type": "rift.core.CoverageScope",
-        "variants": [
-          {
-            "field": "kind",
-            "number": 1,
-            "tag": null,
-            "type": "CoverageScopeKind"
-          },
-          {
-            "field": "unit",
-            "number": 2,
-            "tag": "unit",
-            "type": "CoverageScopeUnit"
-          }
-        ]
-      },
-      "title": "CoverageScope"
-    },
-    "CoverageScopeKind": {
-      "additionalProperties": false,
-      "description": "A standing scope identified by its name.",
-      "properties": {
-        "kind": {
-          "$ref": "#/$defs/CoverageScopeKindKind",
-          "rift:proto": {
-            "number": 1
-          }
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "type": "rift.core.CoverageScopeKind"
-      },
-      "title": "CoverageScopeKind",
-      "type": "object"
-    },
-    "CoverageScopeKindKind": {
+    "CoverageReach": {
       "description": "How far the claim reaches.",
       "enum": [
         "request",
@@ -368,8 +316,60 @@
           }
         }
       },
-      "title": "CoverageScopeKindKind",
+      "title": "CoverageReach",
       "type": "string"
+    },
+    "CoverageScope": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CoverageScopeKind"
+        },
+        {
+          "$ref": "#/$defs/CoverageScopeUnit"
+        }
+      ],
+      "description": "What a completeness statement covers \u2014 everything the request asked for, one file, or a standing scope the answer holds over.",
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "oneof": "variant",
+        "type": "rift.core.CoverageScope",
+        "variants": [
+          {
+            "field": "kind",
+            "number": 1,
+            "tag": null,
+            "type": "CoverageScopeKind"
+          },
+          {
+            "field": "unit",
+            "number": 2,
+            "tag": "unit",
+            "type": "CoverageScopeUnit"
+          }
+        ]
+      },
+      "title": "CoverageScope"
+    },
+    "CoverageScopeKind": {
+      "additionalProperties": false,
+      "description": "A standing scope identified by its name.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/CoverageReach",
+          "rift:proto": {
+            "number": 1
+          }
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "type": "rift.core.CoverageScopeKind"
+      },
+      "title": "CoverageScopeKind",
+      "type": "object"
     },
     "CoverageScopeUnit": {
       "additionalProperties": false,
@@ -606,7 +606,10 @@
         "require": {
           "anyOf": [
             {
-              "const": "available",
+              "enum": [
+                "available",
+                "none"
+              ],
               "type": "string"
             },
             {
@@ -619,7 +622,7 @@
             }
           ],
           "default": "available",
-          "description": "`available` requires every affected adapter that advertises validation; an explicit list requires those exact core.Language pairs.",
+          "description": "`available` requires every affected adapter that advertises validation; `none` requires no adapter reports; an explicit list requires those exact core.Language pairs.",
           "rift:selectsType": "Language",
           "title": "Require"
         }

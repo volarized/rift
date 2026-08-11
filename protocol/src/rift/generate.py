@@ -299,10 +299,18 @@ class SchemaCompiler:
                     map_value=value,
                 )
             )
-        prefixed = len(nested_raw) > 1
+        deduped: dict[str, tuple[str, dict[str, Any], Proto]] = {}
+        for enum_name, enum_schema, enum_mapping in nested_raw:
+            held = deduped.get(enum_name)
+            if held is not None:
+                if held[1] != enum_schema:
+                    raise ValueError(f"{name} nests two different enums as {enum_name}")
+                continue
+            deduped[enum_name] = (enum_name, enum_schema, enum_mapping)
+        prefixed = len(deduped) > 1
         nested = [
             self.enum(enum_name, enum_schema, mapping, prefixed=prefixed)
-            for enum_name, enum_schema, mapping in nested_raw
+            for enum_name, enum_schema, mapping in deduped.values()
         ]
         message = MessageSpec(
             name=name,

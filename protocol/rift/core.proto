@@ -265,6 +265,17 @@ enum FormattingPolicy {
   // Run the language formatter over every text file touched by the change.
   FORMATTING_POLICY_AFFECTED_FILES = 3;
 }
+// How a safe delete eliminates one classified remaining use.
+enum Disposition {
+  // The caller did not set a value.
+  DISPOSITION_UNSPECIFIED = 0;
+  // Stop the whole deletion while such a use exists.
+  DISPOSITION_REFUSE = 1;
+  // Replace the use with a valid form the adapter selects.
+  DISPOSITION_REWRITE = 2;
+  // Delete the construct containing the use, at a safe boundary the adapter selects.
+  DISPOSITION_REMOVE = 3;
+}
 // A property an action claims and must establish with scoped evidence when resolved.
 enum GuaranteeKind {
   // The caller did not set a value.
@@ -338,14 +349,14 @@ enum ExecutionStatus {
   EXECUTION_STATUS_FAILED = 2;
 }
 // Summary of the session projection. The changed paths and the changes that produced them
-// are read from the changes resource, which pages; both fields here are counts a caller can
+// are read from the changes resource, which pages; both fields here are booleans a caller can
 // branch on without that read.
 message ProjectionState {
   // Whether the projection holds anything the workspace does not.
   bool dirty = 3;
   // Whether the changeset holds a change carrying a confirmation the caller has not accepted.
   // Publication refuses while this is true.
-  bool unacknowledged = 4;
+  bool unaccepted = 4;
 }
 // A byte range of one file and the language used to parse it. The owner of `App.svelte` can
 // mark its script block as TypeScript. A produced virtual file records ranges in its own byte
@@ -1144,7 +1155,8 @@ message FieldFilter {
     EQ = 1;
     // The field does not equal the operand.
     NE = 2;
-    // The field equals one of `values`.
+    // The field equals one of `values`. Against an array field it holds at least one of them,
+    // which is how `facets` is asked for any of several at once.
     IN = 3;
     // The field holds the operand: a substring of a string, a member of an array such as
     // `facets`.
@@ -1640,13 +1652,13 @@ message Diagnostic {
     // A suggestion, usually with a code action behind it.
     SEVERITY_HINT = 4;
   }
-  enum Tags {
+  enum Tag {
     // The caller did not set a value.
-    TAGS_UNSPECIFIED = 0;
+    TAG_UNSPECIFIED = 0;
     // The code still works and is marked for removal.
-    TAGS_DEPRECATED = 1;
+    TAG_DEPRECATED = 1;
     // The code has no effect — an unused import, an unreachable branch.
-    TAGS_UNNECESSARY = 2;
+    TAG_UNNECESSARY = 2;
   }
   // Whether the facts around this finding came off a clean parse.
   enum Reliability {
@@ -1683,7 +1695,7 @@ message Diagnostic {
   // Other places the adapter pointed at while explaining this one.
   repeated DiagnosticRelated related = 5;
   // Presentation tags for the finding. An editor can render them as strikethrough or grey text.
-  repeated Tags tags = 6;
+  repeated Tag tags = 6;
   Reliability reliability = 7;
   Continuation continuation = 8;
   // Diagnostic fields the model has no place for, namespaced by the adapter that emitted them.
@@ -1714,7 +1726,8 @@ message ValidationReport {
 message MatchCardinality {
   // Fewest matches required.
   int64 minimum = 1;
-  // Most matches accepted. Null uses the workspace's `max_rewrite_expansions` limit.
+  // Most matches accepted. Null leaves the match count unbounded, and `max_rewrite_expansions`
+  // still caps the concrete edits the expansion may produce.
   optional int64 maximum = 2;
 }
 // The project source an action may inspect or change. Dependencies remain readable adapter
@@ -1746,76 +1759,36 @@ message OperationScope {
   Tests tests = 2;
   Generated generated = 3;
 }
-// How an adapter may eliminate each remaining use while deleting a declaration. `refuse` stops
-// when that use exists, `rewrite` replaces it with a valid form selected by the adapter, and
-// `remove` deletes its containing construct at a safe boundary selected by the adapter.
-// Complete reference coverage is mandatory.
+// How an adapter may eliminate each remaining use while deleting a declaration. Every field
+// holds a `Disposition`, one per class of use. Complete reference coverage is mandatory.
 message SafeDeletePolicy {
+  // How a safe delete eliminates one classified remaining use.
+  enum Disposition {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Stop the whole deletion while such a use exists.
+    DISPOSITION_REFUSE = 1;
+    // Replace the use with a valid form the adapter selects.
+    DISPOSITION_REWRITE = 2;
+    // Delete the construct containing the use, at a safe boundary the adapter selects.
+    DISPOSITION_REMOVE = 3;
+  }
   // Disposition for reads, calls, and constructions.
-  enum Reads {
-    // The caller did not set a value.
-    READS_UNSPECIFIED = 0;
-    READS_REFUSE = 1;
-    READS_REWRITE = 2;
-    READS_REMOVE = 3;
-  }
+  Disposition reads = 1;
   // Disposition for assignments and other writes.
-  enum Writes {
-    // The caller did not set a value.
-    WRITES_UNSPECIFIED = 0;
-    WRITES_REFUSE = 1;
-    WRITES_REWRITE = 2;
-    WRITES_REMOVE = 3;
-  }
+  Disposition writes = 2;
   // Disposition for imports, exports, aliases, and re-exports.
-  enum Imports {
-    // The caller did not set a value.
-    IMPORTS_UNSPECIFIED = 0;
-    IMPORTS_REFUSE = 1;
-    IMPORTS_REWRITE = 2;
-    IMPORTS_REMOVE = 3;
-  }
+  Disposition imports = 3;
   // Disposition for overrides, implementations, and inherited declarations.
-  enum Overrides {
-    // The caller did not set a value.
-    OVERRIDES_UNSPECIFIED = 0;
-    OVERRIDES_REFUSE = 1;
-    OVERRIDES_REWRITE = 2;
-    OVERRIDES_REMOVE = 3;
-  }
+  Disposition overrides = 4;
   // Disposition for adapter-resolved uses in generated source. Scope must also permit generated
   // files.
-  enum Generated {
-    // The caller did not set a value.
-    GENERATED_UNSPECIFIED = 0;
-    GENERATED_REFUSE = 1;
-    GENERATED_REWRITE = 2;
-    GENERATED_REMOVE = 3;
-  }
+  Disposition generated = 5;
   // Disposition for adapter-classified string references such as reflection names. Unclassified
   // strings are outside the reference set and cannot be claimed by a guarantee.
-  enum Strings {
-    // The caller did not set a value.
-    STRINGS_UNSPECIFIED = 0;
-    STRINGS_REFUSE = 1;
-    STRINGS_REWRITE = 2;
-    STRINGS_REMOVE = 3;
-  }
+  Disposition strings = 6;
   // Disposition for complete adapter-resolved uses not covered above.
-  enum Other {
-    // The caller did not set a value.
-    OTHER_UNSPECIFIED = 0;
-    OTHER_REFUSE = 1;
-    OTHER_REWRITE = 2;
-    OTHER_REMOVE = 3;
-  }
-  Reads reads = 1;
-  Writes writes = 2;
-  Imports imports = 3;
-  Overrides overrides = 4;
-  Generated generated = 5;
-  Strings strings = 6;
-  Other other = 7;
+  Disposition other = 7;
 }
 // The desired callable shape for a structured signature action. Existing parameters retain
 // identity through `Parameter.node`; a parameter without a node is new. Language constructs
@@ -1934,8 +1907,8 @@ message OperationVerifierAdapter {
 }
 // One workspace command validator checked a changed tree.
 message OperationVerifierValidator {
-  // Zero-based position in workspace validator declarations.
-  int64 validator = 1;
+  // The `CommandValidator.id` of the workspace validator that ran the check.
+  string validator = 1;
 }
 // The component that checked a precondition or established a guarantee.
 message OperationVerifier {
@@ -2110,10 +2083,10 @@ message GuaranteeEvidence {
 }
 // One effect the caller has to accept before publication. The change that raised it lands in
 // the projection either way, carrying this record, so the caller can read what happened before
-// deciding. Requirements are sorted by kind, source location, title, and detail, then numbered
-// from zero within their change.
+// deciding. Requirements are sorted by kind, source location, title, and detail within their
+// change.
 message ConfirmationRequirement {
-  // The condition that makes acknowledgement necessary.
+  // The condition that makes acceptance necessary.
   enum Kind {
     // The caller did not set a value.
     UNSPECIFIED = 0;
@@ -2136,11 +2109,8 @@ message ConfirmationRequirement {
     // The action advertised a guarantee that resolution produced no evidence for.
     GUARANTEE_UNESTABLISHED = 9;
   }
-  // Zero-based position in its change's ordered confirmation list.
-  int64 id = 1;
-  // The condition that makes acceptance necessary.
   Kind kind = 2;
-  // A short account of the effect being acknowledged.
+  // A short account of the effect being accepted.
   string title = 3;
   // The concrete consequence, including the scope or unresolved item that triggered it.
   string detail = 4;
@@ -2187,7 +2157,7 @@ message ActionDescriptor {
     // resolved preconditions or confirmations.
     CONDITIONAL = 2;
     // The adapter inferred intent from incomplete target evidence. The caller inspects the
-    // operation's effects before retrying with acknowledgements.
+    // resolved change's effects before accepting it.
     SPECULATIVE = 3;
   }
   // A property an action claims and must establish with scoped evidence when resolved.

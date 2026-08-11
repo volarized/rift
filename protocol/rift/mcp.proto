@@ -4,6 +4,26 @@ syntax = "proto3";
 package rift.mcp;
 import "rift/core.proto";
 import "google/protobuf/struct.proto";
+// One family of Rift resources. The family fixes the URI shape a read accepts, the media type
+// it returns, and the payload model inside it.
+enum ResourceFamily {
+  // The caller did not set a value.
+  RESOURCE_FAMILY_UNSPECIFIED = 0;
+  // Workspace capabilities, projection state, and request limits.
+  RESOURCE_FAMILY_WORKSPACE = 1;
+  // One symbol, its nodes, its edges and its diagnostics.
+  RESOURCE_FAMILY_SYMBOL = 2;
+  // One directory page or file-content range.
+  RESOURCE_FAMILY_FS = 3;
+  // The fixes and refactors an adapter offers at one address, or across one file.
+  RESOURCE_FAMILY_ACTIONS = 4;
+  // One discovered action, with the schema of the arguments it takes.
+  RESOURCE_FAMILY_ACTION = 5;
+  // Where this session's projection lives on the filesystem.
+  RESOURCE_FAMILY_ROOT = 6;
+  // The changes this session has made, and what vouched for each.
+  RESOURCE_FAMILY_CHANGES = 7;
+}
 // Why a request failed, as a stable code a caller branches on. The code is the complete
 // classification. Domain results such as unsupported coverage and edit refusal use their typed
 // result values.
@@ -54,9 +74,8 @@ enum ErrorCode {
   // Rift could not read or write workspace or projection files. Worth retrying only if the
   // cause was transient, such as a disk that has since been cleared.
   ERROR_CODE_STORAGE_FAILURE = 14;
-  // Rift could not prepare the validation workspace, launch the command validator, enforce its
-  // timeout, or capture its output. One retry is reasonable when the host failure was
-  // transient.
+  // Rift could not launch the command validator, enforce its timeout, or capture its output.
+  // One retry is reasonable when the host failure was transient.
   ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 15;
   // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected to
   // answer differently.
@@ -116,9 +135,12 @@ enum RefusalReason {
   REFUSAL_REASON_UNSAFE_EFFECT = 8;
   // The requested formatting policy has no formatter behind it for an affected language.
   REFUSAL_REASON_FORMATTER_UNSUPPORTED = 9;
-  // The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`,
-  // or `change_signature` rather than through `act`.
+  // The offer carries a portable argument contract, so it resolves through `rename`, `move`,
+  // `delete`, or `change_signature` rather than through `act`.
   REFUSAL_REASON_PORTABLE_FAMILY = 11;
+  // The language itself forbids it — a rename to a reserved word, a visibility change its rules
+  // do not allow.
+  REFUSAL_REASON_LANGUAGE_REFUSAL = 12;
 }
 // The total order a paginated answer comes back in, named in the request so a cursor can be
 // bound to it. Every order ends in the result's own identity, so two results that tie never
@@ -132,8 +154,8 @@ enum ResultOrder {
   // By the file a result is written in, then its byte range, then identity. Two hits in one
   // file come back in source order.
   RESULT_ORDER_PATH = 2;
-  // By the result's canonical identity: a symbol URI, a file path, or an `ActionKey`. Adapter
-  // actions use this order because they carry no relevance score or common source path.
+  // By the result's canonical identity: a symbol URI, a file path, or an `ActionOfferId`.
+  // Adapter actions use this order because they carry no relevance score or common source path.
   RESULT_ORDER_IDENTITY = 3;
 }
 // A copy of some source, and where it was copied from. A span points into a file that may
@@ -225,8 +247,9 @@ message SearchParams {
     // By the file a result is written in, then its byte range, then identity. Two hits in one
     // file come back in source order.
     RESULT_ORDER_PATH = 2;
-    // By the result's canonical identity: a symbol URI, a file path, or an `ActionKey`. Adapter
-    // actions use this order because they carry no relevance score or common source path.
+    // By the result's canonical identity: a symbol URI, a file path, or an `ActionOfferId`.
+    // Adapter actions use this order because they carry no relevance score or common source
+    // path.
     RESULT_ORDER_IDENTITY = 3;
   }
   enum Include {
@@ -281,82 +304,6 @@ message SearchHit {
   optional SourceExcerpt source = 5;
   // What the adapter reported here, requested with `include: ["diagnostics"]`.
   repeated DiagnosticContext diagnostics = 6;
-}
-// A link to the actions available at one address.
-message ActionsResourceLink {
-  // The address to read, optionally filtered by kind and continued by a cursor.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `ActionsResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to one discovered action and the arguments it takes.
-message ActionResourceLink {
-  // The offer to read.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `ActionResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to the symbol resource, carrying the symbol's own URI.
-message SymbolResourceLink {
-  // The symbol to read. Hand it to `resources/read` unchanged.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `SymbolResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to the workspace resource.
-message WorkspaceResourceLink {
-  // The workspace resource, optionally continued by a cursor.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `WorkspaceResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to one path in the session projection.
-message FsResourceLink {
-  // The filesystem entry to read.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `FsResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to the session's projection directory.
-message RootResourceLink {
-  // The root resource.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `RootResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to the session's changeset.
-message ChangesResourceLink {
-  // The changeset, optionally continued by a cursor.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `ChangesResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed
-// per resource, and the URI is the one that resource accepts.
-message ResourceLink {
-  oneof variant {
-    SymbolResourceLink symbol = 1;
-    WorkspaceResourceLink workspace = 2;
-    FsResourceLink fs = 3;
-    ActionsResourceLink actions = 4;
-    ActionResourceLink action = 5;
-    RootResourceLink root = 6;
-    ChangesResourceLink changes = 7;
-  }
 }
 // JSON payload for one symbol in the session projection.
 message SymbolResourcePayload {
@@ -485,14 +432,14 @@ message SessionContinueResult {
 }
 // Removes one inactive session and the projection it retains.
 message SessionRemoveParams {
-  // Retained session to inspect or remove.
+  // Retained session to remove.
   string session = 1;
 }
-// The session removed at the checked projection state.
+// The removed session and the projection state it held.
 message SessionRemoveResult {
   // Session the result describes.
   string session = 1;
-  // Exact projection state checked by this preview or confirmation.
+  // Exact projection state the session held when it was removed.
   rift.core.ProjectionState state = 2;
 }
 // Workspace ceilings for retained debugging sessions. Null at
@@ -550,14 +497,12 @@ message Limits {
   // How far a relationship filter may walk. Transitive callers of a widely used function fan
   // out fast, and this is what stops one query from touching the whole graph.
   int64 max_relation_depth = 6;
-  // Most top-level `Change` values one mutation request accepts.
-  int64 max_changes = 7;
   // Most concrete `Edit` values one resolved operation may contain across every change.
   int64 max_edits = 8;
   // How many workspace command checks may run before publication. Zero when `rift.toml`
   // declares none.
   int64 max_validators = 9;
-  // Most concrete edits one atomic `RewriteChange` may produce after matching.
+  // Most concrete edits one atomic `rewrite` (`RewriteParams`) may produce after matching.
   int64 max_rewrite_expansions = 10;
   // Caller-code execution ceilings. Null means `rift.toml` disables execute and all debug
   // tools; adapter capability alone never enables them.
@@ -566,23 +511,25 @@ message Limits {
 // Current workspace state and request limits. Each configured language reports its
 // adapter support and effective caller-code availability.
 message WorkspaceResourcePayload {
-  enum Resources {
+  // One family of Rift resources. The family fixes the URI shape a read accepts, the media type
+  // it returns, and the payload model inside it.
+  enum ResourceFamily {
     // The caller did not set a value.
     UNSPECIFIED = 0;
     // Workspace capabilities, projection state, and request limits.
-    RESOURCES_WORKSPACE = 1;
+    RESOURCE_FAMILY_WORKSPACE = 1;
     // One symbol, its nodes, its edges and its diagnostics.
-    RESOURCES_SYMBOL = 2;
+    RESOURCE_FAMILY_SYMBOL = 2;
     // One directory page or file-content range.
-    RESOURCES_FS = 3;
+    RESOURCE_FAMILY_FS = 3;
     // The fixes and refactors an adapter offers at one address, or across one file.
-    RESOURCES_ACTIONS = 4;
+    RESOURCE_FAMILY_ACTIONS = 4;
     // One discovered action, with the schema of the arguments it takes.
-    RESOURCES_ACTION = 5;
+    RESOURCE_FAMILY_ACTION = 5;
     // Where this session's projection lives on the filesystem.
-    RESOURCES_ROOT = 6;
+    RESOURCE_FAMILY_ROOT = 6;
     // The changes this session has made, and what vouched for each.
-    RESOURCES_CHANGES = 7;
+    RESOURCE_FAMILY_CHANGES = 7;
   }
   // The URI this payload answers for.
   string uri = 1;
@@ -598,7 +545,7 @@ message WorkspaceResourcePayload {
   // remains unsupported in subsequent answers.
   rift.core.SemanticCoverage coverage = 6;
   // The MCP resource families this workspace serves.
-  repeated Resources resources = 8;
+  repeated ResourceFamily resources = 8;
   // The same resource carrying the cursor for the next page, or null on the last one.
   optional string next = 9;
   // The pattern grammars the `match` tool accepts here.
@@ -606,15 +553,17 @@ message WorkspaceResourcePayload {
   // Publication checks declared by the workspace-root `rift.toml`.
   repeated CommandValidator validators = 13;
 }
-// Where this session's projection lives on the filesystem. Adapters receive this path over
-// the adapter protocol; a caller that has to reach the projection through an ordinary
-// filesystem tool reads it here.
+// Where this session's projection lives on the filesystem. Adapters receive the tree they
+// analyze over the adapter protocol; a caller that has to reach the projection through an
+// ordinary filesystem tool reads it here.
 message RootResourcePayload {
   // The URI this payload answers for.
   string uri = 1;
   // Absolute path of the projection directory. Rift places it at `.rift/projections/<session>`
-  // below the workspace and keeps it there for the session's life. Session removal deletes the
-  // directory without waiting for a process that is still working inside it.
+  // below the workspace and keeps it there for the session's life. Reading this resource
+  // materializes a projection that has not diverged yet, because a tool pointed here may write
+  // and those writes belong to the changeset. Session removal deletes the directory without
+  // waiting for a process that is still working inside it.
   string path = 2;
   // Absolute path of the workspace this projection was taken from.
   string workspace = 3;
@@ -857,9 +806,8 @@ message ErrorCause {
     // Rift could not read or write workspace or projection files. Worth retrying only if the
     // cause was transient, such as a disk that has since been cleared.
     ERROR_CODE_STORAGE_FAILURE = 14;
-    // Rift could not prepare the validation workspace, launch the command validator, enforce
-    // its timeout, or capture its output. One retry is reasonable when the host failure was
-    // transient.
+    // Rift could not launch the command validator, enforce its timeout, or capture its output.
+    // One retry is reasonable when the host failure was transient.
     ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 15;
     // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected
     // to answer differently.
@@ -956,9 +904,8 @@ message ErrorData {
     // Rift could not read or write workspace or projection files. Worth retrying only if the
     // cause was transient, such as a disk that has since been cleared.
     ERROR_CODE_STORAGE_FAILURE = 14;
-    // Rift could not prepare the validation workspace, launch the command validator, enforce
-    // its timeout, or capture its output. One retry is reasonable when the host failure was
-    // transient.
+    // Rift could not launch the command validator, enforce its timeout, or capture its output.
+    // One retry is reasonable when the host failure was transient.
     ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 15;
     // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected
     // to answer differently.
@@ -1011,8 +958,8 @@ message ErrorData {
     // Checking a proposed change against the schema, the state it was pinned to, and the checks
     // required by the workspace-root `rift.toml`.
     VALIDATE = 4;
-    // Resolving the operation in a private candidate, validating it, and writing the result
-    // into the projection.
+    // Resolving the operation, writing the result into the projection, and validating the
+    // resulting tree.
     CHANGE = 5;
     // Publishing projection changes to the workspace.
     PUBLISH = 6;
@@ -1029,9 +976,6 @@ message ErrorData {
   // What the caller may do next.
   RetryDirective retry = 3;
   Phase phase = 4;
-  // Which operation of a multi-operation request failed, as its zero-based index. Null where
-  // the request carried one, or failed before any of them ran.
-  optional int64 operation = 6;
   // What an adapter or configured command check reported while the request was failing. Empty
   // where neither ran.
   repeated DiagnosticContext diagnostics = 7;
@@ -1083,132 +1027,80 @@ message MatchSyntax {
   MatchSyntaxText text = 1;
   MatchSyntaxPath path = 2;
 }
-// The workspace resource with an optional page cursor.
-message WorkspaceResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `WorkspaceResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// The symbol resource, addressed by language and qualified name.
-message SymbolResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `SymbolResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// The filesystem resource, addressed by a path relative to the project root.
-message FsResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `FsResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// The actions resource, addressed by the place to inspect.
-message ActionsResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `ActionsResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// One discovered action, addressed by the offer identity a listing returned.
-message ActionResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `ActionResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// The projection directory, addressed without parameters.
-message RootResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `RootResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// The changeset with an optional page cursor.
-message ChangesResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `ChangesResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per
-// family.
-message ResourceTemplate {
-  oneof variant {
-    WorkspaceResourceTemplate workspace = 1;
-    SymbolResourceTemplate symbol = 2;
-    FsResourceTemplate fs = 3;
-    ActionsResourceTemplate actions = 4;
-    ActionResourceTemplate action = 5;
-    RootResourceTemplate root = 6;
-    ChangesResourceTemplate changes = 7;
+// A link to one Rift resource, as MCP carries it inside tool output. `name` selects the family,
+// which fixes the URI shape a read of `uri` accepts and the media type it returns.
+message ResourceLink {
+  // One family of Rift resources. The family fixes the URI shape a read accepts, the media type
+  // it returns, and the payload model inside it.
+  enum ResourceFamily {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Workspace capabilities, projection state, and request limits.
+    RESOURCE_FAMILY_WORKSPACE = 1;
+    // One symbol, its nodes, its edges and its diagnostics.
+    RESOURCE_FAMILY_SYMBOL = 2;
+    // One directory page or file-content range.
+    RESOURCE_FAMILY_FS = 3;
+    // The fixes and refactors an adapter offers at one address, or across one file.
+    RESOURCE_FAMILY_ACTIONS = 4;
+    // One discovered action, with the schema of the arguments it takes.
+    RESOURCE_FAMILY_ACTION = 5;
+    // Where this session's projection lives on the filesystem.
+    RESOURCE_FAMILY_ROOT = 6;
+    // The changes this session has made, and what vouched for each.
+    RESOURCE_FAMILY_CHANGES = 7;
   }
+  // The resource to read. Hand it to `resources/read` unchanged.
+  string uri = 1;
+  // The resource family this link belongs to.
+  ResourceFamily name = 2;
+  // What a read of `uri` returns, as `application/vnd.rift.<family>+json`.
+  string mime_type = 3;
+}
+// One advertised MCP resource template, as `resources/templates/list` returns it. The family
+// fixes the template and the media type.
+message ResourceTemplate {
+  // One family of Rift resources. The family fixes the URI shape a read accepts, the media type
+  // it returns, and the payload model inside it.
+  enum ResourceFamily {
+    // The caller did not set a value.
+    UNSPECIFIED = 0;
+    // Workspace capabilities, projection state, and request limits.
+    RESOURCE_FAMILY_WORKSPACE = 1;
+    // One symbol, its nodes, its edges and its diagnostics.
+    RESOURCE_FAMILY_SYMBOL = 2;
+    // One directory page or file-content range.
+    RESOURCE_FAMILY_FS = 3;
+    // The fixes and refactors an adapter offers at one address, or across one file.
+    RESOURCE_FAMILY_ACTIONS = 4;
+    // One discovered action, with the schema of the arguments it takes.
+    RESOURCE_FAMILY_ACTION = 5;
+    // Where this session's projection lives on the filesystem.
+    RESOURCE_FAMILY_ROOT = 6;
+    // The changes this session has made, and what vouched for each.
+    RESOURCE_FAMILY_CHANGES = 7;
+  }
+  // The resource family being advertised.
+  ResourceFamily name = 1;
+  // What a read of a URI from this template returns, as `application/vnd.rift.<family>+json`.
+  string mime_type = 2;
 }
 // The URI passed to MCP `resources/read`. Each branch is one advertised Rift resource family.
 message ResourceReadParams {
-  // A URI matching one branch of `ResourceTemplate`.
+  // A URI matching one advertised resource family.
   string uri = 1;
 }
-// What a read of `rift://workspace` returns.
-message WorkspaceResourceContent {
-  // The URI that was read, as it resolved.
-  string uri = 1;
-  // A `WorkspaceResourcePayload`, serialized as JSON.
-  string text = 2;
-}
-// What a read of a `rift://symbol/…` URI returns.
-message SymbolResourceContent {
-  // The URI that was read, as it resolved.
-  string uri = 1;
-  // A `SymbolResourcePayload`, serialized as JSON.
-  string text = 2;
-}
-// What a read of a `rift://fs` URI returns.
-message FsResourceContent {
-  // The URI that was read, as it resolved.
-  string uri = 1;
-  // An `FsResourcePayload`, serialized as JSON.
-  string text = 2;
-}
-// What a read of a `rift://actions/…` URI returns.
-message ActionsResourceContent {
-  // The address that was read, as it resolved.
-  string uri = 1;
-  // An `ActionsResourcePayload`, serialized as JSON.
-  string text = 2;
-}
-// What a read of a `rift://action/…` URI returns.
-message ActionResourceContent {
-  // The offer that was read, as it resolved.
-  string uri = 1;
-  // An `ActionResourcePayload`, serialized as JSON.
-  string text = 2;
-}
-// What a read of `rift://root` returns.
-message RootResourceContent {
-  // The URI that was read, as it resolved.
-  string uri = 1;
-  // A `RootResourcePayload`, serialized as JSON.
-  string text = 2;
-}
-// What a read of a `rift://changes` URI returns.
-message ChangesResourceContent {
-  // The URI that was read, as it resolved.
-  string uri = 1;
-  // A `ChangesResourcePayload`, serialized as JSON.
-  string text = 2;
-}
+// One content block of an MCP resource read. `text` holds the family's payload as JSON —
+// `WorkspaceResourcePayload` for `rift://workspace`, `SymbolResourcePayload` for a symbol URI,
+// and so on — and `mimeType` names which. The `rift:contentTypes` map in the schema carries the
+// complete pairing.
 message ResourceContent {
-  oneof variant {
-    WorkspaceResourceContent workspace = 1;
-    SymbolResourceContent symbol = 2;
-    FsResourceContent fs = 3;
-    ActionsResourceContent actions = 4;
-    ActionResourceContent action = 5;
-    RootResourceContent root = 6;
-    ChangesResourceContent changes = 7;
-  }
+  // The URI that was read, as it resolved.
+  string uri = 1;
+  // Which payload `text` holds, as `application/vnd.rift.<family>+json`.
+  string mime_type = 3;
+  // The payload, serialized as JSON.
+  string text = 2;
 }
 // The result of one MCP resource read. Each Rift resource returns one JSON payload in `text`,
 // identified by `mimeType`. File bytes use UTF-8 or base64.
@@ -1414,9 +1306,9 @@ message ChangeSignatureParams {
   rift.core.ChangeSignatureArguments arguments = 5;
 }
 // Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an
-// adapter offers that has no portable contract. Rift validates `arguments` against the offer's
-// advertised schema. An offer whose kind belongs to a portable family is refused here, because
-// `rename`, `move`, `delete`, and `change_signature` are its typed entry points.
+// adapter offers that has no portable argument contract. Rift validates `arguments` against the
+// offer's advertised schema. An offer carrying a portable argument contract is refused here,
+// because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.
 message ActParams {
   // How formatting participates in one session change.
   enum FormattingPolicy {
@@ -1467,8 +1359,8 @@ message CommandValidatorGuarantees {
   // Exact property the command checks and limits on interpreting a pass.
   string detail = 3;
 }
-// A command from the workspace-root `rift.toml`, run without a shell against a disposable copy
-// of the changed tree.
+// A command from the workspace-root `rift.toml`, run without a shell inside the session's
+// projection directory. Whatever it writes there joins the changeset.
 message CommandValidator {
   // How workspace configuration presents this check.
   enum Kind {
@@ -1551,8 +1443,9 @@ message ChangeSummary {
   repeated rift.core.GuaranteeEvidence guarantees = 7;
   // Resolution findings in source order.
   repeated rift.core.Diagnostic diagnostics = 8;
-  // Effects the caller has to accept before this change can be published, sorted and numbered
-  // from zero. Empty where every affected adapter and validator vouched for the result.
+  // Effects the caller has to accept before this change can be published, sorted by kind,
+  // source location, title, and detail. Empty where every affected adapter and validator
+  // vouched for the result.
   repeated rift.core.ConfirmationRequirement confirmations = 10;
   // Projection state after this change landed.
   rift.core.ProjectionState current = 9;
@@ -1601,9 +1494,12 @@ message RefusedResult {
     REFUSAL_REASON_UNSAFE_EFFECT = 8;
     // The requested formatting policy has no formatter behind it for an affected language.
     REFUSAL_REASON_FORMATTER_UNSUPPORTED = 9;
-    // The offer belongs to a portable family, which resolves through `rename`, `move`,
+    // The offer carries a portable argument contract, so it resolves through `rename`, `move`,
     // `delete`, or `change_signature` rather than through `act`.
     REFUSAL_REASON_PORTABLE_FAMILY = 11;
+    // The language itself forbids it — a rename to a reserved word, a visibility change its
+    // rules do not allow.
+    REFUSAL_REASON_LANGUAGE_REFUSAL = 12;
   }
   // The condition the caller can act on.
   RefusalReason reason = 2;
@@ -1657,7 +1553,8 @@ message FsResourcePayload {
   rift.core.ProjectEntry entry = 3;
   // How this entry's payload is represented.
   Encoding encoding = 4;
-  // Directory children on this page.
+  // Directory children on this page — subdirectories and files alike, each one a complete
+  // `ProjectEntry`.
   repeated rift.core.ProjectEntry entries = 5;
   optional int64 start = 6;
   optional int64 end = 7;
@@ -1750,7 +1647,7 @@ service Rift {
   rpc SessionList (rift.mcp.SessionListParams) returns (rift.mcp.SessionListResult);
   // Rebinds the current connection to one retained session.
   rpc SessionContinue (rift.mcp.SessionContinueParams) returns (rift.mcp.SessionContinueResult);
-  // Previews or removes one inactive session.
+  // Removes one inactive session and deletes its projection.
   rpc SessionRemove (rift.mcp.SessionRemoveParams) returns (rift.mcp.SessionRemoveResult);
   // Reads the declaration structure of one file from its adapter.
   rpc Outline (rift.mcp.OutlineParams) returns (rift.mcp.OutlineResult);
@@ -1790,8 +1687,9 @@ service Rift {
   // `behavior_unknown` confirmation.
   rpc ChangeSignature (rift.mcp.ChangeSignatureParams) returns (rift.mcp.ChangeResult);
   // Resolves one action an adapter offered — a quick fix, an extraction, an inline, or an
-  // adapter-specific family. Arguments are validated against the schema the offer advertises. A
-  // portable family is refused here and resolves through its own tool.
+  // adapter-specific family. Arguments are validated against the schema the offer advertises.
+  // An offer carrying a portable argument contract is refused here and resolves through its own
+  // tool.
   rpc Act (rift.mcp.ActParams) returns (rift.mcp.ChangeResult);
   // Restores changed paths from the workspace and drops the changes that touched them.
   rpc ProjectionRestore (rift.mcp.ProjectionRestoreParams) returns (rift.core.ProjectionState);

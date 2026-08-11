@@ -72,7 +72,7 @@ class SourceExcerpt(ClosedModel):
         }
     },
 )
-class OutlineParamsIncludeItemInclude(str, Enum):
+class OutlineInclude(str, Enum):
     SYMBOL = "symbol"
     SOURCE = "source"
     DIAGNOSTICS = "diagnostics"
@@ -92,7 +92,7 @@ class OutlineParams(ClosedModel):
         ),
         number=2,
     )
-    include: Field[list[OutlineParamsIncludeItemInclude]] = proto_field(
+    include: Field[list[OutlineInclude]] = proto_field(
         description=(
             "Optional payload attached to each outline item. Symbol identity and source "
             "structure are always present."
@@ -214,7 +214,7 @@ class SearchParamsTarget(str, Enum):
         }
     },
 )
-class SearchParamsIncludeItemInclude(str, Enum):
+class SearchInclude(str, Enum):
     SOURCE = "source"
     SIGNATURE = "signature"
     RELATIONSHIPS = "relationships"
@@ -245,14 +245,6 @@ class SearchParams(ClosedModel):
             "records that bind it, and filters can search those attachments."
         ),
         number=1,
-        json_schema_extra={
-            "rift:enumDescriptions": {
-                "symbol": "Declarations the adapter resolved — a function, a class, a trait.",
-                "node": "Places in a syntax tree where a symbol is written. One symbol has many.",
-                "file": "Entries of the workspace tree. The only target that answers with no adapter installed.",
-                "all": "Every kind above, in one ranked list.",
-            }
-        },
     )
     order: Field[ResultOrder] = proto_field(
         description=(
@@ -287,7 +279,7 @@ class SearchParams(ClosedModel):
         ),
         number=5,
     )
-    include: Field[list[SearchParamsIncludeItemInclude] | None] = proto_field(
+    include: Field[list[SearchInclude] | None] = proto_field(
         default=None,
         description=(
             "Extra payload to attach to every hit. Each entry costs a lookup per hit, so ask "
@@ -355,166 +347,11 @@ class SearchHit(ClosedModel):
     )
 
 
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ActionsResourceLink(ClosedModel):
-    """A link to the actions available at one address."""
-
-    uri: Field[ActionsResourceUri] = proto_field(
-        description="The address to read, optionally filtered by kind and continued by a cursor.",
-        number=1,
-    )
-    name: Field[Literal["actions"]] = proto_field(
-        description="The resource family this link belongs to.", number=2
-    )
-    mimeType: Field[Literal["application/vnd.rift.actions+json"]] = proto_field(
-        description="What a read of this URI returns: `ActionsResourcePayload` as JSON.",
-        number=3,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ActionResourceLink(ClosedModel):
-    """A link to one discovered action and the arguments it takes."""
-
-    uri: Field[ActionResourceUri] = proto_field(
-        description="The offer to read.", number=1
-    )
-    name: Field[Literal["action"]] = proto_field(
-        description="The resource family this link belongs to.", number=2
-    )
-    mimeType: Field[Literal["application/vnd.rift.action+json"]] = proto_field(
-        description="What a read of this URI returns: `ActionResourcePayload` as JSON.",
-        number=3,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class SymbolResourceLink(ClosedModel):
-    """A link to the symbol resource, carrying the symbol's own URI."""
-
-    type: Field[Literal["resource_link"]] = proto_field(
-        description="MCP's tag for a link to a resource inside tool output."
-    )
-    uri: Field[core.SymbolId] = proto_field(
-        description="The symbol to read. Hand it to `resources/read` unchanged.",
-        number=1,
-    )
-    name: Field[Literal["symbol"]] = proto_field(
-        description="The resource family this link belongs to.", number=2
-    )
-    mimeType: Field[Literal["application/vnd.rift.symbol+json"]] = proto_field(
-        description="What a read of this URI returns: `SymbolResourcePayload` as JSON.",
-        number=3,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class WorkspaceResourceLink(ClosedModel):
-    """A link to the workspace resource."""
-
-    type: Field[Literal["resource_link"]] = proto_field(
-        description="MCP's tag for a link to a resource inside tool output."
-    )
-    uri: Field[WorkspaceResourceUri] = proto_field(
-        description="The workspace resource, optionally continued by a cursor.",
-        number=1,
-    )
-    name: Field[Literal["workspace"]] = proto_field(
-        description="The resource family this link belongs to.", number=2
-    )
-    mimeType: Field[Literal["application/vnd.rift.workspace+json"]] = proto_field(
-        description="What a read of this URI returns: `WorkspaceResourcePayload` as JSON.",
-        number=3,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class FsResourceLink(ClosedModel):
-    """A link to one path in the session projection."""
-
-    type: Field[Literal["resource_link"]] = proto_field(
-        description="MCP's tag for a link to a resource inside tool output."
-    )
-    uri: Field[FsResourceUri] = proto_field(
-        description="The filesystem entry to read.", number=1
-    )
-    name: Field[Literal["fs"]] = proto_field(
-        description="The resource family this link belongs to.", number=2
-    )
-    mimeType: Field[Literal["application/vnd.rift.fs+json"]] = proto_field(
-        description="What a read of this URI returns: `FsResourcePayload` as JSON.",
-        number=3,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class RootResourceLink(ClosedModel):
-    """A link to the session's projection directory."""
-
-    type: Field[Literal["resource_link"]] = proto_field(
-        description="MCP's tag for a link to a resource inside tool output."
-    )
-    uri: Field[RootResourceUri] = proto_field(
-        description="The root resource.", number=1
-    )
-    name: Field[Literal["root"]] = proto_field(
-        description="The resource family this link belongs to.", number=2
-    )
-    mimeType: Field[Literal["application/vnd.rift.root+json"]] = proto_field(
-        description="What a read of this URI returns: `RootResourcePayload` as JSON.",
-        number=3,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ChangesResourceLink(ClosedModel):
-    """A link to the session's changeset."""
-
-    type: Field[Literal["resource_link"]] = proto_field(
-        description="MCP's tag for a link to a resource inside tool output."
-    )
-    uri: Field[ChangesResourceUri] = proto_field(
-        description="The changeset, optionally continued by a cursor.", number=1
-    )
-    name: Field[Literal["changes"]] = proto_field(
-        description="The resource family this link belongs to.", number=2
-    )
-    mimeType: Field[Literal["application/vnd.rift.changes+json"]] = proto_field(
-        description="What a read of this URI returns: `ChangesResourcePayload` as JSON.",
-        number=3,
-        proto_name="mime_type",
-    )
-
-
-@union(
-    owner=MCP,
-    oneof="variant",
-    discriminator="mimeType",
-    variants=(
-        Variant("symbol", "symbol", 1, SymbolResourceLink),
-        Variant("workspace", "workspace", 2, WorkspaceResourceLink),
-        Variant("fs", "fs", 3, FsResourceLink),
-        Variant("actions", "actions", 4, ActionsResourceLink),
-        Variant("action", "action", 5, ActionResourceLink),
-        Variant("root", "root", 6, RootResourceLink),
-        Variant("changes", "changes", 7, ChangesResourceLink),
-    ),
-)
-class ResourceLink(ProtocolRoot):
-    "A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed per resource, and the URI is the one that resource accepts."
-
-
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SymbolResourcePayload(ClosedModel):
     """JSON payload for one symbol in the session projection."""
 
-    uri: Field[core.SymbolId] = proto_field(
+    uri: Field[SymbolResourceUri] = proto_field(
         description="The symbol this payload answers for, echoed back so a link and its content carry the same address.",
         number=1,
     )
@@ -560,7 +397,7 @@ class SymbolResourcePayload(ClosedModel):
         ),
         number=9,
     )
-    next: Field[core.SymbolId | None] = proto_field(
+    next: Field[SymbolResourceUri | None] = proto_field(
         description=(
             "The same symbol URI carrying the cursor for the next page, or null on the last "
             "one. Nodes, edges and diagnostics are what page."
@@ -895,19 +732,19 @@ class SessionRemoveParams(ClosedModel):
     """Removes one inactive session and the projection it retains."""
 
     session: Field[SessionId] = proto_field(
-        description="Retained session to inspect or remove.", number=1
+        description="Retained session to remove.", number=1
     )
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SessionRemoveResult(ClosedModel):
-    """The session removed at the checked projection state."""
+    """The removed session and the projection state it held."""
 
     session: Field[SessionId] = proto_field(
         description="Session the result describes.", number=1
     )
     state: Field[core.ProjectionState] = proto_field(
-        description="Exact projection state checked by this preview or confirmation.",
+        description="Exact projection state the session held when it was removed.",
         number=2,
     )
 
@@ -1050,12 +887,6 @@ class Limits(ClosedModel):
         le=100,
         number=6,
     )
-    max_changes: Field[int] = proto_field(
-        description="Most top-level `Change` values one mutation request accepts.",
-        ge=1,
-        le=4294967295,
-        number=7,
-    )
     max_edits: Field[int] = proto_field(
         description="Most concrete `Edit` values one resolved operation may contain across every change.",
         ge=1,
@@ -1072,7 +903,7 @@ class Limits(ClosedModel):
         number=9,
     )
     max_rewrite_expansions: Field[int] = proto_field(
-        description="Most concrete edits one atomic `RewriteChange` may produce after matching.",
+        description="Most concrete edits one atomic `rewrite` (`RewriteParams`) may produce after matching.",
         ge=1,
         le=100000,
         number=10,
@@ -1137,6 +968,31 @@ class ChangesResourceUri(ProtocolRoot):
     owner=MCP,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
+    pattern=r"^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}(?:\?cursor=[A-Za-z0-9_-]{1,4096})?$",
+    min_length=17,
+    max_length=12288,
+    examples=[
+        "rift://symbol/python/pkg.util.load_config~1",
+        "rift://symbol/rust/config::Loader?cursor=eyJwYWdlIjoyfQ",
+    ],
+)
+class SymbolResourceUri(ProtocolRoot):
+    """URI for one symbol read. It is the symbol's own `SymbolId`, optionally carrying the
+    cursor that continues its paged nodes, edges, and diagnostics."""
+
+    @model_validator(mode="after")
+    def identity_is_canonical(self) -> SymbolResourceUri:
+        core.SymbolId.model_validate(self.root.partition("?")[0])
+        cursor = _raw_resource_query(self.root).get("cursor")
+        if cursor is not None:
+            Cursor.model_validate(cursor)
+        return self
+
+
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
     pattern=r"^rift://fs(?:/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000})?(?:\?(?:start=[0-9]+&length=[1-9][0-9]*|cursor=[A-Za-z0-9_-]{1,4096}))?$",
     min_length=9,
     max_length=8192,
@@ -1178,18 +1034,19 @@ class FsResourceUri(ProtocolRoot):
 
 @definition(
     owner=MCP,
-    public=False,
+    public=True,
     proto=Proto.enum(
-        "Resources",
+        "ResourceFamily",
         (
-            EnumValue("workspace", "RESOURCES_WORKSPACE", 1),
-            EnumValue("symbol", "RESOURCES_SYMBOL", 2),
-            EnumValue("fs", "RESOURCES_FS", 3),
-            EnumValue("actions", "RESOURCES_ACTIONS", 4),
-            EnumValue("action", "RESOURCES_ACTION", 5),
-            EnumValue("root", "RESOURCES_ROOT", 6),
-            EnumValue("changes", "RESOURCES_CHANGES", 7),
+            EnumValue("workspace", "RESOURCE_FAMILY_WORKSPACE", 1),
+            EnumValue("symbol", "RESOURCE_FAMILY_SYMBOL", 2),
+            EnumValue("fs", "RESOURCE_FAMILY_FS", 3),
+            EnumValue("actions", "RESOURCE_FAMILY_ACTIONS", 4),
+            EnumValue("action", "RESOURCE_FAMILY_ACTION", 5),
+            EnumValue("root", "RESOURCE_FAMILY_ROOT", 6),
+            EnumValue("changes", "RESOURCE_FAMILY_CHANGES", 7),
         ),
+        named=True,
     ),
     schema_extra={
         "rift:enumDescriptions": {
@@ -1203,7 +1060,9 @@ class FsResourceUri(ProtocolRoot):
         }
     },
 )
-class WorkspaceResourcePayloadResourcesItemResources(str, Enum):
+class ResourceFamily(str, Enum):
+    "One family of Rift resources. The family fixes the URI shape a read accepts, the media type it returns, and the payload model inside it."
+
     WORKSPACE = "workspace"
     SYMBOL = "symbol"
     FS = "fs"
@@ -1247,12 +1106,10 @@ class WorkspaceResourcePayload(ClosedModel):
         ),
         number=6,
     )
-    resources: Field[list[WorkspaceResourcePayloadResourcesItemResources]] = (
-        proto_field(
-            description="The MCP resource families this workspace serves.",
-            number=8,
-            json_schema_extra={"uniqueItems": True},
-        )
+    resources: Field[list[ResourceFamily]] = proto_field(
+        description="The MCP resource families this workspace serves.",
+        number=8,
+        json_schema_extra={"uniqueItems": True},
     )
     next: Field[WorkspaceResourceUri | None] = proto_field(
         description="The same resource carrying the cursor for the next page, or null on the last one.",
@@ -1269,9 +1126,9 @@ class WorkspaceResourcePayload(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class RootResourcePayload(ClosedModel):
-    """Where this session's projection lives on the filesystem. Adapters receive this path over
-    the adapter protocol; a caller that has to reach the projection through an ordinary
-    filesystem tool reads it here."""
+    """Where this session's projection lives on the filesystem. Adapters receive the tree they
+    analyze over the adapter protocol; a caller that has to reach the projection through an
+    ordinary filesystem tool reads it here."""
 
     uri: Field[RootResourceUri] = proto_field(
         description="The URI this payload answers for.", number=1
@@ -1280,7 +1137,9 @@ class RootResourcePayload(ClosedModel):
         description=(
             "Absolute path of the projection directory. Rift places it at "
             "`.rift/projections/<session>` below the workspace and keeps it there for the "
-            "session's life. Session removal deletes the directory without waiting for a "
+            "session's life. Reading this resource materializes a projection that has not "
+            "diverged yet, because a tool pointed here may write and those writes belong to "
+            "the changeset. Session removal deletes the directory without waiting for a "
             "process that is still working inside it."
         ),
         number=2,
@@ -1341,7 +1200,9 @@ class ActionOffer(ClosedModel):
     ],
 )
 class ActionsResourceUri(ProtocolRoot):
-    """URI for adapter actions at one address in the session projection."""
+    """URI for adapter actions at one address in the session projection. The address is
+    `symbol/{language}/{name}`, `node/{language}/{path}@{start}-{end}`, `match/{token}`,
+    or `file/{path}`."""
 
     @model_validator(mode="after")
     def address_is_well_formed(self) -> ActionsResourceUri:
@@ -1701,13 +1562,6 @@ class DiagnosticContext(ClosedModel):
             "validator, or apply output."
         ),
         number=1,
-        json_schema_extra={
-            "rift:enumDescriptions": {
-                "adapter": "The language's own analysis.",
-                "validator": "A check Rift ran over a proposed change.",
-                "apply": "Reported while applying edits to the workspace.",
-            }
-        },
     )
     diagnostic: Field[core.Diagnostic] = proto_field(
         description="The finding itself, exactly as the adapter minted it.", number=3
@@ -1841,9 +1695,8 @@ class DiagnosticContext(ClosedModel):
                 "if the cause was transient, such as a disk that has since been cleared."
             ),
             "validator_execution_failure": (
-                "Rift could not prepare the validation workspace, launch the command validator, "
-                "enforce its timeout, or capture its output. One retry is reasonable when the "
-                "host failure was transient."
+                "Rift could not launch the command validator, enforce its timeout, or capture "
+                "its output. One retry is reasonable when the host failure was transient."
             ),
             "internal_error": (
                 "A bug in Rift. `causes` says what it was doing at the time, and a retry is not "
@@ -1977,7 +1830,7 @@ class ErrorCause(ClosedModel):
                 "Checking a proposed change against the schema, the state it was pinned to, and "
                 "the checks required by the workspace-root `rift.toml`."
             ),
-            "change": "Resolving the operation in a private candidate, validating it, and writing the result into the projection.",
+            "change": "Resolving the operation, writing the result into the projection, and validating the resulting tree.",
             "publish": "Publishing projection changes to the workspace.",
             "execute": "Preparing an execution workspace and evaluating caller-provided code.",
             "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
@@ -2036,31 +1889,6 @@ class ErrorData(ClosedModel):
             "while validating it is a change set too large."
         ),
         number=4,
-        json_schema_extra={
-            "rift:enumDescriptions": {
-                "discovery": (
-                    "Working out what the workspace can do: capabilities, limits, which languages "
-                    "have adapters."
-                ),
-                "read": "Fetching what was asked for, from the index, the object store or an adapter.",
-                "resolve": "Turning an address, a cursor or an action key into the concrete thing it names at a state.",
-                "validate": (
-                    "Checking a proposed change against the schema, the state it was pinned to, and "
-                    "the checks required by the workspace-root `rift.toml`."
-                ),
-                "change": "Resolving the operation in a private candidate, validating it, and writing the result into the projection.",
-                "publish": "Publishing projection changes to the workspace.",
-                "execute": "Preparing an execution workspace and evaluating caller-provided code.",
-                "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
-            }
-        },
-    )
-    operation: Field[int | None] = proto_field(
-        description=(
-            "Which operation of a multi-operation request failed, as its zero-based index. "
-            "Null where the request carried one, or failed before any of them ran."
-        ),
-        number=6,
     )
     diagnostics: Field[list[DiagnosticContext]] = proto_field(
         description=(
@@ -2119,12 +1947,6 @@ class LimitEvidence(ClosedModel):
             "is enforced inside one adapter process."
         ),
         number=1,
-        json_schema_extra={
-            "rift:enumDescriptions": {
-                "driver": "A field of `Limits`, advertised by the workspace resource.",
-                "adapter": "A field of the adapter's `AdapterLimits`, advertised in `Describe`.",
-            }
-        },
     )
     field: Field[str] = proto_field(
         description=(
@@ -2191,168 +2013,107 @@ class MatchSyntax(ClosedModel):
     )
 
 
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class WorkspaceResourceTemplate(ClosedModel):
-    """The workspace resource with an optional page cursor."""
-
-    uriTemplate: Field[Literal["rift://workspace{?cursor}"]] = proto_field(
-        description="The template, in RFC 6570 form. What follows `?` is optional."
-    )
-    name: Field[Literal["workspace"]] = proto_field(
-        description="The resource family, as `resources/templates/list` advertises it.",
-        number=1,
-    )
-    mimeType: Field[Literal["application/vnd.rift.workspace+json"]] = proto_field(
-        description="What a read of a URI from this template returns: `WorkspaceResourcePayload` as JSON.",
-        number=2,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class SymbolResourceTemplate(ClosedModel):
-    """The symbol resource, addressed by language and qualified name."""
-
-    uriTemplate: Field[Literal["rift://symbol/{language}/{name}{?cursor}"]] = (
-        proto_field(
-            description="The template, in RFC 6570 form. What follows `?` is optional."
-        )
-    )
-    name: Field[Literal["symbol"]] = proto_field(
-        description="The resource family, as `resources/templates/list` advertises it.",
-        number=1,
-    )
-    mimeType: Field[Literal["application/vnd.rift.symbol+json"]] = proto_field(
-        description="What a read of a URI from this template returns: `SymbolResourcePayload` as JSON.",
-        number=2,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class FsResourceTemplate(ClosedModel):
-    """The filesystem resource, addressed by a path relative to the project root."""
-
-    uriTemplate: Field[Literal["rift://fs{/path}{?start,length,cursor}"]] = proto_field(
-        description="The template, in RFC 6570 form. What follows `?` is optional."
-    )
-    name: Field[Literal["fs"]] = proto_field(
-        description="The resource family, as `resources/templates/list` advertises it.",
-        number=1,
-    )
-    mimeType: Field[Literal["application/vnd.rift.fs+json"]] = proto_field(
-        description="What a read of a URI from this template returns: `FsResourcePayload` as JSON.",
-        number=2,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ActionsResourceTemplate(ClosedModel):
-    """The actions resource, addressed by the place to inspect."""
-
-    uriTemplate: Field[Literal["rift://actions/{address}{?only,cursor}"]] = proto_field(
-        description=(
-            "The template, in RFC 6570 form. The address is `symbol/{language}/{name}`, "
-            "`node/{language}/{path}@{start}-{end}`, `match/{token}`, or `file/{path}`."
-        )
-    )
-    name: Field[Literal["actions"]] = proto_field(
-        description="The resource family, as `resources/templates/list` advertises it.",
-        number=1,
-    )
-    mimeType: Field[Literal["application/vnd.rift.actions+json"]] = proto_field(
-        description="What a read of a URI from this template returns: `ActionsResourcePayload` as JSON.",
-        number=2,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ActionResourceTemplate(ClosedModel):
-    """One discovered action, addressed by the offer identity a listing returned."""
-
-    uriTemplate: Field[Literal["rift://action/{token}"]] = proto_field(
-        description="The template, in RFC 6570 form."
-    )
-    name: Field[Literal["action"]] = proto_field(
-        description="The resource family, as `resources/templates/list` advertises it.",
-        number=1,
-    )
-    mimeType: Field[Literal["application/vnd.rift.action+json"]] = proto_field(
-        description="What a read of a URI from this template returns: `ActionResourcePayload` as JSON.",
-        number=2,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class RootResourceTemplate(ClosedModel):
-    """The projection directory, addressed without parameters."""
-
-    uriTemplate: Field[Literal["rift://root"]] = proto_field(
-        description="The template, in RFC 6570 form."
-    )
-    name: Field[Literal["root"]] = proto_field(
-        description="The resource family, as `resources/templates/list` advertises it.",
-        number=1,
-    )
-    mimeType: Field[Literal["application/vnd.rift.root+json"]] = proto_field(
-        description="What a read of a URI from this template returns: `RootResourcePayload` as JSON.",
-        number=2,
-        proto_name="mime_type",
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ChangesResourceTemplate(ClosedModel):
-    """The changeset with an optional page cursor."""
-
-    uriTemplate: Field[Literal["rift://changes{?cursor}"]] = proto_field(
-        description="The template, in RFC 6570 form. What follows `?` is optional."
-    )
-    name: Field[Literal["changes"]] = proto_field(
-        description="The resource family, as `resources/templates/list` advertises it.",
-        number=1,
-    )
-    mimeType: Field[Literal["application/vnd.rift.changes+json"]] = proto_field(
-        description="What a read of a URI from this template returns: `ChangesResourcePayload` as JSON.",
-        number=2,
-        proto_name="mime_type",
-    )
-
-
-@union(
-    owner=MCP,
-    oneof="variant",
-    discriminator="mimeType",
-    variants=(
-        Variant(
-            "rift://workspace{?cursor}",
-            "workspace",
-            1,
-            WorkspaceResourceTemplate,
-        ),
-        Variant(
-            "rift://symbol/{language}/{name}{?cursor}",
-            "symbol",
-            2,
-            SymbolResourceTemplate,
-        ),
-        Variant("rift://fs{/path}{?start,length,cursor}", "fs", 3, FsResourceTemplate),
-        Variant(
-            "rift://actions/{address}{?only,cursor}",
-            "actions",
-            4,
-            ActionsResourceTemplate,
-        ),
-        Variant("rift://action/{token}", "action", 5, ActionResourceTemplate),
-        Variant("rift://root", "root", 6, RootResourceTemplate),
-        Variant("rift://changes{?cursor}", "changes", 7, ChangesResourceTemplate),
+RESOURCE_FORMS: dict[ResourceFamily, tuple[str, str, type[Any]]] = {
+    ResourceFamily.WORKSPACE: (
+        "rift://workspace{?cursor}",
+        "application/vnd.rift.workspace+json",
+        WorkspaceResourceUri,
     ),
-)
-class ResourceTemplate(ProtocolRoot):
-    """One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per family."""
+    ResourceFamily.SYMBOL: (
+        "rift://symbol/{language}/{name}{?cursor}",
+        "application/vnd.rift.symbol+json",
+        SymbolResourceUri,
+    ),
+    ResourceFamily.FS: (
+        "rift://fs{/path}{?start,length,cursor}",
+        "application/vnd.rift.fs+json",
+        FsResourceUri,
+    ),
+    ResourceFamily.ACTIONS: (
+        "rift://actions/{address}{?only,cursor}",
+        "application/vnd.rift.actions+json",
+        ActionsResourceUri,
+    ),
+    ResourceFamily.ACTION: (
+        "rift://action/{token}",
+        "application/vnd.rift.action+json",
+        ActionResourceUri,
+    ),
+    ResourceFamily.ROOT: (
+        "rift://root",
+        "application/vnd.rift.root+json",
+        RootResourceUri,
+    ),
+    ResourceFamily.CHANGES: (
+        "rift://changes{?cursor}",
+        "application/vnd.rift.changes+json",
+        ChangesResourceUri,
+    ),
+}
+
+RESOURCE_MEDIA_TYPE_PATTERN = r"^application/vnd\.rift\.[a-z]+\+json$"
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ResourceLink(ClosedModel):
+    "A link to one Rift resource, as MCP carries it inside tool output. `name` selects the family, which fixes the URI shape a read of `uri` accepts and the media type it returns."
+
+    type: Field[Literal["resource_link"]] = proto_field(
+        description="MCP's tag for a link to a resource inside tool output."
+    )
+    uri: Field[str] = proto_field(
+        description="The resource to read. Hand it to `resources/read` unchanged.",
+        min_length=1,
+        max_length=32768,
+        number=1,
+        proto_type=ProtoFieldDescriptor.TYPE_STRING,
+    )
+    name: Field[ResourceFamily] = proto_field(
+        description="The resource family this link belongs to.", number=2
+    )
+    mimeType: Field[str] = proto_field(
+        description="What a read of `uri` returns, as `application/vnd.rift.<family>+json`.",
+        pattern=RESOURCE_MEDIA_TYPE_PATTERN,
+        max_length=64,
+        number=3,
+        proto_name="mime_type",
+    )
+
+    @model_validator(mode="after")
+    def link_is_correlated(self) -> ResourceLink:
+        _template, media_type, uri_model = RESOURCE_FORMS[self.name]
+        if self.mimeType != media_type:
+            raise ValueError("resource link media type must match its family")
+        uri_model.model_validate(self.uri)
+        return self
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ResourceTemplate(ClosedModel):
+    "One advertised MCP resource template, as `resources/templates/list` returns it. The family fixes the template and the media type."
+
+    uriTemplate: Field[str] = proto_field(
+        description="The template, in RFC 6570 form. What follows `?` is optional.",
+        min_length=1,
+        max_length=256,
+    )
+    name: Field[ResourceFamily] = proto_field(
+        description="The resource family being advertised.", number=1
+    )
+    mimeType: Field[str] = proto_field(
+        description="What a read of a URI from this template returns, as `application/vnd.rift.<family>+json`.",
+        pattern=RESOURCE_MEDIA_TYPE_PATTERN,
+        max_length=64,
+        number=2,
+        proto_name="mime_type",
+    )
+
+    @model_validator(mode="after")
+    def template_is_correlated(self) -> ResourceTemplate:
+        template, media_type, _uri_model = RESOURCE_FORMS[self.name]
+        if self.uriTemplate != template or self.mimeType != media_type:
+            raise ValueError("resource template must match its family")
+        return self
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -2361,185 +2122,64 @@ class ResourceReadParams(ClosedModel):
 
     uri: Field[
         WorkspaceResourceUri
-        | core.SymbolId
+        | SymbolResourceUri
         | FsResourceUri
         | ActionsResourceUri
         | ActionResourceUri
         | RootResourceUri
         | ChangesResourceUri
     ] = proto_field(
-        description="A URI matching one branch of `ResourceTemplate`.",
+        description="A URI matching one advertised resource family.",
         number=1,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
     )
 
 
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class WorkspaceResourceContent(ClosedModel):
-    """What a read of `rift://workspace` returns."""
-
-    uri: Field[WorkspaceResourceUri] = proto_field(
-        description="The URI that was read, as it resolved.", number=1
-    )
-    mimeType: Field[Literal["application/vnd.rift.workspace+json"]] = proto_field(
-        description="Which payload `text` holds."
-    )
-    text: Field[str] = proto_field(
-        description="A `WorkspaceResourcePayload`, serialized as JSON.",
-        number=2,
-        json_schema_extra={
-            "contentMediaType": "application/vnd.rift.workspace+json",
-            "rift:contentType": "WorkspaceResourcePayload",
-        },
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class SymbolResourceContent(ClosedModel):
-    """What a read of a `rift://symbol/…` URI returns."""
-
-    uri: Field[core.SymbolId] = proto_field(
-        description="The URI that was read, as it resolved.", number=1
-    )
-    mimeType: Field[Literal["application/vnd.rift.symbol+json"]] = proto_field(
-        description="Which payload `text` holds."
-    )
-    text: Field[str] = proto_field(
-        description="A `SymbolResourcePayload`, serialized as JSON.",
-        number=2,
-        json_schema_extra={
-            "contentMediaType": "application/vnd.rift.symbol+json",
-            "rift:contentType": "SymbolResourcePayload",
-        },
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class FsResourceContent(ClosedModel):
-    """What a read of a `rift://fs` URI returns."""
-
-    uri: Field[FsResourceUri] = proto_field(
-        description="The URI that was read, as it resolved.", number=1
-    )
-    mimeType: Field[Literal["application/vnd.rift.fs+json"]] = proto_field(
-        description="Which payload `text` holds."
-    )
-    text: Field[str] = proto_field(
-        description="An `FsResourcePayload`, serialized as JSON.",
-        number=2,
-        json_schema_extra={
-            "contentMediaType": "application/vnd.rift.fs+json",
-            "rift:contentType": "FsResourcePayload",
-        },
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ActionsResourceContent(ClosedModel):
-    """What a read of a `rift://actions/…` URI returns."""
-
-    uri: Field[ActionsResourceUri] = proto_field(
-        description="The address that was read, as it resolved.", number=1
-    )
-    mimeType: Field[Literal["application/vnd.rift.actions+json"]] = proto_field(
-        description="Which payload `text` holds."
-    )
-    text: Field[str] = proto_field(
-        description="An `ActionsResourcePayload`, serialized as JSON.",
-        number=2,
-        json_schema_extra={
-            "contentMediaType": "application/vnd.rift.actions+json",
-            "rift:contentType": "ActionsResourcePayload",
-        },
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ActionResourceContent(ClosedModel):
-    """What a read of a `rift://action/…` URI returns."""
-
-    uri: Field[ActionResourceUri] = proto_field(
-        description="The offer that was read, as it resolved.", number=1
-    )
-    mimeType: Field[Literal["application/vnd.rift.action+json"]] = proto_field(
-        description="Which payload `text` holds."
-    )
-    text: Field[str] = proto_field(
-        description="An `ActionResourcePayload`, serialized as JSON.",
-        number=2,
-        json_schema_extra={
-            "contentMediaType": "application/vnd.rift.action+json",
-            "rift:contentType": "ActionResourcePayload",
-        },
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class RootResourceContent(ClosedModel):
-    """What a read of `rift://root` returns."""
-
-    uri: Field[RootResourceUri] = proto_field(
-        description="The URI that was read, as it resolved.", number=1
-    )
-    mimeType: Field[Literal["application/vnd.rift.root+json"]] = proto_field(
-        description="Which payload `text` holds."
-    )
-    text: Field[str] = proto_field(
-        description="A `RootResourcePayload`, serialized as JSON.",
-        number=2,
-        json_schema_extra={
-            "contentMediaType": "application/vnd.rift.root+json",
-            "rift:contentType": "RootResourcePayload",
-        },
-    )
-
-
-@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class ChangesResourceContent(ClosedModel):
-    """What a read of a `rift://changes` URI returns."""
-
-    uri: Field[ChangesResourceUri] = proto_field(
-        description="The URI that was read, as it resolved.", number=1
-    )
-    mimeType: Field[Literal["application/vnd.rift.changes+json"]] = proto_field(
-        description="Which payload `text` holds."
-    )
-    text: Field[str] = proto_field(
-        description="A `ChangesResourcePayload`, serialized as JSON.",
-        number=2,
-        json_schema_extra={
-            "contentMediaType": "application/vnd.rift.changes+json",
-            "rift:contentType": "ChangesResourcePayload",
-        },
-    )
-
-
-@union(
+@definition(
     owner=MCP,
-    oneof="variant",
-    discriminator="mimeType",
-    variants=(
-        Variant(
-            "application/vnd.rift.workspace+json",
-            "workspace",
-            1,
-            WorkspaceResourceContent,
-        ),
-        Variant("application/vnd.rift.symbol+json", "symbol", 2, SymbolResourceContent),
-        Variant("application/vnd.rift.fs+json", "fs", 3, FsResourceContent),
-        Variant(
-            "application/vnd.rift.actions+json", "actions", 4, ActionsResourceContent
-        ),
-        Variant("application/vnd.rift.action+json", "action", 5, ActionResourceContent),
-        Variant("application/vnd.rift.root+json", "root", 6, RootResourceContent),
-        Variant(
-            "application/vnd.rift.changes+json", "changes", 7, ChangesResourceContent
-        ),
-    ),
-    public=False,
+    public=True,
+    proto=Proto.message(),
+    schema_extra={
+        "rift:contentTypes": {
+            "application/vnd.rift.workspace+json": "WorkspaceResourcePayload",
+            "application/vnd.rift.symbol+json": "SymbolResourcePayload",
+            "application/vnd.rift.fs+json": "FsResourcePayload",
+            "application/vnd.rift.actions+json": "ActionsResourcePayload",
+            "application/vnd.rift.action+json": "ActionResourcePayload",
+            "application/vnd.rift.root+json": "RootResourcePayload",
+            "application/vnd.rift.changes+json": "ChangesResourcePayload",
+        }
+    },
 )
-class ResourceContent(ProtocolRoot):
-    pass
+class ResourceContent(ClosedModel):
+    "One content block of an MCP resource read. `text` holds the family's payload as JSON — `WorkspaceResourcePayload` for `rift://workspace`, `SymbolResourcePayload` for a symbol URI, and so on — and `mimeType` names which. The `rift:contentTypes` map in the schema carries the complete pairing."
+
+    uri: Field[str] = proto_field(
+        description="The URI that was read, as it resolved.",
+        min_length=1,
+        max_length=32768,
+        number=1,
+        proto_type=ProtoFieldDescriptor.TYPE_STRING,
+    )
+    mimeType: Field[str] = proto_field(
+        description="Which payload `text` holds, as `application/vnd.rift.<family>+json`.",
+        pattern=RESOURCE_MEDIA_TYPE_PATTERN,
+        max_length=64,
+        number=3,
+        proto_name="mime_type",
+    )
+    text: Field[str] = proto_field(
+        description="The payload, serialized as JSON.",
+        number=2,
+    )
+
+    @model_validator(mode="after")
+    def content_is_correlated(self) -> ResourceContent:
+        for _template, media_type, uri_model in RESOURCE_FORMS.values():
+            if media_type == self.mimeType:
+                uri_model.model_validate(self.uri)
+                return self
+        raise ValueError("resource content names an unknown media type")
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -2797,7 +2437,7 @@ class ChangeSignatureParams(ClosedModel):
     schema_extra={},
 )
 class ActParams(ClosedModel):
-    "Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an adapter offers that has no portable contract. Rift validates `arguments` against the offer's advertised schema. An offer whose kind belongs to a portable family is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points."
+    "Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an adapter offers that has no portable argument contract. Rift validates `arguments` against the offer's advertised schema. An offer carrying a portable argument contract is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points."
 
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
@@ -2912,7 +2552,7 @@ class CommandValidatorDeterminism(str, Enum):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class CommandValidator(ClosedModel):
-    "A command from the workspace-root `rift.toml`, run without a shell against a disposable copy of the changed tree."
+    "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there joins the changeset."
 
     id: Field[str] = proto_field(
         description=(
@@ -3045,9 +2685,9 @@ class ChangeSummary(ClosedModel):
     )
     confirmations: Field[list[core.ConfirmationRequirement]] = proto_field(
         description=(
-            "Effects the caller has to accept before this change can be published, sorted and "
-            "numbered from zero. Empty where every affected adapter and validator vouched for "
-            "the result."
+            "Effects the caller has to accept before this change can be published, sorted by "
+            "kind, source location, title, and detail. Empty where every affected adapter and "
+            "validator vouched for the result."
         ),
         number=10,
     )
@@ -3108,6 +2748,7 @@ class ChangeApplied(ClosedModel):
                 "formatter_unsupported", "REFUSAL_REASON_FORMATTER_UNSUPPORTED", 9
             ),
             EnumValue("portable_family", "REFUSAL_REASON_PORTABLE_FAMILY", 11),
+            EnumValue("language_refusal", "REFUSAL_REASON_LANGUAGE_REFUSAL", 12),
         ),
         named=True,
     ),
@@ -3121,7 +2762,8 @@ class ChangeApplied(ClosedModel):
             "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
             "unsafe_effect": "The complete effect reaches outside what the caller can have meant — outside the project, or into generated source.",
             "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
-            "portable_family": "The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
+            "portable_family": "The offer carries a portable argument contract, so it resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
+            "language_refusal": "The language itself forbids it — a rename to a reserved word, a visibility change its rules do not allow.",
         }
     },
 )
@@ -3137,6 +2779,7 @@ class RefusalReason(str, Enum):
     UNSAFE_EFFECT = "unsafe_effect"
     FORMATTER_UNSUPPORTED = "formatter_unsupported"
     PORTABLE_FAMILY = "portable_family"
+    LANGUAGE_REFUSAL = "language_refusal"
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
@@ -3247,7 +2890,7 @@ class PublishResult(ClosedModel):
             ),
             "identity": (
                 "By the result's canonical identity: a symbol URI, a file path, or an "
-                "`ActionKey`. Adapter actions use this order because they carry no relevance "
+                "`ActionOfferId`. Adapter actions use this order because they carry no relevance "
                 "score or common source path."
             ),
         }
@@ -3318,7 +2961,12 @@ class FsResourcePayload(ClosedModel):
         description="How this entry's payload is represented.", number=4
     )
     entries: Field[list[core.ProjectEntry] | None] = proto_field(
-        default=None, description="Directory children on this page.", number=5
+        default=None,
+        description=(
+            "Directory children on this page — subdirectories and files alike, each one a "
+            "complete `ProjectEntry`."
+        ),
+        number=5,
     )
     start: Field[int | None] = proto_field(
         default=None, ge=0, le=9007199254740991, number=6
@@ -3494,8 +3142,7 @@ MODELS = (
     OutlineResult,
     SearchParams,
     SearchHit,
-    ActionsResourceLink,
-    ActionResourceLink,
+    ResourceFamily,
     ResourceLink,
     SymbolResourcePayload,
     Contract,
@@ -3520,6 +3167,7 @@ MODELS = (
     WorkspaceResourceUri,
     RootResourceUri,
     ChangesResourceUri,
+    SymbolResourceUri,
     FsResourceUri,
     WorkspaceResourcePayload,
     RootResourcePayload,
@@ -3549,6 +3197,7 @@ MODELS = (
     LimitEvidence,
     MatchSyntax,
     ResourceTemplate,
+    ResourceContent,
     ResourceReadParams,
     ResourceReadResult,
     SearchHitTarget,

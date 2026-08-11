@@ -59,7 +59,7 @@
       "session_remove": {
         "rpc": "rift.mcp.Rift/SessionRemove",
         "group": "sessions",
-        "description": "Previews or removes one inactive session.",
+        "description": "Removes one inactive session and deletes its projection.",
         "params": {
           "$ref": "#/$defs/SessionRemoveParams"
         },
@@ -180,7 +180,7 @@
       "act": {
         "rpc": "rift.mcp.Rift/Act",
         "group": "changes",
-        "description": "Resolves one action an adapter offered \u2014 a quick fix, an extraction, an inline, or an adapter-specific family. Arguments are validated against the schema the offer advertises. A portable family is refused here and resolves through its own tool.",
+        "description": "Resolves one action an adapter offered \u2014 a quick fix, an extraction, an inline, or an adapter-specific family. Arguments are validated against the schema the offer advertises. An offer carrying a portable argument contract is refused here and resolves through its own tool.",
         "params": {
           "$ref": "#/$defs/ActParams"
         },
@@ -277,7 +277,7 @@
           "$ref": "#/$defs/RootResourceUri"
         },
         "link": {
-          "$ref": "#/$defs/RootResourceLink"
+          "$ref": "#/$defs/ResourceLink"
         }
       },
       "changes": {
@@ -289,7 +289,7 @@
           "$ref": "#/$defs/ChangesResourceUri"
         },
         "link": {
-          "$ref": "#/$defs/ChangesResourceLink"
+          "$ref": "#/$defs/ResourceLink"
         }
       },
       "symbol": {
@@ -298,14 +298,14 @@
           "$ref": "#/$defs/ResourceTemplate"
         },
         "uri": {
-          "$ref": "#/$defs/SymbolId"
+          "$ref": "#/$defs/SymbolResourceUri"
         },
         "link": {
           "$ref": "#/$defs/ResourceLink"
         }
       },
       "fs": {
-        "description": "Returns a directory page or bounded file-content range from the session projection.",
+        "description": "Returns one page of a directory's entries \u2014 subdirectories and files \u2014 or a bounded file-content range from the session projection.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -325,7 +325,7 @@
           "$ref": "#/$defs/ActionsResourceUri"
         },
         "link": {
-          "$ref": "#/$defs/ActionsResourceLink"
+          "$ref": "#/$defs/ResourceLink"
         }
       },
       "action": {
@@ -337,7 +337,7 @@
           "$ref": "#/$defs/ActionResourceUri"
         },
         "link": {
-          "$ref": "#/$defs/ActionResourceLink"
+          "$ref": "#/$defs/ResourceLink"
         }
       }
     },
@@ -534,7 +534,7 @@
   "$defs": {
     "ActParams": {
       "additionalProperties": false,
-      "description": "Resolves one discovered adapter action \u2014 a quick fix, an extraction, an inline, anything an adapter offers that has no portable contract. Rift validates `arguments` against the offer's advertised schema. An offer whose kind belongs to a portable family is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.",
+      "description": "Resolves one discovered adapter action \u2014 a quick fix, an extraction, an inline, anything an adapter offers that has no portable argument contract. Rift validates `arguments` against the offer's advertised schema. An offer carrying a portable argument contract is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.",
       "properties": {
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
@@ -727,7 +727,7 @@
       "rift:enumDescriptions": {
         "always": "The adapter needs no caller-supplied fact before resolution. Result validation and advertised guarantees still apply.",
         "conditional": "Correct only under a condition the adapter cannot establish. The condition appears in the resolved preconditions or confirmations.",
-        "speculative": "The adapter inferred intent from incomplete target evidence. The caller inspects the operation's effects before retrying with acknowledgements."
+        "speculative": "The adapter inferred intent from incomplete target evidence. The caller inspects the resolved change's effects before accepting it."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -753,7 +753,7 @@
       "type": "string"
     },
     "ActionKind": {
-      "description": "What an adapter action does, as a dotted hierarchical name. Rift fixes the portable families `quickfix`, `source`, `refactor.rename`, `refactor.move`, `refactor.safe_delete`, `refactor.change_signature`, `refactor.extract`, `refactor.inline`, `refactor.introduce`, `refactor.convert`, and `generate`; adapters may refine them with suffixes. Other roots are reverse-domain namespaced. Prefix filtering selects a whole family.",
+      "description": "What an adapter action does, as a dotted hierarchical name. Rift fixes the standard families `quickfix`, `source`, `refactor.rename`, `refactor.move`, `refactor.safe_delete`, `refactor.change_signature`, `refactor.extract`, `refactor.inline`, `refactor.introduce`, `refactor.convert`, and `generate`; adapters may refine them with suffixes. Other roots are reverse-domain namespaced. Prefix filtering selects a whole family.",
       "maxLength": 128,
       "pattern": "^[a-z][a-z0-9_.-]*$",
       "rift:package": "rift.core",
@@ -809,49 +809,6 @@
       },
       "title": "ActionOfferId",
       "type": "string"
-    },
-    "ActionResourceLink": {
-      "additionalProperties": false,
-      "description": "A link to one discovered action and the arguments it takes.",
-      "properties": {
-        "uri": {
-          "$ref": "#/$defs/ActionResourceUri",
-          "description": "The offer to read.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "name": {
-          "const": "action",
-          "description": "The resource family this link belongs to.",
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Name",
-          "type": "string"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.action+json",
-          "description": "What a read of this URI returns: `ActionResourcePayload` as JSON.",
-          "rift:proto": {
-            "field": "mime_type",
-            "number": 3
-          },
-          "title": "Mimetype",
-          "type": "string"
-        }
-      },
-      "required": [
-        "uri",
-        "name",
-        "mimeType"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.ActionResourceLink"
-      },
-      "title": "ActionResourceLink",
-      "type": "object"
     },
     "ActionResourcePayload": {
       "additionalProperties": false,
@@ -950,49 +907,6 @@
       "title": "ActionSupport",
       "type": "object"
     },
-    "ActionsResourceLink": {
-      "additionalProperties": false,
-      "description": "A link to the actions available at one address.",
-      "properties": {
-        "uri": {
-          "$ref": "#/$defs/ActionsResourceUri",
-          "description": "The address to read, optionally filtered by kind and continued by a cursor.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "name": {
-          "const": "actions",
-          "description": "The resource family this link belongs to.",
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Name",
-          "type": "string"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.actions+json",
-          "description": "What a read of this URI returns: `ActionsResourcePayload` as JSON.",
-          "rift:proto": {
-            "field": "mime_type",
-            "number": 3
-          },
-          "title": "Mimetype",
-          "type": "string"
-        }
-      },
-      "required": [
-        "uri",
-        "name",
-        "mimeType"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.ActionsResourceLink"
-      },
-      "title": "ActionsResourceLink",
-      "type": "object"
-    },
     "ActionsResourcePayload": {
       "additionalProperties": false,
       "description": "One page of actions available at one address in the session projection.",
@@ -1051,7 +965,7 @@
       "type": "object"
     },
     "ActionsResourceUri": {
-      "description": "URI for adapter actions at one address in the session projection.",
+      "description": "URI for adapter actions at one address in the session projection. The address is\n`symbol/{language}/{name}`, `node/{language}/{path}@{start}-{end}`, `match/{token}`,\nor `file/{path}`.",
       "examples": [
         "rift://actions/file/src/api.rs?only=quickfix",
         "rift://actions/symbol/python/pkg.util.load_config"
@@ -1880,7 +1794,7 @@
           "type": "array"
         },
         "confirmations": {
-          "description": "Effects the caller has to accept before this change can be published, sorted and numbered from zero. Empty where every affected adapter and validator vouched for the result.",
+          "description": "Effects the caller has to accept before this change can be published, sorted by kind, source location, title, and detail. Empty where every affected adapter and validator vouched for the result.",
           "items": {
             "$ref": "#/$defs/ConfirmationRequirement"
           },
@@ -1947,56 +1861,6 @@
         "type": "rift.mcp.ChangeValidation"
       },
       "title": "ChangeValidation",
-      "type": "object"
-    },
-    "ChangesResourceLink": {
-      "additionalProperties": false,
-      "description": "A link to the session's changeset.",
-      "properties": {
-        "type": {
-          "const": "resource_link",
-          "description": "MCP's tag for a link to a resource inside tool output.",
-          "title": "Type",
-          "type": "string"
-        },
-        "uri": {
-          "$ref": "#/$defs/ChangesResourceUri",
-          "description": "The changeset, optionally continued by a cursor.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "name": {
-          "const": "changes",
-          "description": "The resource family this link belongs to.",
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Name",
-          "type": "string"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.changes+json",
-          "description": "What a read of this URI returns: `ChangesResourcePayload` as JSON.",
-          "rift:proto": {
-            "field": "mime_type",
-            "number": 3
-          },
-          "title": "Mimetype",
-          "type": "string"
-        }
-      },
-      "required": [
-        "type",
-        "uri",
-        "name",
-        "mimeType"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.ChangesResourceLink"
-      },
-      "title": "ChangesResourceLink",
       "type": "object"
     },
     "ChangesResourcePayload": {
@@ -2103,7 +1967,7 @@
     },
     "CommandValidator": {
       "additionalProperties": false,
-      "description": "A command from the workspace-root `rift.toml`, run without a shell against a disposable copy of the changed tree.",
+      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there joins the changeset.",
       "properties": {
         "id": {
           "description": "Label shown with this validator. It is unique within `validators.commands`.",
@@ -2344,27 +2208,16 @@
     },
     "ConfirmationRequirement": {
       "additionalProperties": false,
-      "description": "One effect the caller has to accept before publication. The change that raised it lands in the projection either way, carrying this record, so the caller can read what happened before deciding. Requirements are sorted by kind, source location, title, and detail, then numbered from zero within their change.",
+      "description": "One effect the caller has to accept before publication. The change that raised it lands in the projection either way, carrying this record, so the caller can read what happened before deciding. Requirements are sorted by kind, source location, title, and detail within their change.",
       "properties": {
-        "id": {
-          "description": "Zero-based position in its change's ordered confirmation list.",
-          "maximum": 4294967295,
-          "minimum": 0,
-          "rift:proto": {
-            "number": 1
-          },
-          "title": "Id",
-          "type": "integer"
-        },
         "kind": {
           "$ref": "#/$defs/ConfirmationRequirementKind",
-          "description": "The condition that makes acceptance necessary.",
           "rift:proto": {
             "number": 2
           }
         },
         "title": {
-          "description": "A short account of the effect being acknowledged.",
+          "description": "A short account of the effect being accepted.",
           "maxLength": 256,
           "minLength": 1,
           "rift:proto": {
@@ -2396,7 +2249,6 @@
         }
       },
       "required": [
-        "id",
         "kind",
         "title",
         "detail",
@@ -2410,7 +2262,7 @@
       "type": "object"
     },
     "ConfirmationRequirementKind": {
-      "description": "The condition that makes acknowledgement necessary.",
+      "description": "The condition that makes acceptance necessary.",
       "enum": [
         "destructive",
         "large_scope",
@@ -2955,6 +2807,47 @@
       },
       "title": "Coverage"
     },
+    "CoverageReach": {
+      "description": "How far the claim reaches.",
+      "enum": [
+        "request",
+        "project",
+        "dependencies",
+        "all"
+      ],
+      "rift:enumDescriptions": {
+        "all": "Everything the adapter could see: the workspace, its dependencies, and the standard library.",
+        "dependencies": "Installed packages outside the workspace source.",
+        "project": "Every file in the workspace, dependencies left out.",
+        "request": "Only what this request asked for. The adapter answered the question put to it and claims nothing past it."
+      },
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "enum": "Kind",
+        "field": "kind",
+        "number": 1,
+        "values": {
+          "all": {
+            "name": "ALL",
+            "number": 4
+          },
+          "dependencies": {
+            "name": "DEPENDENCIES",
+            "number": 3
+          },
+          "project": {
+            "name": "PROJECT",
+            "number": 2
+          },
+          "request": {
+            "name": "REQUEST",
+            "number": 1
+          }
+        }
+      },
+      "title": "CoverageReach",
+      "type": "string"
+    },
     "CoverageScope": {
       "anyOf": [
         {
@@ -2962,7 +2855,7 @@
           "description": "A standing scope identified by its name.",
           "properties": {
             "kind": {
-              "$ref": "#/$defs/CoverageScopeKindKind",
+              "$ref": "#/$defs/CoverageReach",
               "rift:proto": {
                 "number": 1
               }
@@ -3028,47 +2921,6 @@
         ]
       },
       "title": "CoverageScope"
-    },
-    "CoverageScopeKindKind": {
-      "description": "How far the claim reaches.",
-      "enum": [
-        "request",
-        "project",
-        "dependencies",
-        "all"
-      ],
-      "rift:enumDescriptions": {
-        "all": "Everything the adapter could see: the workspace, its dependencies, and the standard library.",
-        "dependencies": "Installed packages outside the workspace source.",
-        "project": "Every file in the workspace, dependencies left out.",
-        "request": "Only what this request asked for. The adapter answered the question put to it and claims nothing past it."
-      },
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "enum": "Kind",
-        "field": "kind",
-        "number": 1,
-        "values": {
-          "all": {
-            "name": "ALL",
-            "number": 4
-          },
-          "dependencies": {
-            "name": "DEPENDENCIES",
-            "number": 3
-          },
-          "project": {
-            "name": "PROJECT",
-            "number": 2
-          },
-          "request": {
-            "name": "REQUEST",
-            "number": 1
-          }
-        }
-      },
-      "title": "CoverageScopeKindKind",
-      "type": "string"
     },
     "CoverageStateState": {
       "description": "`unsupported` \u2014 the adapter cannot produce this family at all. `not_applicable` \u2014 the family has no meaning for this language.",
@@ -3670,7 +3522,7 @@
         "tags": {
           "description": "Presentation tags for the finding. An editor can render them as strikethrough or grey text.",
           "items": {
-            "$ref": "#/$defs/DiagnosticTagsItemTags"
+            "$ref": "#/$defs/DiagnosticTag"
           },
           "rift:proto": {
             "number": 6
@@ -3939,7 +3791,7 @@
       "title": "DiagnosticReliability",
       "type": "string"
     },
-    "DiagnosticTagsItemTags": {
+    "DiagnosticTag": {
       "enum": [
         "deprecated",
         "unnecessary"
@@ -3950,19 +3802,19 @@
       },
       "rift:package": "rift.core",
       "rift:proto": {
-        "enum": "Tags",
+        "enum": "Tag",
         "values": {
           "deprecated": {
-            "name": "TAGS_DEPRECATED",
+            "name": "TAG_DEPRECATED",
             "number": 1
           },
           "unnecessary": {
-            "name": "TAGS_UNNECESSARY",
+            "name": "TAG_UNNECESSARY",
             "number": 2
           }
         }
       },
-      "title": "DiagnosticTagsItemTags",
+      "title": "DiagnosticTag",
       "type": "string"
     },
     "Digest": {
@@ -3974,6 +3826,40 @@
         "scalar": "string"
       },
       "title": "Digest",
+      "type": "string"
+    },
+    "Disposition": {
+      "description": "How a safe delete eliminates one classified remaining use.",
+      "enum": [
+        "refuse",
+        "rewrite",
+        "remove"
+      ],
+      "rift:enumDescriptions": {
+        "refuse": "Stop the whole deletion while such a use exists.",
+        "remove": "Delete the construct containing the use, at a safe boundary the adapter selects.",
+        "rewrite": "Replace the use with a valid form the adapter selects."
+      },
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "enum": "Disposition",
+        "type": "rift.core.Disposition",
+        "values": {
+          "refuse": {
+            "name": "DISPOSITION_REFUSE",
+            "number": 1
+          },
+          "remove": {
+            "name": "DISPOSITION_REMOVE",
+            "number": 3
+          },
+          "rewrite": {
+            "name": "DISPOSITION_REWRITE",
+            "number": 2
+          }
+        }
+      },
+      "title": "Disposition",
       "type": "string"
     },
     "Documentation": {
@@ -4427,7 +4313,7 @@
         "temporarily_unavailable": "The resource exists but is in use. Another connection owns the session, a retained debugger blocks continuation, or a disposable workspace is still releasing. Retry after that owner or operation finishes.",
         "unsupported_path": "The workspace contains a path the protocol cannot represent safely.",
         "unsupported_protocol": "The client and server use different protocol versions. Compare `Contract` with the client's supported contract.",
-        "validator_execution_failure": "Rift could not prepare the validation workspace, launch the command validator, enforce its timeout, or capture its output. One retry is reasonable when the host failure was transient."
+        "validator_execution_failure": "Rift could not launch the command validator, enforce its timeout, or capture its output. One retry is reasonable when the host failure was transient."
       },
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -4578,34 +4464,9 @@
         },
         "phase": {
           "$ref": "#/$defs/ErrorDataPhase",
-          "rift:enumDescriptions": {
-            "change": "Resolving the operation in a private candidate, validating it, and writing the result into the projection.",
-            "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
-            "discovery": "Working out what the workspace can do: capabilities, limits, which languages have adapters.",
-            "execute": "Preparing an execution workspace and evaluating caller-provided code.",
-            "publish": "Publishing projection changes to the workspace.",
-            "read": "Fetching what was asked for, from the index, the object store or an adapter.",
-            "resolve": "Turning an address, a cursor or an action key into the concrete thing it names at a state.",
-            "validate": "Checking a proposed change against the schema, the state it was pinned to, and the checks required by the workspace-root `rift.toml`."
-          },
           "rift:proto": {
             "number": 4
           }
-        },
-        "operation": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Which operation of a multi-operation request failed, as its zero-based index. Null where the request carried one, or failed before any of them ran.",
-          "rift:proto": {
-            "number": 6
-          },
-          "title": "Operation"
         },
         "diagnostics": {
           "description": "What an adapter or configured command check reported while the request was failing. Empty where neither ran.",
@@ -4650,7 +4511,6 @@
         "message",
         "retry",
         "phase",
-        "operation",
         "diagnostics",
         "causes"
       ],
@@ -4674,7 +4534,7 @@
         "debug"
       ],
       "rift:enumDescriptions": {
-        "change": "Resolving the operation in a private candidate, validating it, and writing the result into the projection.",
+        "change": "Resolving the operation, writing the result into the projection, and validating the resulting tree.",
         "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
         "discovery": "Working out what the workspace can do: capabilities, limits, which languages have adapters.",
         "execute": "Preparing an execution workspace and evaluating caller-provided code.",
@@ -5183,19 +5043,6 @@
         "op": {
           "$ref": "#/$defs/FieldFilterOp",
           "description": "How the operand is compared against the field. What a comparison means follows the field's type, so ordering ops apply only where the values are ordered. An array field such as `facets` takes `contains`, `in` and `exists`; the rest have no meaning against a list and Rift rejects them.",
-          "rift:enumDescriptions": {
-            "contains": "The field holds the operand: a substring of a string, a member of an array such as `facets`.",
-            "eq": "The field equals the operand.",
-            "exists": "The field is present at all. No operand is read.",
-            "gt": "The field is greater than the operand.",
-            "gte": "The field is greater than or equal to the operand.",
-            "in": "The field equals one of `values`. Against an array field it holds at least one of them, which is how `facets` is asked for any of several at once.",
-            "lt": "The field is less than the operand.",
-            "lte": "The field is less than or equal to the operand.",
-            "ne": "The field does not equal the operand.",
-            "prefix": "The field is a string starting with the operand.",
-            "regex": "The field matches the `rift-regex` expression in the operand. Rift evaluates it."
-          },
           "rift:proto": {
             "number": 2
           }
@@ -5264,7 +5111,7 @@
         "exists": "The field is present at all. No operand is read.",
         "gt": "The field is greater than the operand.",
         "gte": "The field is greater than or equal to the operand.",
-        "in": "The field equals one of `values`.",
+        "in": "The field equals one of `values`. Against an array field it holds at least one of them, which is how `facets` is asked for any of several at once.",
         "lt": "The field is less than the operand.",
         "lte": "The field is less than or equal to the operand.",
         "ne": "The field does not equal the operand.",
@@ -5873,7 +5720,7 @@
             }
           ],
           "default": null,
-          "description": "Directory children on this page.",
+          "description": "Directory children on this page \u2014 subdirectories and files alike, each one a complete `ProjectEntry`.",
           "rift:proto": {
             "number": 5
           },
@@ -6444,16 +6291,6 @@
           "title": "Max Relation Depth",
           "type": "integer"
         },
-        "max_changes": {
-          "description": "Most top-level `Change` values one mutation request accepts.",
-          "maximum": 4294967295,
-          "minimum": 1,
-          "rift:proto": {
-            "number": 7
-          },
-          "title": "Max Changes",
-          "type": "integer"
-        },
         "max_edits": {
           "description": "Most concrete `Edit` values one resolved operation may contain across every change.",
           "maximum": 1000000,
@@ -6475,7 +6312,7 @@
           "type": "integer"
         },
         "max_rewrite_expansions": {
-          "description": "Most concrete edits one atomic `RewriteChange` may produce after matching.",
+          "description": "Most concrete edits one atomic `rewrite` (`RewriteParams`) may produce after matching.",
           "maximum": 100000,
           "minimum": 1,
           "rift:proto": {
@@ -6506,7 +6343,6 @@
         "max_file_chunk_bytes",
         "max_page_items",
         "max_relation_depth",
-        "max_changes",
         "max_edits",
         "max_validators",
         "max_rewrite_expansions",
@@ -6542,7 +6378,7 @@
               "type": "null"
             }
           ],
-          "description": "Most matches accepted. Null uses the workspace's `max_rewrite_expansions` limit.",
+          "description": "Most matches accepted. Null leaves the match count unbounded, and `max_rewrite_expansions` still caps the concrete edits the expansion may produce.",
           "rift:proto": {
             "number": 2
           },
@@ -7963,14 +7799,13 @@
               "type": "string"
             },
             "validator": {
-              "description": "Zero-based position in workspace validator declarations.",
-              "maximum": 4294967295,
-              "minimum": 0,
+              "description": "The `CommandValidator.id` of the workspace validator that ran the check.",
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
               "rift:proto": {
                 "number": 1
               },
               "title": "Validator",
-              "type": "integer"
+              "type": "string"
             }
           },
           "required": [
@@ -8149,6 +7984,38 @@
       },
       "title": "OriginMapping"
     },
+    "OutlineInclude": {
+      "enum": [
+        "symbol",
+        "source",
+        "diagnostics"
+      ],
+      "rift:enumDescriptions": {
+        "diagnostics": "Attach adapter findings whose primary span falls inside the outline node.",
+        "source": "Attach the source covered by the outline node.",
+        "symbol": "Attach the complete Symbol record, including signatures, types, documentation, and modifiers."
+      },
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Include",
+        "values": {
+          "diagnostics": {
+            "name": "DIAGNOSTICS",
+            "number": 3
+          },
+          "source": {
+            "name": "SOURCE",
+            "number": 2
+          },
+          "symbol": {
+            "name": "SYMBOL",
+            "number": 1
+          }
+        }
+      },
+      "title": "OutlineInclude",
+      "type": "string"
+    },
     "OutlineItem": {
       "additionalProperties": false,
       "description": "One declaration-oriented source node. Items are ordered by range start, then widest range, then node identity, producing a stable source preorder.",
@@ -8250,7 +8117,7 @@
         "include": {
           "description": "Optional payload attached to each outline item. Symbol identity and source structure are always present.",
           "items": {
-            "$ref": "#/$defs/OutlineParamsIncludeItemInclude"
+            "$ref": "#/$defs/OutlineInclude"
           },
           "rift:proto": {
             "number": 3
@@ -8304,38 +8171,6 @@
       },
       "title": "OutlineParams",
       "type": "object"
-    },
-    "OutlineParamsIncludeItemInclude": {
-      "enum": [
-        "symbol",
-        "source",
-        "diagnostics"
-      ],
-      "rift:enumDescriptions": {
-        "diagnostics": "Attach adapter findings whose primary span falls inside the outline node.",
-        "source": "Attach the source covered by the outline node.",
-        "symbol": "Attach the complete Symbol record, including signatures, types, documentation, and modifiers."
-      },
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "enum": "Include",
-        "values": {
-          "diagnostics": {
-            "name": "DIAGNOSTICS",
-            "number": 3
-          },
-          "source": {
-            "name": "SOURCE",
-            "number": 2
-          },
-          "symbol": {
-            "name": "SYMBOL",
-            "number": 1
-          }
-        }
-      },
-      "title": "OutlineParamsIncludeItemInclude",
-      "type": "string"
     },
     "OutlineResult": {
       "additionalProperties": false,
@@ -8860,7 +8695,7 @@
     },
     "ProjectionState": {
       "additionalProperties": false,
-      "description": "Summary of the session projection. The changed paths and the changes that produced them\nare read from the changes resource, which pages; both fields here are counts a caller can\nbranch on without that read.",
+      "description": "Summary of the session projection. The changed paths and the changes that produced them\nare read from the changes resource, which pages; both fields here are booleans a caller can\nbranch on without that read.",
       "properties": {
         "dirty": {
           "description": "Whether the projection holds anything the workspace does not.",
@@ -8870,18 +8705,18 @@
           "title": "Dirty",
           "type": "boolean"
         },
-        "unacknowledged": {
+        "unaccepted": {
           "description": "Whether the changeset holds a change carrying a confirmation the caller has not accepted. Publication refuses while this is true.",
           "rift:proto": {
             "number": 4
           },
-          "title": "Unacknowledged",
+          "title": "Unaccepted",
           "type": "boolean"
         }
       },
       "required": [
         "dirty",
-        "unacknowledged"
+        "unaccepted"
       ],
       "rift:package": "rift.core",
       "rift:proto": {
@@ -8983,13 +8818,15 @@
         "cardinality_mismatch",
         "unsafe_effect",
         "formatter_unsupported",
-        "portable_family"
+        "portable_family",
+        "language_refusal"
       ],
       "rift:enumDescriptions": {
         "ambiguous_target": "The address resolves to several targets. Narrow it and ask again.",
         "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
         "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
-        "portable_family": "The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
+        "language_refusal": "The language itself forbids it \u2014 a rename to a reserved word, a visibility change its rules do not allow.",
+        "portable_family": "The offer carries a portable argument contract, so it resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
         "stale_action": "The file the offer was discovered in has been rewritten since. Read the actions resource again.",
         "stale_match": "The file the match was found in has been rewritten since. Search again.",
         "unmet_precondition": "A condition checked before resolution failed. The failed entry is in `preconditions`.",
@@ -9012,6 +8849,10 @@
           "formatter_unsupported": {
             "name": "REFUSAL_REASON_FORMATTER_UNSUPPORTED",
             "number": 9
+          },
+          "language_refusal": {
+            "name": "REFUSAL_REASON_LANGUAGE_REFUSAL",
+            "number": 12
           },
           "portable_family": {
             "name": "REFUSAL_REASON_PORTABLE_FAMILY",
@@ -9223,10 +9064,6 @@
           ],
           "default": null,
           "description": "Whether a match needs such an edge, or needs there to be none.",
-          "rift:enumDescriptions": {
-            "exists": "At least one edge matches.",
-            "not_exists": "No edge matches. How \"a symbol nothing calls\" is written. It applies after the depth bound, so `max_depth: 3` asks about edges within three hops and says nothing about the fourth."
-          },
           "rift:proto": {
             "number": 7
           }
@@ -9700,555 +9537,171 @@
       "type": "object"
     },
     "ResourceContent": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "What a read of `rift://workspace` returns.",
-          "properties": {
-            "uri": {
-              "$ref": "#/$defs/WorkspaceResourceUri",
-              "description": "The URI that was read, as it resolved.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.workspace+json",
-              "description": "Which payload `text` holds.",
-              "title": "Mimetype",
-              "type": "string"
-            },
-            "text": {
-              "contentMediaType": "application/vnd.rift.workspace+json",
-              "description": "A `WorkspaceResourcePayload`, serialized as JSON.",
-              "rift:contentType": "WorkspaceResourcePayload",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Text",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uri",
-            "mimeType",
-            "text"
-          ],
-          "rift:package": "rift.mcp",
+      "additionalProperties": false,
+      "description": "One content block of an MCP resource read. `text` holds the family's payload as JSON \u2014 `WorkspaceResourcePayload` for `rift://workspace`, `SymbolResourcePayload` for a symbol URI, and so on \u2014 and `mimeType` names which. The `rift:contentTypes` map in the schema carries the complete pairing.",
+      "properties": {
+        "uri": {
+          "description": "The URI that was read, as it resolved.",
+          "maxLength": 32768,
+          "minLength": 1,
           "rift:proto": {
-            "type": "rift.mcp.WorkspaceResourceContent"
+            "number": 1,
+            "scalar": "string"
           },
-          "title": "WorkspaceResourceContent",
-          "type": "object"
+          "title": "Uri",
+          "type": "string"
         },
-        {
-          "additionalProperties": false,
-          "description": "What a read of a `rift://symbol/\u2026` URI returns.",
-          "properties": {
-            "uri": {
-              "$ref": "#/$defs/SymbolId",
-              "description": "The URI that was read, as it resolved.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.symbol+json",
-              "description": "Which payload `text` holds.",
-              "title": "Mimetype",
-              "type": "string"
-            },
-            "text": {
-              "contentMediaType": "application/vnd.rift.symbol+json",
-              "description": "A `SymbolResourcePayload`, serialized as JSON.",
-              "rift:contentType": "SymbolResourcePayload",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Text",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uri",
-            "mimeType",
-            "text"
-          ],
-          "rift:package": "rift.mcp",
+        "mimeType": {
+          "description": "Which payload `text` holds, as `application/vnd.rift.<family>+json`.",
+          "maxLength": 64,
+          "pattern": "^application/vnd\\.rift\\.[a-z]+\\+json$",
           "rift:proto": {
-            "type": "rift.mcp.SymbolResourceContent"
+            "field": "mime_type",
+            "number": 3
           },
-          "title": "SymbolResourceContent",
-          "type": "object"
+          "title": "Mimetype",
+          "type": "string"
         },
-        {
-          "additionalProperties": false,
-          "description": "What a read of a `rift://fs` URI returns.",
-          "properties": {
-            "uri": {
-              "$ref": "#/$defs/FsResourceUri",
-              "description": "The URI that was read, as it resolved.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.fs+json",
-              "description": "Which payload `text` holds.",
-              "title": "Mimetype",
-              "type": "string"
-            },
-            "text": {
-              "contentMediaType": "application/vnd.rift.fs+json",
-              "description": "An `FsResourcePayload`, serialized as JSON.",
-              "rift:contentType": "FsResourcePayload",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Text",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uri",
-            "mimeType",
-            "text"
-          ],
-          "rift:package": "rift.mcp",
+        "text": {
+          "description": "The payload, serialized as JSON.",
           "rift:proto": {
-            "type": "rift.mcp.FsResourceContent"
+            "number": 2
           },
-          "title": "FsResourceContent",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "What a read of a `rift://actions/\u2026` URI returns.",
-          "properties": {
-            "uri": {
-              "$ref": "#/$defs/ActionsResourceUri",
-              "description": "The address that was read, as it resolved.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.actions+json",
-              "description": "Which payload `text` holds.",
-              "title": "Mimetype",
-              "type": "string"
-            },
-            "text": {
-              "contentMediaType": "application/vnd.rift.actions+json",
-              "description": "An `ActionsResourcePayload`, serialized as JSON.",
-              "rift:contentType": "ActionsResourcePayload",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Text",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uri",
-            "mimeType",
-            "text"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.ActionsResourceContent"
-          },
-          "title": "ActionsResourceContent",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "What a read of a `rift://action/\u2026` URI returns.",
-          "properties": {
-            "uri": {
-              "$ref": "#/$defs/ActionResourceUri",
-              "description": "The offer that was read, as it resolved.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.action+json",
-              "description": "Which payload `text` holds.",
-              "title": "Mimetype",
-              "type": "string"
-            },
-            "text": {
-              "contentMediaType": "application/vnd.rift.action+json",
-              "description": "An `ActionResourcePayload`, serialized as JSON.",
-              "rift:contentType": "ActionResourcePayload",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Text",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uri",
-            "mimeType",
-            "text"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.ActionResourceContent"
-          },
-          "title": "ActionResourceContent",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "What a read of `rift://root` returns.",
-          "properties": {
-            "uri": {
-              "$ref": "#/$defs/RootResourceUri",
-              "description": "The URI that was read, as it resolved.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.root+json",
-              "description": "Which payload `text` holds.",
-              "title": "Mimetype",
-              "type": "string"
-            },
-            "text": {
-              "contentMediaType": "application/vnd.rift.root+json",
-              "description": "A `RootResourcePayload`, serialized as JSON.",
-              "rift:contentType": "RootResourcePayload",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Text",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uri",
-            "mimeType",
-            "text"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.RootResourceContent"
-          },
-          "title": "RootResourceContent",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "What a read of a `rift://changes` URI returns.",
-          "properties": {
-            "uri": {
-              "$ref": "#/$defs/ChangesResourceUri",
-              "description": "The URI that was read, as it resolved.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.changes+json",
-              "description": "Which payload `text` holds.",
-              "title": "Mimetype",
-              "type": "string"
-            },
-            "text": {
-              "contentMediaType": "application/vnd.rift.changes+json",
-              "description": "A `ChangesResourcePayload`, serialized as JSON.",
-              "rift:contentType": "ChangesResourcePayload",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Text",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uri",
-            "mimeType",
-            "text"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.ChangesResourceContent"
-          },
-          "title": "ChangesResourceContent",
-          "type": "object"
+          "title": "Text",
+          "type": "string"
         }
+      },
+      "required": [
+        "uri",
+        "mimeType",
+        "text"
       ],
+      "rift:contentTypes": {
+        "application/vnd.rift.action+json": "ActionResourcePayload",
+        "application/vnd.rift.actions+json": "ActionsResourcePayload",
+        "application/vnd.rift.changes+json": "ChangesResourcePayload",
+        "application/vnd.rift.fs+json": "FsResourcePayload",
+        "application/vnd.rift.root+json": "RootResourcePayload",
+        "application/vnd.rift.symbol+json": "SymbolResourcePayload",
+        "application/vnd.rift.workspace+json": "WorkspaceResourcePayload"
+      },
       "rift:package": "rift.mcp",
       "rift:proto": {
-        "oneof": "variant",
-        "type": "rift.mcp.ResourceContent",
-        "variants": [
-          {
-            "field": "workspace",
-            "number": 1,
-            "tag": "application/vnd.rift.workspace+json",
-            "type": "WorkspaceResourceContent"
-          },
-          {
-            "field": "symbol",
-            "number": 2,
-            "tag": "application/vnd.rift.symbol+json",
-            "type": "SymbolResourceContent"
-          },
-          {
-            "field": "fs",
-            "number": 3,
-            "tag": "application/vnd.rift.fs+json",
-            "type": "FsResourceContent"
-          },
-          {
-            "field": "actions",
-            "number": 4,
-            "tag": "application/vnd.rift.actions+json",
-            "type": "ActionsResourceContent"
-          },
-          {
-            "field": "action",
-            "number": 5,
-            "tag": "application/vnd.rift.action+json",
-            "type": "ActionResourceContent"
-          },
-          {
-            "field": "root",
-            "number": 6,
-            "tag": "application/vnd.rift.root+json",
-            "type": "RootResourceContent"
-          },
-          {
-            "field": "changes",
-            "number": 7,
-            "tag": "application/vnd.rift.changes+json",
-            "type": "ChangesResourceContent"
-          }
-        ]
+        "type": "rift.mcp.ResourceContent"
       },
-      "title": "ResourceContent"
+      "title": "ResourceContent",
+      "type": "object"
+    },
+    "ResourceFamily": {
+      "description": "One family of Rift resources. The family fixes the URI shape a read accepts, the media type it returns, and the payload model inside it.",
+      "enum": [
+        "workspace",
+        "symbol",
+        "fs",
+        "actions",
+        "action",
+        "root",
+        "changes"
+      ],
+      "rift:enumDescriptions": {
+        "action": "One discovered action, with the schema of the arguments it takes.",
+        "actions": "The fixes and refactors an adapter offers at one address, or across one file.",
+        "changes": "The changes this session has made, and what vouched for each.",
+        "fs": "One directory page or file-content range.",
+        "root": "Where this session's projection lives on the filesystem.",
+        "symbol": "One symbol, its nodes, its edges and its diagnostics.",
+        "workspace": "Workspace capabilities, projection state, and request limits."
+      },
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "ResourceFamily",
+        "type": "rift.mcp.ResourceFamily",
+        "values": {
+          "action": {
+            "name": "RESOURCE_FAMILY_ACTION",
+            "number": 5
+          },
+          "actions": {
+            "name": "RESOURCE_FAMILY_ACTIONS",
+            "number": 4
+          },
+          "changes": {
+            "name": "RESOURCE_FAMILY_CHANGES",
+            "number": 7
+          },
+          "fs": {
+            "name": "RESOURCE_FAMILY_FS",
+            "number": 3
+          },
+          "root": {
+            "name": "RESOURCE_FAMILY_ROOT",
+            "number": 6
+          },
+          "symbol": {
+            "name": "RESOURCE_FAMILY_SYMBOL",
+            "number": 2
+          },
+          "workspace": {
+            "name": "RESOURCE_FAMILY_WORKSPACE",
+            "number": 1
+          }
+        }
+      },
+      "title": "ResourceFamily",
+      "type": "string"
     },
     "ResourceLink": {
-      "description": "A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed per resource, and the URI is the one that resource accepts.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "A link to the symbol resource, carrying the symbol's own URI.",
-          "properties": {
-            "type": {
-              "const": "resource_link",
-              "description": "MCP's tag for a link to a resource inside tool output.",
-              "title": "Type",
-              "type": "string"
-            },
-            "uri": {
-              "$ref": "#/$defs/SymbolId",
-              "description": "The symbol to read. Hand it to `resources/read` unchanged.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "name": {
-              "const": "symbol",
-              "description": "The resource family this link belongs to.",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.symbol+json",
-              "description": "What a read of this URI returns: `SymbolResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 3
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "uri",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
+      "additionalProperties": false,
+      "description": "A link to one Rift resource, as MCP carries it inside tool output. `name` selects the family, which fixes the URI shape a read of `uri` accepts and the media type it returns.",
+      "properties": {
+        "type": {
+          "const": "resource_link",
+          "description": "MCP's tag for a link to a resource inside tool output.",
+          "title": "Type",
+          "type": "string"
+        },
+        "uri": {
+          "description": "The resource to read. Hand it to `resources/read` unchanged.",
+          "maxLength": 32768,
+          "minLength": 1,
           "rift:proto": {
-            "type": "rift.mcp.SymbolResourceLink"
+            "number": 1,
+            "scalar": "string"
           },
-          "title": "SymbolResourceLink",
-          "type": "object"
+          "title": "Uri",
+          "type": "string"
         },
-        {
-          "additionalProperties": false,
-          "description": "A link to the workspace resource.",
-          "properties": {
-            "type": {
-              "const": "resource_link",
-              "description": "MCP's tag for a link to a resource inside tool output.",
-              "title": "Type",
-              "type": "string"
-            },
-            "uri": {
-              "$ref": "#/$defs/WorkspaceResourceUri",
-              "description": "The workspace resource, optionally continued by a cursor.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "name": {
-              "const": "workspace",
-              "description": "The resource family this link belongs to.",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.workspace+json",
-              "description": "What a read of this URI returns: `WorkspaceResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 3
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "uri",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
+        "name": {
+          "$ref": "#/$defs/ResourceFamily",
+          "description": "The resource family this link belongs to.",
           "rift:proto": {
-            "type": "rift.mcp.WorkspaceResourceLink"
-          },
-          "title": "WorkspaceResourceLink",
-          "type": "object"
+            "number": 2
+          }
         },
-        {
-          "additionalProperties": false,
-          "description": "A link to one path in the session projection.",
-          "properties": {
-            "type": {
-              "const": "resource_link",
-              "description": "MCP's tag for a link to a resource inside tool output.",
-              "title": "Type",
-              "type": "string"
-            },
-            "uri": {
-              "$ref": "#/$defs/FsResourceUri",
-              "description": "The filesystem entry to read.",
-              "rift:proto": {
-                "number": 1
-              }
-            },
-            "name": {
-              "const": "fs",
-              "description": "The resource family this link belongs to.",
-              "rift:proto": {
-                "number": 2
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.fs+json",
-              "description": "What a read of this URI returns: `FsResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 3
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "uri",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
+        "mimeType": {
+          "description": "What a read of `uri` returns, as `application/vnd.rift.<family>+json`.",
+          "maxLength": 64,
+          "pattern": "^application/vnd\\.rift\\.[a-z]+\\+json$",
           "rift:proto": {
-            "type": "rift.mcp.FsResourceLink"
+            "field": "mime_type",
+            "number": 3
           },
-          "title": "FsResourceLink",
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/ActionsResourceLink"
-        },
-        {
-          "$ref": "#/$defs/ActionResourceLink"
-        },
-        {
-          "$ref": "#/$defs/RootResourceLink"
-        },
-        {
-          "$ref": "#/$defs/ChangesResourceLink"
+          "title": "Mimetype",
+          "type": "string"
         }
+      },
+      "required": [
+        "type",
+        "uri",
+        "name",
+        "mimeType"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
-        "oneof": "variant",
-        "type": "rift.mcp.ResourceLink",
-        "variants": [
-          {
-            "field": "symbol",
-            "number": 1,
-            "tag": "symbol",
-            "type": "SymbolResourceLink"
-          },
-          {
-            "field": "workspace",
-            "number": 2,
-            "tag": "workspace",
-            "type": "WorkspaceResourceLink"
-          },
-          {
-            "field": "fs",
-            "number": 3,
-            "tag": "fs",
-            "type": "FsResourceLink"
-          },
-          {
-            "field": "actions",
-            "number": 4,
-            "tag": "actions",
-            "type": "ActionsResourceLink"
-          },
-          {
-            "field": "action",
-            "number": 5,
-            "tag": "action",
-            "type": "ActionResourceLink"
-          },
-          {
-            "field": "root",
-            "number": 6,
-            "tag": "root",
-            "type": "RootResourceLink"
-          },
-          {
-            "field": "changes",
-            "number": 7,
-            "tag": "changes",
-            "type": "ChangesResourceLink"
-          }
-        ]
+        "type": "rift.mcp.ResourceLink"
       },
-      "title": "ResourceLink"
+      "title": "ResourceLink",
+      "type": "object"
     },
     "ResourceReadParams": {
       "additionalProperties": false,
@@ -10260,7 +9713,7 @@
               "$ref": "#/$defs/WorkspaceResourceUri"
             },
             {
-              "$ref": "#/$defs/SymbolId"
+              "$ref": "#/$defs/SymbolResourceUri"
             },
             {
               "$ref": "#/$defs/FsResourceUri"
@@ -10278,7 +9731,7 @@
               "$ref": "#/$defs/ChangesResourceUri"
             }
           ],
-          "description": "A URI matching one branch of `ResourceTemplate`.",
+          "description": "A URI matching one advertised resource family.",
           "rift:proto": {
             "number": 1,
             "scalar": "string"
@@ -10324,353 +9777,46 @@
       "type": "object"
     },
     "ResourceTemplate": {
-      "description": "One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per family.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "The workspace resource with an optional page cursor.",
-          "properties": {
-            "uriTemplate": {
-              "const": "rift://workspace{?cursor}",
-              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
-              "title": "Uritemplate",
-              "type": "string"
-            },
-            "name": {
-              "const": "workspace",
-              "description": "The resource family, as `resources/templates/list` advertises it.",
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.workspace+json",
-              "description": "What a read of a URI from this template returns: `WorkspaceResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 2
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uriTemplate",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.WorkspaceResourceTemplate"
-          },
-          "title": "WorkspaceResourceTemplate",
-          "type": "object"
+      "additionalProperties": false,
+      "description": "One advertised MCP resource template, as `resources/templates/list` returns it. The family fixes the template and the media type.",
+      "properties": {
+        "uriTemplate": {
+          "description": "The template, in RFC 6570 form. What follows `?` is optional.",
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Uritemplate",
+          "type": "string"
         },
-        {
-          "additionalProperties": false,
-          "description": "The symbol resource, addressed by language and qualified name.",
-          "properties": {
-            "uriTemplate": {
-              "const": "rift://symbol/{language}/{name}{?cursor}",
-              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
-              "title": "Uritemplate",
-              "type": "string"
-            },
-            "name": {
-              "const": "symbol",
-              "description": "The resource family, as `resources/templates/list` advertises it.",
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.symbol+json",
-              "description": "What a read of a URI from this template returns: `SymbolResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 2
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uriTemplate",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
+        "name": {
+          "$ref": "#/$defs/ResourceFamily",
+          "description": "The resource family being advertised.",
           "rift:proto": {
-            "type": "rift.mcp.SymbolResourceTemplate"
-          },
-          "title": "SymbolResourceTemplate",
-          "type": "object"
+            "number": 1
+          }
         },
-        {
-          "additionalProperties": false,
-          "description": "The filesystem resource, addressed by a path relative to the project root.",
-          "properties": {
-            "uriTemplate": {
-              "const": "rift://fs{/path}{?start,length,cursor}",
-              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
-              "title": "Uritemplate",
-              "type": "string"
-            },
-            "name": {
-              "const": "fs",
-              "description": "The resource family, as `resources/templates/list` advertises it.",
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.fs+json",
-              "description": "What a read of a URI from this template returns: `FsResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 2
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uriTemplate",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
+        "mimeType": {
+          "description": "What a read of a URI from this template returns, as `application/vnd.rift.<family>+json`.",
+          "maxLength": 64,
+          "pattern": "^application/vnd\\.rift\\.[a-z]+\\+json$",
           "rift:proto": {
-            "type": "rift.mcp.FsResourceTemplate"
+            "field": "mime_type",
+            "number": 2
           },
-          "title": "FsResourceTemplate",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "The actions resource, addressed by the place to inspect.",
-          "properties": {
-            "uriTemplate": {
-              "const": "rift://actions/{address}{?only,cursor}",
-              "description": "The template, in RFC 6570 form. The address is `symbol/{language}/{name}`, `node/{language}/{path}@{start}-{end}`, `match/{token}`, or `file/{path}`.",
-              "title": "Uritemplate",
-              "type": "string"
-            },
-            "name": {
-              "const": "actions",
-              "description": "The resource family, as `resources/templates/list` advertises it.",
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.actions+json",
-              "description": "What a read of a URI from this template returns: `ActionsResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 2
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uriTemplate",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.ActionsResourceTemplate"
-          },
-          "title": "ActionsResourceTemplate",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "One discovered action, addressed by the offer identity a listing returned.",
-          "properties": {
-            "uriTemplate": {
-              "const": "rift://action/{token}",
-              "description": "The template, in RFC 6570 form.",
-              "title": "Uritemplate",
-              "type": "string"
-            },
-            "name": {
-              "const": "action",
-              "description": "The resource family, as `resources/templates/list` advertises it.",
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.action+json",
-              "description": "What a read of a URI from this template returns: `ActionResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 2
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uriTemplate",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.ActionResourceTemplate"
-          },
-          "title": "ActionResourceTemplate",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "The projection directory, addressed without parameters.",
-          "properties": {
-            "uriTemplate": {
-              "const": "rift://root",
-              "description": "The template, in RFC 6570 form.",
-              "title": "Uritemplate",
-              "type": "string"
-            },
-            "name": {
-              "const": "root",
-              "description": "The resource family, as `resources/templates/list` advertises it.",
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.root+json",
-              "description": "What a read of a URI from this template returns: `RootResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 2
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uriTemplate",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.RootResourceTemplate"
-          },
-          "title": "RootResourceTemplate",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "The changeset with an optional page cursor.",
-          "properties": {
-            "uriTemplate": {
-              "const": "rift://changes{?cursor}",
-              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
-              "title": "Uritemplate",
-              "type": "string"
-            },
-            "name": {
-              "const": "changes",
-              "description": "The resource family, as `resources/templates/list` advertises it.",
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Name",
-              "type": "string"
-            },
-            "mimeType": {
-              "const": "application/vnd.rift.changes+json",
-              "description": "What a read of a URI from this template returns: `ChangesResourcePayload` as JSON.",
-              "rift:proto": {
-                "field": "mime_type",
-                "number": 2
-              },
-              "title": "Mimetype",
-              "type": "string"
-            }
-          },
-          "required": [
-            "uriTemplate",
-            "name",
-            "mimeType"
-          ],
-          "rift:package": "rift.mcp",
-          "rift:proto": {
-            "type": "rift.mcp.ChangesResourceTemplate"
-          },
-          "title": "ChangesResourceTemplate",
-          "type": "object"
+          "title": "Mimetype",
+          "type": "string"
         }
+      },
+      "required": [
+        "uriTemplate",
+        "name",
+        "mimeType"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
-        "oneof": "variant",
-        "type": "rift.mcp.ResourceTemplate",
-        "variants": [
-          {
-            "field": "workspace",
-            "number": 1,
-            "tag": "rift://workspace{?cursor}",
-            "type": "WorkspaceResourceTemplate"
-          },
-          {
-            "field": "symbol",
-            "number": 2,
-            "tag": "rift://symbol/{language}/{name}{?cursor}",
-            "type": "SymbolResourceTemplate"
-          },
-          {
-            "field": "fs",
-            "number": 3,
-            "tag": "rift://fs{/path}{?start,length,cursor}",
-            "type": "FsResourceTemplate"
-          },
-          {
-            "field": "actions",
-            "number": 4,
-            "tag": "rift://actions/{address}{?only,cursor}",
-            "type": "ActionsResourceTemplate"
-          },
-          {
-            "field": "action",
-            "number": 5,
-            "tag": "rift://action/{token}",
-            "type": "ActionResourceTemplate"
-          },
-          {
-            "field": "root",
-            "number": 6,
-            "tag": "rift://root",
-            "type": "RootResourceTemplate"
-          },
-          {
-            "field": "changes",
-            "number": 7,
-            "tag": "rift://changes{?cursor}",
-            "type": "ChangesResourceTemplate"
-          }
-        ]
+        "type": "rift.mcp.ResourceTemplate"
       },
-      "title": "ResourceTemplate"
+      "title": "ResourceTemplate",
+      "type": "object"
     },
     "ResultOrder": {
       "description": "The total order a paginated answer comes back in, named in the request so a cursor can be bound to it. Every order ends in the result's own identity, so two results that tie never swap places between pages.",
@@ -10680,7 +9826,7 @@
         "identity"
       ],
       "rift:enumDescriptions": {
-        "identity": "By the result's canonical identity: a symbol URI, a file path, or an `ActionKey`. Adapter actions use this order because they carry no relevance score or common source path.",
+        "identity": "By the result's canonical identity: a symbol URI, a file path, or an `ActionOfferId`. Adapter actions use this order because they carry no relevance score or common source path.",
         "path": "By the file a result is written in, then its byte range, then identity. Two hits in one file come back in source order.",
         "relevance": "Highest `score` first, then identity. Scores are comparable across every page of one request and nowhere else."
       },
@@ -10829,59 +9975,9 @@
       "title": "RewriteRange",
       "type": "string"
     },
-    "RootResourceLink": {
-      "additionalProperties": false,
-      "description": "A link to the session's projection directory.",
-      "properties": {
-        "type": {
-          "const": "resource_link",
-          "description": "MCP's tag for a link to a resource inside tool output.",
-          "title": "Type",
-          "type": "string"
-        },
-        "uri": {
-          "$ref": "#/$defs/RootResourceUri",
-          "description": "The root resource.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "name": {
-          "const": "root",
-          "description": "The resource family this link belongs to.",
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Name",
-          "type": "string"
-        },
-        "mimeType": {
-          "const": "application/vnd.rift.root+json",
-          "description": "What a read of this URI returns: `RootResourcePayload` as JSON.",
-          "rift:proto": {
-            "field": "mime_type",
-            "number": 3
-          },
-          "title": "Mimetype",
-          "type": "string"
-        }
-      },
-      "required": [
-        "type",
-        "uri",
-        "name",
-        "mimeType"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.RootResourceLink"
-      },
-      "title": "RootResourceLink",
-      "type": "object"
-    },
     "RootResourcePayload": {
       "additionalProperties": false,
-      "description": "Where this session's projection lives on the filesystem. Adapters receive this path over\nthe adapter protocol; a caller that has to reach the projection through an ordinary\nfilesystem tool reads it here.",
+      "description": "Where this session's projection lives on the filesystem. Adapters receive the tree they\nanalyze over the adapter protocol; a caller that has to reach the projection through an\nordinary filesystem tool reads it here.",
       "properties": {
         "uri": {
           "$ref": "#/$defs/RootResourceUri",
@@ -10892,7 +9988,7 @@
         },
         "path": {
           "$ref": "#/$defs/WorkspacePath",
-          "description": "Absolute path of the projection directory. Rift places it at `.rift/projections/<session>` below the workspace and keeps it there for the session's life. Session removal deletes the directory without waiting for a process that is still working inside it.",
+          "description": "Absolute path of the projection directory. Rift places it at `.rift/projections/<session>` below the workspace and keeps it there for the session's life. Reading this resource materializes a projection that has not diverged yet, because a tool pointed here may write and those writes belong to the changeset. Session removal deletes the directory without waiting for a process that is still working inside it.",
           "rift:proto": {
             "number": 2
           }
@@ -10967,46 +10063,53 @@
     },
     "SafeDeletePolicy": {
       "additionalProperties": false,
-      "description": "How an adapter may eliminate each remaining use while deleting a declaration. `refuse` stops when that use exists, `rewrite` replaces it with a valid form selected by the adapter, and `remove` deletes its containing construct at a safe boundary selected by the adapter. Complete reference coverage is mandatory.",
+      "description": "How an adapter may eliminate each remaining use while deleting a declaration. Every field holds a `Disposition`, one per class of use. Complete reference coverage is mandatory.",
       "properties": {
         "reads": {
-          "$ref": "#/$defs/SafeDeletePolicyReads",
+          "$ref": "#/$defs/Disposition",
+          "description": "Disposition for reads, calls, and constructions.",
           "rift:proto": {
             "number": 1
           }
         },
         "writes": {
-          "$ref": "#/$defs/SafeDeletePolicyWrites",
+          "$ref": "#/$defs/Disposition",
+          "description": "Disposition for assignments and other writes.",
           "rift:proto": {
             "number": 2
           }
         },
         "imports": {
-          "$ref": "#/$defs/SafeDeletePolicyImports",
+          "$ref": "#/$defs/Disposition",
+          "description": "Disposition for imports, exports, aliases, and re-exports.",
           "rift:proto": {
             "number": 3
           }
         },
         "overrides": {
-          "$ref": "#/$defs/SafeDeletePolicyOverrides",
+          "$ref": "#/$defs/Disposition",
+          "description": "Disposition for overrides, implementations, and inherited declarations.",
           "rift:proto": {
             "number": 4
           }
         },
         "generated": {
-          "$ref": "#/$defs/SafeDeletePolicyGenerated",
+          "$ref": "#/$defs/Disposition",
+          "description": "Disposition for adapter-resolved uses in generated source. Scope must also permit generated files.",
           "rift:proto": {
             "number": 5
           }
         },
         "strings": {
-          "$ref": "#/$defs/SafeDeletePolicyStrings",
+          "$ref": "#/$defs/Disposition",
+          "description": "Disposition for adapter-classified string references such as reflection names. Unclassified strings are outside the reference set and cannot be claimed by a guarantee.",
           "rift:proto": {
             "number": 6
           }
         },
         "other": {
-          "$ref": "#/$defs/SafeDeletePolicyOther",
+          "$ref": "#/$defs/Disposition",
+          "description": "Disposition for complete adapter-resolved uses not covered above.",
           "rift:proto": {
             "number": 7
           }
@@ -11027,216 +10130,6 @@
       },
       "title": "SafeDeletePolicy",
       "type": "object"
-    },
-    "SafeDeletePolicyGenerated": {
-      "description": "Disposition for adapter-resolved uses in generated source. Scope must also permit generated files.",
-      "enum": [
-        "refuse",
-        "rewrite",
-        "remove"
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "enum": "Generated",
-        "field": "generated",
-        "number": 5,
-        "values": {
-          "refuse": {
-            "name": "GENERATED_REFUSE",
-            "number": 1
-          },
-          "remove": {
-            "name": "GENERATED_REMOVE",
-            "number": 3
-          },
-          "rewrite": {
-            "name": "GENERATED_REWRITE",
-            "number": 2
-          }
-        }
-      },
-      "title": "SafeDeletePolicyGenerated",
-      "type": "string"
-    },
-    "SafeDeletePolicyImports": {
-      "description": "Disposition for imports, exports, aliases, and re-exports.",
-      "enum": [
-        "refuse",
-        "rewrite",
-        "remove"
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "enum": "Imports",
-        "field": "imports",
-        "number": 3,
-        "values": {
-          "refuse": {
-            "name": "IMPORTS_REFUSE",
-            "number": 1
-          },
-          "remove": {
-            "name": "IMPORTS_REMOVE",
-            "number": 3
-          },
-          "rewrite": {
-            "name": "IMPORTS_REWRITE",
-            "number": 2
-          }
-        }
-      },
-      "title": "SafeDeletePolicyImports",
-      "type": "string"
-    },
-    "SafeDeletePolicyOther": {
-      "description": "Disposition for complete adapter-resolved uses not covered above.",
-      "enum": [
-        "refuse",
-        "rewrite",
-        "remove"
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "enum": "Other",
-        "field": "other",
-        "number": 7,
-        "values": {
-          "refuse": {
-            "name": "OTHER_REFUSE",
-            "number": 1
-          },
-          "remove": {
-            "name": "OTHER_REMOVE",
-            "number": 3
-          },
-          "rewrite": {
-            "name": "OTHER_REWRITE",
-            "number": 2
-          }
-        }
-      },
-      "title": "SafeDeletePolicyOther",
-      "type": "string"
-    },
-    "SafeDeletePolicyOverrides": {
-      "description": "Disposition for overrides, implementations, and inherited declarations.",
-      "enum": [
-        "refuse",
-        "rewrite",
-        "remove"
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "enum": "Overrides",
-        "field": "overrides",
-        "number": 4,
-        "values": {
-          "refuse": {
-            "name": "OVERRIDES_REFUSE",
-            "number": 1
-          },
-          "remove": {
-            "name": "OVERRIDES_REMOVE",
-            "number": 3
-          },
-          "rewrite": {
-            "name": "OVERRIDES_REWRITE",
-            "number": 2
-          }
-        }
-      },
-      "title": "SafeDeletePolicyOverrides",
-      "type": "string"
-    },
-    "SafeDeletePolicyReads": {
-      "description": "Disposition for reads, calls, and constructions.",
-      "enum": [
-        "refuse",
-        "rewrite",
-        "remove"
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "enum": "Reads",
-        "field": "reads",
-        "number": 1,
-        "values": {
-          "refuse": {
-            "name": "READS_REFUSE",
-            "number": 1
-          },
-          "remove": {
-            "name": "READS_REMOVE",
-            "number": 3
-          },
-          "rewrite": {
-            "name": "READS_REWRITE",
-            "number": 2
-          }
-        }
-      },
-      "title": "SafeDeletePolicyReads",
-      "type": "string"
-    },
-    "SafeDeletePolicyStrings": {
-      "description": "Disposition for adapter-classified string references such as reflection names. Unclassified strings are outside the reference set and cannot be claimed by a guarantee.",
-      "enum": [
-        "refuse",
-        "rewrite",
-        "remove"
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "enum": "Strings",
-        "field": "strings",
-        "number": 6,
-        "values": {
-          "refuse": {
-            "name": "STRINGS_REFUSE",
-            "number": 1
-          },
-          "remove": {
-            "name": "STRINGS_REMOVE",
-            "number": 3
-          },
-          "rewrite": {
-            "name": "STRINGS_REWRITE",
-            "number": 2
-          }
-        }
-      },
-      "title": "SafeDeletePolicyStrings",
-      "type": "string"
-    },
-    "SafeDeletePolicyWrites": {
-      "description": "Disposition for assignments and other writes.",
-      "enum": [
-        "refuse",
-        "rewrite",
-        "remove"
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "enum": "Writes",
-        "field": "writes",
-        "number": 2,
-        "values": {
-          "refuse": {
-            "name": "WRITES_REFUSE",
-            "number": 1
-          },
-          "remove": {
-            "name": "WRITES_REMOVE",
-            "number": 3
-          },
-          "rewrite": {
-            "name": "WRITES_REWRITE",
-            "number": 2
-          }
-        }
-      },
-      "title": "SafeDeletePolicyWrites",
-      "type": "string"
     },
     "SearchHit": {
       "additionalProperties": false,
@@ -11460,6 +10353,44 @@
       },
       "title": "SearchHitTarget"
     },
+    "SearchInclude": {
+      "enum": [
+        "source",
+        "signature",
+        "relationships",
+        "diagnostics"
+      ],
+      "rift:enumDescriptions": {
+        "diagnostics": "What the adapter reported at the hit.",
+        "relationships": "The edges leading out of the hit.",
+        "signature": "The rendered signatures of a symbol hit, filled into `Symbol.signatures`. Nothing to add for a node or a file.",
+        "source": "The source around the hit, with the span it was copied from."
+      },
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Include",
+        "values": {
+          "diagnostics": {
+            "name": "INCLUDE_DIAGNOSTICS",
+            "number": 4
+          },
+          "relationships": {
+            "name": "INCLUDE_RELATIONSHIPS",
+            "number": 3
+          },
+          "signature": {
+            "name": "INCLUDE_SIGNATURE",
+            "number": 2
+          },
+          "source": {
+            "name": "INCLUDE_SOURCE",
+            "number": 1
+          }
+        }
+      },
+      "title": "SearchInclude",
+      "type": "string"
+    },
     "SearchParams": {
       "additionalProperties": false,
       "anyOf": [
@@ -11541,7 +10472,7 @@
           "anyOf": [
             {
               "items": {
-                "$ref": "#/$defs/SearchParamsIncludeItemInclude"
+                "$ref": "#/$defs/SearchInclude"
               },
               "type": "array"
             },
@@ -11600,44 +10531,6 @@
       },
       "title": "SearchParams",
       "type": "object"
-    },
-    "SearchParamsIncludeItemInclude": {
-      "enum": [
-        "source",
-        "signature",
-        "relationships",
-        "diagnostics"
-      ],
-      "rift:enumDescriptions": {
-        "diagnostics": "What the adapter reported at the hit.",
-        "relationships": "The edges leading out of the hit.",
-        "signature": "The rendered signatures of a symbol hit, filled into `Symbol.signatures`. Nothing to add for a node or a file.",
-        "source": "The source around the hit, with the span it was copied from."
-      },
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "enum": "Include",
-        "values": {
-          "diagnostics": {
-            "name": "INCLUDE_DIAGNOSTICS",
-            "number": 4
-          },
-          "relationships": {
-            "name": "INCLUDE_RELATIONSHIPS",
-            "number": 3
-          },
-          "signature": {
-            "name": "INCLUDE_SIGNATURE",
-            "number": 2
-          },
-          "source": {
-            "name": "INCLUDE_SOURCE",
-            "number": 1
-          }
-        }
-      },
-      "title": "SearchParamsIncludeItemInclude",
-      "type": "string"
     },
     "SearchParamsTarget": {
       "description": "Which entity kinds may be returned. Type data is attached to the Symbol and Node records that bind it, and filters can search those attachments.",
@@ -11887,7 +10780,7 @@
       "properties": {
         "session": {
           "$ref": "#/$defs/SessionId",
-          "description": "Retained session to inspect or remove.",
+          "description": "Retained session to remove.",
           "rift:proto": {
             "number": 1
           }
@@ -11905,7 +10798,7 @@
     },
     "SessionRemoveResult": {
       "additionalProperties": false,
-      "description": "The session removed at the checked projection state.",
+      "description": "The removed session and the projection state it held.",
       "properties": {
         "session": {
           "$ref": "#/$defs/SessionId",
@@ -11916,7 +10809,7 @@
         },
         "state": {
           "$ref": "#/$defs/ProjectionState",
-          "description": "Exact projection state checked by this preview or confirmation.",
+          "description": "Exact projection state the session held when it was removed.",
           "rift:proto": {
             "number": 2
           }
@@ -13204,15 +12097,15 @@
       "type": "string"
     },
     "SymbolId": {
-      "description": "Identity of one symbol in the session projection.",
+      "description": "Identity of one symbol in the session projection. The name after the language is the\nadapter's stable qualified name for the declaration; where the language derives module\nidentity from the file path, as TypeScript does, that path is part of the name. A `~N`\nsuffix separates declarations the qualified name alone cannot, such as overloads that\ndispatch separately.",
       "examples": [
         "rift://symbol/python/pkg.util.load_config~1",
         "rift://symbol/sql:postgresql/public.users",
         "rift://symbol/css:scss/theme.$accent"
       ],
-      "maxLength": 12288,
+      "maxLength": 8192,
       "minLength": 17,
-      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}(\\?cursor=[A-Za-z0-9_-]{1,4096})?$",
+      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
       "rift:package": "rift.core",
       "rift:proto": {
         "package": "rift.core",
@@ -13426,7 +12319,7 @@
       "description": "JSON payload for one symbol in the session projection.",
       "properties": {
         "uri": {
-          "$ref": "#/$defs/SymbolId",
+          "$ref": "#/$defs/SymbolResourceUri",
           "description": "The symbol this payload answers for, echoed back so a link and its content carry the same address.",
           "rift:proto": {
             "number": 1
@@ -13504,7 +12397,7 @@
         "next": {
           "anyOf": [
             {
-              "$ref": "#/$defs/SymbolId"
+              "$ref": "#/$defs/SymbolResourceUri"
             },
             {
               "type": "null"
@@ -13533,6 +12426,23 @@
       },
       "title": "SymbolResourcePayload",
       "type": "object"
+    },
+    "SymbolResourceUri": {
+      "description": "URI for one symbol read. It is the symbol's own `SymbolId`, optionally carrying the\ncursor that continues its paged nodes, edges, and diagnostics.",
+      "examples": [
+        "rift://symbol/python/pkg.util.load_config~1",
+        "rift://symbol/rust/config::Loader?cursor=eyJwYWdlIjoyfQ"
+      ],
+      "maxLength": 12288,
+      "minLength": 17,
+      "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}(?:\\?cursor=[A-Za-z0-9_-]{1,4096})?$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "SymbolResourceUri",
+      "type": "string"
     },
     "TextEdit": {
       "additionalProperties": false,
@@ -14109,7 +13019,7 @@
         "resources": {
           "description": "The MCP resource families this workspace serves.",
           "items": {
-            "$ref": "#/$defs/WorkspaceResourcePayloadResourcesItemResources"
+            "$ref": "#/$defs/ResourceFamily"
           },
           "rift:proto": {
             "number": 8
@@ -14169,62 +13079,6 @@
       },
       "title": "WorkspaceResourcePayload",
       "type": "object"
-    },
-    "WorkspaceResourcePayloadResourcesItemResources": {
-      "enum": [
-        "workspace",
-        "symbol",
-        "fs",
-        "actions",
-        "action",
-        "root",
-        "changes"
-      ],
-      "rift:enumDescriptions": {
-        "action": "One discovered action, with the schema of the arguments it takes.",
-        "actions": "The fixes and refactors an adapter offers at one address, or across one file.",
-        "changes": "The changes this session has made, and what vouched for each.",
-        "fs": "One directory page or file-content range.",
-        "root": "Where this session's projection lives on the filesystem.",
-        "symbol": "One symbol, its nodes, its edges and its diagnostics.",
-        "workspace": "Workspace capabilities, projection state, and request limits."
-      },
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "enum": "Resources",
-        "values": {
-          "action": {
-            "name": "RESOURCES_ACTION",
-            "number": 5
-          },
-          "actions": {
-            "name": "RESOURCES_ACTIONS",
-            "number": 4
-          },
-          "changes": {
-            "name": "RESOURCES_CHANGES",
-            "number": 7
-          },
-          "fs": {
-            "name": "RESOURCES_FS",
-            "number": 3
-          },
-          "root": {
-            "name": "RESOURCES_ROOT",
-            "number": 6
-          },
-          "symbol": {
-            "name": "RESOURCES_SYMBOL",
-            "number": 2
-          },
-          "workspace": {
-            "name": "RESOURCES_WORKSPACE",
-            "number": 1
-          }
-        }
-      },
-      "title": "WorkspaceResourcePayloadResourcesItemResources",
-      "type": "string"
     },
     "WorkspaceResourceUri": {
       "description": "Paginated workspace metadata and capabilities.",

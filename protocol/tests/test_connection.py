@@ -15,8 +15,8 @@ CHANGE = "chg_" + "f" * 26
 OTHER_CHANGE = "chg_" + "g" * 26
 
 
-def state(*, dirty: bool = False, unacknowledged: bool = False) -> core.ProjectionState:
-    return core.ProjectionState(dirty=dirty, unacknowledged=unacknowledged)
+def state(*, dirty: bool = False, unaccepted: bool = False) -> core.ProjectionState:
+    return core.ProjectionState(dirty=dirty, unaccepted=unaccepted)
 
 
 class ConnectionContractTests(TestCase):
@@ -83,13 +83,13 @@ class ProjectionContractTests(TestCase):
     def test_projection_state_carries_no_concurrency_token(self) -> None:
         self.assertEqual(
             set(core.ProjectionState.model_fields),
-            {"dirty", "unacknowledged"},
+            {"dirty", "unaccepted"},
         )
         with self.assertRaises(ValidationError):
             core.ProjectionState.model_validate(
                 {
                     "dirty": False,
-                    "unacknowledged": False,
+                    "unaccepted": False,
                     "head": "anything",
                 }
             )
@@ -114,7 +114,7 @@ class ProjectionContractTests(TestCase):
             unaccepted=[],
         )
         unaccepted = mcp.PublishResult(
-            state=state(dirty=True, unacknowledged=True),
+            state=state(dirty=True, unaccepted=True),
             conflicts=[],
             unaccepted=[CHANGE],
         )
