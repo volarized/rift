@@ -273,6 +273,7 @@ function load(version: DocVersion): ProtoData {
     const namespace = root.lookup("rift.adapter");
     if (!(namespace instanceof protobuf.Namespace)) return [];
     const byName = new Map<string, ProtoSection>();
+    const sectionOfMessage = new Map<string, ProtoSection>();
     for (const child of namespace.nestedArray) {
       if (!(child instanceof protobuf.Type)) continue;
       if (protoWrappers.has(child.name)) continue;
@@ -282,6 +283,20 @@ function load(version: DocVersion): ProtoData {
       const section = byName.get(name) ?? { name, types: [] };
       section.types.push(child.name);
       byName.set(name, section);
+      sectionOfMessage.set(child.name, section);
+    }
+    // A top-level enum can't carry the message-only `(section)` option, so it
+    // joins the section of the first message that references it, right after
+    // that message.
+    for (const child of namespace.nestedArray) {
+      if (!(child instanceof protobuf.Enum)) continue;
+      for (const [message, section] of sectionOfMessage) {
+        const declared = namespace.lookup(message);
+        if (!(declared instanceof protobuf.Type)) continue;
+        if (!declared.fieldsArray.some((field) => short(field.type) === child.name)) continue;
+        section.types.splice(section.types.indexOf(message) + 1, 0, child.name);
+        break;
+      }
     }
     return [...byName.values()];
   })();

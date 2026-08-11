@@ -12,6 +12,7 @@ export function sectionId(name: string): string {
 
 interface AdapterView {
   messagesByName: Map<string, ProtoMessage>;
+  enumsByName: Map<string, ProtoEnum>;
   resolve: TypeResolver;
   wrappers: Set<string>;
 }
@@ -27,7 +28,8 @@ interface AdapterView {
  * message it is declared in, which is the heading it is rendered under.
  */
 function viewFor(version: DocVersion): AdapterView {
-  const { adapterOwned, protoEnumOwner, protoMessages, protoWrappers } = protoFor(version);
+  const { adapterOwned, protoEnumOwner, protoEnums, protoMessages, protoWrappers } =
+    protoFor(version);
   const { homeOf } = protocolFor(version);
 
   const resolve: TypeResolver = (name) => {
@@ -41,6 +43,11 @@ function viewFor(version: DocVersion): AdapterView {
   return {
     messagesByName: new Map(
       protoMessages.filter((message) => adapterOwned.has(message.name)).map((m) => [m.name, m]),
+    ),
+    enumsByName: new Map(
+      protoEnums
+        .filter((declared) => adapterOwned.has(declared.name) && !protoEnumOwner[declared.name])
+        .map((declared) => [declared.name, declared]),
     ),
     resolve,
     wrappers: protoWrappers,
@@ -154,7 +161,23 @@ function EnumValues({ declared, view }: { declared: ProtoEnum; view: AdapterView
 
 function Declaration({ name, view }: { name: string; view: AdapterView }): ReactNode {
   const message = view.messagesByName.get(name);
-  if (!message) return null;
+  if (!message) {
+    const declared = view.enumsByName.get(name);
+    if (!declared) return null;
+    return (
+      <section>
+        <h3 id={`msg-${name}`} className="scroll-m-28 font-mono">
+          {name}
+        </h3>
+        {declared.comment ? (
+          <p>
+            <Prose text={declared.comment} resolve={view.resolve} />
+          </p>
+        ) : null}
+        <EnumValues declared={declared} view={view} />
+      </section>
+    );
+  }
   return (
     <section>
       <h3 id={`msg-${name}`} className="scroll-m-28 font-mono">
