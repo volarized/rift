@@ -14,6 +14,12 @@ Point your editor at the schema and everything below autocompletes:
 #:schema ./protocol/rift.schema.json
 ```
 
+`rift.toml` is workspace code. It's committed like the rest of the repository, and opening a
+workspace runs what it names — adapter processes at admission, validator commands on every change
+that applies — so open a repository the way you'd run its build: because you trust it. A change
+to the file made through a session carries a `configuration` confirmation into `publish`, because
+publishing it changes which commands the server runs.
+
 ## Adapters
 
 Each entry below `adapters` starts one process. `command` is an executable followed by literal
@@ -32,12 +38,16 @@ command = ["rift-adapter-sql", "--dialect", "postgresql"]
 The table key is a name local to your workspace. Which language a process actually handles is
 something it reports itself, through `Describe`, along with everything else it can do — so the
 `postgres` entry above ends up serving `sql:postgresql` because that's what the process says when
-Rift asks it.
+Rift asks it. Two entries reporting the same exact `Language` fail workspace admission: the
+server drives one process per language pair and won't pick between claimants.
 
 ## Execution
 
-`execute` runs a block of code your agent wrote against its projection, which is a sharp enough
-tool that it's off until you name the languages it's allowed for. `execution.allow` is that list,
+`execute` runs a block of code your agent wrote in a disposable copy of its projection. The code
+still runs on your machine, so `execute` stays off until you name the languages it's allowed for.
+The list gates only code your agent submits — the adapters you configured already run their
+toolchains on the tree, `build.rs` and proc macros included, which is what an adapter's
+`RuntimeRequirements` disclose. `execution.allow` is that list,
 and `execution.debug` is the subset that may also retain stack frames after a failure for
 `debug_start` to inspect. A selector is a language name, or `name:dialect` to pin a dialect.
 
@@ -45,26 +55,31 @@ and `execution.debug` is the subset that may also retain stack frames after a fa
 [execution]
 allow = ["python", "sql:postgresql"]
 debug = ["python"]
-max-code = "16KiB"
-max-timeout = "30s"
-max-output = "8KiB"
-max-concurrent = 2
-max-debug-sessions = 2
-debug-idle-timeout = "5m"
-max-debug-frames = 64
-max-debug-bindings = 32
-max-debug-value = "1KiB"
+max_code = "16KiB"
+max_timeout = "30s"
+max_output = "8KiB"
+max_concurrent = 2
+max_debug_sessions = 2
+debug_idle_timeout = "5m"
+max_debug_frames = 64
+max_debug_bindings = 32
+max_debug_value = "1KiB"
 ```
 
-`max-code` bounds one submitted block. `max-timeout` bounds one evaluation and `max-output` bounds
-each of its captured streams separately, so a program that floods stdout gets a prefix and a byte
-count rather than a hung request. `max-concurrent` caps evaluations running at once across the
-whole workspace.
+The block above shows every key at its default. `max_code` bounds one submitted block, 1B to
+32KiB. `max_timeout` bounds one evaluation, 1ms to 1d — the evaluation only: materializing the
+disposable copy is extra, and a materialization that outruns the same bound fails the call with
+`deadline_exceeded`. `max_output` bounds each captured stream separately, up to 16KiB, so a
+program that floods stdout gets a prefix and a byte count rather than a hung request.
+`max_concurrent` caps evaluations running at once across the whole workspace, 1 to 64. The
+schema states each range as `rift:range` on the key, and the server enforces it at load — schema
+validation alone can't compare `"16KiB"` against a ceiling.
 
-The debug keys bound what a retained session holds: `max-debug-sessions` across the workspace,
-`debug-idle-timeout` before Rift stops one that nobody is reading, then `max-debug-frames`,
-`max-debug-bindings` per frame, and `max-debug-value` on each rendered value. Durations take `ms`,
-`s`, `m`, `h`, or `d`; byte sizes take `B`, `KiB`, `MiB`, `GiB`, or `TiB`.
+The debug keys bound what a retained session holds: `max_debug_sessions` across the workspace
+(1 to 16), `debug_idle_timeout` before Rift stops one that nobody is reading (1ms to 1d), then
+`max_debug_frames` (1 to 256), `max_debug_bindings` per frame (1 to 128), and `max_debug_value`
+on each rendered value (up to 8KiB). Durations take `ms`, `s`, `m`, `h`, or `d`; byte sizes take
+`B`, `KiB`, `MiB`, `GiB`, or `TiB`.
 
 An adapter has to advertise the matching operation as well. Listing `rust` under `allow` does
 nothing if the Rust adapter never claimed it can execute, and debugging needs all three of
@@ -83,7 +98,8 @@ require = ["rust", "typescript"]
 ```
 
 A change whose required reports don't arrive still lands in the projection — it just carries a
-`validation_incomplete` confirmation, and publication won't take it until you accept that.
+`validation_incomplete` confirmation, and publication won't take it until you accept that. Each
+change reports the strength it reached in its `rift://changes` entry.
 
 ## Command validators
 
@@ -105,19 +121,30 @@ determinism = "deterministic"
 ```
 
 `id` is unique within the list and labels the result. `argv` refuses an absolute executable path; a
-bare name resolves through the validator's `PATH` and a relative one below `working_directory`,
-which is itself relative to the project root and defaults to it. `changed_paths = "append"` adds
+bare name resolves through the `PATH` of the environment the command runs with — the server's,
+with `environment` applied on top — and a relative one below `working_directory`,
+which is itself relative to the projection root and defaults to it. `changed_paths = "append"` adds
 the changed project paths to `argv` in byte order, for a linter that takes files; `"none"` leaves
-`argv` alone.
+`argv` alone. A validator runs the tree it checks — `cargo test` compiles the very change it's
+validating — so a configured validator executes the agent's unpublished code each time a change
+applies.
 
-`timeout_ms` is when Rift kills the process, and `output_limit_bytes` is how much of each stream it
-keeps — the full size is still reported, so you can tell a truncated log from a short one.
+Every key in the block is required — the schema carries no defaults, so a missing `environment`
+fails the file with `configuration_invalid`. Two keys carry bounds: `timeout_ms`, when Rift kills
+the process, takes 1 to 3600000, and `output_limit_bytes`, how much of each stream Rift keeps,
+takes 256 to 4096. The full size is still reported, so you can tell a truncated log from a short
+one.
+
 `guarantees` declares what a pass actually establishes, which is what turns a green run into
 `GuaranteeEvidence` on the change rather than an unexplained tick. `determinism` says whether the
 same tree and environment are expected to give the same answer twice.
 
+A command starts from the environment the server inherited, with `environment` values added on
+top. `rift.toml` is a workspace file your agent reads like any other, so a secret doesn't belong
+in `environment` — put it in the server's own environment and let the validator inherit it.
+
 <Callout type="warn">
-The command runs in the projection, so whatever it writes there is part of the changeset and will
-be published. `cargo test` leaves a `target/` directory behind, and Rift carries it rather than
-guessing which files a tool wrote were disposable.
+The command runs in the projection, so whatever it writes there is published with it. `cargo test`
+leaves a `target/` directory behind, and Rift carries it rather than guessing which files a tool
+wrote were disposable.
 </Callout>

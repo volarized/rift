@@ -19,20 +19,34 @@ no point copying it into every response:
 ```
 
 `dirty` says the projection holds something your workspace doesn't. `unaccepted` says the
-changeset holds a change carrying a confirmation nobody has accepted yet, which is the one thing
-that will stop `publish` on its own. The changes themselves come from the `rift://changes`
-resource.
+changeset holds a change carrying a confirmation, so a `publish` that doesn't name it in `accept`
+will refuse — the one stopper visible before calling `publish`; a workspace conflict only shows
+up in the attempt. The changes
+themselves come from the `rift://changes` resource.
 
 ## Paths and files
 
 `ProjectPath` is a normalized UTF-8 path relative to the workspace root. It uses `/`, contains no
 `.` or `..` component, and can't name `.rift` — the projection directory lives under there, and a
-path that could address it would let a change reach Rift's own state.
+path that could address it would let a change reach Rift's own state. Normalized means Unicode
+NFC: Rift normalizes what it emits and accepts, then compares byte-for-byte, and on a
+case-insensitive filesystem a create or rename whose destination case-folds onto a different
+existing path refuses with `destination_legal`.
 
-`ProjectEntry` is a directory, a regular file or a symlink. A regular file records its size and
+Every identifier that embeds a path — `FileId`, a node id, the `rift://fs` form — carries a
+`ProjectPath` in canonical percent-encoding, and the server re-validates it after decoding. The
+generated schema patterns don't carry the exclusions, so validation can't be left to the schema.
+
+`ProjectEntry` is a visible directory, regular file or symlink — visible meaning below the
+workspace root, outside `.rift`, and not excluded by the workspace's VCS ignore rules; a symlink
+is listed and never followed. Never followed holds for every traversal — reads, materialization,
+the disposable copy `execute` runs in, publication, prune. A `copy` of a symlink reproduces the
+link, and a path that addresses through a symlink component fails with `permission_denied`,
+because following it could leave the workspace. Visibility governs reads, while publication
+carries every changed path, visible or not. A regular file records its size and
 executable bit; a symlink's target travels as base64 because Rift never follows it and can't assume
-the bytes are text. Directories are derived from the path tree rather than stored, so an empty one
-appears when something in the projection creates it.
+the bytes are text. A directory entry carries only its path, so an empty one is still listed once
+something in the projection creates it.
 
 ## Source locations
 
@@ -44,13 +58,17 @@ are on the same scale.
 `NodeId`, `SymbolId`, `MatchId` and `ActionOfferId` address facts in the projection. A match or an
 offer names the file it came from, so Rift rechecks that one file before acting on it — a write
 somewhere else in the projection leaves it usable, which matters when a build is running in the
-same directory.
+same directory. A node or source address is positional: it names the bytes at those offsets as
+the projection stands, and resolution refuses with a failed `target_exists` unless the range is
+exactly a current node of the addressed kind — after editing a file, re-read before addressing
+into it.
 
 ## Semantic facts
 
-Adapters return symbols and the syntax nodes that write them, relationships between symbols,
-signatures and types and documentation, and diagnostics. Each of those is a `FactFamily`, and each
-family comes back with a `Coverage`.
+Adapters return facts in families: symbols, the syntax nodes that write them, relationships
+between symbols, resolved types, diagnostics, and origin mappings for generated source. Each of
+those is a `FactFamily`, and each comes back with a `Coverage`. Signatures and documentation
+travel on the symbol itself, covered under the `types` family.
 
 Coverage is what separates "there is nothing here" from "I couldn't see far enough to tell." A
 symbol with no `relationships` means the symbol has no edges only where that family reported
@@ -76,4 +94,4 @@ and `publish` is where those get settled.
 Transport and infrastructure failures aren't in either bucket. They're `ErrorData`, with a code, a
 phase, and a retry directive saying whether the same bytes are worth sending again.
 
-The full field definitions are in the generated [reference](/docs/protocol/reference).
+The full field definitions are in the generated [reference](/docs/draft/protocol/reference).

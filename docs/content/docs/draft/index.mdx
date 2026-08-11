@@ -2,9 +2,9 @@
 title: Rift
 ---
 
-Rift is an agentic development toolkit for reading, discovering and editing codebases. Your agent
-gets a scratchpad copy of your project, works in it through MCP, and merges the result back when
-you're happy with it.
+Your agent works in a scratchpad over your project — a view that only diverges where the agent
+changes something — reads and edits it through MCP, and publishes the result into your files once
+you've accepted what it did.
 
 Rift is per se not a complex system, and most of what follows matters if you're implementing
 against the protocol or writing a language adapter. If you want to know how the server actually
@@ -12,7 +12,9 @@ works, take a tour:
 
 - Architecture — the processes, what each of them owns, and how a change gets from your agent
   into your files
-- Configuration — the `rift.toml` keys that shape behaviour, for the server and for language
-  adapters
-- Protocol — the MCP surface in detail, and how a request turns into an adapter call. There's a
-  SCIP-compatible export here too.
+- Configuration — the `rift.toml` keys that decide what runs on your machine: which adapters
+  start, which languages may execute agent-written code, and which checks every change has to
+  pass
+- Protocol — the entities both sides exchange, the tools and resources an agent calls, how a
+  request turns into an adapter call, and the generated reference that settles fields and wire
+  numbers. A read-only SCIP index export lives here too, for tools that can't speak MCP

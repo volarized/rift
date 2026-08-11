@@ -2,9 +2,6 @@
 title: Protocol
 ---
 
-At the core of Rift there is a protocol. It describes how the components of the system behave, and
-how they operate.
-
 We've split the protocol definition into separate, logically aligned blocks:
 
 - Core model — logical entities used by both MCP and adapters
@@ -13,7 +10,7 @@ We've split the protocol definition into separate, logically aligned blocks:
 - SCIP — a read-only export for tools that consume SCIP indexes
 
 Each block is generated from the Pydantic models under `protocol/src/rift/models`, so the JSON
-Schema, the Protobuf files and the [reference](/docs/protocol/reference) can't drift apart. The
+Schema, the Protobuf files and the [reference](/docs/draft/protocol/reference) can't drift apart. The
 reference is authoritative for fields, enums and wire numbers; the pages here explain what the
 fields are for.
 
@@ -27,11 +24,18 @@ There's no concurrency token anywhere in this. A session admits one live connect
 MCP writer per projection, and the place where two writers can genuinely collide is the workspace —
 which `publish` checks directly by comparing the paths it's about to write.
 
-## Compatibility
+## Versioning
 
-Every generated contract carries a major, a minor and a schema digest. Majors have to be equal,
-because a major changes exactly when a peer can no longer decode the next message safely. Within
-one major, revisions only add fields, so a peer admits any minor at or below its own and the
-connection settles on the lower of the two — which means a client only has to check that one
-number to know it can decode everything it will be sent. The digest names the exact generation a
-peer was built from; it's what makes a bug report reproducible, and it doesn't decide admission.
+The protocol is versioned by date, the way [MCP versions its own
+specification](https://modelcontextprotocol.io/specification/): an identifier is a release date,
+`YYYY-MM-DD`. A version is a complete snapshot of the generated contract — a peer implements
+whole versions, never parts, so there's no minor number and nothing to intersect: naming the
+version names everything the peer can decode. No version has been released yet; this draft
+tracks the contract as it is written, and the first release cuts the first dated version.
+
+`Connect` declares the versions the caller implements, in preference order, and the server
+answers each attempt independently: it accepts one of them — `Connected` names which — or rejects
+with `unsupported_protocol` whose `protocol` evidence lists the versions the server supports. The
+caller picks one it implements and reconnects, or surfaces the mismatch. The rendezvous under
+`.rift` advertises the server's supported versions, so a caller can check before opening the
+socket.
