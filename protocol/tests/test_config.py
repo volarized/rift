@@ -13,29 +13,20 @@ from rift.generate import (
 )
 from rift.models import config, mcp
 
-REPOSITORY = Path(__file__).parents[2]
+WORKSPACE = Path(__file__).parents[2]
 
 
 class RiftConfigTests(TestCase):
-    def test_repository_file_is_the_typed_model(self) -> None:
-        parsed = validate_rift_toml(REPOSITORY / "rift.toml")
+    def test_workspace_file_is_the_typed_model(self) -> None:
+        parsed = validate_rift_toml(WORKSPACE / "rift.toml")
 
-        self.assertEqual(parsed.session.base, config.SessionBase.HEAD)
         self.assertEqual(parsed.validators.commands, [])
         self.assertEqual(parsed.execution.allow, [])
         self.assertEqual(parsed.execution.max_timeout.milliseconds, 30_000)
-        self.assertEqual(set(config.SessionConfig.model_fields), {"base"})
 
     def test_tables_are_closed(self) -> None:
         with self.assertRaises(ValidationError):
-            config.RiftConfig.model_validate({"session": {"base": "head", "typo": 1}})
-        with self.assertRaises(ValidationError):
-            config.RiftConfig.model_validate(
-                {"session": {"base": "head", "integration": "auto"}}
-            )
-
-        with self.assertRaises(ValidationError):
-            config.SessionConfig.model_validate({"base": "workspace"})
+            config.RiftConfig.model_validate({"session": {"base": "head"}})
 
     def test_language_selector_produces_the_protocol_type(self) -> None:
         language = config.LanguageSelector("sql:postgresql").to_language()
@@ -81,5 +72,5 @@ class RiftConfigTests(TestCase):
         validate_config_schema(content)
         self.assertEqual(
             set(schema["properties"]),
-            {"session", "execution", "validation", "validators", "adapters"},
+            {"execution", "validation", "validators", "adapters"},
         )

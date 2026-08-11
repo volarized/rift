@@ -31,7 +31,7 @@ class ExecutionContractTests(TestCase):
                 max_states=4,
             ),
             runtime=adapter.RuntimeRequirements(
-                executes_repository_code=True,
+                executes_workspace_code=True,
                 spawns_subprocesses=True,
             ),
             contracts=[
