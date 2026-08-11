@@ -176,3 +176,9 @@
     padding-top: 4rem;
   }
 }
+
+/* RootToggle reserves an icon slot per option; ours have no icons. */
+.version-switch-trigger > div:first-child:empty,
+.version-switch-item > div:first-child:empty {
+  display: none;
+}
