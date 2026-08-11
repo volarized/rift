@@ -12,6 +12,7 @@ import { Logo } from "@/components/logo";
  */
 export function baseOptions(): BaseLayoutProps {
   return {
+    githubUrl: "https://github.com/volarized/rift",
     nav: {
       title: (
         // Baseline-aligned, so the mark's apex sits on the wordmark's baseline
