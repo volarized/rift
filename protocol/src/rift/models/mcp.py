@@ -33,7 +33,8 @@ def _raw_resource_query(uri: str) -> dict[str, str]:
 class Cursor(ProtocolRoot):
     """An opaque base64url string that continues a paginated answer from where the last page
     ended. It binds the request, state, order, and page size. Padding is omitted. A mismatch
-    returns `cursor_invalid`."""
+    returns `cursor_invalid`. A cursor pages the result set captured when its first page was
+    computed, so a change landing mid-pagination does not rewrite later pages."""
 
     @model_validator(mode="after")
     def value_is_canonical_base64url(self) -> Cursor:
@@ -43,7 +44,7 @@ class Cursor(ProtocolRoot):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SourceExcerpt(ClosedModel):
-    "A copy of some source, and where it was copied from. A span points into a file that may change under you; an excerpt is the bytes as they were when the answer was produced."
+    "A copy of some source, and where it was copied from. A span points into a file that may change afterwards; an excerpt is the bytes as they were when the answer was produced."
 
     span: Field[core.SourceSpan] = proto_field(
         description="The file and byte range the text was taken from.", number=1
@@ -176,7 +177,7 @@ class OutlineResult(ClosedModel):
         "rift:enumDescriptions": {
             "symbol": "Declarations the adapter resolved — a function, a class, a trait.",
             "node": "Places in a syntax tree where a symbol is written. One symbol has many.",
-            "file": "Entries of the workspace tree. The only target that answers with no adapter installed.",
+            "file": "Entries of the workspace tree. The only target that returns results with no adapter installed.",
             "all": "Every kind above, in one ranked list.",
         }
     },
@@ -257,8 +258,9 @@ class SearchParams(ClosedModel):
         default=None,
         description=(
             "Text to match against file contents, symbol names, and rendered signatures. "
-            "`parse` matches that word in those fields. Caller lookup uses a relationship "
-            "filter."
+            "Matching is case-insensitive and identifier-aware — the query and the fields "
+            "split on case and underscore boundaries, so `loadConfig` finds `load_config`. "
+            "Scoring is server-defined and stable for one cursor's life."
         ),
         number=3,
     )
@@ -282,8 +284,8 @@ class SearchParams(ClosedModel):
     include: Field[list[SearchInclude] | None] = proto_field(
         default=None,
         description=(
-            "Extra payload to attach to every hit. Each entry costs a lookup per hit, so ask "
-            "for what you will read."
+            "Extra payload to attach to every hit. Each entry costs a lookup per hit, so "
+            "the caller requests only what it will read."
         ),
         number=6,
     )
@@ -308,6 +310,40 @@ class SearchParams(ClosedModel):
     )
 
 
+@definition(
+    owner=MCP,
+    public=True,
+    proto=Proto.enum(
+        "MatchedField",
+        (
+            EnumValue("name", "MATCHED_FIELD_NAME", 1),
+            EnumValue("signature", "MATCHED_FIELD_SIGNATURE", 2),
+            EnumValue("documentation", "MATCHED_FIELD_DOCUMENTATION", 3),
+            EnumValue("content", "MATCHED_FIELD_CONTENT", 4),
+            EnumValue("path", "MATCHED_FIELD_PATH", 5),
+        ),
+        named=True,
+    ),
+    schema_extra={
+        "rift:enumDescriptions": {
+            "name": "The symbol or file name matched.",
+            "signature": "The rendered signature matched.",
+            "documentation": "The documentation text matched.",
+            "content": "The text of the file matched.",
+            "path": "The project path matched.",
+        }
+    },
+)
+class MatchedField(str, Enum):
+    """Which indexed field produced a search hit."""
+
+    NAME = "name"
+    SIGNATURE = "signature"
+    DOCUMENTATION = "documentation"
+    CONTENT = "content"
+    PATH = "path"
+
+
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SearchHit(ClosedModel):
     """One search hit. Its file, node, or symbol payload carries the canonical identity."""
@@ -323,8 +359,8 @@ class SearchHit(ClosedModel):
         ),
         number=2,
     )
-    matched_by: Field[list[str]] = proto_field(
-        description="Which fields produced the match — `name`, `signature`, the text of the file.",
+    matched_by: Field[list[MatchedField]] = proto_field(
+        description="Which indexed fields produced the match.",
         number=3,
     )
     relationships: Field[list[core.Relationship] | None] = proto_field(
@@ -336,7 +372,7 @@ class SearchHit(ClosedModel):
         default=None,
         description=(
             'The source around the hit, requested with `include: ["source"]`. Carries its '
-            "span, so an agent can act on what it read without searching for it again."
+            "span, so the caller can act on what it read without searching for it again."
         ),
         number=5,
     )
@@ -406,35 +442,6 @@ class SymbolResourcePayload(ClosedModel):
     )
 
 
-@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class Contract(ClosedModel):
-    "One generated wire contract. Majors have to be equal, because a major changes when a peer can no longer decode the next message safely. Within one major, revisions only add, so a peer can speak any minor at or below its own and the connection settles on the lower of the two."
-
-    major: Field[core.ProtocolVersion] = proto_field(
-        description="Breaking protocol generation selected before the socket is opened.",
-        number=1,
-    )
-    minor: Field[int] = proto_field(
-        description=(
-            "Additive revision within the major. A peer admits any minor at or below its own "
-            "and emits nothing added after the minor the connection settled on, so the client "
-            "checks this one number to know it can decode everything it will be sent."
-        ),
-        ge=0,
-        le=4294967295,
-        number=2,
-        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
-    )
-    schema_digest: Field[core.Digest] = proto_field(
-        description=(
-            "SHA-256 of the generated descriptor and its MCP conversion metadata. It names the "
-            "exact generation a peer was built from, which is what makes a bug report "
-            "reproducible; admission is decided by `major` and `minor`."
-        ),
-        number=3,
-    )
-
-
 @scalar(
     owner=MCP,
     public=False,
@@ -465,18 +472,6 @@ class ChangeId(ProtocolRoot):
     public=False,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^ses_[a-z2-7]{26}$",
-)
-class SessionId(ProtocolRoot):
-    """Random 128-bit identity of one persistent session projection. The server admits at most
-    one live MCP connection for the identity."""
-
-
-@scalar(
-    owner=MCP,
-    public=False,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
     pattern=r"^con_[a-z2-7]{26}$",
 )
 class ConnectionId(ProtocolRoot):
@@ -492,7 +487,7 @@ class ConnectionId(ProtocolRoot):
     pattern=r"^[a-z][a-z0-9_.-]{0,127}$",
 )
 class FeatureId(ProtocolRoot):
-    """One optional behavior implemented by a client or server."""
+    """One optional behavior implemented by the caller or the server."""
 
 
 @definition(
@@ -509,7 +504,7 @@ class FeatureId(ProtocolRoot):
     schema_extra={
         "rift:enumDescriptions": {
             "mcp": "An MCP bridge that creates a session and may reconnect to it while the process lives.",
-            "scip": "A read-only SCIP projection client with no session.",
+            "scip": "A read-only SCIP reader that takes no connection slot on the session it exports.",
         }
     },
 )
@@ -541,16 +536,17 @@ class ConnectRole(str, Enum):
     },
 )
 class ConnectRequest(ClosedModel):
-    """Opens one logical client connection before another server RPC. The control stream
+    """Opens one logical caller connection before another server RPC. The control stream
     remains open for the connection lifetime."""
 
-    contracts: Field[list[Contract]] = proto_field(
-        description="Supported contracts in client preference order.",
+    protocol_versions: Field[list[core.ProtocolVersion]] = proto_field(
+        description="Versions the caller implements, in preference order.",
         min_length=1,
         number=1,
+        json_schema_extra={"uniqueItems": True},
     )
     features: Field[list[FeatureId]] = proto_field(
-        description="Optional behaviors implemented by the client, sorted by identifier.",
+        description="Optional behaviors implemented by the caller, sorted by identifier.",
         number=2,
         json_schema_extra={"uniqueItems": True},
     )
@@ -558,7 +554,7 @@ class ConnectRequest(ClosedModel):
         description="Whether the connection serves MCP requests or a read-only SCIP projection.",
         number=3,
     )
-    session: Field[SessionId | None] = proto_field(
+    session: Field[core.SessionId | None] = proto_field(
         default=None,
         description=(
             "Process-generated persistent session to create or reconnect to. Required for an MCP "
@@ -572,7 +568,7 @@ class ConnectRequest(ClosedModel):
         number=5,
     )
     client_build: Field[str] = proto_field(
-        description="Client build as it names itself in diagnostics.",
+        description="Caller build as it names itself in diagnostics.",
         min_length=1,
         max_length=256,
         number=6,
@@ -616,10 +612,9 @@ class Connected(ClosedModel):
     """The first response on an accepted control stream, including persistent projection state
     for an MCP role."""
 
-    contract: Field[Contract] = proto_field(
-        description=(
-            "Contract this connection speaks: the shared major, and the lower of the two minors."
-        ), number=1
+    protocol_version: Field[core.ProtocolVersion] = proto_field(
+        description="The version the server accepted from the caller's list.",
+        number=1,
     )
     features: Field[list[FeatureId]] = proto_field(
         description="Features implemented by both peers, sorted by identifier.",
@@ -629,7 +624,7 @@ class Connected(ClosedModel):
     workspace: Field[WorkspacePath] = proto_field(
         description="Canonical physical path that identifies this workspace.", number=3
     )
-    session: Field[SessionId | None] = proto_field(
+    session: Field[core.SessionId | None] = proto_field(
         default=None,
         description="Created or reconnected session for an MCP role; null for a SCIP role.",
         number=4,
@@ -657,7 +652,7 @@ class Connected(ClosedModel):
 class SessionSummary(ClosedModel):
     """One retained MCP session and its projection."""
 
-    session: Field[SessionId] = proto_field(
+    session: Field[core.SessionId] = proto_field(
         description="Persistent session identity.",
         number=1,
     )
@@ -668,6 +663,10 @@ class SessionSummary(ClosedModel):
     active: Field[bool] = proto_field(
         description="Whether one live MCP connection currently owns this session.",
         number=4,
+    )
+    current: Field[bool] = proto_field(
+        description="Whether this is the calling connection's own session.",
+        number=6,
     )
 
 
@@ -685,8 +684,9 @@ class SessionListParams(ClosedModel):
     cursor: Field[Cursor | None] = proto_field(
         default=None,
         description=(
-            "Continues a captured session list with the same page size. The cursor expires when "
-            "the server can no longer retain that list."
+            "Continues a captured session list with the same page size. A mismatched cursor "
+            "returns `cursor_invalid`; one whose captured list the server dropped returns "
+            "`cursor_expired`."
         ),
         number=2,
     )
@@ -707,12 +707,13 @@ class SessionListResult(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SessionContinueParams(ClosedModel):
-    """Selects a retained session for the current MCP connection to continue. The current initial
-    session must have its original clean projection and no retained debugging session. The
-    retained session must have no live connection. A changed initial session returns
-    `invalid_request`; an active session or retained debugger returns `temporarily_unavailable`."""
+    """Selects a retained session for the current MCP connection to continue. The current
+    session must be clean and hold no retained debugging session; the server removes the
+    vacated session with its projection directory. The retained session must have no live
+    connection. A changed current session returns `invalid_request`; a live target or
+    retained debugger returns `temporarily_unavailable`."""
 
-    session: Field[SessionId] = proto_field(
+    session: Field[core.SessionId] = proto_field(
         description="Retained session to continue.", number=1
     )
 
@@ -720,7 +721,7 @@ class SessionContinueParams(ClosedModel):
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SessionContinueResult(ClosedModel):
     """The active retained session now bound to the current MCP connection. The MCP process
-    replaces its in-memory session ID with this identity before it sends another call."""
+    replaces its in-memory session ID with this identity before it issues another call."""
 
     session: Field[SessionSummary] = proto_field(
         description="Session state after the connection attached.", number=1
@@ -729,9 +730,10 @@ class SessionContinueResult(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SessionRemoveParams(ClosedModel):
-    """Removes one inactive session and the projection it retains."""
+    """Removes one inactive session and the projection it retains. A session with a live
+    connection — the caller's own included — returns `temporarily_unavailable`."""
 
-    session: Field[SessionId] = proto_field(
+    session: Field[core.SessionId] = proto_field(
         description="Retained session to remove.", number=1
     )
 
@@ -740,7 +742,7 @@ class SessionRemoveParams(ClosedModel):
 class SessionRemoveResult(ClosedModel):
     """The removed session and the projection state it held."""
 
-    session: Field[SessionId] = proto_field(
+    session: Field[core.SessionId] = proto_field(
         description="Session the result describes.", number=1
     )
     state: Field[core.ProjectionState] = proto_field(
@@ -755,7 +757,11 @@ class DebugLimits(ClosedModel):
     `ExecutionLimits.debug` means `rift.toml` disables debugging."""
 
     max_sessions: Field[int] = proto_field(
-        description="Debugging sessions retained across all connections in this workspace.",
+        description=(
+            "Debugging sessions retained across all connections in this workspace. `debug_start` "
+            "past this ceiling returns `temporarily_unavailable` until `debug_stop` or the idle "
+            "timeout frees one."
+        ),
         ge=1,
         le=16,
         number=1,
@@ -769,23 +775,12 @@ class DebugLimits(ClosedModel):
         le=86400000,
         number=2,
     )
-    max_frames: Field[int] = proto_field(
-        description="Stack frames one failed debugging evaluation may retain.",
-        ge=1,
-        le=256,
+    budget: Field[core.DebugBudget] = proto_field(
+        description=(
+            "The exact budget every `debug_start` receives — evaluation bounds, retained "
+            "frames, bindings per frame, and rendered value bytes."
+        ),
         number=3,
-    )
-    max_bindings_per_frame: Field[int] = proto_field(
-        description="Arguments plus locals one debug frame may return.",
-        ge=1,
-        le=128,
-        number=4,
-    )
-    max_value_bytes: Field[int] = proto_field(
-        description="Captured UTF-8 bytes in each rendered binding value.",
-        ge=0,
-        le=8192,
-        number=5,
     )
 
 
@@ -800,20 +795,18 @@ class ExecutionLimits(ClosedModel):
         le=32768,
         number=1,
     )
-    max_timeout_ms: Field[int] = proto_field(
-        description="Wall-clock milliseconds allowed for one evaluation.",
-        ge=1,
-        le=86400000,
+    budget: Field[core.ExecutionBudget] = proto_field(
+        description=(
+            "The exact evaluation budget every `execute` call receives — the advertised "
+            "ceiling and the applied bound are one value."
+        ),
         number=2,
     )
-    max_output_bytes: Field[int] = proto_field(
-        description="Captured prefix bytes allowed separately for stdout and stderr.",
-        ge=0,
-        le=16384,
-        number=3,
-    )
     max_concurrent: Field[int] = proto_field(
-        description="Evaluations running concurrently across all connections in the workspace.",
+        description=(
+            "Evaluations running concurrently across all connections in the workspace. A call "
+            "arriving with every concurrent evaluation in use returns `temporarily_unavailable`."
+        ),
         ge=1,
         le=64,
         number=4,
@@ -895,7 +888,7 @@ class Limits(ClosedModel):
     )
     max_validators: Field[int] = proto_field(
         description=(
-            "How many workspace command checks may run before publication. "
+            "How many workspace command checks run when a change applies. "
             "Zero when `rift.toml` declares none."
         ),
         ge=0,
@@ -914,6 +907,36 @@ class Limits(ClosedModel):
             "debug tools; adapter capability alone never enables them."
         ),
         number=11,
+    )
+    max_filter_depth: Field[int] = proto_field(
+        description=(
+            "Nesting levels accepted in one caller-supplied predicate or argument object, so "
+            "a schema-valid request cannot be a stack overflow. Exceeded fails with "
+            "`limit_exceeded` naming this limit."
+        ),
+        ge=1,
+        le=64,
+        number=12,
+    )
+    max_request_ms: Field[int] = proto_field(
+        description=(
+            "Wall-clock the server allows one call, evaluation excluded — `execute` adds its "
+            "own `max_timeout`. A call that runs past it fails with `deadline_exceeded`."
+        ),
+        ge=1000,
+        le=3600000,
+        number=13,
+        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
+    )
+    max_active_cursors: Field[int] = proto_field(
+        description=(
+            "Captured result sets the server retains per connection, evicting the least "
+            "recently read. A page requested after eviction fails with `cursor_expired`."
+        ),
+        ge=1,
+        le=1024,
+        number=14,
+        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
     )
 
 
@@ -943,9 +966,7 @@ class WorkspaceResourceUri(ProtocolRoot):
     pattern=r"^rift://projection$",
 )
 class ProjectionResourceUri(ProtocolRoot):
-    """The session's projection directory on this host. The name is deliberate: MCP's own
-    `roots` capability runs the other way, a client granting a server directories, so this
-    resource does not call itself a root."""
+    """The session's projection directory on this host."""
 
 
 @scalar(
@@ -1001,7 +1022,8 @@ class SymbolResourceUri(ProtocolRoot):
 )
 class FsResourceUri(ProtocolRoot):
     """URI for one filesystem entry. File ranges use `start` and `length`; directory pages use
-    `cursor`."""
+    `cursor`. A `start` equal to the file size returns an empty final page; a `start` past it
+    is `invalid_request` with `retry: never`."""
 
     @model_validator(mode="after")
     def address_is_canonical(self) -> FsResourceUri:
@@ -1076,7 +1098,7 @@ class ResourceFamily(str, Enum):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class WorkspaceResourcePayload(ClosedModel):
-    """Current workspace state and request limits. Each configured language reports its
+    """Current workspace state and request limits. Each configured language advertises its
     adapter support and effective caller-code availability."""
 
     uri: Field[WorkspaceResourceUri] = proto_field(
@@ -1087,10 +1109,8 @@ class WorkspaceResourcePayload(ClosedModel):
         description="Current session projection state.",
         number=2,
     )
-    contract: Field[Contract] = proto_field(
-        description=(
-            "Protocol version and schema identifier for every other field in this payload."
-        ),
+    protocol_version: Field[core.ProtocolVersion] = proto_field(
+        description="The version every other field in this payload is stated under.",
         number=3,
     )
     limits: Field[Limits] = proto_field(
@@ -1137,12 +1157,9 @@ class ProjectionResourcePayload(ClosedModel):
     )
     path: Field[WorkspacePath] = proto_field(
         description=(
-            "Absolute path of the projection directory. Rift places it at "
-            "`.rift/projections/<session>` below the workspace and keeps it there for the "
-            "session's life. Reading this resource materializes a projection that has not "
-            "diverged yet, because a tool pointed here may write and those writes belong to "
-            "the changeset. Session removal deletes the directory without waiting for a "
-            "process that is still working inside it."
+            "Absolute path of the projection directory, at `.rift/projections/<session>` "
+            "for the session's life. Reading this resource materializes the projection, "
+            "because a tool pointed here may write and those writes belong to the changeset."
         ),
         number=2,
     )
@@ -1168,7 +1185,7 @@ class SearchResult(ClosedModel):
         number=3,
     )
     next_cursor: Field[Cursor | None] = proto_field(
-        description="Pass this back to get the next page. Null on the last one.",
+        description="Cursor for the next page, or null after the final result.",
         number=4,
     )
 
@@ -1232,24 +1249,6 @@ class ActionsResourceUri(ProtocolRoot):
         return self
 
 
-@scalar(
-    owner=MCP,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern="^rift://action/[A-Za-z0-9_-]{16,8192}$",
-    min_length=31,
-    max_length=8207,
-    examples=["rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ"],
-)
-class ActionResourceUri(ProtocolRoot):
-    """URI for one discovered action. It is the `ActionOfferId` a listing returned, and reading it returns the same offer with the JSON Schema of the arguments the action takes."""
-
-    @model_validator(mode="after")
-    def identity_is_canonical(self) -> ActionResourceUri:
-        core.ActionOfferId.model_validate(self.root)
-        return self
-
-
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ActionsResourcePayload(ClosedModel):
     "One page of actions available at one address in the session projection."
@@ -1259,7 +1258,10 @@ class ActionsResourcePayload(ClosedModel):
         number=1,
     )
     offers: Field[list[ActionOffer]] = proto_field(
-        description="The actions on this page, each without its argument schema.",
+        description=(
+            "The actions on this page, each without its argument schema, sorted by "
+            "`ActionOfferId`."
+        ),
         number=3,
     )
     coverage: Field[core.Coverage] = proto_field(
@@ -1279,7 +1281,7 @@ class ActionsResourcePayload(ClosedModel):
 class ActionResourcePayload(ClosedModel):
     "One discovered action and the arguments it accepts. This is the read that supplies `arguments_schema`, so a caller fetches one schema for the action it chose rather than a schema per offer on a page."
 
-    uri: Field[ActionResourceUri] = proto_field(
+    uri: Field[core.ActionOfferId] = proto_field(
         description="The offer this payload answers for, echoed back as it resolved.",
         number=1,
     )
@@ -1293,7 +1295,8 @@ class ActionResourcePayload(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ExecuteParams(ClosedModel):
-    """Evaluate code with one configured language adapter in the session projection."""
+    """Evaluate code with one configured language adapter in a disposable copy of the
+    session projection."""
 
     language: Field[core.Language] = proto_field(
         description="Exact language and optional dialect selecting the adapter.",
@@ -1521,7 +1524,7 @@ class MatchResult(ClosedModel):
         number=3,
     )
     next_cursor: Field[Cursor | None] = proto_field(
-        description="Pass this back to get the next page. Null on the last one.",
+        description="Cursor for the next page, or null after the final result.",
         number=4,
     )
 
@@ -1542,7 +1545,7 @@ class MatchResult(ClosedModel):
         "rift:enumDescriptions": {
             "adapter": "The language's own analysis.",
             "validator": "A check Rift ran over a proposed change.",
-            "apply": "Reported while applying edits to the workspace.",
+            "apply": "Output from applying edits to the workspace.",
         }
     },
 )
@@ -1641,11 +1644,13 @@ class DiagnosticContext(ClosedModel):
                 "same bytes fail identically."
             ),
             "unsupported_protocol": (
-                "The client and server use different protocol versions. Compare `Contract` with "
-                "the client's supported contract."
+                "No version the caller offered is one the server implements. `protocol` "
+                "lists the versions the server supports; the caller selects one it "
+                "implements and reconnects, or surfaces the mismatch."
             ),
             "permission_denied": (
-                "The connection cannot perform this operation: a path leaves the workspace, or a "
+                "The connection cannot perform this operation: a path addresses through a "
+                "symlink component, which following could take outside the workspace, or a "
                 "debugging session belongs to another connection. The same request fails the "
                 "same way."
             ),
@@ -1666,7 +1671,7 @@ class DiagnosticContext(ClosedModel):
                 "Sending it again is fine."
             ),
             "deadline_exceeded": (
-                "The request ran past its time budget. A smaller one may succeed — a lower "
+                "The request ran past `max_request_ms`. A smaller one may succeed — a lower "
                 "`limit`, a narrower path selector — and so may the same one once a cold adapter "
                 "has warmed up."
             ),
@@ -1680,7 +1685,9 @@ class DiagnosticContext(ClosedModel):
             ),
             "adapter_unavailable": (
                 "A configured adapter could serve this request, but its process failed to start or "
-                "died. Retrying can succeed after the process restarts."
+                "died. The server restarts it on demand, doubling a one-second delay after each "
+                "failed start; `retry` says `same_request` until three consecutive starts fail, "
+                "then `operator_action` until the configuration changes."
             ),
             "adapter_protocol_error": (
                 "An adapter contract is unusable. Causes include a malformed message, a field "
@@ -1689,8 +1696,9 @@ class DiagnosticContext(ClosedModel):
                 "adapter configuration before retrying."
             ),
             "adapter_timeout": (
-                "The adapter took the call and did not answer inside its budget. Retrying can "
-                "work: a cold adapter on a large workspace is slow once and fast afterwards."
+                "The adapter took the call and did not answer inside the server's per-call "
+                "budget, which is at most `max_request_ms`. Retrying can work: a cold adapter "
+                "on a large workspace is slow once and fast afterwards."
             ),
             "storage_failure": (
                 "Rift could not read or write workspace or projection files. Worth retrying only "
@@ -1713,8 +1721,9 @@ class DiagnosticContext(ClosedModel):
             ),
             "temporarily_unavailable": (
                 "The resource exists but is in use. Another connection owns the session, a "
-                "retained debugger blocks continuation, or a disposable workspace is still "
-                "releasing. Retry after that owner or operation finishes."
+                "retained debugger blocks continuation, a disposable workspace is still "
+                "releasing, or another publication holds the workspace. Retry after that "
+                "owner or operation finishes."
             ),
             "configuration_invalid": (
                 "The workspace-root `rift.toml` does not satisfy its schema. New requests remain "
@@ -1768,14 +1777,14 @@ class ErrorCode(str, Enum):
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "never": "The request fails the same way every time. Change it or give up.",
+            "never": "The request fails the same way every time. Change it before sending it again.",
             "same_request": (
                 "Send the same bytes again. The cause was transient — a busy projection, an "
                 "adapter still starting."
             ),
             "operator_action": (
-                "A local state command or configuration change must resolve the condition before another "
-                "request can succeed."
+                "Resolve the condition with a local state command or configuration change, "
+                "then send the request again."
             ),
         }
     },
@@ -1853,6 +1862,22 @@ class ErrorDataPhase(str, Enum):
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ProtocolEvidence(ClosedModel):
+    "The versions the server implements, carried when it rejects the caller's. Without it the caller cannot pick a version to reconnect with."
+
+    supported: Field[list[core.ProtocolVersion]] = proto_field(
+        description="Versions the server implements, newest first.",
+        min_length=1,
+        number=1,
+        json_schema_extra={"uniqueItems": True},
+    )
+    requested: Field[core.ProtocolVersion] = proto_field(
+        description="The version the caller declared, echoed back.",
+        number=2,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ErrorData(ClosedModel):
     "The `data` object on every Rift MCP failure. `code` and `retry` are what a caller branches on, `message` is for a human, and the remaining fields carry the evidence available for that failure."
 
@@ -1866,6 +1891,14 @@ class ErrorData(ClosedModel):
                     },
                     "then": {"required": ["limit"]},
                     "else": {"not": {"required": ["limit"]}},
+                },
+                {
+                    "if": {
+                        "required": ["code"],
+                        "properties": {"code": {"const": "unsupported_protocol"}},
+                    },
+                    "then": {"required": ["protocol"]},
+                    "else": {"not": {"required": ["protocol"]}},
                 },
             ]
         }
@@ -1913,6 +1946,14 @@ class ErrorData(ClosedModel):
             "cause is worth waiting out."
         ),
         number=9,
+    )
+    protocol: Field[ProtocolEvidence | None] = proto_field(
+        default=None,
+        description=(
+            "The server's supported versions. Present exactly when `code` is "
+            "`unsupported_protocol`, and forbidden otherwise."
+        ),
+        number=10,
     )
 
 
@@ -2039,7 +2080,7 @@ RESOURCE_FORMS: dict[ResourceFamily, tuple[str, str, type[Any]]] = {
     ResourceFamily.ACTION: (
         "rift://action/{token}",
         "application/vnd.rift.action+json",
-        ActionResourceUri,
+        core.ActionOfferId,
     ),
     ResourceFamily.PROJECTION: (
         "rift://projection",
@@ -2127,7 +2168,7 @@ class ResourceReadParams(ClosedModel):
         | SymbolResourceUri
         | FsResourceUri
         | ActionsResourceUri
-        | ActionResourceUri
+        | core.ActionOfferId
         | ProjectionResourceUri
         | ChangesResourceUri
     ] = proto_field(
@@ -2276,7 +2317,7 @@ class EditParams(ClosedModel):
     schema_extra={},
 )
 class PatchParams(ClosedModel):
-    "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the state it resolves against."
+    "A UTF-8 unified diff guarded by its context lines. A malformed patch — an absolute path, path traversal, a binary patch, a broken header — is `invalid_request`; a hunk whose context differs from the state it resolves against is a refusal carrying a failed `source_unchanged` precondition."
 
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
@@ -2361,7 +2402,7 @@ class RenameParams(ClosedModel):
         description="Formatting applied after this operation's edits resolve.", number=3
     )
     target: Field[core.Address] = proto_field(
-        description="The declaration to rename: a symbol, a node, a byte range, or a match.",
+        description="The declaration to rename.",
         number=4,
     )
     arguments: Field[core.RenameArguments] = proto_field(
@@ -2382,7 +2423,7 @@ class MoveParams(ClosedModel):
         description="Formatting applied after this operation's edits resolve.", number=3
     )
     target: Field[core.Address] = proto_field(
-        description="The declaration or file to move.", number=4
+        description="The declaration, file, or directory to move.", number=4
     )
     arguments: Field[core.MoveArguments] = proto_field(
         description="The destination, and the source eligible for import and reference updates.",
@@ -2403,7 +2444,7 @@ class DeleteParams(ClosedModel):
         description="Formatting applied after this operation's edits resolve.", number=3
     )
     target: Field[core.Address] = proto_field(
-        description="The declaration or file to remove.", number=4
+        description="The declaration, file, or directory to remove.", number=4
     )
     arguments: Field[core.SafeDeleteArguments] = proto_field(
         description="The disposition for each classified use, and the source it may be applied in.",
@@ -2463,7 +2504,11 @@ class ProjectionRestoreParams(ClosedModel):
 
     paths: Field[list[core.ProjectPath] | None] = proto_field(
         default=None,
-        description="Changed paths to restore. Null restores every changed path.",
+        description=(
+            "Changed paths to restore. Null restores every changed path. Naming any path of "
+            "a change restores every path that change touched — a change leaves the changeset "
+            "whole."
+        ),
         min_length=1,
         number=2,
         json_schema_extra={"uniqueItems": True},
@@ -2554,7 +2599,7 @@ class CommandValidatorDeterminism(str, Enum):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class CommandValidator(ClosedModel):
-    "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there joins the changeset."
+    "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes."
 
     id: Field[str] = proto_field(
         description=(
@@ -2569,8 +2614,9 @@ class CommandValidator(ClosedModel):
     argv: Field[list[str]] = proto_field(
         description=(
             "Executable followed by literal arguments. An absolute executable path is "
-            "refused; a bare name resolves through the validator PATH and a relative path "
-            "resolves below `working_directory`. Rift performs no shell expansion."
+            "refused; a bare name resolves through the `PATH` of the merged environment the "
+            "command runs with, and a relative path resolves below `working_directory` in "
+            "the session projection. Rift performs no shell expansion."
         ),
         min_length=1,
         number=3,
@@ -2580,13 +2626,14 @@ class CommandValidator(ClosedModel):
         number=4,
     )
     working_directory: Field[core.ProjectPath] = proto_field(
-        description="Directory below the project root in which the process starts. The empty path selects the root.",
+        description="Directory below the projection root in which the process starts. The empty path selects the root.",
         number=5,
     )
     environment: Field[dict[str, str]] = proto_field(
         description=(
-            "Environment additions declared for the command. Rift starts it directly without a "
-            "shell and supplies its working directory separately."
+            "Environment values added on top of the environment the server inherited. Rift "
+            "starts the command directly, without a shell, and supplies its working directory "
+            "separately."
         ),
         number=6,
         json_schema_extra={"propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
@@ -2610,7 +2657,8 @@ class CommandValidator(ClosedModel):
     guarantees: Field[list[CommandValidatorGuarantees]] = proto_field(
         description=(
             "Behavior or other properties this command is intended to check. A passing result "
-            "turns each declaration into `GuaranteeEvidence`; a failed result rejects publication."
+            "turns each declaration into `GuaranteeEvidence`; a failed result attaches a "
+            "`ConfirmationRequirement` to the change."
         ),
         number=9,
     )
@@ -2701,7 +2749,7 @@ class ChangeSummary(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ChangesResourcePayload(ClosedModel):
-    """One page of the session's changeset, oldest change first. This is the read an agent makes
+    """One page of the session's changeset, oldest change first. This is the read the caller makes
     before publishing: every change it applied, what each one did, and which of them nobody
     vouched for."""
 
@@ -2733,57 +2781,6 @@ class ChangeApplied(ClosedModel):
     )
 
 
-@definition(
-    owner=MCP,
-    public=True,
-    proto=Proto.enum(
-        "RefusalReason",
-        (
-            EnumValue("unsupported", "REFUSAL_REASON_UNSUPPORTED", 1),
-            EnumValue("unmet_precondition", "REFUSAL_REASON_UNMET_PRECONDITION", 2),
-            EnumValue("ambiguous_target", "REFUSAL_REASON_AMBIGUOUS_TARGET", 3),
-            EnumValue("stale_action", "REFUSAL_REASON_STALE_ACTION", 4),
-            EnumValue("stale_match", "REFUSAL_REASON_STALE_MATCH", 5),
-            EnumValue("cardinality_mismatch", "REFUSAL_REASON_CARDINALITY_MISMATCH", 6),
-            EnumValue("unsafe_effect", "REFUSAL_REASON_UNSAFE_EFFECT", 8),
-            EnumValue(
-                "formatter_unsupported", "REFUSAL_REASON_FORMATTER_UNSUPPORTED", 9
-            ),
-            EnumValue("portable_family", "REFUSAL_REASON_PORTABLE_FAMILY", 11),
-            EnumValue("language_refusal", "REFUSAL_REASON_LANGUAGE_REFUSAL", 12),
-        ),
-        named=True,
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "unsupported": "No adapter implements this operation for the language it reaches.",
-            "unmet_precondition": "A condition checked before resolution failed. The failed entry is in `preconditions`.",
-            "ambiguous_target": "The address resolves to several targets. Narrow it and ask again.",
-            "stale_action": "The file the offer was discovered in has been rewritten since. Read the actions resource again.",
-            "stale_match": "The file the match was found in has been rewritten since. Search again.",
-            "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
-            "unsafe_effect": "The complete effect reaches outside what the caller can have meant — outside the project, or into generated source.",
-            "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
-            "portable_family": "The offer carries a portable argument contract, so it resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
-            "language_refusal": "The language itself forbids it — a rename to a reserved word, a visibility change its rules do not allow.",
-        }
-    },
-)
-class RefusalReason(str, Enum):
-    "Why Rift produced no edits at all. Every reason here means resolution had nothing to write: a change Rift can express but nobody will vouch for still lands, carrying its confirmations. `ErrorData` carries transport and infrastructure failures."
-
-    UNSUPPORTED = "unsupported"
-    UNMET_PRECONDITION = "unmet_precondition"
-    AMBIGUOUS_TARGET = "ambiguous_target"
-    STALE_ACTION = "stale_action"
-    STALE_MATCH = "stale_match"
-    CARDINALITY_MISMATCH = "cardinality_mismatch"
-    UNSAFE_EFFECT = "unsafe_effect"
-    FORMATTER_UNSUPPORTED = "formatter_unsupported"
-    PORTABLE_FAMILY = "portable_family"
-    LANGUAGE_REFUSAL = "language_refusal"
-
-
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class RefusedResult(ClosedModel):
     "Resolution produced no edits, so the projection is untouched."
@@ -2791,7 +2788,7 @@ class RefusedResult(ClosedModel):
     status: Field[Literal["refused"]] = proto_field(
         description="Identifies a domain refusal.", default="refused"
     )
-    reason: Field[RefusalReason] = proto_field(
+    reason: Field[core.RefusalReason] = proto_field(
         description="The condition the caller can act on.", number=2
     )
     preconditions: Field[list[core.OperationPrecondition]] = proto_field(
@@ -2826,7 +2823,7 @@ class ChangeResult(ProtocolRoot):
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class PublishParams(ClosedModel):
     """Publishes the session projection into the workspace. Publication is the one step that
-    touches the user's own files, so it is where confirmations are settled: a change carrying
+    writes into the workspace, so it is where confirmations are settled: a change carrying
     one is published only when this call names it."""
 
     accept: Field[list[ChangeId]] = proto_field(
@@ -2848,7 +2845,11 @@ class PublishResult(ClosedModel):
         description="Current projection state after the attempt.", number=2
     )
     conflicts: Field[list[core.ProjectPath]] = proto_field(
-        description="Workspace paths changed outside this projection.", number=3
+        description=(
+            "Paths changed in both this projection and the workspace. Non-empty means "
+            "nothing was written."
+        ),
+        number=3,
     )
     unaccepted: Field[list[ChangeId]] = proto_field(
         description=(
@@ -2966,7 +2967,7 @@ class FsResourcePayload(ClosedModel):
         default=None,
         description=(
             "Directory children on this page — subdirectories and files alike, each one a "
-            "complete `ProjectEntry`."
+            "complete `ProjectEntry`, sorted bytewise by path."
         ),
         number=5,
     )
@@ -2980,6 +2981,15 @@ class FsResourcePayload(ClosedModel):
         default=None, ge=0, le=9007199254740991, number=8
     )
     content: Field[str | None] = proto_field(default=None, number=9)
+    digest: Field[core.Digest | None] = proto_field(
+        default=None,
+        description=(
+            "SHA-256 of the complete file for a regular-file read, null for directories and "
+            "symlinks. Compare it across pages of one range read: a changed digest means the "
+            "file moved underneath the read, and the range starts over at zero."
+        ),
+        number=11,
+    )
     next: Field[FsResourceUri | None] = proto_field(
         default=None, description="Continuation for the same entry.", number=10
     )
@@ -3100,7 +3110,7 @@ class ExecutionAvailability(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class LanguageSupport(ClosedModel):
-    """Capabilities reported by one configured language adapter. `execution` applies the
+    """Capabilities advertised by one configured language adapter. `execution` applies the
     workspace configuration to its caller-code operations."""
 
     language: Field[core.Language] = proto_field(
@@ -3108,7 +3118,7 @@ class LanguageSupport(ClosedModel):
         number=1,
     )
     adapter: Field[str] = proto_field(
-        description="Implementation name and version reported by the adapter.",
+        description="Implementation name and version the adapter advertises.",
         max_length=4096,
         examples=["rift-adapter-typescript 0.4.1"],
         number=2,
@@ -3147,10 +3157,8 @@ MODELS = (
     ResourceFamily,
     ResourceLink,
     SymbolResourcePayload,
-    Contract,
     WorkspacePath,
     ChangeId,
-    SessionId,
     ConnectionId,
     FeatureId,
     ConnectRole,
@@ -3176,7 +3184,6 @@ MODELS = (
     SearchResult,
     ActionOffer,
     ActionsResourceUri,
-    ActionResourceUri,
     ActionsResourcePayload,
     ActionResourcePayload,
     ExecuteParams,
@@ -3195,6 +3202,7 @@ MODELS = (
     ErrorCode,
     RetryDirective,
     ErrorCause,
+    ProtocolEvidence,
     ErrorData,
     LimitEvidence,
     MatchSyntax,
@@ -3216,7 +3224,6 @@ MODELS = (
     ChangeValidation,
     ChangeSummary,
     ChangesResourcePayload,
-    RefusalReason,
     ChangeResult,
     PublishParams,
     PublishResult,

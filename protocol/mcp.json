@@ -4,10 +4,10 @@
   "title": "Rift MCP surface",
   "description": "JSON values accepted and returned by the Rift MCP server. Each definition carries the Protobuf identity used after `rift mcp` decodes the request.",
   "rift:entryPoints": {
-    "description": "The internal connection stream establishes the gRPC context used by later calls. Tools map MCP request and result JSON to Rift service methods. The MCP process queues those calls and sends one application RPC at a time. Each resource entry maps one URI family to the types that carry it.",
+    "description": "The internal connection stream establishes the gRPC context used by later calls. Tools map MCP request and result JSON to Rift service methods: the typed result rides `structuredContent` against the tool's declared output schema, mirrored as one canonical-JSON `text` block, and a refusal is such a result \u2014 never `isError`. `ErrorData` travels as the JSON-RPC error object's `data` with code -32000. The MCP process queues those calls and issues one application RPC at a time; a cancelled queued call is dropped, and a cancelled running change completes or rolls back whole. Each resource entry maps one URI family to the types that carry it.",
     "grpc.connection": {
       "rpc": "rift.mcp.Rift/Connect",
-      "description": "Opens one client session and returns its writable projection. A session ID admits one live connection.",
+      "description": "Opens one caller session and returns its writable projection. A session ID admits one live connection.",
       "params": {
         "$ref": "#/$defs/ConnectRequest"
       },
@@ -59,7 +59,7 @@
       "session_remove": {
         "rpc": "rift.mcp.Rift/SessionRemove",
         "group": "sessions",
-        "description": "Removes one inactive session and deletes its projection.",
+        "description": "Removes one inactive session and deletes its projection. A live one, the caller's own included, returns `temporarily_unavailable`.",
         "params": {
           "$ref": "#/$defs/SessionRemoveParams"
         },
@@ -334,7 +334,7 @@
           "$ref": "#/$defs/ResourceTemplate"
         },
         "uri": {
-          "$ref": "#/$defs/ActionResourceUri"
+          "$ref": "#/$defs/ActionOfferId"
         },
         "link": {
           "$ref": "#/$defs/ResourceLink"
@@ -526,7 +526,7 @@
       },
       {
         "name": "MCP",
-        "summary": "Tool parameters, results, resource links, and payloads on the agent-facing surface.",
+        "summary": "Tool parameters, results, resource links, and payloads on the caller-facing surface.",
         "residualOf": "mcp"
       }
     ]
@@ -586,7 +586,7 @@
         },
         "kind": {
           "$ref": "#/$defs/ActionKind",
-          "description": "What this action does. Filtering by prefix is what makes it useful: an agent that wants a fix asks for `quickfix` and never sees a refactor.",
+          "description": "What this action does. Filtering by prefix is what makes it useful: a caller that wants a fix asks for `quickfix` and never sees a refactor.",
           "rift:proto": {
             "number": 2
           }
@@ -645,7 +645,7 @@
             }
           ],
           "default": null,
-          "description": "JSON Schema draft 2020-12 for the arguments this action takes. Remote references are forbidden. When `argument_contract` is set, this schema may add language constraints while preserving the portable fields and meanings. An adapter always supplies it; Rift leaves it null in a listing page and carries it in the read of one offer, so a caller fetches one schema rather than a schema per offer.",
+          "description": "JSON Schema draft 2020-12 for the arguments this action takes. Remote references are forbidden. When `argument_contract` is set, this schema may add language constraints while preserving the portable fields and meanings. An adapter always supplies it; Rift leaves it null in a listing page and carries it in the read of one offer.",
           "rift:proto": {
             "number": 8
           },
@@ -815,7 +815,7 @@
       "description": "One discovered action and the arguments it accepts. This is the read that supplies `arguments_schema`, so a caller fetches one schema for the action it chose rather than a schema per offer on a page.",
       "properties": {
         "uri": {
-          "$ref": "#/$defs/ActionResourceUri",
+          "$ref": "#/$defs/ActionOfferId",
           "description": "The offer this payload answers for, echoed back as it resolved.",
           "rift:proto": {
             "number": 1
@@ -847,22 +847,6 @@
       },
       "title": "ActionResourcePayload",
       "type": "object"
-    },
-    "ActionResourceUri": {
-      "description": "URI for one discovered action. It is the `ActionOfferId` a listing returned, and reading it returns the same offer with the JSON Schema of the arguments the action takes.",
-      "examples": [
-        "rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ"
-      ],
-      "maxLength": 8207,
-      "minLength": 31,
-      "pattern": "^rift://action/[A-Za-z0-9_-]{16,8192}$",
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "package": "rift.mcp",
-        "scalar": "string"
-      },
-      "title": "ActionResourceUri",
-      "type": "string"
     },
     "ActionSupport": {
       "additionalProperties": false,
@@ -919,7 +903,7 @@
           }
         },
         "offers": {
-          "description": "The actions on this page, each without its argument schema.",
+          "description": "The actions on this page, each without its argument schema, sorted by `ActionOfferId`.",
           "items": {
             "$ref": "#/$defs/ActionOffer"
           },
@@ -1064,7 +1048,7 @@
       "type": "string"
     },
     "Address": {
-      "description": "Where an operation applies. Separate union branches distinguish a semantic symbol, a syntax node, a source range, and a retained match.",
+      "description": "Where an operation applies. Separate union branches distinguish a semantic symbol, a syntax node, a source range, a retained match, and a whole file or directory.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -1208,6 +1192,34 @@
           },
           "title": "AddressMatch",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A whole file or directory, by project path. This is what `move` and `delete` take for\nfilesystem-level work; a directory covers everything beneath it, and a directory holding\nno files resolves to zero edits, which refuses.",
+          "properties": {
+            "kind": {
+              "const": "path",
+              "title": "Kind",
+              "type": "string"
+            },
+            "path": {
+              "$ref": "#/$defs/ProjectPath",
+              "description": "The file or directory the operation applies to.",
+              "rift:proto": {
+                "number": 1
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "rift:package": "rift.core",
+          "rift:proto": {
+            "type": "rift.core.AddressPath"
+          },
+          "title": "AddressPath",
+          "type": "object"
         }
       ],
       "rift:package": "rift.core",
@@ -1238,167 +1250,96 @@
             "number": 4,
             "tag": "match",
             "type": "AddressMatch"
+          },
+          {
+            "field": "path",
+            "number": 5,
+            "tag": "path",
+            "type": "AddressPath"
           }
         ]
       },
       "title": "Address"
     },
     "ArgumentContract": {
-      "description": "A portable argument contract attached to a discovered adapter action. Its stable name and numeric version are separate fields. The descriptor's self-contained schema may narrow the selected contract for one language without changing its field meanings.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "Arguments conform to RenameArguments at the stated contract version.",
-          "properties": {
-            "name": {
-              "const": "rename",
-              "title": "Name",
-              "type": "string"
-            },
-            "version": {
-              "const": 1,
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Version",
-              "type": "integer"
-            }
-          },
-          "required": [
-            "name",
-            "version"
-          ],
-          "rift:arguments": "RenameArguments",
-          "rift:package": "rift.core",
+      "additionalProperties": false,
+      "description": "A portable argument contract attached to a discovered adapter action. `name` selects\nthe portable argument model and `version` its number \u2014 1 for every current contract.\nThe descriptor's self-contained schema may narrow the selected contract for one language\nwithout changing its field meanings.",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/ArgumentContractName",
+          "description": "Which portable argument model applies.",
           "rift:proto": {
-            "type": "rift.core.ArgumentContractRename"
-          },
-          "title": "ArgumentContractRename",
-          "type": "object"
+            "number": 2
+          }
         },
-        {
-          "additionalProperties": false,
-          "description": "Arguments conform to MoveArguments at the stated contract version.",
-          "properties": {
-            "name": {
-              "const": "move",
-              "title": "Name",
-              "type": "string"
-            },
-            "version": {
-              "const": 1,
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Version",
-              "type": "integer"
-            }
-          },
-          "required": [
-            "name",
-            "version"
-          ],
-          "rift:arguments": "MoveArguments",
-          "rift:package": "rift.core",
+        "version": {
+          "description": "Contract version, 1 for every current contract.",
+          "minimum": 1,
           "rift:proto": {
-            "type": "rift.core.ArgumentContractMove"
+            "number": 1,
+            "scalar": "uint32"
           },
-          "title": "ArgumentContractMove",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Arguments conform to SafeDeleteArguments at the stated contract version.",
-          "properties": {
-            "name": {
-              "const": "safe_delete",
-              "title": "Name",
-              "type": "string"
-            },
-            "version": {
-              "const": 1,
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Version",
-              "type": "integer"
-            }
-          },
-          "required": [
-            "name",
-            "version"
-          ],
-          "rift:arguments": "SafeDeleteArguments",
-          "rift:package": "rift.core",
-          "rift:proto": {
-            "type": "rift.core.ArgumentContractSafeDelete"
-          },
-          "title": "ArgumentContractSafeDelete",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Arguments conform to ChangeSignatureArguments at the stated contract version.",
-          "properties": {
-            "name": {
-              "const": "change_signature",
-              "title": "Name",
-              "type": "string"
-            },
-            "version": {
-              "const": 1,
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Version",
-              "type": "integer"
-            }
-          },
-          "required": [
-            "name",
-            "version"
-          ],
-          "rift:arguments": "ChangeSignatureArguments",
-          "rift:package": "rift.core",
-          "rift:proto": {
-            "type": "rift.core.ArgumentContractChangeSignature"
-          },
-          "title": "ArgumentContractChangeSignature",
-          "type": "object"
+          "title": "Version",
+          "type": "integer"
         }
+      },
+      "required": [
+        "name",
+        "version"
       ],
+      "rift:arguments": {
+        "change_signature": "ChangeSignatureArguments",
+        "move": "MoveArguments",
+        "rename": "RenameArguments",
+        "safe_delete": "SafeDeleteArguments"
+      },
       "rift:package": "rift.core",
       "rift:proto": {
-        "oneof": "variant",
-        "type": "rift.core.ArgumentContract",
-        "variants": [
-          {
-            "field": "rename",
-            "number": 1,
-            "tag": "rename",
-            "type": "ArgumentContractRename"
-          },
-          {
-            "field": "move",
-            "number": 2,
-            "tag": "move",
-            "type": "ArgumentContractMove"
-          },
-          {
-            "field": "safe_delete",
-            "number": 3,
-            "tag": "safe_delete",
-            "type": "ArgumentContractSafeDelete"
-          },
-          {
-            "field": "change_signature",
-            "number": 4,
-            "tag": "change_signature",
-            "type": "ArgumentContractChangeSignature"
-          }
-        ]
+        "type": "rift.core.ArgumentContract"
       },
-      "title": "ArgumentContract"
+      "title": "ArgumentContract",
+      "type": "object"
+    },
+    "ArgumentContractName": {
+      "description": "Which portable argument model the contract selects.",
+      "enum": [
+        "rename",
+        "move",
+        "safe_delete",
+        "change_signature"
+      ],
+      "rift:enumDescriptions": {
+        "change_signature": "Arguments conform to `ChangeSignatureArguments`.",
+        "move": "Arguments conform to `MoveArguments`.",
+        "rename": "Arguments conform to `RenameArguments`.",
+        "safe_delete": "Arguments conform to `SafeDeleteArguments`."
+      },
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "enum": "Name",
+        "field": "name",
+        "number": 2,
+        "values": {
+          "change_signature": {
+            "name": "NAME_CHANGE_SIGNATURE",
+            "number": 4
+          },
+          "move": {
+            "name": "NAME_MOVE",
+            "number": 2
+          },
+          "rename": {
+            "name": "NAME_RENAME",
+            "number": 1
+          },
+          "safe_delete": {
+            "name": "NAME_SAFE_DELETE",
+            "number": 3
+          }
+        }
+      },
+      "title": "ArgumentContractName",
+      "type": "string"
     },
     "Capture": {
       "additionalProperties": false,
@@ -1865,7 +1806,7 @@
     },
     "ChangesResourcePayload": {
       "additionalProperties": false,
-      "description": "One page of the session's changeset, oldest change first. This is the read an agent makes\nbefore publishing: every change it applied, what each one did, and which of them nobody\nvouched for.",
+      "description": "One page of the session's changeset, oldest change first. This is the read the caller makes\nbefore publishing: every change it applied, what each one did, and which of them nobody\nvouched for.",
       "properties": {
         "uri": {
           "$ref": "#/$defs/ChangesResourceUri",
@@ -1967,7 +1908,7 @@
     },
     "CommandValidator": {
       "additionalProperties": false,
-      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there joins the changeset.",
+      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes.",
       "properties": {
         "id": {
           "description": "Label shown with this validator. It is unique within `validators.commands`.",
@@ -1985,7 +1926,7 @@
           }
         },
         "argv": {
-          "description": "Executable followed by literal arguments. An absolute executable path is refused; a bare name resolves through the validator PATH and a relative path resolves below `working_directory`. Rift performs no shell expansion.",
+          "description": "Executable followed by literal arguments. An absolute executable path is refused; a bare name resolves through the `PATH` of the merged environment the command runs with, and a relative path resolves below `working_directory` in the session projection. Rift performs no shell expansion.",
           "items": {
             "type": "string"
           },
@@ -2004,7 +1945,7 @@
         },
         "working_directory": {
           "$ref": "#/$defs/ProjectPath",
-          "description": "Directory below the project root in which the process starts. The empty path selects the root.",
+          "description": "Directory below the projection root in which the process starts. The empty path selects the root.",
           "rift:proto": {
             "number": 5
           }
@@ -2013,7 +1954,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Environment additions declared for the command. Rift starts it directly without a shell and supplies its working directory separately.",
+          "description": "Environment values added on top of the environment the server inherited. Rift starts the command directly, without a shell, and supplies its working directory separately.",
           "propertyNames": {
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
           },
@@ -2044,7 +1985,7 @@
           "type": "integer"
         },
         "guarantees": {
-          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result rejects publication.",
+          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement` to the change.",
           "items": {
             "$ref": "#/$defs/CommandValidatorGuarantees"
           },
@@ -2272,11 +2213,13 @@
         "formatting_scope",
         "command_validator",
         "validation_incomplete",
-        "guarantee_unestablished"
+        "guarantee_unestablished",
+        "configuration"
       ],
       "rift:enumDescriptions": {
         "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
         "command_validator": "A workspace command validator will check the changed tree.",
+        "configuration": "The change touches `rift.toml`. Publishing it changes which commands the server runs.",
         "destructive": "The change deletes source or replaces an existing file.",
         "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
         "generated_code": "The change touches source marked as generated.",
@@ -2298,6 +2241,10 @@
           "command_validator": {
             "name": "COMMAND_VALIDATOR",
             "number": 7
+          },
+          "configuration": {
+            "name": "CONFIGURATION",
+            "number": 10
           },
           "destructive": {
             "name": "DESTRUCTIVE",
@@ -2367,22 +2314,23 @@
           }
         }
       ],
-      "description": "Opens one logical client connection before another server RPC. The control stream\nremains open for the connection lifetime.",
+      "description": "Opens one logical caller connection before another server RPC. The control stream\nremains open for the connection lifetime.",
       "properties": {
-        "contracts": {
-          "description": "Supported contracts in client preference order.",
+        "protocol_versions": {
+          "description": "Versions the caller implements, in preference order.",
           "items": {
-            "$ref": "#/$defs/Contract"
+            "$ref": "#/$defs/ProtocolVersion"
           },
           "minItems": 1,
           "rift:proto": {
             "number": 1
           },
-          "title": "Contracts",
-          "type": "array"
+          "title": "Protocol Versions",
+          "type": "array",
+          "uniqueItems": true
         },
         "features": {
-          "description": "Optional behaviors implemented by the client, sorted by identifier.",
+          "description": "Optional behaviors implemented by the caller, sorted by identifier.",
           "items": {
             "$ref": "#/$defs/FeatureId"
           },
@@ -2423,7 +2371,7 @@
           }
         },
         "client_build": {
-          "description": "Client build as it names itself in diagnostics.",
+          "description": "Caller build as it names itself in diagnostics.",
           "maxLength": 256,
           "minLength": 1,
           "rift:proto": {
@@ -2434,7 +2382,7 @@
         }
       },
       "required": [
-        "contracts",
+        "protocol_versions",
         "features",
         "role",
         "canonical_root",
@@ -2455,7 +2403,7 @@
       ],
       "rift:enumDescriptions": {
         "mcp": "An MCP bridge that creates a session and may reconnect to it while the process lives.",
-        "scip": "A read-only SCIP projection client with no session."
+        "scip": "A read-only SCIP reader that takes no connection slot on the session it exports."
       },
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -2524,9 +2472,9 @@
       ],
       "description": "The first response on an accepted control stream, including persistent projection state\nfor an MCP role.",
       "properties": {
-        "contract": {
-          "$ref": "#/$defs/Contract",
-          "description": "Contract this connection speaks: the shared major, and the lower of the two minors.",
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The version the server accepted from the caller's list.",
           "rift:proto": {
             "number": 1
           }
@@ -2589,7 +2537,7 @@
         }
       },
       "required": [
-        "contract",
+        "protocol_version",
         "features",
         "workspace",
         "connection"
@@ -2611,48 +2559,6 @@
       },
       "title": "ConnectionId",
       "type": "string"
-    },
-    "Contract": {
-      "additionalProperties": false,
-      "description": "One generated wire contract. Majors have to be equal, because a major changes when a peer can no longer decode the next message safely. Within one major, revisions only add, so a peer can speak any minor at or below its own and the connection settles on the lower of the two.",
-      "properties": {
-        "major": {
-          "$ref": "#/$defs/ProtocolVersion",
-          "description": "Breaking protocol generation selected before the socket is opened.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "minor": {
-          "description": "Additive revision within the major. A peer admits any minor at or below its own and emits nothing added after the minor the connection settled on, so the client checks this one number to know it can decode everything it will be sent.",
-          "maximum": 4294967295,
-          "minimum": 0,
-          "rift:proto": {
-            "number": 2,
-            "scalar": "uint32"
-          },
-          "title": "Minor",
-          "type": "integer"
-        },
-        "schema_digest": {
-          "$ref": "#/$defs/Digest",
-          "description": "SHA-256 of the generated descriptor and its MCP conversion metadata. It names the exact generation a peer was built from, which is what makes a bug report reproducible; admission is decided by `major` and `minor`.",
-          "rift:proto": {
-            "number": 3
-          }
-        }
-      },
-      "required": [
-        "major",
-        "minor",
-        "schema_digest"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.Contract"
-      },
-      "title": "Contract",
-      "type": "object"
     },
     "Coverage": {
       "anyOf": [
@@ -2849,12 +2755,18 @@
       "type": "string"
     },
     "CoverageScope": {
-      "anyOf": [
+      "description": "What a completeness statement covers \u2014 everything the request asked for, one file, or a standing scope the answer holds over.",
+      "oneOf": [
         {
           "additionalProperties": false,
           "description": "A standing scope identified by its name.",
           "properties": {
             "kind": {
+              "const": "reach",
+              "title": "Kind",
+              "type": "string"
+            },
+            "reach": {
               "$ref": "#/$defs/CoverageReach",
               "rift:proto": {
                 "number": 1
@@ -2862,7 +2774,8 @@
             }
           },
           "required": [
-            "kind"
+            "kind",
+            "reach"
           ],
           "rift:package": "rift.core",
           "rift:proto": {
@@ -2900,16 +2813,15 @@
           "type": "object"
         }
       ],
-      "description": "What a completeness statement covers \u2014 everything the request asked for, one file, or a standing scope the answer holds over.",
       "rift:package": "rift.core",
       "rift:proto": {
         "oneof": "variant",
         "type": "rift.core.CoverageScope",
         "variants": [
           {
-            "field": "kind",
+            "field": "reach",
             "number": 1,
-            "tag": null,
+            "tag": "reach",
             "type": "CoverageScopeKind"
           },
           {
@@ -2930,7 +2842,7 @@
       ],
       "rift:enumDescriptions": {
         "not_applicable": "The language has no such concept because its adapter consumes only physical source.",
-        "unsupported": "The adapter does not produce this family, though the language has the concept. A later build of it might."
+        "unsupported": "The adapter does not produce this family, though the language has the concept."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -2952,7 +2864,7 @@
       "type": "string"
     },
     "Cursor": {
-      "description": "An opaque base64url string that continues a paginated answer from where the last page\nended. It binds the request, state, order, and page size. Padding is omitted. A mismatch\nreturns `cursor_invalid`.",
+      "description": "An opaque base64url string that continues a paginated answer from where the last page\nended. It binds the request, state, order, and page size. Padding is omitted. A mismatch\nreturns `cursor_invalid`. A cursor pages the result set captured when its first page was\ncomputed, so a change landing mid-pagination does not rewrite later pages.",
       "maxLength": 4096,
       "minLength": 1,
       "pattern": "^[A-Za-z0-9_-]+$",
@@ -3209,7 +3121,7 @@
       "description": "Workspace ceilings for retained debugging sessions. Null at\n`ExecutionLimits.debug` means `rift.toml` disables debugging.",
       "properties": {
         "max_sessions": {
-          "description": "Debugging sessions retained across all connections in this workspace.",
+          "description": "Debugging sessions retained across all connections in this workspace. `debug_start` past this ceiling returns `temporarily_unavailable` until `debug_stop` or the idle timeout frees one.",
           "maximum": 16,
           "minimum": 1,
           "rift:proto": {
@@ -3228,43 +3140,18 @@
           "title": "Idle Timeout Ms",
           "type": "integer"
         },
-        "max_frames": {
-          "description": "Stack frames one failed debugging evaluation may retain.",
-          "maximum": 256,
-          "minimum": 1,
+        "budget": {
+          "$ref": "#/$defs/DebugBudget",
+          "description": "The exact budget every `debug_start` receives \u2014 evaluation bounds, retained frames, bindings per frame, and rendered value bytes.",
           "rift:proto": {
             "number": 3
-          },
-          "title": "Max Frames",
-          "type": "integer"
-        },
-        "max_bindings_per_frame": {
-          "description": "Arguments plus locals one debug frame may return.",
-          "maximum": 128,
-          "minimum": 1,
-          "rift:proto": {
-            "number": 4
-          },
-          "title": "Max Bindings Per Frame",
-          "type": "integer"
-        },
-        "max_value_bytes": {
-          "description": "Captured UTF-8 bytes in each rendered binding value.",
-          "maximum": 8192,
-          "minimum": 0,
-          "rift:proto": {
-            "number": 5
-          },
-          "title": "Max Value Bytes",
-          "type": "integer"
+          }
         }
       },
       "required": [
         "max_sessions",
         "idle_timeout_ms",
-        "max_frames",
-        "max_bindings_per_frame",
-        "max_value_bytes"
+        "budget"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -3434,7 +3321,7 @@
         },
         "target": {
           "$ref": "#/$defs/Address",
-          "description": "The declaration or file to remove.",
+          "description": "The declaration, file, or directory to remove.",
           "rift:proto": {
             "number": 4
           }
@@ -3669,7 +3556,7 @@
       ],
       "rift:enumDescriptions": {
         "adapter": "The language's own analysis.",
-        "apply": "Reported while applying edits to the workspace.",
+        "apply": "Output from applying edits to the workspace.",
         "validator": "A check Rift ran over a proposed change."
       },
       "rift:package": "rift.mcp",
@@ -3696,7 +3583,7 @@
       "type": "string"
     },
     "DiagnosticContinuation": {
-      "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal state of a file an agent is halfway through writing.",
+      "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal state of a file the caller is halfway through writing.",
       "enum": [
         "repairable",
         "unrepairable",
@@ -3732,7 +3619,7 @@
     },
     "DiagnosticRelated": {
       "additionalProperties": false,
-      "description": "A second place the adapter wants you to look \u2014 the earlier declaration a redefinition conflicts with, the bound that failed. It carries a message and a location, and never a severity of its own, because it is part of one finding.",
+      "description": "A second place the adapter points at \u2014 the earlier declaration a redefinition conflicts with, the bound that failed. It carries a message and a location, and never a severity of its own, because it is part of one finding.",
       "properties": {
         "message": {
           "description": "What to notice there \u2014 \"first defined here\", \"required by this bound\".",
@@ -3836,7 +3723,7 @@
         "remove"
       ],
       "rift:enumDescriptions": {
-        "refuse": "Stop the whole deletion while such a use exists.",
+        "refuse": "Refuse the whole deletion while such a use exists.",
         "remove": "Delete the construct containing the use, at a safe boundary the adapter selects.",
         "rewrite": "Replace the use with a valid form the adapter selects."
       },
@@ -3900,7 +3787,7 @@
       ],
       "rift:enumDescriptions": {
         "markdown": "Markdown, as the language's own doc tooling writes it.",
-        "plain": "No markup. Show the text as it is."
+        "plain": "Unmarked text, rendered as it is."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -3922,7 +3809,7 @@
       "type": "string"
     },
     "Edit": {
-      "description": "A filesystem effect described before Rift performs it. Edit sets are atomic and sorted bytewise by each edit's RFC 8785 canonical JSON. Text replacements in one set address the same input state and cannot overlap.",
+      "description": "A filesystem effect described before Rift performs it. Edit sets are atomic and sorted\nbytewise by each edit's RFC 8785 canonical JSON.\n\nText replacements in one set address the same input state and cannot overlap. An empty\nrange at `a` overlaps `[s, e)` only when `s < a < e`, so boundary insertions are legal; two\nedits sharing an insertion point apply in the set's canonical order, and an insertion at\nthe start of a replacement lands before the replacement text.\n\nApplication runs in phases: text replacements against the pre-state, then deletes, copies,\nrenames, creates, and executable-bit changes. Structural sources read the pre-state, and\ntwo structural edits contending for one path are `invalid_request` unless a delete freed\nit.",
       "oneOf": [
         {
           "$ref": "#/$defs/TextEdit"
@@ -4019,7 +3906,7 @@
             },
             "destination": {
               "$ref": "#/$defs/FileId",
-              "description": "The path it moves to.",
+              "description": "The path it moves to. It must not exist before this edit runs and must differ from `file`; an intentional overwrite spells as `delete` plus `rename` in one atomic set.",
               "rift:proto": {
                 "number": 2
               }
@@ -4039,7 +3926,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "Copying an existing file preserves its bytes and executable bit. A caller that needs different destination content uses `create` with that content.",
+          "description": "Copying an existing file preserves its bytes and executable bit. Copying a symlink reproduces the link and never its target. A caller that needs different destination content uses `create` with that content.",
           "properties": {
             "kind": {
               "const": "copy",
@@ -4294,25 +4181,25 @@
       ],
       "rift:enumDescriptions": {
         "adapter_protocol_error": "An adapter contract is unusable. Causes include a malformed message, a field outside its range, ambiguous source or virtual claims, overlapping write claims, a virtual path collision, and a cycle in virtual-source routing. Correct the adapter configuration before retrying.",
-        "adapter_timeout": "The adapter took the call and did not answer inside its budget. Retrying can work: a cold adapter on a large workspace is slow once and fast afterwards.",
-        "adapter_unavailable": "A configured adapter could serve this request, but its process failed to start or died. Retrying can succeed after the process restarts.",
+        "adapter_timeout": "The adapter took the call and did not answer inside the server's per-call budget, which is at most `max_request_ms`. Retrying can work: a cold adapter on a large workspace is slow once and fast afterwards.",
+        "adapter_unavailable": "A configured adapter could serve this request, but its process failed to start or died. The server restarts it on demand, doubling a one-second delay after each failed start; `retry` says `same_request` until three consecutive starts fail, then `operator_action` until the configuration changes.",
         "cancelled": "The caller cancelled, or the connection went away before the request finished. Sending it again is fine.",
         "capability_unavailable": "The tool exists, but the workspace configuration and configured adapters cannot serve this operation for the requested language. Read the workspace resource again after `rift.toml` or adapter availability changes.",
         "configuration_invalid": "The workspace-root `rift.toml` does not satisfy its schema. New requests remain blocked until the file is valid.",
         "content_unavailable": "The entry is known but its bytes cannot be read. Retrying does not help.",
         "cursor_expired": "The cursor is valid, but its captured result page set left the process-local cache. Start again from the first page.",
         "cursor_invalid": "The cursor is malformed, or it was minted for a different request, order or page size. Start the query again from its first page.",
-        "deadline_exceeded": "The request ran past its time budget. A smaller one may succeed \u2014 a lower `limit`, a narrower path selector \u2014 and so may the same one once a cold adapter has warmed up.",
+        "deadline_exceeded": "The request ran past `max_request_ms`. A smaller one may succeed \u2014 a lower `limit`, a narrower path selector \u2014 and so may the same one once a cold adapter has warmed up.",
         "internal_error": "A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected to answer differently.",
         "invalid_request": "The request does not satisfy the schema, or names something the schema forbids: a `limit` above the advertised maximum, a filter field that does not exist. The same bytes fail identically.",
         "limit_exceeded": "A request or a response crossed an advertised limit. `limit` says which one and by how much, so the request can be resized and sent again.",
-        "permission_denied": "The connection cannot perform this operation: a path leaves the workspace, or a debugging session belongs to another connection. The same request fails the same way.",
+        "permission_denied": "The connection cannot perform this operation: a path addresses through a symlink component, which following could take outside the workspace, or a debugging session belongs to another connection. The same request fails the same way.",
         "projection_busy": "The session has an in-flight Rift FS mutation that prevents this operation. Retry after that mutation completes.",
         "resource_not_found": "The identity is well-formed and resolves to nothing \u2014 no such symbol, no such filesystem entry, or a debug session already stopped or expired. Retrying does not help.",
         "storage_failure": "Rift could not read or write workspace or projection files. Worth retrying only if the cause was transient, such as a disk that has since been cleared.",
-        "temporarily_unavailable": "The resource exists but is in use. Another connection owns the session, a retained debugger blocks continuation, or a disposable workspace is still releasing. Retry after that owner or operation finishes.",
+        "temporarily_unavailable": "The resource exists but is in use. Another connection owns the session, a retained debugger blocks continuation, a disposable workspace is still releasing, or another publication holds the workspace. Retry after that owner or operation finishes.",
         "unsupported_path": "The workspace contains a path the protocol cannot represent safely.",
-        "unsupported_protocol": "The client and server use different protocol versions. Compare `Contract` with the client's supported contract.",
+        "unsupported_protocol": "No version the caller offered is one the server implements. `protocol` lists the versions the server supports; the caller selects one it implements and reconnects, or surfaces the mismatch.",
         "validator_execution_failure": "Rift could not launch the command validator, enforce its timeout, or capture its output. One retry is reasonable when the host failure was transient."
       },
       "rift:package": "rift.mcp",
@@ -4435,6 +4322,30 @@
               "limit"
             ]
           }
+        },
+        {
+          "else": {
+            "not": {
+              "required": [
+                "protocol"
+              ]
+            }
+          },
+          "if": {
+            "properties": {
+              "code": {
+                "const": "unsupported_protocol"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "protocol"
+            ]
+          }
         }
       ],
       "description": "The `data` object on every Rift MCP failure. `code` and `retry` are what a caller branches on, `message` is for a human, and the remaining fields carry the evidence available for that failure.",
@@ -4504,6 +4415,21 @@
           },
           "title": "Causes",
           "type": "array"
+        },
+        "protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The server's supported versions. Present exactly when `code` is `unsupported_protocol`, and forbidden otherwise.",
+          "rift:proto": {
+            "number": 10
+          }
         }
       },
       "required": [
@@ -4604,7 +4530,7 @@
     },
     "ExecuteParams": {
       "additionalProperties": false,
-      "description": "Evaluate code with one configured language adapter in the session projection.",
+      "description": "Evaluate code with one configured language adapter in a disposable copy of the\nsession projection.",
       "properties": {
         "language": {
           "$ref": "#/$defs/Language",
@@ -4752,28 +4678,15 @@
           "title": "Max Code Bytes",
           "type": "integer"
         },
-        "max_timeout_ms": {
-          "description": "Wall-clock milliseconds allowed for one evaluation.",
-          "maximum": 86400000,
-          "minimum": 1,
+        "budget": {
+          "$ref": "#/$defs/ExecutionBudget",
+          "description": "The exact evaluation budget every `execute` call receives \u2014 the advertised ceiling and the applied bound are one value.",
           "rift:proto": {
             "number": 2
-          },
-          "title": "Max Timeout Ms",
-          "type": "integer"
-        },
-        "max_output_bytes": {
-          "description": "Captured prefix bytes allowed separately for stdout and stderr.",
-          "maximum": 16384,
-          "minimum": 0,
-          "rift:proto": {
-            "number": 3
-          },
-          "title": "Max Output Bytes",
-          "type": "integer"
+          }
         },
         "max_concurrent": {
-          "description": "Evaluations running concurrently across all connections in the workspace.",
+          "description": "Evaluations running concurrently across all connections in the workspace. A call arriving with every concurrent evaluation in use returns `temporarily_unavailable`.",
           "maximum": 64,
           "minimum": 1,
           "rift:proto": {
@@ -4799,8 +4712,7 @@
       },
       "required": [
         "max_code_bytes",
-        "max_timeout_ms",
-        "max_output_bytes",
+        "budget",
         "max_concurrent",
         "debug"
       ],
@@ -5018,7 +4930,7 @@
       "type": "string"
     },
     "FeatureId": {
-      "description": "One optional behavior implemented by a client or server.",
+      "description": "One optional behavior implemented by the caller or the server.",
       "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -5220,7 +5132,7 @@
           }
         },
         "languages": {
-          "description": "Distinct `Language` values in `regions`, sorted by name and dialect. This summary avoids scanning every region. The physical owner reports embedded languages even when another adapter consumes virtual source.",
+          "description": "Distinct `Language` values in `regions`, sorted by name and dialect. This physical owner advertises embedded languages even when another adapter consumes virtual source.",
           "examples": [
             [
               "svelte",
@@ -5371,7 +5283,7 @@
       "title": "FileContent"
     },
     "FileId": {
-      "description": "Identity of one file in the session projection. The path after `rift://file/` is a\ncanonical project-relative path.",
+      "description": "Identity of one file in the session projection. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
       "examples": [
         "rift://file/pkg/util.py",
         "rift://file/src/%E2%98%83.ts",
@@ -5720,7 +5632,7 @@
             }
           ],
           "default": null,
-          "description": "Directory children on this page \u2014 subdirectories and files alike, each one a complete `ProjectEntry`.",
+          "description": "Directory children on this page \u2014 subdirectories and files alike, each one a complete `ProjectEntry`, sorted bytewise by path.",
           "rift:proto": {
             "number": 5
           },
@@ -5792,6 +5704,21 @@
           },
           "title": "Content"
         },
+        "digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SHA-256 of the complete file for a regular-file read, null for directories and symlinks. Compare it across pages of one range read: a changed digest means the file moved underneath the read, and the range starts over at zero.",
+          "rift:proto": {
+            "number": 11
+          }
+        },
         "next": {
           "anyOf": [
             {
@@ -5821,7 +5748,7 @@
       "type": "object"
     },
     "FsResourceUri": {
-      "description": "URI for one filesystem entry. File ranges use `start` and `length`; directory pages use\n`cursor`.",
+      "description": "URI for one filesystem entry. File ranges use `start` and `length`; directory pages use\n`cursor`. A `start` equal to the file size returns an empty final page; a `start` past it\nis `invalid_request` with `retry: never`.",
       "maxLength": 8192,
       "minLength": 9,
       "pattern": "^rift://fs(?:/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000})?(?:\\?(?:start=[0-9]+&length=[1-9][0-9]*|cursor=[A-Za-z0-9_-]{1,4096}))?$",
@@ -5986,14 +5913,14 @@
       "description": "A language name and its optional dialect. The pair selects at most one configured\nadapter process in a workspace; that process can serve many adapter states.",
       "properties": {
         "name": {
-          "description": "The language name, such as `sql`, `json`, or `css`.",
+          "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and `typescript` cannot split one language into two identity spaces.",
           "examples": [
             "sql",
             "json",
             "css"
           ],
           "maxLength": 64,
-          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
+          "pattern": "^[a-z][a-z0-9._-]*$",
           "rift:proto": {
             "number": 1
           },
@@ -6004,7 +5931,7 @@
           "anyOf": [
             {
               "maxLength": 64,
-              "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
+              "pattern": "^[a-z][a-z0-9._-]*$",
               "type": "string"
             },
             {
@@ -6012,7 +5939,7 @@
             }
           ],
           "default": null,
-          "description": "A dialect whose syntax or semantics differ within the language, such as `postgresql`, `jsonc`, or `scss`.",
+          "description": "A dialect whose syntax or semantics differ within the language, such as `postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
           "examples": [
             "postgresql",
             "jsonc",
@@ -6066,7 +5993,7 @@
     },
     "LanguageSupport": {
       "additionalProperties": false,
-      "description": "Capabilities reported by one configured language adapter. `execution` applies the\nworkspace configuration to its caller-code operations.",
+      "description": "Capabilities advertised by one configured language adapter. `execution` applies the\nworkspace configuration to its caller-code operations.",
       "properties": {
         "language": {
           "$ref": "#/$defs/Language",
@@ -6076,7 +6003,7 @@
           }
         },
         "adapter": {
-          "description": "Implementation name and version reported by the adapter.",
+          "description": "Implementation name and version the adapter advertises.",
           "examples": [
             "rift-adapter-typescript 0.4.1"
           ],
@@ -6302,7 +6229,7 @@
           "type": "integer"
         },
         "max_validators": {
-          "description": "How many workspace command checks may run before publication. Zero when `rift.toml` declares none.",
+          "description": "How many workspace command checks run when a change applies. Zero when `rift.toml` declares none.",
           "maximum": 4294967295,
           "minimum": 0,
           "rift:proto": {
@@ -6334,6 +6261,38 @@
           "rift:proto": {
             "number": 11
           }
+        },
+        "max_filter_depth": {
+          "description": "Nesting levels accepted in one caller-supplied predicate or argument object, so a schema-valid request cannot be a stack overflow. Exceeded fails with `limit_exceeded` naming this limit.",
+          "maximum": 64,
+          "minimum": 1,
+          "rift:proto": {
+            "number": 12
+          },
+          "title": "Max Filter Depth",
+          "type": "integer"
+        },
+        "max_request_ms": {
+          "description": "Wall-clock the server allows one call, evaluation excluded \u2014 `execute` adds its own `max_timeout`. A call that runs past it fails with `deadline_exceeded`.",
+          "maximum": 3600000,
+          "minimum": 1000,
+          "rift:proto": {
+            "number": 13,
+            "scalar": "uint32"
+          },
+          "title": "Max Request Ms",
+          "type": "integer"
+        },
+        "max_active_cursors": {
+          "description": "Captured result sets the server retains per connection, evicting the least recently read. A page requested after eviction fails with `cursor_expired`.",
+          "maximum": 1024,
+          "minimum": 1,
+          "rift:proto": {
+            "number": 14,
+            "scalar": "uint32"
+          },
+          "title": "Max Active Cursors",
+          "type": "integer"
         }
       },
       "required": [
@@ -6346,7 +6305,10 @@
         "max_edits",
         "max_validators",
         "max_rewrite_expansions",
-        "execution"
+        "execution",
+        "max_filter_depth",
+        "max_request_ms",
+        "max_active_cursors"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -6676,7 +6638,7 @@
               "type": "null"
             }
           ],
-          "description": "Pass this back to get the next page. Null on the last one.",
+          "description": "Cursor for the next page, or null after the final result.",
           "rift:proto": {
             "number": 4
           }
@@ -6790,12 +6752,59 @@
       "title": "MatchSyntaxText",
       "type": "object"
     },
+    "MatchedField": {
+      "description": "Which indexed field produced a search hit.",
+      "enum": [
+        "name",
+        "signature",
+        "documentation",
+        "content",
+        "path"
+      ],
+      "rift:enumDescriptions": {
+        "content": "The text of the file matched.",
+        "documentation": "The documentation text matched.",
+        "name": "The symbol or file name matched.",
+        "path": "The project path matched.",
+        "signature": "The rendered signature matched."
+      },
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "MatchedField",
+        "type": "rift.mcp.MatchedField",
+        "values": {
+          "content": {
+            "name": "MATCHED_FIELD_CONTENT",
+            "number": 4
+          },
+          "documentation": {
+            "name": "MATCHED_FIELD_DOCUMENTATION",
+            "number": 3
+          },
+          "name": {
+            "name": "MATCHED_FIELD_NAME",
+            "number": 1
+          },
+          "path": {
+            "name": "MATCHED_FIELD_PATH",
+            "number": 5
+          },
+          "signature": {
+            "name": "MATCHED_FIELD_SIGNATURE",
+            "number": 2
+          }
+        }
+      },
+      "title": "MatchedField",
+      "type": "string"
+    },
     "MoveArguments": {
       "additionalProperties": false,
       "description": "Portable arguments for `refactor.move` actions.",
       "properties": {
         "destination": {
-          "$ref": "#/$defs/MoveArgumentsDestination",
+          "$ref": "#/$defs/Address",
+          "description": "Where the target lands. A `symbol` or `node` addresses the existing container that receives the declaration; a `path` is the complete resulting path, never a containing directory. Other branches refuse with a failed `destination_legal` precondition.",
           "rift:proto": {
             "number": 1
           }
@@ -6819,87 +6828,6 @@
       "title": "MoveArguments",
       "type": "object"
     },
-    "MoveArgumentsDestination": {
-      "description": "Existing destination container or project path. Symbols use an Address; files and new modules use a ProjectPath.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "address",
-              "title": "Kind",
-              "type": "string"
-            },
-            "address": {
-              "$ref": "#/$defs/Address",
-              "description": "Existing semantic container that receives the moved declaration.",
-              "rift:proto": {
-                "number": 1
-              }
-            }
-          },
-          "required": [
-            "kind",
-            "address"
-          ],
-          "rift:package": "rift.core",
-          "rift:proto": {
-            "type": "rift.core.MoveArgumentsDestinationAddress"
-          },
-          "title": "MoveArgumentsDestinationAddress",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "path",
-              "title": "Kind",
-              "type": "string"
-            },
-            "path": {
-              "$ref": "#/$defs/ProjectPath",
-              "description": "Project path that receives a file, module, or declaration supported by the language.",
-              "rift:proto": {
-                "number": 1
-              }
-            }
-          },
-          "required": [
-            "kind",
-            "path"
-          ],
-          "rift:package": "rift.core",
-          "rift:proto": {
-            "type": "rift.core.MoveArgumentsDestinationPath"
-          },
-          "title": "MoveArgumentsDestinationPath",
-          "type": "object"
-        }
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "field": "destination",
-        "number": 1,
-        "oneof": "variant",
-        "type": "rift.core.MoveArgumentsDestination",
-        "variants": [
-          {
-            "field": "address",
-            "number": 1,
-            "tag": "address",
-            "type": "MoveArgumentsDestinationAddress"
-          },
-          {
-            "field": "path",
-            "number": 2,
-            "tag": "path",
-            "type": "MoveArgumentsDestinationPath"
-          }
-        ]
-      },
-      "title": "MoveArgumentsDestination"
-    },
     "MoveParams": {
       "additionalProperties": false,
       "description": "Moves a declaration or file to another container or path and updates the imports and references that reach it.",
@@ -6913,7 +6841,7 @@
         },
         "target": {
           "$ref": "#/$defs/Address",
-          "description": "The declaration or file to move.",
+          "description": "The declaration, file, or directory to move.",
           "rift:proto": {
             "number": 4
           }
@@ -7087,7 +7015,7 @@
         "definition": "Gives a name its body. Where jump-to-definition lands.",
         "export": "Makes a name visible outside this unit.",
         "expression": "Something that evaluates to a value.",
-        "generated": "Produced by a tool from something else in the workspace. Destructive policy gates on this, because the next build overwrites whatever you write here.",
+        "generated": "Produced by a tool from something else in the workspace. Destructive policy gates on this, because the next build overwrites whatever is written here.",
         "identifier": "A name as written, whether it declares or refers.",
         "import": "Brings a name in from another unit.",
         "literal": "A value written straight into the source \u2014 `42`, `true`.",
@@ -7563,13 +7491,13 @@
         "language_condition"
       ],
       "rift:enumDescriptions": {
-        "destination_legal": "The requested path or semantic container can receive the moved or created entity.",
+        "destination_legal": "The requested path or semantic container can receive the moved or created entity. On a case-insensitive filesystem a destination that case-folds onto a different existing path fails here.",
         "language_condition": "An adapter-defined condition described by diagnostics and extension data.",
         "name_available": "The requested name creates no forbidden collision or binding change.",
         "no_remaining_usages": "No usage remains after the selected safe-delete policy is applied.",
         "references_complete": "The adapter completely classified the references on which the operation depends.",
         "source_unchanged": "The files a match or action offer was discovered in have not been rewritten since.",
-        "target_exists": "Every addressed symbol, node, match, or source range resolves in the projection as it stands.",
+        "target_exists": "Every addressed symbol, node, match, or source range resolves in the projection as it stands. A node address resolves only when its range is exactly a current node of the addressed kind, so offsets that shifted since the id was read fail here.",
         "writable": "Every affected path is inside the project and writable through Rift's workspace handle."
       },
       "rift:package": "rift.core",
@@ -7848,141 +7776,81 @@
       "title": "OperationVerifier"
     },
     "OriginMapping": {
-      "description": "A relation from one produced source range to the source ranges that contributed its bytes. It lets Rift project a finding on adapter input back to source a person can edit.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "One origin, byte for byte. An offset in the generated file maps back to an offset in the source arithmetically.",
-          "properties": {
-            "precision": {
-              "const": "exact",
-              "default": "exact",
-              "title": "Precision",
-              "type": "string"
-            },
-            "origins": {
-              "anyOf": [
-                {
-                  "items": {},
-                  "maxItems": 1,
-                  "minItems": 1,
-                  "type": "array"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Origins"
-            }
-          },
-          "rift:package": "rift.core",
+      "additionalProperties": false,
+      "description": "A relation from one produced source range to the source ranges that contributed its\nbytes. It lets Rift project a finding on adapter input back to source a person can edit.",
+      "properties": {
+        "produced": {
+          "$ref": "#/$defs/SourceSpan",
+          "description": "The produced bytes this relation explains.",
           "rift:proto": {
-            "type": "rift.core.OriginMappingExact"
-          },
-          "title": "OriginMappingExact",
-          "type": "object"
+            "number": 3
+          }
         },
-        {
-          "additionalProperties": false,
-          "description": "One or more origins, without a position inside them. A macro expansion knows which source it came from and cannot say which byte of it.",
-          "properties": {
-            "precision": {
-              "const": "approximate",
-              "default": "approximate",
-              "title": "Precision",
-              "type": "string"
-            },
-            "origins": {
-              "anyOf": [
-                {
-                  "items": {},
-                  "minItems": 1,
-                  "type": "array"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Origins"
-            }
-          },
-          "rift:package": "rift.core",
+        "precision": {
+          "$ref": "#/$defs/OriginPrecision",
+          "description": "How faithfully `origins` locates the produced bytes: `exact` maps back arithmetically, `approximate` names the source without a position inside it, `synthetic` has nothing in the workspace to jump to.",
           "rift:proto": {
-            "type": "rift.core.OriginMappingApproximate"
-          },
-          "title": "OriginMappingApproximate",
-          "type": "object"
+            "number": 2
+          }
         },
-        {
-          "additionalProperties": false,
-          "description": "No origin. The generator invented these bytes, so there is nothing in the workspace to jump to.",
-          "properties": {
-            "precision": {
-              "const": "synthetic",
-              "default": "synthetic",
-              "title": "Precision",
-              "type": "string"
-            },
-            "origins": {
-              "anyOf": [
-                {
-                  "items": {},
-                  "maxItems": 0,
-                  "type": "array"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "rift:proto": {
-                "number": 1
-              },
-              "title": "Origins"
-            }
+        "origins": {
+          "description": "The contributing source ranges: exactly one for `exact`, one or more for `approximate`, none for `synthetic`.",
+          "items": {
+            "$ref": "#/$defs/SourceSpan"
           },
-          "rift:package": "rift.core",
           "rift:proto": {
-            "type": "rift.core.OriginMappingSynthetic"
+            "number": 1
           },
-          "title": "OriginMappingSynthetic",
-          "type": "object"
+          "title": "Origins",
+          "type": "array"
         }
+      },
+      "required": [
+        "produced",
+        "precision",
+        "origins"
       ],
       "rift:package": "rift.core",
       "rift:proto": {
-        "oneof": "variant",
-        "type": "rift.core.OriginMapping",
-        "variants": [
-          {
-            "field": "exact",
-            "number": 1,
-            "tag": "exact",
-            "type": "OriginMappingExact"
-          },
-          {
-            "field": "approximate",
-            "number": 2,
-            "tag": "approximate",
-            "type": "OriginMappingApproximate"
-          },
-          {
-            "field": "synthetic",
-            "number": 3,
-            "tag": "synthetic",
-            "type": "OriginMappingSynthetic"
-          }
-        ]
+        "type": "rift.core.OriginMapping"
       },
-      "title": "OriginMapping"
+      "title": "OriginMapping",
+      "type": "object"
+    },
+    "OriginPrecision": {
+      "description": "How faithfully the origins locate the produced bytes.",
+      "enum": [
+        "exact",
+        "approximate",
+        "synthetic"
+      ],
+      "rift:enumDescriptions": {
+        "approximate": "One or more origins without a position inside them, as a macro expansion knows its source and cannot say which byte of it.",
+        "exact": "One origin, byte for byte: an offset in the produced range maps back to an offset in the source arithmetically.",
+        "synthetic": "No origin. The generator invented these bytes, so there is nothing in the workspace to jump to."
+      },
+      "rift:package": "rift.core",
+      "rift:proto": {
+        "enum": "Precision",
+        "field": "precision",
+        "number": 2,
+        "values": {
+          "approximate": {
+            "name": "PRECISION_APPROXIMATE",
+            "number": 2
+          },
+          "exact": {
+            "name": "PRECISION_EXACT",
+            "number": 1
+          },
+          "synthetic": {
+            "name": "PRECISION_SYNTHETIC",
+            "number": 3
+          }
+        }
+      },
+      "title": "OriginPrecision",
+      "type": "string"
     },
     "OutlineInclude": {
       "enum": [
@@ -8330,7 +8198,7 @@
     },
     "PatchParams": {
       "additionalProperties": false,
-      "description": "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the state it resolves against.",
+      "description": "A UTF-8 unified diff guarded by its context lines. A malformed patch \u2014 an absolute path, path traversal, a binary patch, a broken header \u2014 is `invalid_request`; a hunk whose context differs from the state it resolves against is a refusal carrying a failed `source_unchanged` precondition.",
       "properties": {
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
@@ -8563,7 +8431,7 @@
       "title": "PreconditionValue"
     },
     "ProjectEntry": {
-      "description": "One visible directory or file in the session projection.",
+      "description": "One visible directory or file in the session projection. Visible means below the workspace root, outside `.rift`, and not excluded by the workspace's VCS ignore rules; a symlink is listed and never followed. Visibility governs reads \u2014 publication carries every changed path, visible or not.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -8576,7 +8444,7 @@
             },
             "path": {
               "$ref": "#/$defs/ProjectPath",
-              "description": "Project-relative directory path. The empty path names the project root.",
+              "description": "Project-relative directory path. The empty path names the workspace root.",
               "rift:proto": {
                 "number": 1
               }
@@ -8644,7 +8512,7 @@
       "title": "ProjectEntry"
     },
     "ProjectPath": {
-      "description": "One path below the project root, using forward slashes and UTF-8. The empty path names\nthe root itself. Absolute paths, backslashes, control characters, empty segments, and `.` or\n`..` segments are refused before the filesystem is touched. The limit is 1000 UTF-8 bytes,\nnot characters.",
+      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC \u2014 Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments, and\n`.` or `..` segments are refused before the filesystem is touched. The limit is 1000 UTF-8\nbytes, not characters. A workspace holding two entries whose NFC forms are equal fails the\nread that touches them with `content_unavailable`.",
       "examples": [
         "",
         "src/config.ts",
@@ -8673,7 +8541,7 @@
         },
         "path": {
           "$ref": "#/$defs/WorkspacePath",
-          "description": "Absolute path of the projection directory. Rift places it at `.rift/projections/<session>` below the workspace and keeps it there for the session's life. Reading this resource materializes a projection that has not diverged yet, because a tool pointed here may write and those writes belong to the changeset. Session removal deletes the directory without waiting for a process that is still working inside it.",
+          "description": "Absolute path of the projection directory, at `.rift/projections/<session>` for the session's life. Reading this resource materializes the projection, because a tool pointed here may write and those writes belong to the changeset.",
           "rift:proto": {
             "number": 2
           }
@@ -8699,7 +8567,7 @@
       "type": "object"
     },
     "ProjectionResourceUri": {
-      "description": "The session's projection directory on this host. The name is deliberate: MCP's own\n`roots` capability runs the other way, a client granting a server directories, so this\nresource does not call itself a root.",
+      "description": "The session's projection directory on this host.",
       "pattern": "^rift://projection$",
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -8727,7 +8595,7 @@
             }
           ],
           "default": null,
-          "description": "Changed paths to restore. Null restores every changed path.",
+          "description": "Changed paths to restore. Null restores every changed path. Naming any path of a change restores every path that change touched \u2014 a change leaves the changeset whole.",
           "rift:proto": {
             "number": 2
           },
@@ -8755,7 +8623,7 @@
           "type": "boolean"
         },
         "unaccepted": {
-          "description": "Whether the changeset holds a change carrying a confirmation the caller has not accepted. Publication refuses while this is true.",
+          "description": "Whether the changeset holds a change carrying a confirmation. Publication refuses unless the `publish` call names each such change in `accept`.",
           "rift:proto": {
             "number": 4
           },
@@ -8774,20 +8642,59 @@
       "title": "ProjectionState",
       "type": "object"
     },
+    "ProtocolEvidence": {
+      "additionalProperties": false,
+      "description": "The versions the server implements, carried when it rejects the caller's. Without it the caller cannot pick a version to reconnect with.",
+      "properties": {
+        "supported": {
+          "description": "Versions the server implements, newest first.",
+          "items": {
+            "$ref": "#/$defs/ProtocolVersion"
+          },
+          "minItems": 1,
+          "rift:proto": {
+            "number": 1
+          },
+          "title": "Supported",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "requested": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The version the caller declared, echoed back.",
+          "rift:proto": {
+            "number": 2
+          }
+        }
+      },
+      "required": [
+        "supported",
+        "requested"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.ProtocolEvidence"
+      },
+      "title": "ProtocolEvidence",
+      "type": "object"
+    },
     "ProtocolVersion": {
-      "const": 1,
-      "description": "The protocol major. It changes when a peer cannot decode the next message safely. The\nworkspace lease exposes it before a client opens the version-independent server socket.",
+      "description": "One protocol version, named by its release date as `YYYY-MM-DD`. A version is a\ncomplete snapshot of the generated contract, so a peer implements whole versions, never\nparts, and there is no minor number. The workspace rendezvous under `.rift` advertises\nthe server's supported versions before the caller opens the version-independent server\nsocket.",
+      "examples": [
+        "2026-08-04"
+      ],
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
       "rift:package": "rift.core",
       "rift:proto": {
         "package": "rift.core",
-        "scalar": "int64"
+        "scalar": "string"
       },
       "title": "ProtocolVersion",
-      "type": "integer"
+      "type": "string"
     },
     "PublishParams": {
       "additionalProperties": false,
-      "description": "Publishes the session projection into the workspace. Publication is the one step that\ntouches the user's own files, so it is where confirmations are settled: a change carrying\none is published only when this call names it.",
+      "description": "Publishes the session projection into the workspace. Publication is the one step that\nwrites into the workspace, so it is where confirmations are settled: a change carrying\none is published only when this call names it.",
       "properties": {
         "accept": {
           "description": "Changes whose confirmations the caller accepts. A change carrying a confirmation and absent here is returned in `unaccepted` and nothing is written.",
@@ -8821,7 +8728,7 @@
           }
         },
         "conflicts": {
-          "description": "Workspace paths changed outside this projection.",
+          "description": "Paths changed in both this projection and the workspace. Non-empty means nothing was written.",
           "items": {
             "$ref": "#/$defs/ProjectPath"
           },
@@ -8857,7 +8764,7 @@
       "type": "object"
     },
     "RefusalReason": {
-      "description": "Why Rift produced no edits at all. Every reason here means resolution had nothing to write: a change Rift can express but nobody will vouch for still lands, carrying its confirmations. `ErrorData` carries transport and infrastructure failures.",
+      "description": "Why resolution produced no edits at all. Adapters emit `unsupported`,\n`unmet_precondition`, `ambiguous_target`, `stale_action`, `stale_match`,\n`unsafe_effect`, and `language_refusal`; Rift itself produces the rest. A change Rift\ncan express but nobody will vouch for still lands, carrying its confirmations \u2014\n`ErrorData` carries transport and infrastructure failures.",
       "enum": [
         "unsupported",
         "unmet_precondition",
@@ -8882,10 +8789,10 @@
         "unsafe_effect": "The complete effect reaches outside what the caller can have meant \u2014 outside the project, or into generated source.",
         "unsupported": "No adapter implements this operation for the language it reaches."
       },
-      "rift:package": "rift.mcp",
+      "rift:package": "rift.core",
       "rift:proto": {
         "enum": "RefusalReason",
-        "type": "rift.mcp.RefusalReason",
+        "type": "rift.core.RefusalReason",
         "values": {
           "ambiguous_target": {
             "name": "REFUSAL_REASON_AMBIGUOUS_TARGET",
@@ -8897,15 +8804,15 @@
           },
           "formatter_unsupported": {
             "name": "REFUSAL_REASON_FORMATTER_UNSUPPORTED",
-            "number": 9
+            "number": 8
           },
           "language_refusal": {
             "name": "REFUSAL_REASON_LANGUAGE_REFUSAL",
-            "number": 12
+            "number": 10
           },
           "portable_family": {
             "name": "REFUSAL_REASON_PORTABLE_FAMILY",
-            "number": 11
+            "number": 9
           },
           "stale_action": {
             "name": "REFUSAL_REASON_STALE_ACTION",
@@ -8921,7 +8828,7 @@
           },
           "unsafe_effect": {
             "name": "REFUSAL_REASON_UNSAFE_EFFECT",
-            "number": 8
+            "number": 7
           },
           "unsupported": {
             "name": "REFUSAL_REASON_UNSUPPORTED",
@@ -9096,7 +9003,7 @@
             }
           ],
           "default": null,
-          "description": "How many edges a traversal may cross. Call graphs contain cycles and can span the workspace, so every traversal has this bound. Only edges that compose carry a depth \u2014 `contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`, `mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing to walk, and Rift rejects it.",
+          "description": "How many edges a traversal may cross. Only edges that compose carry a depth \u2014 `contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`, `mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing to walk, and Rift rejects it.",
           "rift:proto": {
             "number": 6
           },
@@ -9560,7 +9467,7 @@
         },
         "target": {
           "$ref": "#/$defs/Address",
-          "description": "The declaration to rename: a symbol, a node, a byte range, or a match.",
+          "description": "The declaration to rename.",
           "rift:proto": {
             "number": 4
           }
@@ -9771,7 +9678,7 @@
               "$ref": "#/$defs/ActionsResourceUri"
             },
             {
-              "$ref": "#/$defs/ActionResourceUri"
+              "$ref": "#/$defs/ActionOfferId"
             },
             {
               "$ref": "#/$defs/ProjectionResourceUri"
@@ -9909,8 +9816,8 @@
         "operator_action"
       ],
       "rift:enumDescriptions": {
-        "never": "The request fails the same way every time. Change it or give up.",
-        "operator_action": "A local state command or configuration change must resolve the condition before another request can succeed.",
+        "never": "The request fails the same way every time. Change it before sending it again.",
+        "operator_action": "Resolve the condition with a local state command or configuration change, then send the request again.",
         "same_request": "Send the same bytes again. The cause was transient \u2014 a busy projection, an adapter still starting."
       },
       "rift:package": "rift.mcp",
@@ -10151,9 +10058,9 @@
           "type": "number"
         },
         "matched_by": {
-          "description": "Which fields produced the match \u2014 `name`, `signature`, the text of the file.",
+          "description": "Which indexed fields produced the match.",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/MatchedField"
           },
           "rift:proto": {
             "number": 3
@@ -10190,7 +10097,7 @@
             }
           ],
           "default": null,
-          "description": "The source around the hit, requested with `include: [\"source\"]`. Carries its span, so an agent can act on what it read without searching for it again.",
+          "description": "The source around the hit, requested with `include: [\"source\"]`. Carries its span, so the caller can act on what it read without searching for it again.",
           "rift:proto": {
             "number": 5
           }
@@ -10432,7 +10339,7 @@
             }
           ],
           "default": null,
-          "description": "Text to match against file contents, symbol names, and rendered signatures. `parse` matches that word in those fields. Caller lookup uses a relationship filter.",
+          "description": "Text to match against file contents, symbol names, and rendered signatures. Matching is case-insensitive and identifier-aware \u2014 the query and the fields split on case and underscore boundaries, so `loadConfig` finds `load_config`. Scoring is server-defined and stable for one cursor's life.",
           "rift:proto": {
             "number": 3
           },
@@ -10481,7 +10388,7 @@
             }
           ],
           "default": null,
-          "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so ask for what you will read.",
+          "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so the caller requests only what it will read.",
           "rift:proto": {
             "number": 6
           },
@@ -10542,7 +10449,7 @@
       ],
       "rift:enumDescriptions": {
         "all": "Every kind above, in one ranked list.",
-        "file": "Entries of the workspace tree. The only target that answers with no adapter installed.",
+        "file": "Entries of the workspace tree. The only target that returns results with no adapter installed.",
         "node": "Places in a syntax tree where a symbol is written. One symbol has many.",
         "symbol": "Declarations the adapter resolved \u2014 a function, a class, a trait."
       },
@@ -10604,7 +10511,7 @@
               "type": "null"
             }
           ],
-          "description": "Pass this back to get the next page. Null on the last one.",
+          "description": "Cursor for the next page, or null after the final result.",
           "rift:proto": {
             "number": 4
           }
@@ -10642,7 +10549,7 @@
     },
     "SessionContinueParams": {
       "additionalProperties": false,
-      "description": "Selects a retained session for the current MCP connection to continue. The current initial\nsession must have its original clean projection and no retained debugging session. The\nretained session must have no live connection. A changed initial session returns\n`invalid_request`; an active session or retained debugger returns `temporarily_unavailable`.",
+      "description": "Selects a retained session for the current MCP connection to continue. The current\nsession must be clean and hold no retained debugging session; the server removes the\nvacated session with its projection directory. The retained session must have no live\nconnection. A changed current session returns `invalid_request`; a live target or\nretained debugger returns `temporarily_unavailable`.",
       "properties": {
         "session": {
           "$ref": "#/$defs/SessionId",
@@ -10664,7 +10571,7 @@
     },
     "SessionContinueResult": {
       "additionalProperties": false,
-      "description": "The active retained session now bound to the current MCP connection. The MCP process\nreplaces its in-memory session ID with this identity before it sends another call.",
+      "description": "The active retained session now bound to the current MCP connection. The MCP process\nreplaces its in-memory session ID with this identity before it issues another call.",
       "properties": {
         "session": {
           "$ref": "#/$defs/SessionSummary",
@@ -10687,9 +10594,9 @@
     "SessionId": {
       "description": "Random 128-bit identity of one persistent session projection. The server admits at most\none live MCP connection for the identity.",
       "pattern": "^ses_[a-z2-7]{26}$",
-      "rift:package": "rift.mcp",
+      "rift:package": "rift.core",
       "rift:proto": {
-        "package": "rift.mcp",
+        "package": "rift.core",
         "scalar": "string"
       },
       "title": "SessionId",
@@ -10720,7 +10627,7 @@
             }
           ],
           "default": null,
-          "description": "Continues a captured session list with the same page size. The cursor expires when the server can no longer retain that list.",
+          "description": "Continues a captured session list with the same page size. A mismatched cursor returns `cursor_invalid`; one whose captured list the server dropped returns `cursor_expired`.",
           "rift:proto": {
             "number": 2
           }
@@ -10776,7 +10683,7 @@
     },
     "SessionRemoveParams": {
       "additionalProperties": false,
-      "description": "Removes one inactive session and the projection it retains.",
+      "description": "Removes one inactive session and the projection it retains. A session with a live\nconnection \u2014 the caller's own included \u2014 returns `temporarily_unavailable`.",
       "properties": {
         "session": {
           "$ref": "#/$defs/SessionId",
@@ -10851,12 +10758,21 @@
           },
           "title": "Active",
           "type": "boolean"
+        },
+        "current": {
+          "description": "Whether this is the calling connection's own session.",
+          "rift:proto": {
+            "number": 6
+          },
+          "title": "Current",
+          "type": "boolean"
         }
       },
       "required": [
         "session",
         "state",
-        "active"
+        "active",
+        "current"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -10874,10 +10790,10 @@
         "hint"
       ],
       "rift:enumDescriptions": {
-        "error": "The adapter would not accept the code. Facts read from around it may be missing.",
-        "hint": "A suggestion, usually with a code action behind it.",
+        "error": "Code the adapter would not accept. Facts read from around it may be missing.",
+        "hint": "A suggestion. An adapter action resolves it where one is offered.",
         "info": "Something worth knowing that is not a defect.",
-        "warning": "The code compiles and the adapter thinks it is wrong anyway."
+        "warning": "Code that compiles and the adapter judges wrong anyway."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -11217,7 +11133,7 @@
     },
     "SourceExcerpt": {
       "additionalProperties": false,
-      "description": "A copy of some source, and where it was copied from. A span points into a file that may change under you; an excerpt is the bytes as they were when the answer was produced.",
+      "description": "A copy of some source, and where it was copied from. A span points into a file that may change afterwards; an excerpt is the bytes as they were when the answer was produced.",
       "properties": {
         "span": {
           "$ref": "#/$defs/SourceSpan",
@@ -11399,7 +11315,7 @@
     },
     "StructuralMatchRanges": {
       "additionalProperties": false,
-      "description": "The ranges a replacement can be written over, computed by the adapter that parsed the match. Whether the trivia around a node belongs to the edit depends on what you are doing \u2014 deleting a list element has to take a separator with it \u2014 and only the grammar knows where that trivia ends.",
+      "description": "The ranges a replacement can be written over, computed by the adapter that parsed the match. Whether the trivia around a node belongs to the edit depends on the operation \u2014 deleting a list element has to take a separator with it \u2014 and only the grammar knows where that trivia ends.",
       "properties": {
         "exact": {
           "$ref": "#/$defs/SourceSpan",
@@ -11457,7 +11373,7 @@
         },
         "version": {
           "const": 1,
-          "description": "Which revision of the metavariable grammar the pattern is written in.",
+          "description": "Which version of the metavariable grammar the pattern is written in.",
           "rift:proto": {
             "number": 2
           },
@@ -11490,20 +11406,20 @@
         "within": {
           "anyOf": [
             {
-              "$ref": "#/$defs/StructuralQueryWithin"
+              "$ref": "#/$defs/Address"
             },
             {
               "type": "null"
             }
           ],
           "default": null,
-          "description": "Optional source boundary for the search. A symbol selects its nodes. A node selects its syntax subtree. A span selects its bytes.",
+          "description": "Optional source boundary for the search. A symbol bounds it to the nodes that write it, a node to its syntax subtree \u2014 optionally one region \u2014 a span to its bytes, and a path to a file or directory. The `match` branch refuses: a retained match is a result, not a scope.",
           "rift:proto": {
             "number": 6
           }
         },
         "constraints": {
-          "description": "Conditions the captures have to meet. The pattern finds a shape; these narrow it to the occurrences you meant.",
+          "description": "Conditions the captures have to meet. The pattern finds a shape; these narrow it to the intended occurrences.",
           "items": {
             "$ref": "#/$defs/StructuralCaptureConstraint"
           },
@@ -11578,123 +11494,6 @@
       },
       "title": "StructuralQueryOverlap",
       "type": "string"
-    },
-    "StructuralQueryWithin": {
-      "description": "Optional source boundary for the search. A symbol selects its nodes. A node selects its syntax subtree. A span selects its bytes.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "Every node that writes one symbol.",
-          "properties": {
-            "kind": {
-              "const": "symbol",
-              "description": "Selects symbol scope.",
-              "title": "Kind",
-              "type": "string"
-            },
-            "symbol": {
-              "$ref": "#/$defs/SymbolId",
-              "rift:proto": {
-                "number": 1
-              }
-            }
-          },
-          "required": [
-            "kind",
-            "symbol"
-          ],
-          "rift:package": "rift.core",
-          "rift:proto": {
-            "type": "rift.core.StructuralQueryWithinSymbol"
-          },
-          "title": "StructuralQueryWithinSymbol",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "One syntax subtree.",
-          "properties": {
-            "kind": {
-              "const": "node",
-              "description": "Selects node scope.",
-              "title": "Kind",
-              "type": "string"
-            },
-            "node": {
-              "$ref": "#/$defs/NodeId",
-              "rift:proto": {
-                "number": 1
-              }
-            }
-          },
-          "required": [
-            "kind",
-            "node"
-          ],
-          "rift:package": "rift.core",
-          "rift:proto": {
-            "type": "rift.core.StructuralQueryWithinNode"
-          },
-          "title": "StructuralQueryWithinNode",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "One source byte range.",
-          "properties": {
-            "kind": {
-              "const": "source",
-              "description": "Selects source-range scope.",
-              "title": "Kind",
-              "type": "string"
-            },
-            "span": {
-              "$ref": "#/$defs/SourceSpan",
-              "rift:proto": {
-                "number": 1
-              }
-            }
-          },
-          "required": [
-            "kind",
-            "span"
-          ],
-          "rift:package": "rift.core",
-          "rift:proto": {
-            "type": "rift.core.StructuralQueryWithinSource"
-          },
-          "title": "StructuralQueryWithinSource",
-          "type": "object"
-        }
-      ],
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "field": "within",
-        "number": 6,
-        "oneof": "variant",
-        "type": "rift.core.StructuralQueryWithin",
-        "variants": [
-          {
-            "field": "symbol",
-            "number": 1,
-            "tag": "symbol",
-            "type": "StructuralQueryWithinSymbol"
-          },
-          {
-            "field": "node",
-            "number": 2,
-            "tag": "node",
-            "type": "StructuralQueryWithinNode"
-          },
-          {
-            "field": "source",
-            "number": 3,
-            "tag": "source",
-            "type": "StructuralQueryWithinSource"
-          }
-        ]
-      },
-      "title": "StructuralQueryWithin"
     },
     "Symbol": {
       "additionalProperties": false,
@@ -12119,7 +11918,7 @@
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "Declared in this workspace's own source. The code you can open and change.",
+          "description": "Declared in this workspace's own source. Source the caller can open and change.",
           "properties": {
             "kind": {
               "const": "workspace",
@@ -12606,7 +12405,7 @@
       "properties": {
         "start": {
           "description": "First byte of the range, counted from the start of the file.",
-          "maximum": 4294967295,
+          "maximum": 9007199254740991,
           "minimum": 0,
           "rift:proto": {
             "number": 1
@@ -12616,7 +12415,7 @@
         },
         "end": {
           "description": "One past the last byte. Equal to `start` for an empty range, which is how a position between two bytes is spelled.",
-          "maximum": 4294967295,
+          "maximum": 9007199254740991,
           "minimum": 0,
           "rift:proto": {
             "number": 2
@@ -12967,7 +12766,7 @@
     },
     "WorkspaceResourcePayload": {
       "additionalProperties": false,
-      "description": "Current workspace state and request limits. Each configured language reports its\nadapter support and effective caller-code availability.",
+      "description": "Current workspace state and request limits. Each configured language advertises its\nadapter support and effective caller-code availability.",
       "properties": {
         "uri": {
           "$ref": "#/$defs/WorkspaceResourceUri",
@@ -12983,9 +12782,9 @@
             "number": 2
           }
         },
-        "contract": {
-          "$ref": "#/$defs/Contract",
-          "description": "Protocol version and schema identifier for every other field in this payload.",
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The version every other field in this payload is stated under.",
           "rift:proto": {
             "number": 3
           }
@@ -13064,7 +12863,7 @@
       "required": [
         "uri",
         "state",
-        "contract",
+        "protocol_version",
         "limits",
         "languages",
         "coverage",

@@ -13,7 +13,7 @@ from .base import FieldRef
 DURATION_PATTERN = r"^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$"
 BYTE_SIZE_PATTERN = r"^(?:0|[1-9][0-9]*)(?:B|KiB|MiB|GiB|TiB)$"
 LANGUAGE_SELECTOR_PATTERN = (
-    r"^[A-Za-z][A-Za-z0-9._-]{0,63}(?::[A-Za-z][A-Za-z0-9._-]{0,63})?$"
+    r"^[a-z][a-z0-9._-]{0,63}(?::[a-z][a-z0-9._-]{0,63})?$"
 )
 PROCESS_NAME_PATTERN = r"^[A-Za-z][A-Za-z0-9._-]{0,63}$"
 ENVIRONMENT_NAME_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*$"
@@ -26,7 +26,7 @@ def _field_target(reference: FieldRef[Any, Any]) -> dict[str, str]:
 
 
 class ConfigModel(BaseModel):
-    """Closed TOML table with aliases matching the file's kebab-case keys."""
+    """Closed TOML table. Keys are snake_case, matching the protocol's wire names."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -120,53 +120,50 @@ class ExecutionConfig(ConfigModel):
     )
     max_code: ByteSize = Field(
         default=ByteSize("16KiB"),
-        alias="max-code",
         description="Maximum UTF-8 bytes in one CodeBlock.source.",
         json_schema_extra={
             "rift:bounds": _field_target(core.CodeBlock.source),
             "rift:conversion": "UTF-8 byte length",
+            "rift:range": {"min": "1B", "max": "32KiB"},
         },
     )
     max_timeout: Duration = Field(
         default=Duration("30s"),
-        alias="max-timeout",
         description="Wall-clock bound applied to each execution and debugging evaluation.",
         json_schema_extra={
             "rift:bounds": _field_target(core.ExecutionBudget.timeout_ms),
             "rift:conversion": "Duration.milliseconds",
+            "rift:range": {"min": "1ms", "max": "1d"},
         },
     )
     max_output: ByteSize = Field(
         default=ByteSize("8KiB"),
-        alias="max-output",
         description="Captured prefix bound applied separately to stdout and stderr.",
         json_schema_extra={
             "rift:bounds": _field_target(core.ExecutionBudget.output_bytes),
             "rift:conversion": "ByteSize.bytes",
+            "rift:range": {"min": "0B", "max": "16KiB"},
         },
     )
     max_concurrent: int = Field(
         default=2,
-        alias="max-concurrent",
         ge=1,
         le=64,
         description="Evaluations admitted concurrently across the workspace.",
     )
     max_debug_sessions: int = Field(
         default=2,
-        alias="max-debug-sessions",
         ge=1,
         le=16,
         description="Retained debugging sessions admitted across the workspace.",
     )
     debug_idle_timeout: Duration = Field(
         default=Duration("5m"),
-        alias="debug-idle-timeout",
         description="Idle time before Rift stops a debugging session and releases its lease.",
+        json_schema_extra={"rift:range": {"min": "1ms", "max": "1d"}},
     )
     max_debug_frames: int = Field(
         default=64,
-        alias="max-debug-frames",
         ge=1,
         le=256,
         description="Stack frames one failed debugging evaluation may retain.",
@@ -174,7 +171,6 @@ class ExecutionConfig(ConfigModel):
     )
     max_debug_bindings: int = Field(
         default=32,
-        alias="max-debug-bindings",
         ge=1,
         le=128,
         description="Arguments plus locals returned for one debug frame.",
@@ -184,11 +180,11 @@ class ExecutionConfig(ConfigModel):
     )
     max_debug_value: ByteSize = Field(
         default=ByteSize("1KiB"),
-        alias="max-debug-value",
         description="Captured UTF-8 bytes in each adapter-rendered debug binding value.",
         json_schema_extra={
             "rift:bounds": _field_target(core.DebugBudget.value_bytes),
             "rift:conversion": "ByteSize.bytes",
+            "rift:range": {"min": "0B", "max": "8KiB"},
         },
     )
 
@@ -203,15 +199,15 @@ class ExecutionConfig(ConfigModel):
         if not set(debugged).issubset(allowed):
             raise ValueError("execution.debug must be a subset of execution.allow")
         if not 1 <= self.max_code.bytes <= 32768:
-            raise ValueError("execution.max-code must be between 1B and 32KiB")
+            raise ValueError("execution.max_code must be between 1B and 32KiB")
         if not 1 <= self.max_timeout.milliseconds <= 86_400_000:
-            raise ValueError("execution.max-timeout must be between 1ms and 1d")
+            raise ValueError("execution.max_timeout must be between 1ms and 1d")
         if not 0 <= self.max_output.bytes <= 16384:
-            raise ValueError("execution.max-output must be at most 16KiB")
+            raise ValueError("execution.max_output must be at most 16KiB")
         if not 1 <= self.debug_idle_timeout.milliseconds <= 86_400_000:
-            raise ValueError("execution.debug-idle-timeout must be between 1ms and 1d")
+            raise ValueError("execution.debug_idle_timeout must be between 1ms and 1d")
         if not 0 <= self.max_debug_value.bytes <= 8192:
-            raise ValueError("execution.max-debug-value must be at most 8KiB")
+            raise ValueError("execution.max_debug_value must be at most 8KiB")
         return self
 
     @staticmethod
@@ -270,14 +266,11 @@ class ExecutionConfig(ConfigModel):
             debug = mcp.DebugLimits(
                 max_sessions=self.max_debug_sessions,
                 idle_timeout_ms=self.debug_idle_timeout.milliseconds,
-                max_frames=self.max_debug_frames,
-                max_bindings_per_frame=self.max_debug_bindings,
-                max_value_bytes=self.max_debug_value.bytes,
+                budget=self.debug_budget(),
             )
         return mcp.ExecutionLimits(
             max_code_bytes=self.max_code.bytes,
-            max_timeout_ms=self.max_timeout.milliseconds,
-            max_output_bytes=self.max_output.bytes,
+            budget=self.execution_budget(),
             max_concurrent=self.max_concurrent,
             debug=debug,
         )
@@ -312,7 +305,7 @@ class ValidationConfig(ConfigModel):
 
 
 class ValidatorsConfig(ConfigModel):
-    """Workspace command checks requested before publication."""
+    """Workspace command checks run in the projection each time a change applies."""
 
     commands: list[mcp.CommandValidator] = Field(
         default_factory=list,
@@ -355,7 +348,7 @@ class AdapterProcessConfig(ConfigModel):
 
 
 class RiftConfig(ConfigModel):
-    """Workspace behavior loaded from the physical root's ``rift.toml``."""
+    """Workspace behavior loaded from the workspace-root ``rift.toml``."""
 
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)

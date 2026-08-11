@@ -170,14 +170,12 @@ class SchemaCompiler:
         name: str,
         schema: dict[str, Any],
         mapping: Proto,
-        *,
-        prefixed: bool,
     ) -> EnumSpec:
         values_meta = {value.json: value for value in mapping.enum_values}
         descriptions = schema.get("rift:enumDescriptions", {})
         values = [
             EnumValueSpec(
-                name=(f"{scream(name)}_" if prefixed else "") + "UNSPECIFIED",
+                name=f"{scream(name)}_UNSPECIFIED",
                 number=0,
                 description="The caller did not set a value.",
             )
@@ -209,6 +207,13 @@ class SchemaCompiler:
             enum_name = target.mapping.enum_name
             if enum_name is None:
                 raise TypeError(f"{ref} has no Protobuf enum name")
+            if target.mapping.named:
+                qualified = (
+                    enum_name
+                    if target.owner == self.owner
+                    else f"rift.{target.owner}.{enum_name}"
+                )
+                return qualified, False, None, None
             nested_enums.append((enum_name, copy.deepcopy(target.body), target.mapping))
             return enum_name, False, None, None
         if ref:
@@ -256,6 +261,11 @@ class SchemaCompiler:
         for json_name, field_schema in schema.get("properties", {}).items():
             declared = declared_fields.get(json_name)
             if declared is None or declared.number is None:
+                if declared is not None and ref_name(real_schema(field_schema)):
+                    raise TypeError(
+                        f"{name}.{json_name} references a definition but carries no "
+                        "proto number"
+                    )
                 continue
             kind, repeated, map_key, map_value = (
                 (
@@ -307,9 +317,8 @@ class SchemaCompiler:
                     raise ValueError(f"{name} nests two different enums as {enum_name}")
                 continue
             deduped[enum_name] = (enum_name, enum_schema, enum_mapping)
-        prefixed = len(deduped) > 1
         nested = [
-            self.enum(enum_name, enum_schema, mapping, prefixed=prefixed)
+            self.enum(enum_name, enum_schema, mapping)
             for enum_name, enum_schema, mapping in deduped.values()
         ]
         message = MessageSpec(
@@ -364,7 +373,7 @@ class SchemaCompiler:
                     continue
                 if name not in self.enum_names:
                     self.enum_names.add(name)
-                    self.enums.append(self.enum(name, schema, mapping, prefixed=True))
+                    self.enums.append(self.enum(name, schema, mapping))
             elif ("oneOf" in schema or "anyOf" in schema) and mapping.kind == "union":
                 if mapping.named:
                     self.compile_union(definition)
@@ -509,7 +518,11 @@ def message_from_model(model: type[Any]) -> MessageSpec:
                 type=wire_type,
                 description=pydantic_field.description,
                 repeated=repeated,
-                optional=nullable and isinstance(wire_type, int),
+                optional=nullable
+                and (
+                    isinstance(wire_type, int)
+                    or (isinstance(wire_type, str) and "." not in wire_type)
+                ),
                 oneof=oneof,
                 deprecated=declared.deprecated,
             )

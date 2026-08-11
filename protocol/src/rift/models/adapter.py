@@ -9,30 +9,6 @@ from .base import *
 @proto_message(
     DirectMessage(
         ADAPTER,
-        description="One generated adapter wire contract supported by the process.",
-        section="Capabilities",
-    )
-)
-class AdapterContract(ProtoModel):
-    major: Field[core.ProtocolVersion] = proto_field(
-        default=..., number=1, description="Breaking adapter protocol generation."
-    )
-    minor: Field[int] = proto_field(
-        default=...,
-        number=2,
-        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
-        description="Additive revision within the selected major.",
-    )
-    schema_digest: Field[core.Digest] = proto_field(
-        default=...,
-        number=3,
-        description="SHA-256 of the generated adapter descriptor.",
-    )
-
-
-@proto_message(
-    DirectMessage(
-        ADAPTER,
         description="Adapter capabilities read once during startup.",
         reserved_numbers=(1,),
         section="Capabilities",
@@ -114,12 +90,12 @@ class Capabilities(ProtoModel):
     runtime: Field[RuntimeRequirements] = proto_field(
         default=...,
         number=13,
-        description="Execution behavior the host should account for while this adapter runs.",
+        description="Execution behavior this adapter declares, for the operator's information.",
     )
-    contracts: Field[list[AdapterContract]] = proto_field(
+    protocol_versions: Field[list[core.ProtocolVersion]] = proto_field(
         default=...,
         number=14,
-        description="Supported generated contracts in adapter preference order.",
+        description="Versions the adapter implements, in preference order.",
     )
 
     @model_validator(mode="after")
@@ -141,8 +117,8 @@ class Capabilities(ProtoModel):
         }
         if operations.intersection(debug) and not debug.issubset(operations):
             raise ValueError("Capabilities debugging operations are all-or-none")
-        if not self.contracts:
-            raise ValueError("Capabilities.contracts must not be empty")
+        if not self.protocol_versions:
+            raise ValueError("Capabilities.protocol_versions must not be empty")
         return self
 
 
@@ -242,13 +218,13 @@ class AuxiliaryClaimPurpose(IntEnum):
     add or remove whole source trees, which Rift has to rescan for. What the
     adapter has to redo is `environment_defining`."""
 
-    UNSPECIFIED = 0
-    ADAPTER_CONFIGURATION = 1
-    DEPENDENCY_MANIFEST = 2
-    DEPENDENCY_LOCK = 3
-    WORKSPACE_MANIFEST = 4
-    GENERATED_METADATA = 5
-    OTHER = 6
+    PURPOSE_UNSPECIFIED = 0
+    PURPOSE_ADAPTER_CONFIGURATION = 1
+    PURPOSE_DEPENDENCY_MANIFEST = 2
+    PURPOSE_DEPENDENCY_LOCK = 3
+    PURPOSE_WORKSPACE_MANIFEST = 4
+    PURPOSE_GENERATED_METADATA = 5
+    PURPOSE_OTHER = 6
 
 
 @proto_message(
@@ -302,12 +278,11 @@ class AuxiliaryClaim(ProtoModel):
         ADAPTER,
         description=(
             "Paths inside the workspace that this adapter writes to. Rift\n classifies each "
-            "claimed subtree as adapter output and excludes it from\n source analysis and agent results.\n "
+            "claimed subtree as adapter output and excludes it from\n source analysis and caller results.\n "
             "Write claims are exclusive across adapters "
             "sharing a connection projection. Rift\n refuses workspace admission when two "
             "adapters can write the same path; one\n of them must redirect that output to its "
-            "private state_root.\n\n CARGO_TARGET_DIR, GOCACHE, PYTHONPYCACHEPREFIX, and "
-            "tsBuildInfoFile can point\n at `state_root`. Declare generated output that must remain "
+            "private state_root.\n\n Declare generated output that must remain "
             "beside source, such as npm's `node_modules`; an already tracked source path remains "
             "source even when a claim matches it.\n\n Selectors follow "
             "SourceClaim's bytewise rules. A directory name matches the\n directory and "
@@ -319,13 +294,12 @@ class AuxiliaryClaim(ProtoModel):
 class WriteClaim(ProtoModel):
     """Paths inside the workspace that this adapter writes to. Rift
     classifies each claimed subtree as adapter output and excludes it from
-    source analysis and agent results.
+    source analysis and caller results.
     Write claims are exclusive across adapters sharing a connection projection. Rift
     refuses workspace admission when two adapters can write the same path; one
     of them must redirect that output to its private state_root.
 
-    CARGO_TARGET_DIR, GOCACHE, PYTHONPYCACHEPREFIX, and tsBuildInfoFile can point
-    at `state_root`. Declare generated output that must remain beside source, such as npm's
+    Declare generated output that must remain beside source, such as npm's
     `node_modules`; an already tracked source path remains source even when a claim matches it.
 
     Selectors follow SourceClaim's bytewise rules. A directory name matches the
@@ -484,33 +458,47 @@ class ExtensionDescriptor(ProtoModel):
 )
 class AdapterLimits(ProtoModel):
     """Bounds this adapter advertises. One process holds state for several server-owned
-    projections, so each state receives its own in-flight limit."""
+    projections, so each state receives its own in-flight limit. Rift enforces these bounds
+    and never exceeds them; a call past a bound anyway returns `RESOURCE_EXHAUSTED`, and Rift
+    retries after an in-flight call completes."""
 
     max_message_bytes: Field[int] = proto_field(
         default=...,
         number=1,
+        ge=4194304,
         proto_type=ProtoFieldDescriptor.TYPE_UINT64,
-        description="Largest single message this adapter will accept or send. A fact batch is\n split to stay under it.",
+        description=(
+            "Largest single message this adapter will accept or send, at least 4 MiB; "
+            "`Describe` precedes this declaration and is exempt. A fact batch is split to stay "
+            "under it, and a single fact that cannot fit alone is dropped — its file's coverage "
+            "for that family reports partial with a reason."
+        ),
     )
     max_in_flight: Field[int] = proto_field(
         default=...,
         number=2,
+        ge=1,
         proto_type=ProtoFieldDescriptor.TYPE_UINT32,
-        description="Concurrent calls accepted across the whole connection.",
+        description="Concurrent calls accepted across the whole connection, at least one.",
     )
     max_in_flight_per_state: Field[int] = proto_field(
         default=...,
         number=3,
+        ge=1,
         proto_type=ProtoFieldDescriptor.TYPE_UINT32,
-        description="Concurrent calls accepted for one adapter state, so one caller cannot consume the process.",
+        description="Concurrent calls accepted for one adapter state, at least one, so one adapter state cannot consume the process.",
     )
     max_states: Field[int] = proto_field(
         default=...,
         number=4,
+        ge=1,
         proto_type=ProtoFieldDescriptor.TYPE_UINT32,
         description=(
-            "Server-owned projection states this adapter will hold at once. Each can retain a "
-            "parsed tree, index, and runtime worker, so the bound controls resource use."
+            "Server-owned projection states this adapter will hold at once, at least one. Each "
+            "can retain a parsed tree, index, and runtime worker, so the bound controls "
+            "resource use. A debug-retained state is pinned and does not count as idle: the "
+            "server refuses `debug_start` with `temporarily_unavailable` when granting it "
+            "would leave no state to evict."
         ),
     )
 
@@ -519,17 +507,17 @@ class AdapterLimits(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Execution behavior reported by an adapter process for server admission and diagnostics.\n "
-            "Rift does not isolate the process or its workers from the host. These requirements\n "
-            "do not select the project runtime used for one adapter state."
+            "Execution behavior an adapter process declares, disclosed to the operator who\n "
+            "configured it. Rift does not isolate the process or its workers from the host.\n "
+            "These requirements do not select the project runtime used for one adapter state."
         ),
         section="Capabilities",
     )
 )
 class RuntimeRequirements(ProtoModel):
-    """Execution behavior reported by an adapter process for server admission and diagnostics.
-    Rift does not isolate the process or its workers from the host. These requirements
-    do not select the project runtime used for one adapter state."""
+    """Execution behavior an adapter process declares, disclosed to the operator who
+    configured it. Rift does not isolate the process or its workers from the host.
+    These requirements do not select the project runtime used for one adapter state."""
 
     executes_workspace_code: Field[bool] = proto_field(
         default=...,
@@ -595,16 +583,17 @@ class OpenRequest(ProtoModel):
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
             "Absolute path to a directory the adapter owns and Rift never reads. Build\n "
-            "output belongs here — point CARGO_TARGET_DIR and friends at it. Every open\n "
-            "adapter state receives a distinct path, and Rift never reuses that path after\n "
+            "output belongs here — point CARGO_TARGET_DIR and friends at it. Rift creates it\n "
+            "before Open, deletes it after Close returns, and reclaims orphaned ones at server\n "
+            "startup; every open adapter state receives a distinct path, never reused after\n "
             "Close. An adapter may maintain its own shared read-only cache\n outside this "
             "directory when its language toolchain supports safe sharing."
         ),
     )
-    contract: Field[AdapterContract] = proto_field(
+    protocol_version: Field[core.ProtocolVersion] = proto_field(
         default=...,
         number=4,
-        description="Exact contract selected from the adapter's `Capabilities.contracts`.",
+        description="Exact version selected from the adapter's `Capabilities.protocol_versions`.",
     )
     root: Field[str] = proto_field(
         default=...,
@@ -624,7 +613,7 @@ class OpenRequest(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Rift changed files in a projection. It sends this call to every language\n"
+            "Rift changed files in a projection. Rift issues this call to every language\n"
             " adapter holding the shared path. Paths are\n "
             "project-relative and cover every file Rift touched; each adapter decides\n which "
             "changes reach its own analysis. Content is on disk before this call. The adapter\n "
@@ -663,7 +652,7 @@ class RefreshRequest(ProtoModel):
         ADAPTER,
         description=(
             "One atomic replacement of the virtual sources consumed by an adapter. Rift\n "
-            "sends exactly one `start` event first, then each `unit` followed by ordered\n "
+            "emits exactly one `start` event first, then each `unit` followed by ordered\n "
             "`text` chunks ending in `final: true`. The complete stream replaces the\n "
             "previous overlay; an RPC failure leaves the previous generation intact. The\n "
             "units are the complete set selected for this consumer at `start`,\n "
@@ -674,7 +663,7 @@ class RefreshRequest(ProtoModel):
 )
 class VirtualSyncEvent(ProtoModel):
     """One atomic replacement of the virtual sources consumed by an adapter. Rift
-    sends exactly one `start` event first, then each `unit` followed by ordered
+    emits exactly one `start` event first, then each `unit` followed by ordered
     `text` chunks ending in `final: true`. The complete stream replaces the
     previous overlay; an RPC failure leaves the previous generation intact. The
     units are the complete set selected for this consumer at `start`,
@@ -753,7 +742,11 @@ class AnalyzeRequest(ProtoModel):
     )
 )
 class AnalyzeEvent(ProtoModel):
-    """One event of an analyze stream, followed eventually by exactly one summary."""
+    """One event of an analyze stream, followed eventually by exactly one summary. Files
+    interleave freely; for one file the order is its unit event, then its facts, then exactly
+    one coverage event, and nothing for that file after its coverage. Every unit the request
+    names gets a coverage event — an absent one with `present` false — and a unit outside the
+    adapter's claims is `INVALID_ARGUMENT`."""
 
     source_unit: Field[SourceUnit | None] = proto_field(
         default=None,
@@ -1272,7 +1265,14 @@ class MatchEvent(ProtoModel):
 
 @proto_message(DirectMessage(ADAPTER, section="Matching"))
 class Matches(ProtoModel):
-    items: Field[list[StructuralMatch]] = proto_field(default=..., number=1)
+    items: Field[list[StructuralMatch]] = proto_field(
+        default=...,
+        number=1,
+        description=(
+            "Matches sorted by unit UTF-8 bytes, range start, range end, then RFC 8785 "
+            "bytes of their replacement ranges and captures."
+        ),
+    )
 
 
 @proto_message(
@@ -1326,11 +1326,7 @@ class MatchSummary(ProtoModel):
     coverage: Field[core.Coverage] = proto_field(
         default=...,
         number=2,
-        description=(
-            "Matches sort by unit UTF-8 bytes, range start, range end, then RFC 8785\n bytes "
-            "of their replacement ranges and captures.\n How much of the workspace the pattern "
-            "actually reached."
-        ),
+        description="How much of the searched source the pattern reached.",
     )
 
 
@@ -1356,7 +1352,11 @@ class ActionsRequest(ProtoModel):
     target: Field[core.Address] = proto_field(
         default=...,
         number=2,
-        description="Where in the code to ask: a symbol, a node, a byte range, or a match.",
+        description=(
+            "Where in the code to ask: a symbol, a node, or a byte range. Rift resolves a "
+            "match address to its span before this call, so the match branch never reaches "
+            "an adapter."
+        ),
     )
     only: Field[list[str]] = proto_field(
         default=...,
@@ -1546,6 +1546,17 @@ class ExecuteRequest(ProtoModel):
         number=3,
         description="Exact workspace-configured bounds the adapter must enforce for this evaluation.",
     )
+    execution_root: Field[str] = proto_field(
+        default=...,
+        number=4,
+        proto_type=ProtoFieldDescriptor.TYPE_STRING,
+        description=(
+            "Absolute path to a disposable copy of the projection, created outside the "
+            "projection and outside the workspace so its contents never publish. Rift "
+            "materializes it for this evaluation and deletes it when the call returns; "
+            "`block.working_directory` resolves against it."
+        ),
+    )
 
 
 @proto_message(
@@ -1647,6 +1658,17 @@ class DebugStartRequest(ProtoModel):
         number=3,
         description="Exact workspace-configured bounds for evaluation, retained frames, and bindings.",
     )
+    execution_root: Field[str] = proto_field(
+        default=...,
+        number=4,
+        proto_type=ProtoFieldDescriptor.TYPE_STRING,
+        description=(
+            "Absolute path to a disposable copy of the projection, created outside the "
+            "projection and outside the workspace so its contents never publish. Rift "
+            "materializes it for this evaluation and deletes it at `DebugStop`, the idle "
+            "timeout, or state cleanup; `block.working_directory` resolves against it."
+        ),
+    )
 
 
 @proto_message(
@@ -1695,52 +1717,11 @@ class DebugStopRequest(ProtoModel):
     session: Field[DebugSessionKey] = proto_field(default=..., number=1)
 
 
-@proto_enum(
-    DirectEnum(
-        ADAPTER,
-        name="Reason",
-        parent=lambda: Refusal,
-        description=(
-            "Why the adapter declined. The value is what a caller acts on: some of these\n are "
-            "worth retrying after a Refresh, and the rest never are."
-        ),
-        value_descriptions=(
-            "The adapter did not classify it. Treated as permanent.",
-            "The operation has no implementation for this language. Retrying is futile.",
-            "The code has to change first — a file must compile before this can run.",
-            "The address resolves to several targets. The caller narrows it and asks\n again.",
-            (
-                "The action was discovered against an adapter state that has advanced.\n "
-                "Rediscover it and resolve the new token."
-            ),
-            "The match was found against an adapter state that has advanced. Search again.",
-            (
-                "Doing it would reach further than the caller can have meant — outside the\n "
-                "workspace, or into generated code nothing regenerates."
-            ),
-            "The language itself forbids it: a rename to a reserved word, a visibility\n change its rules do not allow.",
-        ),
-    )
-)
-class RefusalReason(IntEnum):
-    """Why the adapter declined. The value is what a caller acts on: some of these
-    are worth retrying after a Refresh, and the rest never are."""
-
-    UNSPECIFIED = 0
-    UNSUPPORTED = 1
-    UNMET_PRECONDITION = 2
-    AMBIGUOUS_TARGET = 3
-    STALE_ACTION = 4
-    STALE_MATCH = 5
-    UNSAFE_EFFECT = 6
-    LANGUAGE_REFUSAL = 7
-
-
 @proto_message(
     DirectMessage(
         ADAPTER,
         description=(
-            "Carried in `google.rpc.Status.details` when an adapter declines work it\n "
+            "Carried in `google.rpc.Status.details` when an adapter refuses work it\n "
             "understood: the target is ambiguous, an action went stale, the language\n forbids "
             "it. Everything else is an ordinary status code."
         ),
@@ -1748,14 +1729,20 @@ class RefusalReason(IntEnum):
     )
 )
 class Refusal(ProtoModel):
-    """Carried in `google.rpc.Status.details` when an adapter declines work it
-    understood: the target is ambiguous, an action went stale, the language
-    forbids it. Everything else is an ordinary status code."""
+    """Carried in `google.rpc.Status.details` on `FAILED_PRECONDITION` when an adapter
+    refuses work it understood: the target is ambiguous, an action went stale, the language
+    forbids it. A malformed request is `INVALID_ARGUMENT` with no detail; everything else is
+    an ordinary status code."""
 
-    reason: Field[RefusalReason] = proto_field(
+    reason: Field[core.RefusalReason] = proto_field(
         default=...,
         number=1,
-        description="Which class of refusal this is, so a caller can decide without parsing\n `message`.",
+        description=(
+            "Which class of refusal this is, so the server can decide without parsing\n "
+            "`message`. Adapters emit `unsupported`, `unmet_precondition`, "
+            "`ambiguous_target`, `stale_action`, `stale_match`, `unsafe_effect`, and "
+            "`language_refusal`; the remaining reasons are Rift's own."
+        ),
     )
     message: Field[str] = proto_field(
         default=...,
@@ -1781,14 +1768,16 @@ class Refusal(ProtoModel):
         ADAPTER,
         description=(
             "Carried in `google.rpc.Status.details` when a pinned call names a state the\n "
-            "adapter has moved past. The caller resyncs to `actual` before retrying."
+            "adapter has moved past. The server resyncs to `actual` before retrying."
         ),
         section="Failure",
     )
 )
 class StaleState(ProtoModel):
-    """Carried in `google.rpc.Status.details` when a pinned call names a state the
-    adapter has moved past. The caller resyncs to `actual` before retrying."""
+    """Carried in `google.rpc.Status.details` on `ABORTED` when a pinned call names a state
+    the adapter has moved past. The server resyncs to `actual` before retrying. A call naming
+    a state from a previous adapter process is `NOT_FOUND` instead: there is no `actual` to
+    resync to, and the server reopens the state."""
 
     actual: Field[AdapterState] = proto_field(default=..., number=1)
 
@@ -1805,7 +1794,6 @@ ADAPTER_PACKAGE = ProtoPackage(
         section_option=True,
     ),
     models=(
-        AdapterContract,
         Capabilities,
         SourceClaim,
         AuxiliaryClaim,
@@ -1866,7 +1854,10 @@ ADAPTER_PACKAGE = ProtoPackage(
         Service(
             "Adapter",
             (
-                "Everything Rift can ask one language for. The adapter answers `Describe`\n once, "
+                "Everything Rift can ask one language for. The server starts the adapter process\n "
+                "and passes the gRPC endpoint in the RIFT_ADAPTER_ENDPOINT environment value; the\n "
+                "adapter binds it, and the socket accepting is its readiness signal. The adapter\n "
+                "answers `Describe` once, "
                 "then holds state for projections and answers questions about their code. Optional\n "
                 "calls are advertised in `Capabilities.operations`; an unimplemented call returns\n"
                 " gRPC `UNIMPLEMENTED`. Rift issues only advertised optional calls. Returning\n "
@@ -1879,7 +1870,10 @@ ADAPTER_PACKAGE = ProtoPackage(
                     Capabilities,
                     description=(
                         "What this adapter can do, asked once before anything else. Rift holds the\n "
-                        "adapter to exactly what it claims here and never probes or feature-tests."
+                        "adapter to exactly what it claims here and never probes or feature-tests.\n "
+                        "This call and its response stay decodable across protocol versions, so a\n "
+                        "contract mismatch surfaces as a workspace admission failure rather than a\n "
+                        "decode error; version selection itself happens at Open."
                     ),
                 ),
                 Rpc(
@@ -1887,7 +1881,7 @@ ADAPTER_PACKAGE = ProtoPackage(
                     OpenRequest,
                     AdapterState,
                     description=(
-                        "Here is the Rift FS projection. The adapter can inspect its "
+                        "Open one Rift FS projection so the adapter can inspect its "
                         "source, select a runtime worker, and initialize state."
                     ),
                 ),
@@ -1896,11 +1890,13 @@ ADAPTER_PACKAGE = ProtoPackage(
                     RefreshRequest,
                     AdapterState,
                     description=(
-                        "The files on disk moved to a new state, and these are the paths that "
+                        "Advance an open state to the tree's new content, naming the paths that "
                         "changed. The adapter re-evaluates runtime-defining inputs before "
                         "acknowledging the new state. Without this it would have to stat the tree "
                         "to find out, and rebuilding adapter state per edit would discard "
-                        "incremental work."
+                        "incremental work. Rift drains calls in flight for this adapter state "
+                        "before the refresh and blocks new ones until it returns, so a generation "
+                        "never advances under an open stream."
                     ),
                 ),
                 Rpc(
@@ -1921,9 +1917,11 @@ ADAPTER_PACKAGE = ProtoPackage(
                     CloseRequest,
                     ProtoEmpty,
                     description=(
-                        "Release this tree's adapter state so Rift can delete the tree. Refused while\n "
-                        "calls are in flight so their adapter state and source path remain valid\n through "
-                        "the final stream event."
+                        "Release this tree's adapter state so Rift can delete the tree. Refused with\n "
+                        "`FAILED_PRECONDITION` while calls are in flight, so their adapter state and\n "
+                        "source path remain valid through the final stream event; Rift drains or\n "
+                        "cancels first. Rift deletes the state's `state_root` after this returns, so\n "
+                        "the adapter releases every handle into it before returning."
                     ),
                 ),
                 Rpc(

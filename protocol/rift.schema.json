@@ -39,7 +39,7 @@
     },
     "CommandValidator": {
       "additionalProperties": false,
-      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there joins the changeset.",
+      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes.",
       "properties": {
         "id": {
           "description": "Label shown with this validator. It is unique within `validators.commands`.",
@@ -57,7 +57,7 @@
           }
         },
         "argv": {
-          "description": "Executable followed by literal arguments. An absolute executable path is refused; a bare name resolves through the validator PATH and a relative path resolves below `working_directory`. Rift performs no shell expansion.",
+          "description": "Executable followed by literal arguments. An absolute executable path is refused; a bare name resolves through the `PATH` of the merged environment the command runs with, and a relative path resolves below `working_directory` in the session projection. Rift performs no shell expansion.",
           "items": {
             "type": "string"
           },
@@ -76,7 +76,7 @@
         },
         "working_directory": {
           "$ref": "#/$defs/ProjectPath",
-          "description": "Directory below the project root in which the process starts. The empty path selects the root.",
+          "description": "Directory below the projection root in which the process starts. The empty path selects the root.",
           "rift:proto": {
             "number": 5
           }
@@ -85,7 +85,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Environment additions declared for the command. Rift starts it directly without a shell and supplies its working directory separately.",
+          "description": "Environment values added on top of the environment the server inherited. Rift starts the command directly, without a shell, and supplies its working directory separately.",
           "propertyNames": {
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
           },
@@ -116,7 +116,7 @@
           "type": "integer"
         },
         "guarantees": {
-          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result rejects publication.",
+          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement` to the change.",
           "items": {
             "$ref": "#/$defs/CommandValidatorGuarantees"
           },
@@ -320,7 +320,15 @@
       "type": "string"
     },
     "CoverageScope": {
-      "anyOf": [
+      "description": "What a completeness statement covers \u2014 everything the request asked for, one file, or a standing scope the answer holds over.",
+      "discriminator": {
+        "mapping": {
+          "reach": "#/$defs/CoverageScopeKind",
+          "unit": "#/$defs/CoverageScopeUnit"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
         {
           "$ref": "#/$defs/CoverageScopeKind"
         },
@@ -328,16 +336,15 @@
           "$ref": "#/$defs/CoverageScopeUnit"
         }
       ],
-      "description": "What a completeness statement covers \u2014 everything the request asked for, one file, or a standing scope the answer holds over.",
       "rift:package": "rift.core",
       "rift:proto": {
         "oneof": "variant",
         "type": "rift.core.CoverageScope",
         "variants": [
           {
-            "field": "kind",
+            "field": "reach",
             "number": 1,
-            "tag": null,
+            "tag": "reach",
             "type": "CoverageScopeKind"
           },
           {
@@ -355,6 +362,11 @@
       "description": "A standing scope identified by its name.",
       "properties": {
         "kind": {
+          "const": "reach",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reach": {
           "$ref": "#/$defs/CoverageReach",
           "rift:proto": {
             "number": 1
@@ -362,7 +374,8 @@
         }
       },
       "required": [
-        "kind"
+        "kind",
+        "reach"
       ],
       "rift:package": "rift.core",
       "rift:proto": {
@@ -429,7 +442,7 @@
           "type": "array",
           "uniqueItems": true
         },
-        "max-code": {
+        "max_code": {
           "$ref": "#/$defs/ByteSize",
           "default": "16KiB",
           "description": "Maximum UTF-8 bytes in one CodeBlock.source.",
@@ -437,9 +450,13 @@
             "field": "source",
             "model": "CodeBlock"
           },
-          "rift:conversion": "UTF-8 byte length"
+          "rift:conversion": "UTF-8 byte length",
+          "rift:range": {
+            "max": "32KiB",
+            "min": "1B"
+          }
         },
-        "max-timeout": {
+        "max_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30s",
           "description": "Wall-clock bound applied to each execution and debugging evaluation.",
@@ -447,9 +464,13 @@
             "field": "timeout_ms",
             "model": "ExecutionBudget"
           },
-          "rift:conversion": "Duration.milliseconds"
+          "rift:conversion": "Duration.milliseconds",
+          "rift:range": {
+            "max": "1d",
+            "min": "1ms"
+          }
         },
-        "max-output": {
+        "max_output": {
           "$ref": "#/$defs/ByteSize",
           "default": "8KiB",
           "description": "Captured prefix bound applied separately to stdout and stderr.",
@@ -457,30 +478,38 @@
             "field": "output_bytes",
             "model": "ExecutionBudget"
           },
-          "rift:conversion": "ByteSize.bytes"
+          "rift:conversion": "ByteSize.bytes",
+          "rift:range": {
+            "max": "16KiB",
+            "min": "0B"
+          }
         },
-        "max-concurrent": {
+        "max_concurrent": {
           "default": 2,
           "description": "Evaluations admitted concurrently across the workspace.",
           "maximum": 64,
           "minimum": 1,
-          "title": "Max-Concurrent",
+          "title": "Max Concurrent",
           "type": "integer"
         },
-        "max-debug-sessions": {
+        "max_debug_sessions": {
           "default": 2,
           "description": "Retained debugging sessions admitted across the workspace.",
           "maximum": 16,
           "minimum": 1,
-          "title": "Max-Debug-Sessions",
+          "title": "Max Debug Sessions",
           "type": "integer"
         },
-        "debug-idle-timeout": {
+        "debug_idle_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "5m",
-          "description": "Idle time before Rift stops a debugging session and releases its lease."
+          "description": "Idle time before Rift stops a debugging session and releases its lease.",
+          "rift:range": {
+            "max": "1d",
+            "min": "1ms"
+          }
         },
-        "max-debug-frames": {
+        "max_debug_frames": {
           "default": 64,
           "description": "Stack frames one failed debugging evaluation may retain.",
           "maximum": 256,
@@ -489,10 +518,10 @@
             "field": "frames",
             "model": "DebugBudget"
           },
-          "title": "Max-Debug-Frames",
+          "title": "Max Debug Frames",
           "type": "integer"
         },
-        "max-debug-bindings": {
+        "max_debug_bindings": {
           "default": 32,
           "description": "Arguments plus locals returned for one debug frame.",
           "maximum": 128,
@@ -501,10 +530,10 @@
             "field": "bindings_per_frame",
             "model": "DebugBudget"
           },
-          "title": "Max-Debug-Bindings",
+          "title": "Max Debug Bindings",
           "type": "integer"
         },
-        "max-debug-value": {
+        "max_debug_value": {
           "$ref": "#/$defs/ByteSize",
           "default": "1KiB",
           "description": "Captured UTF-8 bytes in each adapter-rendered debug binding value.",
@@ -512,14 +541,18 @@
             "field": "value_bytes",
             "model": "DebugBudget"
           },
-          "rift:conversion": "ByteSize.bytes"
+          "rift:conversion": "ByteSize.bytes",
+          "rift:range": {
+            "max": "8KiB",
+            "min": "0B"
+          }
         }
       },
       "title": "ExecutionConfig",
       "type": "object"
     },
     "FileId": {
-      "description": "Identity of one file in the session projection. The path after `rift://file/` is a\ncanonical project-relative path.",
+      "description": "Identity of one file in the session projection. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
       "examples": [
         "rift://file/pkg/util.py",
         "rift://file/src/%E2%98%83.ts",
@@ -578,12 +611,12 @@
     },
     "LanguageSelector": {
       "description": "The TOML spelling of the same exact language pair represented by ``core.Language``.",
-      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}(?::[A-Za-z][A-Za-z0-9._-]{0,63})?$",
+      "pattern": "^[a-z][a-z0-9._-]{0,63}(?::[a-z][a-z0-9._-]{0,63})?$",
       "title": "LanguageSelector",
       "type": "string"
     },
     "ProjectPath": {
-      "description": "One path below the project root, using forward slashes and UTF-8. The empty path names\nthe root itself. Absolute paths, backslashes, control characters, empty segments, and `.` or\n`..` segments are refused before the filesystem is touched. The limit is 1000 UTF-8 bytes,\nnot characters.",
+      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC \u2014 Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments, and\n`.` or `..` segments are refused before the filesystem is touched. The limit is 1000 UTF-8\nbytes, not characters. A workspace holding two entries whose NFC forms are equal fails the\nread that touches them with `content_unavailable`.",
       "examples": [
         "",
         "src/config.ts",
@@ -632,7 +665,7 @@
     },
     "ValidatorsConfig": {
       "additionalProperties": false,
-      "description": "Workspace command checks requested before publication.",
+      "description": "Workspace command checks run in the projection each time a change applies.",
       "properties": {
         "commands": {
           "description": "Exact command declarations, in execution order.",

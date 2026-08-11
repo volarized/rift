@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pydantic import model_validator
+
 from . import core, scip
 from .base import *
 
@@ -13,40 +15,79 @@ from .base import *
         value_descriptions=(
             "The server did not classify the omission.",
             "SCIP v0.9.0 has no field with the same meaning.",
-            "The projection contract excludes the value. `detail` states the boundary.",
+            "No adapter serves the file's language, or its adapter was unavailable while the export ran.",
+            "SCIP cannot carry the path: a symbolic link, or a form the SCIP canonical-path rules forbid.",
+            "The unit cannot fit one 4 MiB stream event on its own.",
         ),
     )
 )
 class OmissionReason(IntEnum):
     REASON_UNSPECIFIED = 0
     REASON_UNREPRESENTABLE = 1
-    REASON_OUTSIDE_PROJECTION = 2
+    REASON_NO_ANALYSIS = 2
+    REASON_UNINDEXABLE_PATH = 3
+    REASON_TOO_LARGE = 4
 
 
 @proto_message(
     DirectMessage(
         RIFT_SCIP,
-        description="One populated Rift field absent from the projected index.",
+        description=(
+            "One unit of Rift data absent from the projected index: a populated field the "
+            "mapping dropped, or a whole file the export could not carry."
+        ),
     )
 )
 class Omission(ProtoModel):
-    field: Field[str] = proto_field(
-        default=...,
+    field: Field[str | None] = proto_field(
+        default=None,
         number=1,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
-        description="Core model and field path whose populated value was omitted.",
+        description=(
+            "Core model and field path whose populated value was omitted, such as "
+            "`Relationship.evidence`. Absent when the omission covers a whole file named "
+            "by `path`."
+        ),
     )
     reason: Field[OmissionReason] = proto_field(
         default=...,
         number=2,
-        description="Why the value has no field in the projected index.",
+        description="Why the value has no place in the projected index.",
     )
     detail: Field[str | None] = proto_field(
         default=None,
         number=3,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
-        description="The mapping boundary when `reason` is `REASON_OUTSIDE_PROJECTION`.",
+        description=(
+            "What was dropped, named concretely: the meaning SCIP lacks a field for, the "
+            "language with no adapter, or the forbidden path form."
+        ),
     )
+    count: Field[int] = proto_field(
+        default=...,
+        number=4,
+        proto_type=ProtoFieldDescriptor.TYPE_UINT64,
+        description="How many populated values or files this record covers across the index.",
+    )
+    language: Field[core.Language | None] = proto_field(
+        default=None,
+        number=5,
+        description=(
+            "The exact `Language` whose facts were omitted. Absent when no language claims "
+            "the unit, as for a path the export never analyzed."
+        ),
+    )
+    path: Field[core.ProjectPath | None] = proto_field(
+        default=None,
+        number=6,
+        description="The file the omission covers. Absent when `field` names the unit.",
+    )
+
+    @model_validator(mode="after")
+    def names_a_unit(self) -> Omission:
+        if self.field is None and self.path is None:
+            raise ValueError("an omission names a field or a path")
+        return self
 
 
 @proto_message(
@@ -55,14 +96,35 @@ class Omission(ProtoModel):
     )
 )
 class Request(ProtoModel):
-    session: Field[str] = proto_field(
+    session: Field[core.SessionId] = proto_field(
         default=...,
         number=2,
-        proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
             "Session whose projection is exported. The export reads the projection as it "
-            "stands, so a write landing mid-stream can make the index inconsistent; a "
-            "consumer that needs a whole one reads again."
+            "stands, dirty content included, so a write landing mid-stream can make the "
+            "index inconsistent; a consumer that needs a whole one reads again."
+        ),
+    )
+
+
+@proto_message(
+    DirectMessage(
+        RIFT_SCIP,
+        description="Analysis coverage for one language over the whole projection.",
+    )
+)
+class LanguageCoverage(ProtoModel):
+    language: Field[core.Language] = proto_field(
+        default=...,
+        number=1,
+        description="The exact `Language` the coverage is stated for.",
+    )
+    coverage: Field[core.SemanticCoverage] = proto_field(
+        default=...,
+        number=2,
+        description=(
+            "The weakest per-file coverage the language's adapter reported for each fact "
+            "family across the projection."
         ),
     )
 
@@ -73,32 +135,46 @@ class Request(ProtoModel):
     )
 )
 class Header(ProtoModel):
-    session: Field[str] = proto_field(
+    session: Field[core.SessionId] = proto_field(
         default=...,
         number=2,
-        proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description="Session whose projection produced every following record.",
     )
     metadata: Field[scip.Metadata] = proto_field(
         default=...,
         number=3,
-        description="The metadata field of the projected `scip.Index`.",
+        description=(
+            "The `metadata` of the projected `scip.Index`. `project_root` is the file URI "
+            "of the session projection directory, `text_document_encoding` is UTF-8, and "
+            "`tool_info` carries the name `rift` with the server build version."
+        ),
     )
-    coverage: Field[core.SemanticCoverage] = proto_field(
+    coverage: Field[list[LanguageCoverage]] = proto_field(
         default=...,
         number=4,
-        description="Availability of each Rift fact family used by the projection.",
+        description=(
+            "Analysis coverage per language, sorted by language name then dialect. It "
+            "states what the underlying analysis established; what the SCIP mapping then "
+            "dropped is in `omissions`."
+        ),
     )
     omissions: Field[list[Omission]] = proto_field(
         default=...,
         number=5,
-        description="Populated Rift fields absent from the index, sorted by field and reason.",
+        description=(
+            "Rift data absent from the index, sorted by language, field, path, and reason."
+        ),
     )
 
 
 @proto_message(
     DirectMessage(
-        RIFT_SCIP, description="One ordered part of a projected `scip.Index`."
+        RIFT_SCIP,
+        description=(
+            "One ordered part of a projected `scip.Index`. The server emits no event larger "
+            "than 4 MiB, so a consumer with stock gRPC limits can read the stream; a unit "
+            "that cannot fit alone is dropped and recorded as an `Omission`."
+        ),
     )
 )
 class Event(ProtoModel):
@@ -118,7 +194,10 @@ class Event(ProtoModel):
         default=None,
         number=3,
         oneof=Oneof("value"),
-        description="One external symbol after the final document, in encoded-symbol order.",
+        description=(
+            "One external symbol after the final document, in byte order of the encoded "
+            "SCIP symbol string."
+        ),
     )
 
 
@@ -129,12 +208,16 @@ SCIP_API_PACKAGE = ProtoPackage(
         description="The Rift server's read-only SCIP export API.",
         imports=("rift/core.proto", "scip/scip.proto"),
     ),
-    models=(Omission, Request, Header, Event),
+    models=(Omission, Request, LanguageCoverage, Header, Event),
     enums=(),
     services=(
         Service(
             "Index",
-            "Exports one Rift projection into the pinned SCIP schema.",
+            (
+                "Exports one Rift projection into the pinned SCIP schema. The service is "
+                "served on the same workspace rendezvous socket as the Rift server's other "
+                "connections."
+            ),
             (
                 Rpc(
                     "Read",
@@ -142,7 +225,10 @@ SCIP_API_PACKAGE = ProtoPackage(
                     Event,
                     description=(
                         "Returns one header, then documents, then external symbols. The stream order is "
-                        "the canonical `scip.Index` order."
+                        "the canonical `scip.Index` order. `Read` fails with `NOT_FOUND` for a session "
+                        "the server does not hold and `INVALID_ARGUMENT` for a malformed `SessionId`. "
+                        "A session removed mid-stream terminates the stream with `ABORTED`; a stream "
+                        "that ends with `OK` carried the complete index."
                     ),
                     response_stream=True,
                 ),

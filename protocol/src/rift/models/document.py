@@ -9,7 +9,7 @@ RPC_CONNECT = Rpc(
     response=mcp.Connected,
     response_stream=True,
     description=(
-        "Opens one client session and returns its writable projection. A session ID admits one "
+        "Opens one caller session and returns its writable projection. A session ID admits one "
         "live connection."
     ),
 )
@@ -32,7 +32,10 @@ RPC_SESSION_REMOVE = Rpc(
     name="SessionRemove",
     request=mcp.SessionRemoveParams,
     response=mcp.SessionRemoveResult,
-    description=("Removes one inactive session and deletes its projection."),
+    description=(
+        "Removes one inactive session and deletes its projection. A live one, the caller's "
+        "own included, returns `temporarily_unavailable`."
+    ),
 )
 
 RPC_OUTLINE = Rpc(
@@ -235,9 +238,13 @@ DOCUMENT = Document(
     ),
     entry_points_description=(
         "The internal connection stream establishes the gRPC context used by later calls. Tools "
-        "map MCP request and result JSON to Rift service methods. The MCP process queues those "
-        "calls and sends one application RPC at a time. Each resource entry maps one URI family "
-        "to the types that carry it."
+        "map MCP request and result JSON to Rift service methods: the typed result rides "
+        "`structuredContent` against the tool's declared output schema, mirrored as one "
+        "canonical-JSON `text` block, and a refusal is such a result — never `isError`. "
+        "`ErrorData` travels as the JSON-RPC error object's `data` with code -32000. The MCP "
+        "process queues those calls and issues one application RPC at a time; a cancelled queued "
+        "call is dropped, and a cancelled running change completes or rolls back whole. Each "
+        "resource entry maps one URI family to the types that carry it."
     ),
     service=RIFT_SERVICE,
     tool_groups=(
@@ -357,7 +364,7 @@ DOCUMENT = Document(
                 "identity to `act`."
             ),
             template=mcp.ResourceTemplate,
-            uri=mcp.ActionResourceUri,
+            uri=core.ActionOfferId,
             link=mcp.ResourceLink,
         ),
     ),
@@ -493,7 +500,7 @@ DOCUMENT = Document(
                 mcp.DeleteParams,
                 mcp.ChangeSignatureParams,
                 mcp.ActParams,
-                mcp.RefusalReason,
+                core.RefusalReason,
                 core.ActionSupport,
                 mcp.CommandValidator,
             ),
@@ -549,7 +556,7 @@ DOCUMENT = Document(
         ),
         Axis(
             name="MCP",
-            summary="Tool parameters, results, resource links, and payloads on the agent-facing surface.",
+            summary="Tool parameters, results, resource links, and payloads on the caller-facing surface.",
             residual_of="mcp",
         ),
     ),
