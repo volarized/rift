@@ -23,3 +23,7 @@ skills-lock.json
 CONTEXT.md
 
 .ruff_cache
+.playwright-mcp
+
+AGENTS.md
+CLAUDE.md
