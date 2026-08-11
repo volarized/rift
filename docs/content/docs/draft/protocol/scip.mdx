@@ -2,6 +2,8 @@
 title: SCIP
 ---
 
+import { ScipReference } from "@/components/protocol/scip";
+
 Rift can export a session's semantic facts as a [SCIP](https://github.com/sourcegraph/scip) index,
 for the tools that already consume one.
 
@@ -64,3 +66,5 @@ rift . python . `frobnicate.Frobnicator.connect~2`.
 
 The encoding is reversible back to the `SymbolId`, and there are no locals: a Rift symbol is
 workspace-stable by contract, so every one exports as a global symbol.
+
+<ScipReference version="draft" />

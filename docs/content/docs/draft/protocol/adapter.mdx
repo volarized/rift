@@ -2,6 +2,8 @@
 title: Adapter
 ---
 
+import { AdapterReference } from "@/components/protocol/adapter";
+
 A language adapter is a subprocess the workspace server starts and talks to over gRPC on a Unix
 domain socket, or a named pipe on Windows. It owns everything about a language; Rift owns sessions, source state, ordering and
 publication, and never guesses at what an adapter can do.
@@ -150,3 +152,5 @@ be acted on by whoever configures the workspace. Budgets bound wall time, captur
 frames, bindings per frame, and each rendered value.
 
 The generated [reference](/docs/draft/protocol/reference) defines every request, event and capability.
+
+<AdapterReference version="draft" />

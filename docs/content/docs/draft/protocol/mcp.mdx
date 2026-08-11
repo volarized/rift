@@ -2,6 +2,8 @@
 title: MCP
 ---
 
+import { McpReference } from "@/components/protocol/mcp";
+
 `rift mcp` is a thin process: it maps MCP JSON onto the local Rift service and owns one session
 connection for its lifetime. Nothing below is decided in that process; how the JSON is carried is
 all that's its own.
@@ -213,3 +215,5 @@ bytes will fail the same way. `same_request` means it was transient — an adapt
 projection with a filesystem write in flight. `operator_action` means nothing will work until
 someone fixes the workspace, usually `rift.toml`. A `limit_exceeded` also carries which limit and
 by how much, so a request can be resized without parsing the message meant for a human.
+
+<McpReference version="draft" />
