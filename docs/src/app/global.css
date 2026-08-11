@@ -158,3 +158,21 @@
  * Motion lives in react-spring, not here. See components/reveal.tsx for the
  * entry reveal and components/line-object.tsx for the r3f line objects.
  */
+
+/*
+ * The home nav mark must land on the same pixel as the docs sidebar mark:
+ * the sidebar puts it at x = 3px gutter + 16px padding, y = 16px into a 64px
+ * row. Below md both layouts already agree (56px bar, 16px inset).
+ */
+@media (min-width: 48rem) {
+  #nd-nav > * {
+    max-width: none;
+  }
+  #nd-nav nav {
+    height: 4rem;
+    padding-inline-start: 19px;
+  }
+  #nd-home-layout {
+    padding-top: 4rem;
+  }
+}
