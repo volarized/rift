@@ -93,7 +93,7 @@ RPC_EDIT = Rpc(
     request=mcp.EditParams,
     response=mcp.ChangeResult,
     description=(
-        "Applies and validates an atomic edit set at the expected projection head."
+        "Applies and validates an atomic edit set, and records the result in the changeset."
     ),
 )
 
@@ -101,7 +101,7 @@ RPC_PATCH = Rpc(
     name="Patch",
     request=mcp.PatchParams,
     response=mcp.ChangeResult,
-    description=("Applies a unified diff at the expected projection head."),
+    description=("Applies a unified diff, and records the result in the changeset."),
 )
 
 RPC_REWRITE = Rpc(
@@ -173,14 +173,20 @@ RPC_PROJECTION_RESTORE = Rpc(
     name="ProjectionRestore",
     request=mcp.ProjectionRestoreParams,
     response=core.ProjectionState,
-    description="Restores changed paths from the current workspace.",
+    description=(
+        "Restores changed paths from the workspace and drops the changes that touched them."
+    ),
 )
 
 RPC_PUBLISH = Rpc(
     name="Publish",
     request=mcp.PublishParams,
     response=mcp.PublishResult,
-    description="Publishes projection changes whose workspace paths have not changed.",
+    description=(
+        "Publishes the changeset into the workspace. A change carrying a confirmation is "
+        "published only when the call accepts it, and a workspace path changed since the "
+        "projection took it refuses the whole publication."
+    ),
 )
 
 RPC_READRESOURCE = Rpc(
@@ -292,6 +298,26 @@ DOCUMENT = Document(
             link=mcp.ResourceLink,
         ),
         Resource(
+            name="root",
+            description=(
+                "Returns the filesystem path of this session's projection, for tools that can "
+                "only work through a directory."
+            ),
+            template=mcp.ResourceTemplate,
+            uri=mcp.RootResourceUri,
+            link=mcp.RootResourceLink,
+        ),
+        Resource(
+            name="changes",
+            description=(
+                "Returns the changes this session has applied, each with its edits, effects, "
+                "validation evidence, and the confirmations publication will check."
+            ),
+            template=mcp.ResourceTemplate,
+            uri=mcp.ChangesResourceUri,
+            link=mcp.ChangesResourceLink,
+        ),
+        Resource(
             name="symbol",
             description=(
                 "Returns one symbol and its semantic facts from the session projection."
@@ -343,11 +369,15 @@ DOCUMENT = Document(
     ),
     axes=(
         Axis(
-            name="Versioning",
-            summary="Session projections and their optimistic-concurrency heads.",
+            name="Changeset",
+            summary=(
+                "What a session has changed in its projection, and what vouched for each change."
+            ),
             identified_by=(
                 core.ProjectionState,
-                core.ProjectionHead,
+                mcp.ChangeId,
+                mcp.ChangeSummary,
+                mcp.ChangesResourcePayload,
             ),
         ),
         Axis(

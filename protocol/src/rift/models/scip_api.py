@@ -55,8 +55,15 @@ class Omission(ProtoModel):
     )
 )
 class Request(ProtoModel):
-    head: Field[core.ProjectionHead] = proto_field(
-        default=..., number=2, description="Session projection head to export."
+    session: Field[str] = proto_field(
+        default=...,
+        number=2,
+        proto_type=ProtoFieldDescriptor.TYPE_STRING,
+        description=(
+            "Session whose projection is exported. The export reads the projection as it "
+            "stands, so a write landing mid-stream can make the index inconsistent; a "
+            "consumer that needs a whole one reads again."
+        ),
     )
 
 
@@ -66,10 +73,11 @@ class Request(ProtoModel):
     )
 )
 class Header(ProtoModel):
-    head: Field[core.ProjectionHead] = proto_field(
+    session: Field[str] = proto_field(
         default=...,
         number=2,
-        description="Projection head that produced every following record.",
+        proto_type=ProtoFieldDescriptor.TYPE_STRING,
+        description="Session whose projection produced every following record.",
     )
     metadata: Field[scip.Metadata] = proto_field(
         default=...,

@@ -54,27 +54,21 @@ class Digest(ProtocolRoot):
     """SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes the algorithm so Rift and its adapters produce the same identity for the same bytes."""
 
 
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern=r"^ph_[a-z2-7]{26}$",
-    examples=["ph_bbbbbbbbbbbbbbbbbbbbbbbbbb"],
-)
-class ProjectionHead(ProtocolRoot):
-    """Opaque compare-and-swap token for the current source state of a writable projection.
-    Rift generates a fresh token whenever the visible state advances."""
-
-
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class ProjectionState(ClosedModel):
-    """Current state of the session projection."""
+    """Summary of the session projection. The changed paths and the changes that produced them
+    are read from the changes resource, which pages; both fields here are counts a caller can
+    branch on without that read."""
 
-    head: Field[ProjectionHead] = proto_field(
-        description="Fresh ABA-safe token for this current state.", number=2
-    )
     dirty: Field[bool] = proto_field(
-        description="Whether the projection contains unpublished changes.", number=3
+        description="Whether the projection holds anything the workspace does not.", number=3
+    )
+    unacknowledged: Field[bool] = proto_field(
+        description=(
+            "Whether the changeset holds a change carrying a confirmation the caller has not "
+            "accepted. Publication refuses while this is true."
+        ),
+        number=4,
     )
 
 
@@ -452,7 +446,7 @@ class PathSelector(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class TextRange(ClosedModel):
-    "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from its adapter's native offsets at the seam. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead."
+    "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from whatever its language toolchain counts in at the seam, so a rustc column and a tsc column arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead."
 
     start: Field[int] = proto_field(
         description="First byte of the range, counted from the start of the file.",
@@ -494,7 +488,7 @@ class TextRange(ClosedModel):
     },
 )
 class Severity(str, Enum):
-    "How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their adapter's levels onto these four, so a caller can drop everything below `warning` without knowing which language produced it."
+    "How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their toolchain's own levels onto these four, so a caller can drop everything below `warning` without knowing which language produced it."
 
     ERROR = "error"
     WARNING = "warning"
@@ -2930,7 +2924,7 @@ class FormattingPolicy(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class MatchCardinality(ClosedModel):
-    "How many matches an atomic rewrite accepts. Rift counts against the expected session state and refuses the operation when the count falls outside this interval."
+    "How many matches an atomic rewrite accepts. Rift counts the matches in the projection as it stands and refuses the operation when the count falls outside this interval, so a pattern that is looser than the caller believed rewrites nothing."
 
     minimum: Field[int] = proto_field(
         description="Fewest matches required.", ge=0, le=100000, number=1
@@ -3468,11 +3462,11 @@ class ArgumentContract(ProtocolRoot):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class OperationVerifierAdapter(ClosedModel):
-    """A language adapter checked its own state."""
+    """A language adapter ran the check against its own analysis."""
 
     kind: Field[Literal["adapter"]] = proto_field()
     language: Field[Language] = proto_field(
-        description="Adapter whose adapter performed the check.", number=1
+        description="The language whose adapter performed the check.", number=1
     )
 
 
@@ -3564,7 +3558,7 @@ class PreconditionValue(ProtocolRoot):
         "Kind",
         (
             EnumValue("target_exists", "KIND_TARGET_EXISTS", 1),
-            EnumValue("state_matches", "KIND_STATE_MATCHES", 2),
+            EnumValue("source_unchanged", "KIND_SOURCE_UNCHANGED", 2),
             EnumValue("writable", "KIND_WRITABLE", 3),
             EnumValue("references_complete", "KIND_REFERENCES_COMPLETE", 4),
             EnumValue("no_remaining_usages", "KIND_NO_REMAINING_USAGES", 5),
@@ -3576,8 +3570,8 @@ class PreconditionValue(ProtocolRoot):
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "target_exists": "Every addressed symbol, node, match, or source range resolves at the expected state.",
-            "state_matches": "The state used for discovery still matches the state being resolved.",
+            "target_exists": "Every addressed symbol, node, match, or source range resolves in the projection as it stands.",
+            "source_unchanged": "The files a match or action offer was discovered in have not been rewritten since.",
             "writable": "Every affected path is inside the project and writable through Rift's workspace handle.",
             "references_complete": "The adapter completely classified the references on which the operation depends.",
             "no_remaining_usages": "No usage remains after the selected safe-delete policy is applied.",
@@ -3591,7 +3585,7 @@ class OperationPreconditionKind(str, Enum):
     """Condition being checked."""
 
     TARGET_EXISTS = "target_exists"
-    STATE_MATCHES = "state_matches"
+    SOURCE_UNCHANGED = "source_unchanged"
     WRITABLE = "writable"
     REFERENCES_COMPLETE = "references_complete"
     NO_REMAINING_USAGES = "no_remaining_usages"
@@ -3629,8 +3623,8 @@ class OperationPrecondition(ClosedModel):
         number=1,
         json_schema_extra={
             "rift:enumDescriptions": {
-                "target_exists": "Every addressed symbol, node, match, or source range resolves at the expected state.",
-                "state_matches": "The state used for discovery still matches the state being resolved.",
+                "target_exists": "Every addressed symbol, node, match, or source range resolves in the projection as it stands.",
+                "source_unchanged": "The files a match or action offer was discovered in have not been rewritten since.",
                 "writable": "Every affected path is inside the project and writable through Rift's workspace handle.",
                 "references_complete": "The adapter completely classified the references on which the operation depends.",
                 "no_remaining_usages": "No usage remains after the selected safe-delete policy is applied.",
@@ -3657,7 +3651,7 @@ class OperationPrecondition(ClosedModel):
     )
     expected: Field[PreconditionValue] = proto_field(
         description=(
-            "Required value. Examples include the discovered head, zero remaining usages, "
+            "Required value. Examples include zero remaining usages "
             "or complete coverage."
         ),
         number=6,
@@ -3755,7 +3749,7 @@ class OperationEffect(ClosedModel):
     after: Field[list[Address]] = proto_field(
         description=(
             "Subjects after Rift applies the change and every adapter sharing the projection "
-            "acknowledges the new head. Empty for deletion."
+            "acknowledges the change. Empty for deletion."
         ),
         number=3,
     )
@@ -3892,18 +3886,22 @@ class GuaranteeEvidence(ClosedModel):
             EnumValue("behavior_unknown", "BEHAVIOR_UNKNOWN", 5),
             EnumValue("formatting_scope", "FORMATTING_SCOPE", 6),
             EnumValue("command_validator", "COMMAND_VALIDATOR", 7),
+            EnumValue("validation_incomplete", "VALIDATION_INCOMPLETE", 8),
+            EnumValue("guarantee_unestablished", "GUARANTEE_UNESTABLISHED", 9),
         ),
         placement=Placement("kind", 2),
     ),
     schema_extra={
         "rift:enumDescriptions": {
             "destructive": "The change deletes source or replaces an existing file.",
-            "large_scope": "The change reaches enough files or symbols to require explicit acknowledgement.",
+            "large_scope": "The change reaches enough files or symbols to require explicit acceptance.",
             "generated_code": "The change touches source marked as generated.",
             "unresolved_reference": "The adapter found a reference it could not classify or update.",
             "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
             "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
             "command_validator": "A workspace command validator will check the changed tree.",
+            "validation_incomplete": "Required adapter or command validation did not complete over the resulting tree.",
+            "guarantee_unestablished": "The action advertised a guarantee that resolution produced no evidence for.",
         }
     },
 )
@@ -3917,32 +3915,36 @@ class ConfirmationRequirementKind(str, Enum):
     BEHAVIOR_UNKNOWN = "behavior_unknown"
     FORMATTING_SCOPE = "formatting_scope"
     COMMAND_VALIDATOR = "command_validator"
+    VALIDATION_INCOMPLETE = "validation_incomplete"
+    GUARANTEE_UNESTABLISHED = "guarantee_unestablished"
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class ConfirmationRequirement(ClosedModel):
-    "One effect a caller must acknowledge before a change becomes visible. Requirements are sorted by kind, source location, title, and detail, then numbered from zero. An acknowledgement applies to a retry of the same operation and expected head."
+    "One effect the caller has to accept before publication. The change that raised it lands in the projection either way, carrying this record, so the caller can read what happened before deciding. Requirements are sorted by kind, source location, title, and detail, then numbered from zero within their change."
 
     id: Field[int] = proto_field(
-        description="Zero-based position in the refusal's ordered confirmation list.",
+        description="Zero-based position in its change's ordered confirmation list.",
         ge=0,
         le=4294967295,
         number=1,
     )
     kind: Field[ConfirmationRequirementKind] = proto_field(
-        description="The condition that makes acknowledgement necessary.",
+        description="The condition that makes acceptance necessary.",
         number=2,
         json_schema_extra={
             "rift:enumDescriptions": {
                 "destructive": "The change deletes source or replaces an existing file.",
                 "large_scope": (
-                    "The change reaches enough files or symbols to require explicit acknowledgement."
+                    "The change reaches enough files or symbols to require explicit acceptance."
                 ),
                 "generated_code": "The change touches source marked as generated.",
                 "unresolved_reference": "The adapter found a reference it could not classify or update.",
                 "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
                 "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
                 "command_validator": "A workspace command validator will check the changed tree.",
+                "validation_incomplete": "Required adapter or command validation did not complete over the resulting tree.",
+                "guarantee_unestablished": "The action advertised a guarantee that resolution produced no evidence for.",
             }
         },
     )
@@ -4460,7 +4462,8 @@ class ActionKind(ProtocolRoot):
     examples=["rift://match/eyJzbmFwc2hvdCI6eyJraW5kIjoiY29tbWl0In19"],
 )
 class MatchId(ProtocolRoot):
-    """Identity of one match at a projection head."""
+    """Identity of one match, carrying the file it was found in and the bytes it covered. Rift
+    revalidates it against that file, so a write elsewhere in the projection leaves it usable."""
 
     @model_validator(mode="after")
     def token_is_canonical(self) -> MatchId:
@@ -4478,7 +4481,8 @@ class MatchId(ProtocolRoot):
     examples=["rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ"],
 )
 class ActionOfferId(ProtocolRoot):
-    """Identity of one adapter action at a projection head."""
+    """Identity of one adapter action, carrying the file its target was resolved in. Rift
+    revalidates it against that file, so a write elsewhere in the projection leaves it usable."""
 
     @model_validator(mode="after")
     def token_is_canonical(self) -> ActionOfferId:
@@ -4489,7 +4493,6 @@ class ActionOfferId(ProtocolRoot):
 MODELS = (
     ProtocolVersion,
     Digest,
-    ProjectionHead,
     ProjectionState,
     LanguageRegion,
     FileId,

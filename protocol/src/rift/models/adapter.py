@@ -564,17 +564,14 @@ class AdapterState(ProtoModel):
     carries it. The adapter may back different states with different project runtimes.
     A call naming an earlier state receives `StaleState`."""
 
-    head: Field[core.ProjectionHead] = proto_field(
-        default=..., number=2, description="Projection head the adapter has read."
-    )
     generation: Field[int] = proto_field(
         default=...,
         number=3,
         proto_type=ProtoFieldDescriptor.TYPE_UINT64,
         description=(
-            "Adapter-local state generation. Open mints the first value;\n Refresh and "
-            "SyncVirtual advance it. Calls carrying an earlier generation\n receive StaleState "
-            "even when the projection head is unchanged."
+            "Adapter-local state generation, and the whole of an adapter state's identity.\n "
+            "Open mints the first value; Refresh and SyncVirtual advance it. A call carrying\n "
+            "an earlier generation receives StaleState."
         ),
     )
 
@@ -601,11 +598,8 @@ class OpenRequest(ProtoModel):
             "output belongs here — point CARGO_TARGET_DIR and friends at it. Every open\n "
             "adapter state receives a distinct path, and Rift never reuses that path after\n "
             "Close. An adapter may maintain its own shared read-only cache\n outside this "
-            "directory when its adapter supports safe sharing."
+            "directory when its language toolchain supports safe sharing."
         ),
-    )
-    head: Field[core.ProjectionHead] = proto_field(
-        default=..., number=3, description="Current projection head."
     )
     contract: Field[AdapterContract] = proto_field(
         default=...,
@@ -630,7 +624,7 @@ class OpenRequest(ProtoModel):
             "Rift changed files in a projection. It sends this call to every language\n"
             " adapter holding the shared path. Paths are\n "
             "project-relative and cover every file Rift touched; each adapter decides\n which "
-            "changes affect its adapter. Content is on disk before this call. The adapter\n "
+            "changes reach its own analysis. Content is on disk before this call. The adapter\n "
             "reselects its project runtime when runtime-defining inputs have changed."
         ),
         section="Adapter state",
@@ -646,11 +640,6 @@ class RefreshRequest(ProtoModel):
             "The state the adapter last acknowledged. A mismatch means Rift and the\n adapter "
             "disagree about what is on disk, and comes back as StaleState."
         ),
-    )
-    to: Field[core.ProjectionHead] = proto_field(
-        default=...,
-        number=2,
-        description="Projection head after the listed changes.",
     )
     written: Field[list[str]] = proto_field(
         default=...,
@@ -674,7 +663,7 @@ class RefreshRequest(ProtoModel):
             "sends exactly one `start` event first, then each `unit` followed by ordered\n "
             "`text` chunks ending in `final: true`. The complete stream replaces the\n "
             "previous overlay; an RPC failure leaves the previous generation intact. The\n "
-            "units are the complete set selected for this consumer at `start.head`,\n "
+            "units are the complete set selected for this consumer at `start`,\n "
             "including an empty set when every previous unit has been retracted."
         ),
         section="Adapter state",
@@ -685,7 +674,7 @@ class VirtualSyncEvent(ProtoModel):
     sends exactly one `start` event first, then each `unit` followed by ordered
     `text` chunks ending in `final: true`. The complete stream replaces the
     previous overlay; an RPC failure leaves the previous generation intact. The
-    units are the complete set selected for this consumer at `start.head`,
+    units are the complete set selected for this consumer at `start`,
     including an empty set when every previous unit has been retracted."""
 
     start: Field[AdapterState | None] = proto_field(
@@ -693,8 +682,8 @@ class VirtualSyncEvent(ProtoModel):
         number=1,
         oneof=Oneof("event"),
         description=(
-            "Current adapter-local state. The returned AdapterState keeps its\n head and "
-            "advances its generation."
+            "Current adapter-local state. The returned AdapterState advances its\n "
+            "generation."
         ),
     )
     unit: Field[VirtualUnit | None] = proto_field(
@@ -1023,7 +1012,7 @@ class UnitCoverage(ProtoModel):
         description="How long Rift may retain one Analyze result.",
         value_descriptions=(
             "No cache claim. Rift treats the result as request-volatile.",
-            "The projection head, adapter implementation, language, and virtual inputs determine the result.",
+            "The projection contents, adapter implementation, language, and virtual inputs determine the result.",
             (
                 "Adapter-observed external state also affects the result. Retention ends with the "
                 "process or adapter-state generation."
@@ -1288,16 +1277,16 @@ class Matches(ProtoModel):
         ADAPTER,
         description=(
             "One match, as the adapter found it. It carries no identity of its own: a\n "
-            "`MatchKey` is the projection head, query and span, and Rift already holds\n the "
-            "first two, so the span below completes it."
+            "`MatchKey` is the query and the span it matched, and Rift already holds\n the "
+            "first, so the span below completes it."
         ),
         section="Matching",
     )
 )
 class StructuralMatch(ProtoModel):
     """One match, as the adapter found it. It carries no identity of its own: a
-    `MatchKey` is the projection head, query and span, and Rift already holds
-    the first two, so the span below completes it."""
+    `MatchKey` is the query and the span it matched, and Rift already holds
+    the first, so the span below completes it."""
 
     span: Field[core.SourceSpan] = proto_field(
         default=...,
@@ -1542,7 +1531,7 @@ class ExecuteRequest(ProtoModel):
     state: Field[AdapterState] = proto_field(
         default=...,
         number=1,
-        description="Exact projection head and adapter generation to evaluate against.",
+        description="Adapter state to evaluate against.",
     )
     block: Field[core.CodeBlock] = proto_field(
         default=...,

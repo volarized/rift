@@ -73,9 +73,6 @@ enum ErrorCode {
   // The workspace-root `rift.toml` does not satisfy its schema. New requests remain blocked
   // until the file is valid.
   ERROR_CODE_CONFIGURATION_INVALID = 20;
-  // A change or cleanup request names a projection token that is no longer current. Read the
-  // projection again before retrying.
-  ERROR_CODE_PROJECTION_HEAD_MOVED = 21;
   // The tool exists, but the workspace configuration and configured adapters cannot serve this
   // operation for the requested language. Read the workspace resource again after `rift.toml`
   // or adapter availability changes.
@@ -91,14 +88,13 @@ enum RetryDirective {
   // Send the same bytes again. The cause was transient — a busy projection, an adapter still
   // starting.
   RETRY_DIRECTIVE_SAME_REQUEST = 2;
-  // The projection moved. Read its current head before retrying.
-  RETRY_DIRECTIVE_REFRESH_PROJECTION = 3;
   // A local state command or configuration change must resolve the condition before another
   // request can succeed.
   RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
 }
-// Why Rift declined a change. A refusal is a completed decision; `ErrorData` carries transport
-// and infrastructure failures.
+// Why Rift produced no edits at all. Every reason here means resolution had nothing to write: a
+// change Rift can express but nobody will vouch for still lands, carrying its confirmations.
+// `ErrorData` carries transport and infrastructure failures.
 enum RefusalReason {
   // The caller did not set a value.
   REFUSAL_REASON_UNSPECIFIED = 0;
@@ -108,21 +104,18 @@ enum RefusalReason {
   REFUSAL_REASON_UNMET_PRECONDITION = 2;
   // The address resolves to several targets. Narrow it and ask again.
   REFUSAL_REASON_AMBIGUOUS_TARGET = 3;
-  // The offer belongs to an earlier projection head. Read the actions resource again.
+  // The file the offer was discovered in has been rewritten since. Read the actions resource
+  // again.
   REFUSAL_REASON_STALE_ACTION = 4;
-  // The match belongs to an earlier projection head. Search again.
+  // The file the match was found in has been rewritten since. Search again.
   REFUSAL_REASON_STALE_MATCH = 5;
   // A rewrite matched fewer or more times than its cardinality accepts.
   REFUSAL_REASON_CARDINALITY_MISMATCH = 6;
-  // The operation needs acknowledgements the caller did not supply.
-  REFUSAL_REASON_CONFIRMATION_REQUIRED = 7;
   // The complete effect reaches outside what the caller can have meant — outside the project,
   // or into generated source.
   REFUSAL_REASON_UNSAFE_EFFECT = 8;
   // The requested formatting policy has no formatter behind it for an affected language.
   REFUSAL_REASON_FORMATTER_UNSUPPORTED = 9;
-  // Required adapter or command validation did not complete.
-  REFUSAL_REASON_VALIDATION_INCOMPLETE = 10;
   // The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`,
   // or `change_signature` rather than through `act`.
   REFUSAL_REASON_PORTABLE_FAMILY = 11;
@@ -192,8 +185,6 @@ message OutlineItem {
 }
 // One page of a file outline with explicit semantic coverage.
 message OutlineResult {
-  // Projection head from which the file and semantic facts were read.
-  string head = 1;
   // File entry being outlined.
   rift.core.File file = 2;
   // Outline items on this page in stable source preorder.
@@ -336,6 +327,24 @@ message FsResourceLink {
   // What a read of this URI returns: `FsResourcePayload` as JSON.
   string mime_type = 3;
 }
+// A link to the session's projection directory.
+message RootResourceLink {
+  // The root resource.
+  string uri = 1;
+  // The resource family this link belongs to.
+  string name = 2;
+  // What a read of this URI returns: `RootResourcePayload` as JSON.
+  string mime_type = 3;
+}
+// A link to the session's changeset.
+message ChangesResourceLink {
+  // The changeset, optionally continued by a cursor.
+  string uri = 1;
+  // The resource family this link belongs to.
+  string name = 2;
+  // What a read of this URI returns: `ChangesResourcePayload` as JSON.
+  string mime_type = 3;
+}
 // A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed
 // per resource, and the URI is the one that resource accepts.
 message ResourceLink {
@@ -345,6 +354,8 @@ message ResourceLink {
     FsResourceLink fs = 3;
     ActionsResourceLink actions = 4;
     ActionResourceLink action = 5;
+    RootResourceLink root = 6;
+    ChangesResourceLink changes = 7;
   }
 }
 // JSON payload for one symbol in the session projection.
@@ -352,8 +363,6 @@ message SymbolResourcePayload {
   // The symbol this payload answers for, echoed back so a link and its content carry the same
   // address.
   string uri = 1;
-  // Projection head this answer used.
-  string head = 2;
   // The declaration itself: its name, its kind in the language's own words, its origin, its
   // types and its signatures.
   rift.core.Symbol symbol = 3;
@@ -378,15 +387,19 @@ message SymbolResourcePayload {
   // edges and diagnostics are what page.
   optional string next = 10;
 }
-// One generated wire contract. A peer accepts it only when all three fields match one of its
-// own generated descriptors.
+// One generated wire contract. Majors have to be equal, because a major changes when a peer can
+// no longer decode the next message safely. Within one major, revisions only add, so a peer can
+// speak any minor at or below its own and the connection settles on the lower of the two.
 message Contract {
   // Breaking protocol generation selected before the socket is opened.
   int64 major = 1;
-  // Additive revision within the selected major.
+  // Additive revision within the major. A peer admits any minor at or below its own and emits
+  // nothing added after the minor the connection settled on, so the client checks this one
+  // number to know it can decode everything it will be sent.
   uint32 minor = 2;
-  // SHA-256 of the generated descriptor and its MCP conversion metadata. Equal major and minor
-  // values with different digests are incompatible.
+  // SHA-256 of the generated descriptor and its MCP conversion metadata. It names the exact
+  // generation a peer was built from, which is what makes a bug report reproducible; admission
+  // is decided by `major` and `minor`.
   string schema_digest = 3;
 }
 // Opens one logical client connection before another server RPC. The control stream
@@ -419,7 +432,7 @@ message ConnectRequest {
 // The first response on an accepted control stream, including persistent projection state
 // for an MCP role.
 message Connected {
-  // Exact generated contract selected for this connection.
+  // Contract this connection speaks: the shared major, and the lower of the two minors.
   Contract contract = 1;
   // Features implemented by both peers, sorted by identifier.
   repeated string features = 2;
@@ -470,12 +483,10 @@ message SessionContinueResult {
   // Session state after the connection attached.
   SessionSummary session = 1;
 }
-// Removes one inactive session at an exact projection head.
+// Removes one inactive session and the projection it retains.
 message SessionRemoveParams {
   // Retained session to inspect or remove.
   string session = 1;
-  // Projection head observed by the caller.
-  string expected = 2;
 }
 // The session removed at the checked projection state.
 message SessionRemoveResult {
@@ -568,6 +579,10 @@ message WorkspaceResourcePayload {
     RESOURCES_ACTIONS = 4;
     // One discovered action, with the schema of the arguments it takes.
     RESOURCES_ACTION = 5;
+    // Where this session's projection lives on the filesystem.
+    RESOURCES_ROOT = 6;
+    // The changes this session has made, and what vouched for each.
+    RESOURCES_CHANGES = 7;
   }
   // The URI this payload answers for.
   string uri = 1;
@@ -591,11 +606,22 @@ message WorkspaceResourcePayload {
   // Publication checks declared by the workspace-root `rift.toml`.
   repeated CommandValidator validators = 13;
 }
+// Where this session's projection lives on the filesystem. Adapters receive this path over
+// the adapter protocol; a caller that has to reach the projection through an ordinary
+// filesystem tool reads it here.
+message RootResourcePayload {
+  // The URI this payload answers for.
+  string uri = 1;
+  // Absolute path of the projection directory. Rift places it at `.rift/projections/<session>`
+  // below the workspace and keeps it there for the session's life. Session removal deletes the
+  // directory without waiting for a process that is still working inside it.
+  string path = 2;
+  // Absolute path of the workspace this projection was taken from.
+  string workspace = 3;
+}
 // One page of search hits, and what the page is worth. `coverage` is what makes an empty page
 // readable: nothing matched, or Rift could not see far enough to know.
 message SearchResult {
-  // Projection head this answer used.
-  string head = 1;
   // How much Rift could see while answering. An empty page means nothing matched only where
   // this is complete.
   rift.core.Coverage coverage = 2;
@@ -619,8 +645,6 @@ message ActionOffer {
 message ActionsResourcePayload {
   // The address this page answers for, echoed back as it resolved.
   string uri = 1;
-  // Projection head this answer used.
-  string head = 2;
   // The actions on this page, each without its argument schema.
   repeated ActionOffer offers = 3;
   // Whether the adapter could answer here. A language with no action support returns an empty
@@ -635,8 +659,6 @@ message ActionsResourcePayload {
 message ActionResourcePayload {
   // The offer this payload answers for, echoed back as it resolved.
   string uri = 1;
-  // Projection head in which this offer was discovered.
-  string head = 2;
   // Language whose adapter minted the offer and resolves it.
   rift.core.Language language = 3;
   // The offer, with `descriptor.arguments_schema` present.
@@ -652,8 +674,6 @@ message ExecuteParams {
 // Bounded result of one execution. Writes made by evaluated code are absent because its
 // execution workspace is discarded.
 message ExecuteResult {
-  // Projection head used for execution.
-  string head = 1;
   // Adapter that evaluated the block.
   rift.core.Language language = 2;
   // Runtime status, bounded output, and structured diagnostics.
@@ -666,8 +686,6 @@ message ExecuteResult {
 message DebugSession {
   // Server-minted public handle. The adapter-local DebugSessionKey never crosses MCP.
   string id = 1;
-  // Projection head used by the debugging session.
-  string head = 2;
   // Adapter that owns the retained debug state.
   rift.core.Language language = 3;
   // Retained stack frames, innermost first. Zero after normal completion.
@@ -748,11 +766,9 @@ message MatchParams {
   // Continues a previous match where its last page ended. Omit it for the first page.
   optional string cursor = 3;
 }
-// One page of matches and the state they were found in. Matches sort by file bytes, range, and
-// canonical key. Rift checks the key against `at` before applying an addressed edit.
+// One page of matches. Matches sort by file bytes, range, and canonical key. A match key names
+// the file it was found in, so Rift rechecks that file before applying an edit addressed at it.
 message MatchResult {
-  // Projection head this answer used.
-  string head = 1;
   // The matches on this page.
   repeated MatchHit matches = 2;
   // How much of the selected path set was searched. A file too large to read makes this partial
@@ -777,8 +793,6 @@ message DiagnosticContext {
     APPLY = 3;
   }
   Source source = 1;
-  // Projection head this diagnostic belongs to.
-  string head = 2;
   // The finding itself, exactly as the adapter minted it.
   rift.core.Diagnostic diagnostic = 3;
   // One-based line the finding starts on. Null where the diagnostic has no span — a
@@ -862,9 +876,6 @@ message ErrorCause {
     // The workspace-root `rift.toml` does not satisfy its schema. New requests remain blocked
     // until the file is valid.
     ERROR_CODE_CONFIGURATION_INVALID = 20;
-    // A change or cleanup request names a projection token that is no longer current. Read the
-    // projection again before retrying.
-    ERROR_CODE_PROJECTION_HEAD_MOVED = 21;
     // The tool exists, but the workspace configuration and configured adapters cannot serve
     // this operation for the requested language. Read the workspace resource again after
     // `rift.toml` or adapter availability changes.
@@ -880,8 +891,6 @@ message ErrorCause {
     // Send the same bytes again. The cause was transient — a busy projection, an adapter still
     // starting.
     RETRY_DIRECTIVE_SAME_REQUEST = 2;
-    // The projection moved. Read its current head before retrying.
-    RETRY_DIRECTIVE_REFRESH_PROJECTION = 3;
     // A local state command or configuration change must resolve the condition before another
     // request can succeed.
     RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
@@ -966,9 +975,6 @@ message ErrorData {
     // The workspace-root `rift.toml` does not satisfy its schema. New requests remain blocked
     // until the file is valid.
     ERROR_CODE_CONFIGURATION_INVALID = 20;
-    // A change or cleanup request names a projection token that is no longer current. Read the
-    // projection again before retrying.
-    ERROR_CODE_PROJECTION_HEAD_MOVED = 21;
     // The tool exists, but the workspace configuration and configured adapters cannot serve
     // this operation for the requested language. Read the workspace resource again after
     // `rift.toml` or adapter availability changes.
@@ -984,8 +990,6 @@ message ErrorData {
     // Send the same bytes again. The cause was transient — a busy projection, an adapter still
     // starting.
     RETRY_DIRECTIVE_SAME_REQUEST = 2;
-    // The projection moved. Read its current head before retrying.
-    RETRY_DIRECTIVE_REFRESH_PROJECTION = 3;
     // A local state command or configuration change must resolve the condition before another
     // request can succeed.
     RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
@@ -1007,8 +1011,8 @@ message ErrorData {
     // Checking a proposed change against the schema, the state it was pinned to, and the checks
     // required by the workspace-root `rift.toml`.
     VALIDATE = 4;
-    // Checking the projection token, resolving in a private candidate, validating, and
-    // conditionally advancing the projection.
+    // Resolving the operation in a private candidate, validating it, and writing the result
+    // into the projection.
     CHANGE = 5;
     // Publishing projection changes to the workspace.
     PUBLISH = 6;
@@ -1025,9 +1029,6 @@ message ErrorData {
   // What the caller may do next.
   RetryDirective retry = 3;
   Phase phase = 4;
-  // The projection head used by the request. Null where the failure happened before one was
-  // resolved.
-  optional string head = 5;
   // Which operation of a multi-operation request failed, as its zero-based index. Null where
   // the request carried one, or failed before any of them ran.
   optional int64 operation = 6;
@@ -1117,6 +1118,20 @@ message ActionResourceTemplate {
   // What a read of a URI from this template returns: `ActionResourcePayload` as JSON.
   string mime_type = 2;
 }
+// The projection directory, addressed without parameters.
+message RootResourceTemplate {
+  // The resource family, as `resources/templates/list` advertises it.
+  string name = 1;
+  // What a read of a URI from this template returns: `RootResourcePayload` as JSON.
+  string mime_type = 2;
+}
+// The changeset with an optional page cursor.
+message ChangesResourceTemplate {
+  // The resource family, as `resources/templates/list` advertises it.
+  string name = 1;
+  // What a read of a URI from this template returns: `ChangesResourcePayload` as JSON.
+  string mime_type = 2;
+}
 // One advertised MCP resource template. uriTemplate, name, and mimeType are correlated per
 // family.
 message ResourceTemplate {
@@ -1126,6 +1141,8 @@ message ResourceTemplate {
     FsResourceTemplate fs = 3;
     ActionsResourceTemplate actions = 4;
     ActionResourceTemplate action = 5;
+    RootResourceTemplate root = 6;
+    ChangesResourceTemplate changes = 7;
   }
 }
 // The URI passed to MCP `resources/read`. Each branch is one advertised Rift resource family.
@@ -1168,6 +1185,20 @@ message ActionResourceContent {
   // An `ActionResourcePayload`, serialized as JSON.
   string text = 2;
 }
+// What a read of `rift://root` returns.
+message RootResourceContent {
+  // The URI that was read, as it resolved.
+  string uri = 1;
+  // A `RootResourcePayload`, serialized as JSON.
+  string text = 2;
+}
+// What a read of a `rift://changes` URI returns.
+message ChangesResourceContent {
+  // The URI that was read, as it resolved.
+  string uri = 1;
+  // A `ChangesResourcePayload`, serialized as JSON.
+  string text = 2;
+}
 message ResourceContent {
   oneof variant {
     WorkspaceResourceContent workspace = 1;
@@ -1175,6 +1206,8 @@ message ResourceContent {
     FsResourceContent fs = 3;
     ActionsResourceContent actions = 4;
     ActionResourceContent action = 5;
+    RootResourceContent root = 6;
+    ChangesResourceContent changes = 7;
   }
 }
 // The result of one MCP resource read. Each Rift resource returns one JSON payload in `text`,
@@ -1224,11 +1257,6 @@ message EditParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Projection head this operation must replace.
-  string expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
   // An atomic effect set in canonical file-and-range order. Every text replacement addresses
@@ -1251,11 +1279,6 @@ message PatchParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Projection head this operation must replace.
-  string expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
   // Unified text diff with project-relative `a/` and `b/` paths.
@@ -1286,11 +1309,6 @@ message RewriteParams {
     TRAILING = 3;
     BOTH = 4;
   }
-  // Projection head this operation must replace.
-  string expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
   // The text or structural pattern evaluated against the state this operation resolves against.
@@ -1319,11 +1337,6 @@ message RenameParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Projection head this operation must replace.
-  string expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
   // The declaration to rename: a symbol, a node, a byte range, or a match.
@@ -1346,11 +1359,6 @@ message MoveParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Projection head this operation must replace.
-  string expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
   // The declaration or file to move.
@@ -1375,11 +1383,6 @@ message DeleteParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Projection head this operation must replace.
-  string expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
   // The declaration or file to remove.
@@ -1403,11 +1406,6 @@ message ChangeSignatureParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Projection head this operation must replace.
-  string expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
   // The callable whose signature changes.
@@ -1432,11 +1430,6 @@ message ActParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Projection head this operation must replace.
-  string expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
   // The offer to resolve, as the actions resource returned it.
@@ -1447,8 +1440,6 @@ message ActParams {
 }
 // Restores changed paths from the current workspace.
 message ProjectionRestoreParams {
-  // Projection head the caller intends to discard.
-  string expected = 1;
   // Changed paths to restore. Null restores every changed path.
   repeated string paths = 2;
 }
@@ -1544,8 +1535,12 @@ message ChangeValidation {
   // Adapter reports in language order.
   repeated rift.core.ValidationReport adapter_reports = 4;
 }
-// An applied projection change and its validation evidence.
+// One change in the projection's changeset, with everything Rift learned while resolving it.
+// A change carrying confirmations is recorded the same way as one carrying none; the
+// confirmations are what publication checks.
 message ChangeSummary {
+  // Identity of this change in the changeset.
+  string id = 1;
   // Adapter validation of the resulting projection.
   ChangeValidation validation = 3;
   // Concrete edits in canonical file-and-range order.
@@ -1556,18 +1551,35 @@ message ChangeSummary {
   repeated rift.core.GuaranteeEvidence guarantees = 7;
   // Resolution findings in source order.
   repeated rift.core.Diagnostic diagnostics = 8;
-  // Current projection state with a fresh head token.
+  // Effects the caller has to accept before this change can be published, sorted and numbered
+  // from zero. Empty where every affected adapter and validator vouched for the result.
+  repeated rift.core.ConfirmationRequirement confirmations = 10;
+  // Projection state after this change landed.
   rift.core.ProjectionState current = 9;
 }
-// The operation atomically replaced the current projection state.
+// One page of the session's changeset, oldest change first. This is the read an agent makes
+// before publishing: every change it applied, what each one did, and which of them nobody
+// vouched for.
+message ChangesResourcePayload {
+  // The URI this payload answers for.
+  string uri = 1;
+  // Projection state the page was read from.
+  rift.core.ProjectionState state = 2;
+  // Changes on this page, in the order they were applied.
+  repeated ChangeSummary changes = 3;
+  // The same resource carrying the cursor for the next page, or null on the last one.
+  optional string next = 4;
+}
+// The operation resolved to edits and Rift wrote them into the projection.
 message ChangeApplied {
   // The applied change and its evidence.
   ChangeSummary summary = 1;
 }
-// Resolution stopped before Rift changed the projection.
+// Resolution produced no edits, so the projection is untouched.
 message RefusedResult {
-  // Why Rift declined a change. A refusal is a completed decision; `ErrorData` carries
-  // transport and infrastructure failures.
+  // Why Rift produced no edits at all. Every reason here means resolution had nothing to write:
+  // a change Rift can express but nobody will vouch for still lands, carrying its
+  // confirmations. `ErrorData` carries transport and infrastructure failures.
   enum RefusalReason {
     // The caller did not set a value.
     UNSPECIFIED = 0;
@@ -1577,27 +1589,22 @@ message RefusedResult {
     REFUSAL_REASON_UNMET_PRECONDITION = 2;
     // The address resolves to several targets. Narrow it and ask again.
     REFUSAL_REASON_AMBIGUOUS_TARGET = 3;
-    // The offer belongs to an earlier projection head. Read the actions resource again.
+    // The file the offer was discovered in has been rewritten since. Read the actions resource
+    // again.
     REFUSAL_REASON_STALE_ACTION = 4;
-    // The match belongs to an earlier projection head. Search again.
+    // The file the match was found in has been rewritten since. Search again.
     REFUSAL_REASON_STALE_MATCH = 5;
     // A rewrite matched fewer or more times than its cardinality accepts.
     REFUSAL_REASON_CARDINALITY_MISMATCH = 6;
-    // The operation needs acknowledgements the caller did not supply.
-    REFUSAL_REASON_CONFIRMATION_REQUIRED = 7;
     // The complete effect reaches outside what the caller can have meant — outside the project,
     // or into generated source.
     REFUSAL_REASON_UNSAFE_EFFECT = 8;
     // The requested formatting policy has no formatter behind it for an affected language.
     REFUSAL_REASON_FORMATTER_UNSUPPORTED = 9;
-    // Required adapter or command validation did not complete.
-    REFUSAL_REASON_VALIDATION_INCOMPLETE = 10;
     // The offer belongs to a portable family, which resolves through `rename`, `move`,
     // `delete`, or `change_signature` rather than through `act`.
     REFUSAL_REASON_PORTABLE_FAMILY = 11;
   }
-  // Projection head against which the work was attempted.
-  string head = 1;
   // The condition the caller can act on.
   RefusalReason reason = 2;
   // Conditions checked before refusal, including at least one failed entry for
@@ -1607,9 +1614,6 @@ message RefusedResult {
   repeated rift.core.OperationBlocker blockers = 4;
   // Evidence that explains the refusal.
   repeated rift.core.Diagnostic diagnostics = 5;
-  // Acknowledgements required for a retry of the same operation and expected projection state.
-  // Empty unless `reason` is `confirmation_required`.
-  repeated rift.core.ConfirmationRequirement confirmations = 6;
 }
 // An applied projection change or semantic refusal.
 message ChangeResult {
@@ -1618,10 +1622,13 @@ message ChangeResult {
     RefusedResult refused = 2;
   }
 }
-// Publishes the session projection into the physical workspace.
+// Publishes the session projection into the workspace. Publication is the one step that
+// touches the user's own files, so it is where confirmations are settled: a change carrying
+// one is published only when this call names it.
 message PublishParams {
-  // Projection head the caller reviewed.
-  string expected = 1;
+  // Changes whose confirmations the caller accepts. A change carrying a confirmation and absent
+  // here is returned in `unaccepted` and nothing is written.
+  repeated string accept = 1;
 }
 // The result of publishing projection changes into the workspace.
 message PublishResult {
@@ -1629,6 +1636,9 @@ message PublishResult {
   rift.core.ProjectionState state = 2;
   // Workspace paths changed outside this projection.
   repeated string conflicts = 3;
+  // Changes carrying a confirmation that `accept` did not name, sorted by change identity.
+  // Non-empty means nothing was written.
+  repeated string unaccepted = 4;
 }
 // One filesystem entry from the session projection.
 message FsResourcePayload {
@@ -1643,8 +1653,6 @@ message FsResourcePayload {
   }
   // Exact resource request this payload answers.
   string uri = 1;
-  // Projection head from which the entry was read.
-  string head = 2;
   // Directory, regular file, or symbolic link named by the URI.
   rift.core.ProjectEntry entry = 3;
   // How this entry's payload is represented.
@@ -1758,9 +1766,9 @@ service Rift {
   rpc DebugGetFrame (rift.mcp.DebugGetFrameParams) returns (rift.mcp.DebugGetFrameResult);
   // Releases a debugging session, adapter state, and execution workspace.
   rpc DebugStop (rift.mcp.DebugStopParams) returns (rift.mcp.DebugStopResult);
-  // Applies and validates an atomic edit set at the expected projection head.
+  // Applies and validates an atomic edit set, and records the result in the changeset.
   rpc Edit (rift.mcp.EditParams) returns (rift.mcp.ChangeResult);
-  // Applies a unified diff at the expected projection head.
+  // Applies a unified diff, and records the result in the changeset.
   rpc Patch (rift.mcp.PatchParams) returns (rift.mcp.ChangeResult);
   // Applies replacements for every match of one query. The cardinality is checked before
   // expansion, so a pattern that matches more places than intended refuses instead of rewriting
@@ -1785,9 +1793,11 @@ service Rift {
   // adapter-specific family. Arguments are validated against the schema the offer advertises. A
   // portable family is refused here and resolves through its own tool.
   rpc Act (rift.mcp.ActParams) returns (rift.mcp.ChangeResult);
-  // Restores changed paths from the current workspace.
+  // Restores changed paths from the workspace and drops the changes that touched them.
   rpc ProjectionRestore (rift.mcp.ProjectionRestoreParams) returns (rift.core.ProjectionState);
-  // Publishes projection changes whose workspace paths have not changed.
+  // Publishes the changeset into the workspace. A change carrying a confirmation is published
+  // only when the call accepts it, and a workspace path changed since the projection took it
+  // refuses the whole publication.
   rpc Publish (rift.mcp.PublishParams) returns (rift.mcp.PublishResult);
   rpc ReadResource (rift.mcp.ResourceReadParams) returns (rift.mcp.ResourceReadResult);
 }

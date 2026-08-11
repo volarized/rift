@@ -103,7 +103,7 @@
       "edit": {
         "rpc": "rift.mcp.Rift/Edit",
         "group": "changes",
-        "description": "Applies and validates an atomic edit set at the expected projection head.",
+        "description": "Applies and validates an atomic edit set, and records the result in the changeset.",
         "params": {
           "$ref": "#/$defs/EditParams"
         },
@@ -114,7 +114,7 @@
       "patch": {
         "rpc": "rift.mcp.Rift/Patch",
         "group": "changes",
-        "description": "Applies a unified diff at the expected projection head.",
+        "description": "Applies a unified diff, and records the result in the changeset.",
         "params": {
           "$ref": "#/$defs/PatchParams"
         },
@@ -191,7 +191,7 @@
       "projection_restore": {
         "rpc": "rift.mcp.Rift/ProjectionRestore",
         "group": "changes",
-        "description": "Restores changed paths from the current workspace.",
+        "description": "Restores changed paths from the workspace and drops the changes that touched them.",
         "params": {
           "$ref": "#/$defs/ProjectionRestoreParams"
         },
@@ -202,7 +202,7 @@
       "publish": {
         "rpc": "rift.mcp.Rift/Publish",
         "group": "changes",
-        "description": "Publishes projection changes whose workspace paths have not changed.",
+        "description": "Publishes the changeset into the workspace. A change carrying a confirmation is published only when the call accepts it, and a workspace path changed since the projection took it refuses the whole publication.",
         "params": {
           "$ref": "#/$defs/PublishParams"
         },
@@ -266,6 +266,30 @@
         },
         "link": {
           "$ref": "#/$defs/ResourceLink"
+        }
+      },
+      "root": {
+        "description": "Returns the filesystem path of this session's projection, for tools that can only work through a directory.",
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/RootResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/RootResourceLink"
+        }
+      },
+      "changes": {
+        "description": "Returns the changes this session has applied, each with its edits, effects, validation evidence, and the confirmations publication will check.",
+        "template": {
+          "$ref": "#/$defs/ResourceTemplate"
+        },
+        "uri": {
+          "$ref": "#/$defs/ChangesResourceUri"
+        },
+        "link": {
+          "$ref": "#/$defs/ChangesResourceLink"
         }
       },
       "symbol": {
@@ -334,11 +358,13 @@
     "description": "Each axis owns a set of definitions. `identifiedBy` supplies its roots, then the group closes over references without taking a definition already assigned to another axis. `holds` assigns explicit definitions and `residualOf` assigns the unclaimed definitions from one schema document.",
     "groups": [
       {
-        "name": "Versioning",
-        "summary": "Session projections and their optimistic-concurrency heads.",
+        "name": "Changeset",
+        "summary": "What a session has changed in its projection, and what vouched for each change.",
         "identifiedBy": [
           "ProjectionState",
-          "ProjectionHead"
+          "ChangeId",
+          "ChangeSummary",
+          "ChangesResourcePayload"
         ]
       },
       {
@@ -510,25 +536,6 @@
       "additionalProperties": false,
       "description": "Resolves one discovered adapter action \u2014 a quick fix, an extraction, an inline, anything an adapter offers that has no portable contract. Rift validates `arguments` against the offer's advertised schema. An offer whose kind belongs to a portable family is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this operation must replace.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "confirmations": {
-          "description": "Confirmation ids returned by an earlier refusal for this same expected projection state and operation. Missing or extra ids refuse the retry.",
-          "items": {
-            "type": "integer"
-          },
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Confirmations",
-          "type": "array",
-          "uniqueItems": true
-        },
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
           "description": "Formatting applied after this operation's edits resolve.",
@@ -554,7 +561,6 @@
         }
       },
       "required": [
-        "expected",
         "formatting",
         "action",
         "arguments"
@@ -789,7 +795,7 @@
       "type": "object"
     },
     "ActionOfferId": {
-      "description": "Identity of one adapter action at a projection head.",
+      "description": "Identity of one adapter action, carrying the file its target was resolved in. Rift\nrevalidates it against that file, so a write elsewhere in the projection leaves it usable.",
       "examples": [
         "rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ"
       ],
@@ -858,13 +864,6 @@
             "number": 1
           }
         },
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head in which this offer was discovered.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
         "language": {
           "$ref": "#/$defs/Language",
           "description": "Language whose adapter minted the offer and resolves it.",
@@ -882,7 +881,6 @@
       },
       "required": [
         "uri",
-        "head",
         "language",
         "offer"
       ],
@@ -1006,13 +1004,6 @@
             "number": 1
           }
         },
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this answer used.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
         "offers": {
           "description": "The actions on this page, each without its argument schema.",
           "items": {
@@ -1048,7 +1039,6 @@
       },
       "required": [
         "uri",
-        "head",
         "offers",
         "coverage",
         "next"
@@ -1626,12 +1616,26 @@
       "title": "CapturedText",
       "type": "object"
     },
+    "ChangeId": {
+      "description": "Identity of one change recorded in the projection's changeset. Rift mints it when the\nchange lands and keeps it until publication or restore removes the change.",
+      "examples": [
+        "chg_bbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "pattern": "^chg_[a-z2-7]{26}$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "ChangeId",
+      "type": "string"
+    },
     "ChangeResult": {
       "description": "An applied projection change or semantic refusal.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "The operation atomically replaced the current projection state.",
+          "description": "The operation resolved to edits and Rift wrote them into the projection.",
           "properties": {
             "status": {
               "const": "applied",
@@ -1660,7 +1664,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "Resolution stopped before Rift changed the projection.",
+          "description": "Resolution produced no edits, so the projection is untouched.",
           "properties": {
             "status": {
               "const": "refused",
@@ -1668,13 +1672,6 @@
               "description": "Identifies a domain refusal.",
               "title": "Status",
               "type": "string"
-            },
-            "head": {
-              "$ref": "#/$defs/ProjectionHead",
-              "description": "Projection head against which the work was attempted.",
-              "rift:proto": {
-                "number": 1
-              }
             },
             "reason": {
               "$ref": "#/$defs/RefusalReason",
@@ -1715,26 +1712,13 @@
               },
               "title": "Diagnostics",
               "type": "array"
-            },
-            "confirmations": {
-              "description": "Acknowledgements required for a retry of the same operation and expected projection state. Empty unless `reason` is `confirmation_required`.",
-              "items": {
-                "$ref": "#/$defs/ConfirmationRequirement"
-              },
-              "rift:proto": {
-                "number": 6
-              },
-              "title": "Confirmations",
-              "type": "array"
             }
           },
           "required": [
-            "head",
             "reason",
             "preconditions",
             "blockers",
-            "diagnostics",
-            "confirmations"
+            "diagnostics"
           ],
           "rift:package": "rift.mcp",
           "rift:proto": {
@@ -1799,25 +1783,6 @@
       "additionalProperties": false,
       "description": "Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument lists: a new required parameter has to be supplied at every call site, which is why the operation commonly raises a `behavior_unknown` confirmation.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this operation must replace.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "confirmations": {
-          "description": "Confirmation ids returned by an earlier refusal for this same expected projection state and operation. Missing or extra ids refuse the retry.",
-          "items": {
-            "type": "integer"
-          },
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Confirmations",
-          "type": "array",
-          "uniqueItems": true
-        },
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
           "description": "Formatting applied after this operation's edits resolve.",
@@ -1841,7 +1806,6 @@
         }
       },
       "required": [
-        "expected",
         "formatting",
         "target",
         "arguments"
@@ -1855,8 +1819,15 @@
     },
     "ChangeSummary": {
       "additionalProperties": false,
-      "description": "An applied projection change and its validation evidence.",
+      "description": "One change in the projection's changeset, with everything Rift learned while resolving it.\nA change carrying confirmations is recorded the same way as one carrying none; the\nconfirmations are what publication checks.",
       "properties": {
+        "id": {
+          "$ref": "#/$defs/ChangeId",
+          "description": "Identity of this change in the changeset.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
         "validation": {
           "$ref": "#/$defs/ChangeValidation",
           "description": "Adapter validation of the resulting projection.",
@@ -1908,20 +1879,33 @@
           "title": "Diagnostics",
           "type": "array"
         },
+        "confirmations": {
+          "description": "Effects the caller has to accept before this change can be published, sorted and numbered from zero. Empty where every affected adapter and validator vouched for the result.",
+          "items": {
+            "$ref": "#/$defs/ConfirmationRequirement"
+          },
+          "rift:proto": {
+            "number": 10
+          },
+          "title": "Confirmations",
+          "type": "array"
+        },
         "current": {
           "$ref": "#/$defs/ProjectionState",
-          "description": "Current projection state with a fresh head token.",
+          "description": "Projection state after this change landed.",
           "rift:proto": {
             "number": 9
           }
         }
       },
       "required": [
+        "id",
         "validation",
         "edits",
         "effects",
         "guarantees",
         "diagnostics",
+        "confirmations",
         "current"
       ],
       "rift:package": "rift.mcp",
@@ -1964,6 +1948,125 @@
       },
       "title": "ChangeValidation",
       "type": "object"
+    },
+    "ChangesResourceLink": {
+      "additionalProperties": false,
+      "description": "A link to the session's changeset.",
+      "properties": {
+        "type": {
+          "const": "resource_link",
+          "description": "MCP's tag for a link to a resource inside tool output.",
+          "title": "Type",
+          "type": "string"
+        },
+        "uri": {
+          "$ref": "#/$defs/ChangesResourceUri",
+          "description": "The changeset, optionally continued by a cursor.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "name": {
+          "const": "changes",
+          "description": "The resource family this link belongs to.",
+          "rift:proto": {
+            "number": 2
+          },
+          "title": "Name",
+          "type": "string"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.changes+json",
+          "description": "What a read of this URI returns: `ChangesResourcePayload` as JSON.",
+          "rift:proto": {
+            "field": "mime_type",
+            "number": 3
+          },
+          "title": "Mimetype",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "uri",
+        "name",
+        "mimeType"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.ChangesResourceLink"
+      },
+      "title": "ChangesResourceLink",
+      "type": "object"
+    },
+    "ChangesResourcePayload": {
+      "additionalProperties": false,
+      "description": "One page of the session's changeset, oldest change first. This is the read an agent makes\nbefore publishing: every change it applied, what each one did, and which of them nobody\nvouched for.",
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/ChangesResourceUri",
+          "description": "The URI this payload answers for.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "state": {
+          "$ref": "#/$defs/ProjectionState",
+          "description": "Projection state the page was read from.",
+          "rift:proto": {
+            "number": 2
+          }
+        },
+        "changes": {
+          "description": "Changes on this page, in the order they were applied.",
+          "items": {
+            "$ref": "#/$defs/ChangeSummary"
+          },
+          "rift:proto": {
+            "number": 3
+          },
+          "title": "Changes",
+          "type": "array"
+        },
+        "next": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangesResourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The same resource carrying the cursor for the next page, or null on the last one.",
+          "rift:proto": {
+            "number": 4
+          }
+        }
+      },
+      "required": [
+        "uri",
+        "state",
+        "changes"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.ChangesResourcePayload"
+      },
+      "title": "ChangesResourcePayload",
+      "type": "object"
+    },
+    "ChangesResourceUri": {
+      "description": "Paginated changeset of the session projection.",
+      "maxLength": 8192,
+      "pattern": "^rift://changes(?:\\?cursor=[A-Za-z0-9_-]{1,4096})?$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "ChangesResourceUri",
+      "type": "string"
     },
     "CodeBlock": {
       "additionalProperties": false,
@@ -2241,10 +2344,10 @@
     },
     "ConfirmationRequirement": {
       "additionalProperties": false,
-      "description": "One effect a caller must acknowledge before a change becomes visible. Requirements are sorted by kind, source location, title, and detail, then numbered from zero. An acknowledgement applies to a retry of the same operation and expected head.",
+      "description": "One effect the caller has to accept before publication. The change that raised it lands in the projection either way, carrying this record, so the caller can read what happened before deciding. Requirements are sorted by kind, source location, title, and detail, then numbered from zero within their change.",
       "properties": {
         "id": {
-          "description": "Zero-based position in the refusal's ordered confirmation list.",
+          "description": "Zero-based position in its change's ordered confirmation list.",
           "maximum": 4294967295,
           "minimum": 0,
           "rift:proto": {
@@ -2255,6 +2358,7 @@
         },
         "kind": {
           "$ref": "#/$defs/ConfirmationRequirementKind",
+          "description": "The condition that makes acceptance necessary.",
           "rift:proto": {
             "number": 2
           }
@@ -2314,7 +2418,9 @@
         "unresolved_reference",
         "behavior_unknown",
         "formatting_scope",
-        "command_validator"
+        "command_validator",
+        "validation_incomplete",
+        "guarantee_unestablished"
       ],
       "rift:enumDescriptions": {
         "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
@@ -2322,8 +2428,10 @@
         "destructive": "The change deletes source or replaces an existing file.",
         "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
         "generated_code": "The change touches source marked as generated.",
-        "large_scope": "The change reaches enough files or symbols to require explicit acknowledgement.",
-        "unresolved_reference": "The adapter found a reference it could not classify or update."
+        "guarantee_unestablished": "The action advertised a guarantee that resolution produced no evidence for.",
+        "large_scope": "The change reaches enough files or symbols to require explicit acceptance.",
+        "unresolved_reference": "The adapter found a reference it could not classify or update.",
+        "validation_incomplete": "Required adapter or command validation did not complete over the resulting tree."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -2351,6 +2459,10 @@
             "name": "GENERATED_CODE",
             "number": 3
           },
+          "guarantee_unestablished": {
+            "name": "GUARANTEE_UNESTABLISHED",
+            "number": 9
+          },
           "large_scope": {
             "name": "LARGE_SCOPE",
             "number": 2
@@ -2358,6 +2470,10 @@
           "unresolved_reference": {
             "name": "UNRESOLVED_REFERENCE",
             "number": 4
+          },
+          "validation_incomplete": {
+            "name": "VALIDATION_INCOMPLETE",
+            "number": 8
           }
         }
       },
@@ -2558,7 +2674,7 @@
       "properties": {
         "contract": {
           "$ref": "#/$defs/Contract",
-          "description": "Exact generated contract selected for this connection.",
+          "description": "Contract this connection speaks: the shared major, and the lower of the two minors.",
           "rift:proto": {
             "number": 1
           }
@@ -2646,7 +2762,7 @@
     },
     "Contract": {
       "additionalProperties": false,
-      "description": "One generated wire contract. A peer accepts it only when all three fields match one of its own generated descriptors.",
+      "description": "One generated wire contract. Majors have to be equal, because a major changes when a peer can no longer decode the next message safely. Within one major, revisions only add, so a peer can speak any minor at or below its own and the connection settles on the lower of the two.",
       "properties": {
         "major": {
           "$ref": "#/$defs/ProtocolVersion",
@@ -2656,7 +2772,7 @@
           }
         },
         "minor": {
-          "description": "Additive revision within the selected major.",
+          "description": "Additive revision within the major. A peer admits any minor at or below its own and emits nothing added after the minor the connection settled on, so the client checks this one number to know it can decode everything it will be sent.",
           "maximum": 4294967295,
           "minimum": 0,
           "rift:proto": {
@@ -2668,7 +2784,7 @@
         },
         "schema_digest": {
           "$ref": "#/$defs/Digest",
-          "description": "SHA-256 of the generated descriptor and its MCP conversion metadata. Equal major and minor values with different digests are incompatible.",
+          "description": "SHA-256 of the generated descriptor and its MCP conversion metadata. It names the exact generation a peer was built from, which is what makes a bug report reproducible; admission is decided by `major` and `minor`.",
           "rift:proto": {
             "number": 3
           }
@@ -3316,13 +3432,6 @@
             "number": 1
           }
         },
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head used by the debugging session.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
         "language": {
           "$ref": "#/$defs/Language",
           "description": "Adapter that owns the retained debug state.",
@@ -3357,7 +3466,6 @@
       },
       "required": [
         "id",
-        "head",
         "language",
         "frame_count",
         "result",
@@ -3465,25 +3573,6 @@
       "additionalProperties": false,
       "description": "Removes a declaration. Without a policy this is a mechanical removal that analyses no references and claims no reference guarantee. With one, the adapter classifies every remaining use, applies the stated disposition, and refuses the operation when reference coverage is incomplete.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this operation must replace.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "confirmations": {
-          "description": "Confirmation ids returned by an earlier refusal for this same expected projection state and operation. Missing or extra ids refuse the retry.",
-          "items": {
-            "type": "integer"
-          },
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Confirmations",
-          "type": "array",
-          "uniqueItems": true
-        },
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
           "description": "Formatting applied after this operation's edits resolve.",
@@ -3507,7 +3596,6 @@
         }
       },
       "required": [
-        "expected",
         "formatting",
         "target",
         "arguments"
@@ -3654,13 +3742,6 @@
             "number": 1
           }
         },
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this diagnostic belongs to.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
         "diagnostic": {
           "$ref": "#/$defs/Diagnostic",
           "description": "The finding itself, exactly as the adapter minted it.",
@@ -3715,7 +3796,6 @@
       },
       "required": [
         "source",
-        "head",
         "diagnostic",
         "line",
         "column",
@@ -4196,25 +4276,6 @@
       "additionalProperties": false,
       "description": "Concrete filesystem edits supplied by the caller. Their ranges address the state this operation resolves against, and replacements in one set may not overlap.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this operation must replace.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "confirmations": {
-          "description": "Confirmation ids returned by an earlier refusal for this same expected projection state and operation. Missing or extra ids refuse the retry.",
-          "items": {
-            "type": "integer"
-          },
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Confirmations",
-          "type": "array",
-          "uniqueItems": true
-        },
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
           "description": "Formatting applied after this operation's edits resolve.",
@@ -4236,7 +4297,6 @@
         }
       },
       "required": [
-        "expected",
         "formatting",
         "edits"
       ],
@@ -4344,7 +4404,6 @@
         "cursor_expired",
         "temporarily_unavailable",
         "configuration_invalid",
-        "projection_head_moved",
         "capability_unavailable"
       ],
       "rift:enumDescriptions": {
@@ -4363,7 +4422,6 @@
         "limit_exceeded": "A request or a response crossed an advertised limit. `limit` says which one and by how much, so the request can be resized and sent again.",
         "permission_denied": "The connection cannot perform this operation: a path leaves the workspace, or a debugging session belongs to another connection. The same request fails the same way.",
         "projection_busy": "The session has an in-flight Rift FS mutation that prevents this operation. Retry after that mutation completes.",
-        "projection_head_moved": "A change or cleanup request names a projection token that is no longer current. Read the projection again before retrying.",
         "resource_not_found": "The identity is well-formed and resolves to nothing \u2014 no such symbol, no such filesystem entry, or a debug session already stopped or expired. Retrying does not help.",
         "storage_failure": "Rift could not read or write workspace or projection files. Worth retrying only if the cause was transient, such as a disk that has since been cleared.",
         "temporarily_unavailable": "The resource exists but is in use. Another connection owns the session, a retained debugger blocks continuation, or a disposable workspace is still releasing. Retry after that owner or operation finishes.",
@@ -4435,10 +4493,6 @@
           "projection_busy": {
             "name": "ERROR_CODE_PROJECTION_BUSY",
             "number": 10
-          },
-          "projection_head_moved": {
-            "name": "ERROR_CODE_PROJECTION_HEAD_MOVED",
-            "number": 21
           },
           "resource_not_found": {
             "name": "ERROR_CODE_RESOURCE_NOT_FOUND",
@@ -4525,7 +4579,7 @@
         "phase": {
           "$ref": "#/$defs/ErrorDataPhase",
           "rift:enumDescriptions": {
-            "change": "Checking the projection token, resolving in a private candidate, validating, and conditionally advancing the projection.",
+            "change": "Resolving the operation in a private candidate, validating it, and writing the result into the projection.",
             "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
             "discovery": "Working out what the workspace can do: capabilities, limits, which languages have adapters.",
             "execute": "Preparing an execution workspace and evaluating caller-provided code.",
@@ -4536,20 +4590,6 @@
           },
           "rift:proto": {
             "number": 4
-          }
-        },
-        "head": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ProjectionHead"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The projection head used by the request. Null where the failure happened before one was resolved.",
-          "rift:proto": {
-            "number": 5
           }
         },
         "operation": {
@@ -4610,7 +4650,6 @@
         "message",
         "retry",
         "phase",
-        "head",
         "operation",
         "diagnostics",
         "causes"
@@ -4635,7 +4674,7 @@
         "debug"
       ],
       "rift:enumDescriptions": {
-        "change": "Checking the projection token, resolving in a private candidate, validating, and conditionally advancing the projection.",
+        "change": "Resolving the operation in a private candidate, validating it, and writing the result into the projection.",
         "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
         "discovery": "Working out what the workspace can do: capabilities, limits, which languages have adapters.",
         "execute": "Preparing an execution workspace and evaluating caller-provided code.",
@@ -4737,13 +4776,6 @@
       "additionalProperties": false,
       "description": "Bounded result of one execution. Writes made by evaluated code are absent because its\nexecution workspace is discarded.",
       "properties": {
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head used for execution.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
         "language": {
           "$ref": "#/$defs/Language",
           "description": "Adapter that evaluated the block.",
@@ -4767,7 +4799,6 @@
         }
       },
       "required": [
-        "head",
         "language",
         "result",
         "budget"
@@ -5815,13 +5846,6 @@
             "number": 1
           }
         },
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head from which the entry was read.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
         "entry": {
           "$ref": "#/$defs/ProjectEntry",
           "description": "Directory, regular file, or symbolic link named by the URI.",
@@ -5939,7 +5963,6 @@
       },
       "required": [
         "uri",
-        "head",
         "entry",
         "encoding"
       ],
@@ -6498,7 +6521,7 @@
     },
     "MatchCardinality": {
       "additionalProperties": false,
-      "description": "How many matches an atomic rewrite accepts. Rift counts against the expected session state and refuses the operation when the count falls outside this interval.",
+      "description": "How many matches an atomic rewrite accepts. Rift counts the matches in the projection as it stands and refuses the operation when the count falls outside this interval, so a pattern that is looser than the caller believed rewrites nothing.",
       "properties": {
         "minimum": {
           "description": "Fewest matches required.",
@@ -6685,7 +6708,7 @@
       "title": "MatchHit"
     },
     "MatchId": {
-      "description": "Identity of one match at a projection head.",
+      "description": "Identity of one match, carrying the file it was found in and the bytes it covered. Rift\nrevalidates it against that file, so a write elsewhere in the projection leaves it usable.",
       "examples": [
         "rift://match/eyJzbmFwc2hvdCI6eyJraW5kIjoiY29tbWl0In19"
       ],
@@ -6788,15 +6811,8 @@
     },
     "MatchResult": {
       "additionalProperties": false,
-      "description": "One page of matches and the state they were found in. Matches sort by file bytes, range, and canonical key. Rift checks the key against `at` before applying an addressed edit.",
+      "description": "One page of matches. Matches sort by file bytes, range, and canonical key. A match key names the file it was found in, so Rift rechecks that file before applying an edit addressed at it.",
       "properties": {
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this answer used.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
         "matches": {
           "description": "The matches on this page.",
           "items": {
@@ -6831,7 +6847,6 @@
         }
       },
       "required": [
-        "head",
         "matches",
         "coverage",
         "next_cursor"
@@ -7053,25 +7068,6 @@
       "additionalProperties": false,
       "description": "Moves a declaration or file to another container or path and updates the imports and references that reach it.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this operation must replace.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "confirmations": {
-          "description": "Confirmation ids returned by an earlier refusal for this same expected projection state and operation. Missing or extra ids refuse the retry.",
-          "items": {
-            "type": "integer"
-          },
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Confirmations",
-          "type": "array",
-          "uniqueItems": true
-        },
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
           "description": "Formatting applied after this operation's edits resolve.",
@@ -7095,7 +7091,6 @@
         }
       },
       "required": [
-        "expected",
         "formatting",
         "target",
         "arguments"
@@ -7529,7 +7524,7 @@
           "type": "array"
         },
         "after": {
-          "description": "Subjects after Rift applies the change and every adapter sharing the projection acknowledges the new head. Empty for deletion.",
+          "description": "Subjects after Rift applies the change and every adapter sharing the projection acknowledges the change. Empty for deletion.",
           "items": {
             "$ref": "#/$defs/Address"
           },
@@ -7678,7 +7673,7 @@
         },
         "expected": {
           "$ref": "#/$defs/PreconditionValue",
-          "description": "Required value. Examples include the discovered head, zero remaining usages, or complete coverage.",
+          "description": "Required value. Examples include zero remaining usages or complete coverage.",
           "rift:proto": {
             "number": 6
           }
@@ -7723,7 +7718,7 @@
       "description": "Condition being checked.",
       "enum": [
         "target_exists",
-        "state_matches",
+        "source_unchanged",
         "writable",
         "references_complete",
         "no_remaining_usages",
@@ -7737,8 +7732,8 @@
         "name_available": "The requested name creates no forbidden collision or binding change.",
         "no_remaining_usages": "No usage remains after the selected safe-delete policy is applied.",
         "references_complete": "The adapter completely classified the references on which the operation depends.",
-        "state_matches": "The state used for discovery still matches the state being resolved.",
-        "target_exists": "Every addressed symbol, node, match, or source range resolves at the expected state.",
+        "source_unchanged": "The files a match or action offer was discovered in have not been rewritten since.",
+        "target_exists": "Every addressed symbol, node, match, or source range resolves in the projection as it stands.",
         "writable": "Every affected path is inside the project and writable through Rift's workspace handle."
       },
       "rift:package": "rift.core",
@@ -7767,8 +7762,8 @@
             "name": "KIND_REFERENCES_COMPLETE",
             "number": 4
           },
-          "state_matches": {
-            "name": "KIND_STATE_MATCHES",
+          "source_unchanged": {
+            "name": "KIND_SOURCE_UNCHANGED",
             "number": 2
           },
           "target_exists": {
@@ -7932,7 +7927,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "A language adapter checked its own state.",
+          "description": "A language adapter ran the check against its own analysis.",
           "properties": {
             "kind": {
               "const": "adapter",
@@ -7941,7 +7936,7 @@
             },
             "language": {
               "$ref": "#/$defs/Language",
-              "description": "Adapter whose adapter performed the check.",
+              "description": "The language whose adapter performed the check.",
               "rift:proto": {
                 "number": 1
               }
@@ -8346,13 +8341,6 @@
       "additionalProperties": false,
       "description": "One page of a file outline with explicit semantic coverage.",
       "properties": {
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head from which the file and semantic facts were read.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
         "file": {
           "$ref": "#/$defs/File",
           "description": "File entry being outlined.",
@@ -8394,7 +8382,6 @@
         }
       },
       "required": [
-        "head",
         "file",
         "items",
         "coverage",
@@ -8510,25 +8497,6 @@
       "additionalProperties": false,
       "description": "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the state it resolves against.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this operation must replace.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "confirmations": {
-          "description": "Confirmation ids returned by an earlier refusal for this same expected projection state and operation. Missing or extra ids refuse the retry.",
-          "items": {
-            "type": "integer"
-          },
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Confirmations",
-          "type": "array",
-          "uniqueItems": true
-        },
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
           "description": "Formatting applied after this operation's edits resolve.",
@@ -8547,7 +8515,6 @@
         }
       },
       "required": [
-        "expected",
         "formatting",
         "patch"
       ],
@@ -8858,31 +8825,10 @@
       "title": "ProjectPath",
       "type": "string"
     },
-    "ProjectionHead": {
-      "description": "Opaque compare-and-swap token for the current source state of a writable projection.\nRift generates a fresh token whenever the visible state advances.",
-      "examples": [
-        "ph_bbbbbbbbbbbbbbbbbbbbbbbbbb"
-      ],
-      "pattern": "^ph_[a-z2-7]{26}$",
-      "rift:package": "rift.core",
-      "rift:proto": {
-        "package": "rift.core",
-        "scalar": "string"
-      },
-      "title": "ProjectionHead",
-      "type": "string"
-    },
     "ProjectionRestoreParams": {
       "additionalProperties": false,
       "description": "Restores changed paths from the current workspace.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head the caller intends to discard.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
         "paths": {
           "anyOf": [
             {
@@ -8905,9 +8851,6 @@
           "uniqueItems": true
         }
       },
-      "required": [
-        "expected"
-      ],
       "rift:package": "rift.mcp",
       "rift:proto": {
         "type": "rift.mcp.ProjectionRestoreParams"
@@ -8917,27 +8860,28 @@
     },
     "ProjectionState": {
       "additionalProperties": false,
-      "description": "Current state of the session projection.",
+      "description": "Summary of the session projection. The changed paths and the changes that produced them\nare read from the changes resource, which pages; both fields here are counts a caller can\nbranch on without that read.",
       "properties": {
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Fresh ABA-safe token for this current state.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
         "dirty": {
-          "description": "Whether the projection contains unpublished changes.",
+          "description": "Whether the projection holds anything the workspace does not.",
           "rift:proto": {
             "number": 3
           },
           "title": "Dirty",
           "type": "boolean"
+        },
+        "unacknowledged": {
+          "description": "Whether the changeset holds a change carrying a confirmation the caller has not accepted. Publication refuses while this is true.",
+          "rift:proto": {
+            "number": 4
+          },
+          "title": "Unacknowledged",
+          "type": "boolean"
         }
       },
       "required": [
-        "head",
-        "dirty"
+        "dirty",
+        "unacknowledged"
       ],
       "rift:package": "rift.core",
       "rift:proto": {
@@ -8959,19 +8903,21 @@
     },
     "PublishParams": {
       "additionalProperties": false,
-      "description": "Publishes the session projection into the physical workspace.",
+      "description": "Publishes the session projection into the workspace. Publication is the one step that\ntouches the user's own files, so it is where confirmations are settled: a change carrying\none is published only when this call names it.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head the caller reviewed.",
+        "accept": {
+          "description": "Changes whose confirmations the caller accepts. A change carrying a confirmation and absent here is returned in `unaccepted` and nothing is written.",
+          "items": {
+            "$ref": "#/$defs/ChangeId"
+          },
           "rift:proto": {
             "number": 1
-          }
+          },
+          "title": "Accept",
+          "type": "array",
+          "uniqueItems": true
         }
       },
-      "required": [
-        "expected"
-      ],
       "rift:package": "rift.mcp",
       "rift:proto": {
         "type": "rift.mcp.PublishParams"
@@ -9000,11 +8946,24 @@
           },
           "title": "Conflicts",
           "type": "array"
+        },
+        "unaccepted": {
+          "description": "Changes carrying a confirmation that `accept` did not name, sorted by change identity. Non-empty means nothing was written.",
+          "items": {
+            "$ref": "#/$defs/ChangeId"
+          },
+          "rift:proto": {
+            "number": 4
+          },
+          "title": "Unaccepted",
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
         "state",
-        "conflicts"
+        "conflicts",
+        "unaccepted"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -9014,7 +8973,7 @@
       "type": "object"
     },
     "RefusalReason": {
-      "description": "Why Rift declined a change. A refusal is a completed decision; `ErrorData` carries transport and infrastructure failures.",
+      "description": "Why Rift produced no edits at all. Every reason here means resolution had nothing to write: a change Rift can express but nobody will vouch for still lands, carrying its confirmations. `ErrorData` carries transport and infrastructure failures.",
       "enum": [
         "unsupported",
         "unmet_precondition",
@@ -9022,24 +8981,20 @@
         "stale_action",
         "stale_match",
         "cardinality_mismatch",
-        "confirmation_required",
         "unsafe_effect",
         "formatter_unsupported",
-        "validation_incomplete",
         "portable_family"
       ],
       "rift:enumDescriptions": {
         "ambiguous_target": "The address resolves to several targets. Narrow it and ask again.",
         "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
-        "confirmation_required": "The operation needs acknowledgements the caller did not supply.",
         "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
         "portable_family": "The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
-        "stale_action": "The offer belongs to an earlier projection head. Read the actions resource again.",
-        "stale_match": "The match belongs to an earlier projection head. Search again.",
+        "stale_action": "The file the offer was discovered in has been rewritten since. Read the actions resource again.",
+        "stale_match": "The file the match was found in has been rewritten since. Search again.",
         "unmet_precondition": "A condition checked before resolution failed. The failed entry is in `preconditions`.",
         "unsafe_effect": "The complete effect reaches outside what the caller can have meant \u2014 outside the project, or into generated source.",
-        "unsupported": "No adapter implements this operation for the language it reaches.",
-        "validation_incomplete": "Required adapter or command validation did not complete."
+        "unsupported": "No adapter implements this operation for the language it reaches."
       },
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -9053,10 +9008,6 @@
           "cardinality_mismatch": {
             "name": "REFUSAL_REASON_CARDINALITY_MISMATCH",
             "number": 6
-          },
-          "confirmation_required": {
-            "name": "REFUSAL_REASON_CONFIRMATION_REQUIRED",
-            "number": 7
           },
           "formatter_unsupported": {
             "name": "REFUSAL_REASON_FORMATTER_UNSUPPORTED",
@@ -9085,10 +9036,6 @@
           "unsupported": {
             "name": "REFUSAL_REASON_UNSUPPORTED",
             "number": 1
-          },
-          "validation_incomplete": {
-            "name": "REFUSAL_REASON_VALIDATION_INCOMPLETE",
-            "number": 10
           }
         }
       },
@@ -9718,25 +9665,6 @@
       "additionalProperties": false,
       "description": "Changes what a declaration is called and rewrites the references that name it. The adapter checks language spelling, collisions, and binding changes; a reference outside `scope` refuses the operation rather than leaving it half done.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this operation must replace.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "confirmations": {
-          "description": "Confirmation ids returned by an earlier refusal for this same expected projection state and operation. Missing or extra ids refuse the retry.",
-          "items": {
-            "type": "integer"
-          },
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Confirmations",
-          "type": "array",
-          "uniqueItems": true
-        },
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
           "description": "Formatting applied after this operation's edits resolve.",
@@ -9760,7 +9688,6 @@
         }
       },
       "required": [
-        "expected",
         "formatting",
         "target",
         "arguments"
@@ -9973,6 +9900,86 @@
           },
           "title": "ActionResourceContent",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "What a read of `rift://root` returns.",
+          "properties": {
+            "uri": {
+              "$ref": "#/$defs/RootResourceUri",
+              "description": "The URI that was read, as it resolved.",
+              "rift:proto": {
+                "number": 1
+              }
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.root+json",
+              "description": "Which payload `text` holds.",
+              "title": "Mimetype",
+              "type": "string"
+            },
+            "text": {
+              "contentMediaType": "application/vnd.rift.root+json",
+              "description": "A `RootResourcePayload`, serialized as JSON.",
+              "rift:contentType": "RootResourcePayload",
+              "rift:proto": {
+                "number": 2
+              },
+              "title": "Text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "mimeType",
+            "text"
+          ],
+          "rift:package": "rift.mcp",
+          "rift:proto": {
+            "type": "rift.mcp.RootResourceContent"
+          },
+          "title": "RootResourceContent",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "What a read of a `rift://changes` URI returns.",
+          "properties": {
+            "uri": {
+              "$ref": "#/$defs/ChangesResourceUri",
+              "description": "The URI that was read, as it resolved.",
+              "rift:proto": {
+                "number": 1
+              }
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.changes+json",
+              "description": "Which payload `text` holds.",
+              "title": "Mimetype",
+              "type": "string"
+            },
+            "text": {
+              "contentMediaType": "application/vnd.rift.changes+json",
+              "description": "A `ChangesResourcePayload`, serialized as JSON.",
+              "rift:contentType": "ChangesResourcePayload",
+              "rift:proto": {
+                "number": 2
+              },
+              "title": "Text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "mimeType",
+            "text"
+          ],
+          "rift:package": "rift.mcp",
+          "rift:proto": {
+            "type": "rift.mcp.ChangesResourceContent"
+          },
+          "title": "ChangesResourceContent",
+          "type": "object"
         }
       ],
       "rift:package": "rift.mcp",
@@ -10009,6 +10016,18 @@
             "number": 5,
             "tag": "application/vnd.rift.action+json",
             "type": "ActionResourceContent"
+          },
+          {
+            "field": "root",
+            "number": 6,
+            "tag": "application/vnd.rift.root+json",
+            "type": "RootResourceContent"
+          },
+          {
+            "field": "changes",
+            "number": 7,
+            "tag": "application/vnd.rift.changes+json",
+            "type": "ChangesResourceContent"
           }
         ]
       },
@@ -10172,6 +10191,12 @@
         },
         {
           "$ref": "#/$defs/ActionResourceLink"
+        },
+        {
+          "$ref": "#/$defs/RootResourceLink"
+        },
+        {
+          "$ref": "#/$defs/ChangesResourceLink"
         }
       ],
       "rift:package": "rift.mcp",
@@ -10208,6 +10233,18 @@
             "number": 5,
             "tag": "action",
             "type": "ActionResourceLink"
+          },
+          {
+            "field": "root",
+            "number": 6,
+            "tag": "root",
+            "type": "RootResourceLink"
+          },
+          {
+            "field": "changes",
+            "number": 7,
+            "tag": "changes",
+            "type": "ChangesResourceLink"
           }
         ]
       },
@@ -10233,6 +10270,12 @@
             },
             {
               "$ref": "#/$defs/ActionResourceUri"
+            },
+            {
+              "$ref": "#/$defs/RootResourceUri"
+            },
+            {
+              "$ref": "#/$defs/ChangesResourceUri"
             }
           ],
           "description": "A URI matching one branch of `ResourceTemplate`.",
@@ -10492,6 +10535,90 @@
           },
           "title": "ActionResourceTemplate",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The projection directory, addressed without parameters.",
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://root",
+              "description": "The template, in RFC 6570 form.",
+              "title": "Uritemplate",
+              "type": "string"
+            },
+            "name": {
+              "const": "root",
+              "description": "The resource family, as `resources/templates/list` advertises it.",
+              "rift:proto": {
+                "number": 1
+              },
+              "title": "Name",
+              "type": "string"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.root+json",
+              "description": "What a read of a URI from this template returns: `RootResourcePayload` as JSON.",
+              "rift:proto": {
+                "field": "mime_type",
+                "number": 2
+              },
+              "title": "Mimetype",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "rift:package": "rift.mcp",
+          "rift:proto": {
+            "type": "rift.mcp.RootResourceTemplate"
+          },
+          "title": "RootResourceTemplate",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The changeset with an optional page cursor.",
+          "properties": {
+            "uriTemplate": {
+              "const": "rift://changes{?cursor}",
+              "description": "The template, in RFC 6570 form. What follows `?` is optional.",
+              "title": "Uritemplate",
+              "type": "string"
+            },
+            "name": {
+              "const": "changes",
+              "description": "The resource family, as `resources/templates/list` advertises it.",
+              "rift:proto": {
+                "number": 1
+              },
+              "title": "Name",
+              "type": "string"
+            },
+            "mimeType": {
+              "const": "application/vnd.rift.changes+json",
+              "description": "What a read of a URI from this template returns: `ChangesResourcePayload` as JSON.",
+              "rift:proto": {
+                "field": "mime_type",
+                "number": 2
+              },
+              "title": "Mimetype",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uriTemplate",
+            "name",
+            "mimeType"
+          ],
+          "rift:package": "rift.mcp",
+          "rift:proto": {
+            "type": "rift.mcp.ChangesResourceTemplate"
+          },
+          "title": "ChangesResourceTemplate",
+          "type": "object"
         }
       ],
       "rift:package": "rift.mcp",
@@ -10528,6 +10655,18 @@
             "number": 5,
             "tag": "rift://action/{token}",
             "type": "ActionResourceTemplate"
+          },
+          {
+            "field": "root",
+            "number": 6,
+            "tag": "rift://root",
+            "type": "RootResourceTemplate"
+          },
+          {
+            "field": "changes",
+            "number": 7,
+            "tag": "rift://changes{?cursor}",
+            "type": "ChangesResourceTemplate"
           }
         ]
       },
@@ -10572,13 +10711,11 @@
       "enum": [
         "never",
         "same_request",
-        "refresh_projection",
         "operator_action"
       ],
       "rift:enumDescriptions": {
         "never": "The request fails the same way every time. Change it or give up.",
         "operator_action": "A local state command or configuration change must resolve the condition before another request can succeed.",
-        "refresh_projection": "The projection moved. Read its current head before retrying.",
         "same_request": "Send the same bytes again. The cause was transient \u2014 a busy projection, an adapter still starting."
       },
       "rift:package": "rift.mcp",
@@ -10594,10 +10731,6 @@
             "name": "RETRY_DIRECTIVE_OPERATOR_ACTION",
             "number": 4
           },
-          "refresh_projection": {
-            "name": "RETRY_DIRECTIVE_REFRESH_PROJECTION",
-            "number": 3
-          },
           "same_request": {
             "name": "RETRY_DIRECTIVE_SAME_REQUEST",
             "number": 2
@@ -10611,25 +10744,6 @@
       "additionalProperties": false,
       "description": "An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the replacement, and either applies all resulting edits or refuses the operation.",
       "properties": {
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this operation must replace.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "confirmations": {
-          "description": "Confirmation ids returned by an earlier refusal for this same expected projection state and operation. Missing or extra ids refuse the retry.",
-          "items": {
-            "type": "integer"
-          },
-          "rift:proto": {
-            "number": 2
-          },
-          "title": "Confirmations",
-          "type": "array",
-          "uniqueItems": true
-        },
         "formatting": {
           "$ref": "#/$defs/FormattingPolicy",
           "description": "Formatting applied after this operation's edits resolve.",
@@ -10667,7 +10781,6 @@
         }
       },
       "required": [
-        "expected",
         "formatting",
         "query",
         "replacement",
@@ -10714,6 +10827,105 @@
         }
       },
       "title": "RewriteRange",
+      "type": "string"
+    },
+    "RootResourceLink": {
+      "additionalProperties": false,
+      "description": "A link to the session's projection directory.",
+      "properties": {
+        "type": {
+          "const": "resource_link",
+          "description": "MCP's tag for a link to a resource inside tool output.",
+          "title": "Type",
+          "type": "string"
+        },
+        "uri": {
+          "$ref": "#/$defs/RootResourceUri",
+          "description": "The root resource.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "name": {
+          "const": "root",
+          "description": "The resource family this link belongs to.",
+          "rift:proto": {
+            "number": 2
+          },
+          "title": "Name",
+          "type": "string"
+        },
+        "mimeType": {
+          "const": "application/vnd.rift.root+json",
+          "description": "What a read of this URI returns: `RootResourcePayload` as JSON.",
+          "rift:proto": {
+            "field": "mime_type",
+            "number": 3
+          },
+          "title": "Mimetype",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "uri",
+        "name",
+        "mimeType"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.RootResourceLink"
+      },
+      "title": "RootResourceLink",
+      "type": "object"
+    },
+    "RootResourcePayload": {
+      "additionalProperties": false,
+      "description": "Where this session's projection lives on the filesystem. Adapters receive this path over\nthe adapter protocol; a caller that has to reach the projection through an ordinary\nfilesystem tool reads it here.",
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/RootResourceUri",
+          "description": "The URI this payload answers for.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "path": {
+          "$ref": "#/$defs/WorkspacePath",
+          "description": "Absolute path of the projection directory. Rift places it at `.rift/projections/<session>` below the workspace and keeps it there for the session's life. Session removal deletes the directory without waiting for a process that is still working inside it.",
+          "rift:proto": {
+            "number": 2
+          }
+        },
+        "workspace": {
+          "$ref": "#/$defs/WorkspacePath",
+          "description": "Absolute path of the workspace this projection was taken from.",
+          "rift:proto": {
+            "number": 3
+          }
+        }
+      },
+      "required": [
+        "uri",
+        "path",
+        "workspace"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.RootResourcePayload"
+      },
+      "title": "RootResourcePayload",
+      "type": "object"
+    },
+    "RootResourceUri": {
+      "description": "The session's projection directory on this host.",
+      "pattern": "^rift://root$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "RootResourceUri",
       "type": "string"
     },
     "SafeDeleteArguments": {
@@ -11472,13 +11684,6 @@
       "additionalProperties": false,
       "description": "One page of search hits, and what the page is worth. `coverage` is what makes an empty page readable: nothing matched, or Rift could not see far enough to know.",
       "properties": {
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this answer used.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
         "coverage": {
           "$ref": "#/$defs/Coverage",
           "description": "How much Rift could see while answering. An empty page means nothing matched only where this is complete.",
@@ -11513,7 +11718,6 @@
         }
       },
       "required": [
-        "head",
         "coverage",
         "results",
         "next_cursor"
@@ -11679,7 +11883,7 @@
     },
     "SessionRemoveParams": {
       "additionalProperties": false,
-      "description": "Removes one inactive session at an exact projection head.",
+      "description": "Removes one inactive session and the projection it retains.",
       "properties": {
         "session": {
           "$ref": "#/$defs/SessionId",
@@ -11687,18 +11891,10 @@
           "rift:proto": {
             "number": 1
           }
-        },
-        "expected": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head observed by the caller.",
-          "rift:proto": {
-            "number": 2
-          }
         }
       },
       "required": [
-        "session",
-        "expected"
+        "session"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -11777,7 +11973,7 @@
       "type": "object"
     },
     "Severity": {
-      "description": "How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their adapter's levels onto these four, so a caller can drop everything below `warning` without knowing which language produced it.",
+      "description": "How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their toolchain's own levels onto these four, so a caller can drop everything below `warning` without knowing which language produced it.",
       "enum": [
         "error",
         "warning",
@@ -13236,13 +13432,6 @@
             "number": 1
           }
         },
-        "head": {
-          "$ref": "#/$defs/ProjectionHead",
-          "description": "Projection head this answer used.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
         "symbol": {
           "$ref": "#/$defs/Symbol",
           "description": "The declaration itself: its name, its kind in the language's own words, its origin, its types and its signatures.",
@@ -13329,7 +13518,6 @@
       },
       "required": [
         "uri",
-        "head",
         "symbol",
         "origin_mappings",
         "nodes",
@@ -13504,7 +13692,7 @@
     },
     "TextRange": {
       "additionalProperties": false,
-      "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from its adapter's native offsets at the seam. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead.",
+      "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from whatever its language toolchain counts in at the seam, so a rustc column and a tsc column arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead.",
       "properties": {
         "start": {
           "description": "First byte of the range, counted from the start of the file.",
@@ -13988,12 +14176,16 @@
         "symbol",
         "fs",
         "actions",
-        "action"
+        "action",
+        "root",
+        "changes"
       ],
       "rift:enumDescriptions": {
         "action": "One discovered action, with the schema of the arguments it takes.",
         "actions": "The fixes and refactors an adapter offers at one address, or across one file.",
+        "changes": "The changes this session has made, and what vouched for each.",
         "fs": "One directory page or file-content range.",
+        "root": "Where this session's projection lives on the filesystem.",
         "symbol": "One symbol, its nodes, its edges and its diagnostics.",
         "workspace": "Workspace capabilities, projection state, and request limits."
       },
@@ -14009,9 +14201,17 @@
             "name": "RESOURCES_ACTIONS",
             "number": 4
           },
+          "changes": {
+            "name": "RESOURCES_CHANGES",
+            "number": 7
+          },
           "fs": {
             "name": "RESOURCES_FS",
             "number": 3
+          },
+          "root": {
+            "name": "RESOURCES_ROOT",
+            "number": 6
           },
           "symbol": {
             "name": "RESOURCES_SYMBOL",

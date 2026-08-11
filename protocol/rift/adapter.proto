@@ -16,7 +16,7 @@ extend google.protobuf.MessageOptions {
 enum CacheScope {
   // No cache claim. Rift treats the result as request-volatile.
   CACHE_SCOPE_UNSPECIFIED = 0;
-  // The projection head, adapter implementation, language, and virtual inputs determine the
+  // The projection contents, adapter implementation, language, and virtual inputs determine the
   // result.
   PROJECTION = 1;
   // Adapter-observed external state also affects the result. Retention ends with the process or
@@ -239,11 +239,9 @@ message RuntimeRequirements {
 // runtimes. A call naming an earlier state receives `StaleState`.
 message AdapterState {
   option (section) = "Adapter state";
-  // Projection head the adapter has read.
-  string head = 2;
-  // Adapter-local state generation. Open mints the first value;
-  // Refresh and SyncVirtual advance it. Calls carrying an earlier generation
-  // receive StaleState even when the projection head is unchanged.
+  // Adapter-local state generation, and the whole of an adapter state's identity.
+  // Open mints the first value; Refresh and SyncVirtual advance it. A call carrying
+  // an earlier generation receives StaleState.
   uint64 generation = 3;
 }
 // Open one Rift FS projection in the adapter. The adapter
@@ -254,10 +252,8 @@ message OpenRequest {
   // output belongs here — point CARGO_TARGET_DIR and friends at it. Every open
   // adapter state receives a distinct path, and Rift never reuses that path after
   // Close. An adapter may maintain its own shared read-only cache
-  // outside this directory when its adapter supports safe sharing.
+  // outside this directory when its language toolchain supports safe sharing.
   string state_root = 2;
-  // Current projection head.
-  string head = 3;
   // Exact contract selected from the adapter's `Capabilities.contracts`.
   rift.adapter.AdapterContract contract = 4;
   // Absolute Rift FS path for `projection`. Other adapters can receive the same path. Adapter
@@ -267,15 +263,13 @@ message OpenRequest {
 // Rift changed files in a projection. It sends this call to every language
 // adapter holding the shared path. Paths are
 // project-relative and cover every file Rift touched; each adapter decides
-// which changes affect its adapter. Content is on disk before this call. The adapter
+// which changes reach its own analysis. Content is on disk before this call. The adapter
 // reselects its project runtime when runtime-defining inputs have changed.
 message RefreshRequest {
   option (section) = "Adapter state";
   // The state the adapter last acknowledged. A mismatch means Rift and the
   // adapter disagree about what is on disk, and comes back as StaleState.
   rift.adapter.AdapterState from = 1;
-  // Projection head after the listed changes.
-  string to = 2;
   // Files created or overwritten since `from`, as `rift://file/<path>`.
   repeated string written = 3;
   // Files deleted since `from`. A rename arrives as one of each.
@@ -285,13 +279,13 @@ message RefreshRequest {
 // sends exactly one `start` event first, then each `unit` followed by ordered
 // `text` chunks ending in `final: true`. The complete stream replaces the
 // previous overlay; an RPC failure leaves the previous generation intact. The
-// units are the complete set selected for this consumer at `start.head`,
+// units are the complete set selected for this consumer at `start`,
 // including an empty set when every previous unit has been retracted.
 message VirtualSyncEvent {
   option (section) = "Adapter state";
   oneof event {
-    // Current adapter-local state. The returned AdapterState keeps its
-    // head and advances its generation.
+    // Current adapter-local state. The returned AdapterState advances its
+    // generation.
     rift.adapter.AdapterState start = 1;
     // One virtual file whose exact Language matches this adapter.
     rift.adapter.VirtualUnit unit = 2;
@@ -517,8 +511,8 @@ message Matches {
   repeated rift.adapter.StructuralMatch items = 1;
 }
 // One match, as the adapter found it. It carries no identity of its own: a
-// `MatchKey` is the projection head, query and span, and Rift already holds
-// the first two, so the span below completes it.
+// `MatchKey` is the query and the span it matched, and Rift already holds
+// the first, so the span below completes it.
 message StructuralMatch {
   option (section) = "Matching";
   // The file and byte range the pattern matched.
@@ -613,7 +607,7 @@ message ResolveResponse {
 // the session projection.
 message ExecuteRequest {
   option (section) = "Execution";
-  // Exact projection head and adapter generation to evaluate against.
+  // Adapter state to evaluate against.
   rift.adapter.AdapterState state = 1;
   // Source and project-relative working directory.
   rift.core.CodeBlock block = 2;

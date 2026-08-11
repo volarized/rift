@@ -143,10 +143,6 @@ class OutlineItem(ClosedModel):
 class OutlineResult(ClosedModel):
     """One page of a file outline with explicit semantic coverage."""
 
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head from which the file and semantic facts were read.",
-        number=1,
-    )
     file: Field[core.File] = proto_field(
         description="File entry being outlined.", number=2
     )
@@ -456,6 +452,46 @@ class FsResourceLink(ClosedModel):
     )
 
 
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RootResourceLink(ClosedModel):
+    """A link to the session's projection directory."""
+
+    type: Field[Literal["resource_link"]] = proto_field(
+        description="MCP's tag for a link to a resource inside tool output."
+    )
+    uri: Field[RootResourceUri] = proto_field(
+        description="The root resource.", number=1
+    )
+    name: Field[Literal["root"]] = proto_field(
+        description="The resource family this link belongs to.", number=2
+    )
+    mimeType: Field[Literal["application/vnd.rift.root+json"]] = proto_field(
+        description="What a read of this URI returns: `RootResourcePayload` as JSON.",
+        number=3,
+        proto_name="mime_type",
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ChangesResourceLink(ClosedModel):
+    """A link to the session's changeset."""
+
+    type: Field[Literal["resource_link"]] = proto_field(
+        description="MCP's tag for a link to a resource inside tool output."
+    )
+    uri: Field[ChangesResourceUri] = proto_field(
+        description="The changeset, optionally continued by a cursor.", number=1
+    )
+    name: Field[Literal["changes"]] = proto_field(
+        description="The resource family this link belongs to.", number=2
+    )
+    mimeType: Field[Literal["application/vnd.rift.changes+json"]] = proto_field(
+        description="What a read of this URI returns: `ChangesResourcePayload` as JSON.",
+        number=3,
+        proto_name="mime_type",
+    )
+
+
 @union(
     owner=MCP,
     oneof="variant",
@@ -466,6 +502,8 @@ class FsResourceLink(ClosedModel):
         Variant("fs", "fs", 3, FsResourceLink),
         Variant("actions", "actions", 4, ActionsResourceLink),
         Variant("action", "action", 5, ActionResourceLink),
+        Variant("root", "root", 6, RootResourceLink),
+        Variant("changes", "changes", 7, ChangesResourceLink),
     ),
 )
 class ResourceLink(ProtocolRoot):
@@ -479,10 +517,6 @@ class SymbolResourcePayload(ClosedModel):
     uri: Field[core.SymbolId] = proto_field(
         description="The symbol this payload answers for, echoed back so a link and its content carry the same address.",
         number=1,
-    )
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this answer used.",
-        number=2,
     )
     symbol: Field[core.Symbol] = proto_field(
         description=(
@@ -537,14 +571,18 @@ class SymbolResourcePayload(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class Contract(ClosedModel):
-    "One generated wire contract. A peer accepts it only when all three fields match one of its own generated descriptors."
+    "One generated wire contract. Majors have to be equal, because a major changes when a peer can no longer decode the next message safely. Within one major, revisions only add, so a peer can speak any minor at or below its own and the connection settles on the lower of the two."
 
     major: Field[core.ProtocolVersion] = proto_field(
         description="Breaking protocol generation selected before the socket is opened.",
         number=1,
     )
     minor: Field[int] = proto_field(
-        description="Additive revision within the selected major.",
+        description=(
+            "Additive revision within the major. A peer admits any minor at or below its own "
+            "and emits nothing added after the minor the connection settled on, so the client "
+            "checks this one number to know it can decode everything it will be sent."
+        ),
         ge=0,
         le=4294967295,
         number=2,
@@ -552,8 +590,9 @@ class Contract(ClosedModel):
     )
     schema_digest: Field[core.Digest] = proto_field(
         description=(
-            "SHA-256 of the generated descriptor and its MCP conversion metadata. Equal major "
-            "and minor values with different digests are incompatible."
+            "SHA-256 of the generated descriptor and its MCP conversion metadata. It names the "
+            "exact generation a peer was built from, which is what makes a bug report "
+            "reproducible; admission is decided by `major` and `minor`."
         ),
         number=3,
     )
@@ -570,6 +609,18 @@ class Contract(ClosedModel):
 )
 class WorkspacePath(ProtocolRoot):
     """Canonical absolute path that identifies one workspace on this host."""
+
+
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^chg_[a-z2-7]{26}$",
+    examples=["chg_bbbbbbbbbbbbbbbbbbbbbbbbbb"],
+)
+class ChangeId(ProtocolRoot):
+    """Identity of one change recorded in the projection's changeset. Rift mints it when the
+    change lands and keeps it until publication or restore removes the change."""
 
 
 @scalar(
@@ -729,7 +780,9 @@ class Connected(ClosedModel):
     for an MCP role."""
 
     contract: Field[Contract] = proto_field(
-        description="Exact generated contract selected for this connection.", number=1
+        description=(
+            "Contract this connection speaks: the shared major, and the lower of the two minors."
+        ), number=1
     )
     features: Field[list[FeatureId]] = proto_field(
         description="Features implemented by both peers, sorted by identifier.",
@@ -839,14 +892,10 @@ class SessionContinueResult(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SessionRemoveParams(ClosedModel):
-    """Removes one inactive session at an exact projection head."""
+    """Removes one inactive session and the projection it retains."""
 
     session: Field[SessionId] = proto_field(
         description="Retained session to inspect or remove.", number=1
-    )
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head observed by the caller.",
-        number=2,
     )
 
 
@@ -1060,6 +1109,34 @@ class WorkspaceResourceUri(ProtocolRoot):
     owner=MCP,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
+    pattern=r"^rift://root$",
+)
+class RootResourceUri(ProtocolRoot):
+    """The session's projection directory on this host."""
+
+
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://changes(?:\?cursor=[A-Za-z0-9_-]{1,4096})?$",
+    max_length=8192,
+)
+class ChangesResourceUri(ProtocolRoot):
+    """Paginated changeset of the session projection."""
+
+    @model_validator(mode="after")
+    def query_is_canonical(self) -> ChangesResourceUri:
+        cursor = _raw_resource_query(self.root).get("cursor")
+        if cursor is not None:
+            Cursor.model_validate(cursor)
+        return self
+
+
+@scalar(
+    owner=MCP,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
     pattern=r"^rift://fs(?:/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000})?(?:\?(?:start=[0-9]+&length=[1-9][0-9]*|cursor=[A-Za-z0-9_-]{1,4096}))?$",
     min_length=9,
     max_length=8192,
@@ -1110,6 +1187,8 @@ class FsResourceUri(ProtocolRoot):
             EnumValue("fs", "RESOURCES_FS", 3),
             EnumValue("actions", "RESOURCES_ACTIONS", 4),
             EnumValue("action", "RESOURCES_ACTION", 5),
+            EnumValue("root", "RESOURCES_ROOT", 6),
+            EnumValue("changes", "RESOURCES_CHANGES", 7),
         ),
     ),
     schema_extra={
@@ -1119,6 +1198,8 @@ class FsResourceUri(ProtocolRoot):
             "fs": "One directory page or file-content range.",
             "actions": "The fixes and refactors an adapter offers at one address, or across one file.",
             "action": "One discovered action, with the schema of the arguments it takes.",
+            "root": "Where this session's projection lives on the filesystem.",
+            "changes": "The changes this session has made, and what vouched for each.",
         }
     },
 )
@@ -1128,6 +1209,8 @@ class WorkspaceResourcePayloadResourcesItemResources(str, Enum):
     FS = "fs"
     ACTIONS = "actions"
     ACTION = "action"
+    ROOT = "root"
+    CHANGES = "changes"
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
@@ -1185,13 +1268,33 @@ class WorkspaceResourcePayload(ClosedModel):
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class RootResourcePayload(ClosedModel):
+    """Where this session's projection lives on the filesystem. Adapters receive this path over
+    the adapter protocol; a caller that has to reach the projection through an ordinary
+    filesystem tool reads it here."""
+
+    uri: Field[RootResourceUri] = proto_field(
+        description="The URI this payload answers for.", number=1
+    )
+    path: Field[WorkspacePath] = proto_field(
+        description=(
+            "Absolute path of the projection directory. Rift places it at "
+            "`.rift/projections/<session>` below the workspace and keeps it there for the "
+            "session's life. Session removal deletes the directory without waiting for a "
+            "process that is still working inside it."
+        ),
+        number=2,
+    )
+    workspace: Field[WorkspacePath] = proto_field(
+        description="Absolute path of the workspace this projection was taken from.",
+        number=3,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class SearchResult(ClosedModel):
     "One page of search hits, and what the page is worth. `coverage` is what makes an empty page readable: nothing matched, or Rift could not see far enough to know."
 
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this answer used.",
-        number=1,
-    )
     coverage: Field[core.Coverage] = proto_field(
         description=(
             "How much Rift could see while answering. An empty page means nothing matched "
@@ -1292,10 +1395,6 @@ class ActionsResourcePayload(ClosedModel):
         description="The address this page answers for, echoed back as it resolved.",
         number=1,
     )
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this answer used.",
-        number=2,
-    )
     offers: Field[list[ActionOffer]] = proto_field(
         description="The actions on this page, each without its argument schema.",
         number=3,
@@ -1320,9 +1419,6 @@ class ActionResourcePayload(ClosedModel):
     uri: Field[ActionResourceUri] = proto_field(
         description="The offer this payload answers for, echoed back as it resolved.",
         number=1,
-    )
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head in which this offer was discovered.", number=2
     )
     language: Field[core.Language] = proto_field(
         description="Language whose adapter minted the offer and resolves it.", number=3
@@ -1351,9 +1447,6 @@ class ExecuteResult(ClosedModel):
     """Bounded result of one execution. Writes made by evaluated code are absent because its
     execution workspace is discarded."""
 
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head used for execution.", number=1
-    )
     language: Field[core.Language] = proto_field(
         description="Adapter that evaluated the block.", number=2
     )
@@ -1384,9 +1477,6 @@ class DebugSession(ClosedModel):
     id: Field[DebugSessionId] = proto_field(
         description="Server-minted public handle. The adapter-local DebugSessionKey never crosses MCP.",
         number=1,
-    )
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head used by the debugging session.", number=2
     )
     language: Field[core.Language] = proto_field(
         description="Adapter that owns the retained debug state.", number=3
@@ -1555,12 +1645,8 @@ class MatchParams(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class MatchResult(ClosedModel):
-    "One page of matches and the state they were found in. Matches sort by file bytes, range, and canonical key. Rift checks the key against `at` before applying an addressed edit."
+    "One page of matches. Matches sort by file bytes, range, and canonical key. A match key names the file it was found in, so Rift rechecks that file before applying an edit addressed at it."
 
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this answer used.",
-        number=1,
-    )
     matches: Field[list[MatchHit]] = proto_field(
         description="The matches on this page.", number=2
     )
@@ -1623,9 +1709,6 @@ class DiagnosticContext(ClosedModel):
             }
         },
     )
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this diagnostic belongs to.", number=2
-    )
     diagnostic: Field[core.Diagnostic] = proto_field(
         description="The finding itself, exactly as the adapter minted it.", number=3
     )
@@ -1686,7 +1769,6 @@ class DiagnosticContext(ClosedModel):
                 "ERROR_CODE_CONFIGURATION_INVALID",
                 20,
             ),
-            EnumValue("projection_head_moved", "ERROR_CODE_PROJECTION_HEAD_MOVED", 21),
             EnumValue(
                 "capability_unavailable",
                 "ERROR_CODE_CAPABILITY_UNAVAILABLE",
@@ -1783,10 +1865,6 @@ class DiagnosticContext(ClosedModel):
                 "The workspace-root `rift.toml` does not satisfy its schema. New requests remain "
                 "blocked until the file is valid."
             ),
-            "projection_head_moved": (
-                "A change or cleanup request names a projection token that is no longer "
-                "current. Read the projection again before retrying."
-            ),
             "capability_unavailable": (
                 "The tool exists, but the workspace configuration and configured adapters cannot "
                 "serve this operation for the requested language. Read the workspace resource "
@@ -1818,7 +1896,6 @@ class ErrorCode(str, Enum):
     CURSOR_EXPIRED = "cursor_expired"
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
     CONFIGURATION_INVALID = "configuration_invalid"
-    PROJECTION_HEAD_MOVED = "projection_head_moved"
     CAPABILITY_UNAVAILABLE = "capability_unavailable"
 
 
@@ -1830,7 +1907,6 @@ class ErrorCode(str, Enum):
         (
             EnumValue("never", "RETRY_DIRECTIVE_NEVER", 1),
             EnumValue("same_request", "RETRY_DIRECTIVE_SAME_REQUEST", 2),
-            EnumValue("refresh_projection", "RETRY_DIRECTIVE_REFRESH_PROJECTION", 3),
             EnumValue("operator_action", "RETRY_DIRECTIVE_OPERATOR_ACTION", 4),
         ),
         named=True,
@@ -1841,9 +1917,6 @@ class ErrorCode(str, Enum):
             "same_request": (
                 "Send the same bytes again. The cause was transient — a busy projection, an "
                 "adapter still starting."
-            ),
-            "refresh_projection": (
-                "The projection moved. Read its current head before retrying."
             ),
             "operator_action": (
                 "A local state command or configuration change must resolve the condition before another "
@@ -1857,7 +1930,6 @@ class RetryDirective(str, Enum):
 
     NEVER = "never"
     SAME_REQUEST = "same_request"
-    REFRESH_PROJECTION = "refresh_projection"
     OPERATOR_ACTION = "operator_action"
 
 
@@ -1905,7 +1977,7 @@ class ErrorCause(ClosedModel):
                 "Checking a proposed change against the schema, the state it was pinned to, and "
                 "the checks required by the workspace-root `rift.toml`."
             ),
-            "change": "Checking the projection token, resolving in a private candidate, validating, and conditionally advancing the projection.",
+            "change": "Resolving the operation in a private candidate, validating it, and writing the result into the projection.",
             "publish": "Publishing projection changes to the workspace.",
             "execute": "Preparing an execution workspace and evaluating caller-provided code.",
             "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
@@ -1976,19 +2048,12 @@ class ErrorData(ClosedModel):
                     "Checking a proposed change against the schema, the state it was pinned to, and "
                     "the checks required by the workspace-root `rift.toml`."
                 ),
-                "change": "Checking the projection token, resolving in a private candidate, validating, and conditionally advancing the projection.",
+                "change": "Resolving the operation in a private candidate, validating it, and writing the result into the projection.",
                 "publish": "Publishing projection changes to the workspace.",
                 "execute": "Preparing an execution workspace and evaluating caller-provided code.",
                 "debug": "Starting, inspecting, or stopping a connection-bound debugging session.",
             }
         },
-    )
-    head: Field[core.ProjectionHead | None] = proto_field(
-        description=(
-            "The projection head used by the request. Null where the failure happened "
-            "before one was resolved."
-        ),
-        number=5,
     )
     operation: Field[int | None] = proto_field(
         description=(
@@ -2221,6 +2286,42 @@ class ActionResourceTemplate(ClosedModel):
     )
 
 
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RootResourceTemplate(ClosedModel):
+    """The projection directory, addressed without parameters."""
+
+    uriTemplate: Field[Literal["rift://root"]] = proto_field(
+        description="The template, in RFC 6570 form."
+    )
+    name: Field[Literal["root"]] = proto_field(
+        description="The resource family, as `resources/templates/list` advertises it.",
+        number=1,
+    )
+    mimeType: Field[Literal["application/vnd.rift.root+json"]] = proto_field(
+        description="What a read of a URI from this template returns: `RootResourcePayload` as JSON.",
+        number=2,
+        proto_name="mime_type",
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ChangesResourceTemplate(ClosedModel):
+    """The changeset with an optional page cursor."""
+
+    uriTemplate: Field[Literal["rift://changes{?cursor}"]] = proto_field(
+        description="The template, in RFC 6570 form. What follows `?` is optional."
+    )
+    name: Field[Literal["changes"]] = proto_field(
+        description="The resource family, as `resources/templates/list` advertises it.",
+        number=1,
+    )
+    mimeType: Field[Literal["application/vnd.rift.changes+json"]] = proto_field(
+        description="What a read of a URI from this template returns: `ChangesResourcePayload` as JSON.",
+        number=2,
+        proto_name="mime_type",
+    )
+
+
 @union(
     owner=MCP,
     oneof="variant",
@@ -2246,6 +2347,8 @@ class ActionResourceTemplate(ClosedModel):
             ActionsResourceTemplate,
         ),
         Variant("rift://action/{token}", "action", 5, ActionResourceTemplate),
+        Variant("rift://root", "root", 6, RootResourceTemplate),
+        Variant("rift://changes{?cursor}", "changes", 7, ChangesResourceTemplate),
     ),
 )
 class ResourceTemplate(ProtocolRoot):
@@ -2262,6 +2365,8 @@ class ResourceReadParams(ClosedModel):
         | FsResourceUri
         | ActionsResourceUri
         | ActionResourceUri
+        | RootResourceUri
+        | ChangesResourceUri
     ] = proto_field(
         description="A URI matching one branch of `ResourceTemplate`.",
         number=1,
@@ -2369,6 +2474,46 @@ class ActionResourceContent(ClosedModel):
     )
 
 
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class RootResourceContent(ClosedModel):
+    """What a read of `rift://root` returns."""
+
+    uri: Field[RootResourceUri] = proto_field(
+        description="The URI that was read, as it resolved.", number=1
+    )
+    mimeType: Field[Literal["application/vnd.rift.root+json"]] = proto_field(
+        description="Which payload `text` holds."
+    )
+    text: Field[str] = proto_field(
+        description="A `RootResourcePayload`, serialized as JSON.",
+        number=2,
+        json_schema_extra={
+            "contentMediaType": "application/vnd.rift.root+json",
+            "rift:contentType": "RootResourcePayload",
+        },
+    )
+
+
+@definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
+class ChangesResourceContent(ClosedModel):
+    """What a read of a `rift://changes` URI returns."""
+
+    uri: Field[ChangesResourceUri] = proto_field(
+        description="The URI that was read, as it resolved.", number=1
+    )
+    mimeType: Field[Literal["application/vnd.rift.changes+json"]] = proto_field(
+        description="Which payload `text` holds."
+    )
+    text: Field[str] = proto_field(
+        description="A `ChangesResourcePayload`, serialized as JSON.",
+        number=2,
+        json_schema_extra={
+            "contentMediaType": "application/vnd.rift.changes+json",
+            "rift:contentType": "ChangesResourcePayload",
+        },
+    )
+
+
 @union(
     owner=MCP,
     oneof="variant",
@@ -2386,6 +2531,10 @@ class ActionResourceContent(ClosedModel):
             "application/vnd.rift.actions+json", "actions", 4, ActionsResourceContent
         ),
         Variant("application/vnd.rift.action+json", "action", 5, ActionResourceContent),
+        Variant("application/vnd.rift.root+json", "root", 6, RootResourceContent),
+        Variant(
+            "application/vnd.rift.changes+json", "changes", 7, ChangesResourceContent
+        ),
     ),
     public=False,
 )
@@ -2465,19 +2614,6 @@ class SearchHitTarget(ProtocolRoot):
 class EditParams(ClosedModel):
     "Concrete filesystem edits supplied by the caller. Their ranges address the state this operation resolves against, and replacements in one set may not overlap."
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this operation must replace.",
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
@@ -2500,19 +2636,6 @@ class EditParams(ClosedModel):
 class PatchParams(ClosedModel):
     "A UTF-8 unified diff guarded by its context lines. Rift refuses absolute paths, path traversal, binary patches, malformed headers, and any hunk whose context differs from the state it resolves against."
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this operation must replace.",
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
@@ -2556,19 +2679,6 @@ class RewriteRange(str, Enum):
 class RewriteParams(ClosedModel):
     "An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the replacement, and either applies all resulting edits or refuses the operation."
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this operation must replace.",
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
@@ -2605,19 +2715,6 @@ class RewriteParams(ClosedModel):
 class RenameParams(ClosedModel):
     "Changes what a declaration is called and rewrites the references that name it. The adapter checks language spelling, collisions, and binding changes; a reference outside `scope` refuses the operation rather than leaving it half done."
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this operation must replace.",
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
@@ -2639,19 +2736,6 @@ class RenameParams(ClosedModel):
 class MoveParams(ClosedModel):
     "Moves a declaration or file to another container or path and updates the imports and references that reach it."
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this operation must replace.",
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
@@ -2673,19 +2757,6 @@ class MoveParams(ClosedModel):
 class DeleteParams(ClosedModel):
     "Removes a declaration. Without a policy this is a mechanical removal that analyses no references and claims no reference guarantee. With one, the adapter classifies every remaining use, applies the stated disposition, and refuses the operation when reference coverage is incomplete."
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this operation must replace.",
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
@@ -2707,19 +2778,6 @@ class DeleteParams(ClosedModel):
 class ChangeSignatureParams(ClosedModel):
     "Changes the shape of a callable and propagates it. Unlike a rename, this rewrites argument lists: a new required parameter has to be supplied at every call site, which is why the operation commonly raises a `behavior_unknown` confirmation."
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this operation must replace.",
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
@@ -2741,19 +2799,6 @@ class ChangeSignatureParams(ClosedModel):
 class ActParams(ClosedModel):
     "Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an adapter offers that has no portable contract. Rift validates `arguments` against the offer's advertised schema. An offer whose kind belongs to a portable family is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points."
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head this operation must replace.",
-        number=1,
-    )
-    confirmations: Field[list[int]] = proto_field(
-        default_factory=list,
-        description=(
-            "Confirmation ids returned by an earlier refusal for this same expected projection state and "
-            "operation. Missing or extra ids refuse the retry."
-        ),
-        number=2,
-        json_schema_extra={"uniqueItems": True},
-    )
     formatting: Field[core.FormattingPolicy] = proto_field(
         description="Formatting applied after this operation's edits resolve.", number=3
     )
@@ -2774,10 +2819,6 @@ class ActParams(ClosedModel):
 class ProjectionRestoreParams(ClosedModel):
     """Restores changed paths from the current workspace."""
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head the caller intends to discard.",
-        number=1,
-    )
     paths: Field[list[core.ProjectPath] | None] = proto_field(
         default=None,
         description="Changed paths to restore. Null restores every changed path.",
@@ -2980,8 +3021,13 @@ class ChangeValidation(ClosedModel):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class ChangeSummary(ClosedModel):
-    """An applied projection change and its validation evidence."""
+    """One change in the projection's changeset, with everything Rift learned while resolving it.
+    A change carrying confirmations is recorded the same way as one carrying none; the
+    confirmations are what publication checks."""
 
+    id: Field[ChangeId] = proto_field(
+        description="Identity of this change in the changeset.", number=1
+    )
     validation: Field[ChangeValidation] = proto_field(
         description="Adapter validation of the resulting projection.", number=3
     )
@@ -2997,15 +3043,45 @@ class ChangeSummary(ClosedModel):
     diagnostics: Field[list[core.Diagnostic]] = proto_field(
         description="Resolution findings in source order.", number=8
     )
+    confirmations: Field[list[core.ConfirmationRequirement]] = proto_field(
+        description=(
+            "Effects the caller has to accept before this change can be published, sorted and "
+            "numbered from zero. Empty where every affected adapter and validator vouched for "
+            "the result."
+        ),
+        number=10,
+    )
     current: Field[core.ProjectionState] = proto_field(
-        description="Current projection state with a fresh head token.",
+        description="Projection state after this change landed.",
         number=9,
+    )
+
+
+@definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
+class ChangesResourcePayload(ClosedModel):
+    """One page of the session's changeset, oldest change first. This is the read an agent makes
+    before publishing: every change it applied, what each one did, and which of them nobody
+    vouched for."""
+
+    uri: Field[ChangesResourceUri] = proto_field(
+        description="The URI this payload answers for.", number=1
+    )
+    state: Field[core.ProjectionState] = proto_field(
+        description="Projection state the page was read from.", number=2
+    )
+    changes: Field[list[ChangeSummary]] = proto_field(
+        description="Changes on this page, in the order they were applied.", number=3
+    )
+    next: Field[ChangesResourceUri | None] = proto_field(
+        default=None,
+        description="The same resource carrying the cursor for the next page, or null on the last one.",
+        number=4,
     )
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class ChangeApplied(ClosedModel):
-    """The operation atomically replaced the current projection state."""
+    """The operation resolved to edits and Rift wrote them into the projection."""
 
     status: Field[Literal["applied"]] = proto_field(
         description="Identifies an applied store change.", default="applied"
@@ -3027,15 +3103,9 @@ class ChangeApplied(ClosedModel):
             EnumValue("stale_action", "REFUSAL_REASON_STALE_ACTION", 4),
             EnumValue("stale_match", "REFUSAL_REASON_STALE_MATCH", 5),
             EnumValue("cardinality_mismatch", "REFUSAL_REASON_CARDINALITY_MISMATCH", 6),
-            EnumValue(
-                "confirmation_required", "REFUSAL_REASON_CONFIRMATION_REQUIRED", 7
-            ),
             EnumValue("unsafe_effect", "REFUSAL_REASON_UNSAFE_EFFECT", 8),
             EnumValue(
                 "formatter_unsupported", "REFUSAL_REASON_FORMATTER_UNSUPPORTED", 9
-            ),
-            EnumValue(
-                "validation_incomplete", "REFUSAL_REASON_VALIDATION_INCOMPLETE", 10
             ),
             EnumValue("portable_family", "REFUSAL_REASON_PORTABLE_FAMILY", 11),
         ),
@@ -3046,19 +3116,17 @@ class ChangeApplied(ClosedModel):
             "unsupported": "No adapter implements this operation for the language it reaches.",
             "unmet_precondition": "A condition checked before resolution failed. The failed entry is in `preconditions`.",
             "ambiguous_target": "The address resolves to several targets. Narrow it and ask again.",
-            "stale_action": "The offer belongs to an earlier projection head. Read the actions resource again.",
-            "stale_match": "The match belongs to an earlier projection head. Search again.",
+            "stale_action": "The file the offer was discovered in has been rewritten since. Read the actions resource again.",
+            "stale_match": "The file the match was found in has been rewritten since. Search again.",
             "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
-            "confirmation_required": "The operation needs acknowledgements the caller did not supply.",
             "unsafe_effect": "The complete effect reaches outside what the caller can have meant — outside the project, or into generated source.",
             "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
-            "validation_incomplete": "Required adapter or command validation did not complete.",
             "portable_family": "The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
         }
     },
 )
 class RefusalReason(str, Enum):
-    "Why Rift declined a change. A refusal is a completed decision; `ErrorData` carries transport and infrastructure failures."
+    "Why Rift produced no edits at all. Every reason here means resolution had nothing to write: a change Rift can express but nobody will vouch for still lands, carrying its confirmations. `ErrorData` carries transport and infrastructure failures."
 
     UNSUPPORTED = "unsupported"
     UNMET_PRECONDITION = "unmet_precondition"
@@ -3066,22 +3134,17 @@ class RefusalReason(str, Enum):
     STALE_ACTION = "stale_action"
     STALE_MATCH = "stale_match"
     CARDINALITY_MISMATCH = "cardinality_mismatch"
-    CONFIRMATION_REQUIRED = "confirmation_required"
     UNSAFE_EFFECT = "unsafe_effect"
     FORMATTER_UNSUPPORTED = "formatter_unsupported"
-    VALIDATION_INCOMPLETE = "validation_incomplete"
     PORTABLE_FAMILY = "portable_family"
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
 class RefusedResult(ClosedModel):
-    "Resolution stopped before Rift changed the projection."
+    "Resolution produced no edits, so the projection is untouched."
 
     status: Field[Literal["refused"]] = proto_field(
         description="Identifies a domain refusal.", default="refused"
-    )
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head against which the work was attempted.", number=1
     )
     reason: Field[RefusalReason] = proto_field(
         description="The condition the caller can act on.", number=2
@@ -3100,13 +3163,6 @@ class RefusedResult(ClosedModel):
     diagnostics: Field[list[core.Diagnostic]] = proto_field(
         description="Evidence that explains the refusal.", number=5
     )
-    confirmations: Field[list[core.ConfirmationRequirement]] = proto_field(
-        description=(
-            "Acknowledgements required for a retry of the same operation and expected projection state. "
-            "Empty unless `reason` is `confirmation_required`."
-        ),
-        number=6,
-    )
 
 
 @union(
@@ -3124,10 +3180,18 @@ class ChangeResult(ProtocolRoot):
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
 class PublishParams(ClosedModel):
-    """Publishes the session projection into the physical workspace."""
+    """Publishes the session projection into the workspace. Publication is the one step that
+    touches the user's own files, so it is where confirmations are settled: a change carrying
+    one is published only when this call names it."""
 
-    expected: Field[core.ProjectionHead] = proto_field(
-        description="Projection head the caller reviewed.", number=1
+    accept: Field[list[ChangeId]] = proto_field(
+        default_factory=list,
+        description=(
+            "Changes whose confirmations the caller accepts. A change carrying a confirmation "
+            "and absent here is returned in `unaccepted` and nothing is written."
+        ),
+        number=1,
+        json_schema_extra={"uniqueItems": True},
     )
 
 
@@ -3141,13 +3205,21 @@ class PublishResult(ClosedModel):
     conflicts: Field[list[core.ProjectPath]] = proto_field(
         description="Workspace paths changed outside this projection.", number=3
     )
+    unaccepted: Field[list[ChangeId]] = proto_field(
+        description=(
+            "Changes carrying a confirmation that `accept` did not name, sorted by change "
+            "identity. Non-empty means nothing was written."
+        ),
+        number=4,
+        json_schema_extra={"uniqueItems": True},
+    )
 
     @model_validator(mode="after")
     def result_is_correlated(self) -> PublishResult:
-        if bool(self.conflicts) != self.state.dirty:
-            raise ValueError(
-                "conflicts require a dirty projection and success requires a clean one"
-            )
+        if (self.conflicts or self.unaccepted) and not self.state.dirty:
+            raise ValueError("a refused publication leaves the projection dirty")
+        if not (self.conflicts or self.unaccepted) and self.state.dirty:
+            raise ValueError("a successful publication leaves the projection clean")
         return self
 
 
@@ -3237,9 +3309,6 @@ class FsResourcePayload(ClosedModel):
 
     uri: Field[FsResourceUri] = proto_field(
         description="Exact resource request this payload answers.", number=1
-    )
-    head: Field[core.ProjectionHead] = proto_field(
-        description="Projection head from which the entry was read.", number=2
     )
     entry: Field[core.ProjectEntry] = proto_field(
         description="Directory, regular file, or symbolic link named by the URI.",
@@ -3431,6 +3500,7 @@ MODELS = (
     SymbolResourcePayload,
     Contract,
     WorkspacePath,
+    ChangeId,
     SessionId,
     ConnectionId,
     FeatureId,
@@ -3448,8 +3518,11 @@ MODELS = (
     ExecutionLimits,
     Limits,
     WorkspaceResourceUri,
+    RootResourceUri,
+    ChangesResourceUri,
     FsResourceUri,
     WorkspaceResourcePayload,
+    RootResourcePayload,
     SearchResult,
     ActionOffer,
     ActionsResourceUri,
@@ -3491,6 +3564,7 @@ MODELS = (
     CommandValidator,
     ChangeValidation,
     ChangeSummary,
+    ChangesResourcePayload,
     RefusalReason,
     ChangeResult,
     PublishParams,

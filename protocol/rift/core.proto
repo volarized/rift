@@ -4,9 +4,9 @@ syntax = "proto3";
 package rift.core;
 import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
-// How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their adapter's
-// levels onto these four, so a caller can drop everything below `warning` without knowing which
-// language produced it.
+// How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their
+// toolchain's own levels onto these four, so a caller can drop everything below `warning`
+// without knowing which language produced it.
 enum Severity {
   // The caller did not set a value.
   SEVERITY_UNSPECIFIED = 0;
@@ -337,12 +337,15 @@ enum ExecutionStatus {
   // The language runtime rejected the block or raised an unhandled failure.
   EXECUTION_STATUS_FAILED = 2;
 }
-// Current state of the session projection.
+// Summary of the session projection. The changed paths and the changes that produced them
+// are read from the changes resource, which pages; both fields here are counts a caller can
+// branch on without that read.
 message ProjectionState {
-  // Fresh ABA-safe token for this current state.
-  string head = 2;
-  // Whether the projection contains unpublished changes.
+  // Whether the projection holds anything the workspace does not.
   bool dirty = 3;
+  // Whether the changeset holds a change carrying a confirmation the caller has not accepted.
+  // Publication refuses while this is true.
+  bool unacknowledged = 4;
 }
 // A byte range of one file and the language used to parse it. The owner of `App.svelte` can
 // mark its script block as TypeScript. A produced virtual file records ranges in its own byte
@@ -441,9 +444,10 @@ message PathSelector {
   // Globs that drop a path `include` already matched.
   repeated string exclude = 2;
 }
-// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from its
-// adapter's native offsets at the seam. No JSON Schema keyword can tie one field to another, so
-// that `end` is never below `start` is asserted by the conformance tests instead.
+// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from
+// whatever its language toolchain counts in at the seam, so a rustc column and a tsc column
+// arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that
+// `end` is never below `start` is asserted by the conformance tests instead.
 message TextRange {
   // First byte of the range, counted from the start of the file.
   int64 start = 1;
@@ -1622,8 +1626,8 @@ message DiagnosticRelated {
 // vocabulary.
 message Diagnostic {
   // How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their
-  // adapter's levels onto these four, so a caller can drop everything below `warning` without
-  // knowing which language produced it.
+  // toolchain's own levels onto these four, so a caller can drop everything below `warning`
+  // without knowing which language produced it.
   enum Severity {
     // The caller did not set a value.
     SEVERITY_UNSPECIFIED = 0;
@@ -1704,8 +1708,9 @@ message ValidationReport {
   // range.
   repeated Diagnostic diagnostics = 5;
 }
-// How many matches an atomic rewrite accepts. Rift counts against the expected session state
-// and refuses the operation when the count falls outside this interval.
+// How many matches an atomic rewrite accepts. Rift counts the matches in the projection as it
+// stands and refuses the operation when the count falls outside this interval, so a pattern
+// that is looser than the caller believed rewrites nothing.
 message MatchCardinality {
   // Fewest matches required.
   int64 minimum = 1;
@@ -1922,9 +1927,9 @@ message ArgumentContract {
     ArgumentContractChangeSignature change_signature = 4;
   }
 }
-// A language adapter checked its own state.
+// A language adapter ran the check against its own analysis.
 message OperationVerifierAdapter {
-  // Adapter whose adapter performed the check.
+  // The language whose adapter performed the check.
   Language language = 1;
 }
 // One workspace command validator checked a changed tree.
@@ -1972,10 +1977,11 @@ message OperationPrecondition {
   enum Kind {
     // The caller did not set a value.
     KIND_UNSPECIFIED = 0;
-    // Every addressed symbol, node, match, or source range resolves at the expected state.
+    // Every addressed symbol, node, match, or source range resolves in the projection as it
+    // stands.
     KIND_TARGET_EXISTS = 1;
-    // The state used for discovery still matches the state being resolved.
-    KIND_STATE_MATCHES = 2;
+    // The files a match or action offer was discovered in have not been rewritten since.
+    KIND_SOURCE_UNCHANGED = 2;
     // Every affected path is inside the project and writable through Rift's workspace handle.
     KIND_WRITABLE = 3;
     // The adapter completely classified the references on which the operation depends.
@@ -2004,8 +2010,7 @@ message OperationPrecondition {
   repeated Address addresses = 4;
   // Project paths involved in the condition, including destinations that do not yet exist.
   repeated string paths = 5;
-  // Required value. Examples include the discovered head, zero remaining usages, or complete
-  // coverage.
+  // Required value. Examples include zero remaining usages or complete coverage.
   PreconditionValue expected = 6;
   // Value found while checking the condition.
   PreconditionValue observed = 7;
@@ -2053,7 +2058,7 @@ message OperationEffect {
   // Subjects in the state before this change. Empty for creation.
   repeated Address before = 2;
   // Subjects after Rift applies the change and every adapter sharing the projection
-  // acknowledges the new head. Empty for deletion.
+  // acknowledges the change. Empty for deletion.
   repeated Address after = 3;
   // Source locations demonstrating the effect, pinned to their respective before or after
   // address state.
@@ -2103,9 +2108,10 @@ message GuaranteeEvidence {
   // Findings produced while establishing the guarantee.
   repeated Diagnostic diagnostics = 6;
 }
-// One effect a caller must acknowledge before a change becomes visible. Requirements are sorted
-// by kind, source location, title, and detail, then numbered from zero. An acknowledgement
-// applies to a retry of the same operation and expected head.
+// One effect the caller has to accept before publication. The change that raised it lands in
+// the projection either way, carrying this record, so the caller can read what happened before
+// deciding. Requirements are sorted by kind, source location, title, and detail, then numbered
+// from zero within their change.
 message ConfirmationRequirement {
   // The condition that makes acknowledgement necessary.
   enum Kind {
@@ -2113,7 +2119,7 @@ message ConfirmationRequirement {
     UNSPECIFIED = 0;
     // The change deletes source or replaces an existing file.
     DESTRUCTIVE = 1;
-    // The change reaches enough files or symbols to require explicit acknowledgement.
+    // The change reaches enough files or symbols to require explicit acceptance.
     LARGE_SCOPE = 2;
     // The change touches source marked as generated.
     GENERATED_CODE = 3;
@@ -2125,9 +2131,14 @@ message ConfirmationRequirement {
     FORMATTING_SCOPE = 6;
     // A workspace command validator will check the changed tree.
     COMMAND_VALIDATOR = 7;
+    // Required adapter or command validation did not complete over the resulting tree.
+    VALIDATION_INCOMPLETE = 8;
+    // The action advertised a guarantee that resolution produced no evidence for.
+    GUARANTEE_UNESTABLISHED = 9;
   }
-  // Zero-based position in the refusal's ordered confirmation list.
+  // Zero-based position in its change's ordered confirmation list.
   int64 id = 1;
+  // The condition that makes acceptance necessary.
   Kind kind = 2;
   // A short account of the effect being acknowledged.
   string title = 3;

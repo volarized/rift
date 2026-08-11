@@ -24,13 +24,15 @@ message Omission {
 }
 // Selects a session projection to export as SCIP.
 message Request {
-  // Session projection head to export.
-  string head = 2;
+  // Session whose projection is exported. The export reads the projection as it stands, so a
+  // write landing mid-stream can make the index inconsistent; a consumer that needs a whole one
+  // reads again.
+  string session = 2;
 }
 // Identity and coverage emitted before index records.
 message Header {
-  // Projection head that produced every following record.
-  string head = 2;
+  // Session whose projection produced every following record.
+  string session = 2;
   // The metadata field of the projected `scip.Index`.
   .scip.Metadata metadata = 3;
   // Availability of each Rift fact family used by the projection.
