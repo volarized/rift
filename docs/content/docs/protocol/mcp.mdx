@@ -2,334 +2,229 @@
 title: MCP
 ---
 
-import { McpReference } from "@/components/protocol/mcp";
+Rift's MCP surface maps JSON tools and resources to the `rift.mcp.Rift` gRPC service. The generated
+[reference](/docs/protocol/reference) defines fields and wire types. This page defines how calls
+compose with the persistent source store, mounted projections, and the narrow Git boundary.
 
-Agents reach Rift through MCP tools and resources. A client begins by reading the repository resource,
-which reports the surface this workspace serves, its configured language adapters, and the limits on
-requests and disposable caches.
+## Connection
 
-| Profile | Additional surface |
+`rift mcp` creates a random session id and opens the server's `Connect` control stream. The first
+`Connected` response carries the selected contract, canonical workspace root, persistent session
+projection, exact `ProjectionState`, and a connection id required on later RPC metadata.
+
+The first connection for a session may supply `initial_revision` to import any local Git commit. Its
+omission uses `session.base` configuration. Reconnection requires the existing stored base and
+current state and does not resolve Git again. SCIP export clients connect without a writable session.
+
+One session id admits one live MCP connection. Closing the bridge closes adapter and ephemeral
+resource state but retains the session projection, current source, base, and scratch.
+
+## Resources
+
+Resources return one JSON payload inside MCP text content:
+
+| Resource | Purpose |
 | --- | --- |
-| `file` | Git tree, diff, file and text-match reads; concrete edits, patches, and session commits |
-| `read` | adapter outline, search, structural match, symbol, actions, and retained facts |
-| `edit` | adapter-resolved changes, formatting, validation, Git merge reporting, and integration |
-| `full` | the edit fixtures with two language adapters and one embedded-language route |
+| `rift://repository{?rev,cursor}` | capabilities, limits, validators, and resolved source |
+| `rift://fs{?cursor}` | mounted session and explicit read projections |
+| `rift://file/{path}{?rev,start,length}` | one bounded file range |
+| `rift://symbol/{language}/{name}{?rev,cursor}` | one symbol and its semantic relationships |
+| `rift://diff{?from,to,cursor}` | file changes between two independently encoded revisions |
+| `rift://actions/{address}{?only,rev,cursor}` | actions available at an address |
+| `rift://action/{token}` | one action and its argument schema |
 
-Profiles accumulate and record runtime conformance. The repository resource separately reports the
-actual tools, resources, per-language operations, and validation strength. Command validators,
-execution, and debugging depend on user-owned host grants and do not follow the profile ladder.
+Revision query values use the scalar spellings `git:main`, `snapshot:snap_…`, or
+`projection:prj_…`. Git revision bytes outside the URI-unreserved set use uppercase percent
+encoding and are decoded once. Tool parameters use the tagged `Revision` object. Omission in a
+session-scoped read selects that session's current state.
 
-Host policy governs execution and debugging. `execute` is listed only when that policy authorizes at
-least one language, its adapter advertises `execute`, and the execution fixtures pass on this host.
-The debugging tools appear together under the same rule and require the complete `debug_start`,
-`debug_get_frame`, `debug_stop` adapter triplet.
-`LanguageSupport.execution` reports the effective intersection for each language. Passing the `full`
-conformance suite does not authorize either capability.
+Every resolved payload carries a content-only `Snapshot` through `ResolvedSnapshot`; a Git selector
+also reports the exact peeled commit in `imported_from`. `Snapshot` equality never depends on how the
+tree was reached.
 
-The [`ConformanceProfile`](/docs/protocol/reference#ConformanceProfile) definition specifies the
-executable gate behind each claim. The repository reports a profile only after that suite passes on the
-current host.
+Copying an id does not pin source. Page cursors, returned file continuations, and diff links own
+bounded, connection-scoped pins until consumption, server-defined expiry, or connection close; no
+minimum lifetime is promised. A file read acquires the next-page pin before releasing the current
+one. Match and action ids are self-contained but non-pinning; reading one after collection returns
+`snapshot_not_found`. An action whose adapter generation is gone returns `stale_action`.
 
-`tools/list` contains only the effective entries. A changed policy grant, adapter generation, or
-conformance result emits `notifications/tools/list_changed`; the next list reflects the new surface.
-This keeps execution and adapter-resolved schemas out of clients that cannot call them.
+`rift://fs` is the host-independent way to discover mount paths. It lists persistent session
+projections and explicit read projections only, with exact current snapshots, availability,
+mutability, scratch bytes, and open-handle counts. Its first page captures a connection-scoped,
+identity-sorted inventory; later cursors read that same capture. Reading it grants no cleanup
+authority. Private candidates and execution mounts are absent.
+
+A file resource echoes its request URI, exact `ResolvedSnapshot`, and complete `File` entry. Regular
+entries add `start`, actual `end`, `total_bytes`, and UTF-8 or canonical-base64 content. A partial
+answer returns `next` at exactly `end` with a `snapshot:` selector, so pagination cannot drift with a
+projection or Git ref. LFS pointers, symlinks, and gitlinks return their complete entry metadata with
+an empty range and no continuation.
+
+A requested file `start` beyond `total_bytes` is `invalid_request`. A request at EOF returns an
+empty UTF-8 range with no continuation.
 
 ## Discovery
 
-`tree` lists project paths from Git objects. A depth of one lists a directory; recursive depth plus
-include and exclude globs provides tree, glob, and file-find queries. File and diff resources supply
-content and changes. Text `match` searches UTF-8 source. These calls work for every language without
-starting an adapter.
-
-`outline` reads declarations, definitions, imports, exports, and their source nesting for one file.
-`search` retrieves files, nodes, or symbols by text and adapter facts. Relationship filters express
-callers, callees, dependencies, implementations, overrides, and type hierarchy walks. `match` returns
-source ranges for a `MatchQuery`. Each semantic answer carries coverage and the `Snapshot` it used.
-
-Recursive search predicates use the `rql/1` string grammar reported by `matching.search`. A query
-crosses MCP as one bounded string:
-
-```text
-rql/1: facets contains "callable" and
-       relation("outgoing", "returns",
-                type.resolved == "rift://symbol/rust/crate::Config", 1, "exists")
-```
-
-The grammar is:
-
-```text
-query       = or-expr ;
-or-expr     = and-expr, { "or", and-expr } ;
-and-expr    = unary, { "and", unary } ;
-unary       = [ "not" ], ( comparison | relation | element | "(", query, ")" ) ;
-comparison  = field, operator, json-value ;
-relation    = "relation(", direction, ",", facet, ",", query,
-              [ ",", depth, [ ",", quantifier ] ], ")" ;
-element     = "element(", field, ",", query, ")" ;
-operator    = "==" | "!=" | "<" | "<=" | ">" | ">=" | "contains" | "in"
-            | "matches" | "starts_with" | "ends_with" ;
-direction   = '"incoming"' | '"outgoing"' ;
-quantifier  = '"exists"' | '"not_exists"' ;
-```
-
-`field` is a dot-separated identifier, `facet` and every other quoted token use JSON string syntax,
-`json-value` is one canonical JSON value, and `depth` is an integer from 1 through the effective
-relation-depth limit. Whitespace is insignificant outside strings. The parser consumes the complete
-input after the `rql/1:` prefix and rejects unknown fields, invalid operator/type pairs, excessive
-nesting, and excess predicate nodes. It then builds the typed `Filter` model, which keeps the recursive
-model out of every tool's self-contained input schema.
-
-Records that another call can address carry an identity for that purpose. A symbol uses a
-`rift://symbol/…` URI, while a retained match uses `rift://match/…`. The match URI's last segment is
-base64url of the snapshot, the span, and the query that found it. Rift decodes that segment without a
-stored record, so the same identity resolves after a server restart. Resource pages also carry their
-next URI: the file resource returns one byte range as UTF-8 or base64, then puts the following offset
-in that link.
-
-Answers are bounded. `max_response_bytes` fixes the serialized page ceiling at 64 KiB,
-`max_record_bytes` holds back enough of it for the page's own identity and cursor, and
-`max_file_chunk_bytes` caps source bytes before encoding; an item that can't fit `max_record_bytes` is
-refused rather than truncated. Anything larger comes back with an opaque `Cursor` bound to an
-immutable result generation.
-
-The cursor contains a version, canonical request digest, snapshot cache key, result generation,
-ordering mode, final sort key, and checksum. Every following page reads the same facts and coverage,
-even when analysis publishes a newer generation between calls. Repeating the request without a
-cursor polls that newer state. The cursor is stateless. Semantic generations live in server memory,
-so eviction or server exit returns `cursor_expired`. A mechanical cursor names a Git object and
-survives restart while Git retains that object. A malformed cursor or one copied to a different
-request returns `cursor_invalid`.
-
-`max_query_nodes` and `max_query_depth` bound the parsed RQL tree before relation planning. The request
-byte limit applies before parsing, so a rejected query consumes neither an adapter slot nor a read
-worktree.
-
-The read conformance suite measures cold and warm latency against fixed repositories, and records
-serialized bytes alongside answer tokens. Warm there means a semantic read served from retained facts
-with its adapter stopped, which is the case that decides whether an agent waits on a compiler.
-
-From those records a client can build its own views: ranked context maps out of tree, symbol and
-relationship records, change frequency out of diffs. The derived view keeps the identities of the
-records it was built from, so a ranking can be traced back to the code it ranked. For a two-commit
-frequency window, read `rift://diff/HEAD~1..HEAD` and `rift://diff/HEAD~2..HEAD~1`, then count each
-`FileChange` path.
-
-A submodule appears in the parent project tree as one gitlink entry carrying the child commit. Parent
-reads and adapters stop at that path. The child repository uses its own Rift connection. A parent edit
-can create or update the gitlink, while a matching `.gitmodules` change travels as an ordinary text edit.
-
-### Actions
-
-Adapters expose the actions available at one place through a resource URI:
-
-```
-rift://actions/symbol/python/pkg.util.load_config
-rift://actions/file/src/api.rs?only=quickfix
-```
-
-A point address asks about one symbol, node, byte range, or match. A file address asks for every
-offer in that file, which supports an agent working through file diagnostics; Rift fans out over the
-nodes those diagnostics land on. `?only=` keeps one kind
-prefix, `?rev=` selects the revision, and the page continues through `?cursor=`.
-
-Each entry carries what the action would do and its own URI, and leaves `arguments_schema` out. An
-adapter can offer a dozen actions at one address, and their JSON Schemas could consume the 64 KiB
-page. Reading one offer returns it with its schema:
-
-```
-rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ
-```
-
-That URI is what `act` takes.
-
-## Changes
-
-Each change tool performs one operation with typed arguments. It also carries `expected_head`, the
-Git commit the caller observed at the session ref. Rift compares it before allocating or changing
-the session worktree. A different current head returns `stale_head` without creating a checkout.
-
-When resolution finds an effect that needs acknowledgement, it returns `refused` with ordered
-confirmation requirements and leaves the ref unchanged. The caller may retry the same operation and
-`expected_head` with exactly those confirmation IDs. Missing or extra IDs refuse the retry, so an
-acknowledgement cannot drift onto different Git state.
-
-| tool | what it does |
+| Tool | Result |
 | --- | --- |
-| `edit` | an atomic set of concrete `Edit` values |
-| `patch` | a unified diff, checked hunk by hunk against the state it resolves on |
-| `rewrite` | one `MatchQuery`, a replacement template, and an accepted match count |
-| `revert` | the three-way inverse of one commit against a selected parent |
-| `merge` | Git's three-way merge of one commit into the session worktree |
-| `rename` | a new name for a declaration, propagated to its references |
-| `move` | a new container or path, with imports and references updated |
-| `delete` | removal of a declaration, with or without reference analysis |
-| `change_signature` | a new callable shape, propagated to callers and overrides |
-| `act` | any other action an adapter offered, by its `rift://action/…` URI |
-| `integrate` | a merge of the session head into a local branch, described under [Integration](#integration) |
+| `tree` | project entries below one directory, without an adapter |
+| `outline` | adapter-owned declaration nesting for one file |
+| `search` | ranked files, nodes, or symbols with explicit coverage |
+| `match` | literal, regular-expression, or structural byte ranges |
 
-`rename`, `move`, `delete`, and `change_signature` use portable argument contracts, so their arguments
-are in the tool schema an agent already has. Everything else an adapter can do — extract, inline,
-organize imports, a quick fix, an adapter's own family — is discovered through the actions resource
-and resolved by `act`. Its `arguments_json` field is a JSON string whose contents follow the schema
-that offer advertises; Rift canonicalizes those contents as `rift-json/1` without passing the inner
-numbers through the outer JSON-RPC decoder. `act` refuses an offer belonging to a portable family,
-which leaves one entry point for each operation.
+Mechanical reads and diffs use source-store trees. Semantic calls open or refresh an adapter against
+an exact mounted snapshot. A cursor binds request parameters, result order, and snapshot. Empty
+semantic results are meaningful only with their coverage: `complete`, `partial`, or `unsupported`.
 
-`delete` carries both kinds of removal on one axis. Without a `policy` it removes the declaration
-without reference analysis, which supports deleting newly created code. With a policy, the adapter
-classifies every remaining use and applies the selected disposition. Incomplete reference coverage
-refuses the operation before it can leave a dangling call behind.
+`match` returns self-contained `MatchId` values. The actions resource returns `ActionOfferId` values
+bound to one snapshot and adapter-local offer. `act` accepts only adapter-specific families; rename,
+move, delete, and change-signature use their typed tools.
 
-The first change materializes and registers the session worktree at `expected_head`; later changes
-reuse it. Each successful tool writes that worktree, validates the resulting tree with affected
-adapters, [creates a Git commit](https://git-scm.com/docs/git-commit-tree), and
-[conditionally advances](https://git-scm.com/docs/git-update-ref)
-`refs/rift/sessions/<session-id>`. The response contains the previous and resulting commits, the diff,
-and bounded validation evidence. These links define Git's operation semantics; Rift calls equivalent
-library APIs.
+## Projection tools
 
-### Composing operations
+`projection_open` resolves one tagged revision and mounts an immutable read projection. It reports
+the exact snapshot and peeled Git commit when applicable. `projection_close` withdraws the namespace
+from new opens and is accepted only from the connection that opened it. Connection cleanup performs
+the same withdrawal. Existing external handles retain only their inode version or captured
+directory enumeration; their final pin is released when they close. Session and internal
+projections cannot be closed through this tool.
 
-A change that takes several steps is ordinary Git history on the session ref:
+Ordinary writes to a session projection persist directly in the source store and mint a fresh
+`ProjectionHead`. They do not create a Git commit or ref. Scratch writes do not change the source
+head. Source/scratch classification and cross-layer rename rules are defined in the
+[architecture](/docs/architecture#source-and-scratch).
 
-```
-edit(expected_head: B, …)   -> commit A, parent B
-rename(expected_head: A, …) -> commit C, parent A
-act(expected_head: C, …)    -> commit D, parent C
-```
+`projection_restore` compares the exact dirty `ProjectionState` and resets current source to its
+pinned `base.snapshot` with a fresh head. Non-conflicting scratch remains; source paths atomically
+unlink conflicting scratch names while open scratch handles retain their unlinked inode versions. A
+clean projection returns `noop`.
 
-Each step resolves against the current session tree, so the rename sees the declaration the edit
-created. Before `act`, the caller reads the actions resource at commit `C` and passes back the selected
-`ActionOfferId`. Rift formats and refreshes every adapter sharing the worktree before it creates each
-commit.
+The synthetic root `.git` entry prevents Git from discovering the physical parent checkout. Normal
+projection operation therefore needs no Git index, status, add, commit, or restore workflow.
 
-The expected head serializes mutation without a retained request record. If a response is lost, the
-caller reads the session head and diff. Finding the returned commit in Git proves the operation
-completed; another head requires a fresh decision from the supervisor.
+## Change tools
 
-## Lifecycle
+All semantic mutations carry `expected: ProjectionState`:
 
-A session begins when `Connect` creates or attaches its Git ref. Reads resolve that ref without
-creating the session's writable worktree. An adapter-backed read may use a disposable detached read
-worktree for the selected commit; it does not materialize the session worktree. The first change
-creates the registered session worktree, and change operations append commits to the ref. Closing
-every connection releases adapter state but leaves the ref and any materialized worktree available
-for another connection.
-
-Rift does not keep durable request outcomes. A process failure can leave one of three Git-visible
-states: the old session head, a new session commit, or mutable worktree/index changes that were not
-committed. The next request reports that state. It never infers completion from a separate journal.
-
-Session removal is an explicit local operation because its ref may be the only name for user work.
-It reports commits that would become unreachable, removes the registered worktree when present, and
-then removes the ref.
-
-### Validation
-
-Adapter validation runs after a change is applied. Workspace policy defaults to `require =
-"available"`, which runs affected adapters that advertise `validate`. A result with no such adapter
-reports validation strength `mechanical`. An explicit list such as
-`['rust', 'sql:postgresql', 'json']` requires complete, valid reports from those exact languages and
-reports strength `required`.
-
-Command validators run on the merged tree before integration advances its target. Their declarations
-come from `rift.toml` in that tree and remain requests until current user policy grants them. Rift runs
-the executable directly, without a shell, in a disposable validation workspace and returns its exit
-status and bounded output. Writes inside the workspace disappear with it, while the command retains
-the server's host access.
-
-The repository resource reports the declarations admitted by current policy in execution order. This
-lets a supervisor inspect the exact checks an integration will run without interpreting `rift.toml` or
-machine policy itself.
-
-Validation evidence may be cached under `.rift/cache` when its key contains the merged Git tree,
-executable digest, arguments, environment, carried-file digests, and limits. A missing entry reruns
-the validator, so policy may grant only repeat-safe commands.
-
-One workspace and every transaction in it cover one repository. A gitlink remains an opaque entry in
-the parent repository; its child repository is outside this connection.
-
-### Integration
-
-`integrate` merges the session head into a local target branch in a dedicated integration worktree.
-Rift calls Git's [merge API](https://git-scm.com/docs/api-merge), preserving repository merge drivers
-and Git's standard index stages. Two commits that are each valid can merge into a broken tree, so
-adapter and command validation run on the complete merged state before the target moves.
-
-A merge conflict returns `merge_conflict`, the integration worktree, and Git's path statuses. The
-unmerged index and working files stay as Git produced them. Rift creates no provisional commit and
-does not choose a resolution. Semantic operations return `worktree_busy` until the supervisor uses
-Git-aware tooling to resolve or abort the merge.
-
-After a clean merge and validation, Rift creates the merge commit and asks Git to update the target
-only if it still holds the expected object ID. A moved target returns `target_moved` with the expected
-and current commits. A checked-out target returns `checked_out_target` with its worktree path, leaving
-its ref, index, and files unchanged.
-
-## Execution and debugging
-
-`execute` takes an exact `Language`, an optional `rev`, and a `CodeBlock`. Rift resolves the revision,
-prepares a disposable execution workspace, opens a fresh adapter state, and calls that adapter's
-`Execute` RPC. The result reports the exact `Snapshot`, completion or language failure, bounded stdout
-and stderr, structured diagnostics, and the exact `ExecutionBudget` applied. `Limits.execution`
-reports code, time, output, concurrency, and optional debugging ceilings; null means policy disables
-caller code. A returned `DebugSession` likewise echoes its `DebugBudget`. Cancellation, deadline
-expiry, adapter loss, and workspace preparation return protocol errors. They do not become code
-outcomes.
-
-The block includes a project-relative working directory and never becomes a repository file. Imports,
-dependencies, toolchain selection, and configuration come from the chosen snapshot. Files the block
-writes are discarded with the execution workspace after the call.
-
-Debugging retains a session across explicit lifecycle calls:
-
-| tool | effect |
+| Tool | Operation |
 | --- | --- |
-| `debug_start` | Runs a block to normal completion or an unhandled failure and returns a connection-bound `DebugSession`. |
-| `debug_get_frame` | Reads one retained failure frame by zero-based stack depth, innermost first. It does not resume execution. |
-| `debug_stop` | Releases the adapter token, adapter state, and execution workspace. |
+| `edit` | one atomic set of concrete file and text edits |
+| `patch` | a UTF-8 unified diff with checked context |
+| `rewrite` | query, cardinality check, expansion, and atomic replacement |
+| `revert` | three-way inverse of one Git commit against an explicit parent |
+| `rename` | declaration rename and reference propagation |
+| `move` | declaration or file move and dependency updates |
+| `delete` | mechanical or policy-driven deletion |
+| `change_signature` | callable-shape and call-site propagation |
+| `act` | one adapter-specific action offer |
 
-Normal completion returns `frame_count: 0`. A failed run retains bounded frame names, repository source
-locations where one exists, and adapter-rendered arguments and locals. Each value uses `CapturedText`,
-which carries a prefix plus its complete byte count, truncation flag, and digest. The interface has no
-portable runtime object graph. Child expansion,
-stepping, continue, breakpoints, and variable mutation can be added as separate interfaces later
-without changing frame identity.
+The state contains a fresh ABA-safe head, current snapshot, one retained Git-backed base, and dirty
+flag. Rift compares the complete state before adapter work and the head again at publication. The
+token detects A→B→A even when snapshot content repeats.
 
-The public `DebugSessionId` is opaque and valid only on the MCP connection that started it. Rift maps
-it to an adapter-local `DebugSessionKey` and never exposes that key to an agent. A stop is idempotent:
-an exact retry after a lost response returns the same success without retaining the workspace. An ID
-from another connection is `permission_denied`; an unknown or idle-expired ID is
-`resource_not_found`. A stopped-session tombstone retains idempotency until connection close.
-Connection close, adapter exit, and server recovery perform the same cleanup as `debug_stop`.
+One operation pins the expected state, forks a private copy-on-write candidate, resolves and
+validates the complete result, then briefly acquires the projection publication barrier. A matching
+head publishes the candidate in one store transaction with a fresh head. A concurrent FUSE or MCP
+write returns `stale_projection`; it is never overwritten. Refusal, cancellation, validation
+failure, or adapter failure changes no public source.
 
-An execution workspace contains repository writes so Rift can discard them after evaluation.
-Evaluated code retains the filesystem, process, and network access of `rift server`, so machine and
-workspace policy must both grant the exact language before any of these tools are advertised. Rift
-resolves the working directory without following symlinks or entering gitlinks.
+`ChangeApplied` returns previous and current states, a snapshot-to-snapshot diff link, concrete
+edits, preconditions, effects, guarantees, diagnostics, and validation. The diff link owns its
+temporary pins. No change result contains a Git commit because normal source mutations do not touch
+Git.
+
+A risky operation returns deterministic confirmation requirements bound to the operation and exact
+expected state. Any changed head, operation, arguments, or confirmation set invalidates them.
+
+Rift keeps no completed-response journal. If an applied response is lost, retrying the old state
+returns `stale_projection`; the caller reads current state. This is a deliberate consequence of
+keeping current state without Rift-side historization.
+
+## Sessions
+
+Sessions retain one current projection, one Git-backed base snapshot, and disposable scratch.
+
+| Tool | Behavior |
+| --- | --- |
+| `session_list` | pages through session id, projection location/state, and active owner |
+| `session_continue` | replaces an untouched initial session with one inactive retained session |
+| `session_remove` | previews or confirms deletion against an exact source state |
+
+Removal preview reports whether source is unintegrated, scratch bytes, and estimated reclaimable
+store bytes. Confirmation requires the same source head and no live connection, handle, mutation,
+debugger, recovery, or integration intent. Under the open-admission barrier it withdraws the
+namespace, rescans disposable scratch, and deletes the store-backed session. Scratch is generated,
+disposable state and is not separately CAS-guarded.
+There is no session Git ref to delete or orphan.
+
+## Validation and execution
+
+Adapter validation runs against a private candidate. Configured command validators run only during
+integration, in declaration order, against a disposable projection of the exact merged snapshot.
+Their working directory is the projection root; configured carry paths come from session scratch.
+
+Rift runs validator `argv` directly without a shell. A nonzero exit is a completed rejection.
+Failure to prepare the projection, launch, enforce timeout, or capture output is
+`validator_execution_failure`.
+
+`execute` and `debug_start` resolve one exact snapshot and use disposable projection scratch. The
+mount is not a host sandbox. Debug sessions retain bounded frames until stop, connection close, or
+idle expiry, then release their adapter, process, projection, and pins.
+
+## Integration
+
+`integrate` accepts a target branch, exact current `ProjectionState`, expected target commit, and
+commit subject. It computes the source delta from `expected.base.snapshot` to `expected.snapshot`,
+merges it onto the target tree, and validates the complete merged snapshot.
+
+If the merged tree already equals the target, `synchronized` creates no commit and simply rebases
+the projection to that target commit and tree. Otherwise Rift writes one squash commit whose sole
+parent is `expected_target`, compare-and-swaps the target, and rebases the projection to the merged
+tree as its new clean base. This is the only normal workflow that writes Git.
+
+The final transition compares both source head and target commit. A source write returns
+`stale_projection`; a target move returns `target_moved`; validation rejection returns its complete
+evidence. Integration refuses any target checked out in a Git worktree. Rift does not synchronize
+the physical root or modify an ordinary index.
+
+The architecture defines the transient integration intent and private transaction marker that make
+the Git-ref/store transition crash-recoverable without turning it into a history log.
+
+## Merge recovery
+
+A built-in clean integration never exposes Git. Conflicts or a custom merge-driver attribute create
+one conventional worktree below `.rift/recovery/<RecoveryId>` and one private recovery ref. Synthetic
+commits exist only to populate recovery index stages and never become public parents.
+
+`recovery_list` discovers active recoveries after restart or a lost response and rescans their index
+and worktree manifests. The user resolves files and stages the intended tree with ordinary Git in
+that directory. `recovery_continue` compares the reviewed manifest, requires no unmerged, unstaged,
+or untracked paths, imports the index tree, validates it, and repeats source and target CAS. Any
+recovery-only commit is ignored.
+
+An already-target-equivalent resolution returns `integration_synchronized`. Validation rejection or
+repository refusal retains the recovery and returns it with refreshed evidence; success removes it.
+An obsolete continuation returns expected and current source, target, and manifest values, using
+null when the target branch was deleted. `recovery_abort` previews the current manifest and removes
+the worktree, private ref, and pins only when confirmation carries the same manifest. A changed
+manifest fails with `recovery_moved`; a special file must be removed before continue or confirmed
+abort can succeed.
 
 ## Failures
 
-A failed MCP request returns `ErrorData`, whose code classifies the failure and whose phase identifies
-the lifecycle step that failed. Its `request_id` is the same random id recorded in gRPC metadata and
-the structured server log, so an operator can find the matching adapter and storage events without
-logging source or caller arguments.
+Transport and server failures use `ErrorData`; domain decisions use typed result variants.
 
-The error model includes Git-state failures that require a fresh query or local supervisor action:
-
-| code | condition | retry |
+| Code | Meaning | Next action |
 | --- | --- | --- |
-| `unsupported_path` | Git contains a path the protocol or host filesystem cannot represent safely | `never` for that snapshot |
-| `cursor_expired` | the cursor is valid but its immutable result generation was evicted | `refresh_snapshot` from the first page |
-| `state_corrupt` | a Rift ref is malformed, or Git's registered-worktree record does not match its directory | `operator_action` |
-| `temporarily_unavailable` | a required adapter or disposable workspace is temporarily unavailable | `same_request` |
+| `snapshot_not_found` | an exact unpinned snapshot was collected | resolve or import again |
+| `git_revision_not_found` | a Git selector or required local object is missing | fetch explicitly or choose another revision |
+| `projection_not_found` | the projection was closed or removed | read `rift://fs` |
+| `projection_unavailable` | the frontend or mount is not serving | remount or restart the server |
+| `projection_busy` | handles, mutations, or a barrier prevent cleanup | close the owner and retry |
+| `projection_head_moved` | cleanup state is stale | reread current state |
+| `recovery_moved` | recovery bytes changed after preview | list and review recoveries again |
+| `state_corrupt` | a store digest, reachability, or head invariant failed | run `rift state check` |
+| `unsupported_path` | a source path cannot be represented safely on this host | change it on a compatible host |
 
-`operator_action` tells an MCP client to stop retrying until local Git-aware tooling repairs or
-resolves the condition. The error carries the affected ref or worktree and request ID.
-
-A refused operation returns its failed preconditions and blockers in `RefusalReason`, while rejected
-integration returns its validation evidence. A target race carries the object ID Rift expected and the
-one Git reported. A merge conflict carries the unmerged paths Git produced. These are ordinary
-results; `ErrorData` covers requests that failed before reaching one.
-
-<McpReference />
+An invalidation failure after a durable mutation is reported as committed-but-degraded with the new
+current state; it is never returned as an ordinary error implying that nothing changed.

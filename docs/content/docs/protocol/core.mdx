@@ -4,10 +4,12 @@ title: Core
 
 import { Callout } from "fumadocs-ui/components/callout";
 
-Rift resolves every request against a Git revision, so the workspace must be a Git repository.
+Rift resolves every request to a complete immutable source snapshot in its persistent store. Git is
+used to import existing history and publish an integration; it does not own live session state.
 
-<Callout type="info" title="Git is required">
-  If it isn't already enabled, run `git init` in the workspace.
+<Callout type="info" title="An initial commit is required">
+  A writable projection needs one committed Git tree as its retained base. An unborn repository is
+  refused until it has an initial commit.
 </Callout>
 
 The schema groups its definitions by the part of a request they describe. `rift:axes` records those
@@ -18,68 +20,59 @@ shapes.
 
 ## Versioning
 
-A request may name a revision of the workspace. The Rift server resolves a commit directly and
-captures a mutable worktree into an immutable Git tree. It returns a `Snapshot` identifying the tree
-it actually read, so a later request can reuse the same code after the live worktree moves.
-
-Revision resolution belongs to the server. A mechanical read uses Git objects directly. Before an
-adapter-backed read, the server reuses a physical tree only when it represents the exact resolved
-snapshot; otherwise it allocates a detached read worktree. The adapter receives the resolved snapshot
-and tree through `Open`, rather than deciding which revision to check out.
+A request can select a Git revision, a retained `SnapshotId`, or the current head of a filesystem
+projection. The server resolves the selector once, imports Git trees when necessary, and returns the
+exact store snapshot it read. Adapters receive a mounted projection for that snapshot through `Open`;
+they never choose revisions or allocate filesystems.
 
 ### Revision
 
-By default Rift works with the default branch at its latest commit. Every tool and resource also takes
-an optional `rev`. It accepts [`gitrevisions(7)`](https://git-scm.com/docs/gitrevisions) expressions
-without control characters or a leading `-`, plus Rift's mutable-worktree selectors:
+MCP tools use a tagged `Revision` object:
 
-| `rev` | Points at |
+| Selector | Points at |
 | --- | --- |
-| *(omitted)* | default branch, latest commit |
-| `main`, `refs/heads/main` | a branch |
-| `v1.2.0`, `tags/v1.2.0` | a tag |
-| `dae86e1` | a commit |
-| `HEAD~3`, `main@{yesterday}` | anything else the syntax allows |
-| `worktrees/feature-x/HEAD` | the commit a linked worktree sits on |
-| `worktrees/feature-x` | that worktree's **working** tree, uncommitted edits included |
-| `main-worktree` | the main working tree, uncommitted edits included |
+| *(omitted)* | current MCP session state |
+| `{ "kind": "git", "revision": "main" }` | one locally resolved Git commit |
+| `{ "kind": "snapshot", "snapshot": "snap_…" }` | one retained immutable source tree |
+| `{ "kind": "projection", "projection": "prj_…" }` | one projection head, resolved once |
 
-The worktree spellings are git's own — per-worktree refs are reachable from any other worktree as
-`worktrees/<id>/HEAD` and `main-worktree/HEAD`. Dropping the `/HEAD` is Rift's one addition, because
-gitrevisions has no way to name work that isn't committed yet, and that is usually what you are editing.
+`GitRevision` follows [`gitrevisions(7)`](https://git-scm.com/docs/gitrevisions). Rift peels annotated
+tags, accepts only commits, and performs no implicit network fetch. A missing promisor object or
+shallow-history boundary returns `git_revision_not_found`.
 
-Resource URIs percent-encode the UTF-8 revision as one query-parameter value. For example,
-`HEAD^{tree}` becomes `rev=HEAD%5E%7Btree%7D`; decoding yields the same `Revision` a tool accepts. The
-server passes the decoded value to the Git library's revision parser and verifies that it resolves to
-an object kind admitted by the operation. The leading-`-` restriction prevents option-like input from
-crossing implementations that also expose command syntax.
+Resources encode the same namespaces in a scalar spelling: `git:main`, `snapshot:snap_…`, or
+`projection:prj_…`. Git bytes outside the URI-unreserved set use uppercase percent encoding. Diff
+URIs encode `from` and `to` independently:
+
+```text
+rift://diff?from=git:main&to=projection:prj_…
+```
 
 ### Snapshot
 
-Because `main` names a different commit tomorrow, and a working tree changes under you, the answer says
-what it actually resolved to. A [`Snapshot`](/docs/protocol/reference#Snapshot) comes back with every
-response:
+`SnapshotId` is SHA-256 over the domain-separated Merkle encoding defined in the
+[architecture](/docs/architecture#snapshot-encoding). It commits to regular-file bytes and mode,
+symlink target bytes, gitlink object ids, and the complete path tree. Scratch, empty directories,
+and synthetic mount entries are excluded. It carries no parent, time, or history.
 
+A [`Snapshot`](/docs/protocol/reference#Snapshot) contains only the content id:
+
+```json
+{ "id": "snap_71d62c8d…" }
 ```
-{ "kind": "commit",   "commit": "dae86e1…" }
-{ "kind": "worktree", "worktree": "worktrees/feature-x",
-                      "base": "dae86e1…", "changes": "9f2c…" }
-```
 
-A working-tree snapshot contains its base commit and the SHA-256 of a canonical capture manifest.
-Each changed entry records its path, regular-file or symlink kind, executable mode, and Git object id;
-a deletion has an explicit deletion tag. Untracked non-ignored files appear as additions. An index
-`skip-worktree` entry distinguishes a sparse absent path from a deletion, gitlinks remain opaque, and
-untracked special files make capture fail. A mode-only change therefore changes the digest.
+`ResolvedSnapshot` adds the exact peeled commit when a request selected a Git revision. Keeping that
+evidence outside `Snapshot` means two commits with the same tree still share one content identity.
 
-The server pins the captured Git tree for the request and gives adapters a detached materialization of
-that tree. It then repeats the complete status enumeration and manifest construction. A changed
-`HEAD`, index checksum, file identity, or manifest restarts capture; exhausting the retry limit returns
-`worktree_busy` and no snapshot. The live worktree may move after capture without changing the state
-the request used.
+The store owns all bytes needed to render a retained snapshot. Current states and bounded active
+resources pin exact snapshots. Copying an id out of a response does not pin it; a superseded unpinned
+snapshot can later return `snapshot_not_found`.
 
-The tree also contains dependency and adapter configuration files. An adapter tracks changes to
-those inputs across `Refresh`. The repository resource identifies the adapter serving the snapshot.
+`ProjectionState` adds a projection identity, fresh `ProjectionHead`, current `SnapshotId`, one
+`ProjectionBase`, and a dirty flag. The base pairs an imported Git commit with a complete pinned copy
+of its tree. `dirty` is true exactly when current differs from base. The head changes on every source
+mutation even when content returns to the same `SnapshotId`, preventing ABA races without creating
+Rift history.
 
 ## Execution
 
@@ -95,10 +88,10 @@ output and error use `CapturedText`, whose bounded prefix, full byte count, trun
 preserve the identity of output too large to return. Command-validator output and rendered debug
 values reuse the same type.
 
-`ExecutionBudget` carries the exact wall-time and per-stream capture bounds that host policy selected
-for one adapter call. `DebugBudget` adds retained frame, binding, and rendered-value bounds. They are
-per-call requirements at the adapter seam, while `Limits.execution` reports the workspace ceilings to
-the MCP caller.
+`ExecutionBudget` carries the exact wall-time and per-stream capture bounds selected by the
+workspace-root `rift.toml` for one adapter call. `DebugBudget` adds retained frame, binding, and
+rendered-value bounds. They are per-call requirements at the adapter seam, while `Limits.execution`
+reports the workspace ceilings to the MCP caller.
 
 A [`DebugFrame`](/docs/protocol/reference#DebugFrame) is a retained stack frame from one failed debug
 evaluation. Its source span points into the pinned repository snapshot where possible. Arguments and
@@ -132,11 +125,16 @@ Physically, a codebase is files. A file is identified by its path, relative to t
 rift://file/pkg/util.py
 ```
 
-The URI contains the path. The resource returns the Git entry and file content. It also reports which
-languages read the file. The same resource reads `LICENSE` and adapter-owned source.
+The URI contains the path. The resource returns the immutable source-store entry and file content.
+It also reports which languages read the file. The same resource reads `LICENSE` and adapter-owned
+source.
 
 An adapter's retained virtual publication also resolves as a regular, non-executable `File`. Its bytes
-come from the adapter overlay and do not create a `ProjectEntry` in the Git tree listing.
+come from the adapter overlay and do not create a `ProjectEntry` in the source-store tree listing.
+
+Symlink targets are arbitrary Git blob bytes up to 4096 bytes. `FileContentSymlink.target` carries
+canonical padded base64 so non-UTF-8 targets remain lossless; Rift never follows the target while
+resolving a protocol path.
 
 A submodule path is a Git `gitlink`. The parent tree stores one child commit at that path. Rift returns
 the gitlink as one `File` with `content.kind: "gitlink"`; `tree` does not list descendants, the file
@@ -145,7 +143,7 @@ separate Rift workspace to read or edit its files.
 
 The parent repository can create a gitlink with `create_gitlink` or change its child commit with
 `set_gitlink`. Adding or moving a submodule also changes the parent repository's `.gitmodules` file, so
-the caller places that text edit in the same atomic `edit` call. These edits change Git tree entries;
+the caller places that text edit in the same atomic `edit` call. These edits change source entries;
 they do not fetch, check out, or mutate the child repository.
 
 Every protocol path is valid UTF-8, relative to the project root, and separated with `/`. An empty,
@@ -154,8 +152,8 @@ normalize either one. In a `rift://` URI, unreserved characters and segment sepa
 literal, while every other UTF-8 byte uses uppercase percent-encoding. For example, `src/☃.ts`
 becomes `rift://file/src/%E2%98%83.ts`.
 
-Git can store names that a host filesystem or the protocol cannot represent. Before materializing a
-tree, Rift derives the host comparison key for every path and refuses aliases such as `A.ts` and
+Git can store names that a host filesystem or the protocol cannot represent. Before mounting a
+snapshot, Rift derives the host comparison key for every path and refuses aliases such as `A.ts` and
 `a.ts` on a case-insensitive volume. It also refuses invalid UTF-8, Windows reserved names,
 trailing-dot or trailing-space aliases, and paths the host cannot create. The repository can still
 open for unaffected Git operations; an operation that enumerates or touches such an entry returns
@@ -224,14 +222,14 @@ delete, rename, or copy a file, change its executable bit, and create or update 
   "text": "def load_config(path: Path) -> Config:" }
 ```
 
-An adapter returns proposed source changes to Rift as `Edit` values. Rift can inspect the values before
-writing them to the session worktree. The [adapter contract](/docs/protocol/adapter#source-ownership)
-defines that ownership boundary.
+An adapter returns proposed source changes to Rift as `Edit` values. Rift inspects and applies them in
+a private copy-on-write candidate before the public session projection changes. The
+[adapter contract](/docs/protocol/adapter#source-ownership) defines that ownership boundary.
 
 An edit set is atomic. Every text range addresses the input state, and ranges in one set cannot
 overlap, and Rift orders the set by file and range before it crosses a seam. Where a later operation
-has to observe an earlier one, the caller uses the resulting session commit as the next call's
-`expected_head`, so the second operation resolves against the first one's tree.
+has to observe an earlier one, the caller uses the resulting `ProjectionState` as the next call's
+`expected` value, so the second operation resolves against the first one's exact tree and token.
 
 Gitlink creation and update use `create_gitlink` and `set_gitlink`. Delete and rename also apply to a
 gitlink entry. Copy and executable-bit changes apply to regular files. The pinned snapshot supplies the
@@ -467,15 +465,15 @@ mid-construct, as it can while an agent is writing a file.
 ### ValidationReport
 
 A [`ValidationReport`](/docs/protocol/reference#ValidationReport) records one adapter's verdict over a
-session commit or merged tree. It names the language, files checked, adapter diagnostics, and coverage
-of the affected program. Workspace validation policy selects required reports independently of source
+applied snapshot or merged tree. It names the language, files checked, adapter diagnostics, and coverage
+of the affected program. `validation.require` selects required reports independently of source
 ownership. The default requires complete, valid reports from affected adapters that advertise
 validation; a repository can instead list exact `Language` values as fixed gates.
 
 The MCP surface combines those adapter reports with command-validator results produced before
 integration. Its validation strength says whether the result contains mechanical checks, every
 available report, or a fixed required language set. The response carries the evidence, while a
-disposable cache may reuse it only for the same complete Git and execution-policy identity.
+disposable cache may reuse it only for the same complete Git and execution-configuration identity.
 
 ## Operations
 
@@ -519,7 +517,7 @@ family. An agent can request a prefix such as `quickfix` or `refactor.extract`.
 
 `applicability` records how the action was selected. `always` needs no caller-supplied fact before
 resolution. `conditional` exposes a condition outside the adapter's knowledge.
-`speculative` records inferred intent. Every resulting session commit still passes adapter validation.
+`speculative` records inferred intent. Every resulting source snapshot still passes adapter validation.
 
 The descriptor lists the guarantees resolution must establish. `syntax_validated` covers parsing;
 `bindings_preserved` covers unchanged references; `references_updated` covers references that should
@@ -558,7 +556,7 @@ An `OperationEffect` explains the semantic consequence of exact edits: a declara
 removed, moved, or changed; references or imports were updated; source was rewritten; or formatting
 ran. `GuaranteeEvidence` then states the scope, verifier, method, and diagnostics for one advertised
 guarantee. These records let a change result show why an action is admissible without replacing the
-concrete `Edit` values that determine the committed tree.
+concrete `Edit` values that determine the applied tree.
 
 Commit reversion stays on the MCP seam because it is a request envelope over versioning and edits. The
 `revert` tool selects an exact commit, its parent, and eligible paths. Rift computes a three-way
@@ -569,18 +567,19 @@ operation.
 
 An action or match points into one snapshot, and after the source moves its byte offsets can be stale.
 Both are therefore identified by a URI that carries the snapshot they were computed against, which
-Rift checks before applying anything addressed at one.
+Rift checks before applying anything addressed at one. The URI itself does not pin that snapshot.
 
 A [`MatchId`](/docs/protocol/reference#MatchId) is `rift://match/` followed by base64url of the
 snapshot, the matched span, and the complete `MatchQuery`, in RFC 8785 canonical JSON. One query
-produces at most one match for a given span, so those three fields identify the match, and because
-they travel in the identity Rift stores nothing: the same URI still resolves after a restart, and
-reading it returns the query that found it.
+produces at most one match for a given span, so those three fields identify the match. Rift stores
+nothing for the id: the same URI can be decoded after restart, but resolution returns
+`snapshot_not_found` if its snapshot has become unpinned and collectible.
 
 An [`ActionOfferId`](/docs/protocol/reference#ActionOfferId) is `rift://action/` followed by base64url
 of the snapshot, the language whose adapter minted the offer, and an opaque adapter token. The
 language selects the adapter, and the token binds its handle and adapter generation. Reading the URI
-returns the offer with the JSON Schema of the arguments it takes.
+returns the offer while both snapshot and adapter state remain live; otherwise it returns
+`snapshot_not_found` or `stale_action`.
 
 The `ActionDescriptor` carries the target once. Keeping it out of the identity prevents two target
 fields from disagreeing.

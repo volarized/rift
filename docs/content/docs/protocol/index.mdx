@@ -2,159 +2,110 @@
 title: Protocol
 ---
 
-Rift uses JSON Schema at the agent boundary and Protobuf messages between its own processes. The
-protocol fixes the conversion between those representations and the gRPC method each request calls.
+Rift has three typed seams:
 
-Which processes exist and how they find each other is on the
-[architecture page](/docs/architecture). This page is about what they say to each other:
+- `rift.mcp.Rift` serves agent tools, resources, sessions, filesystem projections, changes,
+  integration, execution, and recovery.
+- `rift.adapter.Adapter` lets language processes analyze and validate exact mounted snapshots.
+- `rift.scip.Index` exports one exact snapshot as a canonical SCIP stream.
 
-| caller | callee | interface | transport | definition |
-| --- | --- | --- | --- | --- |
-| agent | `rift mcp` | [MCP](https://modelcontextprotocol.io/specification/latest) tools and resources | JSON-RPC over stdio | `mcp.json` |
-| `rift mcp` | `rift server` | `rift.mcp.Rift` | gRPC over a Unix socket | `rift/mcp.proto` |
-| SCIP client | `rift server` | `rift.scip.Projection` | gRPC | `rift/scip.proto`, `scip/scip.proto` |
-| `rift server` | adapter | `rift.adapter.Adapter` | gRPC over a Unix socket | `rift/adapter.proto` |
-
-The Rift server speaks gRPC. `rift mcp` parses agent JSON and carries values that require exact JSON
-semantics as canonical UTF-8 bytes across that boundary.
+All three share `rift.core` identities. The source Pydantic models generate the JSON Schemas,
+Protobuf descriptors, public surface metadata, and this site's reference.
 
 ## Negotiation
 
-The workspace lease exposes the active protocol major before a client opens
-`.rift/run/server.sock`. When the major differs, the launcher returns `unsupported_protocol` without
-sending bytes that the server may decode under another schema. A free lease makes stale owner bytes
-irrelevant and lets the new server claim the stable socket.
+The workspace lease exposes the protocol major before a client opens the version-independent local
+socket. `Connect` sends supported `Contract` values in preference order. A contract matches only when
+major, minor, and schema digest all agree. The digest covers the generated descriptor and MCP
+conversion metadata, so equal numbers with different wire shapes are incompatible.
 
-For a compatible major, every server-side gRPC client calls the server-streaming `Connect` method
-before another RPC. Its request contains supported contracts in preference order. Each contract has a
-major, an additive minor, and the SHA-256 digest of the generated descriptor and MCP conversion
-metadata. The server selects an exact tuple and returns the optional features both peers implement.
-Equal version numbers with different digests are incompatible.
+The accepted control stream returns a connection id. Every later gRPC call carries it in
+`rift-connection-id` metadata. Local peer identity and the workspace lease provide the same-user trust
+boundary.
 
-The first `ConnectionEvent` contains the selected contract and canonical workspace path. For an MCP
-role it also echoes the client-generated session ID, returns the commit held by that session's Git
-ref, and names its registered worktree when one exists. A random connection ID identifies later
-RPCs. The control stream remains open while the logical connection exists; closing or superseding it
-releases resources owned by that connection.
-Later RPCs carry the connection ID in `rift-connection-id` gRPC metadata. A missing ID is
-`invalid_request`, and an unknown or closed ID is `resource_not_found` before repository work begins.
+## Source identities
 
-An MCP client generates a random session ID before it connects. The server creates the corresponding
-Git ref when it is absent and attaches when the ref already exists. The ref pins the configured base
-commit, which is enough for reads and gives the first change its `expected_head`. Rift creates the
-registered session worktree when that first change reaches mutation. Reconnecting with the same ID
-therefore reaches the same ref and receives a fresh connection ID whether or not a worktree has been
-materialized.
+The core model separates three concerns:
 
-A SCIP role creates no session. It uses the returned connection ID when calling
-`rift.scip.Projection.Read`. Local socket peer identity supplies the same-user trust boundary for both
-roles.
+| Type | Meaning |
+| --- | --- |
+| `SnapshotId` | content address of a complete immutable store tree |
+| `ProjectionHead` | fresh opaque current-state token used for compare-and-swap |
+| `Projection` | stable mounted namespace identity |
+| `GitCommit` | Git object id used for history, gitlinks, and publication |
 
-The server starts an adapter with the reserved `RIFT_PROTOCOL_MAJOR` environment value. An adapter
-that does not implement that major exits before binding its private socket. `Describe` reports the
-generated minor-and-digest tuples it supports, and the server passes the selected tuple to `Open`.
-The server computes the adapter executable digest itself for cache identity and diagnostics.
+`ProjectionState` combines the projection id, token, exact current snapshot, one pinned Git-backed
+base, and dirty flag. It contains no parent or sequence history.
 
-## Conversion
+Tool selectors use tagged `Revision` values for Git, snapshot, or current projection state. Resource
+URIs use the corresponding `git:`, `snapshot:`, and `projection:` scalar namespaces. Omission in an
+MCP session selects that session's current projection.
 
-`rift mcp` validates the agent's JSON against `mcp.json`, converts typed fields to the Protobuf type
-the schema names, and calls the gRPC method the same entry names. The response follows the selected
-contract back to JSON.
+## MCP seam
 
-```json
-"tree": { "rpc": "rift.mcp.Rift/Tree", "params": … , "result": … }
+The MCP process translates stdio JSON to one application RPC at a time on the workspace server. It
+does not own source or Git state. The server returns the session's persistent mounted projection at
+connection time.
+
+Discovery reads exact snapshots. Mechanical operations use store trees. Semantic operations open an
+adapter against a filesystem projection. Bounded cursors and diff links pin the state they require;
+self-contained matches and offers do not.
+
+Every mutation compares an exact `ProjectionState`, resolves and validates in a private
+copy-on-write candidate, and swaps the public projection in one store transaction. Filesystem writes
+use the same current-state model. Neither path creates Git history.
+
+`rift://fs` exposes live projection paths and current states. `projection_open` and
+`projection_close` provide explicit read-only mounts for historical Git commits or retained
+snapshots. `projection_restore` discards reviewed unintegrated source.
+
+Integration squash-merges the exact current projection from its base and writes at most one Git
+commit. Unresolved integration creates an exceptional conventional Git recovery worktree;
+`recovery_list`, `recovery_continue`, and `recovery_abort` are the only protocol operations over it.
+
+See [MCP](/docs/protocol/mcp) for lifecycle details and the
+[reference](/docs/protocol/reference) for every field.
+
+## Adapter seam
+
+The server starts one configured adapter process per exact language and calls `Describe` once. An
+adapter state names a Rift projection, exact snapshot, and adapter-local generation. `Open` also
+provides the mounted root and native `state_root` for generated output.
+
+Adapters read source through ordinary filesystem APIs. They return semantic facts and typed edits;
+they never write public source as an RPC side effect. Candidate projections isolate formatting,
+resolution, and validation from the public session until the final compare-and-swap.
+
+No store or projection lock is held across adapter calls because adapters re-enter the server through
+the mount. See [Adapter](/docs/protocol/adapter).
+
+## SCIP seam
+
+A SCIP client connects with the read-only role and calls `rift.scip.Index.Read`. The request selects
+one exact Rift snapshot. The server streams one header, canonical documents, and canonical external
+symbols. SCIP is an export projection of semantic facts; “filesystem projection” always refers to the
+mounted namespaces under `.rift/projections`.
+
+See [SCIP](/docs/protocol/scip).
+
+## Generated artifacts
+
+The source model lives under `protocol/src/rift/models`. Generation writes:
+
+```text
+protocol/mcp.json
+protocol/rift.schema.json
+protocol/rift/core.proto
+protocol/rift/mcp.proto
+protocol/rift/adapter.proto
+protocol/rift/scip.proto
 ```
 
-Every JSON definition carries its Protobuf identity in `rift:proto` metadata, so the converter reads
-the mapping out of the schema it already loaded. That generated metadata is the sole operation
-mapping.
-
-Fields shaped by an advertised JSON Schema use a `CanonicalJson` message containing `rift-json/1`
-UTF-8 bytes and their SHA-256 digest. This applies to action arguments, extension values, filter
-literals, and schemas carried as values. At the MCP boundary each such value is JSON text inside a
-JSON string, so the outer JSON-RPC parser never converts an inner number to a host floating-point
-value.
-
-`rift-json/1` rejects duplicate object keys, sorts keys by Unicode scalar value, uses minimal JSON
-string escaping, and preserves array order. It parses a number into an arbitrary-precision sign,
-integer coefficient, and decimal exponent. Zero encodes as `0`; every other number strips coefficient
-zeros and encodes as `[minus]<coefficient>e<exponent>`. Thus `1`, `1.0`, and `10e-1` all encode as
-`1e0`, while `1152921504606846977` remains `1152921504606846977e0`.
-
-The receiver checks canonical form and the digest before it parses the value. This custom number rule
-is necessary because `google.protobuf.Value` stores every number as a double, and RFC 8785 likewise
-canonicalizes numbers through IEEE-754 binary64; either would lose the integer in the example.
-
-The generated metadata assigns each tool to the phase where a caller uses it. The
-[MCP page](/docs/protocol/mcp) renders those groups from the same metadata as the tool manifest, while
-the repository resource reports which members the current workspace serves.
-
-Tool parameters carry Git object IDs where a completed change already exists. Change tools require
-the session head they expect, while `act` resolves an `ActionOfferId`; portable refactors locate their
-target with an `Address`.
-
-The manifest omits retained plan records. Action discovery keeps descriptors and per-offer argument
-schemas behind resources until the caller chooses one. Recursive search predicates use the versioned
-`rql/1` string grammar advertised by the repository resource; this keeps the recursive filter closure
-out of every self-contained MCP input schema. Structural patterns remain adapter-owned strings with
-their grammar version reported per language.
-
-`tools/list` contains only tools admitted by the effective profile, adapter capabilities, validation
-policy, and host grants. A policy or adapter-generation change sends `tools_changed` on the control
-stream; `rift mcp` translates that event into `notifications/tools/list_changed`. Clients that never
-enable execution or semantic edits never load those schemas.
-
-## Compatibility checks
-
-The release gate compiles every Protobuf file, validates each JSON Schema, and compares the generated
-descriptor set and MCP schema with the latest released contract:
+Run the check from `protocol/`:
 
 ```sh
 uv run python -m rift.generate --check
-uv run python -m unittest discover -s tests -v
-buf breaking --against '.git#tag=<latest-protocol-tag>'
 ```
 
-The source model generates the current contract. The release gate applies the breaking-change check
-while the major remains unchanged. A newly required field, changed default, narrowed accepted value,
-or changed operation meaning increments the major even when Protobuf itself would decode it. Released
-schemas carry the contracts shipped earlier.
-
-## The SCIP seam
-
-A SCIP client calls `rift.scip.Projection.Read` on the server directly. The server-streaming method
-returns a header followed by official SCIP records. It has no MCP URI and no JSON envelope, and MCP
-tools neither advertise it nor carry its records.
-
-Rift pins
-[SCIP v0.9.0](https://github.com/scip-code/scip/blob/v0.9.0/scip.proto), whose schema fixes every
-field number, alias and oneof membership those records use.
-
-## The adapter seam
-
-The server calls each adapter process through `rift.adapter.Adapter`. The server first resolves the
-requested revision and reuses or allocates a worktree representing that exact snapshot. `Open` gives
-the adapter its path; the adapter selects any revision-appropriate runtime and returns state. Source
-bytes stay on disk, and worktree allocation never crosses the adapter seam.
-
-The exception is source no adapter could open. An adapter that generates input for another language —
-the TypeScript inside a `.svelte` file — sends those bytes over the wire, since there's no path to read
-them from.
-
-Execution uses the same revision-resolution seam with a different lifetime. Rift materializes a
-disposable execution workspace for the exact `Snapshot`, opens a fresh `AdapterState`, and sends the
-caller-provided `CodeBlock` over gRPC. `Execute` removes that state after one result. `DebugStart`
-retains it behind a connection-bound public handle until `DebugStop`; `DebugGetFrame` reads one
-adapter-retained stack frame. Host policy supplies an `ExecutionBudget` or `DebugBudget` on the
-starting adapter call, and the server maps the public handle to a private `DebugSessionKey`.
-Repository writes made by evaluated code are discarded with the workspace.
-
-## Definitions
-
-The definitions split where a process boundary changes ownership:
-
-- [Core model](/docs/protocol/core) — entities shared by server services and adapters
-- [MCP](/docs/protocol/mcp) — tools and resources provided to an agent
-- [SCIP](/docs/protocol/scip) — export of retained facts as a SCIP index
-- [Adapter](/docs/protocol/adapter) — the gRPC service through which the server calls adapters
-- [Reference](/docs/protocol/reference) — shared and seam types, grouped by axis
+The generated reference is normative for field names and wire types. The mechanism pages define the
+transaction, lifetime, recovery, and filesystem rules those fields participate in.

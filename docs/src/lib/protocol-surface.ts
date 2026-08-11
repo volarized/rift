@@ -196,17 +196,6 @@ const readFamilies = (readItems?.oneOf ?? []).flatMap((branch) => {
 });
 assertSameFamilies("ResourceReadResult", readFamilies);
 
-const advertisedTools =
-  shape(repositoryProperties.tools?.items)?.enum?.filter(
-    (value): value is string => typeof value === "string",
-  ) ?? [];
-const toolNames = mcpTools.map((tool) => tool.name).sort();
-if (toolNames.join("\0") !== [...advertisedTools].sort().join("\0")) {
-  throw new Error(
-    `RepositoryResourcePayload.tools are [${advertisedTools.join(", ")}], expected [${toolNames.join(", ")}]`,
-  );
-}
-
 // ---------------------------------------------------------------------------
 // The reference, grouped by axis and nested by reference
 // ---------------------------------------------------------------------------

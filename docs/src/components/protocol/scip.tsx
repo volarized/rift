@@ -101,9 +101,7 @@ function MessageFields({ message }: { message: ProtoMessage }): ReactNode {
                 </code>
               )}
             </td>
-            <td>
-              {field.comment ? <Prose text={field.comment} resolve={resolveScip} /> : "—"}
-            </td>
+            <td>{field.comment ? <Prose text={field.comment} resolve={resolveScip} /> : "—"}</td>
           </tr>
         ))}
       </tbody>

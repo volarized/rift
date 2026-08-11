@@ -21,8 +21,8 @@ export function McpReference(): ReactNode {
         Tools
       </h2>
       <p>
-        Tools work on the default branch unless you pass a <code>rev</code>, and each reports the
-        revision it actually resolved to.
+        Source-discovery tools read the current session unless you pass a <code>rev</code>, and each
+        reports the snapshot it resolved to.
       </p>
 
       {mcpToolGroups.map((group) => (
@@ -54,7 +54,10 @@ export function McpReference(): ReactNode {
       <h2 id="resources" className="scroll-m-28">
         Resources
       </h2>
-      <p>Read a resource by URI. The URI carries its revision, so a copied link keeps its state.</p>
+      <p>
+        Read a resource by URI. An omitted <code>rev</code> selects the current session; a URI that
+        carries one keeps the selected repository state.
+      </p>
 
       {mcpResources.map((resource) => (
         <section key={resource.name}>

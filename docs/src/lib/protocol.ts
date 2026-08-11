@@ -84,7 +84,10 @@ export const defNamesByFile = Object.fromEntries(
   PROTOCOL_FILES.map((file) => [
     file,
     Object.entries(document.$defs)
-      .filter(([, schema]) => (schema as Schema & { "rift:package"?: string })["rift:package"] === `rift.${file}`)
+      .filter(
+        ([, schema]) =>
+          (schema as Schema & { "rift:package"?: string })["rift:package"] === `rift.${file}`,
+      )
       .map(([name]) => name),
   ]),
 ) as Record<ProtocolFile, string[]>;
@@ -347,7 +350,9 @@ while (pending.length > 0) {
 }
 const unreachable = defNames.filter((name) => !reachable.has(name));
 if (unreachable.length > 0) {
-  throw new Error(`protocol definitions do not reach a seam or projection: ${unreachable.join(", ")}`);
+  throw new Error(
+    `protocol definitions do not reach a seam or projection: ${unreachable.join(", ")}`,
+  );
 }
 
 /**
