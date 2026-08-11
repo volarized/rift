@@ -268,13 +268,13 @@
           "$ref": "#/$defs/ResourceLink"
         }
       },
-      "root": {
+      "projection": {
         "description": "Returns the filesystem path of this session's projection, for tools that can only work through a directory.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
         "uri": {
-          "$ref": "#/$defs/RootResourceUri"
+          "$ref": "#/$defs/ProjectionResourceUri"
         },
         "link": {
           "$ref": "#/$defs/ResourceLink"
@@ -8660,6 +8660,55 @@
       "title": "ProjectPath",
       "type": "string"
     },
+    "ProjectionResourcePayload": {
+      "additionalProperties": false,
+      "description": "Where this session's projection lives on the filesystem. Adapters receive the tree they\nanalyze over the adapter protocol; a caller that has to reach the projection through an\nordinary filesystem tool reads it here.",
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/ProjectionResourceUri",
+          "description": "The URI this payload answers for.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "path": {
+          "$ref": "#/$defs/WorkspacePath",
+          "description": "Absolute path of the projection directory. Rift places it at `.rift/projections/<session>` below the workspace and keeps it there for the session's life. Reading this resource materializes a projection that has not diverged yet, because a tool pointed here may write and those writes belong to the changeset. Session removal deletes the directory without waiting for a process that is still working inside it.",
+          "rift:proto": {
+            "number": 2
+          }
+        },
+        "workspace": {
+          "$ref": "#/$defs/WorkspacePath",
+          "description": "Absolute path of the workspace this projection was taken from.",
+          "rift:proto": {
+            "number": 3
+          }
+        }
+      },
+      "required": [
+        "uri",
+        "path",
+        "workspace"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.ProjectionResourcePayload"
+      },
+      "title": "ProjectionResourcePayload",
+      "type": "object"
+    },
+    "ProjectionResourceUri": {
+      "description": "The session's projection directory on this host. The name is deliberate: MCP's own\n`roots` capability runs the other way, a client granting a server directories, so this\nresource does not call itself a root.",
+      "pattern": "^rift://projection$",
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "package": "rift.mcp",
+        "scalar": "string"
+      },
+      "title": "ProjectionResourceUri",
+      "type": "string"
+    },
     "ProjectionRestoreParams": {
       "additionalProperties": false,
       "description": "Restores changed paths from the current workspace.",
@@ -9581,7 +9630,7 @@
         "application/vnd.rift.actions+json": "ActionsResourcePayload",
         "application/vnd.rift.changes+json": "ChangesResourcePayload",
         "application/vnd.rift.fs+json": "FsResourcePayload",
-        "application/vnd.rift.root+json": "RootResourcePayload",
+        "application/vnd.rift.projection+json": "ProjectionResourcePayload",
         "application/vnd.rift.symbol+json": "SymbolResourcePayload",
         "application/vnd.rift.workspace+json": "WorkspaceResourcePayload"
       },
@@ -9600,7 +9649,7 @@
         "fs",
         "actions",
         "action",
-        "root",
+        "projection",
         "changes"
       ],
       "rift:enumDescriptions": {
@@ -9608,7 +9657,7 @@
         "actions": "The fixes and refactors an adapter offers at one address, or across one file.",
         "changes": "The changes this session has made, and what vouched for each.",
         "fs": "One directory page or file-content range.",
-        "root": "Where this session's projection lives on the filesystem.",
+        "projection": "Where this session's projection lives on the filesystem.",
         "symbol": "One symbol, its nodes, its edges and its diagnostics.",
         "workspace": "Workspace capabilities, projection state, and request limits."
       },
@@ -9633,8 +9682,8 @@
             "name": "RESOURCE_FAMILY_FS",
             "number": 3
           },
-          "root": {
-            "name": "RESOURCE_FAMILY_ROOT",
+          "projection": {
+            "name": "RESOURCE_FAMILY_PROJECTION",
             "number": 6
           },
           "symbol": {
@@ -9725,7 +9774,7 @@
               "$ref": "#/$defs/ActionResourceUri"
             },
             {
-              "$ref": "#/$defs/RootResourceUri"
+              "$ref": "#/$defs/ProjectionResourceUri"
             },
             {
               "$ref": "#/$defs/ChangesResourceUri"
@@ -9973,55 +10022,6 @@
         }
       },
       "title": "RewriteRange",
-      "type": "string"
-    },
-    "RootResourcePayload": {
-      "additionalProperties": false,
-      "description": "Where this session's projection lives on the filesystem. Adapters receive the tree they\nanalyze over the adapter protocol; a caller that has to reach the projection through an\nordinary filesystem tool reads it here.",
-      "properties": {
-        "uri": {
-          "$ref": "#/$defs/RootResourceUri",
-          "description": "The URI this payload answers for.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "path": {
-          "$ref": "#/$defs/WorkspacePath",
-          "description": "Absolute path of the projection directory. Rift places it at `.rift/projections/<session>` below the workspace and keeps it there for the session's life. Reading this resource materializes a projection that has not diverged yet, because a tool pointed here may write and those writes belong to the changeset. Session removal deletes the directory without waiting for a process that is still working inside it.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
-        "workspace": {
-          "$ref": "#/$defs/WorkspacePath",
-          "description": "Absolute path of the workspace this projection was taken from.",
-          "rift:proto": {
-            "number": 3
-          }
-        }
-      },
-      "required": [
-        "uri",
-        "path",
-        "workspace"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.RootResourcePayload"
-      },
-      "title": "RootResourcePayload",
-      "type": "object"
-    },
-    "RootResourceUri": {
-      "description": "The session's projection directory on this host.",
-      "pattern": "^rift://root$",
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "package": "rift.mcp",
-        "scalar": "string"
-      },
-      "title": "RootResourceUri",
       "type": "string"
     },
     "SafeDeleteArguments": {

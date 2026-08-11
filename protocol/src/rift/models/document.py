@@ -299,13 +299,13 @@ DOCUMENT = Document(
             link=mcp.ResourceLink,
         ),
         Resource(
-            name="root",
+            name="projection",
             description=(
                 "Returns the filesystem path of this session's projection, for tools that can "
                 "only work through a directory."
             ),
             template=mcp.ResourceTemplate,
-            uri=mcp.RootResourceUri,
+            uri=mcp.ProjectionResourceUri,
             link=mcp.ResourceLink,
         ),
         Resource(

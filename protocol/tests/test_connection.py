@@ -140,17 +140,17 @@ class ProjectionContractTests(TestCase):
         with self.assertRaises(ValidationError):
             mcp.FsResourceUri.model_validate("rift://fs/a.txt?rev=git:HEAD")
 
-    def test_root_resource_addresses_the_projection_directory(self) -> None:
-        payload = mcp.RootResourcePayload(
-            uri="rift://root",
+    def test_projection_resource_addresses_the_projection_directory(self) -> None:
+        payload = mcp.ProjectionResourcePayload(
+            uri="rift://projection",
             path="/workspace/.rift/projections/" + SESSION,
             workspace="/workspace",
         )
 
-        self.assertEqual(payload.uri.root, "rift://root")
+        self.assertEqual(payload.uri.root, "rift://projection")
         self.assertTrue(payload.path.root.endswith(SESSION))
         with self.assertRaises(ValidationError):
-            mcp.RootResourceUri.model_validate("rift://root/src")
+            mcp.ProjectionResourceUri.model_validate("rift://projection/src")
 
     def test_filesystem_resource_reads_directories(self) -> None:
         root = core.ProjectEntry.model_validate({"kind": "directory", "path": ""})
@@ -178,10 +178,10 @@ class ProjectionContractTests(TestCase):
         self.assertNotIn("ProjectionOpen", methods)
         self.assertNotIn("ProjectionClose", methods)
 
-    def test_root_and_changes_are_advertised_resources(self) -> None:
+    def test_projection_and_changes_are_advertised_resources(self) -> None:
         resources = {resource.name for resource in DOCUMENT.resources}
 
-        self.assertIn("root", resources)
+        self.assertIn("projection", resources)
         self.assertIn("changes", resources)
 
 

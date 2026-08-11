@@ -69,8 +69,8 @@ the agent's next read — and every clean session shares that one view, which is
 second session on a large monorepo isn't a second checkout.
 
 The projection materializes the moment a session needs somewhere of its own: the first change it
-applies, or the first read of `rift://root`, which hands the directory to a tool whose writes have
-to land in the changeset. Even then it stays a live view. Only a changed path detaches and keeps
+applies, or the first read of `rift://projection`, which hands the directory to a tool whose
+writes have to land in the changeset. Even then it stays a live view. Only a changed path detaches and keeps
 the session's version; everything around it carries on tracking the workspace, and changing a
 directory covers everything beneath it. Materializing a projection and restoring a clean one cost
 what the changed data costs, not what the repository costs.
@@ -87,8 +87,8 @@ real directory, and Rift puts it at a predictable place below the workspace:
 
 Adapters analyze whichever tree the server opened their state on — the workspace itself while the
 session is clean, the projection once it materializes — and receive that absolute path over the
-adapter protocol. Anything else reads the projection's path from the `rift://root` resource, which
-also names the workspace it came from. That read is the second materialization trigger: a tool
+adapter protocol. Anything else reads the projection's path from the `rift://projection` resource,
+which also names the workspace it came from. That read is the second materialization trigger: a tool
 pointed at the directory may write, and those writes have to land in the changeset rather than in
 your files. The path stays put for the session's life, so a shell you `cd` into keeps working
 across a server restart. Removing the session deletes the directory without waiting for whatever

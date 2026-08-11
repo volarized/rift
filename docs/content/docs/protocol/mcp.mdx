@@ -43,7 +43,7 @@ Resources carry the larger and reusable payloads:
 | Resource | Content |
 | --- | --- |
 | `rift://workspace{?cursor}` | projection state, per-language capabilities, limits, and validators |
-| `rift://root` | the projection's path on disk, and the workspace it came from |
+| `rift://projection` | the projection's path on disk, and the workspace it came from |
 | `rift://changes{?cursor}` | every change this session applied, with its evidence |
 | `rift://fs{/path}{?start,length,cursor}` | a directory's entries — subdirectories and files — or a bounded range of file bytes |
 | `rift://symbol/{language}/{name}{?cursor}` | one symbol, its nodes, its edges, its diagnostics |
@@ -61,7 +61,8 @@ captured result set, which comes back as `cursor_expired` rather than a quietly 
 <Callout>
 MCP's `roots` capability runs the other way: a client tells a server which directories it may work
 in. That's why the projection path is a Rift resource rather than a root — a server has no way to
-advertise one.
+advertise one — and why the resource is named `rift://projection`, so the two ideas never share a
+word.
 </Callout>
 
 ## Changes

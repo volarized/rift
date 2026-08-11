@@ -20,7 +20,7 @@ enum ResourceFamily {
   // One discovered action, with the schema of the arguments it takes.
   RESOURCE_FAMILY_ACTION = 5;
   // Where this session's projection lives on the filesystem.
-  RESOURCE_FAMILY_ROOT = 6;
+  RESOURCE_FAMILY_PROJECTION = 6;
   // The changes this session has made, and what vouched for each.
   RESOURCE_FAMILY_CHANGES = 7;
 }
@@ -527,7 +527,7 @@ message WorkspaceResourcePayload {
     // One discovered action, with the schema of the arguments it takes.
     RESOURCE_FAMILY_ACTION = 5;
     // Where this session's projection lives on the filesystem.
-    RESOURCE_FAMILY_ROOT = 6;
+    RESOURCE_FAMILY_PROJECTION = 6;
     // The changes this session has made, and what vouched for each.
     RESOURCE_FAMILY_CHANGES = 7;
   }
@@ -556,7 +556,7 @@ message WorkspaceResourcePayload {
 // Where this session's projection lives on the filesystem. Adapters receive the tree they
 // analyze over the adapter protocol; a caller that has to reach the projection through an
 // ordinary filesystem tool reads it here.
-message RootResourcePayload {
+message ProjectionResourcePayload {
   // The URI this payload answers for.
   string uri = 1;
   // Absolute path of the projection directory. Rift places it at `.rift/projections/<session>`
@@ -1046,7 +1046,7 @@ message ResourceLink {
     // One discovered action, with the schema of the arguments it takes.
     RESOURCE_FAMILY_ACTION = 5;
     // Where this session's projection lives on the filesystem.
-    RESOURCE_FAMILY_ROOT = 6;
+    RESOURCE_FAMILY_PROJECTION = 6;
     // The changes this session has made, and what vouched for each.
     RESOURCE_FAMILY_CHANGES = 7;
   }
@@ -1076,7 +1076,7 @@ message ResourceTemplate {
     // One discovered action, with the schema of the arguments it takes.
     RESOURCE_FAMILY_ACTION = 5;
     // Where this session's projection lives on the filesystem.
-    RESOURCE_FAMILY_ROOT = 6;
+    RESOURCE_FAMILY_PROJECTION = 6;
     // The changes this session has made, and what vouched for each.
     RESOURCE_FAMILY_CHANGES = 7;
   }

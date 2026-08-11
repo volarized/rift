@@ -940,10 +940,12 @@ class WorkspaceResourceUri(ProtocolRoot):
     owner=MCP,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^rift://root$",
+    pattern=r"^rift://projection$",
 )
-class RootResourceUri(ProtocolRoot):
-    """The session's projection directory on this host."""
+class ProjectionResourceUri(ProtocolRoot):
+    """The session's projection directory on this host. The name is deliberate: MCP's own
+    `roots` capability runs the other way, a client granting a server directories, so this
+    resource does not call itself a root."""
 
 
 @scalar(
@@ -1043,7 +1045,7 @@ class FsResourceUri(ProtocolRoot):
             EnumValue("fs", "RESOURCE_FAMILY_FS", 3),
             EnumValue("actions", "RESOURCE_FAMILY_ACTIONS", 4),
             EnumValue("action", "RESOURCE_FAMILY_ACTION", 5),
-            EnumValue("root", "RESOURCE_FAMILY_ROOT", 6),
+            EnumValue("projection", "RESOURCE_FAMILY_PROJECTION", 6),
             EnumValue("changes", "RESOURCE_FAMILY_CHANGES", 7),
         ),
         named=True,
@@ -1055,7 +1057,7 @@ class FsResourceUri(ProtocolRoot):
             "fs": "One directory page or file-content range.",
             "actions": "The fixes and refactors an adapter offers at one address, or across one file.",
             "action": "One discovered action, with the schema of the arguments it takes.",
-            "root": "Where this session's projection lives on the filesystem.",
+            "projection": "Where this session's projection lives on the filesystem.",
             "changes": "The changes this session has made, and what vouched for each.",
         }
     },
@@ -1068,7 +1070,7 @@ class ResourceFamily(str, Enum):
     FS = "fs"
     ACTIONS = "actions"
     ACTION = "action"
-    ROOT = "root"
+    PROJECTION = "projection"
     CHANGES = "changes"
 
 
@@ -1125,12 +1127,12 @@ class WorkspaceResourcePayload(ClosedModel):
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class RootResourcePayload(ClosedModel):
+class ProjectionResourcePayload(ClosedModel):
     """Where this session's projection lives on the filesystem. Adapters receive the tree they
     analyze over the adapter protocol; a caller that has to reach the projection through an
     ordinary filesystem tool reads it here."""
 
-    uri: Field[RootResourceUri] = proto_field(
+    uri: Field[ProjectionResourceUri] = proto_field(
         description="The URI this payload answers for.", number=1
     )
     path: Field[WorkspacePath] = proto_field(
@@ -2039,10 +2041,10 @@ RESOURCE_FORMS: dict[ResourceFamily, tuple[str, str, type[Any]]] = {
         "application/vnd.rift.action+json",
         ActionResourceUri,
     ),
-    ResourceFamily.ROOT: (
-        "rift://root",
-        "application/vnd.rift.root+json",
-        RootResourceUri,
+    ResourceFamily.PROJECTION: (
+        "rift://projection",
+        "application/vnd.rift.projection+json",
+        ProjectionResourceUri,
     ),
     ResourceFamily.CHANGES: (
         "rift://changes{?cursor}",
@@ -2126,7 +2128,7 @@ class ResourceReadParams(ClosedModel):
         | FsResourceUri
         | ActionsResourceUri
         | ActionResourceUri
-        | RootResourceUri
+        | ProjectionResourceUri
         | ChangesResourceUri
     ] = proto_field(
         description="A URI matching one advertised resource family.",
@@ -2146,7 +2148,7 @@ class ResourceReadParams(ClosedModel):
             "application/vnd.rift.fs+json": "FsResourcePayload",
             "application/vnd.rift.actions+json": "ActionsResourcePayload",
             "application/vnd.rift.action+json": "ActionResourcePayload",
-            "application/vnd.rift.root+json": "RootResourcePayload",
+            "application/vnd.rift.projection+json": "ProjectionResourcePayload",
             "application/vnd.rift.changes+json": "ChangesResourcePayload",
         }
     },
@@ -3165,12 +3167,12 @@ MODELS = (
     ExecutionLimits,
     Limits,
     WorkspaceResourceUri,
-    RootResourceUri,
+    ProjectionResourceUri,
     ChangesResourceUri,
     SymbolResourceUri,
     FsResourceUri,
     WorkspaceResourcePayload,
-    RootResourcePayload,
+    ProjectionResourcePayload,
     SearchResult,
     ActionOffer,
     ActionsResourceUri,
