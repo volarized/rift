@@ -47,15 +47,17 @@ function Section({
   children,
   className,
   wide,
+  tall,
   id,
 }: {
   children: React.ReactNode;
   className?: string;
   wide?: boolean;
+  tall?: boolean;
   id?: string;
 }) {
   return (
-    <section id={id} className={cn("flex scroll-mt-14 items-center", SCREEN)}>
+    <section id={id} className={cn("flex scroll-mt-14 items-center", tall ? HERO : SCREEN)}>
       <Reveal className={cn(wide ? WIDE : SHELL, "grid gap-9 py-16", className)}>{children}</Reveal>
     </section>
   );
@@ -193,7 +195,7 @@ export default function HomePage() {
 
       {/* 7 — the two ways out, against the Aizawa attractor drawn on by the
           scroll and unpicked again on the way back up */}
-      <Section wide className="md:grid-cols-2 md:items-center md:gap-20">
+      <Section wide tall className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
           <Statement className="max-w-125">
             Coming soon, reach out if you want to get involved.
