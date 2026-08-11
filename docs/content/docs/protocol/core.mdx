@@ -2,63 +2,78 @@
 title: Core
 ---
 
-The core schema contains values shared by MCP and language adapters. It describes projection
-concurrency, source structure, semantic facts, and changes.
+The core schema holds the values MCP and the adapter protocol both use: the shape of the
+projection, the structure of source, the semantic facts an adapter resolves, and the changes Rift
+applies.
 
 ## Projection state
 
-`ProjectionHead` is an opaque token for the current session view. `ProjectionState` contains:
+`ProjectionState` is two booleans, because everything else about a projection is paged and there's
+no point copying it into every response:
 
 ```json
 {
-  "head": "ph_…",
-  "dirty": true
+  "dirty": true,
+  "unacknowledged": false
 }
 ```
 
-The head advances whenever the visible projection state changes. Reads use the current session
-projection, and changes carry the head they expect.
+`dirty` says the projection holds something your workspace doesn't. `unacknowledged` says the
+changeset holds a change carrying a confirmation nobody has accepted yet, which is the one thing
+that will stop `publish` on its own. The changes themselves come from the `rift://changes`
+resource.
 
 ## Paths and files
 
 `ProjectPath` is a normalized UTF-8 path relative to the workspace root. It uses `/`, contains no
-`.` or `..` component, and never addresses `.rift`.
+`.` or `..` component, and can't name `.rift` — the projection directory lives under there, and a
+path that could address it would let a change reach Rift's own state.
 
-`ProjectEntry` describes a directory, regular file, or symlink. Regular-file content records size
-and executable mode. Symlink targets are bytes. The filesystem resource carries file bytes as
-UTF-8 or base64 and lists directory entries.
-
-Directories are derived from the path tree. Source changes cover regular files, symlinks, modes,
-and paths.
+`ProjectEntry` is a directory, a regular file or a symlink. A regular file records its size and
+executable bit; a symlink's target travels as base64 because Rift never follows it and can't assume
+the bytes are text. Directories are derived from the path tree rather than stored, so an empty one
+appears when something in the projection creates it.
 
 ## Source locations
 
-`TextRange` uses half-open UTF-8 byte offsets. `SourceSpan` combines a file with a range. `NodeId`,
-`SymbolId`, `MatchId`, and `ActionOfferId` address facts in the session projection.
+`TextRange` is a pair of half-open UTF-8 byte offsets, and `SourceSpan` puts one against a file.
+Byte offsets rather than line and column, because every adapter converts from whatever its own
+toolchain counts in exactly once, at the seam, and after that a `rustc` column and a `tsc` column
+are on the same scale.
 
-Opaque match and action ids are valid only for the projection head that produced them. A later head
-requires discovery again.
+`NodeId`, `SymbolId`, `MatchId` and `ActionOfferId` address facts in the projection. A match or an
+offer names the file it came from, so Rift rechecks that one file before acting on it — a write
+somewhere else in the projection leaves it usable, which matters when a build is running in the
+same directory.
 
 ## Semantic facts
 
-Adapters return:
+Adapters return symbols and the syntax nodes that write them, relationships between symbols,
+signatures and types and documentation, and diagnostics. Each of those is a `FactFamily`, and each
+family comes back with a `Coverage`.
 
-- symbols and syntax nodes;
-- relationships between them;
-- signatures, types, and documentation;
-- diagnostics and coverage.
-
-Coverage distinguishes “nothing matched” from “the adapter could not inspect enough source to
-know.” Consumers must use it when interpreting empty or partial results.
+Coverage is what separates "there is nothing here" from "I couldn't see far enough to tell." A
+symbol with no `relationships` means the symbol has no edges only where that family reported
+`complete`; anywhere else it means the adapter stopped early, and the coverage says why. Read it
+before you read an empty list as an answer.
 
 ## Changes
 
-`Edit` contains source operations such as text replacement, file creation, deletion, and movement.
-Higher-level operations resolve to an atomic edit set plus preconditions, effects, diagnostics, and
-validation evidence.
+An `Edit` is one filesystem effect: replace these bytes, create this file, delete it, move it,
+copy it, flip its executable bit. Edits in one set share one input state, can't overlap, and apply
+together or not at all.
 
-Rift applies the set only while the supplied `ProjectionHead` is current. A successful change
-returns a fresh `ProjectionState`. A semantic refusal is a typed result; transport and
-infrastructure failures use `ErrorData`.
+Higher-level operations resolve down to a set of those, plus the preconditions Rift checked, the
+semantic effects the change had, the diagnostics it produced, and `GuaranteeEvidence` for every
+property the operation claimed.
+
+When resolution yields no edits at all, that's a refusal and the projection is untouched:
+`ambiguous_target`, `cardinality_mismatch`, `unsupported`, and the rest of `RefusalReason`. When it
+yields edits that nothing will vouch for, the change lands carrying a `ConfirmationRequirement` per
+problem — a validator that didn't finish, a reference the adapter couldn't classify, a deletion —
+and `publish` is where those get settled.
+
+Transport and infrastructure failures aren't in either bucket. They're `ErrorData`, with a code, a
+phase, and a retry directive saying whether the same bytes are worth sending again.
 
 The full field definitions are in the generated [reference](/docs/protocol/reference).

@@ -2,24 +2,17 @@
 title: Rift
 ---
 
-import { IsoDiagram } from "@/components/iso-diagram";
+Rift is an agentic development toolkit for reading, discovering and editing codebases. Your agent
+gets a scratchpad copy of your project, works in it through MCP, and merges the result back when
+you're happy with it.
 
-Rift gives an agent a writable projection of any directory. The agent reads and changes code through
-MCP; language adapters provide semantic facts and refactors. When the work is ready, the agent
-publishes its changes into the directory.
+Rift is per se not a complex system, and most of what follows matters if you're implementing
+against the protocol or writing a language adapter. If you want to know how the server actually
+works, take a tour:
 
-<IsoDiagram
-  alt="An agent connects through Rift MCP to a workspace server. The server coordinates Rift FS and language adapters, then publishes projection changes to the workspace."
-  chart={`
-    flowchart LR
-      agent["agent"]:::agent --> mcp["rift mcp"]:::rift
-      mcp --> server["workspace server"]:::rift
-      server --> fs["Rift FS"]:::store
-      server --> adapters["language adapters"]:::adapter
-      fs -- "publish" --> workspace["workspace"]:::store
-  `}
-/>
-
-The [architecture](/docs/architecture) defines the system's target behavior. [Configuration](/docs/configuration)
-controls workspace policy. The [protocol](/docs/protocol) specifies the boundaries used by MCP clients,
-language adapters, and SCIP consumers.
+- Architecture — the processes, what each of them owns, and how a change gets from your agent
+  into your files
+- Configuration — the `rift.toml` keys that shape behaviour, for the server and for language
+  adapters
+- Protocol — the MCP surface in detail, and how a request turns into an adapter call. There's a
+  SCIP-compatible export here too.

@@ -2,27 +2,30 @@
 title: SCIP
 ---
 
-SCIP export streams semantic facts from one session view as a `scip.Index`.
+Rift can export a session's semantic facts as a [SCIP](https://github.com/sourcegraph/scip) index,
+for the tools that already consume one.
 
 ## Request
 
-`Read` receives a `ProjectionHead`. The server reads the corresponding adapter state and emits
-events in canonical SCIP order:
+`Read` names a session, and the server streams that session's projection as it stands: one header,
+then documents in project-path byte order, then external symbols in encoded-symbol order — the
+canonical `scip.Index` order, so a consumer can write the stream straight out.
 
-1. one header;
-2. documents in project-path byte order;
-3. external symbols in encoded-symbol order.
+The read isn't isolated from anything. A `cargo build` writing into the same projection mid-stream
+can leave the index internally inconsistent, and the export won't stop it. This is a fallback
+surface for tools that can't speak MCP, and the right answer to a bad index is to read again.
 
-The header repeats the head, carries SCIP metadata, and reports semantic coverage.
+The header repeats the session, carries the SCIP metadata, and reports coverage per fact family —
+so a consumer can tell an index that's missing relationships from one whose language genuinely has
+none.
 
 ## Mapping
 
-Rift maps source documents, occurrences, symbols, relationships, signatures, and documentation to
-their SCIP equivalents. Paths remain workspace-relative. Source ranges use SCIP line and character
-coordinates after conversion from Rift's UTF-8 byte ranges.
+Documents, occurrences, symbols, relationships, signatures and documentation map onto their SCIP
+equivalents. Paths stay workspace-relative. Ranges convert from Rift's UTF-8 byte offsets to SCIP's
+line and character coordinates.
 
-`Omission` records a populated Rift field that the pinned SCIP schema cannot express. Each entry
-names the field, reason, count, and affected language. This keeps a successful export explicit about
-lost facts.
-
-The stream is read-only and uses the same adapter-derived state as MCP semantic reads.
+Some facts have nowhere to go. `Omission` records each Rift field that was populated and didn't
+make it into the index, with the reason, the count, and the language it came from — either the
+pinned SCIP v0.9.0 schema has no field with that meaning, or the projection contract excludes it.
+A successful export that quietly dropped facts would be worse than one that failed.

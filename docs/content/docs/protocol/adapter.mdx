@@ -2,63 +2,96 @@
 title: Adapter
 ---
 
-A language adapter is a subprocess started by the workspace server. It owns language analysis while
-Rift owns sessions, source state, concurrency, and publication.
+A language adapter is a subprocess the workspace server starts and talks to over gRPC on a Unix
+domain socket. It owns everything about a language; Rift owns sessions, source state, ordering and
+publication, and never guesses at what an adapter can do.
+
+One process serves one exact `Language` — a name plus an optional dialect — and holds state for as
+many projections as its limits allow. Plenty of tools use tree-sitter to collect language facts,
+and LSP is there for operations. The trouble is that tree-sitter reaches only a small subset of the
+facts that matter, and LSP's operations are shaped around what an IDE needs, so an adapter is
+expected to reach for the real toolchain instead.
 
 ## Discovery
 
-Rift calls `Describe` once after starting the process. The response declares:
+Rift calls `Describe` once, right after starting the process, and holds the adapter to exactly what
+comes back. There's no probing and no feature detection anywhere else, which is why the response
+has to be complete:
 
-- the exact language and dialect;
-- source, auxiliary, and write claims;
-- semantic fact families and kinds;
-- supported operations and action families;
-- limits and runtime requirements;
-- compatible generated contracts.
+- the exact language and dialect it handles
+- which files it owns as source, which it reads as configuration or dependency metadata, and which
+  paths it writes to while it works
+- the syntax and symbol kinds it emits, and the portable facets each one carries
+- the optional RPCs it implements and the fact families `Analyze` can produce
+- the action families it can offer, its limits, and what its runtime does to the host
 
-Rift uses these declarations for routing and admission. A capability change requires a new adapter
-process.
+The kinds matter more than they look. A filter can only negate on a facet somebody advertised, so
+an adapter that never declares `test` makes "not a test" unanswerable for its language.
+
+Write claims are how build output stays out of analysis. An adapter naming `target` or
+`node_modules` tells Rift those subtrees are its own output, not source — and two adapters that
+could write the same path is a workspace admission error, because one of them has to redirect that
+output into its private `state_root` instead.
+
+Capabilities are fixed for the process's life. Changing them means a new process.
 
 ## State
 
-`Open` gives the adapter a Rift FS path and its current `ProjectionHead`. The adapter returns an
-`AdapterState` for later calls. Several adapters may analyze the same projection.
+`Open` hands the adapter an absolute path to a projection, plus a `state_root` of its own that Rift
+never reads — that's where `CARGO_TARGET_DIR` and friends should point. Every open state gets a
+distinct `state_root` and Rift never reuses one after `Close`. Several adapters can be given the
+same projection path at once, because a Svelte file and the TypeScript inside it are two adapters
+reading one tree.
 
-After a source change, `Refresh` advances the adapter to the new head and carries the changed files.
-Rift serializes refreshes for one adapter state. A stale call returns the adapter's actual state so
-the server can refresh before retrying.
+The returned `AdapterState` is a generation counter, and that's the whole of its identity. `Open`
+mints the first value; `Refresh` and `SyncVirtual` advance it; a call carrying an older generation
+comes back as `StaleState` with the value the adapter actually holds, so the server resyncs and
+retries rather than acting on offsets that have moved.
 
-`Close` releases the adapter state. Adapter indexes and caches are rebuildable.
+`Refresh` is what tells an adapter its files changed, and it carries the paths — `written` and
+`removed`, with a rename arriving as one of each. Without that the adapter would have to stat the
+tree to find out what happened, and rebuilding its state per edit would throw away the incremental
+work that makes it fast. Rift serializes refreshes for one adapter state.
 
-Virtual documents use `VirtualSync` events. Each event names its owning source unit and mappings
-back to source ranges. Rift keeps virtual paths in a separate namespace.
+An adapter that produces source for another language publishes it through `VirtualSync`. Each event
+names the unit it belongs to and the mappings back to the ranges it came from, so a diagnostic on
+generated TypeScript can be pointed at the Svelte a person can actually edit. Rift keeps those
+paths in a namespace of their own.
 
 ## Analysis
 
-`Analyze` streams facts for requested source units. Events carry symbols, nodes, relationships,
-diagnostics, origin mappings, and coverage. A final summary reports the complete coverage of that
-analysis.
+`Analyze` streams facts for the requested source units: symbols, nodes, relationships, origin
+mappings, diagnostics, and a per-file coverage event that closes each one. A final summary closes
+the stream, states how long Rift may keep the facts, and lists files whose earlier facts no longer
+hold — which is the only way to invalidate a file the stream said nothing about.
 
-Claims decide which adapter owns a source file. Auxiliary claims add supporting files. Write claims
-bound the files an operation may change.
+Every family is stated explicitly per file. A family the adapter can't produce is `unsupported`,
+one the language has no concept of is `not_applicable`, and neither is spelled as silence, because
+a caller reading silence as "none" would be wrong.
 
 ## Changes
 
-The server asks the adapter to:
+For a change, the server asks the adapter to validate the affected source closure, format the
+regions or files a change touched, find structural matches, list the actions available at an
+address, and resolve the one action that got picked. `Actions` and `Resolve` are separate calls
+because computing an action's edits costs about what performing it costs, and only one of the
+offers is going to be chosen.
 
-- validate a changed source closure;
-- format changed regions or files;
-- find structural matches;
-- list actions at an address;
-- resolve one action to edits and evidence.
+`Resolve` returns the edits plus the evidence: which preconditions it checked, what the change does
+semantically, and one `GuaranteeEvidence` entry for every guarantee its descriptor advertised.
+Coverage rides along, so Rift can tell a rename that reached everything from one that couldn't
+follow a name into a macro.
 
-Rift checks paths, limits, expected heads, and atomicity around these calls. Adapter results include
-coverage so Rift can refuse an operation whose required semantic reach is incomplete.
+When the adapter understood the request and declined it — the target was ambiguous, the offer went
+stale, the language forbids the new name — that's a `Refusal` in the status details. Everything
+else is an ordinary gRPC status.
 
 ## Execution
 
-Adapters that advertise execution receive a disposable workspace for `Execute` and debugging.
-Runtime requirements tell the server whether the adapter executes workspace code or starts child
-processes. Execution budgets bound time, output, frames, bindings, and rendered values.
+An adapter that advertises execution gets a disposable workspace for `Execute` and for debugging,
+never the session's own projection. Its `RuntimeRequirements` tell the server whether it runs
+workspace code or spawns subprocesses; Rift doesn't sandbox either, so the declaration is there to
+be acted on by whoever configures the workspace. Budgets bound wall time, captured output, retained
+frames, bindings per frame, and each rendered value.
 
-The generated [reference](/docs/protocol/reference) defines every request, event, and capability.
+The generated [reference](/docs/protocol/reference) defines every request, event and capability.

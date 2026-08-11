@@ -2,23 +2,36 @@
 title: Protocol
 ---
 
-MCP connects an agent to `rift mcp`. The adapter protocol connects the workspace server to language
-adapters. SCIP export serves tools that consume SCIP indexes.
+At the core of Rift there is a protocol. It describes how the components of the system behave, and
+how they operate.
 
-These boundaries share the [core model](/docs/protocol/core). The generated
-[reference](/docs/protocol/reference) is authoritative for fields, enums, and wire numbers.
+We've split the protocol definition into separate, logically aligned blocks:
 
-## Session flow
+- Core model — logical entities used by both MCP and adapters
+- MCP — the tools and resources an agent calls
+- Adapter — the protocol between the Rift server and a language toolchain
+- SCIP — a read-only export for tools that consume SCIP indexes
 
-1. `rift mcp` starts or connects to the server for a workspace.
-2. `Connect` opens a session and returns its current projection state.
-3. Reads and changes use that projection.
-4. Changes name the head they observed.
-5. `publish` applies non-conflicting projection changes to the workspace.
+Each block is generated from the Pydantic models under `protocol/src/rift/models`, so the JSON
+Schema, the Protobuf files and the [reference](/docs/protocol/reference) can't drift apart. The
+reference is authoritative for fields, enums and wire numbers; the pages here explain what the
+fields are for.
 
-Rift FS exposes the projection to adapters and filesystem tools when they need a path.
+## What a session does
+
+Your agent's `rift mcp` starts or finds the server for its workspace and opens `Connect`, which
+returns a session and the state of that session's projection. Everything after that reads or
+changes the projection, and `publish` is what carries the result into your files.
+
+There's no concurrency token anywhere in this. A session admits one live connection, so there's one
+MCP writer per projection, and the place where two writers can genuinely collide is the workspace —
+which `publish` checks directly by comparing the paths it's about to write.
 
 ## Compatibility
 
-Generated contracts carry a major version, minor version, and schema digest. Peers communicate when
-one descriptor matches exactly. Unknown fields are rejected.
+Every generated contract carries a major, a minor and a schema digest. Majors have to be equal,
+because a major changes exactly when a peer can no longer decode the next message safely. Within
+one major, revisions only add fields, so a peer admits any minor at or below its own and the
+connection settles on the lower of the two — which means a client only has to check that one
+number to know it can decode everything it will be sent. The digest names the exact generation a
+peer was built from; it's what makes a bug report reproducible, and it doesn't decide admission.

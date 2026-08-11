@@ -4,81 +4,138 @@ title: Architecture
 
 import { IsoDiagram } from "@/components/iso-diagram";
 
-Rift gives each agent a persistent projection of a workspace. A workspace is any directory.
+Rift doesn't provide a standalone agent. It works as a toolkit for an agent like Claude Code,
+Codex, or any other LLM appliance that speaks MCP.
+
+When an agent has Rift configured as one of its MCP servers, the `rift mcp` process starts and
+checks whether a `rift server` is already running for that particular folder — which we'll call
+the workspace throughout this documentation:
+
+```
+~/projects/charming-aurora  ->  running rift mcp here
+```
+
+The `rift server` coordinates between one or several `rift mcp` instances and one or several
+language adapters. A language adapter is a subprocess that talks to the server and gives Rift its
+introspection into a language's facts and operations. The server drives one adapter process for
+each exact `Language` pair — a name plus an optional dialect — so `sql` and `sql:postgresql` are
+two different adapters, and one process serves every session that needs it.
 
 <IsoDiagram
-  alt="An agent connects through Rift MCP to one workspace server. Rift FS keeps the session projection, language adapters provide semantic operations, and publication applies reviewed changes to the workspace."
+  alt="An agent talks to rift mcp, which talks to one rift server per workspace. The server owns a projection per session and drives one adapter process per language, and publication writes the projection's changes back into the workspace."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP" --> mcp["rift mcp"]:::rift
       mcp --> server["rift server<br/>one per workspace"]:::rift
-      server --> fs["Rift FS<br/>session projection"]:::store
-      server -- "semantic protocol" --> adapters["language adapters"]:::adapter
-      fs -- "when a path is needed" --> tools["editor / compiler / tool"]:::agent
-      fs -- "publish" --> workspace["workspace"]:::store
+      server --> projection["projection<br/>one per session"]:::store
+      server -- "adapter protocol" --> adapters["language adapters"]:::adapter
+      projection -- "publish" --> workspace["workspace"]:::store
   `}
 />
 
+## Server lifecycle
+
+So, as said — the `rift mcp` instances talk to the `rift server`, which acts as the coordinator.
+But what if `rift mcp` doesn't see a server running? Quite simple: it launches one, and keeps it
+on a Unix domain socket, or a named pipe on Windows.
+
+You might be asking what the actual reason for this is, and the answer is rooted in the MCP
+protocol itself. Assume your agent launches a couple of subagents. Each of them might also want to
+read or edit the codebase through Rift, and none of them can reach the `rift mcp` process the
+others are using — each gets its own, because MCP's stdio transport has the client launch its
+server as a subprocess. We use stdio to avoid managing ports.
+
+Adapters, analysis results and projections are expensive, and a `rift mcp` process that dies with
+its agent can't hold any of them. That's what forces a server behind them.
+
 ## Sessions
 
-Each MCP client launches `rift mcp` with a workspace path. The bridge starts the workspace server or
-connects to the server already responsible for that directory.
+Each `rift mcp` opens one session, and that session owns one projection. A session admits one live
+connection at a time, so there's exactly one MCP writer per projection and nothing to arbitrate
+between.
 
-The bridge opens one session, and that session owns one writable projection. One live MCP connection
-may use a session at a time. Its projection remains available across disconnects and server restarts
-until the session is removed.
+Your agent exiting doesn't destroy anything. The session and its projection stay, and
+`session_continue` rebinds a fresh connection to them, which is how a crashed agent picks up work
+it had half finished. `session_list` shows what's retained and `session_remove` discards one.
 
-The server coordinates sessions, Rift FS, language adapters, and publication.
+## The projection
+
+A projection is a scratchpad copy of your workspace. Your agent works in it, gets things wrong in
+it, fixes them, and none of that reaches your files until you publish.
+
+It starts as a live view. A path nobody has touched follows the workspace, so a `git pull` in your
+own terminal shows up in the agent's reads without anything being copied. Once a session changes a
+path, that path detaches and keeps the session's version while everything around it carries on
+tracking the workspace. Changing a directory covers everything beneath it.
+
+Creating a projection and restoring a clean one cost what the changed data costs, not what the
+repository costs, so opening a second session on a large monorepo isn't a second checkout.
 
 ## Rift FS
 
-Rift FS is the persistent filesystem layer for workspace projections. It exposes a projection below
-`<workspace>/.rift/projections` when an adapter or filesystem tool needs a path. That exposure and its
-lifecycle remain internal to Rift.
+Plenty of what a developer runs can't be handed a protocol — `cargo test`, `prettier`, `ruff`, a
+linter your team wrote in 2019. They take a directory and nothing else. So the projection is a
+real directory, and Rift puts it at a predictable place below the workspace:
 
-Each projection is a live workspace view. An untouched path follows the workspace. After a session
-changes a path, its version remains isolated while other workspace changes continue to appear on
-untouched paths. A directory change covers its descendants.
+```
+~/projects/charming-aurora/.rift/projections/ses_7k2mq4vx8ntbwpj3rfd6a9zcyh
+```
 
-Every visible projection state has a `ProjectionHead`. The head advances after an acknowledged MCP
-change, an acknowledged Rift FS operation, a restore or publication, and a workspace change visible
-through an untouched path. Reads at one head observe one ordered state. Language adapters refresh
-their derived state before answering for a newer head.
+Adapters receive that absolute path over the adapter protocol when the server opens their state.
+Anything else reads it from the `rift://root` resource, which also names the workspace the
+projection came from. The path stays put for the session's life, so a shell you `cd` into keeps
+working across a server restart. Removing the session deletes the directory without waiting for
+whatever is still inside it — a lock there would let one abandoned `cargo watch` wedge cleanup
+forever.
 
-Acknowledged projection changes, dirty paths, and the current head survive bridge disconnects and
-server restarts. A failed persistence step leaves the previous acknowledged state and head intact.
+Your agent *can* work through that directory. It shouldn't: MCP reads carry semantic facts and
+coverage that a filesystem read can't, and a change made through MCP is validated and recorded.
+Use the directory for the tools that have no other way in.
 
-Projection creation and clean restore scale with changed data. Storage and publication scale with
-affected paths and changed bytes. Access to one untouched file reads only the required path.
+<Callout type="warn">
+Everything written inside the projection belongs to the changeset, including build output. A
+`cargo test` run in there leaves `target/` behind, and publication carries it. Rift would rather
+hand you files you didn't want than quietly drop a file some tool wrote and you needed. Adapters
+can point `CARGO_TARGET_DIR` and friends at the private `state_root` the server gives them; a
+validator command or a tool you launched yourself has no such escape.
+</Callout>
 
-## Reads and changes
+## Changes
 
-Rift reads the projection tree directly. Language adapters analyze the same projection and return
-symbols, relationships, diagnostics, actions, and validation results.
+Your agent reads the projection tree directly. Language adapters analyze the same tree and return
+symbols, relationships, diagnostics, offered actions and validation results.
 
-MCP changes name the head they observed and apply atomically. A change fails before mutation when the
-head has advanced. Filesystem operations through Rift FS are ordered and advance the head after each
-acknowledged operation; a tool that changes several files may expose intermediate heads.
+A change through MCP — `edit`, `rename`, `act`, any of them — is resolved and validated before
+Rift writes anything, and what happens next depends on which way it failed. If Rift ended up with
+no bytes to write, that's a refusal and the projection is untouched: the address was ambiguous,
+the pattern matched forty places where you said one, the language has no such operation. There is
+nothing to record because nothing was produced.
+
+If Rift produced the edits and nobody would vouch for them, the change lands anyway and carries
+what's wrong with it. A validator didn't finish, an adapter couldn't classify every reference, the
+change deletes a file — each of those becomes a `ConfirmationRequirement` attached to that change.
+This is the point of a scratchpad: a bad change you can look at is worth more than a refusal that
+tells you a validator was unhappy and leaves you to guess where.
+
+The `rift://changes` resource pages through everything the session has applied, oldest first, each
+entry carrying its edits, its semantic effects, its guarantee evidence and its confirmations.
+That's the read to make before publishing.
 
 ## Publication
 
-`publish` applies the session's reviewed changes to the workspace. It operates on one stable
-projection head, so projection mutations cannot interleave with it.
+`publish` is the one step that writes your actual files, so it's where the confirmations get
+settled. A change carrying one is published only when the call names it in `accept`; anything left
+unaccepted comes back in `unaccepted` and nothing is written at all.
 
-Rift refuses to replace a changed path when its workspace value also changed while the session's
-version was isolated. A changed directory includes its subtree.
+Rift also refuses when a path the projection changed has changed in the workspace too, and returns
+those paths in `conflicts`. A path the session never touched can't conflict, because it was
+tracking the workspace the whole time.
 
-Rift forms the resulting workspace tree and validates it before applying the changed paths. A
-conflict or failed validation leaves the workspace and projection unchanged. Success applies all
-changed paths, refreshes the projection from the workspace, marks it clean, and returns a fresh head.
-Unrelated workspace changes remain visible.
+Publication is serialized against itself and validated as a whole tree before any of it lands. A
+conflict, a rejected validator or an unaccepted change leaves both the workspace and the
+projection exactly as they were. On success Rift writes every changed path, refreshes the
+projection, and empties the changeset. An interrupted publication finishes into either the new
+tree or the old one before the server accepts more work.
 
-Rift serializes its own publications and checks affected paths as they are applied. After an
-interrupted publication, recovery completes either the published tree or the tree that preceded it
-before accepting more work.
-
-## Restore and removal
-
-`projection_restore` refreshes selected changed paths from the workspace, or every changed path when
-none are selected. It returns a fresh head. Session removal discards the retained projection. Clean
-and dirty inactive sessions remain until explicit removal.
+`projection_restore` goes the other way: it refreshes selected changed paths from the workspace and
+drops the changes that touched them, or does it for every changed path when you name none.

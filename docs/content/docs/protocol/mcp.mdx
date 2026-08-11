@@ -2,65 +2,118 @@
 title: MCP
 ---
 
-`rift mcp` maps MCP JSON to the local Rift service. One bridge process owns one session connection.
+`rift mcp` is a thin process: it maps MCP JSON onto the local Rift service and owns one session
+connection for its lifetime. Nothing below is decided in that process.
 
 ## Connection
 
-The bridge starts or finds the server for the requested workspace, creates a session id, and opens
-`Connect`. `Connected` returns the workspace path, session, current `ProjectionState`, and a
-connection id used by later calls.
+The bridge finds or starts the server for its workspace, mints a session id, and opens `Connect`.
+`Connected` comes back with the contract the two peers settled on, the workspace path, the session,
+its `ProjectionState`, and a connection id that every later call carries.
 
-One session admits one live connection. A disconnected session is retained and may be continued or
-removed. Rift FS exposes its projection when another process or adapter needs a path.
+A session takes one live connection. When your agent exits, the session and its projection stay
+put, and three tools deal with what's left behind:
+
+| Tool | What it does |
+| --- | --- |
+| `session_list` | retained sessions and the state of each projection |
+| `session_continue` | rebinds this connection to a retained session |
+| `session_remove` | discards a session and deletes its projection |
+
+`session_continue` refuses a session that already has a live connection, and refuses to abandon a
+current session that has changes of its own — otherwise picking up old work would silently throw
+away new work.
 
 ## Reads
 
-The discovery tools read the current session projection:
+Three tools read the projection:
 
 | Tool | Result |
 | --- | --- |
-| `outline` | declarations in one file |
+| `outline` | declarations in one file, in source order |
 | `search` | ranked files, nodes, or symbols |
 | `match` | literal, regular-expression, or structural matches |
 
-Resources provide larger or reusable payloads:
+`search` takes a lexical `query`, a `filter` over resolved adapter facts, or both — the filter is
+where adapter knowledge enters a search, so "implements this trait" and "called by that function"
+are one request rather than three.
+
+Resources carry the larger and reusable payloads:
 
 | Resource | Content |
 | --- | --- |
-| `rift://workspace{?cursor}` | projection state, capabilities, limits, and validators |
-| `rift://fs{/path}{?start,length,cursor}` | directory entries or bounded file content |
-| `rift://symbol/{language}/{name}{?cursor}` | semantic facts for one symbol |
-| `rift://actions/{address}{?only,cursor}` | actions offered at an address |
-| `rift://action/{token}` | one action and its argument schema |
+| `rift://workspace{?cursor}` | projection state, per-language capabilities, limits, and validators |
+| `rift://root` | the projection's path on disk, and the workspace it came from |
+| `rift://changes{?cursor}` | every change this session applied, with its evidence |
+| `rift://fs{/path}{?start,length,cursor}` | directory entries, or a bounded range of file bytes |
+| `rift://symbol/{language}/{name}{?cursor}` | one symbol, its nodes, its edges, its diagnostics |
+| `rift://actions/{address}{?only,cursor}` | the actions an adapter offers at one address |
+| `rift://action/{token}` | one action and the JSON Schema of its arguments |
 
-Reads return the `ProjectionHead` they used. Cursors continue one captured result order and expire
-when the server releases it.
+The split between the last two is about page size. A listing can hold many offers and each offer's
+argument schema is large, so the listing leaves the schema out and you fetch it for the one action
+you picked.
+
+Paginated answers stop before `max_response_bytes` and hand back a cursor. A cursor is bound to the
+request that minted it — same order, same page size — and expires when the server drops the
+captured result set, which comes back as `cursor_expired` rather than a quietly different answer.
+
+<Callout>
+MCP's `roots` capability runs the other way: a client tells a server which directories it may work
+in. That's why the projection path is a Rift resource rather than a root — a server has no way to
+advertise one.
+</Callout>
 
 ## Changes
 
-`edit`, `patch`, `rewrite`, `rename`, `move`, `delete`, `change_signature`, and `act` change the
-session projection. Each request supplies the expected `ProjectionHead`.
+`edit`, `patch`, `rewrite`, `rename`, `move`, `delete`, `change_signature` and `act` all change the
+projection, and all return the same `ChangeResult`. Rift resolves and validates the whole operation
+before writing anything, and the result is one of two things.
 
-Rift resolves and validates the complete operation before making it visible. The result is one of:
+**Refused**, when resolution produced no edits. The projection is untouched and `RefusalReason` says
+what stopped it: the address hit several targets, a `rewrite` matched outside its cardinality, no
+adapter implements the operation for that language, the offer belongs to a portable family that has
+its own tool.
 
-- applied, with a fresh projection state and evidence;
-- refused, with a stable reason and diagnostics.
+**Applied**, when it produced edits. The change lands and gets an id in the changeset, along with
+its edits, its semantic effects, its guarantee evidence, its diagnostics — and its confirmations,
+where an adapter or validator wouldn't vouch for the result. An unvalidated change is still a
+change you can read, run tests against, and either keep or restore.
 
-A stale head returns `projection_head_moved` with the current head. `projection_restore` restores
-selected changed paths from the workspace, or every changed path when none are selected. `publish`
-compares affected workspace paths and either writes all changes or returns the conflicting paths.
+`projection_restore` refreshes selected changed paths from the workspace and drops the changes that
+touched them; naming no paths restores all of them.
+
+## Publication
+
+`publish` takes the list of change ids whose confirmations you accept, and writes nothing unless it
+can write everything:
+
+- a change carrying a confirmation you didn't accept comes back in `unaccepted`
+- a path the workspace changed since the projection took it comes back in `conflicts`
+
+Either way both trees are left as they were. On success every changed path is written, the
+projection is refreshed from the workspace, and the changeset is emptied.
 
 ## Execution
 
-`execute` evaluates a code block in a disposable workspace derived from the session projection.
-`debug_start`, `debug_get_frame`, and `debug_stop` provide bounded post-mortem inspection. Writes
-made by evaluated code are discarded.
+`execute` evaluates a block of code in a disposable copy of the projection, so anything it writes
+is thrown away — the projection is the scratchpad your changes live in, and evaluated code doesn't
+get to edit it as a side effect. `debug_start`, `debug_get_frame` and `debug_stop` do the same for
+a failed evaluation, holding its stack frames for inspection until you stop the session or the
+idle timeout does.
 
-Execution is enabled only when both workspace configuration and the language adapter allow it.
+Both need `rift.toml` to allow the language *and* the adapter to advertise the operation. The
+`rift://workspace` resource reports what's left after that intersection, so you never have to
+discover it by being refused.
 
 ## Errors
 
-Domain refusals are normal tool results. `ErrorData` is reserved for invalid requests, expired
-cursors, stale heads, unavailable adapters, limits, timeouts, storage failures, and similar call
-failures. Its retry directive tells the caller whether to change the request, retry it, refresh the
-projection, or wait for operator action.
+A refusal is a normal tool result — Rift understood you and declined. `ErrorData` is for the call
+itself failing: a request that doesn't fit the schema, an expired cursor, an adapter that isn't
+running, a limit crossed, a timeout, a storage failure.
+
+Every one carries a `retry` directive, which is the field to branch on. `never` means the same
+bytes will fail the same way. `same_request` means it was transient — an adapter still starting, a
+projection with a filesystem write in flight. `operator_action` means nothing will work until
+someone fixes the workspace, usually `rift.toml`. A `limit_exceeded` also carries which limit and
+by how much, so a request can be resized without parsing the message meant for a human.

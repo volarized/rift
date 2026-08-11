@@ -3,53 +3,91 @@ title: Configuration
 ---
 
 Rift reads `rift.toml` from the workspace root. The generated
-[`rift.schema.json`](/rift/protocol/rift.schema.json) defines the file and rejects unknown keys.
-Changes apply to later requests after validation succeeds.
+[`rift.schema.json`](https://github.com/volarized/rift/blob/main/protocol/rift.schema.json) defines
+the file and rejects any key it doesn't know, so a typo fails at load rather than being silently
+ignored. Edits take effect for later requests once validation passes; while the file is
+invalid, requests fail with `configuration_invalid` until you fix it.
+
+Point your editor at the schema and everything below autocompletes:
 
 ```toml
 #:schema ./protocol/rift.schema.json
-
-[execution]
-allow = []
-debug = []
-
-[validation]
-require = "available"
-
-[validators]
-commands = []
 ```
 
 ## Adapters
 
-Each entry below `adapters` names one process. `command` is an executable followed by literal
-arguments. `env` adds environment values.
+Each entry below `adapters` starts one process. `command` is an executable followed by literal
+arguments, with no shell in between, and `env` adds environment values on top of what the server
+inherited.
 
 ```toml
 [adapters.rust]
 command = ["rift-adapter-rust"]
 env = { RUST_LOG = "warn" }
+
+[adapters.postgres]
+command = ["rift-adapter-sql", "--dialect", "postgresql"]
 ```
 
-After launch, the process describes its language and capabilities through the adapter protocol.
+The table key is a name local to your workspace. Which language a process actually handles is
+something it reports itself, through `Describe`, along with everything else it can do — so the
+`postgres` entry above ends up serving `sql:postgresql` because that's what the process says when
+Rift asks it.
 
 ## Execution
 
-`execution.allow` lists languages permitted to evaluate caller code. `execution.debug` selects a
-subset permitted to retain post-mortem frames. A selector is a language name or `name:dialect`.
+`execute` runs a block of code your agent wrote against its projection, which is a sharp enough
+tool that it's off until you name the languages it's allowed for. `execution.allow` is that list,
+and `execution.debug` is the subset that may also retain stack frames after a failure for
+`debug_start` to inspect. A selector is a language name, or `name:dialect` to pin a dialect.
 
-The remaining fields bound code size, duration, captured output, concurrency, retained debug
-sessions, frames, bindings, and rendered values. Durations use units such as `ms`, `s`, and `m`;
-byte sizes use `B`, `KiB`, and `MiB`.
+```toml
+[execution]
+allow = ["python", "sql:postgresql"]
+debug = ["python"]
+max-code = "16KiB"
+max-timeout = "30s"
+max-output = "8KiB"
+max-concurrent = 2
+max-debug-sessions = 2
+debug-idle-timeout = "5m"
+max-debug-frames = 64
+max-debug-bindings = 32
+max-debug-value = "1KiB"
+```
+
+`max-code` bounds one submitted block. `max-timeout` bounds one evaluation and `max-output` bounds
+each of its captured streams separately, so a program that floods stdout gets a prefix and a byte
+count rather than a hung request. `max-concurrent` caps evaluations running at once across the
+whole workspace.
+
+The debug keys bound what a retained session holds: `max-debug-sessions` across the workspace,
+`debug-idle-timeout` before Rift stops one that nobody is reading, then `max-debug-frames`,
+`max-debug-bindings` per frame, and `max-debug-value` on each rendered value. Durations take `ms`,
+`s`, `m`, `h`, or `d`; byte sizes take `B`, `KiB`, `MiB`, `GiB`, or `TiB`.
+
+An adapter has to advertise the matching operation as well. Listing `rust` under `allow` does
+nothing if the Rust adapter never claimed it can execute, and debugging needs all three of
+`debug_start`, `debug_get_frame` and `debug_stop`. The `rift://workspace` resource reports what
+survived that intersection per language.
 
 ## Validation
 
-`validation.require = "available"` requires complete reports from affected adapters that advertise
-validation. A list of language selectors requires reports for those languages.
+`validation.require = "available"` asks every affected adapter that advertises validation for a
+complete report. Naming languages instead requires reports from exactly those:
 
-`validators.commands` adds workspace commands to the validation pass. Rift starts each command
-directly in a disposable copy of the projection. A declaration sets its argument vector, working
-directory, environment, timeout, output limit, changed-path behavior, and guarantees.
+```toml
+[validation]
+require = ["rust", "typescript"]
+```
+
+A change whose required reports don't arrive still lands in the projection — it just carries a
+`validation_incomplete` confirmation, and publication won't take it until you accept that.
+
+## Command validators
+
+`validators.commands` adds your own checks. Rift starts each one directly, without a shell,
+inside the session's projection directory:
 
 ```toml
 [[validators.commands]]
@@ -64,3 +102,21 @@ output_limit_bytes = 4096
 guarantees = []
 determinism = "deterministic"
 ```
+
+`id` is unique within the list and labels the result. `argv` refuses an absolute executable path; a
+bare name resolves through the validator's `PATH` and a relative one below `working_directory`,
+which is itself relative to the project root and defaults to it. `changed_paths = "append"` adds
+the changed project paths to `argv` in byte order, for a linter that takes files; `"none"` leaves
+`argv` alone.
+
+`timeout_ms` is when Rift kills the process, and `output_limit_bytes` is how much of each stream it
+keeps — the full size is still reported, so you can tell a truncated log from a short one.
+`guarantees` declares what a pass actually establishes, which is what turns a green run into
+`GuaranteeEvidence` on the change rather than an unexplained tick. `determinism` says whether the
+same tree and environment are expected to give the same answer twice.
+
+<Callout type="warn">
+The command runs in the projection, so whatever it writes there is part of the changeset and will
+be published. `cargo test` leaves a `target/` directory behind, and Rift carries it rather than
+guessing which files a tool wrote were disposable.
+</Callout>
