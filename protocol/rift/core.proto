@@ -337,66 +337,12 @@ enum ExecutionStatus {
   // The language runtime rejected the block or raised an unhandled failure.
   EXECUTION_STATUS_FAILED = 2;
 }
-// An exact immutable source tree. Current projection heads and explicit active resources
-// pin snapshots. A value merely copied by a client does not; an unpinned value may later return
-// `snapshot_not_found`. Git provenance belongs to the operation that resolved a revision, not
-// to this content identity.
-message Snapshot {
-  // Complete source-tree content identity in Rift's persistent store.
-  string id = 1;
-}
-// One immutable snapshot plus the exact Git commit selected during this resolution, if
-// the request used a Git revision. Provenance is response evidence and does not participate in
-// snapshot identity.
-message ResolvedSnapshot {
-  // Exact source tree selected by the request.
-  Snapshot snapshot = 1;
-  // Peeled Git commit selected by a Git revision, otherwise null.
-  optional string imported_from = 2;
-}
-// The single Git-backed baseline retained for one writable projection. `snapshot` is a
-// complete store copy of `commit`'s tree, so restore and merging do not depend on Git retaining
-// the object's blobs. This is current state, not a history node.
-message ProjectionBase {
-  // Pinned source tree used by restore and three-way integration.
-  string snapshot = 1;
-  // Git commit whose tree was imported into `snapshot`.
-  string commit = 2;
-}
-// Complete current state of one writable filesystem projection. It is a compare-and-swap
-// value, not a history record.
+// Current state of the session projection.
 message ProjectionState {
-  // Filesystem projection this state belongs to.
-  string projection = 1;
   // Fresh ABA-safe token for this current state.
   string head = 2;
-  // Complete immutable source tree rendered by the projection.
-  string snapshot = 3;
-  // Single pinned baseline used by restore and integration.
-  ProjectionBase base = 4;
-  // Whether `snapshot` differs from `base.snapshot`.
-  bool dirty = 5;
-}
-message RevisionGit {
-  // Git revision to resolve locally and import atomically.
-  string revision = 1;
-}
-message RevisionSnapshot {
-  // Retained immutable source tree to read.
-  string snapshot = 1;
-}
-message RevisionProjection {
-  // Projection whose current head to resolve once.
-  string projection = 1;
-}
-// Tagged source selector. Git, snapshot, and current-projection namespaces cannot collide.
-// Omission in a session-scoped request selects that session's current projection.
-message Revision {
-  oneof variant {
-    RevisionGit git = 1;
-    RevisionSnapshot snapshot = 2;
-    RevisionProjection projection = 3;
-  }
+  // Whether the projection contains unpublished changes.
+  bool dirty = 3;
 }
 // A byte range of one file and the language used to parse it. The owner of `App.svelte` can
 // mark its script block as TypeScript. A produced virtual file records ranges in its own byte
@@ -410,55 +356,28 @@ message LanguageRegion {
 // A physical or virtual file with bytes in it. Every node and symbol with readable source comes
 // from this kind.
 message FileContentRegular {
-  // SHA-256 root of the canonical fixed-chunk Merkle encoding for the complete raw file bytes.
-  // The architecture defines the byte-exact encoding.
-  string digest = 1;
   // Size in bytes.
-  int64 size = 2;
-  // Whether Git records the executable bit.
-  bool executable = 3;
+  int64 size = 1;
+  // Whether the file is executable.
+  bool executable = 2;
 }
-// A Git LFS pointer: a stub committed in place of a large file. Rift reads the stub and never
-// fetches what it names, so the size and hash below are the only facts available.
-message FileContentLfsPointer {
-  // The content hash the pointer names. Rift checks the pointer's syntax and never fetches what
-  // it points at.
-  string oid = 1;
-  // Size in bytes of the content the pointer names.
-  int64 size = 2;
-}
-// A symbolic link. Git records its target as arbitrary bytes, so the protocol carries canonical
-// base64 rather than assuming UTF-8.
+// A symbolic link whose target is carried as canonical base64.
 message FileContentSymlink {
   // Canonical padded base64 of the raw target bytes. Rift does not follow the target.
   string target = 1;
 }
-// A submodule boundary: the parent repository records one child commit at this path. Tree,
-// file, search, and adapter analysis treat the gitlink as one opaque entry and do not descend
-// into the child checkout.
-message FileContentGitlink {
-  // The child repository commit stored in the parent tree entry. Its hexadecimal width matches
-  // the parent repository's object format. A separate Rift workspace can open the child
-  // repository at this commit.
-  string commit = 1;
-}
-// What the entry holds. Only a regular entry has source in it; the other three are paths that
-// point elsewhere and carry no nodes.
+// The bytes of a regular file or the target of a symbolic link.
 message FileContent {
   oneof variant {
     FileContentRegular regular = 1;
-    FileContentLfsPointer lfs_pointer = 2;
-    FileContentSymlink symlink = 3;
-    FileContentGitlink gitlink = 4;
+    FileContentSymlink symlink = 2;
   }
 }
-// One source entry at a revision: what it is called, what it holds, and which languages read
-// it. Physical entries come from the immutable source-store tree. A generated regular entry
-// comes from adapter virtual output. Bytes are read from the same URI that identifies the
-// entry.
+// One file in the session projection and the languages that read it.
 message File {
   // Project-relative source identity and the URI from which this record and its bytes are read.
   string id = 1;
+  // Regular-file metadata or a symbolic-link target.
   FileContent content = 2;
   // Distinct `Language` values in `regions`, sorted by name and dialect. This summary avoids
   // scanning every region. The physical owner reports embedded languages even when another
@@ -471,20 +390,17 @@ message File {
   // no adapter claims the path.
   bool semantic = 5;
 }
-// A derived directory containing at least one visible descendant at this snapshot.
+// A visible directory, including an empty one.
 message ProjectEntryDirectory {
   // Project-relative directory path. The empty path names the project root.
   string path = 1;
 }
-// A physical source-store entry with content and language ownership metadata. Generated virtual
-// files remain outside the project tree listing.
+// A file with its content and language ownership metadata.
 message ProjectEntryFile {
   // The file represented by this tree node.
   File file = 1;
 }
-// One visible node in a project tree. Rift walks the immutable store tree at the requested
-// snapshot, returning a derived directory path or the complete `File` for a content-bearing
-// entry.
+// One visible directory or file in the session projection.
 message ProjectEntry {
   oneof variant {
     ProjectEntryDirectory directory = 1;
@@ -542,9 +458,7 @@ message SourceSpan {
   // The bytes, as offsets into that file.
   TextRange range = 2;
 }
-// One byte range of one file, and what replaces it. Offsets are into the file as it stands at
-// the pinned snapshot, so edits in a set never observe each other, and two of them may not
-// overlap.
+// One byte range of one file and what replaces it. Edits in a set share one input state.
 message TextEdit {
   string kind = 1;
   // The file, and the byte range being replaced.
@@ -554,21 +468,19 @@ message TextEdit {
 }
 // A regular UTF-8 file that does not exist yet, with its complete content and executable bit.
 message EditCreate {
-  // A path that does not exist at the pinned snapshot. Extracting a module is the usual reason.
+  // A path that does not exist in the projection.
   string file = 1;
   // All UTF-8 source in the new file.
   string text = 2;
-  // Whether Git records the new file as executable.
+  // Whether the new file is executable.
   bool executable = 3;
 }
-// Removing a file by path. The pinned snapshot supplies its previous entry and content
-// identity.
+// Removing a file by path.
 message EditDelete {
-  // The file to remove, as it stands at the pinned snapshot.
+  // The file to remove.
   string file = 1;
 }
-// A move carries the source and destination paths. Its content stays in the existing Git
-// object.
+// A move from one path to another.
 message EditRename {
   // The path the file has now.
   string file = 1;
@@ -585,28 +497,10 @@ message EditCopy {
 }
 // Changing the executable bit without rewriting file content.
 message EditSetExecutable {
-  // The regular file whose Git mode changes.
+  // The regular file whose executable bit changes.
   string file = 1;
   // The executable bit the file has after the edit.
   bool executable = 2;
-}
-// Creating a submodule tree entry in the parent repository. A companion text edit updates
-// `.gitmodules` when the mapping is new.
-message EditCreateGitlink {
-  // A parent-repository path that does not exist at the pinned snapshot.
-  string file = 1;
-  // Child repository commit stored in the new gitlink. Its hexadecimal width matches the parent
-  // repository's object format.
-  string commit = 2;
-}
-// Updating an existing submodule entry to a different child commit. The operation changes the
-// parent tree entry and does not read or mutate the child checkout.
-message EditSetGitlink {
-  // Existing gitlink in the parent repository at the pinned snapshot.
-  string file = 1;
-  // Child repository commit stored after the edit. Its hexadecimal width matches the parent
-  // repository's object format.
-  string commit = 2;
 }
 // A filesystem effect described before Rift performs it. Edit sets are atomic and sorted
 // bytewise by each edit's RFC 8785 canonical JSON. Text replacements in one set address the
@@ -619,23 +513,7 @@ message Edit {
     EditRename rename = 4;
     EditCopy copy = 5;
     EditSetExecutable set_executable = 6;
-    EditCreateGitlink create_gitlink = 7;
-    EditSetGitlink set_gitlink = 8;
   }
-}
-// One file between two states. A creation has no `before`. A deletion has no `after`. A rename
-// has different paths on each side. The path comes from `after.id`, or `before.id` after
-// deletion.
-message FileChange {
-  // The entry before the change. Null where the file did not exist.
-  optional File before = 1;
-  // The entry after the change. Null where the file was deleted.
-  optional File after = 2;
-  // Text replacements that transform the `before` content into `after`. The surrounding entries
-  // carry creation, deletion, and rename state.
-  repeated TextEdit edits = 3;
-  // Whether edits were dropped to stay inside the size limit.
-  bool truncated = 4;
 }
 // One origin, byte for byte. An offset in the generated file maps back to an offset in the
 // source arithmetically.
@@ -2049,9 +1927,9 @@ message OperationVerifierAdapter {
   // Adapter whose adapter performed the check.
   Language language = 1;
 }
-// One repository-declared command validator checked an integration tree.
+// One workspace command validator checked a changed tree.
 message OperationVerifierValidator {
-  // Zero-based position in repository validator declarations.
+  // Zero-based position in workspace validator declarations.
   int64 validator = 1;
 }
 // The component that checked a precondition or established a guarantee.
@@ -2070,10 +1948,6 @@ message PreconditionValueBoolean {
 message PreconditionValueCount {
   int64 value = 1;
 }
-// Pinned project state used by stale-state checks.
-message PreconditionValueSnapshot {
-  Snapshot value = 1;
-}
 // Coverage required or observed for an adapter fact family.
 message PreconditionValueCoverage {
   Coverage value = 1;
@@ -2082,15 +1956,13 @@ message PreconditionValueCoverage {
 message PreconditionValueText {
   string value = 1;
 }
-// A typed value compared by an operation precondition. The tag prevents a snapshot string, a
-// name, and a count rendered as text from becoming indistinguishable.
+// A typed value compared by an operation precondition.
 message PreconditionValue {
   oneof variant {
     PreconditionValueBoolean boolean = 1;
     PreconditionValueCount count = 2;
-    PreconditionValueSnapshot snapshot = 3;
-    PreconditionValueCoverage coverage = 4;
-    PreconditionValueText text = 5;
+    PreconditionValueCoverage coverage = 3;
+    PreconditionValueText text = 4;
   }
 }
 // One executable condition checked while resolving an operation. Expected and observed values
@@ -2132,8 +2004,8 @@ message OperationPrecondition {
   repeated Address addresses = 4;
   // Project paths involved in the condition, including destinations that do not yet exist.
   repeated string paths = 5;
-  // Required value. Examples include the discovered snapshot, zero remaining usages, or
-  // complete coverage.
+  // Required value. Examples include the discovered head, zero remaining usages, or complete
+  // coverage.
   PreconditionValue expected = 6;
   // Value found while checking the condition.
   PreconditionValue observed = 7;
@@ -2181,7 +2053,7 @@ message OperationEffect {
   // Subjects in the state before this change. Empty for creation.
   repeated Address before = 2;
   // Subjects after Rift applies the change and every adapter sharing the projection
-  // acknowledges the new snapshot. Empty for deletion.
+  // acknowledges the new head. Empty for deletion.
   repeated Address after = 3;
   // Source locations demonstrating the effect, pinned to their respective before or after
   // address state.
@@ -2217,7 +2089,7 @@ message GuaranteeEvidence {
     ADAPTER = 2;
     // A named language analysis checked a property narrower than compilation.
     STATIC_ANALYSIS = 3;
-    // A repository-declared command validator checked the integration tree.
+    // A workspace command validator checked the changed tree.
     VALIDATOR = 4;
   }
   GuaranteeKind kind = 1;
@@ -2231,9 +2103,9 @@ message GuaranteeEvidence {
   // Findings produced while establishing the guarantee.
   repeated Diagnostic diagnostics = 6;
 }
-// One effect a caller must acknowledge before a change commits. Requirements are sorted by
-// kind, source location, title, and detail, then numbered from zero. An acknowledgement applies
-// only to a retry of the same operation and expected head.
+// One effect a caller must acknowledge before a change becomes visible. Requirements are sorted
+// by kind, source location, title, and detail, then numbered from zero. An acknowledgement
+// applies to a retry of the same operation and expected head.
 message ConfirmationRequirement {
   // The condition that makes acknowledgement necessary.
   enum Kind {
@@ -2251,7 +2123,7 @@ message ConfirmationRequirement {
     BEHAVIOR_UNKNOWN = 5;
     // Formatting reaches outside the changed syntactic regions.
     FORMATTING_SCOPE = 6;
-    // A repository-declared command validator will execute against the integration tree.
+    // A workspace command validator will check the changed tree.
     COMMAND_VALIDATOR = 7;
   }
   // Zero-based position in the refusal's ordered confirmation list.
@@ -2359,14 +2231,13 @@ message ActionDescriptor {
 message SemanticCoverage {
   map<string, Coverage> entries = 1;
 }
-// Caller-provided source evaluated by an adapter in the project runtime selected for one
-// exact snapshot. It is sent over the adapter seam and is never written into the repository
-// snapshot.
+// Caller-provided source evaluated against a session projection. It is never written back
+// to that projection.
 message CodeBlock {
   // UTF-8 source to evaluate as one language-specific block.
   string source = 1;
   // Project-relative directory used as the evaluation working directory. The empty path selects
-  // the project root. It must name a directory in the resolved snapshot.
+  // the project root. It must name a directory in the projection.
   optional string working_directory = 2;
 }
 // A bounded UTF-8 rendering of bytes. Invalid byte sequences become U+FFFD. The digest
@@ -2445,8 +2316,8 @@ message DebugFrame {
   int64 depth = 1;
   // Function, method, or adapter-local frame name.
   string name = 2;
-  // Source location in the pinned repository snapshot, or null for runtime and synthetic code.
-  // The caller-provided block itself has no repository span.
+  // Source location in the projection, or null for runtime and synthetic code. The
+  // caller-provided block itself has no source span.
   optional SourceSpan source = 3;
   // Visible arguments in adapter order.
   repeated DebugBinding arguments = 4;

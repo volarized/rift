@@ -302,8 +302,8 @@ class AuxiliaryClaim(ProtoModel):
         ADAPTER,
         description=(
             "Paths inside the workspace that this adapter writes to. Rift\n classifies each "
-            "claimed subtree as adapter output and excludes it from\n source analysis, "
-            "snapshot diffs, and agent results.\n Write claims are exclusive across adapters "
+            "claimed subtree as adapter output and excludes it from\n source analysis and agent results.\n "
+            "Write claims are exclusive across adapters "
             "sharing a connection projection. Rift\n refuses workspace admission when two "
             "adapters can write the same path; one\n of them must redirect that output to its "
             "private state_root.\n\n CARGO_TARGET_DIR, GOCACHE, PYTHONPYCACHEPREFIX, and "
@@ -319,7 +319,7 @@ class AuxiliaryClaim(ProtoModel):
 class WriteClaim(ProtoModel):
     """Paths inside the workspace that this adapter writes to. Rift
     classifies each claimed subtree as adapter output and excludes it from
-    source analysis, snapshot diffs, and agent results.
+    source analysis and agent results.
     Write claims are exclusive across adapters sharing a connection projection. Rift
     refuses workspace admission when two adapters can write the same path; one
     of them must redirect that output to its private state_root.
@@ -352,7 +352,7 @@ class WriteClaim(ProtoModel):
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
             "Why the adapter needs it, in one line. Rift logs this when a claim shadows\n a "
-            "file the repository actually tracks, which is nearly always a mistake."
+            "workspace file, which is nearly always a mistake."
         ),
     )
 
@@ -531,11 +531,11 @@ class RuntimeRequirements(ProtoModel):
     Rift does not isolate the process or its workers from the host. These requirements
     do not select the project runtime used for one adapter state."""
 
-    executes_repository_code: Field[bool] = proto_field(
+    executes_workspace_code: Field[bool] = proto_field(
         default=...,
         number=1,
         proto_type=ProtoFieldDescriptor.TYPE_BOOL,
-        description="Whether the adapter executes code from the repository — a build script, a\n plugin, a macro.",
+        description="Whether the adapter executes workspace code, such as a build script, plugin, or macro.",
     )
     spawns_subprocesses: Field[bool] = proto_field(
         default=...,
@@ -552,7 +552,7 @@ class RuntimeRequirements(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "One adapter's state for a server-owned filesystem projection. Every call that reads code\n"
+            "One adapter's state for a Rift FS projection. Every call that reads code\n"
             " carries it. The adapter may back different states with different project\n"
             " runtimes. A call naming an earlier state receives `StaleState`."
         ),
@@ -560,17 +560,12 @@ class RuntimeRequirements(ProtoModel):
     )
 )
 class AdapterState(ProtoModel):
-    """One adapter's state for a server-owned filesystem projection. Every call that reads code
+    """One adapter's state for a Rift FS projection. Every call that reads code
     carries it. The adapter may back different states with different project runtimes.
     A call naming an earlier state receives `StaleState`."""
 
-    projection: Field[core.Projection] = proto_field(
-        default=...,
-        number=1,
-        description="Stable filesystem projection identity this adapter state reads.",
-    )
-    snapshot: Field[core.Snapshot] = proto_field(
-        default=..., number=2, description="The state the files in it hold."
+    head: Field[core.ProjectionHead] = proto_field(
+        default=..., number=2, description="Projection head the adapter has read."
     )
     generation: Field[int] = proto_field(
         default=...,
@@ -579,7 +574,7 @@ class AdapterState(ProtoModel):
         description=(
             "Adapter-local state generation. Open mints the first value;\n Refresh and "
             "SyncVirtual advance it. Calls carrying an earlier generation\n receive StaleState "
-            "even when the source snapshot is unchanged."
+            "even when the projection head is unchanged."
         ),
     )
 
@@ -588,26 +583,15 @@ class AdapterState(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Open one complete server-owned filesystem projection in the adapter. Rift resolved\n"
-            " the requested revision and mounted this exact snapshot before the call. The adapter\n"
-            " does not allocate or rebind projections. It\n"
-            " may inspect revision-local configuration and select or start the project runtime\n"
-            " for this state."
+            "Open one Rift FS projection in the adapter. The adapter\n"
+            " may inspect its files and select or start the project runtime for this state."
         ),
         section="Adapter state",
     )
 )
 class OpenRequest(ProtoModel):
-    """Open one complete server-owned filesystem projection in the adapter. Rift resolved the
-    requested revision and mounted this exact snapshot before the call. The adapter does not
-    allocate or rebind projections. It may inspect
-    revision-local configuration and select or start the project runtime for this state."""
+    """Open one Rift FS projection in the adapter."""
 
-    projection: Field[core.Projection] = proto_field(
-        default=...,
-        number=1,
-        description="Stable identity of the projection supplied to this adapter state.",
-    )
     state_root: Field[str] = proto_field(
         default=...,
         number=2,
@@ -620,8 +604,8 @@ class OpenRequest(ProtoModel):
             "directory when its adapter supports safe sharing."
         ),
     )
-    snapshot: Field[core.Snapshot] = proto_field(
-        default=..., number=3, description="The state that tree holds."
+    head: Field[core.ProjectionHead] = proto_field(
+        default=..., number=3, description="Current projection head."
     )
     contract: Field[AdapterContract] = proto_field(
         default=...,
@@ -633,7 +617,7 @@ class OpenRequest(ProtoModel):
         number=5,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
-            "Absolute mounted path for `projection`. Other adapters can receive the same path. "
+            "Absolute Rift FS path for `projection`. Other adapters can receive the same path. "
             "Adapter output goes to `state_root` or a declared WriteClaim scratch subtree."
         ),
     )
@@ -643,8 +627,8 @@ class OpenRequest(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Rift rebound the projection to an exact snapshot under its write barrier. It sends\n"
-            " this call to every language adapter holding the shared path. Paths are\n "
+            "Rift changed files in a projection. It sends this call to every language\n"
+            " adapter holding the shared path. Paths are\n "
             "project-relative and cover every file Rift touched; each adapter decides\n which "
             "changes affect its adapter. Content is on disk before this call. The adapter\n "
             "reselects its project runtime when runtime-defining inputs have changed."
@@ -653,11 +637,7 @@ class OpenRequest(ProtoModel):
     )
 )
 class RefreshRequest(ProtoModel):
-    """Rift rebound the projection to an exact snapshot under its write barrier. It sends
-    this call to every language adapter holding the shared path. Paths are
-    project-relative and cover every file Rift touched; each adapter decides
-    which changes affect its adapter. Content is on disk before this call. The adapter
-    reselects its project runtime when runtime-defining inputs have changed."""
+    """Updates an adapter after files in its projection change."""
 
     from_: Field[AdapterState] = proto_field(
         default=...,
@@ -667,10 +647,10 @@ class RefreshRequest(ProtoModel):
             "disagree about what is on disk, and comes back as StaleState."
         ),
     )
-    to: Field[core.Snapshot] = proto_field(
+    to: Field[core.ProjectionHead] = proto_field(
         default=...,
         number=2,
-        description="The exact source snapshot the projection holds now.",
+        description="Projection head after the listed changes.",
     )
     written: Field[list[str]] = proto_field(
         default=...,
@@ -694,7 +674,7 @@ class RefreshRequest(ProtoModel):
             "sends exactly one `start` event first, then each `unit` followed by ordered\n "
             "`text` chunks ending in `final: true`. The complete stream replaces the\n "
             "previous overlay; an RPC failure leaves the previous generation intact. The\n "
-            "units are the complete set selected for this consumer at `start.snapshot`,\n "
+            "units are the complete set selected for this consumer at `start.head`,\n "
             "including an empty set when every previous unit has been retracted."
         ),
         section="Adapter state",
@@ -705,7 +685,7 @@ class VirtualSyncEvent(ProtoModel):
     sends exactly one `start` event first, then each `unit` followed by ordered
     `text` chunks ending in `final: true`. The complete stream replaces the
     previous overlay; an RPC failure leaves the previous generation intact. The
-    units are the complete set selected for this consumer at `start.snapshot`,
+    units are the complete set selected for this consumer at `start.head`,
     including an empty set when every previous unit has been retracted."""
 
     start: Field[AdapterState | None] = proto_field(
@@ -713,7 +693,7 @@ class VirtualSyncEvent(ProtoModel):
         number=1,
         oneof=Oneof("event"),
         description=(
-            "Current adapter-local state. The returned AdapterState keeps its\n snapshot and "
+            "Current adapter-local state. The returned AdapterState keeps its\n head and "
             "advances its generation."
         ),
     )
@@ -734,29 +714,27 @@ class VirtualSyncEvent(ProtoModel):
 @proto_message(
     DirectMessage(
         ADAPTER,
-        description="Release adapter state for this projection so Rift can unmount or rebind it.",
+        description="Release one open adapter state.",
         section="Adapter state",
     )
 )
 class CloseRequest(ProtoModel):
-    """Release adapter state for this projection so Rift can unmount or rebind it."""
+    """Release one open adapter state."""
 
-    projection: Field[core.Projection] = proto_field(default=..., number=1)
+    state: Field[AdapterState] = proto_field(default=..., number=1)
 
 
 @proto_message(
     DirectMessage(
         ADAPTER,
         description=(
-            "Read selected claimed physical or synced virtual sources at one state. A\n "
-            "physical unit below a gitlink is an adapter protocol error."
+            "Read selected claimed physical or synced virtual sources at one state."
         ),
         section="Analysis",
     )
 )
 class AnalyzeRequest(ProtoModel):
-    """Read selected claimed physical or synced virtual sources at one state. A
-    physical unit below a gitlink is an adapter protocol error."""
+    """Read selected physical or virtual sources at one adapter state."""
 
     state: Field[AdapterState] = proto_field(default=..., number=1)
     units: Field[list[str]] = proto_field(
@@ -1045,7 +1023,7 @@ class UnitCoverage(ProtoModel):
         description="How long Rift may retain one Analyze result.",
         value_descriptions=(
             "No cache claim. Rift treats the result as request-volatile.",
-            "The source snapshot, adapter implementation, language, and derived virtual inputs determine the result.",
+            "The projection head, adapter implementation, language, and virtual inputs determine the result.",
             (
                 "Adapter-observed external state also affects the result. Retention ends with the "
                 "process or adapter-state generation."
@@ -1058,7 +1036,7 @@ class CacheScope(IntEnum):
     """How long Rift may retain one Analyze result."""
 
     CACHE_SCOPE_UNSPECIFIED = 0
-    SNAPSHOT = 1
+    PROJECTION = 1
     PROCESS = 2
     NONE = 3
 
@@ -1310,7 +1288,7 @@ class Matches(ProtoModel):
         ADAPTER,
         description=(
             "One match, as the adapter found it. It carries no identity of its own: a\n "
-            "`MatchKey` is the snapshot, the query and the span, and Rift already holds\n the "
+            "`MatchKey` is the projection head, query and span, and Rift already holds\n the "
             "first two, so the span below completes it."
         ),
         section="Matching",
@@ -1318,7 +1296,7 @@ class Matches(ProtoModel):
 )
 class StructuralMatch(ProtoModel):
     """One match, as the adapter found it. It carries no identity of its own: a
-    `MatchKey` is the snapshot, the query and the span, and Rift already holds
+    `MatchKey` is the projection head, query and span, and Rift already holds
     the first two, so the span below completes it."""
 
     span: Field[core.SourceSpan] = proto_field(
@@ -1552,7 +1530,7 @@ class ResolveResponse(ProtoModel):
         description=(
             "Evaluate one caller-provided block in the project runtime selected for a pinned "
             "adapter state. Rift gives this call a disposable execution workspace, so evaluated "
-            "code never runs in a shared read, session, or integration projection."
+            "code never runs in the session projection."
         ),
         section="Execution",
     )
@@ -1564,7 +1542,7 @@ class ExecuteRequest(ProtoModel):
     state: Field[AdapterState] = proto_field(
         default=...,
         number=1,
-        description="Exact snapshot and adapter generation to evaluate against.",
+        description="Exact projection head and adapter generation to evaluate against.",
     )
     block: Field[core.CodeBlock] = proto_field(
         default=...,
@@ -1917,9 +1895,8 @@ ADAPTER_PACKAGE = ProtoPackage(
                     OpenRequest,
                     AdapterState,
                     description=(
-                        "Here is the server-owned projection for an exact snapshot. The tree exists "
-                        "before this call, so the adapter can inspect complete source, select any "
-                        "revision-appropriate runtime worker, and initialize state."
+                        "Here is the Rift FS projection. The adapter can inspect its "
+                        "source, select a runtime worker, and initialize state."
                     ),
                 ),
                 Rpc(

@@ -1,8 +1,5 @@
 #:schema ./protocol/rift.schema.json
 
-[session]
-base = "head"
-
 [execution]
 allow = []
 debug = []
@@ -21,4 +18,3 @@ require = "available"
 
 [validators]
 commands = []
-carry = []

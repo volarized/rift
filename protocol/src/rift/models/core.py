@@ -21,25 +21,6 @@ def validate_base64url(value: str) -> None:
         raise ValueError("value must use canonical unpadded base64url")
 
 
-def validate_resource_revision(value: str) -> None:
-    """Validate one canonical namespaced revision embedded in a resource URI."""
-
-    namespace, separator, payload = value.partition(":")
-    if not separator:
-        raise ValueError("resource revision requires a namespace")
-    if namespace == "git":
-        decoded = unquote_to_bytes(payload).decode("utf-8")
-        GitRevision.model_validate(decoded)
-        if quote(decoded, safe="-._~") != payload:
-            raise ValueError("Git revision must use canonical URI encoding")
-    elif namespace == "snapshot":
-        SnapshotId.model_validate(payload)
-    elif namespace == "projection":
-        Projection.model_validate(payload)
-    else:
-        raise ValueError("unknown resource revision namespace")
-
-
 def _raw_query(uri: str) -> dict[str, str]:
     query = uri.partition("?")[2]
     if not query:
@@ -77,192 +58,24 @@ class Digest(ProtocolRoot):
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^[^\u0000-\u001F\u007F]+$",
-    min_length=1,
-    max_length=256,
-    examples=[
-        "main",
-        "v1.2.0",
-        "HEAD~3",
-    ],
-)
-class GitRevision(ProtocolRoot):
-    """A Git revision parameter in the syntax defined by gitrevisions(7). Rift resolves it
-    once, peels annotated tags to commits, rejects blobs and trees, and never fetches missing
-    objects. The limit is 256 UTF-8 bytes, not characters."""
-
-    @model_validator(mode="after")
-    def utf8_size_is_bounded(self) -> GitRevision:
-        if len(self.root.encode("utf-8")) > 256:
-            raise ValueError("Git revision exceeds 256 UTF-8 bytes")
-        return self
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern="^[0-9a-f]{40}([0-9a-f]{24})?$",
-    examples=["dae86e1950b1277e545cee180551750029cfe735"],
-)
-class GitCommit(ProtocolRoot):
-    """One committed state, as its full object ID. SHA-1 repositories write 40 hex characters and SHA-256 repositories 64."""
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern=r"^prj_[a-z2-7]{26}$",
-    examples=["prj_aaaaaaaaaaaaaaaaaaaaaaaaaa"],
-)
-class Projection(ProtocolRoot):
-    """Stable identity of one Rift-owned filesystem projection. It names store state and a
-    mounted directory; it is unrelated to a Git worktree or the SCIP Projection service."""
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
     pattern=r"^ph_[a-z2-7]{26}$",
     examples=["ph_bbbbbbbbbbbbbbbbbbbbbbbbbb"],
 )
 class ProjectionHead(ProtocolRoot):
     """Opaque compare-and-swap token for the current source state of a writable projection.
-    Rift generates a fresh token for every committed source mutation, including mutations made
-    through the mounted filesystem. Tokens carry no ordering or history and are never reused."""
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern=r"^snap_[0-9a-f]{64}$",
-    examples=["snap_71d62c8d6cc4a7f076c39970f47af38e21c7a2b23a286be5a0869a509631a53c"],
-)
-class SnapshotId(ProtocolRoot):
-    """Content address of one complete immutable source tree in Rift's store. The suffix is
-    SHA-256 over the canonical Merkle-tree encoding defined by the core protocol. Scratch files,
-    empty-directory metadata, and synthetic mount entries are excluded. The identifier carries
-    no parent or time order."""
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class Snapshot(ClosedModel):
-    """An exact immutable source tree. Current projection heads and explicit active resources
-    pin snapshots. A value merely copied by a client does not; an unpinned value may later return
-    `snapshot_not_found`. Git provenance belongs to the operation that resolved a revision, not
-    to this content identity."""
-
-    id: Field[SnapshotId] = proto_field(
-        description="Complete source-tree content identity in Rift's persistent store.",
-        number=1,
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class ResolvedSnapshot(ClosedModel):
-    """One immutable snapshot plus the exact Git commit selected during this resolution, if
-    the request used a Git revision. Provenance is response evidence and does not participate in
-    snapshot identity."""
-
-    snapshot: Field[Snapshot] = proto_field(
-        description="Exact source tree selected by the request.", number=1
-    )
-    imported_from: Field[GitCommit | None] = proto_field(
-        default=None,
-        description="Peeled Git commit selected by a Git revision, otherwise null.",
-        number=2,
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class ProjectionBase(ClosedModel):
-    """The single Git-backed baseline retained for one writable projection. `snapshot` is a
-    complete store copy of `commit`'s tree, so restore and merging do not depend on Git retaining
-    the object's blobs. This is current state, not a history node."""
-
-    snapshot: Field[SnapshotId] = proto_field(
-        description="Pinned source tree used by restore and three-way integration.",
-        number=1,
-    )
-    commit: Field[GitCommit] = proto_field(
-        description="Git commit whose tree was imported into `snapshot`.", number=2
-    )
+    Rift generates a fresh token whenever the visible state advances."""
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class ProjectionState(ClosedModel):
-    """Complete current state of one writable filesystem projection. It is a compare-and-swap
-    value, not a history record."""
+    """Current state of the session projection."""
 
-    projection: Field[Projection] = proto_field(
-        description="Filesystem projection this state belongs to.", number=1
-    )
     head: Field[ProjectionHead] = proto_field(
         description="Fresh ABA-safe token for this current state.", number=2
     )
-    snapshot: Field[SnapshotId] = proto_field(
-        description="Complete immutable source tree rendered by the projection.",
-        number=3,
-    )
-    base: Field[ProjectionBase] = proto_field(
-        description="Single pinned baseline used by restore and integration.",
-        number=4,
-    )
     dirty: Field[bool] = proto_field(
-        description="Whether `snapshot` differs from `base.snapshot`.", number=5
+        description="Whether the projection contains unpublished changes.", number=3
     )
-
-    @model_validator(mode="after")
-    def dirty_matches_base(self) -> ProjectionState:
-        if self.dirty != (self.snapshot != self.base.snapshot):
-            raise ValueError("dirty must equal snapshot != base.snapshot")
-        return self
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class RevisionGit(ClosedModel):
-    kind: Field[Literal["git"]] = proto_field(description="Selects a Git revision.")
-    revision: Field[GitRevision] = proto_field(
-        description="Git revision to resolve locally and import atomically.", number=1
-    )
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class RevisionSnapshot(ClosedModel):
-    kind: Field[Literal["snapshot"]] = proto_field(
-        description="Selects an exact Rift snapshot."
-    )
-    snapshot: Field[SnapshotId] = proto_field(
-        description="Retained immutable source tree to read.", number=1
-    )
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class RevisionProjection(ClosedModel):
-    kind: Field[Literal["projection"]] = proto_field(
-        description="Selects the current state of a filesystem projection."
-    )
-    projection: Field[Projection] = proto_field(
-        description="Projection whose current head to resolve once.", number=1
-    )
-
-
-@union(
-    owner=CORE,
-    oneof="variant",
-    discriminator="kind",
-    variants=(
-        Variant("git", "git", 1, RevisionGit),
-        Variant("snapshot", "snapshot", 2, RevisionSnapshot),
-        Variant("projection", "projection", 3, RevisionProjection),
-    ),
-)
-class Revision(ProtocolRoot):
-    """Tagged source selector. Git, snapshot, and current-projection namespaces cannot collide.
-    Omission in a session-scoped request selects that session's current projection."""
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -281,17 +94,18 @@ class LanguageRegion(ClosedModel):
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(\?rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26}))?$",
+    pattern=r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
     min_length=13,
     max_length=8192,
     examples=[
         "rift://file/pkg/util.py",
         "rift://file/src/%E2%98%83.ts",
-        "rift://file/src/config.ts?rev=git:main",
+        "rift://file/src/config.ts",
     ],
 )
 class FileId(ProtocolRoot):
-    """Identity of one file, and the URI that resolves it. The path after `rift://file/` is a `ProjectPath`: unreserved URI characters remain literal, `/` separates segments, and every other UTF-8 byte uses uppercase percent-encoding. Decoding to an absolute path or a `.` or `..` segment is refused. A revision can be attached as `?rev=`."""
+    """Identity of one file in the session projection. The path after `rift://file/` is a
+    canonical project-relative path."""
 
     @model_validator(mode="after")
     def path_is_canonical(self) -> FileId:
@@ -301,9 +115,6 @@ class FileId(ProtocolRoot):
         canonical = quote(decoded, safe="/!$&'()*+,;=:@-._~")
         if canonical != encoded:
             raise ValueError("file path must use canonical URI encoding")
-        revision = _raw_query(self.root).get("rev")
-        if revision is not None:
-            validate_resource_revision(revision)
         return self
 
 
@@ -312,45 +123,17 @@ class FileContentRegular(ClosedModel):
     """A physical or virtual file with bytes in it. Every node and symbol with readable source comes from this kind."""
 
     kind: Field[Literal["regular"]] = proto_field()
-    digest: Field[Digest] = proto_field(
-        description=(
-            "SHA-256 root of the canonical fixed-chunk Merkle encoding for the complete raw "
-            "file bytes. The architecture defines the byte-exact encoding."
-        ),
-        number=1,
-    )
     size: Field[int] = proto_field(
-        description="Size in bytes.", ge=0, le=9007199254740991, number=2
+        description="Size in bytes.", ge=0, le=9007199254740991, number=1
     )
     executable: Field[bool] = proto_field(
-        description="Whether Git records the executable bit.", number=3
-    )
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class FileContentLfsPointer(ClosedModel):
-    "A Git LFS pointer: a stub committed in place of a large file. Rift reads the stub and never fetches what it names, so the size and hash below are the only facts available."
-
-    kind: Field[Literal["lfs_pointer"]] = proto_field()
-    oid: Field[str] = proto_field(
-        description=(
-            "The content hash the pointer names. Rift checks the pointer's syntax and never "
-            "fetches what it points at."
-        ),
-        pattern="^sha256:[0-9a-f]{64}$",
-        number=1,
-    )
-    size: Field[int] = proto_field(
-        description="Size in bytes of the content the pointer names.",
-        ge=0,
-        le=9007199254740991,
-        number=2,
+        description="Whether the file is executable.", number=2
     )
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class FileContentSymlink(ClosedModel):
-    "A symbolic link. Git records its target as arbitrary bytes, so the protocol carries canonical base64 rather than assuming UTF-8."
+    "A symbolic link whose target is carried as canonical base64."
 
     kind: Field[Literal["symlink"]] = proto_field()
     target: Field[str] = proto_field(
@@ -372,41 +155,24 @@ class FileContentSymlink(ClosedModel):
         return self
 
 
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class FileContentGitlink(ClosedModel):
-    "A submodule boundary: the parent repository records one child commit at this path. Tree, file, search, and adapter analysis treat the gitlink as one opaque entry and do not descend into the child checkout."
-
-    kind: Field[Literal["gitlink"]] = proto_field()
-    commit: Field[GitCommit] = proto_field(
-        description=(
-            "The child repository commit stored in the parent tree entry. Its hexadecimal "
-            "width matches the parent repository's object format. A separate Rift workspace "
-            "can open the child repository at this commit."
-        ),
-        number=1,
-    )
-
-
 @union(
     owner=CORE,
     oneof="variant",
     discriminator="kind",
     variants=(
         Variant("regular", "regular", 1, FileContentRegular),
-        Variant("lfs_pointer", "lfs_pointer", 2, FileContentLfsPointer),
-        Variant("symlink", "symlink", 3, FileContentSymlink),
-        Variant("gitlink", "gitlink", 4, FileContentGitlink),
+        Variant("symlink", "symlink", 2, FileContentSymlink),
     ),
     placement=Placement("content", 2),
     public=False,
 )
 class FileContent(ProtocolRoot):
-    "What the entry holds. Only a regular entry has source in it; the other three are paths that point elsewhere and carry no nodes."
+    "The bytes of a regular file or the target of a symbolic link."
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class File(ClosedModel):
-    "One source entry at a revision: what it is called, what it holds, and which languages read it. Physical entries come from the immutable source-store tree. A generated regular entry comes from adapter virtual output. Bytes are read from the same URI that identifies the entry."
+    "One file in the session projection and the languages that read it."
 
     model_config = closed_config(
         {
@@ -414,13 +180,7 @@ class File(ClosedModel):
                 {
                     "if": {
                         "properties": {
-                            "content": {
-                                "properties": {
-                                    "kind": {
-                                        "enum": ["lfs_pointer", "symlink", "gitlink"]
-                                    }
-                                }
-                            }
+                            "content": {"properties": {"kind": {"const": "symlink"}}}
                         }
                     },
                     "then": {
@@ -439,10 +199,7 @@ class File(ClosedModel):
         number=1,
     )
     content: Field[FileContent] = proto_field(
-        description=(
-            "What the entry holds. Only a regular entry has source in it; the other three are "
-            "paths that point elsewhere and carry no nodes."
-        ),
+        description="Regular-file metadata or a symbolic-link target.",
         number=2,
     )
     languages: Field[list[Language]] = proto_field(
@@ -474,7 +231,7 @@ class File(ClosedModel):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class ProjectEntryDirectory(ClosedModel):
-    """A derived directory containing at least one visible descendant at this snapshot."""
+    """A visible directory, including an empty one."""
 
     kind: Field[Literal["directory"]] = proto_field()
     path: Field[ProjectPath] = proto_field(
@@ -485,7 +242,7 @@ class ProjectEntryDirectory(ClosedModel):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class ProjectEntryFile(ClosedModel):
-    "A physical source-store entry with content and language ownership metadata. Generated virtual files remain outside the project tree listing."
+    "A file with its content and language ownership metadata."
 
     kind: Field[Literal["file"]] = proto_field()
     file: Field[File] = proto_field(
@@ -503,14 +260,14 @@ class ProjectEntryFile(ClosedModel):
     ),
 )
 class ProjectEntry(ProtocolRoot):
-    "One visible node in a project tree. Rift walks the immutable store tree at the requested snapshot, returning a derived directory path or the complete `File` for a content-bearing entry."
+    "One visible directory or file in the session projection."
 
 
 @scalar(
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\d+-\d+(\?rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26}))?$",
+    pattern=r"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\d+-\d+$",
     min_length=18,
     max_length=8192,
     examples=[
@@ -519,7 +276,7 @@ class ProjectEntry(ProtocolRoot):
     ],
 )
 class NodeId(ProtocolRoot):
-    """Identity and resource URI of one syntax-tree node. The first path segment is the language name followed by `:<dialect>` when a dialect is present. The remaining path is a canonical `ProjectPath`, followed by a half-open UTF-8 byte range. A revision can be attached as `?rev=`."""
+    """Identity of one syntax-tree node in the session projection."""
 
     @model_validator(mode="after")
     def span_is_canonical(self) -> NodeId:
@@ -543,9 +300,6 @@ class NodeId(ProtocolRoot):
             raise ValueError("node range start must not exceed end")
         if end > 9007199254740991:
             raise ValueError("node range exceeds exact protocol integers")
-        revision = _raw_query(self.root).get("rev")
-        if revision is not None:
-            validate_resource_revision(revision)
         return self
 
 
@@ -553,17 +307,17 @@ class NodeId(ProtocolRoot):
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}(\?(rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26})(&cursor=[A-Za-z0-9_-]{1,4096})?|cursor=[A-Za-z0-9_-]{1,4096}))?$",
+    pattern=r"^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}(\?cursor=[A-Za-z0-9_-]{1,4096})?$",
     min_length=17,
     max_length=12288,
     examples=[
-        "rift://symbol/python/pkg.util.load_config~1?rev=git:HEAD~3",
+        "rift://symbol/python/pkg.util.load_config~1",
         "rift://symbol/sql:postgresql/public.users",
         "rift://symbol/css:scss/theme.$accent",
     ],
 )
 class SymbolId(ProtocolRoot):
-    """Identity and resource URI of one symbol. The first path segment is the language name followed by `:<dialect>` when present. The adapter supplies the remaining qualified name and percent-encodes UTF-8 bytes outside URI path characters with uppercase hex. Where a namespace declares identical names, the adapter appends `~` and an index. A revision can be attached as `?rev=`."""
+    """Identity of one symbol in the session projection."""
 
     @model_validator(mode="after")
     def address_is_canonical(self) -> SymbolId:
@@ -576,9 +330,6 @@ class SymbolId(ProtocolRoot):
         if canonical != encoded_name:
             raise ValueError("symbol name must use canonical URI encoding")
         query = _raw_query(self.root)
-        revision = query.get("rev")
-        if revision is not None:
-            validate_resource_revision(revision)
         cursor = query.get("cursor")
         if cursor is not None:
             validate_base64url(cursor)
@@ -657,14 +408,14 @@ class Extensions(ProtocolRoot):
     pattern=r"^(?!/)(?!\.\.?(/|$))(?!.*(/\.\.?)(/|$))[^\\\u0000-\u001F\u007F]+$",
 )
 class PathPattern(ProtocolRoot):
-    """Project-relative Git-style glob using *, ?, **, and character classes; absolute, backslash, control, and '..' segments are forbidden."""
+    """Project-relative glob using *, ?, **, and character classes."""
 
 
 @scalar(
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^(?:$|(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)[^\\\u0000-\u001F\u007F/]+(?:/[^\\\u0000-\u001F\u007F/]+)*)$",
+    pattern=r"^(?:$|(?!\.rift(?:/|$))(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)[^\\\u0000-\u001F\u007F/]+(?:/[^\\\u0000-\u001F\u007F/]+)*)$",
     max_length=1000,
     examples=["", "src/config.ts", "packages/api/Cargo.toml"],
 )
@@ -678,6 +429,8 @@ class ProjectPath(ProtocolRoot):
     def utf8_size_is_bounded(self) -> ProjectPath:
         if len(self.root.encode("utf-8")) > 1000:
             raise ValueError("project path exceeds 1000 UTF-8 bytes")
+        if self.root == ".rift" or self.root.startswith(".rift/"):
+            raise ValueError("project path is inside Rift workspace state")
         return self
 
 
@@ -763,7 +516,7 @@ class SourceSpan(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class TextEdit(ClosedModel):
-    "One byte range of one file, and what replaces it. Offsets are into the file as it stands at the pinned snapshot, so edits in a set never observe each other, and two of them may not overlap."
+    "One byte range of one file and what replaces it. Edits in a set share one input state."
 
     kind: Field[Literal["replace"]] = proto_field(number=1)
     span: Field[SourceSpan] = proto_field(
@@ -780,30 +533,28 @@ class EditCreate(ClosedModel):
 
     kind: Field[Literal["create"]] = proto_field()
     file: Field[FileId] = proto_field(
-        description="A path that does not exist at the pinned snapshot. Extracting a module is the usual reason.",
+        description="A path that does not exist in the projection.",
         number=1,
     )
     text: Field[str] = proto_field(
         description="All UTF-8 source in the new file.", number=2
     )
     executable: Field[bool] = proto_field(
-        description="Whether Git records the new file as executable.", number=3
+        description="Whether the new file is executable.", number=3
     )
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class EditDelete(ClosedModel):
-    """Removing a file by path. The pinned snapshot supplies its previous entry and content identity."""
+    """Removing a file by path."""
 
     kind: Field[Literal["delete"]] = proto_field()
-    file: Field[FileId] = proto_field(
-        description="The file to remove, as it stands at the pinned snapshot.", number=1
-    )
+    file: Field[FileId] = proto_field(description="The file to remove.", number=1)
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class EditRename(ClosedModel):
-    """A move carries the source and destination paths. Its content stays in the existing Git object."""
+    """A move from one path to another."""
 
     kind: Field[Literal["rename"]] = proto_field()
     file: Field[FileId] = proto_field(
@@ -835,50 +586,10 @@ class EditSetExecutable(ClosedModel):
         description="Tags this as an executable-bit change."
     )
     file: Field[FileId] = proto_field(
-        description="The regular file whose Git mode changes.", number=1
+        description="The regular file whose executable bit changes.", number=1
     )
     executable: Field[bool] = proto_field(
         description="The executable bit the file has after the edit.", number=2
-    )
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class EditCreateGitlink(ClosedModel):
-    "Creating a submodule tree entry in the parent repository. A companion text edit updates `.gitmodules` when the mapping is new."
-
-    kind: Field[Literal["create_gitlink"]] = proto_field(
-        description="Tags this as creation of a gitlink entry."
-    )
-    file: Field[FileId] = proto_field(
-        description="A parent-repository path that does not exist at the pinned snapshot.",
-        number=1,
-    )
-    commit: Field[GitCommit] = proto_field(
-        description=(
-            "Child repository commit stored in the new gitlink. Its hexadecimal width matches "
-            "the parent repository's object format."
-        ),
-        number=2,
-    )
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class EditSetGitlink(ClosedModel):
-    "Updating an existing submodule entry to a different child commit. The operation changes the parent tree entry and does not read or mutate the child checkout."
-
-    kind: Field[Literal["set_gitlink"]] = proto_field(
-        description="Tags this as a gitlink commit update."
-    )
-    file: Field[FileId] = proto_field(
-        description="Existing gitlink in the parent repository at the pinned snapshot.",
-        number=1,
-    )
-    commit: Field[GitCommit] = proto_field(
-        description=(
-            "Child repository commit stored after the edit. Its hexadecimal width matches the "
-            "parent repository's object format."
-        ),
-        number=2,
     )
 
 
@@ -893,66 +604,10 @@ class EditSetGitlink(ClosedModel):
         Variant("rename", "rename", 4, EditRename),
         Variant("copy", "copy", 5, EditCopy),
         Variant("set_executable", "set_executable", 6, EditSetExecutable),
-        Variant("create_gitlink", "create_gitlink", 7, EditCreateGitlink),
-        Variant("set_gitlink", "set_gitlink", 8, EditSetGitlink),
     ),
 )
 class Edit(ProtocolRoot):
     "A filesystem effect described before Rift performs it. Edit sets are atomic and sorted bytewise by each edit's RFC 8785 canonical JSON. Text replacements in one set address the same input state and cannot overlap."
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class FileChange(ClosedModel):
-    "One file between two states. A creation has no `before`. A deletion has no `after`. A rename has different paths on each side. The path comes from `after.id`, or `before.id` after deletion."
-
-    before: Field[File | None] = proto_field(
-        description="The entry before the change. Null where the file did not exist.",
-        number=1,
-    )
-    after: Field[File | None] = proto_field(
-        description="The entry after the change. Null where the file was deleted.",
-        number=2,
-    )
-    edits: Field[list[TextEdit]] = proto_field(
-        description=(
-            "Text replacements that transform the `before` content into `after`. The "
-            "surrounding entries carry creation, deletion, and rename state."
-        ),
-        number=3,
-    )
-    truncated: Field[bool] = proto_field(
-        description="Whether edits were dropped to stay inside the size limit.",
-        number=4,
-    )
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern=r"^rift://diff\?from=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26})&to=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26})(?:&cursor=[A-Za-z0-9_-]{1,4096})?$",
-    min_length=15,
-    max_length=12288,
-    examples=[
-        "rift://diff?from=git:main&to=git:feature-x",
-        "rift://diff?from=git:HEAD~3&to=git:HEAD",
-    ],
-)
-class DiffId(ProtocolRoot):
-    """URI for one comparison. `from` and `to` independently use the resource revision
-    spelling, so Git names, Rift snapshots, and current projections cannot collide.
-
-    Append `&cursor=` to continue a paged read."""
-
-    @model_validator(mode="after")
-    def query_is_canonical(self) -> DiffId:
-        query = _raw_query(self.root)
-        validate_resource_revision(query["from"])
-        validate_resource_revision(query["to"])
-        cursor = query.get("cursor")
-        if cursor is not None:
-            validate_base64url(cursor)
-        return self
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
@@ -2029,7 +1684,7 @@ class Symbol(ClosedModel):
             "Unique identifier of this symbol across the whole workspace, and the URI that "
             "resolves it. Hand it to the symbol resource as it stands."
         ),
-        examples=["rift://symbol/python/pkg.util.load_config~1?rev=git:HEAD~3"],
+        examples=["rift://symbol/python/pkg.util.load_config~1"],
         number=1,
     )
     language: Field[Language] = proto_field(
@@ -3823,11 +3478,11 @@ class OperationVerifierAdapter(ClosedModel):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class OperationVerifierValidator(ClosedModel):
-    """One repository-declared command validator checked an integration tree."""
+    """One workspace command validator checked a changed tree."""
 
     kind: Field[Literal["validator"]] = proto_field()
     validator: Field[int] = proto_field(
-        description="Zero-based position in repository validator declarations.",
+        description="Zero-based position in workspace validator declarations.",
         ge=0,
         le=4294967295,
         number=1,
@@ -3836,7 +3491,7 @@ class OperationVerifierValidator(ClosedModel):
 
 @definition(owner=CORE, public=False, proto=Proto.empty(), schema_extra={})
 class OperationVerifierRift(ClosedModel):
-    """Rift itself checked repository state."""
+    """Rift itself checked projection state."""
 
     kind: Field[Literal["rift"]] = proto_field()
 
@@ -3872,14 +3527,6 @@ class PreconditionValueCount(ClosedModel):
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class PreconditionValueSnapshot(ClosedModel):
-    """Pinned project state used by stale-state checks."""
-
-    kind: Field[Literal["snapshot"]] = proto_field()
-    value: Field[Snapshot] = proto_field(number=1)
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class PreconditionValueCoverage(ClosedModel):
     """Coverage required or observed for an adapter fact family."""
 
@@ -3902,13 +3549,12 @@ class PreconditionValueText(ClosedModel):
     variants=(
         Variant("boolean", "boolean", 1, PreconditionValueBoolean),
         Variant("count", "count", 2, PreconditionValueCount),
-        Variant("snapshot", "snapshot", 3, PreconditionValueSnapshot),
-        Variant("coverage", "coverage", 4, PreconditionValueCoverage),
-        Variant("text", "text", 5, PreconditionValueText),
+        Variant("coverage", "coverage", 3, PreconditionValueCoverage),
+        Variant("text", "text", 4, PreconditionValueText),
     ),
 )
 class PreconditionValue(ProtocolRoot):
-    "A typed value compared by an operation precondition. The tag prevents a snapshot string, a name, and a count rendered as text from becoming indistinguishable."
+    "A typed value compared by an operation precondition."
 
 
 @definition(
@@ -4011,7 +3657,7 @@ class OperationPrecondition(ClosedModel):
     )
     expected: Field[PreconditionValue] = proto_field(
         description=(
-            "Required value. Examples include the discovered snapshot, zero remaining usages, "
+            "Required value. Examples include the discovered head, zero remaining usages, "
             "or complete coverage."
         ),
         number=6,
@@ -4109,7 +3755,7 @@ class OperationEffect(ClosedModel):
     after: Field[list[Address]] = proto_field(
         description=(
             "Subjects after Rift applies the change and every adapter sharing the projection "
-            "acknowledges the new snapshot. Empty for deletion."
+            "acknowledges the new head. Empty for deletion."
         ),
         number=3,
     )
@@ -4186,7 +3832,7 @@ class GuaranteeKind(str, Enum):
             "construction": "Rift established the property directly from its closed edit and transaction rules.",
             "adapter": "The language adapter or resolver checked the transformed program.",
             "static_analysis": "A named language analysis checked a property narrower than compilation.",
-            "validator": "A repository-declared command validator checked the integration tree.",
+            "validator": "A workspace command validator checked the changed tree.",
         }
     },
 )
@@ -4218,7 +3864,7 @@ class GuaranteeEvidence(ClosedModel):
                 "construction": "Rift established the property directly from its closed edit and transaction rules.",
                 "adapter": "The language adapter or resolver checked the transformed program.",
                 "static_analysis": "A named language analysis checked a property narrower than compilation.",
-                "validator": "A repository-declared command validator checked the integration tree.",
+                "validator": "A workspace command validator checked the changed tree.",
             }
         },
     )
@@ -4257,7 +3903,7 @@ class GuaranteeEvidence(ClosedModel):
             "unresolved_reference": "The adapter found a reference it could not classify or update.",
             "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
             "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
-            "command_validator": "A repository-declared command validator will execute against the integration tree.",
+            "command_validator": "A workspace command validator will check the changed tree.",
         }
     },
 )
@@ -4275,7 +3921,7 @@ class ConfirmationRequirementKind(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class ConfirmationRequirement(ClosedModel):
-    "One effect a caller must acknowledge before a change commits. Requirements are sorted by kind, source location, title, and detail, then numbered from zero. An acknowledgement applies only to a retry of the same operation and expected head."
+    "One effect a caller must acknowledge before a change becomes visible. Requirements are sorted by kind, source location, title, and detail, then numbered from zero. An acknowledgement applies to a retry of the same operation and expected head."
 
     id: Field[int] = proto_field(
         description="Zero-based position in the refusal's ordered confirmation list.",
@@ -4296,7 +3942,7 @@ class ConfirmationRequirement(ClosedModel):
                 "unresolved_reference": "The adapter found a reference it could not classify or update.",
                 "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
                 "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
-                "command_validator": "A repository-declared command validator will execute against the integration tree.",
+                "command_validator": "A workspace command validator will check the changed tree.",
             }
         },
     )
@@ -4575,9 +4221,8 @@ class AdapterOperation(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class CodeBlock(ClosedModel):
-    """Caller-provided source evaluated by an adapter in the project runtime selected for one
-    exact snapshot. It is sent over the adapter seam and is never written into the repository
-    snapshot."""
+    """Caller-provided source evaluated against a session projection. It is never written back
+    to that projection."""
 
     source: Field[str] = proto_field(
         description="UTF-8 source to evaluate as one language-specific block.",
@@ -4589,7 +4234,7 @@ class CodeBlock(ClosedModel):
         default="",
         description=(
             "Project-relative directory used as the evaluation working directory. The empty "
-            "path selects the project root. It must name a directory in the resolved snapshot."
+            "path selects the project root. It must name a directory in the projection."
         ),
         number=2,
     )
@@ -4781,8 +4426,8 @@ class DebugFrame(ClosedModel):
     )
     source: Field[SourceSpan | None] = proto_field(
         description=(
-            "Source location in the pinned repository snapshot, or null for runtime and "
-            "synthetic code. The caller-provided block itself has no repository span."
+            "Source location in the projection, or null for runtime and synthetic code. The "
+            "caller-provided block itself has no source span."
         ),
         number=3,
     )
@@ -4815,7 +4460,7 @@ class ActionKind(ProtocolRoot):
     examples=["rift://match/eyJzbmFwc2hvdCI6eyJraW5kIjoiY29tbWl0In19"],
 )
 class MatchId(ProtocolRoot):
-    """Identity of one match, and the URI that resolves it. The segment after `rift://match/` is base64url of the RFC 8785 canonical JSON holding the snapshot it was found in, the span it landed on, and the query that produced it. Rift decodes the segment and retains nothing. The identity survives restart, but resolution can return `snapshot_not_found` after its unpinned snapshot is collected. A span found by two queries denotes two matches."""
+    """Identity of one match at a projection head."""
 
     @model_validator(mode="after")
     def token_is_canonical(self) -> MatchId:
@@ -4833,7 +4478,7 @@ class MatchId(ProtocolRoot):
     examples=["rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ"],
 )
 class ActionOfferId(ProtocolRoot):
-    """Identity of one discovered adapter action, and the URI that resolves it. The segment after `rift://action/` is base64url of the RFC 8785 canonical JSON holding the snapshot it was discovered in, the language whose adapter minted it, and the opaque adapter token. The identifier creates no retention lease. Reading it can return `snapshot_not_found` after collection, or `stale_action` when its adapter state is gone."""
+    """Identity of one adapter action at a projection head."""
 
     @model_validator(mode="after")
     def token_is_canonical(self) -> ActionOfferId:
@@ -4844,15 +4489,7 @@ class ActionOfferId(ProtocolRoot):
 MODELS = (
     ProtocolVersion,
     Digest,
-    GitRevision,
-    Revision,
-    GitCommit,
-    Projection,
     ProjectionHead,
-    SnapshotId,
-    Snapshot,
-    ResolvedSnapshot,
-    ProjectionBase,
     ProjectionState,
     LanguageRegion,
     FileId,
@@ -4872,8 +4509,6 @@ MODELS = (
     SourceSpan,
     TextEdit,
     Edit,
-    FileChange,
-    DiffId,
     OriginMapping,
     CoverageScope,
     Coverage,

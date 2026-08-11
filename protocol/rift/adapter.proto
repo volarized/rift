@@ -1,11 +1,10 @@
 syntax = "proto3";
 // Generated from the Pydantic models under protocol/src/rift/models. Do not edit.
 // The Rift server owns at most one configured adapter process per exact Language and calls it
-// over gRPC on a Unix domain socket. The process can hold states for several snapshots and back
-// them with separate runtime workers. Rift resolves revisions and supplies server-owned
-// projections; adapters never allocate or switch them. Different-language adapters may open the
-// same tree. Rift serializes source writes, then refreshes every adapter that holds the
-// projection.
+// over gRPC on a Unix domain socket. The process can hold several projection states and back
+// them with separate runtime workers. Rift supplies each adapter state with a server-owned
+// projection. Different-language adapters may open the same tree. Rift serializes source
+// writes, then refreshes every adapter that holds the projection.
 package rift.adapter;
 import "rift/core.proto";
 import "google/protobuf/descriptor.proto";
@@ -17,9 +16,9 @@ extend google.protobuf.MessageOptions {
 enum CacheScope {
   // No cache claim. Rift treats the result as request-volatile.
   CACHE_SCOPE_UNSPECIFIED = 0;
-  // The source snapshot, adapter implementation, language, and derived virtual inputs determine
-  // the result.
-  SNAPSHOT = 1;
+  // The projection head, adapter implementation, language, and virtual inputs determine the
+  // result.
+  PROJECTION = 1;
   // Adapter-observed external state also affects the result. Retention ends with the process or
   // adapter-state generation.
   PROCESS = 2;
@@ -140,7 +139,7 @@ message AuxiliaryClaim {
 }
 // Paths inside the workspace that this adapter writes to. Rift
 // classifies each claimed subtree as adapter output and excludes it from
-// source analysis, snapshot diffs, and agent results.
+// source analysis and agent results.
 // Write claims are exclusive across adapters sharing a connection projection. Rift
 // refuses workspace admission when two adapters can write the same path; one
 // of them must redirect that output to its private state_root.
@@ -160,7 +159,7 @@ message WriteClaim {
   // several directories.
   repeated string path_suffixes = 2;
   // Why the adapter needs it, in one line. Rift logs this when a claim shadows
-  // a file the repository actually tracks, which is nearly always a mistake.
+  // a workspace file, which is nearly always a mistake.
   string reason = 3;
 }
 // One kind this adapter emits, and the portable facets it carries. Which facet
@@ -229,52 +228,44 @@ message AdapterLimits {
 // do not select the project runtime used for one adapter state.
 message RuntimeRequirements {
   option (section) = "Capabilities";
-  // Whether the adapter executes code from the repository — a build script, a
-  // plugin, a macro.
-  bool executes_repository_code = 1;
+  // Whether the adapter executes workspace code, such as a build script, plugin, or macro.
+  bool executes_workspace_code = 1;
   // Whether the adapter spawns subprocesses, including runtime workers selected for individual
   // adapter states.
   bool spawns_subprocesses = 2;
 }
-// One adapter's state for a server-owned filesystem projection. Every call that reads code
+// One adapter's state for a Rift FS projection. Every call that reads code
 // carries it. The adapter may back different states with different project
 // runtimes. A call naming an earlier state receives `StaleState`.
 message AdapterState {
   option (section) = "Adapter state";
-  // Stable filesystem projection identity this adapter state reads.
-  string projection = 1;
-  // The state the files in it hold.
-  rift.core.Snapshot snapshot = 2;
+  // Projection head the adapter has read.
+  string head = 2;
   // Adapter-local state generation. Open mints the first value;
   // Refresh and SyncVirtual advance it. Calls carrying an earlier generation
-  // receive StaleState even when the source snapshot is unchanged.
+  // receive StaleState even when the projection head is unchanged.
   uint64 generation = 3;
 }
-// Open one complete server-owned filesystem projection in the adapter. Rift resolved
-// the requested revision and mounted this exact snapshot before the call. The adapter
-// does not allocate or rebind projections. It
-// may inspect revision-local configuration and select or start the project runtime
-// for this state.
+// Open one Rift FS projection in the adapter. The adapter
+// may inspect its files and select or start the project runtime for this state.
 message OpenRequest {
   option (section) = "Adapter state";
-  // Stable identity of the projection supplied to this adapter state.
-  string projection = 1;
   // Absolute path to a directory the adapter owns and Rift never reads. Build
   // output belongs here — point CARGO_TARGET_DIR and friends at it. Every open
   // adapter state receives a distinct path, and Rift never reuses that path after
   // Close. An adapter may maintain its own shared read-only cache
   // outside this directory when its adapter supports safe sharing.
   string state_root = 2;
-  // The state that tree holds.
-  rift.core.Snapshot snapshot = 3;
+  // Current projection head.
+  string head = 3;
   // Exact contract selected from the adapter's `Capabilities.contracts`.
   rift.adapter.AdapterContract contract = 4;
-  // Absolute mounted path for `projection`. Other adapters can receive the same path. Adapter
+  // Absolute Rift FS path for `projection`. Other adapters can receive the same path. Adapter
   // output goes to `state_root` or a declared WriteClaim scratch subtree.
   string root = 5;
 }
-// Rift rebound the projection to an exact snapshot under its write barrier. It sends
-// this call to every language adapter holding the shared path. Paths are
+// Rift changed files in a projection. It sends this call to every language
+// adapter holding the shared path. Paths are
 // project-relative and cover every file Rift touched; each adapter decides
 // which changes affect its adapter. Content is on disk before this call. The adapter
 // reselects its project runtime when runtime-defining inputs have changed.
@@ -283,8 +274,8 @@ message RefreshRequest {
   // The state the adapter last acknowledged. A mismatch means Rift and the
   // adapter disagree about what is on disk, and comes back as StaleState.
   rift.adapter.AdapterState from = 1;
-  // The exact source snapshot the projection holds now.
-  rift.core.Snapshot to = 2;
+  // Projection head after the listed changes.
+  string to = 2;
   // Files created or overwritten since `from`, as `rift://file/<path>`.
   repeated string written = 3;
   // Files deleted since `from`. A rename arrives as one of each.
@@ -294,13 +285,13 @@ message RefreshRequest {
 // sends exactly one `start` event first, then each `unit` followed by ordered
 // `text` chunks ending in `final: true`. The complete stream replaces the
 // previous overlay; an RPC failure leaves the previous generation intact. The
-// units are the complete set selected for this consumer at `start.snapshot`,
+// units are the complete set selected for this consumer at `start.head`,
 // including an empty set when every previous unit has been retracted.
 message VirtualSyncEvent {
   option (section) = "Adapter state";
   oneof event {
     // Current adapter-local state. The returned AdapterState keeps its
-    // snapshot and advances its generation.
+    // head and advances its generation.
     rift.adapter.AdapterState start = 1;
     // One virtual file whose exact Language matches this adapter.
     rift.adapter.VirtualUnit unit = 2;
@@ -308,13 +299,12 @@ message VirtualSyncEvent {
     rift.adapter.VirtualText text = 3;
   }
 }
-// Release adapter state for this projection so Rift can unmount or rebind it.
+// Release one open adapter state.
 message CloseRequest {
   option (section) = "Adapter state";
-  string projection = 1;
+  rift.adapter.AdapterState state = 1;
 }
-// Read selected claimed physical or synced virtual sources at one state. A
-// physical unit below a gitlink is an adapter protocol error.
+// Read selected claimed physical or synced virtual sources at one state.
 message AnalyzeRequest {
   option (section) = "Analysis";
   rift.adapter.AdapterState state = 1;
@@ -527,7 +517,7 @@ message Matches {
   repeated rift.adapter.StructuralMatch items = 1;
 }
 // One match, as the adapter found it. It carries no identity of its own: a
-// `MatchKey` is the snapshot, the query and the span, and Rift already holds
+// `MatchKey` is the projection head, query and span, and Rift already holds
 // the first two, so the span below completes it.
 message StructuralMatch {
   option (section) = "Matching";
@@ -620,10 +610,10 @@ message ResolveResponse {
 }
 // Evaluate one caller-provided block in the project runtime selected for a pinned adapter
 // state. Rift gives this call a disposable execution workspace, so evaluated code never runs in
-// a shared read, session, or integration projection.
+// the session projection.
 message ExecuteRequest {
   option (section) = "Execution";
-  // Exact snapshot and adapter generation to evaluate against.
+  // Exact projection head and adapter generation to evaluate against.
   rift.adapter.AdapterState state = 1;
   // Source and project-relative working directory.
   rift.core.CodeBlock block = 2;
@@ -739,8 +729,7 @@ service Adapter {
   // What this adapter can do, asked once before anything else. Rift holds the
   // adapter to exactly what it claims here and never probes or feature-tests.
   rpc Describe (google.protobuf.Empty) returns (rift.adapter.Capabilities);
-  // Here is the server-owned projection for an exact snapshot. The tree exists before this
-  // call, so the adapter can inspect complete source, select any revision-appropriate runtime
+  // Here is the Rift FS projection. The adapter can inspect its source, select a runtime
   // worker, and initialize state.
   rpc Open (rift.adapter.OpenRequest) returns (rift.adapter.AdapterState);
   // The files on disk moved to a new state, and these are the paths that changed. The adapter

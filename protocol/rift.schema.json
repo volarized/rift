@@ -39,10 +39,10 @@
     },
     "CommandValidator": {
       "additionalProperties": false,
-      "description": "An integration check from the workspace-root `rift.toml`, executed directly without a shell in a disposable validation workspace materialized from the complete merged tree. The workspace is the process working directory and does not isolate the command from the host.",
+      "description": "A command from the workspace-root `rift.toml`, run without a shell against a disposable copy of the changed tree.",
       "properties": {
         "id": {
-          "description": "Repository label shown with this validator. It is unique within `validators.commands`.",
+          "description": "Label shown with this validator. It is unique within `validators.commands`.",
           "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
           "rift:proto": {
             "number": 1
@@ -106,7 +106,7 @@
           "type": "integer"
         },
         "output_limit_bytes": {
-          "description": "Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the omitted size. The upper bound keeps one escaped validator result inside one bounded integration result.",
+          "description": "Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the omitted size. The upper bound keeps one escaped validator result inside one bounded result.",
           "maximum": 4096,
           "minimum": 256,
           "rift:proto": {
@@ -116,7 +116,7 @@
           "type": "integer"
         },
         "guarantees": {
-          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result rejects integration.",
+          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result rejects publication.",
           "items": {
             "$ref": "#/$defs/CommandValidatorGuarantees"
           },
@@ -153,7 +153,7 @@
       "type": "object"
     },
     "CommandValidatorChangedPaths": {
-      "description": "Whether Rift appends the merged tree's changed `ProjectPath` values to `argv` in byte order.",
+      "description": "Whether Rift appends changed `ProjectPath` values to `argv` in byte order.",
       "enum": [
         "none",
         "append"
@@ -204,7 +204,7 @@
     },
     "CommandValidatorGuarantees": {
       "additionalProperties": false,
-      "description": "What a passing run of one configured command establishes over the merged tree.",
+      "description": "What a passing run of one configured command establishes.",
       "properties": {
         "kind": {
           "$ref": "#/$defs/GuaranteeKind",
@@ -244,7 +244,7 @@
       "type": "object"
     },
     "CommandValidatorKind": {
-      "description": "How repository configuration presents this check.",
+      "description": "How workspace configuration presents this check.",
       "enum": [
         "test",
         "lint",
@@ -519,15 +519,15 @@
       "type": "object"
     },
     "FileId": {
-      "description": "Identity of one file, and the URI that resolves it. The path after `rift://file/` is a `ProjectPath`: unreserved URI characters remain literal, `/` separates segments, and every other UTF-8 byte uses uppercase percent-encoding. Decoding to an absolute path or a `.` or `..` segment is refused. A revision can be attached as `?rev=`.",
+      "description": "Identity of one file in the session projection. The path after `rift://file/` is a\ncanonical project-relative path.",
       "examples": [
         "rift://file/pkg/util.py",
         "rift://file/src/%E2%98%83.ts",
-        "rift://file/src/config.ts?rev=git:main"
+        "rift://file/src/config.ts"
       ],
       "maxLength": 8192,
       "minLength": 13,
-      "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}(\\?rev=(?:git:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2}){1,256}|snapshot:snap_[0-9a-f]{64}|projection:prj_[a-z2-7]{26}))?$",
+      "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
       "rift:package": "rift.core",
       "rift:proto": {
         "package": "rift.core",
@@ -590,7 +590,7 @@
         "packages/api/Cargo.toml"
       ],
       "maxLength": 1000,
-      "pattern": "^(?:$|(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+      "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
       "rift:package": "rift.core",
       "rift:proto": {
         "package": "rift.core",
@@ -599,30 +599,9 @@
       "title": "ProjectPath",
       "type": "string"
     },
-    "SessionBase": {
-      "description": "Source state from which a new MCP process starts its session.",
-      "enum": [
-        "head"
-      ],
-      "title": "SessionBase",
-      "type": "string"
-    },
-    "SessionConfig": {
-      "additionalProperties": false,
-      "description": "Initial state for each MCP session.",
-      "properties": {
-        "base": {
-          "$ref": "#/$defs/SessionBase",
-          "default": "head",
-          "description": "State imported into the session projection. `head` imports the resolved HEAD tree."
-        }
-      },
-      "title": "SessionConfig",
-      "type": "object"
-    },
     "ValidationConfig": {
       "additionalProperties": false,
-      "description": "Adapter validation reports required for session changes and integration.",
+      "description": "Adapter validation reports required for projection changes and publication.",
       "properties": {
         "require": {
           "anyOf": [
@@ -650,7 +629,7 @@
     },
     "ValidatorsConfig": {
       "additionalProperties": false,
-      "description": "Repository-declared command checks requested before integration.",
+      "description": "Workspace command checks requested before publication.",
       "properties": {
         "commands": {
           "description": "Exact command declarations, in execution order.",
@@ -659,15 +638,6 @@
           },
           "title": "Commands",
           "type": "array"
-        },
-        "carry": {
-          "description": "Ignored project paths copied into each disposable validation workspace.",
-          "items": {
-            "$ref": "#/$defs/ProjectPath"
-          },
-          "title": "Carry",
-          "type": "array",
-          "uniqueItems": true
         }
       },
       "title": "ValidatorsConfig",
@@ -677,9 +647,6 @@
   "additionalProperties": false,
   "description": "The typed rift.toml file. Configuration reuses protocol enums and paths, and carries machine-checked links to the fields it bounds.",
   "properties": {
-    "session": {
-      "$ref": "#/$defs/SessionConfig"
-    },
     "execution": {
       "$ref": "#/$defs/ExecutionConfig"
     },
@@ -693,7 +660,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/AdapterProcessConfig"
       },
-      "description": "Configured adapter processes keyed by repository-local process name. Each process answers Describe with its exact core.Language and adapter capabilities.",
+      "description": "Configured adapter processes keyed by workspace-local process name. Each process answers Describe with its exact core.Language and adapter capabilities.",
       "propertyNames": {
         "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
       },
@@ -702,7 +669,7 @@
       "type": "object"
     }
   },
-  "title": "Rift repository configuration",
+  "title": "Rift workspace configuration",
   "type": "object",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://volar.sh/rift/protocol/rift.schema.json"

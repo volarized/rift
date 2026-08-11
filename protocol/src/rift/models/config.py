@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from enum import Enum
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
@@ -92,21 +91,6 @@ class LanguageSelector(RootModel[str]):
     def to_language(self) -> core.Language:
         name, separator, dialect = self.root.partition(":")
         return core.Language(name=name, dialect=dialect if separator else None)
-
-
-class SessionBase(str, Enum):
-    """Source state from which a new MCP process starts its session."""
-
-    HEAD = "head"
-
-
-class SessionConfig(ConfigModel):
-    """Initial state for each MCP session."""
-
-    base: SessionBase = Field(
-        default=SessionBase.HEAD,
-        description="State imported into the session projection. `head` imports the resolved HEAD tree.",
-    )
 
 
 AllowedLanguages = Annotated[
@@ -306,7 +290,7 @@ RequiredLanguages = Annotated[
 
 
 class ValidationConfig(ConfigModel):
-    """Adapter validation reports required for session changes and integration."""
+    """Adapter validation reports required for projection changes and publication."""
 
     require: Literal["available"] | RequiredLanguages = Field(
         default="available",
@@ -327,16 +311,11 @@ class ValidationConfig(ConfigModel):
 
 
 class ValidatorsConfig(ConfigModel):
-    """Repository-declared command checks requested before integration."""
+    """Workspace command checks requested before publication."""
 
     commands: list[mcp.CommandValidator] = Field(
         default_factory=list,
         description="Exact command declarations, in execution order.",
-    )
-    carry: list[core.ProjectPath] = Field(
-        default_factory=list,
-        description="Ignored project paths copied into each disposable validation workspace.",
-        json_schema_extra={"uniqueItems": True},
     )
 
     @model_validator(mode="after")
@@ -344,9 +323,6 @@ class ValidatorsConfig(ConfigModel):
         ids = [command.id for command in self.commands]
         if len(ids) != len(set(ids)):
             raise ValueError("validators.commands ids must be unique")
-        carried = [path.root for path in self.carry]
-        if len(carried) != len(set(carried)):
-            raise ValueError("validators.carry paths must be unique")
         return self
 
 
@@ -380,14 +356,13 @@ class AdapterProcessConfig(ConfigModel):
 class RiftConfig(ConfigModel):
     """Workspace behavior loaded from the physical root's ``rift.toml``."""
 
-    session: SessionConfig = Field(default_factory=SessionConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     validators: ValidatorsConfig = Field(default_factory=ValidatorsConfig)
     adapters: dict[str, AdapterProcessConfig] = Field(
         default_factory=dict,
         description=(
-            "Configured adapter processes keyed by repository-local process name. Each process "
+            "Configured adapter processes keyed by workspace-local process name. Each process "
             "answers Describe with its exact core.Language and adapter capabilities."
         ),
         json_schema_extra={
@@ -415,8 +390,6 @@ __all__ = [
     "ExecutionConfig",
     "LanguageSelector",
     "RiftConfig",
-    "SessionBase",
-    "SessionConfig",
     "ValidationConfig",
     "ValidatorsConfig",
 ]

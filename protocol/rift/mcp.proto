@@ -4,15 +4,6 @@ syntax = "proto3";
 package rift.mcp;
 import "rift/core.proto";
 import "google/protobuf/struct.proto";
-// Lifecycle and write policy of one filesystem projection.
-enum ProjectionKind {
-  // The caller did not set a value.
-  PROJECTION_KIND_UNSPECIFIED = 0;
-  // Persistent writable source state owned by one session.
-  PROJECTION_KIND_SESSION = 1;
-  // Explicitly opened immutable snapshot for external read-only tools.
-  PROJECTION_KIND_READ = 2;
-}
 // Why a request failed, as a stable code a caller branches on. The code is the complete
 // classification. Domain results such as unsupported coverage and edit refusal use their typed
 // result values.
@@ -29,97 +20,66 @@ enum ErrorCode {
   // The connection cannot perform this operation: a path leaves the workspace, or a debugging
   // session belongs to another connection. The same request fails the same way.
   ERROR_CODE_PERMISSION_DENIED = 3;
-  // The exact Rift snapshot is no longer retained. Current heads and live resources pin their
-  // snapshots; a copied identifier alone does not. Re-read or re-import it.
-  ERROR_CODE_SNAPSHOT_NOT_FOUND = 4;
-  // The exact source snapshot still exists, but the adapter state supplied with a semantic
-  // identity belongs to another snapshot. Re-read semantic facts against the selected snapshot.
-  ERROR_CODE_SEMANTIC_SNAPSHOT_MISMATCH = 5;
-  // The revision resolves, but Rift has no index for it yet: the adapters are still analysing,
-  // or that state's facts were dropped. Retrying once indexing catches up succeeds.
-  ERROR_CODE_SEMANTIC_SNAPSHOT_UNAVAILABLE = 6;
-  // The identity is well-formed and resolves to nothing — no such symbol, no such file at that
-  // revision, or a debug session already stopped or expired. Retrying does not help.
-  ERROR_CODE_RESOURCE_NOT_FOUND = 7;
-  // The entry is known but its bytes cannot be produced: an LFS object Rift does not fetch, or
-  // a blob the object store cannot read. Retrying does not help.
-  ERROR_CODE_CONTENT_UNAVAILABLE = 8;
+  // The identity is well-formed and resolves to nothing — no such symbol, no such filesystem
+  // entry, or a debug session already stopped or expired. Retrying does not help.
+  ERROR_CODE_RESOURCE_NOT_FOUND = 4;
+  // The entry is known but its bytes cannot be read. Retrying does not help.
+  ERROR_CODE_CONTENT_UNAVAILABLE = 5;
   // The cursor is malformed, or it was minted for a different request, order or page size.
   // Start the query again from its first page.
-  ERROR_CODE_CURSOR_INVALID = 9;
-  // The cursor is well-formed but the state it was minted against has moved, so continuing it
-  // would splice two different answers together. Start again against the current state.
-  ERROR_CODE_CURSOR_SNAPSHOT_MISMATCH = 10;
+  ERROR_CODE_CURSOR_INVALID = 6;
   // The caller cancelled, or the connection went away before the request finished. Sending it
   // again is fine.
-  ERROR_CODE_CANCELLED = 11;
+  ERROR_CODE_CANCELLED = 7;
   // The request ran past its time budget. A smaller one may succeed — a lower `limit`, a
   // narrower path selector — and so may the same one once a cold adapter has warmed up.
-  ERROR_CODE_DEADLINE_EXCEEDED = 12;
+  ERROR_CODE_DEADLINE_EXCEEDED = 8;
   // A request or a response crossed an advertised limit. `limit` says which one and by how
   // much, so the request can be resized and sent again.
-  ERROR_CODE_LIMIT_EXCEEDED = 13;
-  // The required projection has an open writable handle, in-flight mutation, or operation
-  // barrier that prevents removal or recovery. The error identifies the projection. Retry after
-  // the owner completes or closes it.
-  ERROR_CODE_PROJECTION_BUSY = 14;
+  ERROR_CODE_LIMIT_EXCEEDED = 9;
+  // The session has an in-flight Rift FS mutation that prevents this operation. Retry after
+  // that mutation completes.
+  ERROR_CODE_PROJECTION_BUSY = 10;
   // A configured adapter could serve this request, but its process failed to start or died.
   // Retrying can succeed after the process restarts.
-  ERROR_CODE_ADAPTER_UNAVAILABLE = 15;
+  ERROR_CODE_ADAPTER_UNAVAILABLE = 11;
   // An adapter contract is unusable. Causes include a malformed message, a field outside its
   // range, ambiguous source or virtual claims, overlapping write claims, a virtual path
   // collision, and a cycle in virtual-source routing. Correct the adapter configuration before
   // retrying.
-  ERROR_CODE_ADAPTER_PROTOCOL_ERROR = 16;
+  ERROR_CODE_ADAPTER_PROTOCOL_ERROR = 12;
   // The adapter took the call and did not answer inside its budget. Retrying can work: a cold
   // adapter on a large workspace is slow once and fast afterwards.
-  ERROR_CODE_ADAPTER_TIMEOUT = 17;
-  // Rift could not read or write the persistent store, mounted projection, Git objects or refs,
-  // or the repository-local control directory. Worth retrying only if the cause was transient,
-  // such as a disk that has since been cleared.
-  ERROR_CODE_STORAGE_FAILURE = 18;
+  ERROR_CODE_ADAPTER_TIMEOUT = 13;
+  // Rift could not read or write workspace or projection files. Worth retrying only if the
+  // cause was transient, such as a disk that has since been cleared.
+  ERROR_CODE_STORAGE_FAILURE = 14;
   // Rift could not prepare the validation workspace, launch the command validator, enforce its
   // timeout, or capture its output. One retry is reasonable when the host failure was
   // transient.
-  ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 19;
+  ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 15;
   // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected to
   // answer differently.
-  ERROR_CODE_INTERNAL_ERROR = 20;
-  // Git contains a path the protocol or host filesystem cannot represent safely. The same
-  // snapshot remains unusable until that path changes.
-  ERROR_CODE_UNSUPPORTED_PATH = 21;
+  ERROR_CODE_INTERNAL_ERROR = 16;
+  // The workspace contains a path the protocol cannot represent safely.
+  ERROR_CODE_UNSUPPORTED_PATH = 17;
   // The cursor is valid, but its captured result page set left the process-local cache. Start
   // again from the first page.
-  ERROR_CODE_CURSOR_EXPIRED = 22;
-  // A projection head names a missing tree or blob, a digest is wrong, or a store invariant
-  // failed. Rift stops mutations until a local state check repairs or exports the readable
-  // state.
-  ERROR_CODE_STATE_CORRUPT = 23;
+  ERROR_CODE_CURSOR_EXPIRED = 18;
   // The resource exists but is in use. Another connection owns the session, a retained debugger
   // blocks continuation, or a disposable workspace is still releasing. Retry after that owner
   // or operation finishes.
-  ERROR_CODE_TEMPORARILY_UNAVAILABLE = 24;
+  ERROR_CODE_TEMPORARILY_UNAVAILABLE = 19;
   // The workspace-root `rift.toml` does not satisfy its schema. New requests remain blocked
   // until the file is valid.
-  ERROR_CODE_CONFIGURATION_INVALID = 25;
-  // A cleanup or recovery request names a projection token that is no longer current. Read the
+  ERROR_CODE_CONFIGURATION_INVALID = 20;
+  // A change or cleanup request names a projection token that is no longer current. Read the
   // projection again before retrying.
-  ERROR_CODE_PROJECTION_HEAD_MOVED = 26;
+  ERROR_CODE_PROJECTION_HEAD_MOVED = 21;
   // The tool exists, but the workspace configuration and configured adapters cannot serve this
-  // operation for the requested language. Read the repository resource again after `rift.toml`
+  // operation for the requested language. Read the workspace resource again after `rift.toml`
   // or adapter availability changes.
-  ERROR_CODE_CAPABILITY_UNAVAILABLE = 27;
-  // A Git selector does not resolve locally to a commit, or a required object is missing from a
-  // shallow or partial repository. Rift never fetches implicitly.
-  ERROR_CODE_GIT_REVISION_NOT_FOUND = 28;
-  // The named filesystem projection no longer exists.
-  ERROR_CODE_PROJECTION_NOT_FOUND = 29;
-  // The projection exists, but its filesystem frontend or mount is not serving. Retry after the
-  // server reconnects or remounts it.
-  ERROR_CODE_PROJECTION_UNAVAILABLE = 30;
-  // A recovery cleanup request names an index/worktree manifest that is no longer current. List
-  // recoveries again and review the changed bytes before retrying.
-  ERROR_CODE_RECOVERY_MOVED = 31;
+  ERROR_CODE_CAPABILITY_UNAVAILABLE = 22;
 }
 // Stable retry instruction for one failed request. `deadline_exceeded` can permit the same
 // request; `invalid_request` requires changed input.
@@ -131,29 +91,26 @@ enum RetryDirective {
   // Send the same bytes again. The cause was transient — a busy projection, an adapter still
   // starting.
   RETRY_DIRECTIVE_SAME_REQUEST = 2;
-  // The state moved under the request. Re-read the current state, rebuild whatever was pinned
-  // to the old one, then ask again.
-  RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
+  // The projection moved. Read its current head before retrying.
+  RETRY_DIRECTIVE_REFRESH_PROJECTION = 3;
   // A local state command or configuration change must resolve the condition before another
   // request can succeed.
   RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
 }
-// Why Rift declined a change or integration. A refusal is a completed decision with evidence,
-// not a transport failure; `ErrorData` carries failures that never reached a decision.
+// Why Rift declined a change. A refusal is a completed decision; `ErrorData` carries transport
+// and infrastructure failures.
 enum RefusalReason {
   // The caller did not set a value.
   REFUSAL_REASON_UNSPECIFIED = 0;
-  // No adapter implements this operation for the language it reaches, or repository state
-  // cannot satisfy the contract.
+  // No adapter implements this operation for the language it reaches.
   REFUSAL_REASON_UNSUPPORTED = 1;
   // A condition checked before resolution failed. The failed entry is in `preconditions`.
   REFUSAL_REASON_UNMET_PRECONDITION = 2;
   // The address resolves to several targets. Narrow it and ask again.
   REFUSAL_REASON_AMBIGUOUS_TARGET = 3;
-  // The offer was discovered against a snapshot that has moved. Read the actions resource
-  // again.
+  // The offer belongs to an earlier projection head. Read the actions resource again.
   REFUSAL_REASON_STALE_ACTION = 4;
-  // The match was found against a snapshot that has moved. Search again.
+  // The match belongs to an earlier projection head. Search again.
   REFUSAL_REASON_STALE_MATCH = 5;
   // A rewrite matched fewer or more times than its cardinality accepts.
   REFUSAL_REASON_CARDINALITY_MISMATCH = 6;
@@ -169,37 +126,6 @@ enum RefusalReason {
   // The offer belongs to a portable family, which resolves through `rename`, `move`, `delete`,
   // or `change_signature` rather than through `act`.
   REFUSAL_REASON_PORTABLE_FAMILY = 11;
-  // The integration target is checked out in a Git worktree. Rift never changes a checked-out
-  // ref, index, or working tree.
-  REFUSAL_REASON_CHECKED_OUT_TARGET = 12;
-}
-// Git's unmerged-index classification for one path.
-enum GitConflictStatus {
-  // The caller did not set a value.
-  GIT_CONFLICT_STATUS_UNSPECIFIED = 0;
-  // Both sides modified the path.
-  GIT_CONFLICT_STATUS_BOTH_MODIFIED = 1;
-  // The current side added the path and the other side did not.
-  GIT_CONFLICT_STATUS_ADDED_BY_US = 2;
-  // The other side added the path and the current side did not.
-  GIT_CONFLICT_STATUS_ADDED_BY_THEM = 3;
-  // The current side deleted a path modified by the other side.
-  GIT_CONFLICT_STATUS_DELETED_BY_US = 4;
-  // The other side deleted a path modified by the current side.
-  GIT_CONFLICT_STATUS_DELETED_BY_THEM = 5;
-  // Both sides added different entries at the path.
-  GIT_CONFLICT_STATUS_BOTH_ADDED = 6;
-  // Both sides deleted the path with incompatible index state.
-  GIT_CONFLICT_STATUS_BOTH_DELETED = 7;
-}
-// Why integration requires a conventional Git worktree.
-enum RecoveryReason {
-  // The caller did not set a value.
-  RECOVERY_REASON_UNSPECIFIED = 0;
-  // Built-in three-way merging produced unmerged index entries.
-  RECOVERY_REASON_CONFLICTS = 1;
-  // Repository attributes selected a custom merge driver Rift will not execute.
-  RECOVERY_REASON_CUSTOM_DRIVER = 2;
 }
 // The total order a paginated answer comes back in, named in the request so a cursor can be
 // bound to it. Every order ends in the result's own identity, so two results that tie never
@@ -222,39 +148,8 @@ enum ResultOrder {
 message SourceExcerpt {
   // The file and byte range the text was taken from.
   rift.core.SourceSpan span = 1;
-  // The source itself, as it stood at the answer's snapshot.
+  // The source bytes returned by the request.
   string text = 2;
-}
-// Selects a portion of the project tree. The root controls hierarchy and `paths` filters the
-// full project-relative path of each descendant.
-message TreeParams {
-  // Directory whose descendants are listed. The empty path selects the project root; the root
-  // entry itself is not returned. A gitlink is a file entry and cannot be used as a directory
-  // root.
-  string root = 1;
-  // Most directory edges below `root` to include. One lists immediate children; null walks
-  // every descendant and relies on pagination and response limits.
-  optional int64 depth = 2;
-  // Git-style include and exclude globs matched against each full project-relative descendant
-  // path.
-  rift.core.PathSelector paths = 3;
-  // Most entries to return in one page. The server may stop earlier to keep the serialized
-  // result within `max_response_bytes`.
-  optional int64 limit = 4;
-  // Continues the same tree walk. Root, depth, paths, revision, and page size remain fixed.
-  optional string cursor = 5;
-  // Revision whose tree is listed. Omission selects the current session state.
-  optional rift.core.Revision rev = 6;
-}
-// One page of a project tree, ordered by project-path UTF-8 bytes. A directory precedes a file
-// at the same path, though a valid snapshot normally contains only one.
-message TreeResult {
-  // Snapshot whose paths were listed.
-  rift.core.ResolvedSnapshot at = 1;
-  // Derived directories and Git entries on this page.
-  repeated rift.core.ProjectEntry entries = 2;
-  // Cursor for the next path page, or null after the final entry.
-  optional string next_cursor = 3;
 }
 // Selects the adapter outline for one file. Outline nodes include declarations, definitions,
 // imports, exports, and the parent nodes needed to preserve their nesting.
@@ -282,9 +177,6 @@ message OutlineParams {
   optional int64 limit = 4;
   // Continues the same file outline with every other parameter unchanged.
   optional string cursor = 5;
-  // Revision whose file and semantic facts are read. Omission selects the current session
-  // state.
-  optional rift.core.Revision rev = 6;
 }
 // One declaration-oriented source node. Items are ordered by range start, then widest range,
 // then node identity, producing a stable source preorder.
@@ -300,8 +192,8 @@ message OutlineItem {
 }
 // One page of a file outline with explicit semantic coverage.
 message OutlineResult {
-  // Snapshot from which the file and semantic facts were read.
-  rift.core.ResolvedSnapshot at = 1;
+  // Projection head from which the file and semantic facts were read.
+  string head = 1;
   // File entry being outlined.
   rift.core.File file = 2;
   // Outline items on this page in stable source preorder.
@@ -369,20 +261,18 @@ message SearchParams {
   // A predicate over resolved fields and relationships. This is where adapter knowledge enters
   // a search — implements this trait, called by that function, declared under `src/api`.
   optional rift.core.Filter filter = 4;
-  // Files eligible for the search, selected by project-relative Git globs. Omitted selects
-  // every visible file.
+  // Files eligible for the search, selected by project-relative globs. Omitted selects every
+  // visible file.
   optional rift.core.PathSelector paths = 5;
   // Extra payload to attach to every hit. Each entry costs a lookup per hit, so ask for what
   // you will read.
   repeated Include include = 6;
-  // Most hits to return in one page. `max_page_items` from the repository resource caps it, and
+  // Most hits to return in one page. `max_page_items` from the workspace resource caps it, and
   // fewer may come back.
   optional int64 limit = 7;
   // Continues a previous search where its last page ended. Omit it for the first page;
   // everything else in the request has to match what the cursor was minted for.
   optional string cursor = 8;
-  // Which revision to answer against. Omission selects the current session state.
-  optional rift.core.Revision rev = 9;
 }
 // One search hit. Its file, node, or symbol payload carries the canonical identity.
 message SearchHit {
@@ -428,40 +318,22 @@ message SymbolResourceLink {
   // What a read of this URI returns: `SymbolResourcePayload` as JSON.
   string mime_type = 3;
 }
-// A link to the repository resource.
-message RepositoryResourceLink {
-  // The repository resource, optionally pinned to a revision and continued by a cursor.
+// A link to the workspace resource.
+message WorkspaceResourceLink {
+  // The workspace resource, optionally continued by a cursor.
   string uri = 1;
   // The resource family this link belongs to.
   string name = 2;
-  // What a read of this URI returns: `RepositoryResourcePayload` as JSON.
+  // What a read of this URI returns: `WorkspaceResourcePayload` as JSON.
   string mime_type = 3;
 }
-// A link to the comparison between two revisions.
-message DiffResourceLink {
-  // The comparison to read, optionally continued by a cursor.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `DiffResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to one file at one revision.
-message FileResourceLink {
-  // The file range to read, optionally pinned to a revision.
-  string uri = 1;
-  // The resource family this link belongs to.
-  string name = 2;
-  // What a read of this URI returns: `FileResourcePayload` as JSON.
-  string mime_type = 3;
-}
-// A link to the live filesystem-projection inventory.
+// A link to one path in the session projection.
 message FsResourceLink {
-  // Filesystem inventory page to read.
+  // The filesystem entry to read.
   string uri = 1;
   // The resource family this link belongs to.
   string name = 2;
-  // What a read returns: `FsResourcePayload` as JSON.
+  // What a read of this URI returns: `FsResourcePayload` as JSON.
   string mime_type = 3;
 }
 // A link to one Rift resource, as MCP carries it. The resource's name and media type are fixed
@@ -469,22 +341,19 @@ message FsResourceLink {
 message ResourceLink {
   oneof variant {
     SymbolResourceLink symbol = 1;
-    RepositoryResourceLink repository = 2;
-    DiffResourceLink diff = 3;
-    FileResourceLink file = 4;
-    ActionsResourceLink actions = 5;
-    ActionResourceLink action = 6;
-    FsResourceLink fs = 7;
+    WorkspaceResourceLink workspace = 2;
+    FsResourceLink fs = 3;
+    ActionsResourceLink actions = 4;
+    ActionResourceLink action = 5;
   }
 }
-// JSON payload for one symbol at one snapshot.
+// JSON payload for one symbol in the session projection.
 message SymbolResourcePayload {
   // The symbol this payload answers for, echoed back so a link and its content carry the same
   // address.
   string uri = 1;
-  // The snapshot this answer resolved against. Select its id with a tagged snapshot revision
-  // while that tree remains pinned.
-  rift.core.ResolvedSnapshot at = 2;
+  // Projection head this answer used.
+  string head = 2;
   // The declaration itself: its name, its kind in the language's own words, its origin, its
   // types and its signatures.
   rift.core.Symbol symbol = 3;
@@ -509,65 +378,6 @@ message SymbolResourcePayload {
   // edges and diagnostics are what page.
   optional string next = 10;
 }
-// One page of a store-tree comparison. `from` and `to` record the resolved revisions. No
-// adapter is needed, so the comparison works for every file.
-message DiffResourcePayload {
-  // The comparison this payload answers for, echoed back with the cursor that produced this
-  // page.
-  string uri = 1;
-  // The old side, as it resolved.
-  rift.core.ResolvedSnapshot from = 2;
-  // The new side, as it resolved.
-  rift.core.ResolvedSnapshot to = 3;
-  // The files this page covers.
-  repeated rift.core.FileChange files = 4;
-  // Whether files were dropped to stay inside the size limit. Paging past the limit uses
-  // `next`.
-  bool truncated = 5;
-  // The same comparison carrying the cursor for the next page, or null on the last one.
-  optional string next = 6;
-}
-// One externally addressable session or explicitly opened read projection.
-message FilesystemProjectionSummary {
-  // Lifecycle and write policy of one filesystem projection.
-  enum ProjectionKind {
-    // The caller did not set a value.
-    UNSPECIFIED = 0;
-    // Persistent writable source state owned by one session.
-    PROJECTION_KIND_SESSION = 1;
-    // Explicitly opened immutable snapshot for external read-only tools.
-    PROJECTION_KIND_READ = 2;
-  }
-  // Mounted identity and absolute path.
-  ProjectionLocation location = 1;
-  // Lifecycle and write policy.
-  ProjectionKind kind = 2;
-  // Exact source tree currently rendered.
-  rift.core.Snapshot snapshot = 3;
-  // Mutable session state, or null for immutable and disposable projections.
-  optional rift.core.ProjectionState state = 4;
-  // Whether ordinary filesystem writes are accepted.
-  bool writable = 5;
-  // Bytes in its non-source scratch layer, excluding shared adapter state.
-  int64 scratch_bytes = 6;
-  // Open file and directory handles currently pinning this projection.
-  uint32 open_handles = 7;
-  // Whether the frontend currently accepts new opens and coherent reads.
-  bool available = 8;
-  // Frontend invalidation or notification failures while unavailable.
-  repeated rift.core.Diagnostic degradation = 9;
-}
-// One page of a connection-scoped captured Rift filesystem inventory. The first page
-// captures externally addressable projections in identity order; its cursor reads that same
-// capture and grants no close authority.
-message FsResourcePayload {
-  // Resource page that produced this payload.
-  string uri = 1;
-  // Live projections in identity order.
-  repeated FilesystemProjectionSummary projections = 2;
-  // Next captured page, or null after the final projection.
-  optional string next = 3;
-}
 // One generated wire contract. A peer accepts it only when all three fields match one of its
 // own generated descriptors.
 message Contract {
@@ -578,20 +388,6 @@ message Contract {
   // SHA-256 of the generated descriptor and its MCP conversion metadata. Equal major and minor
   // values with different digests are incompatible.
   string schema_digest = 3;
-}
-// One mounted Rift filesystem projection, with its store identity and host path.
-message ProjectionLocation {
-  // Stable projection identity accepted by a namespaced `Revision` selector.
-  string projection = 1;
-  // Canonical absolute path through which ordinary filesystem tools reach it.
-  string path = 2;
-}
-// Conventional Git worktree created only for unresolved integration recovery.
-message GitWorktreeLocation {
-  // Canonical absolute path accepted by `git -C`.
-  string path = 1;
-  // Private `refs/rift/recovery/<RecoveryId>` ref associated with this path.
-  string ref = 2;
 }
 // Opens one logical client connection before another server RPC. The control stream
 // remains open for the connection lifetime.
@@ -615,14 +411,10 @@ message ConnectRequest {
   // and null for a SCIP role. A live connection already using it makes Connect temporarily
   // unavailable.
   optional string session = 4;
-  // Canonical absolute UTF-8 path through which the client reached `.rift`. It must match the
-  // physical workspace served by this endpoint.
+  // Canonical absolute UTF-8 path of the workspace served by this endpoint.
   string canonical_root = 5;
   // Client build as it names itself in diagnostics.
   string client_build = 6;
-  // Git revision imported as the base of a newly created MCP session. Omission uses
-  // `session.base` configuration. Reconnection and SCIP roles require null.
-  optional string initial_revision = 7;
 }
 // The first response on an accepted control stream, including persistent projection state
 // for an MCP role.
@@ -635,20 +427,16 @@ message Connected {
   string workspace = 3;
   // Created or reconnected session for an MCP role; null for a SCIP role.
   optional string session = 4;
-  // Mounted persistent session projection, or null for a SCIP role.
-  optional ProjectionLocation projection = 6;
   // Exact current projection state, or null for a SCIP role.
   optional rift.core.ProjectionState state = 8;
   // Identity required in metadata on every later RPC.
   string connection = 7;
 }
-// One retained store-backed session that an MCP connection may continue or remove.
+// One retained MCP session and its projection.
 message SessionSummary {
   // Persistent session identity.
   string session = 1;
-  // Mounted persistent filesystem projection owned by this session.
-  ProjectionLocation projection = 3;
-  // Exact current source state and concurrency token of the projection.
+  // Current projection state.
   rift.core.ProjectionState state = 5;
   // Whether one live MCP connection currently owns this session.
   bool active = 4;
@@ -682,66 +470,19 @@ message SessionContinueResult {
   // Session state after the connection attached.
   SessionSummary session = 1;
 }
-// Previews or confirms removal of one retained session at an exact projection state. A
-// session with a live connection returns `temporarily_unavailable`. A changed projection fails
-// with `projection_head_moved`, so confirmation cannot discard writes the preview did not
-// observe.
+// Removes one inactive session at an exact projection head.
 message SessionRemoveParams {
   // Retained session to inspect or remove.
   string session = 1;
-  // Projection state observed by the caller. Its head token prevents ABA races.
-  rift.core.ProjectionState expected = 2;
-  // False previews the removal. True applies the same plan when the head still matches.
-  optional bool confirm = 3;
+  // Projection head observed by the caller.
+  string expected = 2;
 }
-// The projection affected by a session-removal preview or confirmation.
+// The session removed at the checked projection state.
 message SessionRemoveResult {
   // Session the result describes.
   string session = 1;
   // Exact projection state checked by this preview or confirmation.
   rift.core.ProjectionState state = 2;
-  // Projection unmounted and removed by confirmation, or selected by preview.
-  ProjectionLocation projection = 3;
-  // Estimated disposable scratch bytes for preview, or actual bytes deleted after confirmation
-  // verified no handles and withdrew the namespace.
-  int64 scratch_bytes = 4;
-  // True after confirmation removed the projection; false for a preview.
-  bool removed = 5;
-  // Whether current source differs from the projection's retained Git base.
-  bool unintegrated = 6;
-  // Estimated store bytes made collectible after removal and final pin release.
-  int64 reclaimable_bytes = 7;
-}
-// Opens an immutable snapshot as a mounted read projection for external tools. The
-// projection is owned by this connection and remains pinned until `projection_close` or
-// connection cleanup.
-message ProjectionOpenParams {
-  // Git commit, retained snapshot, or current projection state to resolve once.
-  rift.core.Revision at = 1;
-}
-// New read-only filesystem projection and the exact snapshot it pins.
-message ProjectionOpenResult {
-  // Mounted path available to ordinary filesystem tools.
-  ProjectionLocation location = 1;
-  // Exact immutable source tree rendered at that path.
-  rift.core.Snapshot snapshot = 2;
-  // Exact peeled commit when `at` used a Git revision, otherwise null.
-  optional string imported_from = 3;
-}
-// Releases one explicit read projection. Session and internal projections cannot be closed
-// through this operation, and another connection cannot close the caller's projection.
-message ProjectionCloseParams {
-  // Read projection returned by `projection_open`.
-  string projection = 1;
-}
-// Confirmation that the read namespace no longer accepts opens. Existing handles retain
-// only their inode version or captured directory enumeration; the final projection pin is
-// released after they close.
-message ProjectionCloseResult {
-  // Projection that was closed.
-  string projection = 1;
-  // The projection no longer accepts new opens.
-  int64 closed = 2;
 }
 // Workspace ceilings for retained debugging sessions. Null at
 // `ExecutionLimits.debug` means `rift.toml` disables debugging.
@@ -802,55 +543,36 @@ message Limits {
   int64 max_changes = 7;
   // Most concrete `Edit` values one resolved operation may contain across every change.
   int64 max_edits = 8;
-  // How many repository-declared command checks may run before one integration. Zero when
-  // `rift.toml` declares none.
+  // How many workspace command checks may run before publication. Zero when `rift.toml`
+  // declares none.
   int64 max_validators = 9;
   // Most concrete edits one atomic `RewriteChange` may produce after matching.
   int64 max_rewrite_expansions = 10;
   // Caller-code execution ceilings. Null means `rift.toml` disables execute and all debug
   // tools; adapter capability alone never enables them.
   optional ExecutionLimits execution = 11;
-  // Workspace ceiling for authoritative source, scratch, pins, and integration intents.
-  int64 max_store_bytes = 12;
-  // Workspace ceiling for source, scratch, pin, and intent records.
-  int64 max_store_entries = 13;
 }
-// Current repository state and request limits. Each configured language reports its
+// Current workspace state and request limits. Each configured language reports its
 // adapter support and effective caller-code availability.
-message RepositoryResourcePayload {
+message WorkspaceResourcePayload {
   enum Resources {
     // The caller did not set a value.
-    RESOURCES_UNSPECIFIED = 0;
-    // Workspace capabilities, resolved state, and request limits.
-    RESOURCES_REPOSITORY = 1;
+    UNSPECIFIED = 0;
+    // Workspace capabilities, projection state, and request limits.
+    RESOURCES_WORKSPACE = 1;
     // One symbol, its nodes, its edges and its diagnostics.
     RESOURCES_SYMBOL = 2;
-    // What changed between two revisions.
-    RESOURCES_DIFF = 3;
-    // One file's tree entry and its bytes.
-    RESOURCES_FILE = 4;
+    // One directory page or file-content range.
+    RESOURCES_FS = 3;
     // The fixes and refactors an adapter offers at one address, or across one file.
-    RESOURCES_ACTIONS = 5;
+    RESOURCES_ACTIONS = 4;
     // One discovered action, with the schema of the arguments it takes.
-    RESOURCES_ACTION = 6;
-    // Mounted filesystem projections and their current source state.
-    RESOURCES_FS = 7;
+    RESOURCES_ACTION = 5;
   }
-  // Git object hash used by this repository. It determines whether a `GitCommit` contains 40 or
-  // 64 hexadecimal characters.
-  enum ObjectFormat {
-    // The caller did not set a value.
-    OBJECT_FORMAT_UNSPECIFIED = 0;
-    // Object IDs are 40 hex characters. Still git's default.
-    OBJECT_FORMAT_SHA1 = 1;
-    // Object IDs are 64 hex characters. A repository created with `--object-format=sha256`.
-    OBJECT_FORMAT_SHA256 = 2;
-  }
-  // The URI this payload answers for, echoed back with the revision and cursor it resolved.
+  // The URI this payload answers for.
   string uri = 1;
-  // The snapshot this answer was resolved against. Use a `Revision` with kind `snapshot` and
-  // this id when a later call must select the same retained tree.
-  rift.core.ResolvedSnapshot at = 2;
+  // Current session projection state.
+  rift.core.ProjectionState state = 2;
   // Protocol version and schema identifier for every other field in this payload.
   Contract contract = 3;
   // The ceilings a request has to stay inside here.
@@ -864,20 +586,16 @@ message RepositoryResourcePayload {
   repeated Resources resources = 8;
   // The same resource carrying the cursor for the next page, or null on the last one.
   optional string next = 9;
-  // Which hash git uses for object IDs in this repository. It decides how long a `GitCommit`
-  // is, so a client that validates one has to read this first.
-  ObjectFormat object_format = 10;
   // The pattern grammars the `match` tool accepts here.
   MatchSyntax matching = 11;
-  // Integration checks declared by the workspace-root `rift.toml`, in execution order.
+  // Publication checks declared by the workspace-root `rift.toml`.
   repeated CommandValidator validators = 13;
 }
 // One page of search hits, and what the page is worth. `coverage` is what makes an empty page
 // readable: nothing matched, or Rift could not see far enough to know.
 message SearchResult {
-  // The snapshot this answer resolved against. Select its id with a tagged snapshot revision
-  // while that tree remains pinned.
-  rift.core.ResolvedSnapshot at = 1;
+  // Projection head this answer used.
+  string head = 1;
   // How much Rift could see while answering. An empty page means nothing matched only where
   // this is complete.
   rift.core.Coverage coverage = 2;
@@ -897,15 +615,12 @@ message ActionOffer {
   // What the action does and what it applies to.
   rift.core.ActionDescriptor descriptor = 2;
 }
-// One page of the actions available at one address. Offers sort by language name, dialect with
-// null first, target, kind, and offer identity. The cursor binds that order, the snapshot, and
-// the adapter build.
+// One page of actions available at one address in the session projection.
 message ActionsResourcePayload {
   // The address this page answers for, echoed back as it resolved.
   string uri = 1;
-  // The snapshot this answer resolved against. Select its id with a tagged snapshot revision
-  // while that tree remains pinned.
-  rift.core.ResolvedSnapshot at = 2;
+  // Projection head this answer used.
+  string head = 2;
   // The actions on this page, each without its argument schema.
   repeated ActionOffer offers = 3;
   // Whether the adapter could answer here. A language with no action support returns an empty
@@ -920,31 +635,25 @@ message ActionsResourcePayload {
 message ActionResourcePayload {
   // The offer this payload answers for, echoed back as it resolved.
   string uri = 1;
-  // The snapshot this offer was discovered in.
-  rift.core.ResolvedSnapshot at = 2;
+  // Projection head in which this offer was discovered.
+  string head = 2;
   // Language whose adapter minted the offer and resolves it.
   rift.core.Language language = 3;
   // The offer, with `descriptor.arguments_schema` present.
   ActionOffer offer = 4;
 }
-// Evaluate a caller-provided code block with one configured language adapter against an
-// exact revision. The server materializes a disposable execution workspace before crossing
-// the adapter seam.
+// Evaluate code with one configured language adapter in the session projection.
 message ExecuteParams {
   // Exact language and optional dialect selecting the adapter.
   rift.core.Language language = 1;
   // Source to evaluate and its project-relative working directory.
   rift.core.CodeBlock block = 2;
-  // Revision whose project source and runtime files provide context. Omission selects the
-  // current session state. Rift configuration remains the physical workspace root's
-  // `rift.toml`.
-  optional rift.core.Revision rev = 3;
 }
 // Bounded result of one execution. Writes made by evaluated code are absent because its
 // execution workspace is discarded.
 message ExecuteResult {
-  // Exact snapshot used to prepare the execution workspace.
-  rift.core.ResolvedSnapshot at = 1;
+  // Projection head used for execution.
+  string head = 1;
   // Adapter that evaluated the block.
   rift.core.Language language = 2;
   // Runtime status, bounded output, and structured diagnostics.
@@ -957,8 +666,8 @@ message ExecuteResult {
 message DebugSession {
   // Server-minted public handle. The adapter-local DebugSessionKey never crosses MCP.
   string id = 1;
-  // Snapshot retained by the session's execution workspace.
-  rift.core.ResolvedSnapshot at = 2;
+  // Projection head used by the debugging session.
+  string head = 2;
   // Adapter that owns the retained debug state.
   rift.core.Language language = 3;
   // Retained stack frames, innermost first. Zero after normal completion.
@@ -973,10 +682,6 @@ message DebugStartParams {
   // Exact language and optional dialect selecting the adapter.
   rift.core.Language language = 1;
   rift.core.CodeBlock block = 2;
-  // Revision whose project source and runtime files provide context. Omission selects the
-  // current session state. Rift configuration remains the physical workspace root's
-  // `rift.toml`.
-  optional rift.core.Revision rev = 3;
 }
 // Read one retained stack frame without resuming or mutating the debugging session.
 message DebugGetFrameParams {
@@ -1034,9 +739,7 @@ message MatchHit {
     MatchHitText text = 2;
   }
 }
-// A match request: the query, a page size, and the revision to run it against. The complete
-// query travels in every match key, so a key can be inspected and replayed without hidden
-// lookup state.
+// A match query and page size for the session projection.
 message MatchParams {
   // What to look for, and which engine answers it.
   rift.core.MatchQuery query = 1;
@@ -1044,15 +747,12 @@ message MatchParams {
   optional int64 limit = 2;
   // Continues a previous match where its last page ended. Omit it for the first page.
   optional string cursor = 3;
-  // Which revision to answer against. Omission selects the current session state.
-  optional rift.core.Revision rev = 4;
 }
 // One page of matches and the state they were found in. Matches sort by file bytes, range, and
 // canonical key. Rift checks the key against `at` before applying an addressed edit.
 message MatchResult {
-  // The snapshot this answer resolved against. Select its id with a tagged snapshot revision
-  // while that tree remains pinned.
-  rift.core.ResolvedSnapshot at = 1;
+  // Projection head this answer used.
+  string head = 1;
   // The matches on this page.
   repeated MatchHit matches = 2;
   // How much of the selected path set was searched. A file too large to read makes this partial
@@ -1077,8 +777,8 @@ message DiagnosticContext {
     APPLY = 3;
   }
   Source source = 1;
-  // The state this answer was resolved against.
-  rift.core.ResolvedSnapshot at = 2;
+  // Projection head this diagnostic belongs to.
+  string head = 2;
   // The finding itself, exactly as the adapter minted it.
   rift.core.Diagnostic diagnostic = 3;
   // One-based line the finding starts on. Null where the diagnostic has no span — a
@@ -1109,99 +809,66 @@ message ErrorCause {
     // The connection cannot perform this operation: a path leaves the workspace, or a debugging
     // session belongs to another connection. The same request fails the same way.
     ERROR_CODE_PERMISSION_DENIED = 3;
-    // The exact Rift snapshot is no longer retained. Current heads and live resources pin their
-    // snapshots; a copied identifier alone does not. Re-read or re-import it.
-    ERROR_CODE_SNAPSHOT_NOT_FOUND = 4;
-    // The exact source snapshot still exists, but the adapter state supplied with a semantic
-    // identity belongs to another snapshot. Re-read semantic facts against the selected
-    // snapshot.
-    ERROR_CODE_SEMANTIC_SNAPSHOT_MISMATCH = 5;
-    // The revision resolves, but Rift has no index for it yet: the adapters are still
-    // analysing, or that state's facts were dropped. Retrying once indexing catches up
-    // succeeds.
-    ERROR_CODE_SEMANTIC_SNAPSHOT_UNAVAILABLE = 6;
-    // The identity is well-formed and resolves to nothing — no such symbol, no such file at
-    // that revision, or a debug session already stopped or expired. Retrying does not help.
-    ERROR_CODE_RESOURCE_NOT_FOUND = 7;
-    // The entry is known but its bytes cannot be produced: an LFS object Rift does not fetch,
-    // or a blob the object store cannot read. Retrying does not help.
-    ERROR_CODE_CONTENT_UNAVAILABLE = 8;
+    // The identity is well-formed and resolves to nothing — no such symbol, no such filesystem
+    // entry, or a debug session already stopped or expired. Retrying does not help.
+    ERROR_CODE_RESOURCE_NOT_FOUND = 4;
+    // The entry is known but its bytes cannot be read. Retrying does not help.
+    ERROR_CODE_CONTENT_UNAVAILABLE = 5;
     // The cursor is malformed, or it was minted for a different request, order or page size.
     // Start the query again from its first page.
-    ERROR_CODE_CURSOR_INVALID = 9;
-    // The cursor is well-formed but the state it was minted against has moved, so continuing it
-    // would splice two different answers together. Start again against the current state.
-    ERROR_CODE_CURSOR_SNAPSHOT_MISMATCH = 10;
+    ERROR_CODE_CURSOR_INVALID = 6;
     // The caller cancelled, or the connection went away before the request finished. Sending it
     // again is fine.
-    ERROR_CODE_CANCELLED = 11;
+    ERROR_CODE_CANCELLED = 7;
     // The request ran past its time budget. A smaller one may succeed — a lower `limit`, a
     // narrower path selector — and so may the same one once a cold adapter has warmed up.
-    ERROR_CODE_DEADLINE_EXCEEDED = 12;
+    ERROR_CODE_DEADLINE_EXCEEDED = 8;
     // A request or a response crossed an advertised limit. `limit` says which one and by how
     // much, so the request can be resized and sent again.
-    ERROR_CODE_LIMIT_EXCEEDED = 13;
-    // The required projection has an open writable handle, in-flight mutation, or operation
-    // barrier that prevents removal or recovery. The error identifies the projection. Retry
-    // after the owner completes or closes it.
-    ERROR_CODE_PROJECTION_BUSY = 14;
+    ERROR_CODE_LIMIT_EXCEEDED = 9;
+    // The session has an in-flight Rift FS mutation that prevents this operation. Retry after
+    // that mutation completes.
+    ERROR_CODE_PROJECTION_BUSY = 10;
     // A configured adapter could serve this request, but its process failed to start or died.
     // Retrying can succeed after the process restarts.
-    ERROR_CODE_ADAPTER_UNAVAILABLE = 15;
+    ERROR_CODE_ADAPTER_UNAVAILABLE = 11;
     // An adapter contract is unusable. Causes include a malformed message, a field outside its
     // range, ambiguous source or virtual claims, overlapping write claims, a virtual path
     // collision, and a cycle in virtual-source routing. Correct the adapter configuration
     // before retrying.
-    ERROR_CODE_ADAPTER_PROTOCOL_ERROR = 16;
+    ERROR_CODE_ADAPTER_PROTOCOL_ERROR = 12;
     // The adapter took the call and did not answer inside its budget. Retrying can work: a cold
     // adapter on a large workspace is slow once and fast afterwards.
-    ERROR_CODE_ADAPTER_TIMEOUT = 17;
-    // Rift could not read or write the persistent store, mounted projection, Git objects or
-    // refs, or the repository-local control directory. Worth retrying only if the cause was
-    // transient, such as a disk that has since been cleared.
-    ERROR_CODE_STORAGE_FAILURE = 18;
+    ERROR_CODE_ADAPTER_TIMEOUT = 13;
+    // Rift could not read or write workspace or projection files. Worth retrying only if the
+    // cause was transient, such as a disk that has since been cleared.
+    ERROR_CODE_STORAGE_FAILURE = 14;
     // Rift could not prepare the validation workspace, launch the command validator, enforce
     // its timeout, or capture its output. One retry is reasonable when the host failure was
     // transient.
-    ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 19;
+    ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 15;
     // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected
     // to answer differently.
-    ERROR_CODE_INTERNAL_ERROR = 20;
-    // Git contains a path the protocol or host filesystem cannot represent safely. The same
-    // snapshot remains unusable until that path changes.
-    ERROR_CODE_UNSUPPORTED_PATH = 21;
+    ERROR_CODE_INTERNAL_ERROR = 16;
+    // The workspace contains a path the protocol cannot represent safely.
+    ERROR_CODE_UNSUPPORTED_PATH = 17;
     // The cursor is valid, but its captured result page set left the process-local cache. Start
     // again from the first page.
-    ERROR_CODE_CURSOR_EXPIRED = 22;
-    // A projection head names a missing tree or blob, a digest is wrong, or a store invariant
-    // failed. Rift stops mutations until a local state check repairs or exports the readable
-    // state.
-    ERROR_CODE_STATE_CORRUPT = 23;
+    ERROR_CODE_CURSOR_EXPIRED = 18;
     // The resource exists but is in use. Another connection owns the session, a retained
     // debugger blocks continuation, or a disposable workspace is still releasing. Retry after
     // that owner or operation finishes.
-    ERROR_CODE_TEMPORARILY_UNAVAILABLE = 24;
+    ERROR_CODE_TEMPORARILY_UNAVAILABLE = 19;
     // The workspace-root `rift.toml` does not satisfy its schema. New requests remain blocked
     // until the file is valid.
-    ERROR_CODE_CONFIGURATION_INVALID = 25;
-    // A cleanup or recovery request names a projection token that is no longer current. Read
-    // the projection again before retrying.
-    ERROR_CODE_PROJECTION_HEAD_MOVED = 26;
+    ERROR_CODE_CONFIGURATION_INVALID = 20;
+    // A change or cleanup request names a projection token that is no longer current. Read the
+    // projection again before retrying.
+    ERROR_CODE_PROJECTION_HEAD_MOVED = 21;
     // The tool exists, but the workspace configuration and configured adapters cannot serve
-    // this operation for the requested language. Read the repository resource again after
+    // this operation for the requested language. Read the workspace resource again after
     // `rift.toml` or adapter availability changes.
-    ERROR_CODE_CAPABILITY_UNAVAILABLE = 27;
-    // A Git selector does not resolve locally to a commit, or a required object is missing from
-    // a shallow or partial repository. Rift never fetches implicitly.
-    ERROR_CODE_GIT_REVISION_NOT_FOUND = 28;
-    // The named filesystem projection no longer exists.
-    ERROR_CODE_PROJECTION_NOT_FOUND = 29;
-    // The projection exists, but its filesystem frontend or mount is not serving. Retry after
-    // the server reconnects or remounts it.
-    ERROR_CODE_PROJECTION_UNAVAILABLE = 30;
-    // A recovery cleanup request names an index/worktree manifest that is no longer current.
-    // List recoveries again and review the changed bytes before retrying.
-    ERROR_CODE_RECOVERY_MOVED = 31;
+    ERROR_CODE_CAPABILITY_UNAVAILABLE = 22;
   }
   // Stable retry instruction for one failed request. `deadline_exceeded` can permit the same
   // request; `invalid_request` requires changed input.
@@ -1213,9 +880,8 @@ message ErrorCause {
     // Send the same bytes again. The cause was transient — a busy projection, an adapter still
     // starting.
     RETRY_DIRECTIVE_SAME_REQUEST = 2;
-    // The state moved under the request. Re-read the current state, rebuild whatever was pinned
-    // to the old one, then ask again.
-    RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
+    // The projection moved. Read its current head before retrying.
+    RETRY_DIRECTIVE_REFRESH_PROJECTION = 3;
     // A local state command or configuration change must resolve the condition before another
     // request can succeed.
     RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
@@ -1247,99 +913,66 @@ message ErrorData {
     // The connection cannot perform this operation: a path leaves the workspace, or a debugging
     // session belongs to another connection. The same request fails the same way.
     ERROR_CODE_PERMISSION_DENIED = 3;
-    // The exact Rift snapshot is no longer retained. Current heads and live resources pin their
-    // snapshots; a copied identifier alone does not. Re-read or re-import it.
-    ERROR_CODE_SNAPSHOT_NOT_FOUND = 4;
-    // The exact source snapshot still exists, but the adapter state supplied with a semantic
-    // identity belongs to another snapshot. Re-read semantic facts against the selected
-    // snapshot.
-    ERROR_CODE_SEMANTIC_SNAPSHOT_MISMATCH = 5;
-    // The revision resolves, but Rift has no index for it yet: the adapters are still
-    // analysing, or that state's facts were dropped. Retrying once indexing catches up
-    // succeeds.
-    ERROR_CODE_SEMANTIC_SNAPSHOT_UNAVAILABLE = 6;
-    // The identity is well-formed and resolves to nothing — no such symbol, no such file at
-    // that revision, or a debug session already stopped or expired. Retrying does not help.
-    ERROR_CODE_RESOURCE_NOT_FOUND = 7;
-    // The entry is known but its bytes cannot be produced: an LFS object Rift does not fetch,
-    // or a blob the object store cannot read. Retrying does not help.
-    ERROR_CODE_CONTENT_UNAVAILABLE = 8;
+    // The identity is well-formed and resolves to nothing — no such symbol, no such filesystem
+    // entry, or a debug session already stopped or expired. Retrying does not help.
+    ERROR_CODE_RESOURCE_NOT_FOUND = 4;
+    // The entry is known but its bytes cannot be read. Retrying does not help.
+    ERROR_CODE_CONTENT_UNAVAILABLE = 5;
     // The cursor is malformed, or it was minted for a different request, order or page size.
     // Start the query again from its first page.
-    ERROR_CODE_CURSOR_INVALID = 9;
-    // The cursor is well-formed but the state it was minted against has moved, so continuing it
-    // would splice two different answers together. Start again against the current state.
-    ERROR_CODE_CURSOR_SNAPSHOT_MISMATCH = 10;
+    ERROR_CODE_CURSOR_INVALID = 6;
     // The caller cancelled, or the connection went away before the request finished. Sending it
     // again is fine.
-    ERROR_CODE_CANCELLED = 11;
+    ERROR_CODE_CANCELLED = 7;
     // The request ran past its time budget. A smaller one may succeed — a lower `limit`, a
     // narrower path selector — and so may the same one once a cold adapter has warmed up.
-    ERROR_CODE_DEADLINE_EXCEEDED = 12;
+    ERROR_CODE_DEADLINE_EXCEEDED = 8;
     // A request or a response crossed an advertised limit. `limit` says which one and by how
     // much, so the request can be resized and sent again.
-    ERROR_CODE_LIMIT_EXCEEDED = 13;
-    // The required projection has an open writable handle, in-flight mutation, or operation
-    // barrier that prevents removal or recovery. The error identifies the projection. Retry
-    // after the owner completes or closes it.
-    ERROR_CODE_PROJECTION_BUSY = 14;
+    ERROR_CODE_LIMIT_EXCEEDED = 9;
+    // The session has an in-flight Rift FS mutation that prevents this operation. Retry after
+    // that mutation completes.
+    ERROR_CODE_PROJECTION_BUSY = 10;
     // A configured adapter could serve this request, but its process failed to start or died.
     // Retrying can succeed after the process restarts.
-    ERROR_CODE_ADAPTER_UNAVAILABLE = 15;
+    ERROR_CODE_ADAPTER_UNAVAILABLE = 11;
     // An adapter contract is unusable. Causes include a malformed message, a field outside its
     // range, ambiguous source or virtual claims, overlapping write claims, a virtual path
     // collision, and a cycle in virtual-source routing. Correct the adapter configuration
     // before retrying.
-    ERROR_CODE_ADAPTER_PROTOCOL_ERROR = 16;
+    ERROR_CODE_ADAPTER_PROTOCOL_ERROR = 12;
     // The adapter took the call and did not answer inside its budget. Retrying can work: a cold
     // adapter on a large workspace is slow once and fast afterwards.
-    ERROR_CODE_ADAPTER_TIMEOUT = 17;
-    // Rift could not read or write the persistent store, mounted projection, Git objects or
-    // refs, or the repository-local control directory. Worth retrying only if the cause was
-    // transient, such as a disk that has since been cleared.
-    ERROR_CODE_STORAGE_FAILURE = 18;
+    ERROR_CODE_ADAPTER_TIMEOUT = 13;
+    // Rift could not read or write workspace or projection files. Worth retrying only if the
+    // cause was transient, such as a disk that has since been cleared.
+    ERROR_CODE_STORAGE_FAILURE = 14;
     // Rift could not prepare the validation workspace, launch the command validator, enforce
     // its timeout, or capture its output. One retry is reasonable when the host failure was
     // transient.
-    ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 19;
+    ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 15;
     // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected
     // to answer differently.
-    ERROR_CODE_INTERNAL_ERROR = 20;
-    // Git contains a path the protocol or host filesystem cannot represent safely. The same
-    // snapshot remains unusable until that path changes.
-    ERROR_CODE_UNSUPPORTED_PATH = 21;
+    ERROR_CODE_INTERNAL_ERROR = 16;
+    // The workspace contains a path the protocol cannot represent safely.
+    ERROR_CODE_UNSUPPORTED_PATH = 17;
     // The cursor is valid, but its captured result page set left the process-local cache. Start
     // again from the first page.
-    ERROR_CODE_CURSOR_EXPIRED = 22;
-    // A projection head names a missing tree or blob, a digest is wrong, or a store invariant
-    // failed. Rift stops mutations until a local state check repairs or exports the readable
-    // state.
-    ERROR_CODE_STATE_CORRUPT = 23;
+    ERROR_CODE_CURSOR_EXPIRED = 18;
     // The resource exists but is in use. Another connection owns the session, a retained
     // debugger blocks continuation, or a disposable workspace is still releasing. Retry after
     // that owner or operation finishes.
-    ERROR_CODE_TEMPORARILY_UNAVAILABLE = 24;
+    ERROR_CODE_TEMPORARILY_UNAVAILABLE = 19;
     // The workspace-root `rift.toml` does not satisfy its schema. New requests remain blocked
     // until the file is valid.
-    ERROR_CODE_CONFIGURATION_INVALID = 25;
-    // A cleanup or recovery request names a projection token that is no longer current. Read
-    // the projection again before retrying.
-    ERROR_CODE_PROJECTION_HEAD_MOVED = 26;
+    ERROR_CODE_CONFIGURATION_INVALID = 20;
+    // A change or cleanup request names a projection token that is no longer current. Read the
+    // projection again before retrying.
+    ERROR_CODE_PROJECTION_HEAD_MOVED = 21;
     // The tool exists, but the workspace configuration and configured adapters cannot serve
-    // this operation for the requested language. Read the repository resource again after
+    // this operation for the requested language. Read the workspace resource again after
     // `rift.toml` or adapter availability changes.
-    ERROR_CODE_CAPABILITY_UNAVAILABLE = 27;
-    // A Git selector does not resolve locally to a commit, or a required object is missing from
-    // a shallow or partial repository. Rift never fetches implicitly.
-    ERROR_CODE_GIT_REVISION_NOT_FOUND = 28;
-    // The named filesystem projection no longer exists.
-    ERROR_CODE_PROJECTION_NOT_FOUND = 29;
-    // The projection exists, but its filesystem frontend or mount is not serving. Retry after
-    // the server reconnects or remounts it.
-    ERROR_CODE_PROJECTION_UNAVAILABLE = 30;
-    // A recovery cleanup request names an index/worktree manifest that is no longer current.
-    // List recoveries again and review the changed bytes before retrying.
-    ERROR_CODE_RECOVERY_MOVED = 31;
+    ERROR_CODE_CAPABILITY_UNAVAILABLE = 22;
   }
   // Stable retry instruction for one failed request. `deadline_exceeded` can permit the same
   // request; `invalid_request` requires changed input.
@@ -1351,9 +984,8 @@ message ErrorData {
     // Send the same bytes again. The cause was transient — a busy projection, an adapter still
     // starting.
     RETRY_DIRECTIVE_SAME_REQUEST = 2;
-    // The state moved under the request. Re-read the current state, rebuild whatever was pinned
-    // to the old one, then ask again.
-    RETRY_DIRECTIVE_REFRESH_SNAPSHOT = 3;
+    // The projection moved. Read its current head before retrying.
+    RETRY_DIRECTIVE_REFRESH_PROJECTION = 3;
     // A local state command or configuration change must resolve the condition before another
     // request can succeed.
     RETRY_DIRECTIVE_OPERATOR_ACTION = 4;
@@ -1367,7 +999,7 @@ message ErrorData {
     // Working out what the workspace can do: capabilities, limits, which languages have
     // adapters.
     DISCOVERY = 1;
-    // Fetching what was asked for, from the index, the object store or an adapter.
+    // Reading workspace or adapter data.
     READ = 2;
     // Turning an address, a cursor or an action key into the concrete thing it names at a
     // state.
@@ -1378,9 +1010,8 @@ message ErrorData {
     // Checking the projection token, resolving in a private candidate, validating, and
     // conditionally advancing the projection.
     CHANGE = 5;
-    // Merging the session head, validating the merged tree, and conditionally advancing a
-    // target branch.
-    INTEGRATE = 6;
+    // Publishing projection changes to the workspace.
+    PUBLISH = 6;
     // Preparing an execution workspace and evaluating caller-provided code.
     EXECUTE = 7;
     // Starting, inspecting, or stopping a connection-bound debugging session.
@@ -1394,9 +1025,9 @@ message ErrorData {
   // What the caller may do next.
   RetryDirective retry = 3;
   Phase phase = 4;
-  // The state this answer was resolved against. Null where the failure happened before one was
+  // The projection head used by the request. Null where the failure happened before one was
   // resolved.
-  optional rift.core.Snapshot at = 5;
+  optional string head = 5;
   // Which operation of a multi-operation request failed, as its zero-based index. Null where
   // the request carried one, or failed before any of them ran.
   optional int64 operation = 6;
@@ -1409,9 +1040,6 @@ message ErrorData {
   // What led to this failure, outermost first. A code alone rarely says whether the cause is
   // worth waiting out.
   repeated ErrorCause causes = 9;
-  // Projection with open or in-flight filesystem mutations. Present exactly when `code` is
-  // `projection_busy` and forbidden otherwise.
-  optional ProjectionLocation projection = 10;
 }
 // Which advertised limit a `limit_exceeded` failure hit, and by how much. It is present exactly
 // when the code is `limit_exceeded`; without it, choosing between retrying smaller, falling
@@ -1423,7 +1051,7 @@ message LimitEvidence {
   enum Scope {
     // The caller did not set a value.
     UNSPECIFIED = 0;
-    // A field of `Limits`, advertised by the repository resource.
+    // A field of `Limits`, advertised by the workspace resource.
     DRIVER = 1;
     // A field of the adapter's `AdapterLimits`, advertised in `Describe`.
     ADAPTER = 2;
@@ -1443,8 +1071,7 @@ message MatchSyntaxText {
   string name = 1;
   int64 version = 2;
 }
-// The grammar a path selector is read in: Git globs, so `src/**/*.ts` means here what it means
-// in `.gitignore`.
+// The grammar used by path selectors.
 message MatchSyntaxPath {
   string name = 1;
   int64 version = 2;
@@ -1455,46 +1082,28 @@ message MatchSyntax {
   MatchSyntaxText text = 1;
   MatchSyntaxPath path = 2;
 }
-// The repository resource. It takes no path, only an optional revision and cursor. An
-// omitted revision selects the current session state.
-message RepositoryResourceTemplate {
+// The workspace resource with an optional page cursor.
+message WorkspaceResourceTemplate {
   // The resource family, as `resources/templates/list` advertises it.
   string name = 1;
-  // What a read of a URI from this template returns: `RepositoryResourcePayload` as JSON.
+  // What a read of a URI from this template returns: `WorkspaceResourcePayload` as JSON.
   string mime_type = 2;
 }
-// The symbol resource, addressed by language and the name that language gives the
-// declaration. An omitted revision selects the current session state.
+// The symbol resource, addressed by language and qualified name.
 message SymbolResourceTemplate {
   // The resource family, as `resources/templates/list` advertises it.
   string name = 1;
   // What a read of a URI from this template returns: `SymbolResourcePayload` as JSON.
   string mime_type = 2;
 }
-// The diff resource, addressed by two independently namespaced revisions.
-message DiffResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `DiffResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// The file resource, addressed by a path relative to the project root. An omitted revision
-// selects the current session state.
-message FileResourceTemplate {
-  // The resource family, as `resources/templates/list` advertises it.
-  string name = 1;
-  // What a read of a URI from this template returns: `FileResourcePayload` as JSON.
-  string mime_type = 2;
-}
-// The live filesystem-projection inventory, paged by an optional cursor.
+// The filesystem resource, addressed by a path relative to the project root.
 message FsResourceTemplate {
-  // The resource family advertised by `resources/templates/list`.
+  // The resource family, as `resources/templates/list` advertises it.
   string name = 1;
-  // A read returns `FsResourcePayload` as JSON.
+  // What a read of a URI from this template returns: `FsResourcePayload` as JSON.
   string mime_type = 2;
 }
-// The actions resource, addressed by the place to ask about. An omitted revision selects
-// the current session state.
+// The actions resource, addressed by the place to inspect.
 message ActionsResourceTemplate {
   // The resource family, as `resources/templates/list` advertises it.
   string name = 1;
@@ -1512,13 +1121,11 @@ message ActionResourceTemplate {
 // family.
 message ResourceTemplate {
   oneof variant {
-    RepositoryResourceTemplate repository = 1;
+    WorkspaceResourceTemplate workspace = 1;
     SymbolResourceTemplate symbol = 2;
-    DiffResourceTemplate diff = 3;
-    FileResourceTemplate file = 4;
-    ActionsResourceTemplate actions = 5;
-    ActionResourceTemplate action = 6;
-    FsResourceTemplate fs = 7;
+    FsResourceTemplate fs = 3;
+    ActionsResourceTemplate actions = 4;
+    ActionResourceTemplate action = 5;
   }
 }
 // The URI passed to MCP `resources/read`. Each branch is one advertised Rift resource family.
@@ -1526,11 +1133,11 @@ message ResourceReadParams {
   // A URI matching one branch of `ResourceTemplate`.
   string uri = 1;
 }
-// What a read of `rift://repository` returns.
-message RepositoryResourceContent {
+// What a read of `rift://workspace` returns.
+message WorkspaceResourceContent {
   // The URI that was read, as it resolved.
   string uri = 1;
-  // A `RepositoryResourcePayload`, serialized as JSON.
+  // A `WorkspaceResourcePayload`, serialized as JSON.
   string text = 2;
 }
 // What a read of a `rift://symbol/…` URI returns.
@@ -1540,23 +1147,9 @@ message SymbolResourceContent {
   // A `SymbolResourcePayload`, serialized as JSON.
   string text = 2;
 }
-// What a read of a `rift://diff/…` URI returns.
-message DiffResourceContent {
-  // The URI that was read, as it resolved.
-  string uri = 1;
-  // A `DiffResourcePayload`, serialized as JSON.
-  string text = 2;
-}
-// What a read of a `rift://file/…` URI returns.
-message FileResourceContent {
-  // The URI that was read, as it resolved.
-  string uri = 1;
-  // A `FileResourcePayload`, serialized as JSON.
-  string text = 2;
-}
-// What a read of `rift://fs` returns.
+// What a read of a `rift://fs` URI returns.
 message FsResourceContent {
-  // Inventory page that was read.
+  // The URI that was read, as it resolved.
   string uri = 1;
   // An `FsResourcePayload`, serialized as JSON.
   string text = 2;
@@ -1577,13 +1170,11 @@ message ActionResourceContent {
 }
 message ResourceContent {
   oneof variant {
-    RepositoryResourceContent repository = 1;
+    WorkspaceResourceContent workspace = 1;
     SymbolResourceContent symbol = 2;
-    DiffResourceContent diff = 3;
-    FileResourceContent file = 4;
-    ActionsResourceContent actions = 5;
-    ActionResourceContent action = 6;
-    FsResourceContent fs = 7;
+    FsResourceContent fs = 3;
+    ActionsResourceContent actions = 4;
+    ActionResourceContent action = 5;
   }
 }
 // The result of one MCP resource read. Each Rift resource returns one JSON payload in `text`,
@@ -1633,9 +1224,8 @@ message EditParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
+  // Projection head this operation must replace.
+  string expected = 1;
   // Confirmation ids returned by an earlier refusal for this same expected projection state and
   // operation. Missing or extra ids refuse the retry.
   repeated int64 confirmations = 2;
@@ -1661,15 +1251,14 @@ message PatchParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
+  // Projection head this operation must replace.
+  string expected = 1;
   // Confirmation ids returned by an earlier refusal for this same expected projection state and
   // operation. Missing or extra ids refuse the retry.
   repeated int64 confirmations = 2;
   // Formatting applied after this operation's edits resolve.
   FormattingPolicy formatting = 3;
-  // Unified diff in Git's text patch syntax, with project-relative `a/` and `b/` paths.
+  // Unified text diff with project-relative `a/` and `b/` paths.
   string patch = 4;
 }
 // An atomic query-and-rewrite. Rift finds every match, checks the cardinality, expands the
@@ -1697,9 +1286,8 @@ message RewriteParams {
     TRAILING = 3;
     BOTH = 4;
   }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
+  // Projection head this operation must replace.
+  string expected = 1;
   // Confirmation ids returned by an earlier refusal for this same expected projection state and
   // operation. Missing or extra ids refuse the retry.
   repeated int64 confirmations = 2;
@@ -1714,40 +1302,6 @@ message RewriteParams {
   Range range = 6;
   // The accepted number of matches before expansion.
   rift.core.MatchCardinality cardinality = 7;
-}
-// A validated three-way inverse of one commit. Rift computes the difference from `parent` to
-// `revision`, applies its inverse, and refuses overlapping changes it cannot merge without
-// guessing.
-message RevertParams {
-  // How formatting participates in one session change.
-  enum FormattingPolicy {
-    // The caller did not set a value.
-    UNSPECIFIED = 0;
-    // Keep every byte outside the resolved edits unchanged.
-    FORMATTING_POLICY_PRESERVE = 1;
-    // Run the language formatter over the smallest syntactic regions containing the resolved
-    // edits.
-    FORMATTING_POLICY_CHANGED_REGIONS = 2;
-    // Run the language formatter over every text file touched by the change.
-    FORMATTING_POLICY_AFFECTED_FILES = 3;
-  }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
-  // Confirmation ids returned by an earlier refusal for this same expected projection state and
-  // operation. Missing or extra ids refuse the retry.
-  repeated int64 confirmations = 2;
-  // Formatting applied after this operation's edits resolve.
-  FormattingPolicy formatting = 3;
-  // Exact commit whose changes are inverted.
-  string revision = 4;
-  // Parent against which the commit's change is defined. Required for ordinary and merge
-  // commits; null selects the empty tree for a root commit. A commit that does not have this
-  // parent is refused.
-  optional string parent = 5;
-  // Paths from the original commit eligible for inversion. Excluded paths remain untouched; the
-  // commit diff exposes them when the caller needs to inspect the omission.
-  rift.core.PathSelector paths = 6;
 }
 // Changes what a declaration is called and rewrites the references that name it. The adapter
 // checks language spelling, collisions, and binding changes; a reference outside `scope`
@@ -1765,9 +1319,8 @@ message RenameParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
+  // Projection head this operation must replace.
+  string expected = 1;
   // Confirmation ids returned by an earlier refusal for this same expected projection state and
   // operation. Missing or extra ids refuse the retry.
   repeated int64 confirmations = 2;
@@ -1793,9 +1346,8 @@ message MoveParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
+  // Projection head this operation must replace.
+  string expected = 1;
   // Confirmation ids returned by an earlier refusal for this same expected projection state and
   // operation. Missing or extra ids refuse the retry.
   repeated int64 confirmations = 2;
@@ -1823,9 +1375,8 @@ message DeleteParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
+  // Projection head this operation must replace.
+  string expected = 1;
   // Confirmation ids returned by an earlier refusal for this same expected projection state and
   // operation. Missing or extra ids refuse the retry.
   repeated int64 confirmations = 2;
@@ -1852,9 +1403,8 @@ message ChangeSignatureParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
+  // Projection head this operation must replace.
+  string expected = 1;
   // Confirmation ids returned by an earlier refusal for this same expected projection state and
   // operation. Missing or extra ids refuse the retry.
   repeated int64 confirmations = 2;
@@ -1882,9 +1432,8 @@ message ActParams {
     // Run the language formatter over every text file touched by the change.
     FORMATTING_POLICY_AFFECTED_FILES = 3;
   }
-  // Exact projection state this operation must replace. Rift refuses a stale token before
-  // resolving edits, invoking an adapter, or publishing source state.
-  rift.core.ProjectionState expected = 1;
+  // Projection head this operation must replace.
+  string expected = 1;
   // Confirmation ids returned by an earlier refusal for this same expected projection state and
   // operation. Missing or extra ids refuse the retry.
   repeated int64 confirmations = 2;
@@ -1896,31 +1445,14 @@ message ActParams {
   // parameters receives an empty object.
   google.protobuf.Struct arguments = 5;
 }
-// Discards all source changes since the current session base and restores its pinned base
-// snapshot. Scratch remains intact.
+// Restores changed paths from the current workspace.
 message ProjectionRestoreParams {
-  // Exact dirty state the caller reviewed and intends to discard.
-  rift.core.ProjectionState expected = 1;
+  // Projection head the caller intends to discard.
+  string expected = 1;
+  // Changed paths to restore. Null restores every changed path.
+  repeated string paths = 2;
 }
-// Bounded summary of one operation after it resolves against the current session projection.
-message ResolvedOperation {
-  // Language adapters that contributed to resolution, sorted by name and dialect with null
-  // first. Empty for an operation resolved entirely by Rift.
-  repeated rift.core.Language owners = 1;
-  // Number of concrete Edit records produced by this operation.
-  int64 edit_count = 2;
-  // Number of satisfied preconditions checked for this operation.
-  int64 precondition_count = 3;
-  // Number of semantic effects reported for this operation.
-  int64 effect_count = 4;
-  // Number of guarantee evidence records produced for this operation.
-  int64 guarantee_count = 5;
-  // How completely Rift and its adapters resolved the request.
-  rift.core.Coverage coverage = 6;
-  // Number of resolution diagnostics produced for this operation.
-  int64 diagnostic_count = 7;
-}
-// What a passing run of one configured command establishes over the merged tree.
+// What a passing run of one configured command establishes.
 message CommandValidatorGuarantees {
   // A property an action claims and must establish with scoped evidence when resolved.
   enum GuaranteeKind {
@@ -1944,11 +1476,10 @@ message CommandValidatorGuarantees {
   // Exact property the command checks and limits on interpreting a pass.
   string detail = 3;
 }
-// An integration check from the workspace-root `rift.toml`, executed directly without a shell
-// in a disposable validation workspace materialized from the complete merged tree. The
-// workspace is the process working directory and does not isolate the command from the host.
+// A command from the workspace-root `rift.toml`, run without a shell against a disposable copy
+// of the changed tree.
 message CommandValidator {
-  // How repository configuration presents this check.
+  // How workspace configuration presents this check.
   enum Kind {
     // The caller did not set a value.
     KIND_UNSPECIFIED = 0;
@@ -1957,8 +1488,7 @@ message CommandValidator {
     KIND_BUILD = 3;
     KIND_OTHER = 4;
   }
-  // Whether Rift appends the merged tree's changed `ProjectPath` values to `argv` in byte
-  // order.
+  // Whether Rift appends changed `ProjectPath` values to `argv` in byte order.
   enum ChangedPaths {
     // The caller did not set a value.
     CHANGED_PATHS_UNSPECIFIED = 0;
@@ -1972,7 +1502,7 @@ message CommandValidator {
     DETERMINISM_DETERMINISTIC = 1;
     DETERMINISM_BEST_EFFORT = 2;
   }
-  // Repository label shown with this validator. It is unique within `validators.commands`.
+  // Label shown with this validator. It is unique within `validators.commands`.
   string id = 1;
   Kind kind = 2;
   // Executable followed by literal arguments. An absolute executable path is refused; a bare
@@ -1989,54 +1519,12 @@ message CommandValidator {
   // Wall-clock limit before Rift terminates the process.
   int64 timeout_ms = 7;
   // Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the
-  // omitted size. The upper bound keeps one escaped validator result inside one bounded
-  // integration result.
+  // omitted size. The upper bound keeps one escaped validator result inside one bounded result.
   int64 output_limit_bytes = 8;
   // Behavior or other properties this command is intended to check. A passing result turns each
-  // declaration into `GuaranteeEvidence`; a failed result rejects integration.
+  // declaration into `GuaranteeEvidence`; a failed result rejects publication.
   repeated CommandValidatorGuarantees guarantees = 9;
   Determinism determinism = 10;
-}
-// A declared validator process that exited with status zero.
-message ValidatorResultPassed {
-  optional int64 exit_code = 1;
-  // SHA-256 of the validator's RFC 8785 canonical JSON declaration. Results and declarations
-  // form a bijection on this value, because labels may repeat while commands differ.
-  string declaration_digest = 2;
-  // Paths evaluated by the validator, sorted by UTF-8 bytes and without duplicates.
-  repeated string files = 3;
-  // Structured findings produced by the validator. The list is empty when its output has no
-  // configured diagnostic decoder.
-  repeated rift.core.Diagnostic diagnostics = 4;
-  // Bounded standard output from the process.
-  rift.core.CapturedText stdout = 5;
-  // Bounded standard error from the process.
-  rift.core.CapturedText stderr = 6;
-}
-// A declared validator process that exited with a nonzero status.
-message ValidatorResultFailed {
-  int64 exit_code = 1;
-  // SHA-256 of the validator's RFC 8785 canonical JSON declaration. Results and declarations
-  // form a bijection on this value, because labels may repeat while commands differ.
-  string declaration_digest = 2;
-  // Paths evaluated by the validator, sorted by UTF-8 bytes and without duplicates.
-  repeated string files = 3;
-  // Structured findings produced by the validator. The list is empty when its output has no
-  // configured diagnostic decoder.
-  repeated rift.core.Diagnostic diagnostics = 4;
-  // Bounded standard output from the process.
-  rift.core.CapturedText stdout = 5;
-  // Bounded standard error from the process.
-  rift.core.CapturedText stderr = 6;
-}
-// The completed outcome of one configured validator. Exit status zero passes. Every other exit
-// status fails. A workspace, launch, timeout, or capture failure raises
-// `validator_execution_failure` before Rift produces integration evidence.
-message ValidatorResult {
-  oneof variant {
-    ValidatorResultPassed passed = 1;
-    ValidatorResultFailed failed = 2;
-  }
 }
 // Bounded adapter-validation evidence for one applied session change.
 message ChangeValidation {
@@ -2051,95 +1539,47 @@ message ChangeValidation {
     // Every language named by `validation.require` supplied a complete report.
     STRENGTH_REQUIRED = 3;
   }
-  // Whether every completed adapter report accepted the resulting tree.
-  bool valid = 1;
-  // Whether every adapter required by `validation.require` returned complete coverage.
-  bool complete = 2;
   // Semantic validation strength established for the resulting tree.
   Strength strength = 3;
   // Adapter reports in language order.
   repeated rift.core.ValidationReport adapter_reports = 4;
 }
-// Projection transition, immutable diff, resolution evidence, and validation for one
-// applied store change.
+// An applied projection change and its validation evidence.
 message ChangeSummary {
-  // Exact projection state against which this operation resolved.
-  rift.core.ProjectionState previous = 1;
-  // Store-tree diff using immutable `snapshot:` selectors for `previous.snapshot` and
-  // `current.snapshot`.
-  DiffResourceLink diff = 2;
-  // Bounded evidence from resolving the requested operation.
-  ResolvedOperation resolved = 3;
-  // Adapter validation of the resulting snapshot.
-  ChangeValidation validation = 4;
+  // Adapter validation of the resulting projection.
+  ChangeValidation validation = 3;
   // Concrete edits in canonical file-and-range order.
-  repeated rift.core.Edit edits = 5;
-  // Satisfied preconditions in check order.
-  repeated rift.core.OperationPrecondition preconditions = 6;
+  repeated rift.core.Edit edits = 4;
   // Semantic effects in adapter emission order.
-  repeated rift.core.OperationEffect effects = 7;
+  repeated rift.core.OperationEffect effects = 6;
   // Scoped guarantee evidence in guarantee-kind order.
-  repeated rift.core.GuaranteeEvidence guarantees = 8;
+  repeated rift.core.GuaranteeEvidence guarantees = 7;
   // Resolution findings in source order.
-  repeated rift.core.Diagnostic diagnostics = 9;
-  // Published current projection state with a fresh head token.
-  rift.core.ProjectionState current = 10;
-  // Post-publication invalidation or notification failures. Non-empty means source was durably
-  // applied but the projection is unavailable until remount.
-  repeated rift.core.Diagnostic degradation = 11;
+  repeated rift.core.Diagnostic diagnostics = 8;
+  // Current projection state with a fresh head token.
+  rift.core.ProjectionState current = 9;
 }
 // The operation atomically replaced the current projection state.
 message ChangeApplied {
   // The applied change and its evidence.
   ChangeSummary summary = 1;
 }
-// The current projection did not have the exact state supplied as `expected`.
-message StaleProjectionResult {
-  // Exact projection state supplied by the caller.
-  rift.core.ProjectionState expected = 1;
-  // Exact current projection state.
-  rift.core.ProjectionState current = 2;
-}
-// The projection already matched its retained base, so restore changed nothing.
-message ProjectionUnchanged {
-  // Unchanged projection state.
-  rift.core.ProjectionState state = 1;
-}
-// Unintegrated source changes were discarded in one projection transaction.
-message ProjectionRestored {
-  // Dirty state discarded by this operation.
-  rift.core.ProjectionState previous = 1;
-  // Clean current state at the same retained base with a fresh token.
-  rift.core.ProjectionState current = 2;
-  // Post-publication projection invalidation or notification failures.
-  repeated rift.core.Diagnostic degradation = 3;
-}
-// A restored projection, clean no-op, or stale projection comparison.
-message ProjectionRestoreResult {
-  oneof variant {
-    ProjectionRestored restored = 1;
-    ProjectionUnchanged noop = 2;
-    StaleProjectionResult stale_projection = 3;
-  }
-}
-// Resolution stopped before Rift could commit a change or begin integration. No ref moved.
+// Resolution stopped before Rift changed the projection.
 message RefusedResult {
-  // Why Rift declined a change or integration. A refusal is a completed decision with evidence,
-  // not a transport failure; `ErrorData` carries failures that never reached a decision.
+  // Why Rift declined a change. A refusal is a completed decision; `ErrorData` carries
+  // transport and infrastructure failures.
   enum RefusalReason {
     // The caller did not set a value.
     UNSPECIFIED = 0;
-    // No adapter implements this operation for the language it reaches, or repository state
-    // cannot satisfy the contract.
+    // No adapter implements this operation for the language it reaches.
     REFUSAL_REASON_UNSUPPORTED = 1;
     // A condition checked before resolution failed. The failed entry is in `preconditions`.
     REFUSAL_REASON_UNMET_PRECONDITION = 2;
     // The address resolves to several targets. Narrow it and ask again.
     REFUSAL_REASON_AMBIGUOUS_TARGET = 3;
-    // The offer was discovered against a snapshot that has moved. Read the actions resource
-    // again.
+    // The offer belongs to an earlier projection head. Read the actions resource again.
     REFUSAL_REASON_STALE_ACTION = 4;
-    // The match was found against a snapshot that has moved. Search again.
+    // The match belongs to an earlier projection head. Search again.
     REFUSAL_REASON_STALE_MATCH = 5;
     // A rewrite matched fewer or more times than its cardinality accepts.
     REFUSAL_REASON_CARDINALITY_MISMATCH = 6;
@@ -2155,12 +1595,9 @@ message RefusedResult {
     // The offer belongs to a portable family, which resolves through `rename`, `move`,
     // `delete`, or `change_signature` rather than through `act`.
     REFUSAL_REASON_PORTABLE_FAMILY = 11;
-    // The integration target is checked out in a Git worktree. Rift never changes a checked-out
-    // ref, index, or working tree.
-    REFUSAL_REASON_CHECKED_OUT_TARGET = 12;
   }
-  // State against which the refused work was attempted.
-  rift.core.Snapshot base = 1;
+  // Projection head against which the work was attempted.
+  string head = 1;
   // The condition the caller can act on.
   RefusalReason reason = 2;
   // Conditions checked before refusal, including at least one failed entry for
@@ -2174,380 +1611,52 @@ message RefusedResult {
   // Empty unless `reason` is `confirmation_required`.
   repeated rift.core.ConfirmationRequirement confirmations = 6;
 }
-// One path left in Git's unmerged index.
-message GitConflict {
-  // Git's unmerged-index classification for one path.
-  enum GitConflictStatus {
-    // The caller did not set a value.
-    UNSPECIFIED = 0;
-    // Both sides modified the path.
-    GIT_CONFLICT_STATUS_BOTH_MODIFIED = 1;
-    // The current side added the path and the other side did not.
-    GIT_CONFLICT_STATUS_ADDED_BY_US = 2;
-    // The other side added the path and the current side did not.
-    GIT_CONFLICT_STATUS_ADDED_BY_THEM = 3;
-    // The current side deleted a path modified by the other side.
-    GIT_CONFLICT_STATUS_DELETED_BY_US = 4;
-    // The other side deleted a path modified by the current side.
-    GIT_CONFLICT_STATUS_DELETED_BY_THEM = 5;
-    // Both sides added different entries at the path.
-    GIT_CONFLICT_STATUS_BOTH_ADDED = 6;
-    // Both sides deleted the path with incompatible index state.
-    GIT_CONFLICT_STATUS_BOTH_DELETED = 7;
-  }
-  // Conflicting project path.
-  string path = 1;
-  // Conflict status derived from Git's index stages.
-  GitConflictStatus status = 2;
-}
-// Content guard for one conventional recovery. Rift rescans the index and worktree under
-// Git locks before continue or abort; equal digests mean the reviewed bytes are unchanged.
-message RecoveryManifest {
-  string recovery = 1;
-  // SHA-256 of canonical index entries and stages.
-  string index = 2;
-  // SHA-256 of canonical tracked and untracked worktree entries.
-  string worktree = 3;
-}
-// Exceptional conventional Git worktree retained for a merge Rift could not complete.
-// Normal filesystem projections do not expose Git administrative state.
-message GitRecovery {
-  // Why integration requires a conventional Git worktree.
-  enum RecoveryReason {
-    // The caller did not set a value.
-    UNSPECIFIED = 0;
-    // Built-in three-way merging produced unmerged index entries.
-    RECOVERY_REASON_CONFLICTS = 1;
-    // Repository attributes selected a custom merge driver Rift will not execute.
-    RECOVERY_REASON_CUSTOM_DRIVER = 2;
-  }
-  // Identity supplied to recovery continue or abort.
-  string recovery = 1;
-  // Durable worktree in `.rift/recovery` for ordinary Git conflict resolution.
-  GitWorktreeLocation worktree = 2;
-  // Deterministic identity of the exact source state, target guard, and request. An exact retry
-  // returns this active recovery instead of allocating another.
-  string operation = 3;
-  // Projection state that continuation must still observe.
-  rift.core.ProjectionState expected_source = 4;
-  // Local branch guarded by this recovery.
-  string target = 5;
-  // Target head continuation must still observe.
-  string expected_target = 6;
-  RecoveryReason reason = 7;
-  // Unmerged paths in project-path order; empty for custom-driver handoff.
-  repeated GitConflict conflicts = 8;
-  // Paths selecting a custom driver; empty for a built-in merge conflict.
-  repeated string driver_paths = 9;
-  // Exact recovery bytes most recently scanned by Rift.
-  RecoveryManifest manifest = 10;
-}
-// An applied store change, domain refusal, or stale-projection result.
+// An applied projection change or semantic refusal.
 message ChangeResult {
   oneof variant {
     ChangeApplied applied = 1;
     RefusedResult refused = 2;
-    StaleProjectionResult stale_projection = 3;
   }
 }
-// Squash-integrates one exact current projection into a local branch.
-message IntegrateParams {
-  // Local branch that receives the merged source tree.
-  string target = 1;
-  // Exact current source and retained base to integrate.
-  rift.core.ProjectionState expected = 2;
-  // Target head that the final conditional ref update must replace.
-  string expected_target = 3;
-  // Subject for the single squash commit. Newlines and NUL are refused.
-  string message = 4;
+// Publishes the session projection into the physical workspace.
+message PublishParams {
+  // Projection head the caller reviewed.
+  string expected = 1;
 }
-// Adapter and command validation run over one complete merged tree.
-message IntegrationValidation {
-  // Adapter validation of the merged tree.
-  ChangeValidation adapters = 1;
-  // Configured command-validator results in declaration order.
-  repeated ValidatorResult commands = 2;
-  // Whether configured adapter validation and every command validator passed.
-  bool valid = 3;
+// The result of publishing projection changes into the workspace.
+message PublishResult {
+  // Current projection state after the attempt.
+  rift.core.ProjectionState state = 2;
+  // Workspace paths changed outside this projection.
+  repeated string conflicts = 3;
 }
-// The merged tree passed validation, one squash commit advanced the target, and the
-// projection was rebased to that published tree.
-message IntegrationSucceeded {
-  // Local branch advanced by integration.
-  string target = 1;
-  // Target head replaced by the conditional update.
-  string previous_target = 2;
-  // Exact projection state supplied to integration.
-  rift.core.ProjectionState previous_state = 3;
-  // Single-parent squash commit now held by the target ref.
-  string integrated = 4;
-  // Validation evidence for the merged tree.
-  IntegrationValidation validation = 5;
-  // Clean projection rebased to the integrated tree with a fresh token.
-  rift.core.ProjectionState current_state = 6;
-  // Pinned snapshot comparison from the supplied source to the merged tree.
-  DiffResourceLink diff = 7;
-  // Post-publication projection invalidation or notification failures.
-  repeated rift.core.Diagnostic degradation = 8;
-}
-// The merged tree already matched the target tree. No commit was created; Rift only
-// rebased the exact projection to the existing target commit and tree.
-message IntegrationSynchronized {
-  string target = 1;
-  string target_head = 2;
-  rift.core.ProjectionState previous_state = 3;
-  rift.core.ProjectionState current_state = 4;
-  // Validation evidence for the already-target-equivalent merged tree.
-  IntegrationValidation validation = 5;
-  // Post-rebase projection invalidation or notification failures.
-  repeated rift.core.Diagnostic degradation = 6;
-}
-// Git reported an unresolved merge. Rift retained a conventional recovery worktree and
-// left the session projection and target ref unchanged.
-message IntegrationMergeConflict {
-  // Retained, discoverable recovery to resolve and continue or abort.
-  GitRecovery recovery = 1;
-}
-// Validation rejected a clean merge in a disposable projection. Rift discarded the
-// candidate and left the target ref unchanged.
-message IntegrationRejected {
-  // Local branch that remained unchanged.
-  string target = 1;
-  // Target commit used by Git.
-  string target_head = 2;
-  // Exact session state merged for validation.
-  rift.core.ProjectionState source = 3;
-  // Evidence that rejected integration.
-  IntegrationValidation validation = 4;
-}
-// Workspace configuration or repository state prevented Git integration from starting.
-message IntegrationRefused {
-  // Why Rift declined a change or integration. A refusal is a completed decision with evidence,
-  // not a transport failure; `ErrorData` carries failures that never reached a decision.
-  enum RefusalReason {
+// One filesystem entry from the session projection.
+message FsResourcePayload {
+  // How a filesystem resource entry is represented.
+  enum Encoding {
     // The caller did not set a value.
     UNSPECIFIED = 0;
-    // No adapter implements this operation for the language it reaches, or repository state
-    // cannot satisfy the contract.
-    REFUSAL_REASON_UNSUPPORTED = 1;
-    // A condition checked before resolution failed. The failed entry is in `preconditions`.
-    REFUSAL_REASON_UNMET_PRECONDITION = 2;
-    // The address resolves to several targets. Narrow it and ask again.
-    REFUSAL_REASON_AMBIGUOUS_TARGET = 3;
-    // The offer was discovered against a snapshot that has moved. Read the actions resource
-    // again.
-    REFUSAL_REASON_STALE_ACTION = 4;
-    // The match was found against a snapshot that has moved. Search again.
-    REFUSAL_REASON_STALE_MATCH = 5;
-    // A rewrite matched fewer or more times than its cardinality accepts.
-    REFUSAL_REASON_CARDINALITY_MISMATCH = 6;
-    // The operation needs acknowledgements the caller did not supply.
-    REFUSAL_REASON_CONFIRMATION_REQUIRED = 7;
-    // The complete effect reaches outside what the caller can have meant — outside the project,
-    // or into generated source.
-    REFUSAL_REASON_UNSAFE_EFFECT = 8;
-    // The requested formatting policy has no formatter behind it for an affected language.
-    REFUSAL_REASON_FORMATTER_UNSUPPORTED = 9;
-    // Required adapter or command validation did not complete.
-    REFUSAL_REASON_VALIDATION_INCOMPLETE = 10;
-    // The offer belongs to a portable family, which resolves through `rename`, `move`,
-    // `delete`, or `change_signature` rather than through `act`.
-    REFUSAL_REASON_PORTABLE_FAMILY = 11;
-    // The integration target is checked out in a Git worktree. Rift never changes a checked-out
-    // ref, index, or working tree.
-    REFUSAL_REASON_CHECKED_OUT_TARGET = 12;
+    ENCODING_DIRECTORY = 1;
+    ENCODING_UTF8 = 2;
+    ENCODING_BASE64 = 3;
+    ENCODING_NONE = 4;
   }
-  // Local branch Rift was asked to integrate.
-  string target = 1;
-  // Exact session state selected for integration.
-  rift.core.ProjectionState source = 2;
-  // Target commit supplied by the caller.
-  string expected_target = 3;
-  // Configuration or repository condition that prevented integration.
-  RefusalReason reason = 4;
-  // Evidence that explains the refusal, including a checked-out path when relevant.
-  repeated rift.core.Diagnostic diagnostics = 5;
-}
-// The target ref moved before Rift could conditionally advance it. Rift discarded the
-// integration candidate.
-message IntegrationTargetMoved {
-  // Local branch that changed concurrently.
-  string target = 1;
-  // Target commit supplied by the caller.
-  string expected = 2;
-  // Target commit observed during the conditional update, or null if deleted.
-  optional string current = 3;
-  // Exact session state used for the discarded integration attempt.
-  rift.core.ProjectionState source = 4;
-}
-// The complete decision from one Git integration attempt.
-message IntegrateResult {
-  oneof variant {
-    IntegrationSucceeded integrated = 1;
-    IntegrationSynchronized synchronized = 2;
-    IntegrationMergeConflict merge_conflict = 3;
-    IntegrationRejected rejected = 4;
-    IntegrationRefused refused = 5;
-    IntegrationTargetMoved target_moved = 6;
-    StaleProjectionResult stale_projection = 7;
-  }
-}
-// Imports a conflict resolution from one retained conventional Git worktree. The index
-// must have no unmerged entries and the worktree must have no unstaged or untracked paths.
-// Rift imports only the reviewed index tree.
-message RecoveryContinueParams {
-  // Exact staged index and worktree bytes reviewed by the caller.
-  RecoveryManifest expected = 1;
-}
-// Exact recovery guards consumed by successful continuation. It is response evidence and
-// does not assert that the conventional worktree or private ref still exists.
-message ConsumedRecovery {
-  string recovery = 1;
-  rift.core.ProjectionState expected_source = 2;
-  string target = 3;
-  string expected_target = 4;
-  RecoveryManifest manifest = 5;
-}
-// A resolved integration merge was imported, validated, and published to its target ref.
-message RecoveryIntegrationContinued {
-  ConsumedRecovery recovery = 1;
-  // Completed target update and validation evidence.
-  IntegrationSucceeded integration = 2;
-}
-// The reviewed resolution already matched the target tree. Rift rebased the source and
-// removed the recovery without creating a commit.
-message RecoveryIntegrationSynchronized {
-  ConsumedRecovery recovery = 1;
-  IntegrationSynchronized integration = 2;
-}
-// Validation rejected the reviewed resolution. The recovery remains available for more
-// edits or explicit abort.
-message RecoveryIntegrationRejected {
-  // Retained recovery with its rescanned current manifest.
-  GitRecovery recovery = 1;
-  IntegrationRejected integration = 2;
-}
-// Repository state prevented publication of the reviewed resolution. The recovery remains
-// available for retry or explicit abort.
-message RecoveryIntegrationRefused {
-  // Retained recovery with its rescanned current manifest.
-  GitRecovery recovery = 1;
-  IntegrationRefused integration = 2;
-}
-// The source projection, target ref, or recovery bytes moved before continuation. Nothing
-// was published; the exact current values let the caller choose whether to abort or restart.
-message RecoveryObsolete {
-  string recovery = 1;
-  rift.core.ProjectionState expected_source = 2;
-  rift.core.ProjectionState current_source = 3;
-  string target = 4;
-  string expected_target = 5;
-  // Current target commit, or null if the guarded branch was deleted.
-  optional string current_target = 6;
-  RecoveryManifest expected_manifest = 7;
-  RecoveryManifest current_manifest = 8;
-}
-// Selects one captured page of active recoveries in recovery-id order.
-message RecoveryListParams {
-  optional int64 limit = 1;
-  optional string cursor = 2;
-}
-// One page of durable merge recoveries. Listing rescans each conventional worktree and
-// returns the manifest a caller can review and pass to continue or abort.
-message RecoveryListResult {
-  repeated GitRecovery recoveries = 1;
-  optional string next_cursor = 2;
-}
-// A completed integration or failed saved-state comparison.
-message RecoveryContinueResult {
-  oneof variant {
-    RecoveryIntegrationContinued integration_continued = 1;
-    RecoveryObsolete obsolete = 2;
-    RecoveryIntegrationSynchronized integration_synchronized = 3;
-    RecoveryIntegrationRejected integration_rejected = 4;
-    RecoveryIntegrationRefused integration_refused = 5;
-  }
-}
-// Previews or removes one retained recovery without changing source or a public Git ref.
-// The manifest prevents deleting recovery edits the caller did not review. A mismatch fails
-// with `recovery_moved`; an unrepresentable special file fails with `unsupported_path`.
-message RecoveryAbortParams {
-  RecoveryManifest expected = 1;
-  optional bool confirm = 2;
-}
-// The recovery still exists and no cleanup was performed.
-message RecoveryAbortPreview {
-  GitRecovery recovery = 1;
-}
-// The reviewed worktree, private ref, and recovery pins were removed.
-message RecoveryAborted {
-  string recovery = 1;
-  // Exact final manifest accepted before cleanup.
-  RecoveryManifest manifest = 2;
-}
-// A recovery cleanup preview or completed cleanup.
-message RecoveryAbortResult {
-  oneof variant {
-    RecoveryAbortPreview preview = 1;
-    RecoveryAborted aborted = 2;
-  }
-}
-// A regular-file range whose bytes decode as UTF-8. Start and end fall on UTF-8
-// code-point boundaries.
-message FileResourcePayloadUtf8 {
   // Exact resource request this payload answers.
   string uri = 1;
-  // Exact source snapshot from which the entry and bytes were read.
-  rift.core.ResolvedSnapshot at = 2;
-  // Complete regular source-store entry.
-  rift.core.File file = 3;
-  int64 start = 4;
-  int64 end = 5;
-  int64 total_bytes = 6;
-  string content = 7;
-  // Next exact-snapshot range beginning at `end`, or null at EOF.
-  optional string next = 8;
-}
-// A range carried as canonical base64 because its bytes do not form valid UTF-8.
-message FileResourcePayloadBase64 {
-  // Exact resource request this payload answers.
-  string uri = 1;
-  // Exact source snapshot from which the entry and bytes were read.
-  rift.core.ResolvedSnapshot at = 2;
-  // Complete regular source-store entry.
-  rift.core.File file = 3;
-  int64 start = 4;
-  int64 end = 5;
-  int64 total_bytes = 6;
-  string content = 7;
-  // Next exact-snapshot range beginning at `end`, or null at EOF.
-  optional string next = 8;
-}
-// A complete non-regular source-store entry. Its empty interval carries no bytes and has
-// no continuation.
-message FileResourcePayloadNone {
-  // Exact resource request this payload answers.
-  string uri = 1;
-  // Exact source snapshot from which the entry was read.
-  rift.core.ResolvedSnapshot at = 2;
-  // Complete LFS-pointer, symlink, or gitlink entry.
-  rift.core.File file = 3;
-  optional int64 start = 4;
-  optional int64 end = 5;
-  optional int64 total_bytes = 6;
-  optional google.protobuf.Value content = 7;
-  optional google.protobuf.Value next = 8;
-}
-// One complete source-store entry and a bounded byte range at an exact resolved snapshot.
-// Regular files carry UTF-8 text where the selected bytes form valid UTF-8 and canonical base64
-// otherwise. `next` uses a `snapshot:` selector and continues at `end`; non-regular entries
-// carry their complete metadata and no bytes.
-message FileResourcePayload {
-  oneof variant {
-    FileResourcePayloadUtf8 utf8 = 1;
-    FileResourcePayloadBase64 base64 = 2;
-    FileResourcePayloadNone none = 3;
-  }
+  // Projection head from which the entry was read.
+  string head = 2;
+  // Directory, regular file, or symbolic link named by the URI.
+  rift.core.ProjectEntry entry = 3;
+  // How this entry's payload is represented.
+  Encoding encoding = 4;
+  // Directory children on this page.
+  repeated rift.core.ProjectEntry entries = 5;
+  optional int64 start = 6;
+  optional int64 end = 7;
+  optional int64 total_bytes = 8;
+  optional string content = 9;
+  // Continuation for the same entry.
+  optional string next = 10;
 }
 // Effective caller-code routing after Rift intersects `rift.toml` with one adapter's
 // advertised operations.
@@ -2626,67 +1735,37 @@ message LanguageSupport {
 // The Protobuf service exposed by the Rift server. `rift mcp` maps its JSON entry points to
 // these methods.
 service Rift {
-  // Opens the control stream that owns one logical client connection. For an MCP role, the
-  // first response returns the always-mounted persistent session projection. A session ID
-  // admits one live connection.
+  // Opens one client session and returns its writable projection. A session ID admits one live
+  // connection.
   rpc Connect (rift.mcp.ConnectRequest) returns (stream rift.mcp.Connected);
-  // Lists retained sessions for this workspace. Each entry reports its projection path, exact
-  // current state and base, and live owner.
+  // Lists retained sessions and their projection state.
   rpc SessionList (rift.mcp.SessionListParams) returns (rift.mcp.SessionListResult);
-  // Rebinds the current MCP connection to one retained session. The connection's initial
-  // session must still be unchanged; Rift then removes it and continues the selected
-  // projection. The MCP process remembers the selected ID for reconnects. A changed initial
-  // session returns `invalid_request`; an active session or retained debugger returns
-  // `temporarily_unavailable`.
+  // Rebinds the current connection to one retained session.
   rpc SessionContinue (rift.mcp.SessionContinueParams) returns (rift.mcp.SessionContinueResult);
-  // Previews or confirms removal of one inactive session. Confirmation removes its projection
-  // and compares the exact observed projection state. An active session returns
-  // `temporarily_unavailable`; open handles and in-flight filesystem mutations return
-  // `projection_busy`.
+  // Previews or removes one inactive session.
   rpc SessionRemove (rift.mcp.SessionRemoveParams) returns (rift.mcp.SessionRemoveResult);
-  // Mounts one exact revision as an explicitly pinned read-only filesystem projection.
-  rpc ProjectionOpen (rift.mcp.ProjectionOpenParams) returns (rift.mcp.ProjectionOpenResult);
-  // Withdraws an explicit read projection; open handles keep only their inode pins.
-  rpc ProjectionClose (rift.mcp.ProjectionCloseParams) returns (rift.mcp.ProjectionCloseResult);
-  // Lists the project tree at one snapshot. Rift derives directories from source paths and
-  // answers without starting a language adapter. A depth of one is an `ls`; an unbounded depth
-  // with path selectors is a recursive tree, glob, or file find.
-  rpc Tree (rift.mcp.TreeParams) returns (rift.mcp.TreeResult);
-  // Reads the adapter-owned declaration structure of one file. Results preserve source nesting
-  // and carry semantic coverage, so an empty outline distinguishes an empty file from an
-  // unsupported language.
+  // Reads the declaration structure of one file from its adapter.
   rpc Outline (rift.mcp.OutlineParams) returns (rift.mcp.OutlineResult);
-  // Searches symbols, nodes and files in a stable ranked order. A lexical query finds names or
-  // text; a structured filter walks adapter facts. Path selectors narrow either form. Every
-  // page carries its total order, continuation cursor, and coverage.
+  // Searches symbols, nodes, and files in the session projection.
   rpc Search (rift.mcp.SearchParams) returns (rift.mcp.SearchResult);
-  // Finds byte ranges. Rift runs literal and regular-expression matching over every UTF-8 file.
-  // The owning adapter parses structural patterns because it defines the language's syntax.
-  // Every hit carries a key an edit can address.
+  // Finds literal, regular-expression, or structural matches.
   rpc Match (rift.mcp.MatchParams) returns (rift.mcp.MatchResult);
-  // Evaluates a caller-provided code block with one configured language adapter against an
-  // exact snapshot. Rift prepares a disposable execution workspace and discards every
-  // filesystem write made by the evaluated code.
+  // Evaluates code against the session projection in a disposable workspace.
   rpc Execute (rift.mcp.ExecuteParams) returns (rift.mcp.ExecuteResult);
-  // Starts an inspect-only debugging evaluation. An unhandled failure retains bounded stack
-  // frames until the caller stops the connection-bound session.
+  // Starts an inspect-only evaluation and retains bounded frames after a failure.
   rpc DebugStart (rift.mcp.DebugStartParams) returns (rift.mcp.DebugSession);
   // Reads one retained stack frame without resuming evaluation.
   rpc DebugGetFrame (rift.mcp.DebugGetFrameParams) returns (rift.mcp.DebugGetFrameResult);
   // Releases a debugging session, adapter state, and execution workspace.
   rpc DebugStop (rift.mcp.DebugStopParams) returns (rift.mcp.DebugStopResult);
-  // Checks the exact projection token, applies an atomic edit set in a private candidate,
-  // validates it, and conditionally swaps the public projection state.
+  // Applies and validates an atomic edit set at the expected projection head.
   rpc Edit (rift.mcp.EditParams) returns (rift.mcp.ChangeResult);
-  // Checks the exact projection token, then applies a unified diff in a private candidate and
-  // checks every hunk's context.
+  // Applies a unified diff at the expected projection head.
   rpc Patch (rift.mcp.PatchParams) returns (rift.mcp.ChangeResult);
   // Applies replacements for every match of one query. The cardinality is checked before
   // expansion, so a pattern that matches more places than intended refuses instead of rewriting
   // them.
   rpc Rewrite (rift.mcp.RewriteParams) returns (rift.mcp.ChangeResult);
-  // Applies the three-way inverse of one commit against a selected parent.
-  rpc Revert (rift.mcp.RevertParams) returns (rift.mcp.ChangeResult);
   // Changes what a declaration is called and rewrites every reference that names it. The
   // adapter checks spelling, collisions, and binding changes. A reference outside the scope
   // refuses the whole operation.
@@ -2706,18 +1785,9 @@ service Rift {
   // adapter-specific family. Arguments are validated against the schema the offer advertises. A
   // portable family is refused here and resolves through its own tool.
   rpc Act (rift.mcp.ActParams) returns (rift.mcp.ChangeResult);
-  // Discards reviewed unintegrated source changes and restores the pinned session base.
-  rpc ProjectionRestore (rift.mcp.ProjectionRestoreParams) returns (rift.mcp.ProjectionRestoreResult);
-  // Merges the exact current projection from its retained base onto a guarded target, validates
-  // the merged snapshot, writes at most one squash commit, and conditionally advances the
-  // target. A conflict creates an exceptional conventional Git recovery worktree.
-  rpc Integrate (rift.mcp.IntegrateParams) returns (rift.mcp.IntegrateResult);
-  // Lists durable unresolved integrations and rescans their exact recovery manifests.
-  rpc RecoveryList (rift.mcp.RecoveryListParams) returns (rift.mcp.RecoveryListResult);
-  // Imports and validates the staged tree of a resolved exceptional Git worktree, then performs
-  // the saved source and target compare-and-swaps.
-  rpc RecoveryContinue (rift.mcp.RecoveryContinueParams) returns (rift.mcp.RecoveryContinueResult);
-  // Previews or removes a retained Git recovery against its exact manifest.
-  rpc RecoveryAbort (rift.mcp.RecoveryAbortParams) returns (rift.mcp.RecoveryAbortResult);
+  // Restores changed paths from the current workspace.
+  rpc ProjectionRestore (rift.mcp.ProjectionRestoreParams) returns (rift.core.ProjectionState);
+  // Publishes projection changes whose workspace paths have not changed.
+  rpc Publish (rift.mcp.PublishParams) returns (rift.mcp.PublishResult);
   rpc ReadResource (rift.mcp.ResourceReadParams) returns (rift.mcp.ResourceReadResult);
 }

@@ -51,12 +51,12 @@ class Omission(ProtoModel):
 
 @proto_message(
     DirectMessage(
-        RIFT_SCIP, description="Selects the Rift snapshot to project into SCIP."
+        RIFT_SCIP, description="Selects a session projection to export as SCIP."
     )
 )
 class Request(ProtoModel):
-    at: Field[core.Snapshot] = proto_field(
-        default=..., number=1, description="The exact repository state to project."
+    head: Field[core.ProjectionHead] = proto_field(
+        default=..., number=2, description="Session projection head to export."
     )
 
 
@@ -66,24 +66,24 @@ class Request(ProtoModel):
     )
 )
 class Header(ProtoModel):
-    at: Field[core.Snapshot] = proto_field(
+    head: Field[core.ProjectionHead] = proto_field(
         default=...,
-        number=1,
-        description="The snapshot that produced every following record.",
+        number=2,
+        description="Projection head that produced every following record.",
     )
     metadata: Field[scip.Metadata] = proto_field(
         default=...,
-        number=2,
+        number=3,
         description="The metadata field of the projected `scip.Index`.",
     )
     coverage: Field[core.SemanticCoverage] = proto_field(
         default=...,
-        number=3,
+        number=4,
         description="Availability of each Rift fact family used by the projection.",
     )
     omissions: Field[list[Omission]] = proto_field(
         default=...,
-        number=4,
+        number=5,
         description="Populated Rift fields absent from the index, sorted by field and reason.",
     )
 
@@ -126,7 +126,7 @@ SCIP_API_PACKAGE = ProtoPackage(
     services=(
         Service(
             "Index",
-            "Exports one Rift snapshot into the pinned SCIP schema.",
+            "Exports one Rift projection into the pinned SCIP schema.",
             (
                 Rpc(
                     "Read",

@@ -21,7 +21,7 @@ from grpc_tools import protoc
 from jsonschema.validators import Draft202012Validator
 from pydantic import TypeAdapter
 
-from .models import adapter, config, scip, scip_api
+from .models import adapter, config, core, mcp, scip, scip_api
 from .models.base import (
     DEFINITIONS,
     PROTO_ENUMS,
@@ -49,6 +49,7 @@ from .proto.model import Service as ServiceSpec
 
 PROTOCOL = Path(__file__).resolve().parents[2]
 SCALAR = {"string": "string", "integer": "int64", "number": "double", "boolean": "bool"}
+PUBLIC_DEFINITIONS = (*core.MODELS, *mcp.MODELS)
 
 
 @dataclass
@@ -62,7 +63,7 @@ class Definition:
 
 def pydantic_schema() -> dict[str, Any]:
     rebuild_models()
-    aggregate = Union[tuple(DEFINITIONS)]  # noqa: UP007 - the union members are dynamic
+    aggregate = Union[PUBLIC_DEFINITIONS]  # noqa: UP007 - the union members are dynamic
     return TypeAdapter(aggregate).json_schema(ref_template="#/$defs/{model}")
 
 
@@ -73,6 +74,8 @@ def definitions() -> dict[str, Definition]:
     generated_definitions = PYDANTIC_SCHEMA["$defs"]
     result: dict[str, Definition] = {}
     for model in DEFINITIONS:
+        if model.__name__ not in generated_definitions:
+            continue
         metadata: DefinitionMetadata = model.__protocol__
         body = generated_definitions[model.__name__]
         if model.__name__ in result:
@@ -545,9 +548,9 @@ def file_from_package(package: ProtoPackage) -> FileSpec:
     if not description and spec.namespace.package == "rift.adapter":
         description = (
             "The Rift server owns at most one configured adapter process per exact Language and calls "
-            "it over gRPC on a Unix domain socket. The process can hold states for several snapshots "
-            "and back them with separate runtime workers. Rift resolves revisions and supplies "
-            "server-owned projections; adapters never allocate or switch them. Different-language "
+            "it over gRPC on a Unix domain socket. The process can hold several projection states "
+            "and back them with separate runtime workers. Rift supplies each adapter state with "
+            "a server-owned projection. Different-language "
             "adapters may open the same tree. Rift serializes source writes, then refreshes every "
             "adapter that holds the projection."
         )
@@ -800,7 +803,7 @@ def config_schema_output() -> dict[str, Any]:
         {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "$id": "https://volar.sh/rift/protocol/rift.schema.json",
-            "title": "Rift repository configuration",
+            "title": "Rift workspace configuration",
             "description": (
                 "The typed rift.toml file. Configuration reuses protocol enums and paths, and "
                 "carries machine-checked links to the fields it bounds."
@@ -886,7 +889,7 @@ def validate_config_schema(content: str) -> dict[str, Any]:
 
 
 def validate_rift_toml(path: Path) -> config.RiftConfig:
-    """Parse the repository's real config through the same model as its schema."""
+    """Parse the workspace config through the same model as its schema."""
 
     try:
         value = tomli.loads(path.read_text())

@@ -22,21 +22,21 @@ message Omission {
   // The mapping boundary when `reason` is `REASON_OUTSIDE_PROJECTION`.
   optional string detail = 3;
 }
-// Selects the Rift snapshot to project into SCIP.
+// Selects a session projection to export as SCIP.
 message Request {
-  // The exact repository state to project.
-  rift.core.Snapshot at = 1;
+  // Session projection head to export.
+  string head = 2;
 }
 // Identity and coverage emitted before index records.
 message Header {
-  // The snapshot that produced every following record.
-  rift.core.Snapshot at = 1;
+  // Projection head that produced every following record.
+  string head = 2;
   // The metadata field of the projected `scip.Index`.
-  .scip.Metadata metadata = 2;
+  .scip.Metadata metadata = 3;
   // Availability of each Rift fact family used by the projection.
-  rift.core.SemanticCoverage coverage = 3;
+  rift.core.SemanticCoverage coverage = 4;
   // Populated Rift fields absent from the index, sorted by field and reason.
-  repeated rift.scip.Omission omissions = 4;
+  repeated rift.scip.Omission omissions = 5;
 }
 // One ordered part of a projected `scip.Index`.
 message Event {
@@ -49,7 +49,7 @@ message Event {
     .scip.SymbolInformation external_symbol = 3;
   }
 }
-// Exports one Rift snapshot into the pinned SCIP schema.
+// Exports one Rift projection into the pinned SCIP schema.
 service Index {
   // Returns one header, then documents, then external symbols. The stream order is the
   // canonical `scip.Index` order.
