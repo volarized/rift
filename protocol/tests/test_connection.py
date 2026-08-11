@@ -1,4 +1,4 @@
-"""Contracts for sessions, projections, and publication."""
+"""Contracts for sessions, projections, the changeset, and publication."""
 
 import json
 from unittest import TestCase
@@ -9,17 +9,14 @@ from rift.generate import schema_output
 from rift.models import core, mcp
 from rift.models.document import DOCUMENT, RIFT_SERVICE
 
-HEAD = "ph_" + "b" * 26
-NEXT_HEAD = "ph_" + "c" * 26
 SESSION = "ses_" + "d" * 26
 CONNECTION = "con_" + "e" * 26
+CHANGE = "chg_" + "f" * 26
+OTHER_CHANGE = "chg_" + "g" * 26
 
 
-def state(*, dirty: bool = False, head: str = HEAD) -> core.ProjectionState:
-    return core.ProjectionState(
-        head=head,
-        dirty=dirty,
-    )
+def state(*, dirty: bool = False, unacknowledged: bool = False) -> core.ProjectionState:
+    return core.ProjectionState(dirty=dirty, unacknowledged=unacknowledged)
 
 
 class ConnectionContractTests(TestCase):
@@ -53,7 +50,7 @@ class ConnectionContractTests(TestCase):
         )
 
         self.assertEqual(request.session.root, SESSION)
-        self.assertEqual(connected.state.head.root, HEAD)
+        self.assertFalse(connected.state.dirty)
 
     def test_scip_connection_has_no_session(self) -> None:
         request = mcp.ConnectRequest(
@@ -73,59 +70,68 @@ class ConnectionContractTests(TestCase):
         self.assertIsNone(request.session)
         self.assertIsNone(connected.state)
 
-    def test_session_state_is_projection_bound(self) -> None:
-        summary = mcp.SessionSummary(
-            session=SESSION,
-            state=state(dirty=True),
-            active=False,
-        )
+    def test_contract_carries_a_checkable_minor(self) -> None:
+        older = mcp.Contract(major=1, minor=2, schema_digest="0" * 64)
+        newer = mcp.Contract(major=1, minor=7, schema_digest="1" * 64)
 
-        self.assertTrue(summary.state.dirty)
+        self.assertEqual(older.major.root, newer.major.root)
+        self.assertLess(older.minor, newer.minor)
+        self.assertNotEqual(older.schema_digest.root, newer.schema_digest.root)
 
 
 class ProjectionContractTests(TestCase):
-    def test_projection_state_has_no_base_or_snapshot(self) -> None:
+    def test_projection_state_carries_no_concurrency_token(self) -> None:
         self.assertEqual(
             set(core.ProjectionState.model_fields),
-            {"head", "dirty"},
+            {"dirty", "unacknowledged"},
         )
         with self.assertRaises(ValidationError):
             core.ProjectionState.model_validate(
                 {
-                    "head": HEAD,
                     "dirty": False,
-                    "base": "anything",
+                    "unacknowledged": False,
+                    "head": "anything",
                 }
             )
 
-    def test_mutations_and_restore_expect_only_a_head(self) -> None:
+    def test_mutations_and_restore_name_no_expected_state(self) -> None:
         patch = mcp.PatchParams(
-            expected=HEAD,
             formatting="preserve",
             patch="--- a/a.txt\n+++ b/a.txt\n",
         )
-        restore = mcp.ProjectionRestoreParams(expected=HEAD)
+        restore = mcp.ProjectionRestoreParams()
 
-        self.assertEqual(patch.expected.root, HEAD)
-        self.assertEqual(restore.expected.root, HEAD)
+        self.assertNotIn("expected", mcp.PatchParams.model_fields)
+        self.assertNotIn("confirmations", mcp.PatchParams.model_fields)
+        self.assertEqual(patch.formatting, core.FormattingPolicy.PRESERVE)
+        self.assertIsNone(restore.paths)
 
-    def test_publish_reports_paths_without_a_conflict_entity(self) -> None:
-        published = mcp.PublishResult(
-            state=state(head=NEXT_HEAD),
-            conflicts=[],
-        )
-        refused = mcp.PublishResult(
+    def test_publish_refuses_on_conflicts_or_unaccepted_changes(self) -> None:
+        published = mcp.PublishResult(state=state(), conflicts=[], unaccepted=[])
+        conflicted = mcp.PublishResult(
             state=state(dirty=True),
             conflicts=["src/lib.rs"],
+            unaccepted=[],
+        )
+        unaccepted = mcp.PublishResult(
+            state=state(dirty=True, unacknowledged=True),
+            conflicts=[],
+            unaccepted=[CHANGE],
         )
 
         self.assertFalse(published.state.dirty)
-        self.assertEqual([path.root for path in refused.conflicts], ["src/lib.rs"])
+        self.assertEqual([path.root for path in conflicted.conflicts], ["src/lib.rs"])
+        self.assertEqual([held.root for held in unaccepted.unaccepted], [CHANGE])
         with self.assertRaises(ValidationError):
-            mcp.PublishResult(
-                state=state(dirty=True),
-                conflicts=[],
-            )
+            mcp.PublishResult(state=state(dirty=True), conflicts=[], unaccepted=[])
+
+    def test_publish_accepts_named_changes(self) -> None:
+        params = mcp.PublishParams(accept=[CHANGE, OTHER_CHANGE])
+
+        self.assertEqual(
+            [accepted.root for accepted in params.accept], [CHANGE, OTHER_CHANGE]
+        )
+        self.assertEqual(mcp.PublishParams().accept, [])
 
     def test_workspace_resource_is_projection_scoped(self) -> None:
         uri = mcp.WorkspaceResourceUri.model_validate("rift://workspace")
@@ -134,12 +140,23 @@ class ProjectionContractTests(TestCase):
         with self.assertRaises(ValidationError):
             mcp.FsResourceUri.model_validate("rift://fs/a.txt?rev=git:HEAD")
 
+    def test_root_resource_addresses_the_projection_directory(self) -> None:
+        payload = mcp.RootResourcePayload(
+            uri="rift://root",
+            path="/workspace/.rift/projections/" + SESSION,
+            workspace="/workspace",
+        )
+
+        self.assertEqual(payload.uri.root, "rift://root")
+        self.assertTrue(payload.path.root.endswith(SESSION))
+        with self.assertRaises(ValidationError):
+            mcp.RootResourceUri.model_validate("rift://root/src")
+
     def test_filesystem_resource_reads_directories(self) -> None:
         root = core.ProjectEntry.model_validate({"kind": "directory", "path": ""})
         child = core.ProjectEntry.model_validate({"kind": "directory", "path": "src"})
         payload = mcp.FsResourcePayload(
             uri="rift://fs",
-            head=HEAD,
             entry=root,
             encoding="directory",
             entries=[child],
@@ -161,7 +178,41 @@ class ProjectionContractTests(TestCase):
         self.assertNotIn("ProjectionOpen", methods)
         self.assertNotIn("ProjectionClose", methods)
 
-    def test_generated_contract_contains_no_git_or_snapshot_types(self) -> None:
+    def test_root_and_changes_are_advertised_resources(self) -> None:
+        resources = {resource.name for resource in DOCUMENT.resources}
+
+        self.assertIn("root", resources)
+        self.assertIn("changes", resources)
+
+
+class ChangesetContractTests(TestCase):
+    def test_refusal_reasons_all_mean_no_edits_were_produced(self) -> None:
+        reasons = {reason.value for reason in mcp.RefusalReason}
+
+        self.assertNotIn("confirmation_required", reasons)
+        self.assertNotIn("validation_incomplete", reasons)
+        self.assertIn("cardinality_mismatch", reasons)
+        self.assertIn("ambiguous_target", reasons)
+
+    def test_refusal_carries_no_confirmations(self) -> None:
+        self.assertNotIn("confirmations", mcp.RefusedResult.model_fields)
+
+    def test_an_unvouched_change_lands_carrying_its_confirmations(self) -> None:
+        self.assertIn("confirmations", mcp.ChangeSummary.model_fields)
+        self.assertIn("id", mcp.ChangeSummary.model_fields)
+
+        kinds = {kind.value for kind in core.ConfirmationRequirementKind}
+        self.assertIn("validation_incomplete", kinds)
+        self.assertIn("guarantee_unestablished", kinds)
+
+    def test_changes_resource_pages_the_changeset(self) -> None:
+        uri = mcp.ChangesResourceUri.model_validate("rift://changes")
+
+        self.assertEqual(uri.root, "rift://changes")
+        self.assertIn("changes", mcp.ChangesResourcePayload.model_fields)
+        self.assertIn("next", mcp.ChangesResourcePayload.model_fields)
+
+    def test_generated_contract_contains_no_head_or_snapshot_types(self) -> None:
         schema = schema_output()
         definitions = set(schema["$defs"])
         serialized = json.dumps(schema).lower()
@@ -169,6 +220,7 @@ class ProjectionContractTests(TestCase):
         self.assertFalse(
             definitions
             & {
+                "ProjectionHead",
                 "Snapshot",
                 "SnapshotId",
                 "GitCommit",
@@ -181,3 +233,5 @@ class ProjectionContractTests(TestCase):
         )
         self.assertNotIn("projection_open", serialized)
         self.assertNotIn("projection_close", serialized)
+        self.assertNotIn("projection_head_moved", serialized)
+        self.assertNotIn("refresh_projection", serialized)
