@@ -1,7 +1,8 @@
-# Tags the GA release for a protocol version once its release PR merges.
-# Fires on the merge commit cut-release created ("Add <YYYY-MM-DD> Rift
-# specification"); the dated tag is bare (2026-09-01), so it never collides
-# with the v*-prefixed docs-deploy tags release.yml listens for.
+# The actual release: tags the GA for a protocol version once its release PR
+# merges, then deploys the docs carrying the new dated tree. Fires on the
+# merge commit cut-release created ("Add <YYYY-MM-DD> Rift specification");
+# tags are bare dates (2026-09-01), the MCP pattern — the draft-release
+# workflow deploys without any tag.
 #
 # The commit message is attacker-influenced input; it reaches the shell only
 # through an environment variable, and the version is extracted with a strict
@@ -35,3 +36,51 @@ jobs:
           [[ -d "protocol/versions/$V" ]] || { echo "::error::protocol/versions/$V is missing"; exit 1; }
           gh release view "$V" >/dev/null 2>&1 && { echo "release $V already exists"; exit 0; }
           gh release create "$V" --latest --title "$V" --generate-notes
+
+  # Same deploy the draft-release workflow runs, so the site picks up the
+  # dated tree the moment the release exists.
+  deploy:
+    needs: tag
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://volar.sh/rift/
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Cache bun install
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('docs/bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+      - name: Cache Next build
+        uses: actions/cache@v6
+        with:
+          path: docs/.next/cache
+          key: >-
+            ${{ runner.os }}-next-${{ hashFiles('docs/bun.lock') }}-${{
+            hashFiles('docs/src/**', 'docs/content/**', 'docs/*.ts', 'docs/*.mjs') }}
+          restore-keys: |
+            ${{ runner.os }}-next-${{ hashFiles('docs/bun.lock') }}-
+            ${{ runner.os }}-next-
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run pack
+      - uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: docs
+          packageManager: bun
+          command: deploy
+      - name: Verify live
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error -o /dev/null "https://volar.sh/rift/"
+          test "$(curl -s -o /dev/null -w '%{http_code}' https://volar.sh/)" = "302"
