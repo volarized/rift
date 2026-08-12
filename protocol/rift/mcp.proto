@@ -535,7 +535,7 @@ message SearchResult {
 // because a page of offers carries as many schemas as it has entries and a caller reads one.
 // The single-offer resource always carries it.
 message ActionOffer {
-  // Identity of this offer. Hand it to `act`, or read it for the argument schema the action
+  // Identity of this offer. Hand it to `apply`, or read it for the argument schema the action
   // takes.
   string action = 1;
   // What the action does and what it applies to.
@@ -974,7 +974,7 @@ message ChangeSignatureParams {
 // adapter offers that has no portable argument contract. Rift validates `arguments` against the
 // offer's advertised schema. An offer carrying a portable argument contract is refused here,
 // because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.
-message ActParams {
+message ApplyParams {
   // Formatting applied after this operation's edits resolve.
   rift.core.FormattingPolicy formatting = 3;
   // The offer to resolve, as the actions resource returned it.
@@ -1260,7 +1260,7 @@ service Rift {
   // adapter-specific family. Arguments are validated against the schema the offer advertises.
   // An offer carrying a portable argument contract is refused here and resolves through its own
   // tool.
-  rpc Act (rift.mcp.ActParams) returns (rift.mcp.ChangeResult);
+  rpc Apply (rift.mcp.ApplyParams) returns (rift.mcp.ChangeResult);
   // Restores changed paths from the workspace and drops the changes that touched them.
   rpc ProjectionRestore (rift.mcp.ProjectionRestoreParams) returns (rift.core.ProjectionState);
   // Publishes the changeset into the workspace. A change carrying a confirmation is published

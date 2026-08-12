@@ -95,7 +95,7 @@ so interleaving more paginations than the advertised limit is what costs you a r
 
 [`edit`](#tool-edit), [`patch`](#tool-patch), [`rewrite`](#tool-rewrite),
 [`rename`](#tool-rename), [`move`](#tool-move), [`delete`](#tool-delete),
-[`change_signature`](#tool-change_signature) and [`act`](#tool-act) all change the projection,
+[`change_signature`](#tool-change_signature) and [`apply`](#tool-apply) all change the projection,
 and all return the same `ChangeResult`. A request whose shape is wrong — an absolute
 path, overlapping spans, a malformed patch header — fails as `invalid_request` before Rift
 resolves anything. Otherwise Rift resolves the whole operation before writing anything, and the

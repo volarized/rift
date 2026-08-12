@@ -303,7 +303,7 @@ enum RefusalReason {
   // The requested formatting policy has no formatter behind it for an affected language.
   REFUSAL_REASON_FORMATTER_UNSUPPORTED = 8;
   // The offer carries a portable argument contract, so it resolves through `rename`, `move`,
-  // `delete`, or `change_signature` rather than through `act`.
+  // `delete`, or `change_signature` rather than through `apply`.
   REFUSAL_REASON_PORTABLE_FAMILY = 9;
   // The language itself forbids it — a rename to a reserved word, a visibility change its rules
   // do not allow.

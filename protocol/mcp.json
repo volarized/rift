@@ -177,12 +177,12 @@
           "$ref": "#/$defs/ChangeResult"
         }
       },
-      "act": {
-        "rpc": "rift.mcp.Rift/Act",
+      "apply": {
+        "rpc": "rift.mcp.Rift/Apply",
         "group": "changes",
         "description": "Resolves one action an adapter offered \u2014 a quick fix, an extraction, an inline, or an adapter-specific family. Arguments are validated against the schema the offer advertises. An offer carrying a portable argument contract is refused here and resolves through its own tool.",
         "params": {
-          "$ref": "#/$defs/ActParams"
+          "$ref": "#/$defs/ApplyParams"
         },
         "result": {
           "$ref": "#/$defs/ChangeResult"
@@ -329,7 +329,7 @@
         }
       },
       "action": {
-        "description": "Returns one discovered action with the JSON Schema of the arguments it takes. This is the read a caller makes for the offer it chose, before handing the same identity to `act`.",
+        "description": "Returns one discovered action with the JSON Schema of the arguments it takes. This is the read a caller makes for the offer it chose, before handing the same identity to `apply`.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -475,7 +475,7 @@
           "MoveParams",
           "DeleteParams",
           "ChangeSignatureParams",
-          "ActParams",
+          "ApplyParams",
           "RefusalReason",
           "ActionSupport",
           "CommandValidator"
@@ -532,46 +532,6 @@
     ]
   },
   "$defs": {
-    "ActParams": {
-      "additionalProperties": false,
-      "description": "Resolves one discovered adapter action \u2014 a quick fix, an extraction, an inline, anything an adapter offers that has no portable argument contract. Rift validates `arguments` against the offer's advertised schema. An offer carrying a portable argument contract is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.",
-      "properties": {
-        "formatting": {
-          "$ref": "#/$defs/FormattingPolicy",
-          "description": "Formatting applied after this operation's edits resolve.",
-          "rift:proto": {
-            "number": 3
-          }
-        },
-        "action": {
-          "$ref": "#/$defs/ActionOfferId",
-          "description": "The offer to resolve, as the actions resource returned it.",
-          "rift:proto": {
-            "number": 4
-          }
-        },
-        "arguments": {
-          "additionalProperties": true,
-          "description": "Arguments accepted by the offer's `ActionDescriptor.arguments_schema`. An action with no parameters receives an empty object.",
-          "rift:proto": {
-            "number": 5
-          },
-          "title": "Arguments",
-          "type": "object"
-        }
-      },
-      "required": [
-        "formatting",
-        "action",
-        "arguments"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.ActParams"
-      },
-      "title": "ActParams",
-      "type": "object"
-    },
     "ActionDescriptor": {
       "additionalProperties": false,
       "description": "An adapter's portable description of one discovered operation. Listing carries no edits because resolution computes only the selected action.",
@@ -770,7 +730,7 @@
       "properties": {
         "action": {
           "$ref": "#/$defs/ActionOfferId",
-          "description": "Identity of this offer. Hand it to `act`, or read it for the argument schema the action takes.",
+          "description": "Identity of this offer. Hand it to `apply`, or read it for the argument schema the action takes.",
           "rift:proto": {
             "number": 1
           }
@@ -1260,6 +1220,46 @@
         ]
       },
       "title": "Address"
+    },
+    "ApplyParams": {
+      "additionalProperties": false,
+      "description": "Resolves one discovered adapter action \u2014 a quick fix, an extraction, an inline, anything an adapter offers that has no portable argument contract. Rift validates `arguments` against the offer's advertised schema. An offer carrying a portable argument contract is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points.",
+      "properties": {
+        "formatting": {
+          "$ref": "#/$defs/FormattingPolicy",
+          "description": "Formatting applied after this operation's edits resolve.",
+          "rift:proto": {
+            "number": 3
+          }
+        },
+        "action": {
+          "$ref": "#/$defs/ActionOfferId",
+          "description": "The offer to resolve, as the actions resource returned it.",
+          "rift:proto": {
+            "number": 4
+          }
+        },
+        "arguments": {
+          "additionalProperties": true,
+          "description": "Arguments accepted by the offer's `ActionDescriptor.arguments_schema`. An action with no parameters receives an empty object.",
+          "rift:proto": {
+            "number": 5
+          },
+          "title": "Arguments",
+          "type": "object"
+        }
+      },
+      "required": [
+        "formatting",
+        "action",
+        "arguments"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.ApplyParams"
+      },
+      "title": "ApplyParams",
+      "type": "object"
     },
     "ArgumentContract": {
       "additionalProperties": false,
@@ -8787,7 +8787,7 @@
         "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
         "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
         "language_refusal": "The language itself forbids it \u2014 a rename to a reserved word, a visibility change its rules do not allow.",
-        "portable_family": "The offer carries a portable argument contract, so it resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
+        "portable_family": "The offer carries a portable argument contract, so it resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `apply`.",
         "stale_action": "The file the offer was discovered in has been rewritten since. Read the actions resource again.",
         "stale_match": "The file the match was found in has been rewritten since. Search again.",
         "unmet_precondition": "A condition checked before resolution failed. The failed entry is in `preconditions`.",

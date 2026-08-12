@@ -173,8 +173,8 @@ Your agent reads the projection through MCP. Language adapters analyze the same 
 symbols, relationships, diagnostics, offered actions and validation results.
 
 A change through MCP — [`edit`](/docs/draft/protocol/mcp#tool-edit),
-[`rename`](/docs/draft/protocol/mcp#tool-rename), [`act`](/docs/draft/protocol/mcp#tool-act), any
-of them — is resolved before Rift writes
+[`rename`](/docs/draft/protocol/mcp#tool-rename), [`apply`](/docs/draft/protocol/mcp#tool-apply),
+any of them — is resolved before Rift writes
 anything, and what happens next depends on which way it failed. If Rift ended up with
 no bytes to write, that's a refusal and the projection is untouched: the address was ambiguous,
 the pattern matched forty places where you said one, the language has no such operation. There is

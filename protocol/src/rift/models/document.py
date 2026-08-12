@@ -161,9 +161,9 @@ RPC_CHANGE_SIGNATURE = Rpc(
     ),
 )
 
-RPC_ACT = Rpc(
-    name="Act",
-    request=mcp.ActParams,
+RPC_APPLY = Rpc(
+    name="Apply",
+    request=mcp.ApplyParams,
     response=mcp.ChangeResult,
     description=(
         "Resolves one action an adapter offered — a quick fix, an extraction, an inline, or an "
@@ -221,7 +221,7 @@ RIFT_SERVICE = Service(
         RPC_MOVE,
         RPC_DELETE,
         RPC_CHANGE_SIGNATURE,
-        RPC_ACT,
+        RPC_APPLY,
         RPC_PROJECTION_RESTORE,
         RPC_PUBLISH,
         RPC_READRESOURCE,
@@ -287,7 +287,7 @@ DOCUMENT = Document(
         Tool(name="move", rpc=RPC_MOVE, group="changes"),
         Tool(name="delete", rpc=RPC_DELETE, group="changes"),
         Tool(name="change_signature", rpc=RPC_CHANGE_SIGNATURE, group="changes"),
-        Tool(name="act", rpc=RPC_ACT, group="changes"),
+        Tool(name="apply", rpc=RPC_APPLY, group="changes"),
         Tool(name="projection_restore", rpc=RPC_PROJECTION_RESTORE, group="changes"),
         Tool(name="publish", rpc=RPC_PUBLISH, group="changes"),
         Tool(name="execute", rpc=RPC_EXECUTE, group="execution"),
@@ -361,7 +361,7 @@ DOCUMENT = Document(
             description=(
                 "Returns one discovered action with the JSON Schema of the arguments it takes. "
                 "This is the read a caller makes for the offer it chose, before handing the same "
-                "identity to `act`."
+                "identity to `apply`."
             ),
             template=mcp.ResourceTemplate,
             uri=core.ActionOfferId,
@@ -499,7 +499,7 @@ DOCUMENT = Document(
                 mcp.MoveParams,
                 mcp.DeleteParams,
                 mcp.ChangeSignatureParams,
-                mcp.ActParams,
+                mcp.ApplyParams,
                 core.RefusalReason,
                 core.ActionSupport,
                 mcp.CommandValidator,

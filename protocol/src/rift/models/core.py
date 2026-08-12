@@ -3342,7 +3342,7 @@ class OperationPreconditionStatus(str, Enum):
             "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
             "unsafe_effect": "The complete effect reaches outside what the caller can have meant — outside the project, or into generated source.",
             "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
-            "portable_family": "The offer carries a portable argument contract, so it resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `act`.",
+            "portable_family": "The offer carries a portable argument contract, so it resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `apply`.",
             "language_refusal": "The language itself forbids it — a rename to a reserved word, a visibility change its rules do not allow.",
         }
     },

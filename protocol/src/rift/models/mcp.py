@@ -1196,7 +1196,7 @@ class ActionOffer(ClosedModel):
 
     action: Field[core.ActionOfferId] = proto_field(
         description=(
-            "Identity of this offer. Hand it to `act`, or read it for the argument schema the "
+            "Identity of this offer. Hand it to `apply`, or read it for the argument schema the "
             "action takes."
         ),
         number=1,
@@ -2480,7 +2480,7 @@ class ChangeSignatureParams(ClosedModel):
     proto=Proto.message(),
     schema_extra={},
 )
-class ActParams(ClosedModel):
+class ApplyParams(ClosedModel):
     "Resolves one discovered adapter action — a quick fix, an extraction, an inline, anything an adapter offers that has no portable argument contract. Rift validates `arguments` against the offer's advertised schema. An offer carrying a portable argument contract is refused here, because `rename`, `move`, `delete`, and `change_signature` are its typed entry points."
 
     formatting: Field[core.FormattingPolicy] = proto_field(
@@ -3219,7 +3219,7 @@ MODELS = (
     MoveParams,
     DeleteParams,
     ChangeSignatureParams,
-    ActParams,
+    ApplyParams,
     ProjectionRestoreParams,
     CommandValidator,
     ChangeValidation,
