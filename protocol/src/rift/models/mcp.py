@@ -1691,8 +1691,8 @@ class DiagnosticContext(ClosedModel):
             ),
             "adapter_protocol_error": (
                 "An adapter contract is unusable. Causes include a malformed message, a field "
-                "outside its range, ambiguous source or virtual claims, overlapping write claims, "
-                "a virtual path collision, and a cycle in virtual-source routing. Correct the "
+                "outside its range, ambiguous source or generated-source claims, overlapping write claims, "
+                "a generated-path collision, and a cycle in generated-source routing. Correct the "
                 "adapter configuration before retrying."
             ),
             "adapter_timeout": (

@@ -16,8 +16,8 @@ extend google.protobuf.MessageOptions {
 enum CacheScope {
   // No cache claim. Rift treats the result as request-volatile.
   CACHE_SCOPE_UNSPECIFIED = 0;
-  // The projection contents, adapter implementation, language, and virtual inputs determine the
-  // result.
+  // The projection contents, adapter implementation, language, and generated inputs determine
+  // the result.
   PROJECTION = 1;
   // Adapter-observed external state also affects the result. Retention ends with the process or
   // adapter-state generation.
@@ -82,7 +82,7 @@ message SourceClaim {
   repeated string shebang_prefixes = 4;
   // Whether a claimed file may contain other languages. A Svelte owner sets
   // this for an embedded TypeScript region, then publishes that region as a
-  // virtual source when the TypeScript adapter has to analyze it.
+  // generated source when the TypeScript adapter has to analyze it.
   bool container = 5;
 }
 // A non-owning claim on project files needed to discover or configure adapter
@@ -234,7 +234,7 @@ message RuntimeRequirements {
 message AdapterState {
   option (section) = "Adapter state";
   // Adapter-local state generation, and the whole of an adapter state's identity.
-  // Open mints the first value; Refresh and SyncVirtual advance it. A call carrying
+  // Open mints the first value; Refresh and ReplaceGeneratedSources advance it. A call carrying
   // an earlier generation receives StaleState.
   uint64 generation = 3;
 }
@@ -272,22 +272,22 @@ message RefreshRequest {
   // Files deleted since `from`. A rename arrives as one of each.
   repeated string removed = 4;
 }
-// One atomic replacement of the virtual sources consumed by an adapter. Rift
+// One atomic replacement of the generated sources consumed by an adapter. Rift
 // emits exactly one `start` event first, then each `unit` followed by ordered
 // `text` chunks ending in `final: true`. The complete stream replaces the
-// previous overlay; an RPC failure leaves the previous generation intact. The
+// previous set; an RPC failure leaves the previous generation intact. The
 // units are the complete set selected for this consumer at `start`,
 // including an empty set when every previous unit has been retracted.
-message VirtualSyncEvent {
+message GeneratedSourceEvent {
   option (section) = "Adapter state";
   oneof event {
     // Current adapter-local state. The returned AdapterState advances its
     // generation.
     rift.adapter.AdapterState start = 1;
-    // One virtual file whose exact Language matches this adapter.
-    rift.adapter.VirtualUnit unit = 2;
+    // One generated file whose exact Language matches this adapter.
+    rift.adapter.GeneratedUnit unit = 2;
     // Ordered bytes for the preceding unit.
-    rift.adapter.VirtualText text = 3;
+    rift.adapter.GeneratedText text = 3;
   }
 }
 // Release one open adapter state.
@@ -295,7 +295,7 @@ message CloseRequest {
   option (section) = "Adapter state";
   rift.adapter.AdapterState state = 1;
 }
-// Read selected claimed physical or synced virtual sources at one state.
+// Read selected claimed physical or generated sources at one state.
 message AnalyzeRequest {
   option (section) = "Analysis";
   rift.adapter.AdapterState state = 1;
@@ -309,12 +309,12 @@ message AnalyzeRequest {
 message AnalyzeEvent {
   option (section) = "Analysis";
   oneof event {
-    // A claimed physical or synced virtual unit is about to have facts.
+    // A claimed physical or generated unit is about to have facts.
     rift.adapter.SourceUnit source_unit = 1;
     // A file this adapter produced is about to have text and facts.
-    rift.adapter.VirtualUnit virtual_unit = 2;
+    rift.adapter.GeneratedUnit generated_unit = 2;
     // A chunk of a produced file's bytes.
-    rift.adapter.VirtualText virtual_text = 3;
+    rift.adapter.GeneratedText generated_text = 3;
     // A batch of facts for one file.
     rift.adapter.Facts facts = 4;
     // No more facts for one file.
@@ -323,8 +323,9 @@ message AnalyzeEvent {
     rift.adapter.AnalyzeSummary summary = 6;
   }
 }
-// Metadata for one physical or synced virtual source unit this adapter owns.
-// Rift resolves the URI against the immutable source-store tree or the virtual overlay at
+// Metadata for one physical or generated source unit this adapter owns.
+// Rift resolves the URI against the immutable source-store tree or the retained generated
+// sources at
 // this AdapterState generation.
 message SourceUnit {
   option (section) = "Analysis";
@@ -337,26 +338,26 @@ message SourceUnit {
 }
 // Metadata for a file this adapter produced from another one. Rift validates
 // the complete publication and forwards it to the selected consumer through
-// SyncVirtual. The consumer stores it in a private overlay under state_root.
+// ReplaceGeneratedSources. The consumer stores it privately under state_root.
 // Rift exposes the retained bytes as a regular, non-executable File resource.
-message VirtualUnit {
+message GeneratedUnit {
   option (section) = "Analysis";
   // The produced file, as `rift://file/<path>`. The adapter mints the path;
-  // downstream facts use the same identity even though the bytes live in the
-  // consumer's private overlay.
+  // downstream facts use the same identity even though the bytes live under the
+  // consumer's state_root.
   string unit = 1;
   // The exact language that consumes these bytes. Rift routes it to the configured adapter for
   // this pair.
   rift.core.Language language = 2;
   // Which bytes each language owns inside the produced file. A consumer echoes
-  // these regions when it later emits SourceUnit for the synced path.
+  // these regions when it later emits SourceUnit for the generated path.
   repeated rift.core.LanguageRegion regions = 3;
 }
 // One chunk of a produced file's bytes. Sent in pieces because a generated file
 // can be far larger than the source it came from, and a message has a bound.
-message VirtualText {
+message GeneratedText {
   option (section) = "Analysis";
-  // The produced file these bytes belong to, spelled as its VirtualUnit did.
+  // The produced file these bytes belong to, spelled as its GeneratedUnit did.
   string unit = 1;
   // Byte offset this chunk starts at. Chunks arrive in order and leave no gaps.
   uint64 offset = 2;
@@ -366,7 +367,7 @@ message VirtualText {
   bool final = 4;
 }
 // One file's worth of one fact family. Rift buffers by file until the coverage
-// event for that file, then routes complete virtual units to their consumer.
+// event for that file, then routes complete generated units to their consumer.
 message Facts {
   option (section) = "Analysis";
   // The file these facts were read from, as `rift://file/<path>`.
@@ -725,12 +726,12 @@ service Adapter {
   // refresh and blocks new ones until it returns, so a generation never advances under an open
   // stream.
   rpc Refresh (rift.adapter.RefreshRequest) returns (rift.adapter.AdapterState);
-  // Replace this adapter state's private virtual-source overlay. The first
-  // event pins the current adapter state; the remaining events carry a
-  // complete manifest and its bytes. Rift drains calls for this adapter
-  // state before the stream and blocks new calls until completion. Stream
-  // completion commits the overlay atomically.
-  rpc SyncVirtual (stream rift.adapter.VirtualSyncEvent) returns (rift.adapter.AdapterState);
+  // Replace the complete set of generated sources this adapter state
+  // consumes. The first event pins the current adapter state; the remaining
+  // events carry the full set and its bytes. Rift drains calls for this
+  // adapter state before the stream and blocks new calls until completion.
+  // Stream completion commits the replacement atomically.
+  rpc ReplaceGeneratedSources (stream rift.adapter.GeneratedSourceEvent) returns (rift.adapter.AdapterState);
   // Release this tree's adapter state so Rift can delete the tree. Refused with
   // `FAILED_PRECONDITION` while calls are in flight, so their adapter state and
   // source path remain valid through the final stream event; Rift drains or

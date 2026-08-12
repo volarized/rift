@@ -75,7 +75,7 @@ class ProjectionState(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class LanguageRegion(ClosedModel):
-    "A byte range of one file and the language used to parse it. The owner of `App.svelte` can mark its script block as TypeScript. A produced virtual file records ranges in its own byte coordinates."
+    "A byte range of one file and the language used to parse it. The owner of `App.svelte` can mark its script block as TypeScript. A generated file records ranges in its own byte coordinates."
 
     language: Field[Language] = proto_field(
         description="The language grammar used for these bytes.", number=1
@@ -117,7 +117,7 @@ class FileId(ProtocolRoot):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class FileContentRegular(ClosedModel):
-    """A physical or virtual file with bytes in it. Every node and symbol with readable source comes from this kind."""
+    """A physical or generated file with bytes in it. Every node and symbol with readable source comes from this kind."""
 
     kind: Field[Literal["regular"]] = proto_field()
     size: Field[int] = proto_field(
@@ -203,7 +203,7 @@ class File(ClosedModel):
         description=(
             "Distinct `Language` values in `regions`, sorted by name and dialect. This "
             "physical owner advertises embedded "
-            "languages even when another adapter consumes virtual source."
+            "languages even when another adapter consumes generated source."
         ),
         examples=[["svelte", "typescript", "css"]],
         number=3,
@@ -3832,7 +3832,7 @@ class ActionDescriptor(ClosedModel):
     schema_extra={
         "rift:enumDescriptions": {
             "origin_mappings": (
-                "Relations from produced source ranges to the physical or virtual source ranges "
+                "Relations from produced source ranges to the physical or generated source ranges "
                 "that contributed them."
             ),
             "symbols": "The declarations the adapter resolved in the file.",
@@ -3879,7 +3879,7 @@ class SemanticCoverage(ProtocolRoot):
             EnumValue("match", "ADAPTER_OPERATION_MATCH", 4),
             EnumValue("actions", "ADAPTER_OPERATION_ACTIONS", 5),
             EnumValue("resolve", "ADAPTER_OPERATION_RESOLVE", 6),
-            EnumValue("sync_virtual", "ADAPTER_OPERATION_SYNC_VIRTUAL", 7),
+            EnumValue("replace_generated_sources", "ADAPTER_OPERATION_REPLACE_GENERATED_SOURCES", 7),
             EnumValue("execute", "ADAPTER_OPERATION_EXECUTE", 8),
             EnumValue("debug_start", "ADAPTER_OPERATION_DEBUG_START", 9),
             EnumValue("debug_get_frame", "ADAPTER_OPERATION_DEBUG_GET_FRAME", 10),
@@ -3895,7 +3895,7 @@ class SemanticCoverage(ProtocolRoot):
             "match": "Run structural matching.",
             "actions": "Discover actions at an address.",
             "resolve": "Resolve a discovered action to edits and evidence.",
-            "sync_virtual": "Consume virtual source produced by another adapter.",
+            "replace_generated_sources": "Consume generated source produced by another adapter.",
             "execute": "Evaluate a caller-provided code block against one adapter state.",
             "debug_start": "Start an inspect-only debugging session for a code block.",
             "debug_get_frame": "Read one retained stack frame from a debugging session.",
@@ -3912,7 +3912,7 @@ class AdapterOperation(str, Enum):
     MATCH = "match"
     ACTIONS = "actions"
     RESOLVE = "resolve"
-    SYNC_VIRTUAL = "sync_virtual"
+    REPLACE_GENERATED_SOURCES = "replace_generated_sources"
     EXECUTE = "execute"
     DEBUG_START = "debug_start"
     DEBUG_GET_FRAME = "debug_get_frame"

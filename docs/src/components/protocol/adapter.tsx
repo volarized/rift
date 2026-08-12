@@ -223,7 +223,7 @@ export function AdapterReference({ version }: { version: DocVersion }): ReactNod
       </h2>
       <p>
         <code>Describe</code> runs at startup. <code>Open</code>, <code>Refresh</code>,{" "}
-        <code>SyncVirtual</code>, and <code>Close</code> maintain adapter state.
+        <code>ReplaceGeneratedSources</code>, and <code>Close</code> maintain adapter state.
       </p>
       <p>
         <code>Analyze</code>, <code>Match</code>, and <code>Actions</code> read that state.{" "}

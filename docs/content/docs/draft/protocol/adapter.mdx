@@ -99,7 +99,8 @@ change is detected on the session's next read, and the server sends [`Refresh`](
 before serving analysis from that state.
 
 The returned [`AdapterState`](#msg-AdapterState) is a generation counter. `Open` mints the first
-value; `Refresh` and [`SyncVirtual`](#rpc-SyncVirtual) advance it; a call carrying an older
+value; `Refresh` and
+[`ReplaceGeneratedSources`](#rpc-ReplaceGeneratedSources) advance it; a call carrying an older
 generation comes back as [`StaleState`](#msg-StaleState) with the value the adapter actually
 holds, so the server resyncs and retries rather than acting on offsets that have moved.
 
@@ -110,10 +111,10 @@ work that makes it fast. Rift serializes refreshes for one adapter state and dra
 calls first, so a generation never advances under an open stream; within one generation, calls up
 to `max_in_flight_per_state` run concurrently, and the adapter has to be safe for that.
 
-An adapter that produces source for another language publishes it through `SyncVirtual`. Each event
-names the unit it belongs to and the mappings back to the ranges it came from, so a diagnostic on
-generated TypeScript can be pointed at the Svelte a person can actually edit. Rift keeps those
-paths in a namespace of their own.
+An adapter that produces source for another language publishes it through
+`ReplaceGeneratedSources`. Each event names the unit it belongs to and the mappings back to the
+ranges it came from, so a diagnostic on generated TypeScript can be pointed at the Svelte a
+person can actually edit. Rift keeps those paths in a namespace of their own.
 
 ## Analysis
 

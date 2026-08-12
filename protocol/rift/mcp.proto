@@ -83,9 +83,9 @@ enum ErrorCode {
   // configuration changes.
   ERROR_CODE_ADAPTER_UNAVAILABLE = 11;
   // An adapter contract is unusable. Causes include a malformed message, a field outside its
-  // range, ambiguous source or virtual claims, overlapping write claims, a virtual path
-  // collision, and a cycle in virtual-source routing. Correct the adapter configuration before
-  // retrying.
+  // range, ambiguous source or generated-source claims, overlapping write claims, a
+  // generated-path collision, and a cycle in generated-source routing. Correct the adapter
+  // configuration before retrying.
   ERROR_CODE_ADAPTER_PROTOCOL_ERROR = 12;
   // The adapter took the call and did not answer inside the server's per-call budget, which is
   // at most `max_request_ms`. Retrying can work: a cold adapter on a large workspace is slow

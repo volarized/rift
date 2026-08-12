@@ -934,7 +934,7 @@
         "match",
         "actions",
         "resolve",
-        "sync_virtual",
+        "replace_generated_sources",
         "execute",
         "debug_start",
         "debug_get_frame",
@@ -949,8 +949,8 @@
         "execute": "Evaluate a caller-provided code block against one adapter state.",
         "format": "Format selected source.",
         "match": "Run structural matching.",
+        "replace_generated_sources": "Consume generated source produced by another adapter.",
         "resolve": "Resolve a discovered action to edits and evidence.",
-        "sync_virtual": "Consume virtual source produced by another adapter.",
         "validate": "Check a changed source closure."
       },
       "rift:package": "rift.core",
@@ -990,13 +990,13 @@
             "name": "ADAPTER_OPERATION_MATCH",
             "number": 4
           },
+          "replace_generated_sources": {
+            "name": "ADAPTER_OPERATION_REPLACE_GENERATED_SOURCES",
+            "number": 7
+          },
           "resolve": {
             "name": "ADAPTER_OPERATION_RESOLVE",
             "number": 6
-          },
-          "sync_virtual": {
-            "name": "ADAPTER_OPERATION_SYNC_VIRTUAL",
-            "number": 7
           },
           "validate": {
             "name": "ADAPTER_OPERATION_VALIDATE",
@@ -4180,7 +4180,7 @@
         "capability_unavailable"
       ],
       "rift:enumDescriptions": {
-        "adapter_protocol_error": "An adapter contract is unusable. Causes include a malformed message, a field outside its range, ambiguous source or virtual claims, overlapping write claims, a virtual path collision, and a cycle in virtual-source routing. Correct the adapter configuration before retrying.",
+        "adapter_protocol_error": "An adapter contract is unusable. Causes include a malformed message, a field outside its range, ambiguous source or generated-source claims, overlapping write claims, a generated-path collision, and a cycle in generated-source routing. Correct the adapter configuration before retrying.",
         "adapter_timeout": "The adapter took the call and did not answer inside the server's per-call budget, which is at most `max_request_ms`. Retrying can work: a cold adapter on a large workspace is slow once and fast afterwards.",
         "adapter_unavailable": "A configured adapter could serve this request, but its process failed to start or died. The server restarts it on demand, doubling a one-second delay after each failed start; `retry` says `same_request` until three consecutive starts fail, then `operator_action` until the configuration changes.",
         "cancelled": "The caller cancelled, or the connection went away before the request finished. Sending it again is fine.",
@@ -4890,7 +4890,7 @@
       "rift:enumDescriptions": {
         "diagnostics": "What the adapter complained about while reading the file.",
         "nodes": "The nodes of the file's syntax tree, and which symbol each writes.",
-        "origin_mappings": "Relations from produced source ranges to the physical or virtual source ranges that contributed them.",
+        "origin_mappings": "Relations from produced source ranges to the physical or generated source ranges that contributed them.",
         "relationships": "The edges between symbols the adapter read out of this file.",
         "symbols": "The declarations the adapter resolved in the file.",
         "types": "The types carried by those symbols. Type facts live in `Symbol.types` and `Signature`; this family records how completely the adapter resolved them."
@@ -5132,7 +5132,7 @@
           }
         },
         "languages": {
-          "description": "Distinct `Language` values in `regions`, sorted by name and dialect. This physical owner advertises embedded languages even when another adapter consumes virtual source.",
+          "description": "Distinct `Language` values in `regions`, sorted by name and dialect. This physical owner advertises embedded languages even when another adapter consumes generated source.",
           "examples": [
             [
               "svelte",
@@ -5189,7 +5189,7 @@
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "A physical or virtual file with bytes in it. Every node and symbol with readable source comes from this kind.",
+          "description": "A physical or generated file with bytes in it. Every node and symbol with readable source comes from this kind.",
           "properties": {
             "kind": {
               "const": "regular",
@@ -5963,7 +5963,7 @@
     },
     "LanguageRegion": {
       "additionalProperties": false,
-      "description": "A byte range of one file and the language used to parse it. The owner of `App.svelte` can mark its script block as TypeScript. A produced virtual file records ranges in its own byte coordinates.",
+      "description": "A byte range of one file and the language used to parse it. The owner of `App.svelte` can mark its script block as TypeScript. A generated file records ranges in its own byte coordinates.",
       "properties": {
         "language": {
           "$ref": "#/$defs/Language",

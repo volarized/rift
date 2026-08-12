@@ -175,7 +175,7 @@ class SourceClaim(ProtoModel):
         proto_type=ProtoFieldDescriptor.TYPE_BOOL,
         description=(
             "Whether a claimed file may contain other languages. A Svelte owner sets\n this "
-            "for an embedded TypeScript region, then publishes that region as a\n virtual "
+            "for an embedded TypeScript region, then publishes that region as a\n generated "
             "source when the TypeScript adapter has to analyze it."
         ),
     )
@@ -558,7 +558,7 @@ class AdapterState(ProtoModel):
         proto_type=ProtoFieldDescriptor.TYPE_UINT64,
         description=(
             "Adapter-local state generation, and the whole of an adapter state's identity.\n "
-            "Open mints the first value; Refresh and SyncVirtual advance it. A call carrying\n "
+            "Open mints the first value; Refresh and ReplaceGeneratedSources advance it. A call carrying\n "
             "an earlier generation receives StaleState."
         ),
     )
@@ -651,21 +651,21 @@ class RefreshRequest(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "One atomic replacement of the virtual sources consumed by an adapter. Rift\n "
+            "One atomic replacement of the generated sources consumed by an adapter. Rift\n "
             "emits exactly one `start` event first, then each `unit` followed by ordered\n "
             "`text` chunks ending in `final: true`. The complete stream replaces the\n "
-            "previous overlay; an RPC failure leaves the previous generation intact. The\n "
+            "previous set; an RPC failure leaves the previous generation intact. The\n "
             "units are the complete set selected for this consumer at `start`,\n "
             "including an empty set when every previous unit has been retracted."
         ),
         section="Adapter state",
     )
 )
-class VirtualSyncEvent(ProtoModel):
-    """One atomic replacement of the virtual sources consumed by an adapter. Rift
+class GeneratedSourceEvent(ProtoModel):
+    """One atomic replacement of the generated sources consumed by an adapter. Rift
     emits exactly one `start` event first, then each `unit` followed by ordered
     `text` chunks ending in `final: true`. The complete stream replaces the
-    previous overlay; an RPC failure leaves the previous generation intact. The
+    previous set; an RPC failure leaves the previous generation intact. The
     units are the complete set selected for this consumer at `start`,
     including an empty set when every previous unit has been retracted."""
 
@@ -678,13 +678,13 @@ class VirtualSyncEvent(ProtoModel):
             "generation."
         ),
     )
-    unit: Field[VirtualUnit | None] = proto_field(
+    unit: Field[GeneratedUnit | None] = proto_field(
         default=None,
         number=2,
         oneof=Oneof("event"),
-        description="One virtual file whose exact Language matches this adapter.",
+        description="One generated file whose exact Language matches this adapter.",
     )
-    text: Field[VirtualText | None] = proto_field(
+    text: Field[GeneratedText | None] = proto_field(
         default=None,
         number=3,
         oneof=Oneof("event"),
@@ -709,13 +709,13 @@ class CloseRequest(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Read selected claimed physical or synced virtual sources at one state."
+            "Read selected claimed physical or generated sources at one state."
         ),
         section="Analysis",
     )
 )
 class AnalyzeRequest(ProtoModel):
-    """Read selected physical or virtual sources at one adapter state."""
+    """Read selected physical or generated sources at one adapter state."""
 
     state: Field[AdapterState] = proto_field(default=..., number=1)
     units: Field[list[str]] = proto_field(
@@ -752,15 +752,15 @@ class AnalyzeEvent(ProtoModel):
         default=None,
         number=1,
         oneof=Oneof("event"),
-        description="A claimed physical or synced virtual unit is about to have facts.",
+        description="A claimed physical or generated unit is about to have facts.",
     )
-    virtual_unit: Field[VirtualUnit | None] = proto_field(
+    generated_unit: Field[GeneratedUnit | None] = proto_field(
         default=None,
         number=2,
         oneof=Oneof("event"),
         description="A file this adapter produced is about to have text and facts.",
     )
-    virtual_text: Field[VirtualText | None] = proto_field(
+    generated_text: Field[GeneratedText | None] = proto_field(
         default=None,
         number=3,
         oneof=Oneof("event"),
@@ -790,16 +790,16 @@ class AnalyzeEvent(ProtoModel):
     DirectMessage(
         ADAPTER,
         description=(
-            "Metadata for one physical or synced virtual source unit this adapter owns.\n Rift "
-            "resolves the URI against the immutable source-store tree or the virtual overlay at\n this "
+            "Metadata for one physical or generated source unit this adapter owns.\n Rift "
+            "resolves the URI against the immutable source-store tree or the retained generated sources at\n this "
             "AdapterState generation."
         ),
         section="Analysis",
     )
 )
 class SourceUnit(ProtoModel):
-    """Metadata for one physical or synced virtual source unit this adapter owns.
-    Rift resolves the URI against the immutable source-store tree or the virtual overlay at
+    """Metadata for one physical or generated source unit this adapter owns.
+    Rift resolves the URI against the immutable source-store tree or the retained generated sources at
     this AdapterState generation."""
 
     unit: Field[str] = proto_field(
@@ -827,16 +827,16 @@ class SourceUnit(ProtoModel):
         description=(
             "Metadata for a file this adapter produced from another one. Rift validates\n the "
             "complete publication and forwards it to the selected consumer through\n "
-            "SyncVirtual. The consumer stores it in a private overlay under state_root.\n Rift "
+            "ReplaceGeneratedSources. The consumer stores it privately under state_root.\n Rift "
             "exposes the retained bytes as a regular, non-executable File resource."
         ),
         section="Analysis",
     )
 )
-class VirtualUnit(ProtoModel):
+class GeneratedUnit(ProtoModel):
     """Metadata for a file this adapter produced from another one. Rift validates
     the complete publication and forwards it to the selected consumer through
-    SyncVirtual. The consumer stores it in a private overlay under state_root.
+    ReplaceGeneratedSources. The consumer stores it privately under state_root.
     Rift exposes the retained bytes as a regular, non-executable File resource."""
 
     unit: Field[str] = proto_field(
@@ -845,8 +845,8 @@ class VirtualUnit(ProtoModel):
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
             "The produced file, as `rift://file/<path>`. The adapter mints the path;\n "
-            "downstream facts use the same identity even though the bytes live in the\n "
-            "consumer's private overlay."
+            "downstream facts use the same identity even though the bytes live under the\n "
+            "consumer's state_root."
         ),
     )
     language: Field[core.Language] = proto_field(
@@ -862,7 +862,7 @@ class VirtualUnit(ProtoModel):
         number=3,
         description=(
             "Which bytes each language owns inside the produced file. A consumer echoes\n "
-            "these regions when it later emits SourceUnit for the synced path."
+            "these regions when it later emits SourceUnit for the generated path."
         ),
     )
 
@@ -877,7 +877,7 @@ class VirtualUnit(ProtoModel):
         section="Analysis",
     )
 )
-class VirtualText(ProtoModel):
+class GeneratedText(ProtoModel):
     """One chunk of a produced file's bytes. Sent in pieces because a generated file
     can be far larger than the source it came from, and a message has a bound."""
 
@@ -885,7 +885,7 @@ class VirtualText(ProtoModel):
         default=...,
         number=1,
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
-        description="The produced file these bytes belong to, spelled as its VirtualUnit did.",
+        description="The produced file these bytes belong to, spelled as its GeneratedUnit did.",
     )
     offset: Field[int] = proto_field(
         default=...,
@@ -912,14 +912,14 @@ class VirtualText(ProtoModel):
         ADAPTER,
         description=(
             "One file's worth of one fact family. Rift buffers by file until the coverage\n "
-            "event for that file, then routes complete virtual units to their consumer."
+            "event for that file, then routes complete generated units to their consumer."
         ),
         section="Analysis",
     )
 )
 class Facts(ProtoModel):
     """One file's worth of one fact family. Rift buffers by file until the coverage
-    event for that file, then routes complete virtual units to their consumer."""
+    event for that file, then routes complete generated units to their consumer."""
 
     unit: Field[str] = proto_field(
         default=...,
@@ -1008,7 +1008,7 @@ class UnitCoverage(ProtoModel):
         description="How long Rift may retain one Analyze result.",
         value_descriptions=(
             "No cache claim. Rift treats the result as request-volatile.",
-            "The projection contents, adapter implementation, language, and virtual inputs determine the result.",
+            "The projection contents, adapter implementation, language, and generated inputs determine the result.",
             (
                 "Adapter-observed external state also affects the result. Retention ends with the "
                 "process or adapter-state generation."
@@ -1808,13 +1808,13 @@ ADAPTER_PACKAGE = ProtoPackage(
         AdapterState,
         OpenRequest,
         RefreshRequest,
-        VirtualSyncEvent,
+        GeneratedSourceEvent,
         CloseRequest,
         AnalyzeRequest,
         AnalyzeEvent,
         SourceUnit,
-        VirtualUnit,
-        VirtualText,
+        GeneratedUnit,
+        GeneratedText,
         Facts,
         OriginMappings,
         Symbols,
@@ -1900,15 +1900,15 @@ ADAPTER_PACKAGE = ProtoPackage(
                     ),
                 ),
                 Rpc(
-                    "SyncVirtual",
-                    VirtualSyncEvent,
+                    "ReplaceGeneratedSources",
+                    GeneratedSourceEvent,
                     AdapterState,
                     description=(
-                        "Replace this adapter state's private virtual-source overlay. The first\n event "
-                        "pins the current adapter state; the remaining events carry a\n complete manifest "
-                        "and its bytes. Rift drains calls for this adapter\n state before the stream and "
-                        "blocks new calls until completion. Stream\n completion commits the overlay "
-                        "atomically."
+                        "Replace the complete set of generated sources this adapter state\n consumes. "
+                        "The first event pins the current adapter state; the remaining\n events carry "
+                        "the full set and its bytes. Rift drains calls for this\n adapter state before "
+                        "the stream and blocks new calls until completion.\n Stream completion commits "
+                        "the replacement atomically."
                     ),
                     request_stream=True,
                 ),

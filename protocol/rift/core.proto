@@ -329,7 +329,7 @@ enum GuaranteeKind {
 enum FactFamily {
   // The caller did not set a value.
   FACT_FAMILY_UNSPECIFIED = 0;
-  // Relations from produced source ranges to the physical or virtual source ranges that
+  // Relations from produced source ranges to the physical or generated source ranges that
   // contributed them.
   FACT_FAMILY_ORIGIN_MAPPINGS = 1;
   // The declarations the adapter resolved in the file.
@@ -360,8 +360,8 @@ enum AdapterOperation {
   ADAPTER_OPERATION_ACTIONS = 5;
   // Resolve a discovered action to edits and evidence.
   ADAPTER_OPERATION_RESOLVE = 6;
-  // Consume virtual source produced by another adapter.
-  ADAPTER_OPERATION_SYNC_VIRTUAL = 7;
+  // Consume generated source produced by another adapter.
+  ADAPTER_OPERATION_REPLACE_GENERATED_SOURCES = 7;
   // Evaluate a caller-provided code block against one adapter state.
   ADAPTER_OPERATION_EXECUTE = 8;
   // Start an inspect-only debugging session for a code block.
@@ -392,7 +392,7 @@ message ProjectionState {
   bool unaccepted = 4;
 }
 // A byte range of one file and the language used to parse it. The owner of `App.svelte` can
-// mark its script block as TypeScript. A produced virtual file records ranges in its own byte
+// mark its script block as TypeScript. A generated file records ranges in its own byte
 // coordinates.
 message LanguageRegion {
   // The language grammar used for these bytes.
@@ -400,8 +400,8 @@ message LanguageRegion {
   // Offsets of the language region inside the file.
   TextRange range = 2;
 }
-// A physical or virtual file with bytes in it. Every node and symbol with readable source comes
-// from this kind.
+// A physical or generated file with bytes in it. Every node and symbol with readable source
+// comes from this kind.
 message FileContentRegular {
   // Size in bytes.
   int64 size = 1;
@@ -427,7 +427,7 @@ message File {
   // Regular-file metadata or a symbolic-link target.
   FileContent content = 2;
   // Distinct `Language` values in `regions`, sorted by name and dialect. This physical owner
-  // advertises embedded languages even when another adapter consumes virtual source.
+  // advertises embedded languages even when another adapter consumes generated source.
   repeated Language languages = 3;
   // Byte ranges parsed with each language grammar. Entries sort by start, end, language name,
   // and dialect with null first. Regions may overlap when two grammars parse the same bytes.
