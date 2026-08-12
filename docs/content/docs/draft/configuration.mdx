@@ -15,11 +15,11 @@ Point your editor at the schema and everything below autocompletes:
 ```
 
 `rift.toml` is workspace code. It's committed like the rest of the repository, and opening a
-workspace runs what it names — adapter processes at admission, validator commands on every change
+workspace runs what it names — adapter processes at admission, hooks on every change
 that applies — so open a repository the way you'd run its build: because you trust it. A change
 to the file made through a session carries a `configuration` confirmation into
-[`publish`](/docs/draft/protocol/mcp#tool-publish), because publishing it changes which commands
-the server runs.
+[`publish`](/docs/draft/protocol/mcp#tool-publish), because publishing it changes which adapter
+processes and hooks the server runs.
 
 ## Adapters
 
@@ -118,13 +118,15 @@ A change whose required reports don't arrive still lands in the projection — i
 change reports the strength it reached in its
 [`rift://changes`](/docs/draft/protocol/mcp#resource-changes) entry.
 
-## Command validators
+## Hooks
 
-`validators.commands` adds your own checks. Rift starts each one directly, without a shell,
-inside the session's projection directory:
+`hooks` adds your own checks, run in the session's projection each time a change applies. A
+hook's `type` selects how it runs; `command` — an executable Rift starts directly, without a
+shell — is the only type:
 
 ```toml
-[[validators.commands]]
+[[hooks]]
+type = "command"
 id = "tests"
 kind = "test"
 argv = ["cargo", "test"]
@@ -147,8 +149,8 @@ The keys that shape how the command runs:
 - `changed_paths` — `"append"` adds the changed project paths to `argv` in byte order, for a
   linter that takes files; `"none"` leaves `argv` alone
 
-A validator runs the tree it checks — `cargo test` compiles the very change it's validating — so
-a configured validator executes the agent's unpublished code each time a change applies.
+A hook runs the tree it checks — `cargo test` compiles the very change it's validating — so
+a configured hook executes the agent's unpublished code each time a change applies.
 
 Every key in the block is required — the schema carries no defaults, so a missing `environment`
 fails the file with `configuration_invalid`. Two keys carry bounds: `timeout_ms`, when Rift kills
@@ -163,7 +165,7 @@ same tree and environment are expected to give the same answer twice.
 
 A command starts from the environment the server inherited, with `environment` values added on
 top. `rift.toml` is a workspace file your agent reads like any other, so a secret doesn't belong
-in `environment` — put it in the server's own environment and let the validator inherit it.
+in `environment` — put it in the server's own environment and let the hook inherit it.
 
 <Callout type="warn">
 The command runs in the projection, so whatever it writes there is published with it. `cargo test`

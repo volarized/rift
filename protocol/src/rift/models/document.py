@@ -299,7 +299,7 @@ DOCUMENT = Document(
         Resource(
             name="workspace",
             description=(
-                "Reports projection state, adapter availability, limits, and validators."
+                "Reports projection state, adapter availability, limits, and hooks."
             ),
             template=mcp.ResourceTemplate,
             uri=mcp.WorkspaceResourceUri,
@@ -451,7 +451,7 @@ DOCUMENT = Document(
         ),
         Axis(
             name="Reachability",
-            summary="Coverage, diagnostics, validation reports, and validator output for returned facts.",
+            summary="Coverage, diagnostics, validation reports, and hook output for returned facts.",
             identified_by=(
                 core.Coverage,
                 core.CoverageScope,
@@ -502,7 +502,8 @@ DOCUMENT = Document(
                 mcp.ApplyParams,
                 core.RefusalReason,
                 core.ActionSupport,
-                mcp.CommandValidator,
+                mcp.Hook,
+                mcp.CommandHook,
             ),
         ),
         Axis(

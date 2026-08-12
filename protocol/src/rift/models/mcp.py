@@ -843,7 +843,7 @@ class Limits(ClosedModel):
     max_record_bytes: Field[int] = proto_field(
         description=(
             "Largest RFC 8785 JSON encoding of one indivisible item in a paginated answer, "
-            "such as one Change, Edit, diagnostic, or validator result. Resolution fails with "
+            "such as one Change, Edit, diagnostic, or hook result. Resolution fails with "
             "`limit_exceeded` before publishing a change when one item exceeds this value. "
             "Rift keeps it at or below 49152 bytes, leaving page space for identity and cursors."
         ),
@@ -886,9 +886,9 @@ class Limits(ClosedModel):
         le=1000000,
         number=8,
     )
-    max_validators: Field[int] = proto_field(
+    max_hooks: Field[int] = proto_field(
         description=(
-            "How many workspace command checks run when a change applies. "
+            "How many workspace hooks run when a change applies. "
             "Zero when `rift.toml` declares none."
         ),
         ge=0,
@@ -1140,8 +1140,8 @@ class WorkspaceResourcePayload(ClosedModel):
     matching: Field[MatchSyntax] = proto_field(
         description="The pattern grammars the `match` tool accepts here.", number=11
     )
-    validators: Field[list[CommandValidator]] = proto_field(
-        description="Publication checks declared by the workspace-root `rift.toml`.",
+    hooks: Field[list[Hook]] = proto_field(
+        description="Hooks declared by the workspace-root `rift.toml`, in execution order.",
         number=13,
     )
 
@@ -1536,7 +1536,7 @@ class MatchResult(ClosedModel):
         "Source",
         (
             EnumValue("adapter", "ADAPTER", 1),
-            EnumValue("validator", "VALIDATOR", 2),
+            EnumValue("hook", "HOOK", 2),
             EnumValue("apply", "APPLY", 3),
         ),
         placement=Placement("source", 1),
@@ -1544,16 +1544,16 @@ class MatchResult(ClosedModel):
     schema_extra={
         "rift:enumDescriptions": {
             "adapter": "The language's own analysis.",
-            "validator": "A check Rift ran over a proposed change.",
+            "hook": "A workspace hook Rift ran over a proposed change.",
             "apply": "Output from applying edits to the workspace.",
         }
     },
 )
 class DiagnosticContextSource(str, Enum):
-    """Component that produced the diagnostic. Rift sets this after collecting adapter, validator, or apply output."""
+    """Component that produced the diagnostic. Rift sets this after collecting adapter, hook, or apply output."""
 
     ADAPTER = "adapter"
-    VALIDATOR = "validator"
+    HOOK = "hook"
     APPLY = "apply"
 
 
@@ -1564,7 +1564,7 @@ class DiagnosticContext(ClosedModel):
     source: Field[DiagnosticContextSource] = proto_field(
         description=(
             "Component that produced the diagnostic. Rift sets this after collecting adapter, "
-            "validator, or apply output."
+            "hook, or apply output."
         ),
         number=1,
     )
@@ -1611,8 +1611,8 @@ class DiagnosticContext(ClosedModel):
             EnumValue("adapter_timeout", "ERROR_CODE_ADAPTER_TIMEOUT", 13),
             EnumValue("storage_failure", "ERROR_CODE_STORAGE_FAILURE", 14),
             EnumValue(
-                "validator_execution_failure",
-                "ERROR_CODE_VALIDATOR_EXECUTION_FAILURE",
+                "hook_execution_failure",
+                "ERROR_CODE_HOOK_EXECUTION_FAILURE",
                 15,
             ),
             EnumValue("internal_error", "ERROR_CODE_INTERNAL_ERROR", 16),
@@ -1704,8 +1704,8 @@ class DiagnosticContext(ClosedModel):
                 "Rift could not read or write workspace or projection files. Worth retrying only "
                 "if the cause was transient, such as a disk that has since been cleared."
             ),
-            "validator_execution_failure": (
-                "Rift could not launch the command validator, enforce its timeout, or capture "
+            "hook_execution_failure": (
+                "Rift could not launch the hook, enforce its timeout, or capture "
                 "its output. One retry is reasonable when the host failure was transient."
             ),
             "internal_error": (
@@ -1754,7 +1754,7 @@ class ErrorCode(str, Enum):
     ADAPTER_PROTOCOL_ERROR = "adapter_protocol_error"
     ADAPTER_TIMEOUT = "adapter_timeout"
     STORAGE_FAILURE = "storage_failure"
-    VALIDATOR_EXECUTION_FAILURE = "validator_execution_failure"
+    HOOK_EXECUTION_FAILURE = "hook_execution_failure"
     INTERNAL_ERROR = "internal_error"
     UNSUPPORTED_PATH = "unsupported_path"
     CURSOR_EXPIRED = "cursor_expired"
@@ -2531,8 +2531,8 @@ class ProjectionRestoreParams(ClosedModel):
     ),
     schema_extra={},
 )
-class CommandValidatorKind(str, Enum):
-    """How workspace configuration presents this check."""
+class HookKind(str, Enum):
+    """How workspace configuration presents this hook."""
 
     TEST = "test"
     LINT = "lint"
@@ -2553,7 +2553,7 @@ class CommandValidatorKind(str, Enum):
     ),
     schema_extra={},
 )
-class CommandValidatorChangedPaths(str, Enum):
+class CommandHookChangedPaths(str, Enum):
     """Whether Rift appends changed `ProjectPath` values to `argv` in byte order."""
 
     NONE = "none"
@@ -2561,17 +2561,17 @@ class CommandValidatorChangedPaths(str, Enum):
 
 
 @definition(owner=MCP, public=False, proto=Proto.message(), schema_extra={})
-class CommandValidatorGuarantees(ClosedModel):
-    "What a passing run of one configured command establishes."
+class HookGuarantee(ClosedModel):
+    "What a passing run of one configured hook establishes."
 
     kind: Field[core.GuaranteeKind] = proto_field(
-        description="Guarantee established when the validator passes.", number=1
+        description="Guarantee established when the hook passes.", number=1
     )
     scope: Field[core.CoverageScope] = proto_field(
-        description="Source over which the command checks the property.", number=2
+        description="Source over which the hook checks the property.", number=2
     )
     detail: Field[str] = proto_field(
-        description="Exact property the command checks and limits on interpreting a pass.",
+        description="Exact property the hook checks and limits on interpreting a pass.",
         min_length=1,
         max_length=4096,
         number=3,
@@ -2591,7 +2591,7 @@ class CommandValidatorGuarantees(ClosedModel):
     ),
     schema_extra={},
 )
-class CommandValidatorDeterminism(str, Enum):
+class HookDeterminism(str, Enum):
     """Whether an identical tree and environment are expected to produce the same result."""
 
     DETERMINISTIC = "deterministic"
@@ -2599,18 +2599,17 @@ class CommandValidatorDeterminism(str, Enum):
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})
-class CommandValidator(ClosedModel):
-    "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes."
+class CommandHook(ClosedModel):
+    "A hook that runs an executable, without a shell, inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes."
 
+    type: Field[Literal["command"]] = proto_field()
     id: Field[str] = proto_field(
-        description=(
-            "Label shown with this validator. It is unique within `validators.commands`."
-        ),
+        description=("Label shown with this hook. It is unique within `hooks`."),
         pattern="^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
         number=1,
     )
-    kind: Field[CommandValidatorKind] = proto_field(
-        description="How workspace configuration presents this check.", number=2
+    kind: Field[HookKind] = proto_field(
+        description="How workspace configuration presents this hook.", number=2
     )
     argv: Field[list[str]] = proto_field(
         description=(
@@ -2622,7 +2621,7 @@ class CommandValidator(ClosedModel):
         min_length=1,
         number=3,
     )
-    changed_paths: Field[CommandValidatorChangedPaths] = proto_field(
+    changed_paths: Field[CommandHookChangedPaths] = proto_field(
         description="Whether Rift appends changed `ProjectPath` values to `argv` in byte order.",
         number=4,
     )
@@ -2648,25 +2647,37 @@ class CommandValidator(ClosedModel):
     output_limit_bytes: Field[int] = proto_field(
         description=(
             "Captured prefix limit for each output stream. `CapturedText.total_bytes` "
-            "reports the omitted size. The upper bound keeps one escaped validator result "
+            "reports the omitted size. The upper bound keeps one escaped hook result "
             "inside one bounded result."
         ),
         ge=256,
         le=4096,
         number=8,
     )
-    guarantees: Field[list[CommandValidatorGuarantees]] = proto_field(
+    guarantees: Field[list[HookGuarantee]] = proto_field(
         description=(
-            "Behavior or other properties this command is intended to check. A passing result "
+            "Behavior or other properties this hook is intended to check. A passing result "
             "turns each declaration into `GuaranteeEvidence`; a failed result attaches a "
             "`ConfirmationRequirement` to the change."
         ),
         number=9,
     )
-    determinism: Field[CommandValidatorDeterminism] = proto_field(
+    determinism: Field[HookDeterminism] = proto_field(
         description="Whether an identical tree and environment are expected to produce the same result.",
         number=10,
     )
+
+
+@union(
+    owner=MCP,
+    oneof="variant",
+    discriminator="type",
+    variants=(Variant("command", "command", 1, CommandHook),),
+)
+class Hook(ProtocolRoot):
+    """One workspace hook from the workspace-root `rift.toml`, run inside the session's
+    projection each time a change applies. `type` selects how the hook runs; `command` is
+    the only type."""
 
 
 @definition(
@@ -2738,7 +2749,7 @@ class ChangeSummary(ClosedModel):
         description=(
             "Effects the caller has to accept before this change can be published, sorted by "
             "kind, source location, title, and detail. Empty where every affected adapter and "
-            "validator vouched for the result."
+            "hook vouched for the result."
         ),
         number=10,
     )
@@ -3221,7 +3232,8 @@ MODELS = (
     ChangeSignatureParams,
     ApplyParams,
     ProjectionRestoreParams,
-    CommandValidator,
+    Hook,
+    CommandHook,
     ChangeValidation,
     ChangeSummary,
     ChangesResourcePayload,

@@ -304,22 +304,6 @@ class ValidationConfig(ConfigModel):
         return self
 
 
-class ValidatorsConfig(ConfigModel):
-    """Workspace command checks run in the projection each time a change applies."""
-
-    commands: list[mcp.CommandValidator] = Field(
-        default_factory=list,
-        description="Exact command declarations, in execution order.",
-    )
-
-    @model_validator(mode="after")
-    def entries_are_well_formed(self) -> ValidatorsConfig:
-        ids = [command.id for command in self.commands]
-        if len(ids) != len(set(ids)):
-            raise ValueError("validators.commands ids must be unique")
-        return self
-
-
 class AdapterProcessConfig(ConfigModel):
     """How Rift starts one configured adapter process."""
 
@@ -352,7 +336,10 @@ class RiftConfig(ConfigModel):
 
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
-    validators: ValidatorsConfig = Field(default_factory=ValidatorsConfig)
+    hooks: list[mcp.Hook] = Field(
+        default_factory=list,
+        description="Hooks run in the projection each time a change applies, in list order.",
+    )
     adapters: dict[str, AdapterProcessConfig] = Field(
         default_factory=dict,
         description=(
@@ -376,6 +363,13 @@ class RiftConfig(ConfigModel):
             raise ValueError(f"invalid adapter process names: {invalid!r}")
         return self
 
+    @model_validator(mode="after")
+    def hook_ids_are_unique(self) -> RiftConfig:
+        ids = [hook.root.id for hook in self.hooks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("hooks ids must be unique")
+        return self
+
 
 __all__ = [
     "AdapterProcessConfig",
@@ -385,5 +379,4 @@ __all__ = [
     "LanguageSelector",
     "RiftConfig",
     "ValidationConfig",
-    "ValidatorsConfig",
 ]

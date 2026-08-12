@@ -111,7 +111,7 @@ When resolution yields no edits at all, that's a refusal and the projection is u
 [`RefusalReason`](/docs/draft/protocol/reference#RefusalReason). When it yields edits that
 nothing will vouch for, the change lands carrying a
 [`ConfirmationRequirement`](/docs/draft/protocol/reference#ConfirmationRequirement) per
-problem — a validator that didn't finish, a reference the adapter couldn't classify, a deletion —
+problem — a hook that didn't finish, a reference the adapter couldn't classify, a deletion —
 and `publish` is where those get settled.
 
 Transport and infrastructure failures aren't in either bucket. They're

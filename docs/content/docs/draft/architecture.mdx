@@ -72,12 +72,12 @@ file decides:
 - which adapter processes to run
 - what execution is allowed
 - what validation requires
-- which validator commands exist
+- which hooks exist
 
 An edit to the file takes effect for later requests once it validates again; a change to
 `rift.toml` made through a session carries a `configuration` confirmation into
-[`publish`](/docs/draft/protocol/mcp#tool-publish), because publishing it changes which commands
-the server runs. Admission fails when two adapters claim the same language or the same output
+[`publish`](/docs/draft/protocol/mcp#tool-publish), because publishing it changes which adapter
+processes and hooks the server runs. Admission fails when two adapters claim the same language or the same output
 paths, and an invalid file keeps the workspace unusable until you fix it.
 
 ## Sessions
@@ -164,7 +164,7 @@ Everything written inside the projection is published with it, including build o
 `cargo test` run in there leaves `target/` behind, and publication carries it. Rift would rather
 hand you files you didn't want than quietly drop a file some tool wrote and you needed. Adapters
 can point `CARGO_TARGET_DIR` and friends at the private `state_root` the server gives them; a
-validator command or a tool you launched yourself has no such escape.
+hook or a tool you launched yourself has no such escape.
 </Callout>
 
 ## Changes
@@ -180,18 +180,18 @@ no bytes to write, that's a refusal and the projection is untouched: the address
 the pattern matched forty places where you said one, the language has no such operation. There is
 nothing to record because nothing was produced.
 
-Alongside the adapters, the server runs the workspace's configured validator commands inside the
+Alongside the adapters, the server runs the workspace's configured hooks inside the
 session's projection each time a change applies, and their verdicts ride on the change — which is
-why publication settles confirmations rather than re-running anything, and why what a validator
+why publication settles confirmations rather than re-running anything, and why what a hook
 writes into the projection is published with it.
 
 If Rift produced the edits and nobody would vouch for them, the change lands anyway and carries
-what's wrong with it. A validator didn't finish, an adapter couldn't classify every reference, the
+what's wrong with it. A hook didn't finish, an adapter couldn't classify every reference, the
 change deletes a file — each of those becomes a
 [`ConfirmationRequirement`](/docs/draft/protocol/reference#ConfirmationRequirement) attached to
 that change.
 This is the point of a scratchpad: a bad change you can look at is worth more than a refusal that
-tells you a validator was unhappy and leaves you to guess where.
+tells you a hook was unhappy and leaves you to guess where.
 
 A path a tool wrote without going through MCP is a changed path with no change record: it makes
 the projection dirty, `publish` carries it, and

@@ -320,7 +320,7 @@ enum GuaranteeKind {
   // Every resolved reference in scope that should follow the operation now reaches its intended
   // target.
   GUARANTEE_KIND_REFERENCES_UPDATED = 3;
-  // A named static analysis or command validator checked a stated behavioral property. The
+  // A named static analysis or workspace hook checked a stated behavioral property. The
   // evidence is limited to that named property and scope.
   GUARANTEE_KIND_BEHAVIOR_CHECKED = 4;
 }
@@ -1514,17 +1514,17 @@ message OperationVerifierAdapter {
   // The language whose adapter performed the check.
   Language language = 1;
 }
-// One workspace command validator checked a changed tree.
-message OperationVerifierValidator {
-  // The `CommandValidator.id` of the workspace validator that ran the check.
-  string validator = 1;
+// One workspace hook checked a changed tree.
+message OperationVerifierHook {
+  // The `id` of the workspace hook that ran the check.
+  string hook = 1;
 }
 // The component that checked a precondition or established a guarantee.
 message OperationVerifier {
   oneof variant {
     google.protobuf.Empty rift = 1;
     OperationVerifierAdapter adapter = 2;
-    OperationVerifierValidator validator = 3;
+    OperationVerifierHook hook = 3;
   }
 }
 // Boolean property such as target existence or writability.
@@ -1664,8 +1664,8 @@ message GuaranteeEvidence {
     ADAPTER = 2;
     // A named language analysis checked a property narrower than compilation.
     STATIC_ANALYSIS = 3;
-    // A workspace command validator checked the changed tree.
-    VALIDATOR = 4;
+    // A workspace hook checked the changed tree.
+    HOOK = 4;
   }
   GuaranteeKind kind = 1;
   // Source over which the guarantee holds.
@@ -1699,13 +1699,14 @@ message ConfirmationRequirement {
     BEHAVIOR_UNKNOWN = 5;
     // Formatting reaches outside the changed syntactic regions.
     FORMATTING_SCOPE = 6;
-    // A workspace command validator will check the changed tree.
-    COMMAND_VALIDATOR = 7;
-    // Required adapter or command validation did not complete over the resulting tree.
+    // A workspace hook will check the changed tree.
+    HOOK = 7;
+    // Required adapter validation or hook run did not complete over the resulting tree.
     VALIDATION_INCOMPLETE = 8;
     // The action advertised a guarantee that resolution produced no evidence for.
     GUARANTEE_UNESTABLISHED = 9;
-    // The change touches `rift.toml`. Publishing it changes which commands the server runs.
+    // The change touches `rift.toml`. Publishing it changes which adapter processes and hooks
+    // the server runs.
     CONFIGURATION = 10;
   }
   Kind kind = 2;

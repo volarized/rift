@@ -37,12 +37,17 @@
       "title": "ByteSize",
       "type": "string"
     },
-    "CommandValidator": {
+    "CommandHook": {
       "additionalProperties": false,
-      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes.",
+      "description": "A hook that runs an executable, without a shell, inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes.",
       "properties": {
+        "type": {
+          "const": "command",
+          "title": "Type",
+          "type": "string"
+        },
         "id": {
-          "description": "Label shown with this validator. It is unique within `validators.commands`.",
+          "description": "Label shown with this hook. It is unique within `hooks`.",
           "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
           "rift:proto": {
             "number": 1
@@ -51,7 +56,7 @@
           "type": "string"
         },
         "kind": {
-          "$ref": "#/$defs/CommandValidatorKind",
+          "$ref": "#/$defs/HookKind",
           "rift:proto": {
             "number": 2
           }
@@ -69,7 +74,7 @@
           "type": "array"
         },
         "changed_paths": {
-          "$ref": "#/$defs/CommandValidatorChangedPaths",
+          "$ref": "#/$defs/CommandHookChangedPaths",
           "rift:proto": {
             "number": 4
           }
@@ -106,7 +111,7 @@
           "type": "integer"
         },
         "output_limit_bytes": {
-          "description": "Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the omitted size. The upper bound keeps one escaped validator result inside one bounded result.",
+          "description": "Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the omitted size. The upper bound keeps one escaped hook result inside one bounded result.",
           "maximum": 4096,
           "minimum": 256,
           "rift:proto": {
@@ -116,9 +121,9 @@
           "type": "integer"
         },
         "guarantees": {
-          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement` to the change.",
+          "description": "Behavior or other properties this hook is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement` to the change.",
           "items": {
-            "$ref": "#/$defs/CommandValidatorGuarantees"
+            "$ref": "#/$defs/HookGuarantee"
           },
           "rift:proto": {
             "number": 9
@@ -127,13 +132,14 @@
           "type": "array"
         },
         "determinism": {
-          "$ref": "#/$defs/CommandValidatorDeterminism",
+          "$ref": "#/$defs/HookDeterminism",
           "rift:proto": {
             "number": 10
           }
         }
       },
       "required": [
+        "type",
         "id",
         "kind",
         "argv",
@@ -147,12 +153,12 @@
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
-        "type": "rift.mcp.CommandValidator"
+        "type": "rift.mcp.CommandHook"
       },
-      "title": "CommandValidator",
+      "title": "CommandHook",
       "type": "object"
     },
-    "CommandValidatorChangedPaths": {
+    "CommandHookChangedPaths": {
       "description": "Whether Rift appends changed `ProjectPath` values to `argv` in byte order.",
       "enum": [
         "none",
@@ -174,108 +180,7 @@
           }
         }
       },
-      "title": "CommandValidatorChangedPaths",
-      "type": "string"
-    },
-    "CommandValidatorDeterminism": {
-      "description": "Whether an identical tree and environment are expected to produce the same result.",
-      "enum": [
-        "deterministic",
-        "best_effort"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "enum": "Determinism",
-        "field": "determinism",
-        "number": 10,
-        "values": {
-          "best_effort": {
-            "name": "DETERMINISM_BEST_EFFORT",
-            "number": 2
-          },
-          "deterministic": {
-            "name": "DETERMINISM_DETERMINISTIC",
-            "number": 1
-          }
-        }
-      },
-      "title": "CommandValidatorDeterminism",
-      "type": "string"
-    },
-    "CommandValidatorGuarantees": {
-      "additionalProperties": false,
-      "description": "What a passing run of one configured command establishes.",
-      "properties": {
-        "kind": {
-          "$ref": "#/$defs/GuaranteeKind",
-          "description": "Guarantee established when the validator passes.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "scope": {
-          "$ref": "#/$defs/CoverageScope",
-          "description": "Source over which the command checks the property.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
-        "detail": {
-          "description": "Exact property the command checks and limits on interpreting a pass.",
-          "maxLength": 4096,
-          "minLength": 1,
-          "rift:proto": {
-            "number": 3
-          },
-          "title": "Detail",
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind",
-        "scope",
-        "detail"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.CommandValidatorGuarantees"
-      },
-      "title": "CommandValidatorGuarantees",
-      "type": "object"
-    },
-    "CommandValidatorKind": {
-      "description": "How workspace configuration presents this check.",
-      "enum": [
-        "test",
-        "lint",
-        "build",
-        "other"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "enum": "Kind",
-        "field": "kind",
-        "number": 2,
-        "values": {
-          "build": {
-            "name": "KIND_BUILD",
-            "number": 3
-          },
-          "lint": {
-            "name": "KIND_LINT",
-            "number": 2
-          },
-          "other": {
-            "name": "KIND_OTHER",
-            "number": 4
-          },
-          "test": {
-            "name": "KIND_TEST",
-            "number": 1
-          }
-        }
-      },
-      "title": "CommandValidatorKind",
+      "title": "CommandHookChangedPaths",
       "type": "string"
     },
     "CoverageReach": {
@@ -578,7 +483,7 @@
         "behavior_checked"
       ],
       "rift:enumDescriptions": {
-        "behavior_checked": "A named static analysis or command validator checked a stated behavioral property. The evidence is limited to that named property and scope.",
+        "behavior_checked": "A named static analysis or workspace hook checked a stated behavioral property. The evidence is limited to that named property and scope.",
         "bindings_preserved": "Unchanged references in scope resolve to the same symbols before and after the action.",
         "references_updated": "Every resolved reference in scope that should follow the operation now reaches its intended target.",
         "syntax_validated": "The language parser accepts the affected source under the stated scope."
@@ -607,6 +512,135 @@
         }
       },
       "title": "GuaranteeKind",
+      "type": "string"
+    },
+    "Hook": {
+      "description": "One workspace hook from the workspace-root `rift.toml`, run inside the session's\nprojection each time a change applies. `type` selects how the hook runs; `command` is\nthe only type.",
+      "discriminator": {
+        "mapping": {
+          "command": "#/$defs/CommandHook"
+        },
+        "propertyName": "type"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/CommandHook"
+        }
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "oneof": "variant",
+        "type": "rift.mcp.Hook",
+        "variants": [
+          {
+            "field": "command",
+            "number": 1,
+            "tag": "command",
+            "type": "CommandHook"
+          }
+        ]
+      },
+      "title": "Hook"
+    },
+    "HookDeterminism": {
+      "description": "Whether an identical tree and environment are expected to produce the same result.",
+      "enum": [
+        "deterministic",
+        "best_effort"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Determinism",
+        "field": "determinism",
+        "number": 10,
+        "values": {
+          "best_effort": {
+            "name": "DETERMINISM_BEST_EFFORT",
+            "number": 2
+          },
+          "deterministic": {
+            "name": "DETERMINISM_DETERMINISTIC",
+            "number": 1
+          }
+        }
+      },
+      "title": "HookDeterminism",
+      "type": "string"
+    },
+    "HookGuarantee": {
+      "additionalProperties": false,
+      "description": "What a passing run of one configured hook establishes.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/GuaranteeKind",
+          "description": "Guarantee established when the hook passes.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/CoverageScope",
+          "description": "Source over which the hook checks the property.",
+          "rift:proto": {
+            "number": 2
+          }
+        },
+        "detail": {
+          "description": "Exact property the hook checks and limits on interpreting a pass.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "rift:proto": {
+            "number": 3
+          },
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "detail"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.HookGuarantee"
+      },
+      "title": "HookGuarantee",
+      "type": "object"
+    },
+    "HookKind": {
+      "description": "How workspace configuration presents this hook.",
+      "enum": [
+        "test",
+        "lint",
+        "build",
+        "other"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Kind",
+        "field": "kind",
+        "number": 2,
+        "values": {
+          "build": {
+            "name": "KIND_BUILD",
+            "number": 3
+          },
+          "lint": {
+            "name": "KIND_LINT",
+            "number": 2
+          },
+          "other": {
+            "name": "KIND_OTHER",
+            "number": 4
+          },
+          "test": {
+            "name": "KIND_TEST",
+            "number": 1
+          }
+        }
+      },
+      "title": "HookKind",
       "type": "string"
     },
     "LanguageSelector": {
@@ -662,22 +696,6 @@
       },
       "title": "ValidationConfig",
       "type": "object"
-    },
-    "ValidatorsConfig": {
-      "additionalProperties": false,
-      "description": "Workspace command checks run in the projection each time a change applies.",
-      "properties": {
-        "commands": {
-          "description": "Exact command declarations, in execution order.",
-          "items": {
-            "$ref": "#/$defs/CommandValidator"
-          },
-          "title": "Commands",
-          "type": "array"
-        }
-      },
-      "title": "ValidatorsConfig",
-      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -689,8 +707,13 @@
     "validation": {
       "$ref": "#/$defs/ValidationConfig"
     },
-    "validators": {
-      "$ref": "#/$defs/ValidatorsConfig"
+    "hooks": {
+      "description": "Hooks run in the projection each time a change applies, in list order.",
+      "items": {
+        "$ref": "#/$defs/Hook"
+      },
+      "title": "Hooks",
+      "type": "array"
     },
     "adapters": {
       "additionalProperties": {

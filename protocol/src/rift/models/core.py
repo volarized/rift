@@ -3169,12 +3169,12 @@ class OperationVerifierAdapter(ClosedModel):
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class OperationVerifierValidator(ClosedModel):
-    """One workspace command validator checked a changed tree."""
+class OperationVerifierHook(ClosedModel):
+    """One workspace hook checked a changed tree."""
 
-    kind: Field[Literal["validator"]] = proto_field()
-    validator: Field[str] = proto_field(
-        description="The `CommandValidator.id` of the workspace validator that ran the check.",
+    kind: Field[Literal["hook"]] = proto_field()
+    hook: Field[str] = proto_field(
+        description="The `id` of the workspace hook that ran the check.",
         pattern="^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
         number=1,
     )
@@ -3194,7 +3194,7 @@ class OperationVerifierRift(ClosedModel):
     variants=(
         Variant("rift", "rift", 1, OperationVerifierRift, ProtoEmpty),
         Variant("adapter", "adapter", 2, OperationVerifierAdapter),
-        Variant("validator", "validator", 3, OperationVerifierValidator),
+        Variant("hook", "hook", 3, OperationVerifierHook),
     ),
 )
 class OperationVerifier(ProtocolRoot):
@@ -3533,7 +3533,7 @@ class OperationEffect(ClosedModel):
                 "its intended target."
             ),
             "behavior_checked": (
-                "A named static analysis or command validator checked a stated behavioral "
+                "A named static analysis or workspace hook checked a stated behavioral "
                 "property. The evidence is limited to that named property and scope."
             ),
         }
@@ -3557,7 +3557,7 @@ class GuaranteeKind(str, Enum):
             EnumValue("construction", "CONSTRUCTION", 1),
             EnumValue("adapter", "ADAPTER", 2),
             EnumValue("static_analysis", "STATIC_ANALYSIS", 3),
-            EnumValue("validator", "VALIDATOR", 4),
+            EnumValue("hook", "HOOK", 4),
         ),
         placement=Placement("method", 4),
     ),
@@ -3566,7 +3566,7 @@ class GuaranteeKind(str, Enum):
             "construction": "Rift established the property directly from its closed edit and transaction rules.",
             "adapter": "The language adapter or resolver checked the transformed program.",
             "static_analysis": "A named language analysis checked a property narrower than compilation.",
-            "validator": "A workspace command validator checked the changed tree.",
+            "hook": "A workspace hook checked the changed tree.",
         }
     },
 )
@@ -3576,7 +3576,7 @@ class GuaranteeEvidenceMethod(str, Enum):
     CONSTRUCTION = "construction"
     ADAPTER = "adapter"
     STATIC_ANALYSIS = "static_analysis"
-    VALIDATOR = "validator"
+    HOOK = "hook"
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -3617,7 +3617,7 @@ class GuaranteeEvidence(ClosedModel):
             EnumValue("unresolved_reference", "UNRESOLVED_REFERENCE", 4),
             EnumValue("behavior_unknown", "BEHAVIOR_UNKNOWN", 5),
             EnumValue("formatting_scope", "FORMATTING_SCOPE", 6),
-            EnumValue("command_validator", "COMMAND_VALIDATOR", 7),
+            EnumValue("hook", "HOOK", 7),
             EnumValue("validation_incomplete", "VALIDATION_INCOMPLETE", 8),
             EnumValue("guarantee_unestablished", "GUARANTEE_UNESTABLISHED", 9),
             EnumValue("configuration", "CONFIGURATION", 10),
@@ -3632,10 +3632,10 @@ class GuaranteeEvidence(ClosedModel):
             "unresolved_reference": "The adapter found a reference it could not classify or update.",
             "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
             "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
-            "command_validator": "A workspace command validator will check the changed tree.",
-            "validation_incomplete": "Required adapter or command validation did not complete over the resulting tree.",
+            "hook": "A workspace hook will check the changed tree.",
+            "validation_incomplete": "Required adapter validation or hook run did not complete over the resulting tree.",
             "guarantee_unestablished": "The action advertised a guarantee that resolution produced no evidence for.",
-            "configuration": "The change touches `rift.toml`. Publishing it changes which commands the server runs.",
+            "configuration": "The change touches `rift.toml`. Publishing it changes which adapter processes and hooks the server runs.",
         }
     },
 )
@@ -3648,7 +3648,7 @@ class ConfirmationRequirementKind(str, Enum):
     UNRESOLVED_REFERENCE = "unresolved_reference"
     BEHAVIOR_UNKNOWN = "behavior_unknown"
     FORMATTING_SCOPE = "formatting_scope"
-    COMMAND_VALIDATOR = "command_validator"
+    HOOK = "hook"
     VALIDATION_INCOMPLETE = "validation_incomplete"
     GUARANTEE_UNESTABLISHED = "guarantee_unestablished"
     CONFIGURATION = "configuration"

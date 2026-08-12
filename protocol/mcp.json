@@ -257,7 +257,7 @@
     },
     "mcp.resources": {
       "workspace": {
-        "description": "Reports projection state, adapter availability, limits, and validators.",
+        "description": "Reports projection state, adapter availability, limits, and hooks.",
         "template": {
           "$ref": "#/$defs/ResourceTemplate"
         },
@@ -427,7 +427,7 @@
       },
       {
         "name": "Reachability",
-        "summary": "Coverage, diagnostics, validation reports, and validator output for returned facts.",
+        "summary": "Coverage, diagnostics, validation reports, and hook output for returned facts.",
         "identifiedBy": [
           "Coverage",
           "CoverageScope",
@@ -478,7 +478,8 @@
           "ApplyParams",
           "RefusalReason",
           "ActionSupport",
-          "CommandValidator"
+          "Hook",
+          "CommandHook"
         ]
       },
       {
@@ -1735,7 +1736,7 @@
           "type": "array"
         },
         "confirmations": {
-          "description": "Effects the caller has to accept before this change can be published, sorted by kind, source location, title, and detail. Empty where every affected adapter and validator vouched for the result.",
+          "description": "Effects the caller has to accept before this change can be published, sorted by kind, source location, title, and detail. Empty where every affected adapter and hook vouched for the result.",
           "items": {
             "$ref": "#/$defs/ConfirmationRequirement"
           },
@@ -1906,12 +1907,17 @@
       "title": "CodeBlock",
       "type": "object"
     },
-    "CommandValidator": {
+    "CommandHook": {
       "additionalProperties": false,
-      "description": "A command from the workspace-root `rift.toml`, run without a shell inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes.",
+      "description": "A hook that runs an executable, without a shell, inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes.",
       "properties": {
+        "type": {
+          "const": "command",
+          "title": "Type",
+          "type": "string"
+        },
         "id": {
-          "description": "Label shown with this validator. It is unique within `validators.commands`.",
+          "description": "Label shown with this hook. It is unique within `hooks`.",
           "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
           "rift:proto": {
             "number": 1
@@ -1920,7 +1926,7 @@
           "type": "string"
         },
         "kind": {
-          "$ref": "#/$defs/CommandValidatorKind",
+          "$ref": "#/$defs/HookKind",
           "rift:proto": {
             "number": 2
           }
@@ -1938,7 +1944,7 @@
           "type": "array"
         },
         "changed_paths": {
-          "$ref": "#/$defs/CommandValidatorChangedPaths",
+          "$ref": "#/$defs/CommandHookChangedPaths",
           "rift:proto": {
             "number": 4
           }
@@ -1975,7 +1981,7 @@
           "type": "integer"
         },
         "output_limit_bytes": {
-          "description": "Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the omitted size. The upper bound keeps one escaped validator result inside one bounded result.",
+          "description": "Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the omitted size. The upper bound keeps one escaped hook result inside one bounded result.",
           "maximum": 4096,
           "minimum": 256,
           "rift:proto": {
@@ -1985,9 +1991,9 @@
           "type": "integer"
         },
         "guarantees": {
-          "description": "Behavior or other properties this command is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement` to the change.",
+          "description": "Behavior or other properties this hook is intended to check. A passing result turns each declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement` to the change.",
           "items": {
-            "$ref": "#/$defs/CommandValidatorGuarantees"
+            "$ref": "#/$defs/HookGuarantee"
           },
           "rift:proto": {
             "number": 9
@@ -1996,13 +2002,14 @@
           "type": "array"
         },
         "determinism": {
-          "$ref": "#/$defs/CommandValidatorDeterminism",
+          "$ref": "#/$defs/HookDeterminism",
           "rift:proto": {
             "number": 10
           }
         }
       },
       "required": [
+        "type",
         "id",
         "kind",
         "argv",
@@ -2016,12 +2023,12 @@
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {
-        "type": "rift.mcp.CommandValidator"
+        "type": "rift.mcp.CommandHook"
       },
-      "title": "CommandValidator",
+      "title": "CommandHook",
       "type": "object"
     },
-    "CommandValidatorChangedPaths": {
+    "CommandHookChangedPaths": {
       "description": "Whether Rift appends changed `ProjectPath` values to `argv` in byte order.",
       "enum": [
         "none",
@@ -2043,108 +2050,7 @@
           }
         }
       },
-      "title": "CommandValidatorChangedPaths",
-      "type": "string"
-    },
-    "CommandValidatorDeterminism": {
-      "description": "Whether an identical tree and environment are expected to produce the same result.",
-      "enum": [
-        "deterministic",
-        "best_effort"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "enum": "Determinism",
-        "field": "determinism",
-        "number": 10,
-        "values": {
-          "best_effort": {
-            "name": "DETERMINISM_BEST_EFFORT",
-            "number": 2
-          },
-          "deterministic": {
-            "name": "DETERMINISM_DETERMINISTIC",
-            "number": 1
-          }
-        }
-      },
-      "title": "CommandValidatorDeterminism",
-      "type": "string"
-    },
-    "CommandValidatorGuarantees": {
-      "additionalProperties": false,
-      "description": "What a passing run of one configured command establishes.",
-      "properties": {
-        "kind": {
-          "$ref": "#/$defs/GuaranteeKind",
-          "description": "Guarantee established when the validator passes.",
-          "rift:proto": {
-            "number": 1
-          }
-        },
-        "scope": {
-          "$ref": "#/$defs/CoverageScope",
-          "description": "Source over which the command checks the property.",
-          "rift:proto": {
-            "number": 2
-          }
-        },
-        "detail": {
-          "description": "Exact property the command checks and limits on interpreting a pass.",
-          "maxLength": 4096,
-          "minLength": 1,
-          "rift:proto": {
-            "number": 3
-          },
-          "title": "Detail",
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind",
-        "scope",
-        "detail"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "type": "rift.mcp.CommandValidatorGuarantees"
-      },
-      "title": "CommandValidatorGuarantees",
-      "type": "object"
-    },
-    "CommandValidatorKind": {
-      "description": "How workspace configuration presents this check.",
-      "enum": [
-        "test",
-        "lint",
-        "build",
-        "other"
-      ],
-      "rift:package": "rift.mcp",
-      "rift:proto": {
-        "enum": "Kind",
-        "field": "kind",
-        "number": 2,
-        "values": {
-          "build": {
-            "name": "KIND_BUILD",
-            "number": 3
-          },
-          "lint": {
-            "name": "KIND_LINT",
-            "number": 2
-          },
-          "other": {
-            "name": "KIND_OTHER",
-            "number": 4
-          },
-          "test": {
-            "name": "KIND_TEST",
-            "number": 1
-          }
-        }
-      },
-      "title": "CommandValidatorKind",
+      "title": "CommandHookChangedPaths",
       "type": "string"
     },
     "ConfirmationRequirement": {
@@ -2211,22 +2117,22 @@
         "unresolved_reference",
         "behavior_unknown",
         "formatting_scope",
-        "command_validator",
+        "hook",
         "validation_incomplete",
         "guarantee_unestablished",
         "configuration"
       ],
       "rift:enumDescriptions": {
         "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
-        "command_validator": "A workspace command validator will check the changed tree.",
-        "configuration": "The change touches `rift.toml`. Publishing it changes which commands the server runs.",
+        "configuration": "The change touches `rift.toml`. Publishing it changes which adapter processes and hooks the server runs.",
         "destructive": "The change deletes source or replaces an existing file.",
         "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
         "generated_code": "The change touches source marked as generated.",
         "guarantee_unestablished": "The action advertised a guarantee that resolution produced no evidence for.",
+        "hook": "A workspace hook will check the changed tree.",
         "large_scope": "The change reaches enough files or symbols to require explicit acceptance.",
         "unresolved_reference": "The adapter found a reference it could not classify or update.",
-        "validation_incomplete": "Required adapter or command validation did not complete over the resulting tree."
+        "validation_incomplete": "Required adapter validation or hook run did not complete over the resulting tree."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -2237,10 +2143,6 @@
           "behavior_unknown": {
             "name": "BEHAVIOR_UNKNOWN",
             "number": 5
-          },
-          "command_validator": {
-            "name": "COMMAND_VALIDATOR",
-            "number": 7
           },
           "configuration": {
             "name": "CONFIGURATION",
@@ -2261,6 +2163,10 @@
           "guarantee_unestablished": {
             "name": "GUARANTEE_UNESTABLISHED",
             "number": 9
+          },
+          "hook": {
+            "name": "HOOK",
+            "number": 7
           },
           "large_scope": {
             "name": "LARGE_SCOPE",
@@ -3548,16 +3454,16 @@
       "type": "object"
     },
     "DiagnosticContextSource": {
-      "description": "Component that produced the diagnostic. Rift sets this after collecting adapter, validator, or apply output.",
+      "description": "Component that produced the diagnostic. Rift sets this after collecting adapter, hook, or apply output.",
       "enum": [
         "adapter",
-        "validator",
+        "hook",
         "apply"
       ],
       "rift:enumDescriptions": {
         "adapter": "The language's own analysis.",
         "apply": "Output from applying edits to the workspace.",
-        "validator": "A check Rift ran over a proposed change."
+        "hook": "A workspace hook Rift ran over a proposed change."
       },
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -3573,8 +3479,8 @@
             "name": "APPLY",
             "number": 3
           },
-          "validator": {
-            "name": "VALIDATOR",
+          "hook": {
+            "name": "HOOK",
             "number": 2
           }
         }
@@ -4171,7 +4077,7 @@
         "adapter_protocol_error",
         "adapter_timeout",
         "storage_failure",
-        "validator_execution_failure",
+        "hook_execution_failure",
         "internal_error",
         "unsupported_path",
         "cursor_expired",
@@ -4190,6 +4096,7 @@
         "cursor_expired": "The cursor is valid, but its captured result page set left the process-local cache. Start again from the first page.",
         "cursor_invalid": "The cursor is malformed, or it was minted for a different request, order or page size. Start the query again from its first page.",
         "deadline_exceeded": "The request ran past `max_request_ms`. A smaller one may succeed \u2014 a lower `limit`, a narrower path selector \u2014 and so may the same one once a cold adapter has warmed up.",
+        "hook_execution_failure": "Rift could not launch the hook, enforce its timeout, or capture its output. One retry is reasonable when the host failure was transient.",
         "internal_error": "A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected to answer differently.",
         "invalid_request": "The request does not satisfy the schema, or names something the schema forbids: a `limit` above the advertised maximum, a filter field that does not exist. The same bytes fail identically.",
         "limit_exceeded": "A request or a response crossed an advertised limit. `limit` says which one and by how much, so the request can be resized and sent again.",
@@ -4199,8 +4106,7 @@
         "storage_failure": "Rift could not read or write workspace or projection files. Worth retrying only if the cause was transient, such as a disk that has since been cleared.",
         "temporarily_unavailable": "The resource exists but is in use. Another connection owns the session, a retained debugger blocks continuation, a disposable workspace is still releasing, or another publication holds the workspace. Retry after that owner or operation finishes.",
         "unsupported_path": "The workspace contains a path the protocol cannot represent safely.",
-        "unsupported_protocol": "No version the caller offered is one the server implements. `protocol` lists the versions the server supports; the caller selects one it implements and reconnects, or surfaces the mismatch.",
-        "validator_execution_failure": "Rift could not launch the command validator, enforce its timeout, or capture its output. One retry is reasonable when the host failure was transient."
+        "unsupported_protocol": "No version the caller offered is one the server implements. `protocol` lists the versions the server supports; the caller selects one it implements and reconnects, or surfaces the mismatch."
       },
       "rift:package": "rift.mcp",
       "rift:proto": {
@@ -4247,6 +4153,10 @@
             "name": "ERROR_CODE_DEADLINE_EXCEEDED",
             "number": 8
           },
+          "hook_execution_failure": {
+            "name": "ERROR_CODE_HOOK_EXECUTION_FAILURE",
+            "number": 15
+          },
           "internal_error": {
             "name": "ERROR_CODE_INTERNAL_ERROR",
             "number": 16
@@ -4286,10 +4196,6 @@
           "unsupported_protocol": {
             "name": "ERROR_CODE_UNSUPPORTED_PROTOCOL",
             "number": 2
-          },
-          "validator_execution_failure": {
-            "name": "ERROR_CODE_VALIDATOR_EXECUTION_FAILURE",
-            "number": 15
           }
         }
       },
@@ -5833,13 +5739,13 @@
         "construction",
         "adapter",
         "static_analysis",
-        "validator"
+        "hook"
       ],
       "rift:enumDescriptions": {
         "adapter": "The language adapter or resolver checked the transformed program.",
         "construction": "Rift established the property directly from its closed edit and transaction rules.",
-        "static_analysis": "A named language analysis checked a property narrower than compilation.",
-        "validator": "A workspace command validator checked the changed tree."
+        "hook": "A workspace hook checked the changed tree.",
+        "static_analysis": "A named language analysis checked a property narrower than compilation."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -5855,13 +5761,13 @@
             "name": "CONSTRUCTION",
             "number": 1
           },
+          "hook": {
+            "name": "HOOK",
+            "number": 4
+          },
           "static_analysis": {
             "name": "STATIC_ANALYSIS",
             "number": 3
-          },
-          "validator": {
-            "name": "VALIDATOR",
-            "number": 4
           }
         }
       },
@@ -5877,7 +5783,7 @@
         "behavior_checked"
       ],
       "rift:enumDescriptions": {
-        "behavior_checked": "A named static analysis or command validator checked a stated behavioral property. The evidence is limited to that named property and scope.",
+        "behavior_checked": "A named static analysis or workspace hook checked a stated behavioral property. The evidence is limited to that named property and scope.",
         "bindings_preserved": "Unchanged references in scope resolve to the same symbols before and after the action.",
         "references_updated": "Every resolved reference in scope that should follow the operation now reaches its intended target.",
         "syntax_validated": "The language parser accepts the affected source under the stated scope."
@@ -5906,6 +5812,135 @@
         }
       },
       "title": "GuaranteeKind",
+      "type": "string"
+    },
+    "Hook": {
+      "description": "One workspace hook from the workspace-root `rift.toml`, run inside the session's\nprojection each time a change applies. `type` selects how the hook runs; `command` is\nthe only type.",
+      "discriminator": {
+        "mapping": {
+          "command": "#/$defs/CommandHook"
+        },
+        "propertyName": "type"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/CommandHook"
+        }
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "oneof": "variant",
+        "type": "rift.mcp.Hook",
+        "variants": [
+          {
+            "field": "command",
+            "number": 1,
+            "tag": "command",
+            "type": "CommandHook"
+          }
+        ]
+      },
+      "title": "Hook"
+    },
+    "HookDeterminism": {
+      "description": "Whether an identical tree and environment are expected to produce the same result.",
+      "enum": [
+        "deterministic",
+        "best_effort"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Determinism",
+        "field": "determinism",
+        "number": 10,
+        "values": {
+          "best_effort": {
+            "name": "DETERMINISM_BEST_EFFORT",
+            "number": 2
+          },
+          "deterministic": {
+            "name": "DETERMINISM_DETERMINISTIC",
+            "number": 1
+          }
+        }
+      },
+      "title": "HookDeterminism",
+      "type": "string"
+    },
+    "HookGuarantee": {
+      "additionalProperties": false,
+      "description": "What a passing run of one configured hook establishes.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/GuaranteeKind",
+          "description": "Guarantee established when the hook passes.",
+          "rift:proto": {
+            "number": 1
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/CoverageScope",
+          "description": "Source over which the hook checks the property.",
+          "rift:proto": {
+            "number": 2
+          }
+        },
+        "detail": {
+          "description": "Exact property the hook checks and limits on interpreting a pass.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "rift:proto": {
+            "number": 3
+          },
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "detail"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "type": "rift.mcp.HookGuarantee"
+      },
+      "title": "HookGuarantee",
+      "type": "object"
+    },
+    "HookKind": {
+      "description": "How workspace configuration presents this hook.",
+      "enum": [
+        "test",
+        "lint",
+        "build",
+        "other"
+      ],
+      "rift:package": "rift.mcp",
+      "rift:proto": {
+        "enum": "Kind",
+        "field": "kind",
+        "number": 2,
+        "values": {
+          "build": {
+            "name": "KIND_BUILD",
+            "number": 3
+          },
+          "lint": {
+            "name": "KIND_LINT",
+            "number": 2
+          },
+          "other": {
+            "name": "KIND_OTHER",
+            "number": 4
+          },
+          "test": {
+            "name": "KIND_TEST",
+            "number": 1
+          }
+        }
+      },
+      "title": "HookKind",
       "type": "string"
     },
     "Language": {
@@ -6179,7 +6214,7 @@
           "type": "integer"
         },
         "max_record_bytes": {
-          "description": "Largest RFC 8785 JSON encoding of one indivisible item in a paginated answer, such as one Change, Edit, diagnostic, or validator result. Resolution fails with `limit_exceeded` before publishing a change when one item exceeds this value. Rift keeps it at or below 49152 bytes, leaving page space for identity and cursors.",
+          "description": "Largest RFC 8785 JSON encoding of one indivisible item in a paginated answer, such as one Change, Edit, diagnostic, or hook result. Resolution fails with `limit_exceeded` before publishing a change when one item exceeds this value. Rift keeps it at or below 49152 bytes, leaving page space for identity and cursors.",
           "maximum": 49152,
           "minimum": 1024,
           "rift:proto": {
@@ -6228,14 +6263,14 @@
           "title": "Max Edits",
           "type": "integer"
         },
-        "max_validators": {
-          "description": "How many workspace command checks run when a change applies. Zero when `rift.toml` declares none.",
+        "max_hooks": {
+          "description": "How many workspace hooks run when a change applies. Zero when `rift.toml` declares none.",
           "maximum": 4294967295,
           "minimum": 0,
           "rift:proto": {
             "number": 9
           },
-          "title": "Max Validators",
+          "title": "Max Hooks",
           "type": "integer"
         },
         "max_rewrite_expansions": {
@@ -6303,7 +6338,7 @@
         "max_page_items",
         "max_relation_depth",
         "max_edits",
-        "max_validators",
+        "max_hooks",
         "max_rewrite_expansions",
         "execution",
         "max_filter_depth",
@@ -7719,32 +7754,32 @@
         },
         {
           "additionalProperties": false,
-          "description": "One workspace command validator checked a changed tree.",
+          "description": "One workspace hook checked a changed tree.",
           "properties": {
             "kind": {
-              "const": "validator",
+              "const": "hook",
               "title": "Kind",
               "type": "string"
             },
-            "validator": {
-              "description": "The `CommandValidator.id` of the workspace validator that ran the check.",
+            "hook": {
+              "description": "The `id` of the workspace hook that ran the check.",
               "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
               "rift:proto": {
                 "number": 1
               },
-              "title": "Validator",
+              "title": "Hook",
               "type": "string"
             }
           },
           "required": [
             "kind",
-            "validator"
+            "hook"
           ],
           "rift:package": "rift.core",
           "rift:proto": {
-            "type": "rift.core.OperationVerifierValidator"
+            "type": "rift.core.OperationVerifierHook"
           },
-          "title": "OperationVerifierValidator",
+          "title": "OperationVerifierHook",
           "type": "object"
         }
       ],
@@ -7766,10 +7801,10 @@
             "type": "OperationVerifierAdapter"
           },
           {
-            "field": "validator",
+            "field": "hook",
             "number": 3,
-            "tag": "validator",
-            "type": "OperationVerifierValidator"
+            "tag": "hook",
+            "type": "OperationVerifierHook"
           }
         ]
       },
@@ -12853,15 +12888,15 @@
             "number": 11
           }
         },
-        "validators": {
-          "description": "Publication checks declared by the workspace-root `rift.toml`.",
+        "hooks": {
+          "description": "Hooks declared by the workspace-root `rift.toml`, in execution order.",
           "items": {
-            "$ref": "#/$defs/CommandValidator"
+            "$ref": "#/$defs/Hook"
           },
           "rift:proto": {
             "number": 13
           },
-          "title": "Validators",
+          "title": "Hooks",
           "type": "array"
         }
       },
@@ -12875,7 +12910,7 @@
         "resources",
         "next",
         "matching",
-        "validators"
+        "hooks"
       ],
       "rift:package": "rift.mcp",
       "rift:proto": {

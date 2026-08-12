@@ -1,5 +1,7 @@
 #:schema ../protocol/rift.schema.json
 
+hooks = []
+
 [execution]
 allow = []
 debug = []
@@ -15,6 +17,3 @@ max_debug_value = "1KiB"
 
 [validation]
 require = "available"
-
-[validators]
-commands = []

@@ -94,9 +94,9 @@ enum ErrorCode {
   // Rift could not read or write workspace or projection files. Worth retrying only if the
   // cause was transient, such as a disk that has since been cleared.
   ERROR_CODE_STORAGE_FAILURE = 14;
-  // Rift could not launch the command validator, enforce its timeout, or capture its output.
-  // One retry is reasonable when the host failure was transient.
-  ERROR_CODE_VALIDATOR_EXECUTION_FAILURE = 15;
+  // Rift could not launch the hook, enforce its timeout, or capture its output. One retry is
+  // reasonable when the host failure was transient.
+  ERROR_CODE_HOOK_EXECUTION_FAILURE = 15;
   // A bug in Rift. `causes` says what it was doing at the time, and a retry is not expected to
   // answer differently.
   ERROR_CODE_INTERNAL_ERROR = 16;
@@ -447,9 +447,9 @@ message Limits {
   // the truncation boundary of common MCP harnesses.
   int64 max_response_bytes = 2;
   // Largest RFC 8785 JSON encoding of one indivisible item in a paginated answer, such as one
-  // Change, Edit, diagnostic, or validator result. Resolution fails with `limit_exceeded`
-  // before publishing a change when one item exceeds this value. Rift keeps it at or below
-  // 49152 bytes, leaving page space for identity and cursors.
+  // Change, Edit, diagnostic, or hook result. Resolution fails with `limit_exceeded` before
+  // publishing a change when one item exceeds this value. Rift keeps it at or below 49152
+  // bytes, leaving page space for identity and cursors.
   int64 max_record_bytes = 3;
   // Most source bytes one file resource page carries before UTF-8 or base64 serialization. Rift
   // may return fewer bytes to preserve a UTF-8 boundary and stay within `max_response_bytes`.
@@ -462,9 +462,8 @@ message Limits {
   int64 max_relation_depth = 6;
   // Most concrete `Edit` values one resolved operation may contain across every change.
   int64 max_edits = 8;
-  // How many workspace command checks run when a change applies. Zero when `rift.toml` declares
-  // none.
-  int64 max_validators = 9;
+  // How many workspace hooks run when a change applies. Zero when `rift.toml` declares none.
+  int64 max_hooks = 9;
   // Most concrete edits one atomic `rewrite` (`RewriteParams`) may produce after matching.
   int64 max_rewrite_expansions = 10;
   // Caller-code execution ceilings. Null means `rift.toml` disables execute and all debug
@@ -503,8 +502,8 @@ message WorkspaceResourcePayload {
   optional string next = 9;
   // The pattern grammars the `match` tool accepts here.
   MatchSyntax matching = 11;
-  // Publication checks declared by the workspace-root `rift.toml`.
-  repeated CommandValidator validators = 13;
+  // Hooks declared by the workspace-root `rift.toml`, in execution order.
+  repeated Hook hooks = 13;
 }
 // Where this session's projection lives on the filesystem. Adapters receive the tree they
 // analyze over the adapter protocol; a caller that has to reach the projection through an
@@ -681,15 +680,15 @@ message MatchResult {
 // One `Diagnostic` as an MCP answer carries it: the fact the adapter minted, plus what Rift can
 // add without the adapter — where it lands in a line and column, and the source around it.
 message DiagnosticContext {
-  // Component that produced the diagnostic. Rift sets this after collecting adapter, validator,
-  // or apply output.
+  // Component that produced the diagnostic. Rift sets this after collecting adapter, hook, or
+  // apply output.
   enum Source {
     // The caller did not set a value.
     SOURCE_UNSPECIFIED = 0;
     // The language's own analysis.
     ADAPTER = 1;
-    // A check Rift ran over a proposed change.
-    VALIDATOR = 2;
+    // A workspace hook Rift ran over a proposed change.
+    HOOK = 2;
     // Output from applying edits to the workspace.
     APPLY = 3;
   }
@@ -989,20 +988,20 @@ message ProjectionRestoreParams {
   // restores every path that change touched — a change leaves the changeset whole.
   repeated string paths = 2;
 }
-// What a passing run of one configured command establishes.
-message CommandValidatorGuarantees {
-  // Guarantee established when the validator passes.
+// What a passing run of one configured hook establishes.
+message HookGuarantee {
+  // Guarantee established when the hook passes.
   rift.core.GuaranteeKind kind = 1;
-  // Source over which the command checks the property.
+  // Source over which the hook checks the property.
   rift.core.CoverageScope scope = 2;
-  // Exact property the command checks and limits on interpreting a pass.
+  // Exact property the hook checks and limits on interpreting a pass.
   string detail = 3;
 }
-// A command from the workspace-root `rift.toml`, run without a shell inside the session's
-// projection directory. Whatever it writes there is published with the projection. The command
-// runs the tree it checks, so it executes unpublished changes.
-message CommandValidator {
-  // How workspace configuration presents this check.
+// A hook that runs an executable, without a shell, inside the session's projection directory.
+// Whatever it writes there is published with the projection. The command runs the tree it
+// checks, so it executes unpublished changes.
+message CommandHook {
+  // How workspace configuration presents this hook.
   enum Kind {
     // The caller did not set a value.
     KIND_UNSPECIFIED = 0;
@@ -1025,7 +1024,7 @@ message CommandValidator {
     DETERMINISM_DETERMINISTIC = 1;
     DETERMINISM_BEST_EFFORT = 2;
   }
-  // Label shown with this validator. It is unique within `validators.commands`.
+  // Label shown with this hook. It is unique within `hooks`.
   string id = 1;
   Kind kind = 2;
   // Executable followed by literal arguments. An absolute executable path is refused; a bare
@@ -1043,13 +1042,21 @@ message CommandValidator {
   // Wall-clock limit before Rift terminates the process.
   int64 timeout_ms = 7;
   // Captured prefix limit for each output stream. `CapturedText.total_bytes` reports the
-  // omitted size. The upper bound keeps one escaped validator result inside one bounded result.
+  // omitted size. The upper bound keeps one escaped hook result inside one bounded result.
   int64 output_limit_bytes = 8;
-  // Behavior or other properties this command is intended to check. A passing result turns each
+  // Behavior or other properties this hook is intended to check. A passing result turns each
   // declaration into `GuaranteeEvidence`; a failed result attaches a `ConfirmationRequirement`
   // to the change.
-  repeated CommandValidatorGuarantees guarantees = 9;
+  repeated HookGuarantee guarantees = 9;
   Determinism determinism = 10;
+}
+// One workspace hook from the workspace-root `rift.toml`, run inside the session's
+// projection each time a change applies. `type` selects how the hook runs; `command` is
+// the only type.
+message Hook {
+  oneof variant {
+    CommandHook command = 1;
+  }
 }
 // Bounded adapter-validation evidence for one applied session change.
 message ChangeValidation {
@@ -1086,8 +1093,8 @@ message ChangeSummary {
   // Resolution findings in source order.
   repeated rift.core.Diagnostic diagnostics = 8;
   // Effects the caller has to accept before this change can be published, sorted by kind,
-  // source location, title, and detail. Empty where every affected adapter and validator
-  // vouched for the result.
+  // source location, title, and detail. Empty where every affected adapter and hook vouched for
+  // the result.
   repeated rift.core.ConfirmationRequirement confirmations = 10;
   // Projection state after this change landed.
   rift.core.ProjectionState current = 9;

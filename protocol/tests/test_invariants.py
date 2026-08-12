@@ -17,7 +17,7 @@ def limits(**overrides: object) -> mcp.Limits:
         "max_page_items": 200,
         "max_relation_depth": 5,
         "max_edits": 10_000,
-        "max_validators": 4,
+        "max_hooks": 4,
         "max_rewrite_expansions": 1_000,
         "execution": None,
         "max_filter_depth": 16,

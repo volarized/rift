@@ -86,7 +86,7 @@ const MARKS: Record<MarkName, (size: number) => React.ReactNode> = {
   store: (size) => <DatabaseIcon size={size} weight="light" className="shrink-0" />,
   adapter: (size) => <PlugsConnectedIcon size={size} weight="light" className="shrink-0" />,
   config: (size) => <GearIcon size={size} weight="light" className="shrink-0" />,
-  validator: (size) => <CheckCircleIcon size={size} weight="light" className="shrink-0" />,
+  hook: (size) => <CheckCircleIcon size={size} weight="light" className="shrink-0" />,
 };
 
 /** A ground-plane point, lifted to a height and scaled into world units. */

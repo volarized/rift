@@ -65,7 +65,7 @@ Resources carry the larger and reusable payloads:
 
 | Resource | Content |
 | --- | --- |
-| [`rift://workspace{?cursor}`](#resource-workspace) | projection state, per-language capabilities, limits, and validators |
+| [`rift://workspace{?cursor}`](#resource-workspace) | projection state, per-language capabilities, limits, and hooks |
 | [`rift://projection`](#resource-projection) | the projection's path on disk, and the workspace it came from |
 | [`rift://changes{?cursor}`](#resource-changes) | every change this session applied, with its evidence |
 | [`rift://fs{/path}{?start,length,cursor}`](#resource-fs) | a directory's entries — subdirectories and files — or a bounded range of file bytes |
@@ -143,7 +143,7 @@ precondition. A `patch` whose context moved shows the shape:
 
 **Applied**, when it produced edits. The change lands and gets an id in the changeset, along with
 its edits, its semantic effects, its guarantee evidence, its diagnostics, its validation, and its
-confirmations, where an adapter or validator wouldn't vouch for the result. Validation strength
+confirmations, where an adapter or hook wouldn't vouch for the result. Validation strength
 climbs from `mechanical` (no adapter report) through `available` (every advertising adapter
 reported) to `required` (every language the policy names reported). An unvalidated change is still
 a change you can read, run tests against, and either keep or restore.
