@@ -1,7 +1,7 @@
 syntax = "proto3";
 // Generated from the Pydantic models under protocol/src/rift/models. Do not edit.
-// SCIP is a language-neutral Protobuf format for code indexes. Rift protocol version 1 pins the
-// schema from SCIP v0.9.0.
+// SCIP is a language-neutral Protobuf format for code indexes. Rift pins the schema from SCIP
+// v0.9.0.
 package scip;
 option go_package = "github.com/scip-code/scip/bindings/go/scip/";
 option java_multiple_files = true;

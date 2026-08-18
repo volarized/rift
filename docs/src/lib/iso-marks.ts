@@ -9,7 +9,16 @@
  * A diagram picks its own marks in its own source — `agent1["agent 1"]:::agent`
  * — so nothing about a particular picture is wired in here either.
  */
-export const MARK_NAMES = ["rift", "agent", "store", "adapter", "config", "validator"] as const;
+export const MARK_NAMES = [
+  "rift",
+  "agent",
+  "store",
+  "provider",
+  "config",
+  "hook",
+  "model",
+  "service",
+] as const;
 
 export type MarkName = (typeof MARK_NAMES)[number];
 

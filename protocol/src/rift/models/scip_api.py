@@ -15,7 +15,7 @@ from .base import *
         value_descriptions=(
             "The server did not classify the omission.",
             "SCIP v0.9.0 has no field with the same meaning.",
-            "No adapter serves the file's language, or its adapter was unavailable while the export ran.",
+            "No provider serves the file's language, or its facts were unavailable while the export ran.",
             "SCIP cannot carry the path: a symbolic link, or a form the SCIP canonical-path rules forbid.",
             "The unit cannot fit one 4 MiB stream event on its own.",
         ),
@@ -60,7 +60,7 @@ class Omission(ProtoModel):
         proto_type=ProtoFieldDescriptor.TYPE_STRING,
         description=(
             "What was dropped, named concretely: the meaning SCIP lacks a field for, the "
-            "language with no adapter, or the forbidden path form."
+            "language with no provider, or the forbidden path form."
         ),
     )
     count: Field[int] = proto_field(
@@ -91,18 +91,16 @@ class Omission(ProtoModel):
 
 
 @proto_message(
-    DirectMessage(
-        RIFT_SCIP, description="Selects a session projection to export as SCIP."
-    )
+    DirectMessage(RIFT_SCIP, description="Selects the tree to export as SCIP.")
 )
 class Request(ProtoModel):
-    session: Field[core.SessionId] = proto_field(
-        default=...,
+    projection: Field[core.ProjectionId | None] = proto_field(
+        default=None,
         number=2,
         description=(
-            "Session whose projection is exported. The export reads the projection as it "
-            "stands, dirty content included, so a write landing mid-stream can make the "
-            "index inconsistent; a consumer that needs a whole one reads again."
+            "Projection to export, or absent for the workspace tree. The export reads the "
+            "tree as it stands, unpublished content included, so a write landing mid-stream "
+            "can make the index inconsistent; a consumer that needs a whole one reads again."
         ),
     )
 
@@ -110,7 +108,7 @@ class Request(ProtoModel):
 @proto_message(
     DirectMessage(
         RIFT_SCIP,
-        description="Analysis coverage for one language over the whole projection.",
+        description="Analysis coverage for one language over the whole exported tree.",
     )
 )
 class LanguageCoverage(ProtoModel):
@@ -123,8 +121,8 @@ class LanguageCoverage(ProtoModel):
         default=...,
         number=2,
         description=(
-            "The weakest per-file coverage the language's adapter reported for each fact "
-            "family across the projection."
+            "The weakest per-file coverage the language's providers reported for each fact "
+            "family across the exported tree."
         ),
     )
 
@@ -135,17 +133,20 @@ class LanguageCoverage(ProtoModel):
     )
 )
 class Header(ProtoModel):
-    session: Field[core.SessionId] = proto_field(
-        default=...,
+    projection: Field[core.ProjectionId | None] = proto_field(
+        default=None,
         number=2,
-        description="Session whose projection produced every following record.",
+        description=(
+            "Projection that produced every following record, or absent for the workspace "
+            "tree."
+        ),
     )
     metadata: Field[scip.Metadata] = proto_field(
         default=...,
         number=3,
         description=(
             "The `metadata` of the projected `scip.Index`. `project_root` is the file URI "
-            "of the session projection directory, `text_document_encoding` is UTF-8, and "
+            "of the exported tree's directory, `text_document_encoding` is UTF-8, and "
             "`tool_info` carries the name `rift` with the server build version."
         ),
     )
@@ -214,9 +215,8 @@ SCIP_API_PACKAGE = ProtoPackage(
         Service(
             "Index",
             (
-                "Exports one Rift projection into the pinned SCIP schema. The service is "
-                "served on the same workspace rendezvous socket as the Rift server's other "
-                "connections."
+                "Exports one Rift tree into the pinned SCIP schema. The service is served by "
+                "the workspace server at the endpoint the `ServerLock` names."
             ),
             (
                 Rpc(
@@ -225,9 +225,9 @@ SCIP_API_PACKAGE = ProtoPackage(
                     Event,
                     description=(
                         "Returns one header, then documents, then external symbols. The stream order is "
-                        "the canonical `scip.Index` order. `Read` fails with `NOT_FOUND` for a session "
-                        "the server does not hold and `INVALID_ARGUMENT` for a malformed `SessionId`. "
-                        "A session removed mid-stream terminates the stream with `ABORTED`; a stream "
+                        "the canonical `scip.Index` order. `Read` fails with `NOT_FOUND` for a projection "
+                        "the server does not hold and `INVALID_ARGUMENT` for a malformed `ProjectionId`. "
+                        "A projection removed mid-stream terminates the stream with `ABORTED`; a stream "
                         "that ends with `OK` carried the complete index."
                     ),
                     response_stream=True,

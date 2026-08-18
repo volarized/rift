@@ -11,15 +11,16 @@ import { cn } from "@/lib/utils";
 const SHELL = "mx-auto w-full max-w-190 px-6 sm:px-7";
 const WIDE = "mx-auto w-full max-w-280 px-6 sm:px-7";
 
-/** Every section is a screen, less the header it scrolls under. */
-const SCREEN = "min-h-[calc(80svh)]";
+/** Most of a screen for the hero; a shallower band for every later section. */
+const HERO = "min-h-[80svh]";
+const SCREEN = "min-h-[60svh]";
 
 /** Inter 300 at display size — one statement per section, never more. */
 function Statement({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <p
       className={cn(
-        "m-0 max-w-165 font-sans leading-[1.28] font-light tracking-[-0.015em] text-4xl text-balance text-foreground",
+        "m-0 max-w-165 font-sans leading-[1.28] font-light tracking-[-0.015em] text-[2rem] text-balance text-foreground sm:text-[2.75rem]",
         className,
       )}
     >
@@ -28,12 +29,12 @@ function Statement({ children, className }: { children: React.ReactNode; classNa
   );
 }
 
-/** Inter 300, 16/1.6 — body copy. */
+/** Inter 300, 18/1.6 — body copy. */
 function Body({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <p
       className={cn(
-        "m-0 max-w-150 leading-relaxed font-light text-pretty text-muted-foreground",
+        "m-0 max-w-150 text-lg leading-relaxed font-light text-pretty text-muted-foreground",
         className,
       )}
     >
@@ -46,26 +47,29 @@ function Section({
   children,
   className,
   wide,
+  tall,
   id,
 }: {
   children: React.ReactNode;
   className?: string;
   wide?: boolean;
+  tall?: boolean;
   id?: string;
 }) {
   return (
-    <section id={id} className={cn("flex scroll-mt-14 items-center", SCREEN)}>
+    <section id={id} className={cn("flex scroll-mt-14 items-center", tall ? HERO : SCREEN)}>
       <Reveal className={cn(wide ? WIDE : SHELL, "grid gap-9 py-16", className)}>{children}</Reveal>
     </section>
   );
 }
 
 /**
- * One object per point: the compiler is the solid taken apart, the other two
- * are attractors — a reversible system and a dynamo that swaps between two
+ * One object per point: the provider stack is the solid taken apart, the other
+ * two are attractors — a reversible system and a dynamo that swaps between two
  * states.
  */
 const DIFFERENCES: {
+  statement: string;
   title: string;
   body: string;
   solid?: ExplodedKind;
@@ -75,20 +79,23 @@ const DIFFERENCES: {
   fit?: number;
 }[] = [
   {
-    title: "Direct compiler integration",
-    body: "rift talks to the language’s own compiler, so every read is typed and every edit is validated before it lands.",
+    statement: "Code facts with reported coverage.",
+    title: "Programming language providers",
+    body: "rift combines syntax, semantic analysis and history to give agents the best available context.",
     solid: "sphere",
   },
   {
+    statement: "Staged changes with verification.",
     title: "Reversible filesystem projections",
-    body: "Every change an agent makes is staged in a Rift-owned projection.",
+    body: "An agent can collect changes in a pinned projection, inspect them, then publish them into the workspace.",
     line: "shimizu",
     // The butterfly stands in the x–z plane; turn it to face the camera.
     tilt: 1.5,
   },
   {
-    title: "Structured reads and writes over MCP",
-    body: "Tools and resources instead of shell transcripts. Agents work with code semantics and edit it structurally.",
+    statement: "Structured reads and guarded edits.",
+    title: "MCP tools and resources",
+    body: "Agents read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
@@ -101,7 +108,7 @@ export default function HomePage() {
   return (
     <main className="flex flex-1 flex-col">
       {/* 1 — hero, standing on a warped ground plane */}
-      <section className={cn("relative flex items-center overflow-hidden", SCREEN)}>
+      <section className={cn("relative flex items-center overflow-hidden", HERO)}>
         <div
           className={cn(
             SHELL,
@@ -109,7 +116,7 @@ export default function HomePage() {
           )}
         >
           <div className="grid justify-items-start gap-5">
-            <h1 className="m-0 font-mono text-[52px] leading-none font-medium tracking-[-0.03em] sm:text-[64px]">
+            <h1 className="m-0 font-mono text-[52px] leading-none font-medium tracking-[-0.03em] sm:text-[76px]">
               rift
             </h1>
 
@@ -123,7 +130,7 @@ export default function HomePage() {
           <Logo
             bloom
             strokeWidth={0.24}
-            className="h-56 w-full max-w-56 justify-self-center text-foreground/70 sm:h-72 sm:max-w-72 md:justify-self-end"
+            className="h-64 w-full max-w-64 justify-self-center text-foreground/70 sm:h-80 sm:max-w-80 md:justify-self-end"
           />
         </div>
       </section>
@@ -137,12 +144,12 @@ export default function HomePage() {
           tilt={1.48}
           fit={0.8}
           opacity={0.15}
-          className="w-full min-w-96 justify-self-center sm:h-72 md:w-72"
+          className="h-64 w-full justify-self-center sm:h-80 sm:min-w-96 md:w-80"
         />
         <div className="grid gap-5">
           <Statement>Agents depend on context and tooling.</Statement>
           <Body className="text-balance">
-            rift provides typesafe, token-efficient, compiler-backed reads and edits.
+            rift provides contextual, parser-precise codebase reading and editing tools.
           </Body>
         </div>
       </Section>
@@ -152,13 +159,11 @@ export default function HomePage() {
       {DIFFERENCES.map((item, index) => (
         <Section key={item.title} wide className="md:grid-cols-2 md:items-center text-base">
           <div className="grid max-w-165 gap-7">
-            {index === 0 ? (
-              <Statement className="max-w-125">
-                Designed with simplicity and minimalism in mind.
-              </Statement>
-            ) : null}
+            <Statement className="max-w-125">{item.statement}</Statement>
             <div className="grid gap-3">
-              <h3 className="m-0 font-mono font-medium tracking-[0.02em]">{item.title}</h3>
+              <h3 className="m-0 font-mono text-lg font-medium tracking-[0.02em] sm:text-xl">
+                {item.title}
+              </h3>
               <Body>{item.body}</Body>
             </div>
           </div>
@@ -169,7 +174,7 @@ export default function HomePage() {
             <ExplodedObject
               kind={item.solid}
               className={cn(
-                "h-56 w-full max-w-64 justify-self-center sm:h-72 md:w-72",
+                "h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80",
                 index % 2 === 1 && "md:order-first",
               )}
             />
@@ -182,7 +187,7 @@ export default function HomePage() {
               fit={item.fit ?? 0.78}
               opacity={0.15}
               className={cn(
-                "h-56 w-full max-w-64 justify-self-center sm:h-72 md:w-72",
+                "h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80",
                 index % 2 === 1 && "md:order-first",
               )}
             />
@@ -192,7 +197,7 @@ export default function HomePage() {
 
       {/* 7 — the two ways out, against the Aizawa attractor drawn on by the
           scroll and unpicked again on the way back up */}
-      <Section wide className="md:grid-cols-2 md:items-center md:gap-20">
+      <Section wide tall className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
           <Statement className="max-w-125">
             Coming soon, reach out if you want to get involved.
@@ -201,7 +206,7 @@ export default function HomePage() {
             href="mailto:contact@volar.sh"
             className="flex items-center gap-2 text-sm font-medium w-0"
           >
-            <Button variant="outline" size="lg" className="w-fit">
+            <Button variant="outline" size="lg" className="w-fit text-base">
               Get in touch
               <ArrowRightIcon weight="bold" className="h-4 w-4" />
             </Button>
@@ -217,7 +222,7 @@ export default function HomePage() {
           spin={-0.55}
           fit={0.82}
           opacity={0.14}
-          className="h-56 w-full max-w-64 justify-self-center sm:h-72 md:w-72"
+          className="h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80"
         />
       </Section>
     </main>

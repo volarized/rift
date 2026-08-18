@@ -8,106 +8,101 @@ the file and rejects any key it doesn't know, so a typo fails at load rather tha
 ignored. Edits take effect for later requests once validation passes; while the file is
 invalid, requests fail with `configuration_invalid` until you fix it.
 
-Point your editor at the schema and everything below autocompletes:
+An editor that supports TOML schema directives can load the generated schema:
 
 ```toml
 #:schema ./protocol/rift.schema.json
 ```
 
-`rift.toml` is workspace code. It's committed like the rest of the repository, and opening a
-workspace runs what it names — adapter processes at admission, validator commands on every change
-that applies — so open a repository the way you'd run its build: because you trust it. A change
-to the file made through a session carries a `configuration` confirmation into `publish`, because
-publishing it changes which commands the server runs.
+Treat `rift.toml` as executable workspace configuration. Hooks named by a repository run after
+Rift applies a change, using the server's OS permissions, so inspect the file before enabling the
+workspace.
 
-## Adapters
-
-Each entry below `adapters` starts one process. `command` is an executable followed by literal
-arguments, with no shell in between, and `env` adds environment values on top of what the server
-inherited.
-
-```toml
-[adapters.rust]
-command = ["rift-adapter-rust"]
-env = { RUST_LOG = "warn" }
-
-[adapters.postgres]
-command = ["rift-adapter-sql", "--dialect", "postgresql"]
-```
-
-The table key is a name local to your workspace. Which language a process actually handles is
-something it reports itself, through `Describe`, along with everything else it can do — so the
-`postgres` entry above ends up serving `sql:postgresql` because that's what the process says when
-Rift asks it. Two entries reporting the same exact `Language` fail workspace admission: the
-server drives one process per language pair and won't pick between claimants.
+A change to `rift.toml` made in a projection carries a `configuration` confirmation into
+[`publish`](/docs/draft/protocol/mcp#tool-publish), because publishing it changes which hooks
+and limits the server runs with.
 
 ## Execution
 
-`execute` runs a block of code your agent wrote in a disposable copy of its projection. The code
-still runs on your machine, so `execute` stays off until you name the languages it's allowed for.
-The list gates only code your agent submits — the adapters you configured already run their
-toolchains on the tree, `build.rs` and proc macros included, which is what an adapter's
-`RuntimeRequirements` disclose. `execution.allow` is that list,
-and `execution.debug` is the subset that may also retain stack frames after a failure for
-`debug_start` to inspect. A selector is a language name, or `name:dialect` to pin a dialect.
+[`execute`](/docs/draft/protocol/mcp#tool-execute) runs a block of code your agent wrote in the
+targeted tree's execution copy. The code still runs on your machine, so `execute` stays off
+until you name the languages it's allowed for. A selector is a language name, or
+`name:dialect` to pin a dialect.
 
 ```toml
 [execution]
-allow = ["python", "sql:postgresql"]
-debug = ["python"]
+allow = ["python"]
 max_code = "16KiB"
 max_timeout = "30s"
 max_output = "8KiB"
 max_concurrent = 2
-max_debug_sessions = 2
-debug_idle_timeout = "5m"
-max_debug_frames = 64
-max_debug_bindings = 32
-max_debug_value = "1KiB"
 ```
 
-Every key below `debug` is shown at its default. `max_code` bounds one submitted block, 1B to
-32KiB. `max_timeout` bounds one evaluation, 1ms to 1d — the evaluation only: materializing the
-disposable copy is extra, and a materialization that outruns the same bound fails the call with
-`deadline_exceeded`. `max_output` bounds each captured stream separately, up to 16KiB, so a
-program that floods stdout gets a prefix and a byte count rather than a hung request.
-`max_concurrent` caps evaluations running at once across the whole workspace, 1 to 64. The
-schema states each range as `rift:range` on the key, and the server enforces it at load — schema
-validation alone can't compare `"16KiB"` against a ceiling.
+Every key below `allow` is shown at its default:
 
-The debug keys bound what a retained session holds: `max_debug_sessions` across the workspace
-(1 to 16), `debug_idle_timeout` before Rift stops one that nobody is reading (1ms to 1d), then
-`max_debug_frames` (1 to 256), `max_debug_bindings` per frame (1 to 128), and `max_debug_value`
-on each rendered value (up to 8KiB). Durations take `ms`, `s`, `m`, `h`, or `d`; byte sizes take
-`B`, `KiB`, `MiB`, `GiB`, or `TiB`.
+- `max_code` bounds one submitted block, 1B to 32KiB
+- `max_timeout` bounds one evaluation, 1ms to 1d — the evaluation only: refreshing the
+  execution copy is extra, and a refresh that outruns the same bound fails the call with
+  `deadline_exceeded`
+- `max_output` bounds each captured stream separately, up to 16KiB, so a program that floods
+  stdout gets a prefix and a byte count rather than a hung request
+- `max_concurrent` caps evaluations running at once across the whole workspace, 1 to 64
 
-An adapter has to advertise the matching operation as well. Listing `rust` under `allow` does
-nothing if the Rust adapter never claimed it can execute, and debugging needs all three of
-`debug_start`, `debug_get_frame` and `debug_stop`. The `rift://workspace` resource reports what
-survived that intersection per language.
+The schema states each range as `rift:range` on the key, and the server enforces it at load —
+schema validation alone can't compare `"16KiB"` against a ceiling.
 
-## Validation
+Durations take `ms`, `s`, `m`, `h`, or `d`; byte sizes take `B`, `KiB`, `MiB`, `GiB`, or `TiB`.
 
-`validation.require = "available"` asks every affected adapter that advertises validation for a
-complete report, and `"none"` asks for no reports at all. Naming languages instead requires
-reports from exactly those:
+A runtime has to serve the language as well. Listing a language under `allow` does nothing when
+no runtime serves it. The [`rift://workspace`](/docs/draft/protocol/mcp#resource-workspace)
+resource reports what survived that intersection per language.
+
+## Providers
+
+The built-in providers run without configuration; the `providers` table exists to bound or
+disable them. The history provider is the one with a budget worth setting, because its cost
+scales with how far back it walks:
 
 ```toml
-[validation]
-require = ["rust", "typescript"]
+[providers.history]
+enabled = true
+max_revisions = 500
 ```
 
-A change whose required reports don't arrive still lands in the projection — it just carries a
-`validation_incomplete` confirmation, and publication won't take it until you accept that. Each
-change reports the strength it reached in its `rift://changes` entry.
+`max_revisions` bounds the walk from the current head, 1 to 100000. Timelines and co-change
+coupling are computed inside that depth, and a
+[`SymbolHistory`](/docs/draft/protocol/reference#SymbolHistory) whose walk ended early reports
+partial coverage rather than pretending the symbol has no earlier past. A workspace without
+version control reports the family `not_applicable` whatever this table says.
 
-## Command validators
+Provider configuration does not set merge order or freshness. The server reports provider order,
+state, and revision through `rift://workspace`; each answer reports the exact provider revisions
+it used through coverage. A provider rebuilding after a file change can serve its previous
+immutable revision as stale without presenting it as current.
 
-`validators.commands` adds your own checks. Rift starts each one directly, without a shell,
-inside the session's projection directory:
+## Search
+
+[`search`](/docs/draft/protocol/mcp#tool-search) runs on a lexical index with nothing to
+configure. The `search` table names the embedding model that adds dense ranking on top of it:
 
 ```toml
-[[validators.commands]]
+[search]
+embedding = "potion-retrieval-32M"
+```
+
+With `embedding` set, the server embeds indexed declarations and fuses cosine similarity into
+the lexical score. Vectors are stored per model — two models' vectors aren't comparable — so
+changing the value rebuilds the dense index. Leaving the table out keeps search lexical.
+
+## Hooks
+
+`hooks` adds your own checks, run in the changed tree each time a change applies — your
+workspace itself, unless the change named a projection. A hook's `type` selects how it runs;
+`command` — an executable Rift starts directly, without a shell — is the only type:
+
+```toml
+[[hooks]]
+type = "command"
 id = "tests"
 kind = "test"
 argv = ["cargo", "test"]
@@ -120,14 +115,18 @@ guarantees = []
 determinism = "deterministic"
 ```
 
-`id` is unique within the list and labels the result. `argv` refuses an absolute executable path; a
-bare name resolves through the `PATH` of the environment the command runs with — the server's,
-with `environment` applied on top — and a relative one below `working_directory`,
-which is itself relative to the projection root and defaults to it. `changed_paths = "append"` adds
-the changed project paths to `argv` in byte order, for a linter that takes files; `"none"` leaves
-`argv` alone. A validator runs the tree it checks — `cargo test` compiles the very change it's
-validating — so a configured validator executes the agent's unpublished code each time a change
-applies.
+The keys that shape how the command runs:
+
+- `id` — unique within the list, labels the result
+- `argv` — refuses an absolute executable path; a bare name resolves through the `PATH` of the
+  environment the command runs with — the server's, with `environment` applied on top — and a
+  relative one below `working_directory`, which is itself relative to the changed tree's root and
+  defaults to it
+- `changed_paths` — `"append"` adds the changed project paths to `argv` in byte order, for a
+  linter that takes files; `"none"` leaves `argv` alone
+
+A hook runs the tree it checks — `cargo test` compiles the very change it's checking — so
+a configured hook executes the agent's change each time one applies.
 
 Every key in the block is required — the schema carries no defaults, so a missing `environment`
 fails the file with `configuration_invalid`. Two keys carry bounds: `timeout_ms`, when Rift kills
@@ -136,15 +135,16 @@ takes 256 to 4096. The full size is still reported, so you can tell a truncated 
 one.
 
 `guarantees` declares what a pass actually establishes, which is what turns a green run into
-`GuaranteeEvidence` on the change rather than an unexplained tick. `determinism` says whether the
+[`GuaranteeEvidence`](/docs/draft/protocol/reference#GuaranteeEvidence) on the change rather than
+an unexplained tick. `determinism` says whether the
 same tree and environment are expected to give the same answer twice.
 
 A command starts from the environment the server inherited, with `environment` values added on
-top. `rift.toml` is a workspace file your agent reads like any other, so a secret doesn't belong
-in `environment` — put it in the server's own environment and let the validator inherit it.
+top. Store secrets outside the committed `rift.toml` and inject them into the server environment.
+Every configured hook inherits that environment and can read those secrets.
 
 <Callout type="warn">
-The command runs in the projection, so whatever it writes there is published with it. `cargo test`
-leaves a `target/` directory behind, and Rift carries it rather than guessing which files a tool
-wrote were disposable.
+A hook can write into the tree it checks. In a projection, Rift imports tracked or unignored
+writes as a `filesystem` change with an `external` confirmation; VCS-ignored output outside the
+manifest stays outside the changeset. A hook run against the workspace writes there directly.
 </Callout>

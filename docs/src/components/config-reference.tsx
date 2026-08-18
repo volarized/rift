@@ -2,17 +2,12 @@ import { Fragment, type ReactNode } from "react";
 import { Prose } from "@/components/protocol/prose";
 import { Constraints } from "@/components/protocol/type-expr";
 import { type ConfigSchema, configDefs, configDocument, workspaceConfig } from "@/lib/config";
-import { protoFor } from "@/lib/proto";
 import { branches, props, refName, sub } from "@/lib/protocol";
 import { hrefFor } from "@/lib/protocol-surface";
 import { DRAFT } from "@/lib/versions";
 
-const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
-
 function protocolHref(name: string): string {
-  return protoFor(DRAFT).adapterOwned.has(name)
-    ? `${BASE_PATH}/docs/${DRAFT}/protocol/adapter#msg-${name}`
-    : hrefFor(DRAFT, name);
+  return hrefFor(DRAFT, name);
 }
 
 function anchor(name: string): string {

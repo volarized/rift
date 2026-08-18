@@ -21,7 +21,7 @@ from grpc_tools import protoc
 from jsonschema.validators import Draft202012Validator
 from pydantic import TypeAdapter
 
-from .models import adapter, config, core, mcp, scip, scip_api
+from .models import config, core, mcp, scip, scip_api
 from .models.base import (
     DEFINITIONS,
     PROTO_ENUMS,
@@ -382,7 +382,14 @@ class SchemaCompiler:
             ):
                 if mapping.named:
                     self.compile_message(definition)
-        imports = ["google/protobuf/struct.proto"]
+        imports = []
+        if any(
+            isinstance(field.type, str)
+            and ("google.protobuf.Value" in field.type or "google.protobuf.Struct" in field.type)
+            for message in self.messages
+            for field in message.fields
+        ):
+            imports.append("google/protobuf/struct.proto")
         if any(
             isinstance(field.type, str) and "google.protobuf.Empty" in field.type
             for message in self.messages
@@ -418,7 +425,7 @@ class SchemaCompiler:
             path=f"rift/{self.owner}.proto",
             package=self.package,
             description=(
-                "Shared messages used by the MCP server and language adapters."
+                "Shared messages used across the Rift protocol."
                 if self.owner == "core"
                 else "Internal messages produced when rift-mcp decodes MCP JSON values."
             ),
@@ -566,20 +573,11 @@ def _direct_rpc_type(model: type[Any]) -> str:
 def file_from_package(package: ProtoPackage) -> FileSpec:
     spec = package.file
     description = spec.description
-    if not description and spec.namespace.package == "rift.adapter":
-        description = (
-            "The Rift server owns at most one configured adapter process per exact Language and calls "
-            "it over gRPC on a Unix domain socket. The process can hold several projection states "
-            "and back them with separate runtime workers. Rift supplies each adapter state with "
-            "a server-owned projection. Different-language "
-            "adapters may open the same tree. Rift serializes source writes, then refreshes every "
-            "adapter that holds the projection."
-        )
     if not description and spec.namespace.package == "scip":
         release = spec.upstream_release
         description = (
-            "SCIP is a language-neutral Protobuf format for code indexes. Rift protocol version 1 "
-            f"pins the schema from SCIP {release}."
+            "SCIP is a language-neutral Protobuf format for code indexes. Rift pins the "
+            f"schema from SCIP {release}."
         )
     return FileSpec(
         path=spec.path,
@@ -766,15 +764,12 @@ def document_metadata(document: Document) -> dict[str, Any]:
         }
         for resource in document.resources
     }
-    connect = next(rpc for rpc in document.service.rpcs if rpc.name == "Connect")
     resource_read = document.resource_read
     entry_points = {
         "description": document.entry_points_description,
-        "grpc.connection": {
-            "rpc": f"{service_name}/{connect.name}",
-            "description": connect.description,
-            "params": _schema_ref(connect.request),
-            "event": _schema_ref(connect.response),
+        "server.lock": {
+            "description": mcp.ServerLock.__doc__,
+            "schema": _schema_ref(mcp.ServerLock),
         },
         "mcp.toolGroups": groups,
         "mcp.tools": tools,
@@ -851,17 +846,12 @@ def validate_json_schema(content: str) -> dict[str, Any]:
     for name, definition in definitions.items():
         if not isinstance(definition, dict):
             raise TypeError(f"$defs/{name} is not an object")
-        if name.startswith("Scip"):
-            raise ValueError(f"$defs/{name} exposes the separate SCIP API through MCP")
         package = definition.get("rift:package")
         if package not in {"rift.core", "rift.mcp"}:
             raise ValueError(f"$defs/{name} has invalid rift:package {package!r}")
         proto = definition.get("rift:proto")
         if not isinstance(proto, dict):
             raise TypeError(f"$defs/{name} has no Protobuf mapping")
-        mapped = proto.get("type")
-        if isinstance(mapped, str) and mapped.startswith(("rift.scip.", "scip.")):
-            raise ValueError(f"$defs/{name} exposes the separate SCIP API through MCP")
     return schema
 
 
@@ -990,7 +980,6 @@ def validate_proto(files: dict[str, str], schema: dict[str, Any]) -> None:
     expected = {
         "rift/core.proto": "rift.core",
         "rift/mcp.proto": "rift.mcp",
-        "rift/adapter.proto": "rift.adapter",
         "rift/scip.proto": "rift.scip",
         "scip/scip.proto": "scip",
     }
@@ -1007,29 +996,6 @@ def validate_proto(files: dict[str, str], schema: dict[str, Any]) -> None:
             raise ValueError(
                 f"{descriptor.name} definitions have generated numeric suffixes: {numbered!r}"
             )
-        if descriptor.name == "rift/mcp.proto":
-            leaked = [
-                value.name
-                for value in [*descriptor.message_type, *descriptor.enum_type]
-                if value.name.startswith("Scip")
-            ]
-            if leaked:
-                raise ValueError(f"rift/mcp.proto exposes SCIP types: {leaked!r}")
-            if any(
-                dependency in {"rift/scip.proto", "scip/scip.proto"}
-                for dependency in descriptor.dependency
-            ):
-                raise ValueError("rift/mcp.proto imports the separate SCIP API")
-        if descriptor.name == "rift/scip.proto":
-            prefixed = [
-                value.name
-                for value in [*descriptor.message_type, *descriptor.enum_type]
-                if value.name.startswith("Scip")
-            ]
-            if prefixed:
-                raise ValueError(
-                    f"rift/scip.proto repeats its namespace in type names: {prefixed!r}"
-                )
 
     names: set[str] = set()
     for descriptor in descriptors.file:
@@ -1080,7 +1046,6 @@ def main() -> int:
     files = [
         SchemaCompiler("core").compile(),
         SchemaCompiler("mcp").compile(),
-        file_from_package(adapter.ADAPTER_PACKAGE),
         file_from_package(scip_api.SCIP_API_PACKAGE),
         file_from_package(scip.SCIP_PACKAGE),
     ]

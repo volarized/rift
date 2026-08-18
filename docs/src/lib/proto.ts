@@ -1,6 +1,6 @@
 /**
  * Loads one version's generated Protobuf packages. MCP uses JSON at the agent
- * boundary. The server, adapters, and SCIP export use the packages loaded here.
+ * boundary. The server and SCIP export use the packages loaded here.
  * `protoFor(version)` reads the live `protocol/` tree for the draft and the
  * frozen `protocol/versions/<date>/` snapshot for a dated version.
  */
@@ -9,16 +9,6 @@ import { isAbsolute, join } from "node:path";
 import protobuf from "protobufjs";
 import { protocolDirFor } from "@/lib/protocol-dir";
 import type { DocVersion } from "@/lib/versions";
-
-// protobufjs bundles the well-known types it can inline, but not
-// descriptor.proto, which `adapter.proto` needs to declare its own options. It
-// ships in the package, and is reached from the build's own directory the same
-// way the schemas are: `require.resolve` would hand webpack a module request
-// for a `.proto`, and webpack has no loader that can parse one.
-const DESCRIPTOR_PROTO = join(
-  process.cwd(),
-  "node_modules/protobufjs/google/protobuf/descriptor.proto",
-);
 
 export interface ProtoField {
   name: string;
@@ -70,25 +60,15 @@ export interface ProtoService {
   rpcs: ProtoRpc[];
 }
 
-export interface ProtoSection {
-  name: string;
-  /** Message and enum names, in declaration order. */
-  types: string[];
-}
-
 /** One version's loaded packages and everything derived from them. */
 export interface ProtoData {
-  adapterServices: ProtoService[];
   scipServices: ProtoService[];
   protoMessages: ProtoMessage[];
   protoEnums: ProtoEnum[];
   protoEnumOwner: Record<string, string>;
-  adapterOwned: Set<string>;
-  protoWrappers: Set<string>;
   protoTypeNames: string[];
   scipMessages: ProtoMessage[];
   scipEnums: ProtoEnum[];
-  protoSections: ProtoSection[];
 }
 
 /** `rift.core.Symbol` reads as `Symbol`; the package adds nothing on a page. */
@@ -103,7 +83,6 @@ function load(version: DocVersion): ProtoData {
     const loaded = new protobuf.Root();
     loaded.resolvePath = (_origin, target) => {
       if (isAbsolute(target)) return target;
-      if (target === "google/protobuf/descriptor.proto") return DESCRIPTOR_PROTO;
       return target.startsWith("google/")
         ? (protobuf.util.path.resolve("", target) as string)
         : join(protocolDir, target);
@@ -114,7 +93,6 @@ function load(version: DocVersion): ProtoData {
       [
         join(protocolDir, "rift/core.proto"),
         join(protocolDir, "rift/mcp.proto"),
-        join(protocolDir, "rift/adapter.proto"),
         join(protocolDir, "rift/scip.proto"),
         join(protocolDir, "scip/scip.proto"),
       ],
@@ -185,7 +163,6 @@ function load(version: DocVersion): ProtoData {
     };
   }
 
-  const adapterServices = services.filter((service) => service.package === "rift.adapter");
   const scipServices = services.filter((service) => service.package === "rift.scip");
 
   const protoMessages: ProtoMessage[] = [...types.values()]
@@ -216,42 +193,6 @@ function load(version: DocVersion): ProtoData {
     ),
   );
 
-  // Which proto types the adapter file declares, as opposed to the generated
-  // model. Messages and enums only: the file also declares the option extensions
-  // that carry its grouping, and those are fields rather than types.
-  const adapterOwned: Set<string> = (() => {
-    const owned = new Set<string>();
-    const namespace = root.lookup("rift.adapter");
-    if (namespace instanceof protobuf.Namespace) {
-      for (const child of namespace.nestedArray) {
-        if (child instanceof protobuf.Type || child instanceof protobuf.Enum) owned.add(child.name);
-      }
-    }
-    return owned;
-  })();
-
-  // The messages that exist only because protobuf forbids a repeated field
-  // directly inside a `oneof`. Each is one repeated field and nothing else, so
-  // there is nothing to read on a page of its own.
-  //
-  // Recognised by shape rather than by name, so a new one costs nothing, and
-  // scoped to the adapter file for the same reason: `FilterAll` and
-  // `OriginMappingExact` are shaped alike but are model types with meaning of
-  // their own. A leading comment is disqualifying — a wrapper someone found worth
-  // explaining is no longer plumbing.
-  const protoWrappers: Set<string> = new Set(
-    protoMessages
-      .filter(
-        (message) =>
-          adapterOwned.has(message.name) &&
-          message.fields.length === 1 &&
-          message.fields[0].repeated &&
-          message.oneofs.length === 0 &&
-          !message.comment,
-      )
-      .map((message) => message.name),
-  );
-
   const scipMessages = protoMessages.filter(
     (message) => message.package === "scip" || message.package === "rift.scip",
   );
@@ -259,45 +200,14 @@ function load(version: DocVersion): ProtoData {
     (declared) => declared.package === "scip" || declared.package === "rift.scip",
   );
 
-  // The groups `adapter.proto` divides itself into, read from the option each
-  // declaration carries:
-  //
-  //   message AdapterState {
-  //     option (section) = "Adapter state";
-  //
-  // Declaring it in the file is the same reason `mcp.json` carries `rift:axes`:
-  // a grouping kept in the documentation code is a second place to edit, and it
-  // drifts silently when a message moves. Sections appear in the order they are
-  // first declared, so the page reads in file order.
-  const protoSections: ProtoSection[] = (() => {
-    const namespace = root.lookup("rift.adapter");
-    if (!(namespace instanceof protobuf.Namespace)) return [];
-    const byName = new Map<string, ProtoSection>();
-    for (const child of namespace.nestedArray) {
-      if (!(child instanceof protobuf.Type)) continue;
-      if (protoWrappers.has(child.name)) continue;
-      const options = child.options as Record<string, string> | undefined;
-      const name = options?.["(section)"];
-      if (!name) continue;
-      const section = byName.get(name) ?? { name, types: [] };
-      section.types.push(child.name);
-      byName.set(name, section);
-    }
-    return [...byName.values()];
-  })();
-
   return {
-    adapterServices,
     scipServices,
     protoMessages,
     protoEnums,
     protoEnumOwner,
-    adapterOwned,
-    protoWrappers,
     protoTypeNames: [...types.keys()],
     scipMessages,
     scipEnums,
-    protoSections,
   };
 }
 

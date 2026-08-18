@@ -2,65 +2,92 @@
 title: SCIP
 ---
 
-Rift can export a session's semantic facts as a [SCIP](https://github.com/sourcegraph/scip) index,
-for the tools that already consume one.
+import { ScipReference } from "@/components/protocol/scip";
 
-## Request
+The [`Index.Read`](#scip-rpc-Read) RPC exports the workspace tree or one projection as a
+[SCIP v0.9.0](https://github.com/sourcegraph/scip) index.
 
-The `Index` service rides the workspace rendezvous under `.rift` — the same socket every other
-connection uses, so a consumer finds it the way `rift mcp` does, and without a running server
-there is nothing to connect to.
+## Endpoint
 
-`Read` names a session, and the server streams that session's projection as it stands: one header,
-then documents in project-path byte order, then external symbols in byte order of their encoded
-symbol strings — the canonical `scip.Index` order, so a consumer can write the stream straight
-out. No event exceeds 4 MiB, matching stock gRPC receive limits; a document that can't fit alone
-is dropped and recorded as an omission. A session the server doesn't hold fails with `NOT_FOUND`.
+The server exposes `Index` at the endpoint named by the workspace
+[`ServerLock`](/docs/draft/protocol/reference#ServerLock).
 
-The read isn't isolated from anything. A `cargo build` writing into the same projection mid-stream
-can leave the index internally inconsistent, and the export won't stop it. This is a fallback
-surface for tools that can't speak MCP, and the right answer to a bad index is to read again.
+`Read` accepts an optional
+[`ProjectionId`](/docs/draft/protocol/reference#ProjectionId). An omitted `projection` selects
+the workspace tree; a present value selects that projection, including unpublished content.
 
-A projection takes one writer and any number of readers. An export attaches to a live or retained
-session as a reader: it leaves the connection slot free for the agent, reads the projection as it
-stands — dirty content included — without materializing it the way `rift://projection` does, and
-lets `session_remove` proceed. A removal mid-stream ends the stream with `ABORTED`, never `OK`,
-and the fix is the same read-again; a stream that ends `OK` carried the whole index.
+**Request:**
 
-The header repeats the session, carries the SCIP metadata, and reports analysis coverage per
-language and fact family — so a consumer can tell an index that's missing relationships from one
-whose language genuinely has none.
+```json
+{
+  "projection": "rift://projection/prj_bbbbbbbbbbbbbbbbbbbbbbbbbb"
+}
+```
+
+The server **MUST** reject a malformed projection identity with `INVALID_ARGUMENT`. It **MUST**
+return `NOT_FOUND` when it does not hold the named projection.
+
+## Stream
+
+The server emits one [`Header`](#scip-Header), then [`Document`](#scip-Document) events in
+canonical project-path order, then external symbols in byte order of their encoded SCIP symbol
+strings. A stream that ends with `OK` contains every event the header describes.
+
+The server **MUST NOT** emit an event larger than 4 MiB. When one document cannot fit in that
+bound, the server omits it and records an [`Omission`](#scip-Omission) with reason
+`REASON_TOO_LARGE` in the header.
+
+`Read` does not lock the exported tree. A concurrent filesystem write can therefore leave one
+stream internally inconsistent; a consumer that requires one tree revision **SHOULD** retry the
+read after writes stop. If `projection_remove` removes the projection during the stream, the
+server **MUST** terminate it with `ABORTED`.
+
+## Header
+
+The first event carries one `Header` with:
+
+- `projection` — selected projection, or absent for the workspace tree
+- `metadata` — projected `scip.Index.metadata`, including the exported directory as
+  `project_root`
+- `coverage` — weakest per-file semantic coverage for each language and fact family
+- `omissions` — populated Rift data absent from the SCIP mapping
+
+Coverage describes what providers established. Omissions describe what the mapping then dropped,
+so an empty relationship list is distinguishable from unavailable analysis.
 
 ## Mapping
 
-Documents, occurrences, symbols, relationships, signatures and documentation map onto their SCIP
-equivalents. Paths stay workspace-relative, and `project_root` names the session projection
-directory as a file URI, so joining the two reads the exported bytes even for a dirty session.
-Ranges convert from Rift's UTF-8 byte offsets to SCIP line and character coordinates with
-`UTF8CodeUnitOffsetFromLineStart`, so the character axis stays in bytes.
+The server maps documents, occurrences, symbols, relationships, signatures, and documentation to
+their SCIP equivalents. `project_root` is a file URI for the exported tree, while document paths
+remain workspace-relative.
 
-Some facts have nowhere to go. `Omission` records what didn't make it into the index and why — a
-populated field the pinned SCIP v0.9.0 schema has no place for, a file whose language has no
-adapter, a path SCIP's canonical form forbids — each with its count and, where one claims it, its
-language. A successful export that quietly dropped facts would be worse than one that failed.
+Rift represents source locations as
+[`TextRange`](/docs/draft/protocol/reference#TextRange) UTF-8 byte offsets. The server converts
+them to SCIP line and character positions with `UTF8CodeUnitOffsetFromLineStart`, preserving
+byte-based character offsets.
+
+`Omission` records each populated field or file the mapping cannot carry. Reasons distinguish an
+unrepresentable fact, unavailable analysis, a path forbidden by SCIP, and a unit exceeding the
+stream bound.
 
 ## Symbols
 
-A Rift symbol is `rift://symbol/{language}/{name}` — an adapter's stable qualified name that Rift
-treats as opaque. The export encodes it as a SCIP symbol without inventing structure it doesn't
-have:
+A [`SymbolId`](/docs/draft/protocol/reference#SymbolId) has the form
+`rift://symbol/{language}/{name}`. The server encodes it as one global SCIP symbol:
 
-- scheme `rift`, then the package triple `. {language} .` — Rift's core model carries no package
-  identity, so manager and version take SCIP's `.` placeholder and the exact `Language` fills the
-  name slot
-- one term descriptor holding the whole qualified name, backtick-escaped when it steps outside
-  SCIP's simple-identifier characters; a `~N` disambiguator stays part of the identifier
+- scheme `rift`
+- package manager `.`
+- package name set to the exact Rift [`Language`](/docs/draft/protocol/reference#Language)
+- package version `.`
+- one term descriptor containing the complete qualified name
 
-So `rift://symbol/python/frobnicate.Frobnicator.connect~2` becomes:
+For example, `rift://symbol/python/frobnicate.Frobnicator.connect~2` becomes:
 
-```
+```text
 rift . python . `frobnicate.Frobnicator.connect~2`.
 ```
 
-The encoding is reversible back to the `SymbolId`, and there are no locals: a Rift symbol is
-workspace-stable by contract, so every one exports as a global symbol.
+The server backtick-escapes a qualified name outside SCIP's simple-identifier grammar. It retains
+the `~N` disambiguator inside that descriptor, making the encoding reversible to `SymbolId`.
+
+<ScipReference version="draft" />

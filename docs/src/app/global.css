@@ -57,7 +57,7 @@
  *
  *   void  #08080A  background
  *   rule  #141416  borders, dividers
- *   dim   #5C5C60  labels, prompts
+ *   dim   #7C7C81  labels, prompts
  *   ink   #C9C9C4  text, line objects
  *
  * Dark is canonical. Light is its inversion: the ramp flips end for end, so
@@ -112,7 +112,7 @@
   --secondary: oklch(0.1921 0.0041 286.9);
   --secondary-foreground: oklch(0.8345 0.0069 106.4);
   --muted: oklch(0.1921 0.0041 286.9);
-  --muted-foreground: oklch(0.4762 0.0063 286.1);
+  --muted-foreground: oklch(0.58 0.0063 286.1);
   --accent: oklch(0.1921 0.0041 286.9);
   --accent-foreground: oklch(0.8345 0.0069 106.4);
   --destructive: oklch(0.637 0.176 25.5);
@@ -158,3 +158,27 @@
  * Motion lives in react-spring, not here. See components/reveal.tsx for the
  * entry reveal and components/line-object.tsx for the r3f line objects.
  */
+
+/*
+ * The home nav mark must land on the same pixel as the docs sidebar mark:
+ * the sidebar puts it at x = 3px gutter + 16px padding, y = 16px into a 64px
+ * row. Below md both layouts already agree (56px bar, 16px inset).
+ */
+@media (min-width: 48rem) {
+  #nd-nav > * {
+    max-width: none;
+  }
+  #nd-nav nav {
+    height: 4rem;
+    padding-inline-start: 19px;
+  }
+  #nd-home-layout {
+    padding-top: 4rem;
+  }
+}
+
+/* RootToggle reserves an icon slot per option; ours have no icons. */
+.version-switch-trigger > div:first-child:empty,
+.version-switch-item > div:first-child:empty {
+  display: none;
+}

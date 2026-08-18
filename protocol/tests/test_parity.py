@@ -15,7 +15,6 @@ PROTOCOL = Path(__file__).parents[1]
 PROTO_FILES = (
     "rift/core.proto",
     "rift/mcp.proto",
-    "rift/adapter.proto",
     "rift/scip.proto",
 )
 FIELD = re.compile(
@@ -30,9 +29,7 @@ def snake(name: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
 
-def parse_proto() -> (
-    tuple[dict[str, dict[str, int]], dict[str, list[tuple[str, int]]]]
-):
+def parse_proto() -> tuple[dict[str, dict[str, int]], dict[str, list[tuple[str, int]]]]:
     """Return message fields and enum values, keyed by declaration path."""
 
     messages: dict[str, dict[str, int]] = {}
@@ -62,11 +59,7 @@ def parse_proto() -> (
                     stack.pop()
                 continue
             container = next(
-                (
-                    (k, n)
-                    for k, n in reversed(stack)
-                    if k in ("message", "enum")
-                ),
+                ((k, n) for k, n in reversed(stack) if k in ("message", "enum")),
                 None,
             )
             if container is None:
@@ -108,9 +101,7 @@ class ProtoParityTests(TestCase):
                 checked += 1
                 names = {prop, snake(prop)}
                 if not any(
-                    fields.get(n) == number
-                    for fields in candidates
-                    for n in names
+                    fields.get(n) == number for fields in candidates for n in names
                 ):
                     missing.append(f"{name}.{prop} = {number}")
         self.assertGreater(checked, 300, "parity check matched too few fields")
@@ -137,11 +128,7 @@ class ProtoParityTests(TestCase):
         by_content: dict[frozenset[tuple[str, int]], list[str]] = {}
         for path, values in self.enums.items():
             by_content.setdefault(frozenset(values), []).append(path)
-        duplicated = {
-            tuple(paths)
-            for paths in by_content.values()
-            if len(paths) > 1
-        }
+        duplicated = {tuple(paths) for paths in by_content.values() if len(paths) > 1}
         self.assertEqual(duplicated, set())
 
 
@@ -155,9 +142,7 @@ class ReachabilityTests(TestCase):
             if isinstance(value, dict):
                 for key, child in value.items():
                     if key == "rift:contentTypes" and isinstance(child, dict):
-                        found.update(
-                            v for v in child.values() if isinstance(v, str)
-                        )
+                        found.update(v for v in child.values() if isinstance(v, str))
                     elif key == "rift:arguments":
                         if isinstance(child, str):
                             found.add(child)
@@ -191,8 +176,96 @@ class ReachabilityTests(TestCase):
                 continue
             seen.add(current)
             frontier |= {
-                ref
-                for ref in self.refs_of(definitions[current])
-                if ref in definitions
+                ref for ref in self.refs_of(definitions[current]) if ref in definitions
             } - seen
         self.assertEqual(sorted(set(definitions) - seen), [])
+
+
+class ObjectSchemaTests(TestCase):
+    """A tool's advertised schema is an object schema, and says so.
+
+    A tool result is a tagged union, which generates as a bare `oneOf` over
+    object branches: it admits objects and nothing else without ever declaring
+    the type. A client that validates the advertisement rejects the whole
+    `tools/list` over the omission and registers the server with no tools at
+    all, so the omission costs every tool, not the one that carries it.
+    """
+
+    UNIONS = ("oneOf", "anyOf")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.documents = {
+            name: json.loads((PROTOCOL / name).read_text())
+            for name in ("mcp.json", "rift.schema.json")
+        }
+
+    def branches(self, schema: dict) -> list[dict] | None:
+        """The branches of a definition whose whole shape is a union.
+
+        A definition carrying `properties` beside a union is an object whose
+        branches only say which of its own fields must be present — `SearchParams`
+        and `RelationFilter` — and those branches describe no shape of their own.
+        """
+        if "properties" in schema:
+            return None
+        for keyword in self.UNIONS:
+            if keyword in schema:
+                return schema[keyword]
+        return None
+
+    def test_every_union_definition_declares_the_object_type(self) -> None:
+        checked = 0
+        for name, document in self.documents.items():
+            definitions = document["$defs"]
+            for definition, schema in definitions.items():
+                branches = self.branches(schema)
+                if branches is None:
+                    continue
+                where = f"{name}/$defs/{definition}"
+                for branch in branches:
+                    resolved = definitions.get(
+                        branch.get("$ref", "").rsplit("/", 1)[-1], branch
+                    )
+                    self.assertEqual(
+                        resolved.get("type"),
+                        "object",
+                        f"{where}: branch is not an object",
+                    )
+                self.assertEqual(schema.get("type"), "object", where)
+                checked += 1
+        self.assertEqual(checked, 16)
+
+    def test_every_tool_result_is_an_object_schema(self) -> None:
+        document = self.documents["mcp.json"]
+        definitions = document["$defs"]
+        tools = document["rift:entryPoints"]["mcp.tools"]
+        for tool, entry in tools.items():
+            for side in ("params", "result"):
+                schema = definitions[entry[side]["$ref"].rsplit("/", 1)[-1]]
+                self.assertEqual(schema.get("type"), "object", f"{tool}.{side}")
+
+    def test_agent_surface_names_are_exact_and_ordered(self) -> None:
+        entry_points = self.documents["mcp.json"]["rift:entryPoints"]
+        self.assertEqual(
+            list(entry_points["mcp.tools"]),
+            [
+                "get_symbol",
+                "search",
+                "nodes",
+                "replace_symbol",
+                "insert_symbol",
+                "replace_node",
+                "patch",
+                "projection_create",
+                "projection_list",
+                "projection_remove",
+                "projection_restore",
+                "publish",
+                "execute",
+            ],
+        )
+        self.assertEqual(
+            list(entry_points["mcp.resources"]),
+            ["workspace", "projection", "changes", "fs"],
+        )

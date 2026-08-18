@@ -5,8 +5,7 @@ import type { DocVersion } from "@/lib/versions";
 
 /**
  * A link to wherever a definition's heading lives. Each definition is rendered
- * once, on the page for the document that owns it, so a type used by both the
- * MCP surface and the adapter wire resolves to the same anchor from either.
+ * once, on the page for the document that owns it.
  */
 export function TypeLink({ name, version }: { name: string; version: DocVersion }): ReactNode {
   return (

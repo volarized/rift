@@ -5,8 +5,8 @@
  * `protocol.ts` loads the documents and knows about JSON Schema. This knows
  * about Rift: that `mcp.tools` and `mcp.resources` declare their members with a
  * params and a result type, and that a resource's URI template is a const
- * inside `ResourceTemplate`. The adapter seam is protobuf and is catalogued by
- * `proto.ts` from its service definition.
+ * inside `ResourceTemplate`. The SCIP export is catalogued from its Protobuf
+ * service definition.
  *
  * Each page also gets its own table of contents and search index here, because
  * fumadocs builds both from the MDX abstract syntax tree and these pages have
@@ -15,7 +15,6 @@
 
 import type { StructuredData } from "fumadocs-core/mdx-plugins";
 import type { TableOfContents } from "fumadocs-core/server";
-import { sectionId } from "@/components/protocol/adapter";
 import { type ProtoData, protoFor } from "@/lib/proto";
 import {
   type ProtocolData,
@@ -365,57 +364,6 @@ function build(version: DocVersion): Surface {
     };
   }
 
-  // The adapter page is protobuf, so its outline comes from the service and the
-  // messages the adapter file declares — not from `defs`, which holds only the
-  // JSON Schema half.
-  function adapterPage(): PageData {
-    const service = proto.adapterServices[0];
-    // The file's own section banners decide the grouping, so a message that moves
-    // between sections moves on the page without anything here changing.
-    const grouped = proto.protoSections.flatMap((section) => [
-      { name: section.name, id: sectionId(section.name), depth: 2 },
-      ...section.types.map((name) => ({ name, id: `msg-${name}`, depth: 3 })),
-    ]);
-
-    // `Transport` and `What crosses this seam` are headings in the MDX, so remark
-    // already produced them. Only what the component renders belongs here.
-    return {
-      toc: [
-        { title: "Service", url: "#service", depth: 2 },
-        ...(service?.rpcs ?? []).map((rpc) => ({
-          title: rpc.name,
-          url: `#rpc-${rpc.name}`,
-          depth: 3,
-        })),
-        ...grouped.map((entry) => ({ title: entry.name, url: `#${entry.id}`, depth: entry.depth })),
-      ],
-      structuredData: {
-        headings: [
-          { id: "service", content: "Service" },
-          ...(service?.rpcs ?? []).map((rpc) => ({ id: `rpc-${rpc.name}`, content: rpc.name })),
-          ...grouped.map((entry) => ({ id: entry.id, content: entry.name })),
-        ],
-        contents: [
-          ...(service?.rpcs ?? []).flatMap((rpc) =>
-            rpc.comment ? [{ heading: `rpc-${rpc.name}`, content: rpc.comment }] : [],
-          ),
-          ...proto.protoMessages
-            .filter((message) => proto.adapterOwned.has(message.name))
-            .flatMap((message) => [
-              ...(message.comment
-                ? [{ heading: `msg-${message.name}`, content: message.comment }]
-                : []),
-              ...message.fields.flatMap((field) =>
-                field.comment
-                  ? [{ heading: `msg-${message.name}`, content: `${field.name}: ${field.comment}` }]
-                  : [],
-              ),
-            ]),
-        ],
-      },
-    };
-  }
-
   // The reference tree, flattened depth-first with each name's depth kept.
   //
   // The nesting is the table of contents, not page furniture: an outline printed
@@ -491,7 +439,6 @@ function build(version: DocVersion): Surface {
   const pageData: Record<string, PageData> = {
     [pageUrl(version, "mcp")]: mcpPage(),
     [`${protocolRoot(version)}/scip`]: scipPage(),
-    [`${protocolRoot(version)}/adapter`]: adapterPage(),
     // No entry for `core`: it is plain prose, so remark already sees every
     // heading it has. Its types are anchored on the reference page.
     [`${protocolRoot(version)}/reference`]: referencePage(),

@@ -2,19 +2,26 @@
 title: Rift
 ---
 
-Your agent works in a scratchpad over your project — a view that only diverges where the agent
-changes something — reads and edits it through MCP, and publishes the result into your files once
-you've accepted what it did.
+Rift is an agentic development toolkit: a set of tools and utilities that helps people and agents
+work with codebases. It uses code structure and surrounding context to give agents deeper reads,
+spend fewer tokens on finding relevant code, and make precise edits.
 
-Rift is per se not a complex system, and most of what follows matters if you're implementing
-against the protocol or writing a language adapter. If you want to know how the server actually
-works, take a tour:
+Agents use Rift through [MCP](https://modelcontextprotocol.io/), the protocol their harness uses
+to discover and call tools. A Rift server operates on one **workspace**: the folder on your
+machine that contains the codebase.
 
-- Architecture — the processes, what each of them owns, and how a change gets from your agent
-  into your files
-- Configuration — the `rift.toml` keys that decide what runs on your machine: which adapters
-  start, which languages may execute agent-written code, and which checks every change has to
-  pass
-- Protocol — the entities both sides exchange, the tools and resources an agent calls, how a
-  request turns into an adapter call, and the generated reference that settles fields and wire
-  numbers. A read-only SCIP index export lives here too, for tools that can't speak MCP
+Changes can land directly in that folder. When work needs to stay separate, the agent creates a
+**projection**: a pinned copy of the workspace, similar to a Git worktree but without requiring
+Git. A projection is an ordinary folder, so agents and existing tools such as formatters and
+linters can work inside it. Rift writes its changes back to the workspace only when the agent
+publishes the projection.
+
+Most implementation detail below matters only to server and protocol implementers. These pages
+explain the parts needed to inspect that behavior:
+
+- [Architecture](/docs/draft/architecture) — how Rift works, which processes it runs, and how
+  ownership is distributed across them
+- [Configuration](/docs/draft/configuration) — the `rift.toml` file used to customize Rift's
+  behavior and connect additional tools and providers
+- [Protocol](/docs/draft/protocol) — the logical entities, MCP and SCIP surfaces, and metadata
+  Rift defines
