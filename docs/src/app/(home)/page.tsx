@@ -64,8 +64,8 @@ function Section({
 }
 
 /**
- * One object per point: the compiler is the solid taken apart, the other two
- * are attractors — a reversible system and a dynamo that swaps between two
+ * One object per point: the provider stack is the solid taken apart, the other
+ * two are attractors — a reversible system and a dynamo that swaps between two
  * states.
  */
 const DIFFERENCES: {
@@ -79,23 +79,23 @@ const DIFFERENCES: {
   fit?: number;
 }[] = [
   {
-    statement: "Full context awareness and introspection.",
-    title: "Direct compiler integration",
-    body: "rift talks to the language’s own compiler, so every read is typed and every edit is validated before it lands.",
+    statement: "Code facts with reported coverage.",
+    title: "Programming language providers",
+    body: "rift combines syntax, semantic analysis and history to give agents the best available context.",
     solid: "sphere",
   },
   {
     statement: "Staged changes with verification.",
     title: "Reversible filesystem projections",
-    body: "Every change an agent makes is staged in a Rift-owned projection.",
+    body: "An agent can collect changes in a pinned projection, inspect them, then publish them into the workspace.",
     line: "shimizu",
     // The butterfly stands in the x–z plane; turn it to face the camera.
     tilt: 1.5,
   },
   {
-    statement: "Clear semantics and efficient edits.",
-    title: "Structured reads and writes over MCP",
-    body: "Tools and resources instead of shell transcripts. Agents work with code semantics and edit it structurally.",
+    statement: "Structured reads and guarded edits.",
+    title: "MCP tools and resources",
+    body: "Agents read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
@@ -149,7 +149,7 @@ export default function HomePage() {
         <div className="grid gap-5">
           <Statement>Agents depend on context and tooling.</Statement>
           <Body className="text-balance">
-            rift provides typesafe, token-efficient, compiler-backed reads and edits.
+            rift provides contextual, parser-precise codebase reading and editing tools.
           </Body>
         </div>
       </Section>

@@ -4,117 +4,269 @@ title: MCP
 
 import { McpReference } from "@/components/protocol/mcp";
 
-`rift mcp` is a thin process: it maps MCP JSON onto the local Rift service and owns one session
-connection for its lifetime. Nothing below is decided in that process; how the JSON is carried is
-all that's its own.
+The Rift server terminates MCP over [Streamable
+HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports#streamable-http) on the
+port its lock file names.
+`rift mcp` is a small stdio proxy for harnesses that launch MCP servers as subprocesses: it
+forwards frames unchanged and decides nothing.
 
-A tool result rides `structuredContent`, typed by the tool's declared output schema, with the
+Requests do not open connection-scoped sessions. Each call names a
+[`ProjectionId`](/docs/draft/protocol/reference#ProjectionId), or the workspace tree when it
+omits one, and carries every witnessed address it uses.
+
+A cursor names a process-local captured result. A projection retains its changes and recorded
+read dependencies across calls, so either identity can refer to server state created earlier.
+
+A tool result rides MCP
+[`structuredContent`](https://modelcontextprotocol.io/specification/draft/server/tools#structured-content),
+typed by the tool's declared output schema, with the
 same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is such a result —
 [`ChangeResult`](/docs/draft/protocol/reference#ChangeResult) saying refused, never `isError` —
-while [`ErrorData`](/docs/draft/protocol/reference#ErrorData) travels as the JSON-RPC error
+while [`ErrorData`](/docs/draft/protocol/reference#ErrorData) travels as the
+[JSON-RPC error](https://www.jsonrpc.org/specification#error_object)
 object's `data`, under code `-32000`.
 
-The connection is a serialized queue: `rift mcp` sends one application call at a time, in arrival
-order, so a long evaluation holds everything behind it — concurrent work wants a second session.
-MCP's cancellation notification drops a queued call outright; a running change completes or rolls
-back whole before the next call starts, the same all-or-nothing publication has.
+The server serializes change application per targeted tree: two concurrent changes against one
+tree apply one after the other, and the later one meets its preconditions against the earlier
+one's result. Reads run concurrently.
 
-`rift mcp` completes MCP `initialize` even when the server's contract doesn't match its own. It
-declares `tools` and `resources` — without `subscribe` or `listChanged`, so the changeset is
-polled — and on a mismatch answers every call with `unsupported_protocol` and `retry:
-operator_action`, because a process that refuses to start gives the agent nothing to diagnose.
-
-## Connection
-
-`rift mcp` finds or starts the server for its workspace, mints a session id, and opens `Connect`.
-`Connected` comes back with the protocol version the server accepted from the caller's list, the
-workspace path, the session, its
-[`ProjectionState`](/docs/draft/protocol/reference#ProjectionState), and a connection id that
-every later call carries.
-
-A session takes one live connection. When your agent exits, the session and its projection stay
-put, and these tools deal with what's left behind:
-
-| Tool | What it does |
-| --- | --- |
-| [`session_list`](#tool-session_list) | retained sessions and the state of each projection |
-| [`session_continue`](#tool-session_continue) | rebinds this connection to a retained session |
-| [`session_remove`](#tool-session_remove) | discards a session and deletes its projection |
-
-`session_continue` refuses a session that already has a live connection, and refuses while the
-current session holds a retained debug session; both come back `temporarily_unavailable`, and
-`debug_stop` clears the second. It also refuses to abandon a current session that has changes of
-its own, which is `invalid_request` — picking up old work would otherwise silently throw away new
-work. The session you leave behind holds nothing, so Rift removes it.
+An MCP [cancellation
+notification](https://modelcontextprotocol.io/specification/draft/basic/utilities/cancellation)
+drops a queued change. A running change completes or rolls back whole.
 
 ## Reads
 
-Your agent reads the projection through these tools:
+Callers read code through these tools:
 
 | Tool | Result |
 | --- | --- |
-| [`outline`](#tool-outline) | declarations in one file, in source order |
-| [`search`](#tool-search) | ranked files, nodes, or symbols |
-| [`match`](#tool-match) | literal, regular-expression, or structural matches |
+| [`get_symbol`](#tool-get_symbol) | project and dependency declarations by known name |
+| [`search`](#tool-search) | ranked files, nodes, or symbols across a selected source scope |
+| [`nodes`](#tool-nodes) | the syntax nodes covering one position, with witnessed addresses |
 
-`search` takes a lexical `query`, a `filter` over resolved adapter facts, or both — the filter is
-where adapter knowledge enters a search, so "implements this trait" and "called by that function"
-are one request rather than three.
+`get_symbol` is the read to start from when the name is known. Its default `scope: "all"` searches
+project, dependency, standard-library, and external declarations. A hit includes source when its
+resolver supplied readable bytes; synthetic and source-less dependency declarations still carry
+their signatures, documentation, types, and relationships. `include_history` applies to project
+symbols and attaches their version-control timeline and co-change coupling.
 
-Resources carry the larger and reusable payloads:
+`search` takes a lexical `query`, a `filter` over resolved provider facts, a bounded
+`traversal`, or a combination. A traversal starts from one symbol and states its intent.
+`trace` follows outgoing `calls`; `find_tests` follows incoming `tests`; `edit_ripple` follows
+incoming `calls`; and `review_context` follows `calls` in both directions. `direction` and
+`facets` override those defaults.
+
+Search defaults to `scope: "project"`. `scope: "dependencies"` searches resolved dependencies;
+`scope: "all"` also includes project, standard-library, and external declarations. A `paths`
+selector only applies to project scope because dependency paths belong to their packages, not the
+workspace folder.
+
+The server walks one hop unless `max_hops` asks for two, and visits no more than `max_nodes`.
+Each reached symbol carries `distance` and a `path` of audited relationship steps. This makes a
+two-hop result distinguishable from direct callers. Each relationship carries its source-node
+evidence and derivation; result coverage names the contributing provider revisions.
+
+For example, this request finds direct tests of one symbol without a separate graph tool:
+
+```json
+{
+  "traversal": {
+    "seed": "rift://symbol/python/pkg.solver.fit~1",
+    "intent": "find_tests",
+    "max_nodes": 10
+  }
+}
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/python/tests.test_solver.test_fit",
+      "language": { "name": "python" },
+      "name": "test_fit",
+      "kind": "function",
+      "facets": ["callable", "test"],
+      "origin": {
+        "location": { "kind": "project", "package": null },
+        "source_kind": "authored",
+        "unit": "rift://source/src_bbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "container": null,
+      "modifiers": [],
+      "visibility": null,
+      "types": [],
+      "signatures": [],
+      "documentation": [],
+      "extensions": {},
+      "document_local": true
+    }
+  },
+  "score": 1.0,
+  "matched_by": ["relationship"],
+  "span": {
+    "unit": "rift://source/src_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "range": { "start": 120, "end": 168 }
+  },
+  "line": 8,
+  "path": [
+    {
+      "relationship": {
+        "from": "rift://symbol/python/tests.test_solver.test_fit",
+        "kind": "call",
+        "facets": ["calls", "tests"],
+        "to": "rift://symbol/python/pkg.solver.fit",
+        "evidence": [],
+        "derivation": "syntax",
+        "confidence": null,
+        "extensions": {}
+      },
+      "direction": "incoming"
+    }
+  ],
+  "distance": 1
+}
+```
+
+When the caller does not know whether a name comes from local code or a package, dependency scope
+keeps that choice explicit:
+
+```json
+{
+  "target": "symbol",
+  "query": "BaseModel",
+  "scope": "dependencies",
+  "include": ["signature"]
+}
+```
+
+A provider can return a declaration even when installed source is unavailable:
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/python/pydantic.main.BaseModel",
+      "language": { "name": "python", "dialect": null },
+      "name": "BaseModel",
+      "kind": "class",
+      "facets": ["type"],
+      "origin": {
+        "location": {
+          "kind": "dependency",
+          "package": { "manager": "pypi", "name": "pydantic", "version": "2.8.2" }
+        },
+        "source_kind": "authored",
+        "unit": null
+      },
+      "container": null,
+      "modifiers": [],
+      "visibility": "public",
+      "types": [],
+      "signatures": [],
+      "documentation": [],
+      "extensions": {},
+      "document_local": false
+    }
+  },
+  "score": 0.98,
+  "matched_by": ["name"],
+  "span": null,
+  "line": null
+}
+```
+
+A traversal with `max_hops: 3` exceeds the contract bound.
+
+**Error data:**
+
+```json
+{
+  "code": "invalid_request",
+  "message": "max_hops must be less than or equal to 2",
+  "retry": "never",
+  "phase": "read",
+  "diagnostics": [],
+  "causes": []
+}
+```
+
+`nodes` lists the syntax regions covering one position, outermost first. Each identity carries
+the witness a later
+[`replace_node`](#tool-replace_node) verifies.
+
+Each result carries a [`ReadSnapshot`](/docs/draft/protocol/reference#ReadSnapshot) identifying
+its project tree and source catalog. `search` and `get_symbol` also identify the index revision
+they used. Coverage lists provider fact revisions in merge precedence order and marks a revision
+stale when its tree or source-catalog input no longer matches.
+
+Every read accepts an optional `projection` and reads the workspace tree when it is absent.
+[`rift://fs`](#resource-fs) serves file bytes and directory listings to consumers without host
+filesystem tools.
+
+## Resources
+
+Resources expose workspace state to consumers such as a UI. They carry data shaped for paging:
 
 | Resource | Content |
 | --- | --- |
-| [`rift://workspace{?cursor}`](#resource-workspace) | projection state, per-language capabilities, limits, and hooks |
-| [`rift://projection`](#resource-projection) | the projection's path on disk, and the workspace it came from |
-| [`rift://changes{?cursor}`](#resource-changes) | every change this session applied, with its evidence |
-| [`rift://fs{/path}{?start,length,cursor}`](#resource-fs) | a directory's entries — subdirectories and files — or a bounded range of file bytes |
-| [`rift://symbol/{language}/{name}{?cursor}`](#resource-symbol) | one symbol, its nodes, its edges, its diagnostics |
-| [`rift://actions/{address}{?only,cursor}`](#resource-actions) | the actions an adapter offers at one address |
-| [`rift://action/{token}`](#resource-action) | one action and the JSON Schema of its arguments |
+| [`rift://workspace{?cursor}`](#resource-workspace) | source catalog, per-language providers, limits, and hooks |
+| [`rift://projection/{id}`](#resource-projection) | one projection's path on disk and its state |
+| [`rift://changes{?projection,cursor}`](#resource-changes) | one changeset, each change with its evidence |
+| [`rift://fs{/path}{?start,length,cursor}`](#resource-fs) | a directory's entries, or a bounded range of file bytes |
 
-The split between the last two is about page size. A listing can hold many offers and each offer's
-argument schema is large, so the listing leaves the schema out and you fetch it for the one action
-you picked. An `{address}` is `symbol/{language}/{name}`, `node/{language}/{path}@{start}-{end}`,
-`match/{token}`, or `file/{path}` — the file form lists every action across one file.
+[`projection_create`](#tool-projection_create) materializes the complete pinned directory.
+Reading `rift://projection/{id}` returns its stable path and base revision. Before returning
+projection state or changes, the server reconciles direct filesystem writes against the
+projection manifest, so a shell write appears in the same changeset as a server-applied change.
 
-`rift://projection` is the one read with a side effect: it materializes a clean projection,
-because the tool you're about to point at that path may write, and those writes belong in the
-changeset rather than in your files.
+Paginated answers stop before `max_response_bytes` and return a cursor. A file-range read instead
+continues by byte offset; the payload's `digest` detects a file change and requires a restart from
+offset zero.
 
-Paginated answers stop before `max_response_bytes` and hand back a cursor — except a file-range
-read, which continues by offset: the next request starts where the previous page ended, and the
-payload's `digest` says whether the file changed underneath the read, restarting the range at
-zero when it does. A cursor is bound to the request that minted it — same state, same order, same
-page size — and a mismatch is `cursor_invalid`: start over from the first page. The server keeps
-`max_active_cursors` captured sets per connection, evicting the least recently read; a page
-requested after eviction comes back as `cursor_expired` rather than a quietly different answer,
-so interleaving more paginations than the advertised limit is what costs you a restart.
+The workspace resource pages through [`SourceUnit`](/docs/draft/protocol/reference#SourceUnit)
+records from its captured source catalog. Each unit identifies its owner, package, source kind,
+language, and content digest; resolver summaries explain which discovery revisions produced that
+catalog.
+
+Every cursor binds the request, order, and page size that produced it. A mismatch returns
+`cursor_invalid`.
+
+`get_symbol` and `search` retain complete result captures. `max_capture_items` and
+`max_capture_bytes` bound one capture, while `max_active_cursors` and
+`max_retained_capture_bytes` bound the workspace cache. The server evicts the oldest capture
+first; a page requested after eviction or process restart returns `cursor_expired`.
 
 ## Changes
 
-[`edit`](#tool-edit), [`patch`](#tool-patch), [`rewrite`](#tool-rewrite),
-[`rename`](#tool-rename), [`move`](#tool-move), [`delete`](#tool-delete),
-[`change_signature`](#tool-change_signature) and [`apply`](#tool-apply) all change the projection,
-and all return the same `ChangeResult`. A request whose shape is wrong — an absolute
-path, overlapping spans, a malformed patch header — fails as `invalid_request` before Rift
-resolves anything. Otherwise Rift resolves the whole operation before writing anything, and the
-result is one of two things.
+[`replace_symbol`](#tool-replace_symbol) and [`insert_symbol`](#tool-insert_symbol) operate on
+whole declarations addressed by symbol. The parser derives their spans, so the caller supplies no
+offsets.
 
-**Refused**, when resolution produced no edits. The projection is untouched and
-[`RefusalReason`](/docs/draft/protocol/reference#RefusalReason) says
-what stopped it: the address hit several targets, a `rewrite` matched outside its cardinality, no
-adapter implements the operation for that language, the offer carries a portable argument contract
-and resolves through its own tool. A request whose shape was fine but whose bytes moved — patch
-context that no longer matches, a create over an existing path — refuses carrying the failed
-precondition. A `patch` whose context moved shows the shape:
+[`replace_node`](#tool-replace_node) reaches below a declaration through a witnessed node
+address. [`patch`](#tool-patch) expresses scattered hunks and file-level changes through a unified
+diff guarded by its context lines.
+
+All of them return the same `ChangeResult`. A request whose shape is wrong — an absolute path,
+a malformed patch header — fails as `invalid_request` before the server resolves anything.
+Otherwise the server resolves the whole operation before writing anything, and the result is one
+of two things.
+
+**Refused**, when resolution produced no edits. The targeted tree is untouched and
+[`RefusalReason`](/docs/draft/protocol/reference#RefusalReason) says what stopped it: the
+address hit several targets, or a witness or patch context no longer matches the bytes. A
+`replace_node` whose listing went stale shows the shape:
 
 **Request:**
 
 ```json
 {
-  "formatting": "preserve",
-  "patch": "--- a/src/config.ts\n+++ b/src/config.ts\n@@ -12,3 +12,3 @@\n export const defaults = {\n-  retries: 3,\n+  retries: 5,\n };\n"
+  "node": "rift://node/python/src/config.py@1204-1266#3f9a1c2e",
+  "body": "retries = 5"
 }
 ```
 
@@ -129,10 +281,12 @@ precondition. A `patch` whose context moved shows the shape:
       "kind": "source_unchanged",
       "status": "failed",
       "verifier": { "kind": "rift" },
-      "addresses": [],
-      "paths": ["src/config.ts"],
-      "expected": { "kind": "text", "value": "  retries: 3," },
-      "observed": { "kind": "text", "value": "  retries: 4," },
+      "addresses": [
+        { "kind": "node", "node": "rift://node/python/src/config.py@1204-1266#3f9a1c2e" }
+      ],
+      "paths": ["src/config.py"],
+      "expected": { "kind": "text", "value": "3f9a1c2e" },
+      "observed": { "kind": "text", "value": "b81d02aa" },
       "diagnostics": []
     }
   ],
@@ -141,91 +295,105 @@ precondition. A `patch` whose context moved shows the shape:
 }
 ```
 
-**Applied**, when it produced edits. The change lands and gets an id in the changeset, along with
-its edits, its semantic effects, its guarantee evidence, its diagnostics, its validation, and its
-confirmations, where an adapter or hook wouldn't vouch for the result. Validation strength
-climbs from `mechanical` (no adapter report) through `available` (every advertising adapter
-reported) to `required` (every language the policy names reported). An unvalidated change is still
-a change you can read, run tests against, and either keep or restore.
+**Applied**, when it produced edits. The change lands in the targeted tree and gets an id in
+that tree's changeset, along with its origin, changed paths, edits, effects, guarantee evidence,
+diagnostics, and its [`Advisory`](/docs/draft/protocol/reference#Advisory) list. An advisory
+rides the result rather than waiting behind a separate read, because the result is the one
+payload the caller is guaranteed to look at: a checked advisory reports a verdict the emitter
+verified itself, and an open warning carries the instruction — the check to run — that settles
+it.
 
-[`projection_restore`](#tool-projection_restore) refreshes selected changed paths from the
-workspace and drops the changes that
-touched them; naming no paths restores all of them. A change is dropped whole — naming one of its
-paths restores every path it touched, because restoring one path of a change without the others
-would leave a change record that no longer describes the tree.
+A change that names no `projection` writes the workspace tree, and there is nothing further to
+settle: the confirmations list stays empty, and the advisories are the caller's to act on. A
+change into a projection carries its open warnings forward as confirmations, which is what
+[`publish`](#tool-publish) checks.
 
-## Publication
+## Projections
 
-[`publish`](#tool-publish) takes the list of change ids whose confirmations you accept, and
-writes nothing unless it can write everything:
+| Tool | What it does |
+| --- | --- |
+| [`projection_create`](#tool-projection_create) | materializes a pinned workspace snapshot |
+| [`projection_list`](#tool-projection_list) | lists projections and the state of each |
+| [`projection_remove`](#tool-projection_remove) | deletes one projection, unpublished changes included |
+| [`projection_restore`](#tool-projection_restore) | refreshes changed paths from the workspace |
+| [`publish`](#tool-publish) | writes one projection's changes into the workspace |
 
-- a change carrying a confirmation you didn't accept comes back in `unaccepted`
-- a path this projection changed that the workspace changed too comes back in `conflicts`
+`publish` takes the list of change ids whose confirmations the caller accepts, and writes
+nothing unless it can write everything:
 
-A `publish` that lost the race to a workspace edit:
+- a change carrying a confirmation the call didn't accept comes back in `unaccepted`
+- a path the projection changed that the workspace changed too comes back in `conflicts`
+- a file returned by a projection read that the workspace changed comes back in
+  `dependency_conflicts`
 
-**Request:**
+Before those checks, the server compares the directory against its manifest. A process-written delta
+becomes one `filesystem` change with exact `paths`, current provider and hook evidence, and an
+`external` confirmation. If this scan discovers new writes, their ids return in `unaccepted`;
+the caller reads `rift://changes` and retries after reviewing them.
 
-```json
-{ "accept": ["chg_k2mq4vx6ntbwpj3rfd6a2zcyhe"] }
-```
+Projection-scoped `get_symbol`, `search`, and `nodes` calls record exact returned files and their
+digests. `publish` checks those read dependencies even when the projection did not change them.
+This prevents a change to `src/app.py` from landing after the declaration it read from
+`src/config.py` moved in the workspace.
 
-**Response:**
+`max_projection_dependencies` and `max_projection_dependency_bytes` bound this read set. A read
+that would cross either limit fails before returning its data.
 
-```json
-{
-  "state": { "dirty": true, "unaccepted": false },
-  "conflicts": ["src/config.ts"],
-  "unaccepted": []
-}
-```
+Each [`DependencyConflict`](/docs/draft/protocol/reference#DependencyConflict) carries `path`,
+`observed`, and `current`. The caller can reread and revise its work, or pass that exact object in
+`accept_dependencies`. An acceptance with an older `current` digest does not match after another
+workspace edit and remains in `dependency_conflicts`.
 
-Either way both trees are left as they were. Publication is serialized workspace-wide, so a
-`publish` that can't take the workspace inside the call budget fails with
-`temporarily_unavailable` and is worth sending again once the holder finishes.
+An empty search has no returned file to record. Reads performed directly against the projection
+directory also bypass the read set. A caller whose work depends on either result reads again
+before publishing.
 
-Reconciling a conflict happens where both trees live — on your disk: the workspace's copy sits
-at its real path, the projection's beside it under `.rift/projections`, so diff the two, re-apply
-what survives as an `edit`, and publish again. On success Rift writes every changed path, removes
-directories its deletions left empty — the workspace root excluded — refreshes the projection
-from the workspace, and empties the changeset.
+For every refusal, the server leaves both trees unchanged. Publication is serialized
+workspace-wide, so a `publish` that cannot take the workspace inside the call budget fails with
+`temporarily_unavailable` and is worth sending again once the holder finishes. On success the server
+writes every changed path, removes directories its deletions left empty — the workspace root
+excluded — rebuilds the pinned projection from the resulting workspace, advances its base
+revision, and clears its changeset and read dependencies.
+
+`projection_restore` goes the other way: it refreshes selected changed paths from the workspace
+and drops the changes that touched them. A change is dropped whole — naming one of its paths
+restores every path it touched, because restoring one path of a change without the others would
+leave a change record that no longer describes the tree. Restored paths take their new conflict
+baseline from the current workspace; other paths retain their earlier baselines.
 
 ## Execution
 
-[`execute`](#tool-execute) evaluates a block of code in a disposable copy of the projection, so
-what it writes in place is thrown away — the projection is the scratchpad your changes live in,
-and the copy keeps evaluated code from editing it by accident. The copy is disposal, not a
-sandbox: the code runs with your permissions.
+[`execute`](#tool-execute) evaluates a block of code in the targeted tree's execution copy. The
+copy persists between calls — a dependency one evaluation installs is still there for the next —
+and the server refreshes its visible files to match the targeted tree before each evaluation, so
+the code always runs against the tree as it stands.
 
-[`debug_start`](#tool-debug_start), [`debug_get_frame`](#tool-debug_get_frame) and
-[`debug_stop`](#tool-debug_stop) do the same for a failed evaluation, holding its stack frames
-for inspection until you stop the session or the idle timeout does. An edit doesn't end them —
-the frames pin the adapter state they failed on, and later changes open a new one — but a server
-restart does, because frames live in adapter memory.
+Writes addressed inside the execution directory stay there and are not synchronized into the
+targeted tree. The execution directory is not a sandbox; the runtime uses the server's OS
+permissions, so an absolute path can reach outside it.
 
-A workspace already at `max_concurrent` evaluations or `max_debug_sessions` debuggers refuses with
-`temporarily_unavailable` — nothing about the request is too big, you're waiting for a slot, and
-`debug_stop` or the idle timeout frees one.
+A workspace already at `max_concurrent` evaluations returns `temporarily_unavailable`. The
+caller may send the same request after an evaluation slot becomes free.
 
-Both need `rift.toml` to allow the language and the adapter to advertise the operation. The
-`rift://workspace` resource reports what survives that intersection; a call that outruns a stale
-read of it comes back as `capability_unavailable`, and reading the resource again shows what
-changed.
+`execute` needs `rift.toml` to allow the language and a runtime to serve it. The
+[`rift://workspace`](#resource-workspace) resource reports what survives that intersection; a
+call that outruns a stale read of it comes back as `capability_unavailable`, and reading the
+resource again shows what changed.
 
 ## Errors
 
-A refusal is a normal tool result — Rift understood you and declined. `ErrorData` is for the call
-itself failing: a request that doesn't fit the schema, an expired cursor, an adapter that isn't
-running, a limit crossed, a timeout, a storage failure.
+A refusal is a normal tool result: the server understood the operation and declined to change the
+tree. `ErrorData` reports request and infrastructure failures such as invalid input, an expired
+cursor, a crossed limit, a timeout, or a storage failure.
 
 Every one carries a `retry` directive, which is the field to branch on — it rides each error
 instance rather than the code, because the same `storage_failure` can be transient once and
 permanent the next time:
 
 - `never` — the same bytes will fail the same way
-- `same_request` — it was transient: an adapter still starting, a projection with a filesystem
+- `same_request` — it was transient: an index still filling, a tree with a filesystem
   write in flight
-- `operator_action` — nothing will work until someone fixes the workspace, usually `rift.toml`
+- `operator_action` — the workspace requires a local state or configuration change before retry
 
 A `limit_exceeded` also carries which limit and by how much, so a request can be resized without
 parsing the message meant for a human.

@@ -2,40 +2,39 @@
 title: Protocol
 ---
 
-We've split the protocol definition into separate, logically aligned blocks:
+Rift publishes one generated contract through these definitions:
 
-- [Core model](/docs/draft/protocol/core) — logical entities used by both MCP and adapters
+- [Core model](/docs/draft/protocol/core) — source discovery, identities, provider facts, and
+  changes shared by protocol surfaces
 - [MCP](/docs/draft/protocol/mcp) — the tools and resources an agent calls
-- [Adapter](/docs/draft/protocol/adapter) — the protocol between the Rift server and a language
-  toolchain
 - [SCIP](/docs/draft/protocol/scip) — a read-only export for tools that consume SCIP indexes
 
-Each block is generated from the Pydantic models under `protocol/src/rift/models`, so the JSON
-Schema, the Protobuf files and the [reference](/docs/draft/protocol/reference) can't drift apart. The
-reference is authoritative for fields, enums and wire numbers; the pages here explain what the
-fields are for.
+Pydantic models under `protocol/src/rift/models` generate JSON Schema, Protobuf, and the
+[reference](/docs/draft/protocol/reference). Generated artifacts settle fields, enums, and wire
+numbers; these pages explain their mechanisms.
 
-## What a session does
+## How a request finds its target
 
-Your agent's `rift mcp` starts or finds the server for its workspace and opens `Connect`, which
-returns a session and the state of that session's projection. Everything after that reads or
-changes the projection, and [`publish`](/docs/draft/protocol/mcp#tool-publish) is what carries
-the result into your files.
+An agent's `rift mcp` reads the workspace's
+[`ServerLock`](/docs/draft/protocol/reference#ServerLock) — or starts the server that writes
+it — and forwards MCP to the endpoint it names. Calls do not open connection-scoped sessions.
+Each call names a [projection](/docs/draft/protocol/mcp#projections), or the workspace tree by
+omitting one, and carries any witnessed address it uses.
 
-There's no concurrency token anywhere in this. A session admits one live connection, so there's one
-MCP writer per projection, and the place where two writers can genuinely collide is the workspace —
-which `publish` checks directly by comparing the paths it's about to write.
+Cursors refer to process-local captured results. Projections retain changes and read dependencies
+across calls.
+
+Node addresses carry content witnesses, so a stale write refuses before replacing moved bytes.
+When two projections change the same workspace path,
+[`publish`](/docs/draft/protocol/mcp#tool-publish) checks directly by comparing the paths it's
+about to write.
 
 ## Versioning
 
-The protocol is versioned by date, the way [MCP versions its own
-specification](https://modelcontextprotocol.io/specification/): an identifier is a release date,
-`YYYY-MM-DD`. A version is a complete snapshot of the generated contract — a peer implements
-whole versions, never parts, so there's no minor number and nothing to intersect: naming the
-version names everything the peer can decode. No version has been released yet; this draft
-tracks the contract as it is written, and the first release cuts the first dated version.
+Rift uses [MCP's protocol versioning](https://modelcontextprotocol.io/specification/draft/basic/versioning)
+without adding another version field. The MCP client carries standard MCP version metadata; Rift
+tool arguments contain only arguments declared by each tool's input schema.
 
-`Connect` declares the versions the caller implements, in preference order, and the server
-answers each attempt independently: it accepts one of them — `Connected` names which — or rejects
-with `unsupported_protocol` whose `protocol` evidence lists the versions the server supports. The
-caller picks one it implements and reconnects, or surfaces the mismatch.
+The server advertises its current tool and resource schemas through MCP. Dated snapshots under
+`protocol/versions` freeze released Rift contracts for implementers and generated clients; callers
+do not select a snapshot on each request.

@@ -23,7 +23,8 @@ export function McpReference({ version }: { version: DocVersion }): ReactNode {
         Tools
       </h2>
       <p>
-        Source-discovery tools read the current session projection and report the head they used.
+        Read tools target the workspace unless their input names a projection. Results report the
+        snapshot they used.
       </p>
 
       {mcpToolGroups.map((group) => (
@@ -55,7 +56,7 @@ export function McpReference({ version }: { version: DocVersion }): ReactNode {
       <h2 id="resources" className="scroll-m-28">
         Resources
       </h2>
-      <p>Read a resource by URI. Each read uses the current session projection.</p>
+      <p>Each resource URI identifies its workspace or projection scope.</p>
 
       {mcpResources.map((resource) => (
         <section key={resource.name}>
