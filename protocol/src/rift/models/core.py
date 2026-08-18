@@ -29,9 +29,7 @@ def validate_base64url(value: str) -> None:
     examples=["2026-08-04"],
 )
 class ProtocolVersion(ProtocolRoot):
-    """One protocol version, named by its release date as `YYYY-MM-DD`. A version is a
-    complete snapshot of the generated contract, so a peer implements whole versions, never
-    parts, and there is no minor number."""
+    """One released contract snapshot, named by its release date as `YYYY-MM-DD`."""
 
 
 @scalar(
@@ -41,28 +39,45 @@ class ProtocolVersion(ProtocolRoot):
     pattern="^[0-9a-f]{64}$",
 )
 class Digest(ProtocolRoot):
-    """SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes the algorithm so Rift and its adapters produce the same identity for the same bytes."""
+    """SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes the algorithm so every consumer produces the same identity for the same bytes."""
 
 
 @scalar(
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^ses_[a-z2-7]{26}$",
+    pattern=r"^[a-z][a-z0-9_.-]{0,127}$",
+    examples=["rift.syntax", "rift.history"],
 )
-class SessionId(ProtocolRoot):
-    """Random 128-bit identity of one persistent session projection. The server admits at most
-    one live MCP connection for the identity."""
+class ProviderId(ProtocolRoot):
+    """Stable identity of one provider implementation. The identity remains unchanged across
+    provider restarts and fact revisions, so callers can compare provenance from separate
+    answers."""
+
+
+@scalar(
+    owner=CORE,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://projection/prj_[a-z2-7]{26}$",
+    examples=["rift://projection/prj_bbbbbbbbbbbbbbbbbbbbbbbbbb"],
+)
+class ProjectionId(ProtocolRoot):
+    """Identity of one projection, and the URI that resolves it. The server mints it when
+    `projection_create` materializes the projection and retires it when `projection_remove`
+    deletes the directory. A change request that omits its `projection` field applies to the
+    workspace tree itself."""
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class ProjectionState(ClosedModel):
-    """Summary of the session projection. The changed paths and the changes that produced them
+    """Summary of one projection. The changed paths and the changes that produced them
     are read from the changes resource, which pages; both fields here are booleans a caller can
     branch on without that read."""
 
     dirty: Field[bool] = proto_field(
-        description="Whether the projection holds anything the workspace does not.", number=3
+        description="Whether the projection holds anything the workspace does not.",
+        number=3,
     )
     unaccepted: Field[bool] = proto_field(
         description=(
@@ -99,7 +114,7 @@ class LanguageRegion(ClosedModel):
     ],
 )
 class FileId(ProtocolRoot):
-    """Identity of one file in the session projection. The path after `rift://file/` is a
+    """Identity of one file in the tree a request targets. The path after `rift://file/` is a
     `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path
     wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
     whatever schema its implementation generated from."""
@@ -169,7 +184,7 @@ class FileContent(ProtocolRoot):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class File(ClosedModel):
-    "One file in the session projection and the languages that read it."
+    "One file and the languages that read it."
 
     model_config = closed_config(
         {
@@ -201,9 +216,8 @@ class File(ClosedModel):
     )
     languages: Field[list[Language]] = proto_field(
         description=(
-            "Distinct `Language` values in `regions`, sorted by name and dialect. This "
-            "physical owner advertises embedded "
-            "languages even when another adapter consumes generated source."
+            "Distinct `Language` values in `regions`, sorted by name and dialect. A file "
+            "holding embedded languages advertises each of them."
         ),
         examples=[["svelte", "typescript", "css"]],
         number=3,
@@ -220,7 +234,7 @@ class File(ClosedModel):
     semantic: Field[bool] = proto_field(
         description=(
             "Whether Rift produced facts from this file. False where there is nothing to "
-            "read, and where no adapter claims the path."
+            "read, and where no provider claims the path."
         ),
         number=5,
     )
@@ -257,23 +271,28 @@ class ProjectEntryFile(ClosedModel):
     ),
 )
 class ProjectEntry(ProtocolRoot):
-    "One visible directory or file in the session projection. Visible means below the workspace root, outside `.rift`, and not excluded by the workspace's VCS ignore rules; a symlink is listed and never followed. Visibility governs reads — publication carries every changed path, visible or not."
+    "One visible directory or file. Visible means below the workspace root, outside `.rift`, and not excluded by the workspace's VCS ignore rules; a symlink is listed and never followed. Visibility governs reads and unjournaled filesystem reconciliation. Publication retains exact paths already recorded by a Rift change even if ignore rules later hide them."
 
 
 @scalar(
     owner=CORE,
     proto=ProtoFieldDescriptor.TYPE_STRING,
     root=str,
-    pattern=r"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\d+-\d+$",
-    min_length=18,
+    pattern=r"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\d+-\d+#[0-9a-f]{8}$",
+    min_length=27,
     max_length=8192,
     examples=[
-        "rift://node/python/pkg/util.py@1204-1266",
-        "rift://node/sql:postgresql/db/schema.sql@40-88",
+        "rift://node/python/pkg/util.py@1204-1266#3f9a1c2e",
+        "rift://node/sql:postgresql/db/schema.sql@40-88#a01b23cd",
     ],
 )
 class NodeId(ProtocolRoot):
-    """Identity of one syntax-tree node in the session projection."""
+    """Identity of one syntax-tree node. The byte range locates the node in the tree the
+    request targets; the fragment after `#` is its witness — the first eight lowercase hex
+    characters of the SHA-256 of the node's source bytes. Resolution recomputes the witness
+    before acting on the address and refuses with a failed `source_unchanged` precondition
+    when the bytes have drifted, so an address read from a stale listing cannot splice into
+    the wrong code."""
 
     @model_validator(mode="after")
     def span_is_canonical(self) -> NodeId:
@@ -281,9 +300,9 @@ class NodeId(ProtocolRoot):
         _language, separator, encoded_span = address.partition("/")
         if not separator:
             raise ValueError("node identity requires a language and path")
-        match = re.fullmatch(r"(.+)@([0-9]+)-([0-9]+)", encoded_span)
+        match = re.fullmatch(r"(.+)@([0-9]+)-([0-9]+)#[0-9a-f]{8}", encoded_span)
         if match is None:
-            raise ValueError("node identity requires a byte range")
+            raise ValueError("node identity requires a byte range and witness")
         encoded_path, start_text, end_text = match.groups()
         decoded_path = unquote_to_bytes(encoded_path).decode("utf-8")
         ProjectPath.model_validate(decoded_path)
@@ -314,11 +333,12 @@ class NodeId(ProtocolRoot):
     ],
 )
 class SymbolId(ProtocolRoot):
-    """Identity of one symbol in the session projection. The name after the language is the
-    adapter's stable qualified name for the declaration; where the language derives module
-    identity from the file path, as TypeScript does, that path is part of the name. A `~N`
-    suffix separates declarations the qualified name alone cannot, such as overloads that
-    dispatch separately."""
+    """Identity of one symbol. The name after the language is the provider's stable qualified
+    name for the declaration; where the language derives module identity from the file path,
+    as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    change the identity when the language includes module path in that qualified name; history
+    correlation records the declaration across that change."""
 
     @model_validator(mode="after")
     def address_is_canonical(self) -> SymbolId:
@@ -335,8 +355,8 @@ class SymbolId(ProtocolRoot):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class Language(ClosedModel):
-    """A language name and its optional dialect. The pair selects at most one configured
-    adapter process in a workspace; that process can serve many adapter states."""
+    """A language name and its optional dialect. The pair is the identity facts are filed
+    under, so `sql` and `sql:postgresql` are two languages with two symbol spaces."""
 
     name: Field[str] = proto_field(
         description=(
@@ -398,7 +418,7 @@ class ExtensionKey(ProtocolRoot):
     placement=Placement("entries", 1),
 )
 class Extensions(ProtocolRoot):
-    """Facts an adapter carries that the model has no field for, under a reverse-domain key. Keys and values use RFC 8785 canonical JSON. `Capabilities.extension_values` advertises every key and version, and consumers skip entries they do not implement."""
+    """Facts a provider carries that the model has no field for, under a reverse-domain key. Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not implement."""
 
 
 @scalar(
@@ -454,7 +474,7 @@ class PathSelector(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class TextRange(ClosedModel):
-    "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every adapter converts from whatever its language toolchain counts in before offsets leave the adapter, so a rustc column and a tsc column arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead."
+    "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts from whatever its toolchain counts in at its own boundary, so two toolchains' column numbers arrive here on the same scale. No JSON Schema keyword can tie one field to another, so that `end` is never below `start` is asserted by the conformance tests instead."
 
     start: Field[int] = proto_field(
         description="First byte of the range, counted from the start of the file.",
@@ -488,15 +508,15 @@ class TextRange(ClosedModel):
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "error": "Code the adapter would not accept. Facts read from around it may be missing.",
-            "warning": "Code that compiles and the adapter judges wrong anyway.",
+            "error": "Code the provider would not accept. Facts read from around it may be missing.",
+            "warning": "Code that parses and the provider judges wrong anyway.",
             "info": "Something worth knowing that is not a defect.",
-            "hint": "A suggestion. An adapter action resolves it where one is offered.",
+            "hint": "A suggestion.",
         }
     },
 )
 class Severity(str, Enum):
-    "How much a `Diagnostic` matters, in the adapter's own judgement. Adapters map their toolchain's own levels onto these four, so a caller can drop everything below `warning` without knowing which language produced it."
+    "How much a `Diagnostic` matters, in the provider's own judgement. Providers map their toolchain's own levels onto these four, so a caller can drop everything below `warning` without knowing which language produced it."
 
     ERROR = "error"
     WARNING = "warning"
@@ -514,6 +534,296 @@ class SourceSpan(ClosedModel):
     range: Field[TextRange] = proto_field(
         description="The bytes, as offsets into that file.", number=2
     )
+
+
+@scalar(
+    owner=CORE,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^rift://source/src_[a-z2-7]{26}$",
+    examples=["rift://source/src_bbbbbbbbbbbbbbbbbbbbbbbbbb"],
+)
+class SourceUnitId(ProtocolRoot):
+    """Stable identity of one source unit in the source catalog. Rift derives it from the
+    resolver identity and that resolver's canonical unit key, so the same installed source
+    keeps its identity across catalog revisions."""
+
+
+@scalar(
+    owner=CORE,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^[a-z][a-z0-9_.-]{0,127}$",
+    examples=["rift.sources.project", "rift.sources.cargo"],
+)
+class SourceResolverId(ProtocolRoot):
+    """Stable identity of one source resolver. It identifies catalog revisions independently
+    from fact-provider revisions."""
+
+
+@scalar(
+    owner=CORE,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^(?!/)(?!\.\.?(/|$))(?!.*(/\.\.?)(/|$))[^\\\u0000-\u001F\u007F]+$",
+    max_length=4096,
+    examples=["src/lib.rs", "pydantic/main.py"],
+)
+class SourcePath(ProtocolRoot):
+    """Path relative to the source location that owns the unit. It never addresses the host
+    filesystem directly."""
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class PackageIdentity(ClosedModel):
+    """One package as its package manager identifies it."""
+
+    manager: Field[str] = proto_field(
+        description="Package manager or ecosystem name.",
+        examples=["cargo", "npm", "pypi"],
+        max_length=128,
+        number=1,
+    )
+    name: Field[str] = proto_field(
+        description="Package name in that ecosystem.",
+        examples=["serde", "zod", "pydantic"],
+        max_length=4096,
+        number=2,
+    )
+    version: Field[str] = proto_field(
+        description="Resolved package version.",
+        examples=["1.0.197", "3.22.4", "2.8.2"],
+        max_length=4096,
+        number=3,
+    )
+
+
+@definition(
+    owner=CORE,
+    public=True,
+    proto=Proto.enum(
+        "SourceLocationKind",
+        (
+            EnumValue("project", "SOURCE_LOCATION_PROJECT", 1),
+            EnumValue("dependency", "SOURCE_LOCATION_DEPENDENCY", 2),
+            EnumValue("stdlib", "SOURCE_LOCATION_STDLIB", 3),
+            EnumValue("external", "SOURCE_LOCATION_EXTERNAL", 4),
+        ),
+        named=True,
+    ),
+    schema_extra={
+        "rift:enumDescriptions": {
+            "project": "Source owned by the current workspace, optionally within one local package.",
+            "dependency": "Source owned by one resolved dependency.",
+            "stdlib": "Source installed with the language toolchain.",
+            "external": "Source outside the project, dependency graph, and standard library.",
+        }
+    },
+)
+class SourceLocationKind(str, Enum):
+    """Which part of the source catalog owns a unit or declaration."""
+
+    PROJECT = "project"
+    DEPENDENCY = "dependency"
+    STDLIB = "stdlib"
+    EXTERNAL = "external"
+
+
+@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
+class SourceLocationProject(ClosedModel):
+    """Source owned by the current workspace."""
+
+    kind: Field[Literal["project"]] = proto_field()
+    package: Field[PackageIdentity | None] = proto_field(
+        default=None,
+        description="Local package that owns the source, or null when no package manifest assigns one.",
+        number=1,
+    )
+
+
+@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
+class SourceLocationDependency(ClosedModel):
+    """Source owned by one resolved dependency."""
+
+    kind: Field[Literal["dependency"]] = proto_field()
+    package: Field[PackageIdentity] = proto_field(
+        description="Resolved dependency that owns the source.", number=1
+    )
+
+
+@definition(owner=CORE, public=False, proto=Proto.empty(), schema_extra={})
+class SourceLocationStdlib(ClosedModel):
+    """Source installed with the language toolchain."""
+
+    kind: Field[Literal["stdlib"]] = proto_field()
+
+
+@definition(owner=CORE, public=False, proto=Proto.empty(), schema_extra={})
+class SourceLocationExternal(ClosedModel):
+    """Source outside the project, dependency graph, and standard library."""
+
+    kind: Field[Literal["external"]] = proto_field()
+
+
+@union(
+    owner=CORE,
+    oneof="variant",
+    discriminator="kind",
+    variants=(
+        Variant("project", "project", 1, SourceLocationProject),
+        Variant("dependency", "dependency", 2, SourceLocationDependency),
+        Variant("stdlib", "stdlib", 3, SourceLocationStdlib, ProtoEmpty),
+        Variant("external", "external", 4, SourceLocationExternal, ProtoEmpty),
+    ),
+)
+class SourceLocation(ProtocolRoot):
+    """Where source belongs. Package ownership is separate from whether source was authored
+    or generated."""
+
+
+@definition(
+    owner=CORE,
+    public=True,
+    proto=Proto.enum(
+        "SourceKind",
+        (
+            EnumValue("authored", "SOURCE_KIND_AUTHORED", 1),
+            EnumValue("generated", "SOURCE_KIND_GENERATED", 2),
+            EnumValue("synthetic", "SOURCE_KIND_SYNTHETIC", 3),
+        ),
+        named=True,
+    ),
+    schema_extra={
+        "rift:enumDescriptions": {
+            "authored": "Original source supplied to the language toolchain.",
+            "generated": "Source produced by a generator from other inputs.",
+            "synthetic": "Declaration invented by a provider, with no source unit.",
+        }
+    },
+)
+class SourceKind(str, Enum):
+    """How source or a declaration came to exist."""
+
+    AUTHORED = "authored"
+    GENERATED = "generated"
+    SYNTHETIC = "synthetic"
+
+
+@definition(
+    owner=CORE,
+    public=True,
+    proto=Proto.enum(
+        "SourceMappingPrecision",
+        (
+            EnumValue("exact", "SOURCE_MAPPING_EXACT", 1),
+            EnumValue("approximate", "SOURCE_MAPPING_APPROXIMATE", 2),
+            EnumValue("synthetic", "SOURCE_MAPPING_SYNTHETIC", 3),
+        ),
+        named=True,
+    ),
+    schema_extra={
+        "rift:enumDescriptions": {
+            "exact": "One byte-for-byte origin range.",
+            "approximate": "One or more contributing ranges without positional equivalence.",
+            "synthetic": "No source range produced these bytes.",
+        }
+    },
+)
+class SourceMappingPrecision(str, Enum):
+    """How precisely generated bytes map back to their inputs."""
+
+    EXACT = "exact"
+    APPROXIMATE = "approximate"
+    SYNTHETIC = "synthetic"
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class SourceUnitSpan(ClosedModel):
+    """One byte range in a source-catalog unit."""
+
+    unit: Field[SourceUnitId] = proto_field(
+        description="Source unit containing the bytes.", number=1
+    )
+    range: Field[TextRange] = proto_field(
+        description="Half-open UTF-8 byte range in that unit.", number=2
+    )
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class SourceMapping(ClosedModel):
+    """Mapping from one generated range to the source ranges that produced it."""
+
+    generated: Field[SourceUnitSpan] = proto_field(
+        description="Generated bytes being explained.", number=1
+    )
+    precision: Field[SourceMappingPrecision] = proto_field(
+        description="Relationship between generated bytes and their inputs.", number=2
+    )
+    originals: Field[list[SourceUnitSpan]] = proto_field(
+        description="Input ranges, in generator order.", number=3
+    )
+
+    @model_validator(mode="after")
+    def originals_match_precision(self) -> SourceMapping:
+        count = len(self.originals)
+        if self.precision is SourceMappingPrecision.EXACT and count != 1:
+            raise ValueError("exact source mapping requires one original")
+        if self.precision is SourceMappingPrecision.APPROXIMATE and count < 1:
+            raise ValueError("approximate source mapping requires an original")
+        if self.precision is SourceMappingPrecision.SYNTHETIC and count != 0:
+            raise ValueError("synthetic source mapping cannot carry originals")
+        return self
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class SourceUnit(ClosedModel):
+    """One readable unit discovered before analysis. Source resolvers classify units; fact
+    providers consume them without guessing package ownership or generated status."""
+
+    id: Field[SourceUnitId] = proto_field(
+        description="Stable source-catalog identity.", number=1
+    )
+    location: Field[SourceLocation] = proto_field(
+        description="Project, dependency, standard-library, or external ownership.", number=2
+    )
+    path: Field[SourcePath] = proto_field(
+        description="Path relative to that location.", number=3
+    )
+    source_kind: Field[SourceKind] = proto_field(
+        description="Whether this unit is authored or generated. A unit cannot be synthetic.",
+        number=4,
+    )
+    languages: Field[list[Language]] = proto_field(
+        description="Languages that analyze the unit, sorted by name and dialect.",
+        min_length=1,
+        number=5,
+        json_schema_extra={"uniqueItems": True},
+    )
+    digest: Field[Digest] = proto_field(
+        description="SHA-256 of the unit bytes.", number=6
+    )
+    generator: Field[str | None] = proto_field(
+        default=None,
+        description="Generator implementation or build step. Present only for generated units.",
+        max_length=4096,
+        number=7,
+    )
+    mappings: Field[list[SourceMapping]] = proto_field(
+        description="Mappings back to input units. Empty when the generator supplies none.",
+        number=8,
+    )
+
+    @model_validator(mode="after")
+    def generated_metadata_matches_kind(self) -> SourceUnit:
+        if self.source_kind is SourceKind.SYNTHETIC:
+            raise ValueError("synthetic declarations have no source unit")
+        if self.source_kind is SourceKind.AUTHORED and (
+            self.generator is not None or self.mappings
+        ):
+            raise ValueError("authored source cannot carry generated metadata")
+        if self.source_kind is SourceKind.GENERATED and self.generator is None:
+            raise ValueError("generated source requires its generator")
+        return self
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -630,65 +940,106 @@ class Edit(ProtocolRoot):
 
 @definition(
     owner=CORE,
-    public=False,
+    public=True,
     proto=Proto.enum(
-        "Precision",
+        "Freshness",
         (
-            EnumValue("exact", "PRECISION_EXACT", 1),
-            EnumValue("approximate", "PRECISION_APPROXIMATE", 2),
-            EnumValue("synthetic", "PRECISION_SYNTHETIC", 3),
+            EnumValue("current", "FRESHNESS_CURRENT", 1),
+            EnumValue("stale", "FRESHNESS_STALE", 2),
         ),
-        placement=Placement("precision", 2),
+        named=True,
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "exact": "One origin, byte for byte: an offset in the produced range maps back to an offset in the source arithmetically.",
-            "approximate": "One or more origins without a position inside them, as a macro expansion knows its source and cannot say which byte of it.",
-            "synthetic": "No origin. The generator invented these bytes, so there is nothing in the workspace to jump to.",
+            "current": "Derived state covers the input revisions captured by the answer.",
+            "stale": "Derived state covers an earlier input revision while its producer catches up.",
         }
     },
 )
-class OriginPrecision(str, Enum):
-    """How faithfully the origins locate the produced bytes."""
+class Freshness(str, Enum):
+    """Whether derived state covers the tree and source-catalog revisions carried by the answer."""
 
-    EXACT = "exact"
-    APPROXIMATE = "approximate"
-    SYNTHETIC = "synthetic"
+    CURRENT = "current"
+    STALE = "stale"
 
 
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class OriginMapping(ClosedModel):
-    """A relation from one produced source range to the source ranges that contributed its
-    bytes. It lets Rift project a finding on adapter input back to source a person can edit."""
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class ProviderProvenance(ClosedModel):
+    """The immutable provider state used for one fact-family answer. A provider publishes a
+    new `revision` only after it has finished deriving facts from one workspace tree and source
+    catalog revision."""
 
-    produced: Field[SourceSpan] = proto_field(
-        description="The produced bytes this relation explains.", number=3
+    provider: Field[ProviderId] = proto_field(
+        description="Stable identity of the provider that contributed facts.", number=1
     )
-    precision: Field[OriginPrecision] = proto_field(
-        description=(
-            "How faithfully `origins` locates the produced bytes: `exact` maps back "
-            "arithmetically, `approximate` names the source without a position inside it, "
-            "`synthetic` has nothing in the workspace to jump to."
-        ),
+    revision: Field[Digest] = proto_field(
+        description="SHA-256 identity of the immutable provider fact revision.",
         number=2,
     )
-    origins: Field[list[SourceSpan]] = proto_field(
+    tree_revision: Field[Digest] = proto_field(
+        description="Tree revision from which the provider derived this fact revision.",
+        number=3,
+    )
+    freshness: Field[Freshness] = proto_field(
+        description="Whether both input revisions equal the answer's captured revisions.",
+        number=4,
+    )
+    source_revision: Field[Digest] = proto_field(
+        description="Source-catalog revision from which the provider derived these facts.",
+        number=5,
+    )
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class IndexSnapshot(ClosedModel):
+    """The immutable search-index revision used for an answer."""
+
+    revision: Field[Digest] = proto_field(
+        description="SHA-256 identity of the index revision.", number=1
+    )
+    tree_revision: Field[Digest] = proto_field(
+        description="Tree revision indexed by this revision.", number=2
+    )
+    freshness: Field[Freshness] = proto_field(
+        description="Whether both indexed revisions equal the answer's captured revisions.",
+        number=3,
+    )
+    source_revision: Field[Digest] = proto_field(
+        description="Source-catalog revision indexed by this revision.", number=4
+    )
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class ReadSnapshot(ClosedModel):
+    """Immutable state captured for one read. Every page produced from one cursor carries the
+    same snapshot."""
+
+    tree_revision: Field[Digest] = proto_field(
         description=(
-            "The contributing source ranges: exactly one for `exact`, one or more for "
-            "`approximate`, none for `synthetic`."
+            "SHA-256 identity of the targeted tree when the read began. The digest covers "
+            "visible paths, entry kinds, executable bits, and contents."
         ),
         number=1,
     )
+    index: Field[IndexSnapshot | None] = proto_field(
+        default=None,
+        description="Search-index state used by the read, or null when the read did not use the index.",
+        number=2,
+    )
+    source_revision: Field[Digest] = proto_field(
+        description="Source-catalog revision captured for the read.", number=3
+    )
 
     @model_validator(mode="after")
-    def origins_match_precision(self) -> OriginMapping:
-        count = len(self.origins)
-        if self.precision is OriginPrecision.EXACT and count != 1:
-            raise ValueError("an exact mapping carries exactly one origin")
-        if self.precision is OriginPrecision.APPROXIMATE and count < 1:
-            raise ValueError("an approximate mapping carries at least one origin")
-        if self.precision is OriginPrecision.SYNTHETIC and count != 0:
-            raise ValueError("a synthetic mapping carries no origins")
+    def index_freshness_matches_tree(self) -> ReadSnapshot:
+        if self.index is None:
+            return self
+        same_inputs = (
+            self.index.tree_revision == self.tree_revision
+            and self.index.source_revision == self.source_revision
+        )
+        if same_inputs != (self.index.freshness is Freshness.CURRENT):
+            raise ValueError("index freshness must match its tree and source revisions")
         return self
 
 
@@ -708,12 +1059,12 @@ class OriginMapping(ClosedModel):
     schema_extra={
         "rift:enumDescriptions": {
             "request": (
-                "Only what this request asked for. The adapter answered the question put to it "
-                "and claims nothing past it."
+                "Only what this request asked for. The provider answered the question put to "
+                "it and claims nothing past it."
             ),
             "project": "Every file in the workspace, dependencies left out.",
             "dependencies": "Installed packages outside the workspace source.",
-            "all": "Everything the adapter could see: the workspace, its dependencies, and the standard library.",
+            "all": "Everything the provider could see: the workspace, its dependencies, and the standard library.",
         }
     },
 )
@@ -768,6 +1119,13 @@ class CoverageComplete(ClosedModel):
     scope: Field[CoverageScope] = proto_field(
         description="What the claim covers.", number=1
     )
+    provenance: Field[list[ProviderProvenance]] = proto_field(
+        description=(
+            "Provider revisions that contributed this family, in merge precedence order. "
+            "Empty only when Rift establishes coverage without a provider."
+        ),
+        number=4,
+    )
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
@@ -792,6 +1150,10 @@ class CoveragePartial(ClosedModel):
         max_length=4096,
         number=3,
     )
+    provenance: Field[list[ProviderProvenance]] = proto_field(
+        description="Provider revisions that contributed available facts, in merge precedence order.",
+        number=4,
+    )
 
 
 @definition(
@@ -808,14 +1170,14 @@ class CoveragePartial(ClosedModel):
     schema_extra={
         "rift:enumDescriptions": {
             "unsupported": (
-                "The adapter does not produce this family, though the language has the concept."
+                "The provider does not produce this family, though the language has the concept."
             ),
-            "not_applicable": "The language has no such concept because its adapter consumes only physical source.",
+            "not_applicable": "The language has no such concept.",
         }
     },
 )
 class CoverageStateState(str, Enum):
-    "`unsupported` — the adapter cannot produce this family at all. `not_applicable` — the family has no meaning for this language."
+    "`unsupported` — no provider produces this family for the language. `not_applicable` — the family has no meaning for this language."
 
     UNSUPPORTED = "unsupported"
     NOT_APPLICABLE = "not_applicable"
@@ -827,8 +1189,8 @@ class CoverageState(ClosedModel):
 
     state: Field[CoverageStateState] = proto_field(
         description=(
-            "`unsupported` — the adapter cannot produce this family at all. `not_applicable` "
-            "— the family has no meaning for this language."
+            "`unsupported` — no provider produces this family for the language. "
+            "`not_applicable` — the family has no meaning for this language."
         ),
         number=1,
     )
@@ -837,11 +1199,18 @@ class CoverageState(ClosedModel):
     )
     reason: Field[str] = proto_field(
         description=(
-            "Which of the two this is, in words: the feature the adapter lacks, or the "
+            "Which of the two this is, in words: the feature no provider has, or the "
             "concept the language lacks."
         ),
         max_length=4096,
         number=3,
+    )
+    provenance: Field[list[ProviderProvenance]] = proto_field(
+        description=(
+            "Provider revisions consulted before reaching this state. Empty for "
+            "`unsupported` and `not_applicable`."
+        ),
+        number=4,
     )
 
 
@@ -855,7 +1224,7 @@ class CoverageState(ClosedModel):
     ),
 )
 class Coverage(ProtocolRoot):
-    "How much of one `FactFamily` an answer actually covers. Absence of a fact means the fact does not exist only where the state is `complete`; anywhere else it means Rift did not get that far."
+    "How much of one fact family or indexed result an answer covers. Absence proves that no matching fact exists only where the state is `complete`."
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -863,7 +1232,7 @@ class TypeExpression(ClosedModel):
     "How a type is written in the source, plus the symbol that declares it when one does. A type with a declaration resolves to that symbol; a structural type — `string | null`, `{ a: string }` — has the spelling and nothing to resolve to."
 
     language: Field[Language] = proto_field(
-        description="The language the spelling is in, and so the adapter that produced it.",
+        description="The language the spelling is in, and so which provider produced it.",
         number=1,
     )
     source: Field[str] = proto_field(
@@ -878,7 +1247,7 @@ class TypeExpression(ClosedModel):
         number=3,
     )
     extensions: Field[Extensions] = proto_field(
-        description="Type facts the model has no field for, namespaced by the adapter that emitted them.",
+        description="Type facts the model has no field for, namespaced by the provider that emitted them.",
         number=4,
     )
 
@@ -953,7 +1322,7 @@ class TypeBindingRole(str, Enum):
     schema_extra={
         "rift:enumDescriptions": {
             "declared": "Written in the source by the author.",
-            "inferred": "The adapter worked it out; nothing in the source says it.",
+            "inferred": "The provider worked it out; nothing in the source says it.",
             "expected": "What the surrounding context demands here. A mismatch is reported against this one.",
         }
     },
@@ -1055,7 +1424,7 @@ class Parameter(ClosedModel):
         number=6,
     )
     extensions: Field[Extensions] = proto_field(
-        description="Parameter facts the model has no field for, namespaced by the adapter that emitted them.",
+        description="Parameter facts the model has no field for, namespaced by the provider that emitted them.",
         number=7,
     )
 
@@ -1113,7 +1482,7 @@ class Signature(ClosedModel):
         number=9,
     )
     extensions: Field[Extensions] = proto_field(
-        description="Signature facts the model has no field for, namespaced by the adapter that emitted them.",
+        description="Signature facts the model has no field for, namespaced by the provider that emitted them.",
         number=10,
     )
 
@@ -1243,8 +1612,8 @@ class SignatureLink(ClosedModel):
             ),
             "public": (
                 "Reachable from outside the unit that declares it. `visibility` carries the "
-                "language's own word, which Go and Python do not have: there the adapter reads "
-                "the naming convention."
+                "language's own word, which Go and Python do not have: there the provider "
+                "reads the naming convention."
             ),
             "deprecated": (
                 "Marked as no longer to be used, however the language spells it — `@Deprecated`, "
@@ -1270,7 +1639,7 @@ class SignatureLink(ClosedModel):
     },
 )
 class SymbolFacet(str, Enum):
-    "One portable category a symbol falls into. Kinds are language-specific; facets are shared, so a filter written once applies to every language an adapter is installed for."
+    "One portable category a symbol falls into. Kinds are language-specific; facets are shared, so a filter written once applies to every served language."
 
     NAMESPACE = "namespace"
     MODULE = "module"
@@ -1312,7 +1681,7 @@ class SymbolFacet(str, Enum):
     examples=["create_table", "selector.class", "mapping.key"],
 )
 class ExactKind(ProtocolRoot):
-    """An adapter-local kind preserving the construct name used by that language implementation."""
+    """A provider-local kind preserving the construct name used by that language implementation."""
 
 
 @definition(
@@ -1357,25 +1726,23 @@ class ExactKind(ProtocolRoot):
             "argument": "A value as written at a call site.",
             "annotation": "Metadata attached to a declaration: a decorator, an attribute, a Java annotation.",
             "comment": (
-                "Text the adapter ignores. A doc comment carries this too; "
+                "Text the parser ignores. A doc comment carries this too; "
                 "`RegionRole.documentation` is what ties one to the declaration it describes."
             ),
             "identifier": "A name as written, whether it declares or refers.",
             "literal": "A value written straight into the source — `42`, `true`.",
             "pattern": "A destructuring or matching form: a `match` arm, a binding that pulls fields apart.",
             "generated": (
-                "Produced by a tool from something else in the workspace. Destructive policy "
-                "gates on this, because the next build overwrites whatever is written here."
+                "Produced by a tool from something else in the workspace. A change that "
+                "touches it carries a `generated_code` confirmation in a projection, because "
+                "the next build overwrites whatever is written here."
             ),
-            "test": (
-                "Part of the test suite. Refactor scope gates on this, so a change can be "
-                "confined to production code or carried across both."
-            ),
+            "test": "Part of the test suite, so a filter can keep test code in or out of an answer.",
         }
     },
 )
 class NodeFacet(str, Enum):
-    "Portable structural facets used by filters and policy. `generated` and `test` also constrain destructive operations, reference handling, and refactor scope."
+    "Portable structural facets, so a filter can ask for bodies or imports without knowing the grammar that produced them."
 
     DECLARATION = "declaration"
     DEFINITION = "definition"
@@ -1416,10 +1783,10 @@ class NodeFacet(str, Enum):
     schema_extra={
         "rift:enumDescriptions": {
             "selection": (
-                "What an editor should select on arriving here: the name for a declaration, the "
+                "What a caller should select on arriving here: the name for a declaration, the "
                 "whole node otherwise."
             ),
-            "name": "The identifier alone. What a rename rewrites.",
+            "name": "The identifier alone.",
             "header": "Everything before the body — the keyword, the name, the parameters, the return type.",
             "body": "The implementation. Replacing it leaves the signature and the documentation standing.",
             "content": (
@@ -1432,7 +1799,7 @@ class NodeFacet(str, Enum):
             ),
             "enclosing": (
                 "The node with everything that belongs to it, documentation and annotations "
-                "included. What a delete should take."
+                "included. What a removal should take."
             ),
         }
     },
@@ -1521,7 +1888,7 @@ class RegionRole(str, Enum):
             "generates": "`to` was produced from `from` by a build step, so editing `to` lasts until the next build.",
             "depends_on": (
                 "`from` needs `to` and there is no place in the source to point at — a manifest "
-                "entry, a build dependency. The coarsest edge there is."
+                "entry or build dependency."
             ),
             "annotated_by": (
                 "`to` is attached to `from` as metadata: an annotation, a decorator, an "
@@ -1596,87 +1963,48 @@ class RelationshipFacet(str, Enum):
     BINDS = "binds"
 
 
-@definition(owner=CORE, public=False, proto=Proto.empty(), schema_extra={})
-class SymbolOriginWorkspace(ClosedModel):
-    """Declared in this workspace's own source. Source the caller can open and change."""
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class SymbolOrigin(ClosedModel):
+    """Where a symbol belongs and how its declaration came to exist. Source location and
+    generation are separate: generated code can belong to the project or to a dependency."""
 
-    kind: Field[Literal["workspace"]] = proto_field()
-
-
-@definition(owner=CORE, public=False, proto=Proto.empty(), schema_extra={})
-class SymbolOriginStdlib(ClosedModel):
-    """Declared in the language's standard library and installed with its toolchain."""
-
-    kind: Field[Literal["stdlib"]] = proto_field()
-
-
-@definition(owner=CORE, public=False, proto=Proto.empty(), schema_extra={})
-class SymbolOriginExternal(ClosedModel):
-    """Declared outside the workspace, its packages, and the language's standard library."""
-
-    kind: Field[Literal["external"]] = proto_field()
-
-
-@definition(owner=CORE, public=False, proto=Proto.empty(), schema_extra={})
-class SymbolOriginGenerated(ClosedModel):
-    """Produced by a build step. Editing it lasts only until it is generated again."""
-
-    kind: Field[Literal["generated"]] = proto_field()
-
-
-@definition(owner=CORE, public=False, proto=Proto.empty(), schema_extra={})
-class SymbolOriginSynthetic(ClosedModel):
-    """Invented by the adapter, with no source declaration to read or edit."""
-
-    kind: Field[Literal["synthetic"]] = proto_field()
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class SymbolOriginPackage(ClosedModel):
-    "Declared in a dependency. `manager` is the package manager that installed it, so `npm`, `cargo` or `pip`; `name` and `version` are that manager's own. Upgrading the dependency replaces these symbols."
-
-    kind: Field[Literal["package"]] = proto_field()
-    manager: Field[str] = proto_field(
-        description="The package manager that installed it.",
-        examples=["npm", "cargo", "pip"],
+    location: Field[SourceLocation | None] = proto_field(
+        default=None,
+        description="Source ownership. Null exactly when `source_kind` is `synthetic`.",
         number=1,
     )
-    name: Field[str] = proto_field(
-        description="The package name, as that manager spells it.",
-        max_length=4096,
-        examples=["zod", "serde"],
+    source_kind: Field[SourceKind] = proto_field(
+        description="Whether the declaration is authored, generated, or synthetic.",
         number=2,
     )
-    version: Field[str] = proto_field(
-        description="The installed version.", examples=["3.22.4", "1.0.197"], number=3
+    unit: Field[SourceUnitId | None] = proto_field(
+        default=None,
+        description=(
+            "Source-catalog unit containing the declaration. Null when source is unavailable "
+            "or the declaration is synthetic."
+        ),
+        number=3,
     )
 
-
-@union(
-    owner=CORE,
-    oneof="variant",
-    discriminator="kind",
-    variants=(
-        Variant("workspace", "workspace", 1, SymbolOriginWorkspace, ProtoEmpty),
-        Variant("package", "package", 2, SymbolOriginPackage),
-        Variant("stdlib", "stdlib", 3, SymbolOriginStdlib, ProtoEmpty),
-        Variant("external", "external", 4, SymbolOriginExternal, ProtoEmpty),
-        Variant("generated", "generated", 5, SymbolOriginGenerated, ProtoEmpty),
-        Variant("synthetic", "synthetic", 6, SymbolOriginSynthetic, ProtoEmpty),
-    ),
-)
-class SymbolOrigin(ProtocolRoot):
-    "Source of a symbol definition. The variant determines whether its source can be read or edited and whether a package upgrade can replace it."
+    @model_validator(mode="after")
+    def synthetic_has_no_source(self) -> SymbolOrigin:
+        if self.source_kind is SourceKind.SYNTHETIC:
+            if self.location is not None or self.unit is not None:
+                raise ValueError("synthetic symbol cannot carry source location or unit")
+            return self
+        if self.location is None:
+            raise ValueError("authored or generated symbol requires source location")
+        return self
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class Symbol(ClosedModel):
-    """Adapter-resolved semantic identity. Source structure lives in Node and is connected through Relationship."""
+    """Provider-resolved semantic identity. Source structure lives in Node and is connected through Relationship."""
 
     id: Field[SymbolId] = proto_field(
         description=(
             "Unique identifier of this symbol across the whole workspace, and the URI that "
-            "resolves it. Hand it to the symbol resource as it stands."
+            "change requests, filters, and relationship records accept unchanged."
         ),
         examples=["rift://symbol/python/pkg.util.load_config~1"],
         number=1,
@@ -1696,7 +2024,7 @@ class Symbol(ClosedModel):
         number=3,
     )
     kind: Field[ExactKind] = proto_field(
-        description="What this symbol is in the adapter's vocabulary, such as `trait`, `function`, or `table`.",
+        description="What this symbol is in the provider's vocabulary, such as `trait`, `function`, or `table`.",
         examples=["function", "trait", "table"],
         number=4,
     )
@@ -1710,7 +2038,7 @@ class Symbol(ClosedModel):
         json_schema_extra={"uniqueItems": True},
     )
     origin: Field[SymbolOrigin] = proto_field(
-        description="Where the symbol comes from: code in this workspace, or a package it depends on.",
+        description="Where the declaration belongs, how it was produced, and its source unit when readable.",
         number=6,
     )
     container: Field[SymbolId | None] = proto_field(
@@ -1758,13 +2086,13 @@ class Symbol(ClosedModel):
         number=12,
     )
     extensions: Field[Extensions] = proto_field(
-        description="Language-specific facts with no portable equivalent, namespaced by the adapter that emitted them.",
+        description="Language-specific facts with no portable equivalent, namespaced by the provider that emitted them.",
         number=13,
     )
     document_local: Field[bool] = proto_field(
         description=(
             "Whether language semantics confine this symbol to the document that declares it. "
-            "The adapter classifies locality from its language model."
+            "The provider classifies locality from its language model."
         ),
         number=14,
     )
@@ -1785,7 +2113,7 @@ class NodeRegion(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class Node(ClosedModel):
-    "One node of a file's concrete syntax tree. It identifies a source range and adapter-local syntax kind. `symbol` connects the node to semantic identity when the language supplies one."
+    "One node of a file's concrete syntax tree. It identifies a source range and provider-local syntax kind. `symbol` connects the node to semantic identity when the language supplies one."
 
     id: Field[NodeId] = proto_field(
         description="Unique identifier of this source region, and the URI that resolves it.",
@@ -1805,13 +2133,13 @@ class Node(ClosedModel):
     language: Field[Language] = proto_field(
         description=(
             "The grammar that produced this node. It belongs to the identity because two "
-            "adapters can produce different trees over the same file bytes."
+            "providers can produce different trees over the same file bytes."
         ),
         number=4,
     )
     kind: Field[ExactKind] = proto_field(
         description=(
-            "What the node is in the adapter's vocabulary, such as `fn_item`, `mapping.key`, "
+            "What the node is in the provider's vocabulary, such as `fn_item`, `mapping.key`, "
             "or `selector.class`."
         ),
         number=5,
@@ -1840,7 +2168,7 @@ class Node(ClosedModel):
         number=9,
     )
     extensions: Field[Extensions] = proto_field(
-        description="Syntax facts the model has no field for, namespaced by the adapter that emitted them.",
+        description="Syntax facts the model has no field for, namespaced by the provider that emitted them.",
         number=10,
     )
 
@@ -1860,19 +2188,19 @@ class Node(ClosedModel):
     schema_extra={
         "rift:enumDescriptions": {
             "resolution": (
-                "The adapter's own name resolution or type checker produced the edge. It is a "
+                "The provider's own name resolution or type checker produced the edge. It is a "
                 "fact about the program."
             ),
             "syntax": (
-                "Read off the syntax tree because the adapter did not resolve it — a call on an "
-                "untyped receiver matched by name. Repeatable, and still capable of being wrong."
+                "Read off the syntax tree because nothing resolved it — a call on an untyped "
+                "receiver matched by name. Repeatable, and still capable of being wrong."
             ),
             "heuristic": "A guess, with `confidence` saying how good a one. Required there and meaningless elsewhere.",
         }
     },
 )
 class RelationshipDerivation(str, Enum):
-    "How this edge was established. Every edge reaches Rift from an adapter; this field records how much the adapter knew. A refactor may use `resolution` directly. Lower levels require another check before rewriting."
+    "How this edge was established. Every edge reaches Rift from a provider; this field records how much the provider knew. A consumer may act on `resolution` directly. Lower levels require another check before rewriting."
 
     RESOLUTION = "resolution"
     SYNTAX = "syntax"
@@ -1881,13 +2209,13 @@ class RelationshipDerivation(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class Relationship(ClosedModel):
-    "One directed edge between two symbols. Its evidence is the nodes it was read from, and its derivation is how much the adapter knew when it was read."
+    "One directed edge between two symbols. Its evidence is the nodes it was read from, and its derivation is how much the provider knew when it was read."
 
     from_: Field[SymbolId] = proto_field(
         alias="from", description="The symbol the edge starts at.", number=1
     )
     kind: Field[ExactKind] = proto_field(
-        description="What the edge is in this adapter's vocabulary, such as `import`, `use`, or `implements`.",
+        description="What the edge is in this provider's vocabulary, such as `import`, `use`, or `implements`.",
         number=2,
     )
     facets: Field[list[RelationshipFacet]] = proto_field(
@@ -1911,8 +2239,8 @@ class Relationship(ClosedModel):
     )
     derivation: Field[RelationshipDerivation] = proto_field(
         description=(
-            "How this edge was established. Every edge reaches Rift from an adapter; this "
-            "field records how much the adapter knew. A refactor may use `resolution` "
+            "How this edge was established. Every edge reaches Rift from a provider; this "
+            "field records how much the provider knew. A consumer may act on `resolution` "
             "directly. Lower levels require another check before rewriting."
         ),
         number=6,
@@ -1925,7 +2253,7 @@ class Relationship(ClosedModel):
         number=7,
     )
     extensions: Field[Extensions] = proto_field(
-        description="Edge facts the model has no field for, namespaced by the adapter that emitted them.",
+        description="Edge facts the model has no field for, namespaced by the provider that emitted them.",
         number=8,
     )
 
@@ -1987,12 +2315,13 @@ class FieldFilterOp(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class FieldFilter(ClosedModel):
-    "A predicate over a standard, namespaced substrate, or diagnostic field. Rift evaluates the regex operation under `rift-regex`, including filters nested in `StructuralCaptureConstraint.semantic`. Structural patterns and path selectors carry separate grammars."
+    "A predicate over a standard, namespaced substrate, or diagnostic field. Rift evaluates the regex operation under `rift-regex`. Path selectors carry their own glob grammar."
 
     field: Field[str] = proto_field(
         description=(
-            "Which field to test, by its name in this model: `facets`, `origin.kind`, "
-            "`severity`. Extension keys and diagnostic fields are addressed the same way."
+            "Which field to test, by its name in this model: `facets`, "
+            "`origin.location.kind`, `origin.source_kind`, `severity`. Extension keys and "
+            "diagnostic fields are addressed the same way."
         ),
         number=1,
     )
@@ -2085,8 +2414,7 @@ class RelationFilter(ClosedModel):
                 },
                 {
                     "description": (
-                        "Matching by portable facet, which reaches every language an adapter is installed "
-                        "for."
+                        "Matching by portable facet, which reaches every served language."
                     ),
                     "required": ["facet"],
                 },
@@ -2095,7 +2423,7 @@ class RelationFilter(ClosedModel):
     )
     kind: Field[list[str] | None] = proto_field(
         default=None,
-        description="Exact relationship kinds advertised by an adapter. Any listed kind matches.",
+        description="Exact relationship kinds a provider emits. Any listed kind matches.",
         number=1,
     )
     facet: Field[list[RelationshipFacet] | None] = proto_field(
@@ -2238,7 +2566,7 @@ class Filter(ProtocolRoot):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class AddressSymbol(ClosedModel):
-    "A symbol, wherever it happens to be written. Addressed this way, a rename reaches every node the adapter knows about."
+    "A symbol, wherever it happens to be written. Addressed this way, an operation reaches the declaration without naming a file or an offset."
 
     kind: Field[Literal["symbol"]] = proto_field()
     symbol: Field[SymbolId] = proto_field(
@@ -2263,7 +2591,7 @@ class AddressNode(ClosedModel):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class AddressSource(ClosedModel):
-    "A byte range, whether or not anything was parsed there. This is what addresses a `LICENSE` file, or a region of a file no adapter claims."
+    "A byte range, whether or not anything was parsed there. This is what addresses a `LICENSE` file, or a region of a file no provider claims."
 
     kind: Field[Literal["source"]] = proto_field()
     span: Field[SourceSpan] = proto_field(
@@ -2272,24 +2600,9 @@ class AddressSource(ClosedModel):
 
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class AddressMatch(ClosedModel):
-    "A result of a `StructuralQuery`, by the identity it came back with. That identity carries its source state; resolution returns `stale_match` when the session state has moved."
-
-    kind: Field[Literal["match"]] = proto_field()
-    match: Field[MatchId] = proto_field(
-        description="The match, and the state it was found in.", number=1
-    )
-    capture: Field[str | None] = proto_field(
-        description="Which named capture of the match. Null addresses the match itself.",
-        number=2,
-    )
-
-
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class AddressPath(ClosedModel):
-    """A whole file or directory, by project path. This is what `move` and `delete` take for
-    filesystem-level work; a directory covers everything beneath it, and a directory holding
-    no files resolves to zero edits, which refuses."""
+    """A whole file or directory, by project path. A directory covers everything beneath
+    it, and a directory holding no files resolves to zero edits, which refuses."""
 
     kind: Field[Literal["path"]] = proto_field()
     path: Field[ProjectPath] = proto_field(
@@ -2305,303 +2618,16 @@ class AddressPath(ClosedModel):
         Variant("symbol", "symbol", 1, AddressSymbol),
         Variant("node", "node", 2, AddressNode),
         Variant("source", "source", 3, AddressSource),
-        Variant("match", "match", 4, AddressMatch),
         Variant("path", "path", 5, AddressPath),
     ),
 )
 class Address(ProtocolRoot):
-    "Where an operation applies. Separate union branches distinguish a semantic symbol, a syntax node, a source range, a retained match, and a whole file or directory."
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.enum(
-        "Cardinality",
-        (EnumValue("one", "ONE", 1), EnumValue("many", "MANY", 2)),
-        placement=Placement("cardinality", 2),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "one": "Exactly one node, as `$NAME` binds.",
-            "many": "A run of nodes, as `$$$NAME` binds.",
-        }
-    },
-)
-class StructuralCaptureConstraintCardinality(str, Enum):
-    """How many nodes the capture binds, which follows the sigil used in the pattern."""
-
-    ONE = "one"
-    MANY = "many"
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class StructuralCaptureConstraint(ClosedModel):
-    "A condition one capture of a `StructuralQuery` has to meet. Constraints are where a pattern over syntax reaches the adapter's knowledge: match every call, then keep only the ones whose target carries the `test` facet."
-
-    capture: Field[str] = proto_field(
-        description="Which metavariable of the pattern this constrains, written without the `$`.",
-        pattern="^[A-Za-z][A-Za-z0-9_]*$",
-        number=1,
-    )
-    cardinality: Field[StructuralCaptureConstraintCardinality] = proto_field(
-        description="How many nodes the capture binds, which follows the sigil used in the pattern.",
-        number=2,
-    )
-    exact_kind: Field[ExactKind | None] = proto_field(
-        default=None,
-        description="The syntax kind the captured node has to be, in its grammar's own words.",
-        number=3,
-    )
-    facet: Field[NodeFacet | None] = proto_field(
-        default=None,
-        description="A portable structural facet the captured node has to carry.",
-        number=4,
-    )
-    text_regex: Field[str | None] = proto_field(
-        default=None,
-        description=(
-            "A `rift-regex` expression the capture's text must match. Rift evaluates it with "
-            "Unicode character classes, linear-time matching, and no look-around or "
-            "backreferences."
-        ),
-        number=5,
-    )
-    semantic: Field[Filter | None] = proto_field(
-        default=None,
-        description=(
-            "What has to be true of the symbol written at the capture. The adapter matches "
-            "syntax; Rift applies this, because only Rift holds the resolved facts."
-        ),
-        number=6,
-    )
-
-
-@union(
-    owner=CORE,
-    oneof="variant",
-    discriminator="kind",
-    variants=(
-        Variant(None, "structural_query", 1, "StructuralQuery"),
-        Variant(None, "text_query", 2, "TextQuery"),
-    ),
-)
-class MatchQuery(ProtocolRoot):
-    "A text or structural pattern, tagged by the engine that evaluates it. Carrying the complete query lets a match key explain its own identity and lets a caller rerun it without retrieving hidden state."
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.enum(
-        "Mode",
-        (EnumValue("literal", "LITERAL", 1), EnumValue("regex", "REGEX", 2)),
-        placement=Placement("mode", 4),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "literal": "Match the pattern bytewise, with no special characters or flags.",
-            "regex": "Read the pattern using the advertised text-matching dialect and the initial flags below.",
-        }
-    },
-)
-class TextQueryMode(str, Enum):
-    """How Rift interprets `pattern`."""
-
-    LITERAL = "literal"
-    REGEX = "regex"
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class TextQuery(ClosedModel):
-    "Literal or regular-expression matching over any UTF-8 file. Rift evaluates this query even when no adapter claims the path. Matches are leftmost-first and non-overlapping. After an empty regular-expression match, scanning advances to the next UTF-8 boundary. The query carries its dialect so a stored match key remains self-contained."
-
-    kind: Field[Literal["text"]] = proto_field(
-        description="Selects Rift's text matcher.", number=1
-    )
-    version: Field[Literal[1]] = proto_field(
-        description="Version of the query shape and pattern semantics.", number=2
-    )
-    dialect: Field[Literal["rift-regex"]] = proto_field(
-        description=(
-            "Regular-expression grammar used in `regex` mode. The separate `version` field "
-            "selects its syntax and match semantics. Version 1 has Unicode character classes, "
-            "linear-time matching, and no look-around or backreferences. Protocol conformance "
-            "fixtures define accepted syntax and match selection."
-        ),
-        number=3,
-    )
-    mode: Field[TextQueryMode] = proto_field(
-        description="How Rift interprets `pattern`.",
-        number=4,
-    )
-    pattern: Field[str] = proto_field(
-        description="Text to find in the selected grammar.", min_length=1, number=5
-    )
-    case_sensitive: Field[bool] = proto_field(
-        description=(
-            "Initial case-sensitivity for regular-expression mode. Inline flags may change it "
-            "within the pattern."
-        ),
-        number=6,
-    )
-    multiline: Field[bool] = proto_field(
-        description=(
-            "Whether `^` and `$` initially match line boundaries in regular-expression mode. "
-            "Inline flags may change it within the pattern."
-        ),
-        number=7,
-    )
-    paths: Field[PathSelector] = proto_field(
-        description="Files searched by this query.", number=8
-    )
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.enum(
-        "Overlap",
-        (
-            EnumValue("outermost", "OUTERMOST", 1),
-            EnumValue("innermost", "INNERMOST", 2),
-            EnumValue("all_non_overlapping", "ALL_NON_OVERLAPPING", 3),
-        ),
-        placement=Placement("overlap", 8),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "outermost": "Keep the enclosing match. A chain of nested calls reports once, at the top.",
-            "innermost": "Keep the enclosed match, and report the chain at its deepest point.",
-            "all_non_overlapping": "Keep every match that does not overlap one already kept.",
-        }
-    },
-)
-class StructuralQueryOverlap(str, Enum):
-    """Which match to keep when one encloses another, as a nested call chain does."""
-
-    OUTERMOST = "outermost"
-    INNERMOST = "innermost"
-    ALL_NON_OVERLAPPING = "all_non_overlapping"
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class StructuralQuery(ClosedModel):
-    "A syntax search parsed with the target language's grammar. `$NAME` stands for one node and `$$$NAME` for a run of nodes. Each adapter uses the shared capture, constraint, and result shapes."
-
-    kind: Field[Literal["structural"]] = proto_field(number=1)
-    version: Field[Literal[1]] = proto_field(
-        description="Which version of the metavariable grammar the pattern is written in.",
-        number=2,
-    )
-    language: Field[Language] = proto_field(
-        description="Which grammar parses `pattern`, and so which adapter runs the search.",
-        number=3,
-    )
-    pattern: Field[str] = proto_field(
-        description=(
-            "The pattern, in the target language's own syntax, with metavariables where the "
-            "shape matters and the text does not."
-        ),
-        min_length=1,
-        number=4,
-    )
-    paths: Field[PathSelector] = proto_field(
-        description="Which files to search.", number=5
-    )
-    within: Field[Address | None] = proto_field(
-        default=None,
-        description=(
-            "Optional source boundary for the search. A symbol bounds it to the nodes that "
-            "write it, a node to its syntax subtree — optionally one region — a span to its "
-            "bytes, and a path to a file or directory. The `match` branch refuses: a "
-            "retained match is a result, not a scope."
-        ),
-        number=6,
-    )
-    constraints: Field[list[StructuralCaptureConstraint]] = proto_field(
-        description=(
-            "Conditions the captures have to meet. The pattern finds a shape; these narrow it "
-            "to the intended occurrences."
-        ),
-        number=7,
-    )
-    overlap: Field[StructuralQueryOverlap] = proto_field(
-        description="Which match to keep when one encloses another, as a nested call chain does.",
-        number=8,
-    )
-    extensions: Field[Extensions] = proto_field(
-        description="Query fields the model has no place for, namespaced by the adapter that reads them.",
-        number=9,
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class Capture(ClosedModel):
-    """One named capture of a match, and the bytes it bound."""
-
-    name: Field[CaptureName] = proto_field(
-        description="Which metavariable of the pattern bound these bytes.", number=1
-    )
-    spans: Field[list[SourceSpan]] = proto_field(
-        description="Where it bound. A capture that matched a run of nodes has one span per node.",
-        min_length=1,
-        number=2,
-    )
-    text: Field[str] = proto_field(
-        description="The source it bound, as written.", number=3
-    )
-    entity: Field[NodeId | None] = proto_field(
-        description=(
-            "The node this capture landed on, or null when the capture is text and nothing "
-            "was parsed — as every text-regex capture is. What the node means is read through "
-            "`Node.symbol`."
-        ),
-        number=4,
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class StructuralMatchRanges(ClosedModel):
-    "The ranges a replacement can be written over, computed by the adapter that parsed the match. Whether the trivia around a node belongs to the edit depends on the operation — deleting a list element has to take a separator with it — and only the grammar knows where that trivia ends."
-
-    exact: Field[SourceSpan] = proto_field(
-        description="The node itself, with nothing around it. What a replacement in place writes over.",
-        number=1,
-    )
-    leading: Field[SourceSpan] = proto_field(
-        description=(
-            "The node with the trivia in front of it: the indentation on its line, a "
-            "separator that precedes it."
-        ),
-        number=2,
-    )
-    trailing: Field[SourceSpan] = proto_field(
-        description="The node with what follows it: a trailing comma, the newline that ends its line.",
-        number=3,
-    )
-    both: Field[SourceSpan] = proto_field(
-        description=(
-            "The node with the trivia on either side. Deleting this leaves no blank line and "
-            "no orphaned separator."
-        ),
-        number=4,
-    )
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern="^(?:[A-Za-z][A-Za-z0-9_]*|[0-9]+)$",
-)
-class CaptureName(ProtocolRoot):
-    """Structural captures use identifier names; text regex results may additionally use numeric capture indexes."""
+    "Where an operation applies. Separate union branches distinguish a semantic symbol, a syntax node, a source range, and a whole file or directory."
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class DiagnosticRelated(ClosedModel):
-    "A second place the adapter points at — the earlier declaration a redefinition conflicts with, the bound that failed. It carries a message and a location, and never a severity of its own, because it is part of one finding."
+    "A second place the provider points at — the earlier declaration a redefinition conflicts with, the bound that failed. It carries a message and a location, and never a severity of its own, because it is part of one finding."
 
     message: Field[str] = proto_field(
         description='What to notice there — "first defined here", "required by this bound".',
@@ -2646,7 +2672,7 @@ class DiagnosticTag(str, Enum):
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "reliable": "The adapter parsed the file. Facts around this finding stand.",
+            "reliable": "The provider parsed the file. Facts around this finding stand.",
             "recovered": (
                 "The parser repaired the source to keep going, so the tree here is a guess and so "
                 "is anything read from it."
@@ -2680,7 +2706,7 @@ class DiagnosticReliability(str, Enum):
                 "the end of the file."
             ),
             "unrepairable": "It stands whatever follows.",
-            "unknown": "The adapter does not say.",
+            "unknown": "The provider does not say.",
         }
     },
 )
@@ -2694,20 +2720,20 @@ class DiagnosticContinuation(str, Enum):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class Diagnostic(ClosedModel):
-    """One finding an adapter produced from source. Its code and message retain the adapter's vocabulary."""
+    """One finding a provider produced from source. Its code and message retain the provider's vocabulary."""
 
     severity: Field[Severity] = proto_field(
         description="How much it matters.", number=1
     )
     code: Field[str | None] = proto_field(
         description=(
-            "The adapter's own identifier for this finding — `TS2345`, `E0308`. Null where "
-            "the adapter issues none."
+            "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where "
+            "the provider issues none."
         ),
         number=2,
     )
     message: Field[str] = proto_field(
-        description="What the adapter said, in its own words.",
+        description="What the provider said, in its own words.",
         max_length=4096,
         number=3,
     )
@@ -2716,11 +2742,11 @@ class Diagnostic(ClosedModel):
         number=4,
     )
     related: Field[list[DiagnosticRelated]] = proto_field(
-        description="Other places the adapter pointed at while explaining this one.",
+        description="Other places the provider pointed at while explaining this one.",
         number=5,
     )
     tags: Field[list[DiagnosticTag]] = proto_field(
-        description="Presentation tags for the finding. An editor can render them as strikethrough or grey text.",
+        description="Presentation tags for the finding. A consumer can render them as strikethrough or grey text.",
         number=6,
         json_schema_extra={"uniqueItems": True},
     )
@@ -2736,435 +2762,22 @@ class Diagnostic(ClosedModel):
         number=8,
     )
     extensions: Field[Extensions] = proto_field(
-        description="Diagnostic fields the model has no place for, namespaced by the adapter that emitted them.",
+        description="Diagnostic fields the model has no place for, namespaced by the provider that emitted them.",
         number=9,
     )
     language: Field[Language | None] = proto_field(
-        description="Which adapter produced this. Null for a finding Rift itself raised.",
+        description="The language whose provider produced this. Null for a finding Rift itself raised.",
         number=10,
     )
 
 
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class ValidationReport(ClosedModel):
-    "One adapter's verdict over a resulting tree. `coverage` states how much the adapter checked, while `valid` records whether the checked scope contains an error. `validation.require` in the workspace-root `rift.toml` decides which reports are required."
-
-    language: Field[Language] = proto_field(
-        description="The adapter that produced this verdict.", number=1
-    )
-    valid: Field[bool] = proto_field(
-        description="Whether this adapter accepted every file in `files` under the reported coverage.",
-        number=2,
-    )
-    coverage: Field[Coverage] = proto_field(
-        description=(
-            "How much of the affected program the adapter checked. The result is incomplete "
-            "when `validation.require` names this language and coverage is partial or unsupported."
-        ),
-        number=3,
-    )
-    files: Field[list[ProjectPath]] = proto_field(
-        description="Affected files this verdict covers, sorted by project path.",
-        number=4,
-        json_schema_extra={"uniqueItems": True},
-    )
-    diagnostics: Field[list[Diagnostic]] = proto_field(
-        description="Adapter findings produced while checking the resulting tree, sorted by file and source range.",
-        number=5,
-    )
-
-
-@definition(
-    owner=CORE,
-    public=True,
-    proto=Proto.enum(
-        "FormattingPolicy",
-        (
-            EnumValue("preserve", "FORMATTING_POLICY_PRESERVE", 1),
-            EnumValue("changed_regions", "FORMATTING_POLICY_CHANGED_REGIONS", 2),
-            EnumValue("affected_files", "FORMATTING_POLICY_AFFECTED_FILES", 3),
-        ),
-        named=True,
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "preserve": "Keep every byte outside the resolved edits unchanged.",
-            "changed_regions": (
-                "Run the language formatter over the smallest syntactic regions containing the "
-                "resolved edits."
-            ),
-            "affected_files": "Run the language formatter over every text file touched by the change.",
-        }
-    },
-)
-class FormattingPolicy(str, Enum):
-    "How formatting participates in one session change."
-
-    PRESERVE = "preserve"
-    CHANGED_REGIONS = "changed_regions"
-    AFFECTED_FILES = "affected_files"
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class MatchCardinality(ClosedModel):
-    "How many matches an atomic rewrite accepts. Rift counts the matches in the projection as it stands and refuses the operation when the count falls outside this interval, so a pattern that is looser than the caller believed rewrites nothing."
-
-    minimum: Field[int] = proto_field(
-        description="Fewest matches required.", ge=0, le=100000, number=1
-    )
-    maximum: Field[int | None] = proto_field(
-        description=(
-            "Most matches accepted. Null leaves the match count unbounded, and "
-            "`max_rewrite_expansions` still caps the concrete edits the expansion may produce."
-        ),
-        number=2,
-    )
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.enum(
-        "Tests",
-        (
-            EnumValue("exclude", "TESTS_EXCLUDE", 1),
-            EnumValue("include", "TESTS_INCLUDE", 2),
-            EnumValue("only", "TESTS_ONLY", 3),
-        ),
-        placement=Placement("tests", 2),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "exclude": "Do not inspect or change test source.",
-            "include": "Treat production and test source as one action scope.",
-            "only": "Confine the action to test source.",
-        }
-    },
-)
-class OperationScopeTests(str, Enum):
-    """How source carrying the `test` node facet participates."""
-
-    EXCLUDE = "exclude"
-    INCLUDE = "include"
-    ONLY = "only"
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.enum(
-        "Generated",
-        (
-            EnumValue("exclude", "GENERATED_EXCLUDE", 1),
-            EnumValue("include", "GENERATED_INCLUDE", 2),
-        ),
-        placement=Placement("generated", 3),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "exclude": "Refuse an action whose complete effect requires generated source.",
-            "include": "Permit generated source and require a `generated_code` confirmation.",
-        }
-    },
-)
-class OperationScopeGenerated(str, Enum):
-    """How source carrying the `generated` node facet participates."""
-
-    EXCLUDE = "exclude"
-    INCLUDE = "include"
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class OperationScope(ClosedModel):
-    "The project source an action may inspect or change. Dependencies remain readable adapter input and are never editable through this scope."
-
-    paths: Field[PathSelector] = proto_field(
-        description="Project paths eligible for the action. Every resolved edit must remain inside this selector.",
-        number=1,
-    )
-    tests: Field[OperationScopeTests] = proto_field(
-        description="How source carrying the `test` node facet participates.",
-        number=2,
-    )
-    generated: Field[OperationScopeGenerated] = proto_field(
-        description="How source carrying the `generated` node facet participates.",
-        number=3,
-    )
-
-
-@definition(
-    owner=CORE,
-    public=True,
-    proto=Proto.enum(
-        "Disposition",
-        (
-            EnumValue("refuse", "DISPOSITION_REFUSE", 1),
-            EnumValue("rewrite", "DISPOSITION_REWRITE", 2),
-            EnumValue("remove", "DISPOSITION_REMOVE", 3),
-        ),
-        named=True,
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "refuse": "Refuse the whole deletion while such a use exists.",
-            "rewrite": "Replace the use with a valid form the adapter selects.",
-            "remove": "Delete the construct containing the use, at a safe boundary the adapter selects.",
-        }
-    },
-)
-class Disposition(str, Enum):
-    "How a safe delete eliminates one classified remaining use."
-
-    REFUSE = "refuse"
-    REWRITE = "rewrite"
-    REMOVE = "remove"
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class SafeDeletePolicy(ClosedModel):
-    "How an adapter may eliminate each remaining use while deleting a declaration. Every field holds a `Disposition`, one per class of use. Complete reference coverage is mandatory."
-
-    reads: Field[Disposition] = proto_field(
-        description="Disposition for reads, calls, and constructions.", number=1
-    )
-    writes: Field[Disposition] = proto_field(
-        description="Disposition for assignments and other writes.", number=2
-    )
-    imports: Field[Disposition] = proto_field(
-        description="Disposition for imports, exports, aliases, and re-exports.",
-        number=3,
-    )
-    overrides: Field[Disposition] = proto_field(
-        description="Disposition for overrides, implementations, and inherited declarations.",
-        number=4,
-    )
-    generated: Field[Disposition] = proto_field(
-        description="Disposition for adapter-resolved uses in generated source. Scope must also permit generated files.",
-        number=5,
-    )
-    strings: Field[Disposition] = proto_field(
-        description=(
-            "Disposition for adapter-classified string references such as reflection names. "
-            "Unclassified strings are outside the reference set and cannot be claimed by a "
-            "guarantee."
-        ),
-        number=6,
-    )
-    other: Field[Disposition] = proto_field(
-        description="Disposition for complete adapter-resolved uses not covered above.",
-        number=7,
-    )
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.enum(
-        "Propagation",
-        (
-            EnumValue("declaration", "DECLARATION", 1),
-            EnumValue("callers", "CALLERS", 2),
-            EnumValue("overrides", "OVERRIDES", 3),
-            EnumValue("all", "ALL", 4),
-        ),
-        placement=Placement("propagation", 7),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "declaration": "Change only the selected declaration and refuse when existing uses would become invalid.",
-            "callers": "Update the declaration and every resolved call site.",
-            "overrides": "Update the declaration and its complete override or implementation family.",
-            "all": "Update the declaration, callers, overrides, and implementations.",
-        }
-    },
-)
-class SignatureChangePropagation(str, Enum):
-    """Declarations and calls the adapter must update with the signature."""
-
-    DECLARATION = "declaration"
-    CALLERS = "callers"
-    OVERRIDES = "overrides"
-    ALL = "all"
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class SignatureChange(ClosedModel):
-    "The desired callable shape for a structured signature action. Existing parameters retain identity through `Parameter.node`; a parameter without a node is new. Language constructs outside this shape travel in `extensions` under an advertised versioned schema."
-
-    receiver: Field[Parameter | None] = proto_field(
-        description="Desired implicit receiver, or null for a free callable.", number=1
-    )
-    parameters: Field[list[Parameter]] = proto_field(
-        description=(
-            "Desired parameters in declaration order. Reordering existing nodes preserves "
-            "their identity while changing their position."
-        ),
-        number=2,
-    )
-    returns: Field[list[TypeBinding]] = proto_field(
-        description="Desired declared return bindings.", number=3
-    )
-    type_parameters: Field[list[SymbolId]] = proto_field(
-        description=(
-            "Desired existing generic parameters in order. Creating a language-specific "
-            "generic parameter uses `extensions`."
-        ),
-        number=4,
-    )
-    throws: Field[list[TypeExpression]] = proto_field(
-        description="Desired declared error or exception types.", number=5
-    )
-    effects: Field[list[str]] = proto_field(
-        description="Desired language effect keywords, in the adapter's spelling.",
-        number=6,
-        json_schema_extra={"uniqueItems": True},
-    )
-    propagation: Field[SignatureChangePropagation] = proto_field(
-        description="Declarations and calls the adapter must update with the signature.",
-        number=7,
-    )
-    extensions: Field[Extensions] = proto_field(
-        description="Versioned language-specific signature fields.", number=8
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class RenameArguments(ClosedModel):
-    """Portable arguments for `refactor.rename` actions."""
-
-    name: Field[str] = proto_field(
-        description=(
-            "New source name. The adapter checks language spelling, collisions, visibility, "
-            "and binding changes."
-        ),
-        min_length=1,
-        max_length=4096,
-        number=1,
-    )
-    scope: Field[OperationScope] = proto_field(
-        description="Source eligible for propagation. Complete references outside it cause refusal.",
-        number=2,
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class MoveArguments(ClosedModel):
-    """Portable arguments for `refactor.move` actions."""
-
-    destination: Field[Address] = proto_field(
-        description=(
-            "Where the target lands. A `symbol` or `node` addresses the existing container "
-            "that receives the declaration; a `path` is the complete resulting path, never a "
-            "containing directory. Other branches refuse with a failed `destination_legal` "
-            "precondition."
-        ),
-        number=1,
-    )
-    scope: Field[OperationScope] = proto_field(
-        description="Source eligible for import and reference updates.", number=2
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class SafeDeleteArguments(ClosedModel):
-    "Portable arguments for deleting a declaration. `policy` is what separates the two kinds of removal: without it the declaration goes and nothing analyses what referred to it, and with it the adapter must classify every remaining use and dispose of it as stated."
-
-    policy: Field[SafeDeletePolicy | None] = proto_field(
-        default=None,
-        description=(
-            "Required behavior for every classified remaining use. Null removes the declaration "
-            "without reference analysis, which claims no reference guarantee and reports no "
-            "remaining-usage precondition."
-        ),
-        number=1,
-    )
-    scope: Field[OperationScope] = proto_field(
-        description="Source in which complete usage analysis and any requested rewrite may occur.",
-        number=2,
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class ChangeSignatureArguments(ClosedModel):
-    """Portable arguments for `refactor.change_signature` actions."""
-
-    signature: Field[SignatureChange] = proto_field(
-        description="Desired callable structure and propagation policy.", number=1
-    )
-    scope: Field[OperationScope] = proto_field(
-        description="Source eligible for caller and override propagation.", number=2
-    )
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.enum(
-        "Name",
-        (
-            EnumValue("rename", "NAME_RENAME", 1),
-            EnumValue("move", "NAME_MOVE", 2),
-            EnumValue("safe_delete", "NAME_SAFE_DELETE", 3),
-            EnumValue("change_signature", "NAME_CHANGE_SIGNATURE", 4),
-        ),
-        placement=Placement("name", 2),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "rename": "Arguments conform to `RenameArguments`.",
-            "move": "Arguments conform to `MoveArguments`.",
-            "safe_delete": "Arguments conform to `SafeDeleteArguments`.",
-            "change_signature": "Arguments conform to `ChangeSignatureArguments`.",
-        }
-    },
-)
-class ArgumentContractName(str, Enum):
-    """Which portable argument model the contract selects."""
-
-    RENAME = "rename"
-    MOVE = "move"
-    SAFE_DELETE = "safe_delete"
-    CHANGE_SIGNATURE = "change_signature"
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.message(),
-    schema_extra={
-        "rift:arguments": {
-            "rename": "RenameArguments",
-            "move": "MoveArguments",
-            "safe_delete": "SafeDeleteArguments",
-            "change_signature": "ChangeSignatureArguments",
-        }
-    },
-)
-class ArgumentContract(ClosedModel):
-    """A portable argument contract attached to a discovered adapter action. `name` selects
-    the portable argument model and `version` its number — 1 for every current contract.
-    The descriptor's self-contained schema may narrow the selected contract for one language
-    without changing its field meanings."""
-
-    name: Field[ArgumentContractName] = proto_field(
-        description="Which portable argument model applies.",
-        number=2,
-    )
-    version: Field[int] = proto_field(
-        description="Contract version, 1 for every current contract.",
-        ge=1,
-        number=1,
-        proto_type=ProtoFieldDescriptor.TYPE_UINT32,
-    )
-
-
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class OperationVerifierAdapter(ClosedModel):
-    """A language adapter ran the check against its own analysis."""
+class OperationVerifierProvider(ClosedModel):
+    """A provider ran the check against its own analysis of the language."""
 
-    kind: Field[Literal["adapter"]] = proto_field()
+    kind: Field[Literal["provider"]] = proto_field()
     language: Field[Language] = proto_field(
-        description="The language whose adapter performed the check.", number=1
+        description="The language whose provider performed the check.", number=1
     )
 
 
@@ -3193,7 +2806,7 @@ class OperationVerifierRift(ClosedModel):
     discriminator="kind",
     variants=(
         Variant("rift", "rift", 1, OperationVerifierRift, ProtoEmpty),
-        Variant("adapter", "adapter", 2, OperationVerifierAdapter),
+        Variant("provider", "provider", 2, OperationVerifierProvider),
         Variant("hook", "hook", 3, OperationVerifierHook),
     ),
 )
@@ -3219,7 +2832,7 @@ class PreconditionValueCount(ClosedModel):
 
 @definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
 class PreconditionValueCoverage(ClosedModel):
-    """Coverage required or observed for an adapter fact family."""
+    """Coverage required or observed for a fact family."""
 
     kind: Field[Literal["coverage"]] = proto_field()
     value: Field[Coverage] = proto_field(number=1)
@@ -3257,24 +2870,16 @@ class PreconditionValue(ProtocolRoot):
             EnumValue("target_exists", "KIND_TARGET_EXISTS", 1),
             EnumValue("source_unchanged", "KIND_SOURCE_UNCHANGED", 2),
             EnumValue("writable", "KIND_WRITABLE", 3),
-            EnumValue("references_complete", "KIND_REFERENCES_COMPLETE", 4),
-            EnumValue("no_remaining_usages", "KIND_NO_REMAINING_USAGES", 5),
             EnumValue("destination_legal", "KIND_DESTINATION_LEGAL", 6),
-            EnumValue("name_available", "KIND_NAME_AVAILABLE", 7),
-            EnumValue("language_condition", "KIND_LANGUAGE_CONDITION", 8),
         ),
         placement=Placement("kind", 1),
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "target_exists": "Every addressed symbol, node, match, or source range resolves in the projection as it stands. A node address resolves only when its range is exactly a current node of the addressed kind, so offsets that shifted since the id was read fail here.",
-            "source_unchanged": "The files a match or action offer was discovered in have not been rewritten since.",
+            "target_exists": "Every addressed symbol, node, or source range resolves in the targeted tree as it stands. A node address resolves only when its range is exactly a current node of the addressed kind, so offsets that shifted since the id was read fail here.",
+            "source_unchanged": "The bytes an address pins have not been rewritten since the address was read. This is the check a witness fails.",
             "writable": "Every affected path is inside the project and writable through Rift's workspace handle.",
-            "references_complete": "The adapter completely classified the references on which the operation depends.",
-            "no_remaining_usages": "No usage remains after the selected safe-delete policy is applied.",
-            "destination_legal": "The requested path or semantic container can receive the moved or created entity. On a case-insensitive filesystem a destination that case-folds onto a different existing path fails here.",
-            "name_available": "The requested name creates no forbidden collision or binding change.",
-            "language_condition": "An adapter-defined condition described by diagnostics and extension data.",
+            "destination_legal": "The requested path can receive the moved or created entry. On a case-insensitive filesystem a destination that case-folds onto a different existing path fails here.",
         }
     },
 )
@@ -3284,11 +2889,7 @@ class OperationPreconditionKind(str, Enum):
     TARGET_EXISTS = "target_exists"
     SOURCE_UNCHANGED = "source_unchanged"
     WRITABLE = "writable"
-    REFERENCES_COMPLETE = "references_complete"
-    NO_REMAINING_USAGES = "no_remaining_usages"
     DESTINATION_LEGAL = "destination_legal"
-    NAME_AVAILABLE = "name_available"
-    LANGUAGE_CONDITION = "language_condition"
 
 
 @definition(
@@ -3320,50 +2921,28 @@ class OperationPreconditionStatus(str, Enum):
             EnumValue("unsupported", "REFUSAL_REASON_UNSUPPORTED", 1),
             EnumValue("unmet_precondition", "REFUSAL_REASON_UNMET_PRECONDITION", 2),
             EnumValue("ambiguous_target", "REFUSAL_REASON_AMBIGUOUS_TARGET", 3),
-            EnumValue("stale_action", "REFUSAL_REASON_STALE_ACTION", 4),
-            EnumValue("stale_match", "REFUSAL_REASON_STALE_MATCH", 5),
-            EnumValue("cardinality_mismatch", "REFUSAL_REASON_CARDINALITY_MISMATCH", 6),
             EnumValue("unsafe_effect", "REFUSAL_REASON_UNSAFE_EFFECT", 7),
-            EnumValue(
-                "formatter_unsupported", "REFUSAL_REASON_FORMATTER_UNSUPPORTED", 8
-            ),
-            EnumValue("portable_family", "REFUSAL_REASON_PORTABLE_FAMILY", 9),
-            EnumValue("language_refusal", "REFUSAL_REASON_LANGUAGE_REFUSAL", 10),
         ),
         named=True,
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "unsupported": "No adapter implements this operation for the language it reaches.",
+            "unsupported": "Nothing serves this operation for the language it reaches.",
             "unmet_precondition": "A condition checked before resolution failed. The failed entry is in `preconditions`.",
             "ambiguous_target": "The address resolves to several targets. Narrow it and ask again.",
-            "stale_action": "The file the offer was discovered in has been rewritten since. Read the actions resource again.",
-            "stale_match": "The file the match was found in has been rewritten since. Search again.",
-            "cardinality_mismatch": "A rewrite matched fewer or more times than its cardinality accepts.",
             "unsafe_effect": "The complete effect reaches outside what the caller can have meant — outside the project, or into generated source.",
-            "formatter_unsupported": "The requested formatting policy has no formatter behind it for an affected language.",
-            "portable_family": "The offer carries a portable argument contract, so it resolves through `rename`, `move`, `delete`, or `change_signature` rather than through `apply`.",
-            "language_refusal": "The language itself forbids it — a rename to a reserved word, a visibility change its rules do not allow.",
         }
     },
 )
 class RefusalReason(str, Enum):
-    """Why resolution produced no edits at all. Adapters emit `unsupported`,
-    `unmet_precondition`, `ambiguous_target`, `stale_action`, `stale_match`,
-    `unsafe_effect`, and `language_refusal`; Rift itself produces the rest. A change Rift
-    can express but nobody will vouch for still lands, carrying its confirmations —
-    `ErrorData` carries transport and infrastructure failures."""
+    """Why resolution produced no edits at all. A change Rift can express but nobody
+    will vouch for still lands, carrying its confirmations — `ErrorData` carries
+    transport and infrastructure failures."""
 
     UNSUPPORTED = "unsupported"
     UNMET_PRECONDITION = "unmet_precondition"
     AMBIGUOUS_TARGET = "ambiguous_target"
-    STALE_ACTION = "stale_action"
-    STALE_MATCH = "stale_match"
-    CARDINALITY_MISMATCH = "cardinality_mismatch"
     UNSAFE_EFFECT = "unsafe_effect"
-    FORMATTER_UNSUPPORTED = "formatter_unsupported"
-    PORTABLE_FAMILY = "portable_family"
-    LANGUAGE_REFUSAL = "language_refusal"
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -3400,7 +2979,7 @@ class OperationPrecondition(ClosedModel):
         description="Value found while checking the condition.", number=7
     )
     diagnostics: Field[list[Diagnostic]] = proto_field(
-        description="Adapter or Rift findings that explain the observed value.",
+        description="Provider or Rift findings that explain the observed value.",
         number=8,
     )
 
@@ -3421,14 +3000,6 @@ class OperationBlockerPath(ClosedModel):
     path: Field[ProjectPath] = proto_field(number=1)
 
 
-@definition(owner=CORE, public=False, proto=Proto.message(), schema_extra={})
-class OperationBlockerRelationship(ClosedModel):
-    """Adapter relationship the operation could not preserve or rewrite."""
-
-    kind: Field[Literal["relationship"]] = proto_field()
-    relationship: Field[Relationship] = proto_field(number=1)
-
-
 @union(
     owner=CORE,
     oneof="variant",
@@ -3436,11 +3007,10 @@ class OperationBlockerRelationship(ClosedModel):
     variants=(
         Variant("address", "address", 1, OperationBlockerAddress),
         Variant("path", "path", 2, OperationBlockerPath),
-        Variant("relationship", "relationship", 3, OperationBlockerRelationship),
     ),
 )
 class OperationBlocker(ProtocolRoot):
-    "A concrete subject preventing resolution. The union admits existing code, a path that may not exist, or the adapter edge that cannot be changed safely."
+    "A concrete subject preventing resolution. The union admits existing code and a path that may not exist."
 
 
 @definition(
@@ -3453,10 +3023,7 @@ class OperationBlocker(ProtocolRoot):
             EnumValue("declaration_removed", "DECLARATION_REMOVED", 2),
             EnumValue("declaration_moved", "DECLARATION_MOVED", 3),
             EnumValue("declaration_changed", "DECLARATION_CHANGED", 4),
-            EnumValue("references_updated", "REFERENCES_UPDATED", 5),
-            EnumValue("imports_updated", "IMPORTS_UPDATED", 6),
             EnumValue("source_rewritten", "SOURCE_REWRITTEN", 7),
-            EnumValue("formatting_applied", "FORMATTING_APPLIED", 8),
         ),
         placement=Placement("kind", 1),
     ),
@@ -3469,10 +3036,7 @@ class OperationEffectKind(str, Enum):
     DECLARATION_REMOVED = "declaration_removed"
     DECLARATION_MOVED = "declaration_moved"
     DECLARATION_CHANGED = "declaration_changed"
-    REFERENCES_UPDATED = "references_updated"
-    IMPORTS_UPDATED = "imports_updated"
     SOURCE_REWRITTEN = "source_rewritten"
-    FORMATTING_APPLIED = "formatting_applied"
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -3487,10 +3051,7 @@ class OperationEffect(ClosedModel):
         number=2,
     )
     after: Field[list[Address]] = proto_field(
-        description=(
-            "Subjects after Rift applies the change and every adapter sharing the projection "
-            "acknowledges the change. Empty for deletion."
-        ),
+        description=("Subjects after Rift applies the change. Empty for deletion."),
         number=3,
     )
     spans: Field[list[SourceSpan]] = proto_field(
@@ -3514,24 +3075,14 @@ class OperationEffect(ClosedModel):
     proto=Proto.enum(
         "GuaranteeKind",
         (
-            EnumValue("syntax_validated", "GUARANTEE_KIND_SYNTAX_VALIDATED", 1),
-            EnumValue("bindings_preserved", "GUARANTEE_KIND_BINDINGS_PRESERVED", 2),
-            EnumValue("references_updated", "GUARANTEE_KIND_REFERENCES_UPDATED", 3),
+            EnumValue("syntax_checked", "GUARANTEE_KIND_SYNTAX_CHECKED", 1),
             EnumValue("behavior_checked", "GUARANTEE_KIND_BEHAVIOR_CHECKED", 4),
         ),
         named=True,
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "syntax_validated": "The language parser accepts the affected source under the stated scope.",
-            "bindings_preserved": (
-                "Unchanged references in scope resolve to the same symbols before and after the "
-                "action."
-            ),
-            "references_updated": (
-                "Every resolved reference in scope that should follow the operation now reaches "
-                "its intended target."
-            ),
+            "syntax_checked": "The language parser accepts the affected source under the stated scope.",
             "behavior_checked": (
                 "A named static analysis or workspace hook checked a stated behavioral "
                 "property. The evidence is limited to that named property and scope."
@@ -3540,11 +3091,9 @@ class OperationEffect(ClosedModel):
     },
 )
 class GuaranteeKind(str, Enum):
-    """A property an action claims and must establish with scoped evidence when resolved."""
+    """A property a change claims and must establish with scoped evidence when resolved."""
 
-    SYNTAX_VALIDATED = "syntax_validated"
-    BINDINGS_PRESERVED = "bindings_preserved"
-    REFERENCES_UPDATED = "references_updated"
+    SYNTAX_CHECKED = "syntax_checked"
     BEHAVIOR_CHECKED = "behavior_checked"
 
 
@@ -3555,8 +3104,7 @@ class GuaranteeKind(str, Enum):
         "Method",
         (
             EnumValue("construction", "CONSTRUCTION", 1),
-            EnumValue("adapter", "ADAPTER", 2),
-            EnumValue("static_analysis", "STATIC_ANALYSIS", 3),
+            EnumValue("provider", "PROVIDER", 2),
             EnumValue("hook", "HOOK", 4),
         ),
         placement=Placement("method", 4),
@@ -3564,8 +3112,7 @@ class GuaranteeKind(str, Enum):
     schema_extra={
         "rift:enumDescriptions": {
             "construction": "Rift established the property directly from its closed edit and transaction rules.",
-            "adapter": "The language adapter or resolver checked the transformed program.",
-            "static_analysis": "A named language analysis checked a property narrower than compilation.",
+            "provider": "The language's provider checked the changed source.",
             "hook": "A workspace hook checked the changed tree.",
         }
     },
@@ -3574,8 +3121,7 @@ class GuaranteeEvidenceMethod(str, Enum):
     """How the property was established."""
 
     CONSTRUCTION = "construction"
-    ADAPTER = "adapter"
-    STATIC_ANALYSIS = "static_analysis"
+    PROVIDER = "provider"
     HOOK = "hook"
 
 
@@ -3614,13 +3160,10 @@ class GuaranteeEvidence(ClosedModel):
             EnumValue("destructive", "DESTRUCTIVE", 1),
             EnumValue("large_scope", "LARGE_SCOPE", 2),
             EnumValue("generated_code", "GENERATED_CODE", 3),
-            EnumValue("unresolved_reference", "UNRESOLVED_REFERENCE", 4),
-            EnumValue("behavior_unknown", "BEHAVIOR_UNKNOWN", 5),
-            EnumValue("formatting_scope", "FORMATTING_SCOPE", 6),
             EnumValue("hook", "HOOK", 7),
-            EnumValue("validation_incomplete", "VALIDATION_INCOMPLETE", 8),
-            EnumValue("guarantee_unestablished", "GUARANTEE_UNESTABLISHED", 9),
             EnumValue("configuration", "CONFIGURATION", 10),
+            EnumValue("advisory", "ADVISORY", 11),
+            EnumValue("external", "EXTERNAL", 12),
         ),
         placement=Placement("kind", 2),
     ),
@@ -3629,13 +3172,10 @@ class GuaranteeEvidence(ClosedModel):
             "destructive": "The change deletes source or replaces an existing file.",
             "large_scope": "The change reaches enough files or symbols to require explicit acceptance.",
             "generated_code": "The change touches source marked as generated.",
-            "unresolved_reference": "The adapter found a reference it could not classify or update.",
-            "behavior_unknown": "Adapter checks establish validity but do not establish equivalent behavior.",
-            "formatting_scope": "Formatting reaches outside the changed syntactic regions.",
-            "hook": "A workspace hook will check the changed tree.",
-            "validation_incomplete": "Required adapter validation or hook run did not complete over the resulting tree.",
-            "guarantee_unestablished": "The action advertised a guarantee that resolution produced no evidence for.",
-            "configuration": "The change touches `rift.toml`. Publishing it changes which adapter processes and hooks the server runs.",
+            "hook": "A workspace hook failed over the changed tree, or did not finish inside its timeout.",
+            "configuration": "The change touches `rift.toml`. Publishing it changes which hooks and limits the server runs with.",
+            "advisory": "The change carries a warning-severity `Advisory` nothing has discharged. Its `instruction` is the check that settles it.",
+            "external": "A process wrote directly into a projection, outside a Rift change request.",
         }
     },
 )
@@ -3645,13 +3185,10 @@ class ConfirmationRequirementKind(str, Enum):
     DESTRUCTIVE = "destructive"
     LARGE_SCOPE = "large_scope"
     GENERATED_CODE = "generated_code"
-    UNRESOLVED_REFERENCE = "unresolved_reference"
-    BEHAVIOR_UNKNOWN = "behavior_unknown"
-    FORMATTING_SCOPE = "formatting_scope"
     HOOK = "hook"
-    VALIDATION_INCOMPLETE = "validation_incomplete"
-    GUARANTEE_UNESTABLISHED = "guarantee_unestablished"
     CONFIGURATION = "configuration"
+    ADVISORY = "advisory"
+    EXTERNAL = "external"
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
@@ -3684,134 +3221,67 @@ class ConfirmationRequirement(ClosedModel):
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class ActionSupport(ClosedModel):
-    "One adapter action family advertised for a language. The prefix supports planning. Discovery still decides whether the family applies at an address."
+class Advisory(ClosedModel):
+    """One concern a provider or hook attached to an applied change, injected on the change
+    result rather than offered behind a separate read. A `checked` advisory is a verdict the
+    emitter verified itself and needs no action; a warning is open, and its `instruction` is
+    the concrete check or edit that settles it. In a projection, an open warning also mints an
+    `advisory` confirmation, so publication cannot take the change until the caller accepts
+    it."""
 
-    kind: Field[ActionKind] = proto_field(
-        description="Supported action kind prefix, such as `refactor.rename` or `quickfix`.",
-        number=1,
-    )
-    coverage: Field[Coverage] = proto_field(
-        description="Languages, files, or constructs for which this family can be discovered and resolved.",
-        number=2,
-    )
-    guarantees: Field[list[GuaranteeKind]] = proto_field(
-        description="Guarantee kinds this family may advertise. Each discovered action states its actual subset.",
-        number=3,
-        json_schema_extra={"uniqueItems": True},
-    )
-
-
-@definition(
-    owner=CORE,
-    public=False,
-    proto=Proto.enum(
-        "Applicability",
-        (
-            EnumValue("always", "ALWAYS", 1),
-            EnumValue("conditional", "CONDITIONAL", 2),
-            EnumValue("speculative", "SPECULATIVE", 3),
-        ),
-        placement=Placement("applicability", 4),
-    ),
-    schema_extra={
-        "rift:enumDescriptions": {
-            "always": (
-                "The adapter needs no caller-supplied fact before resolution. Result validation "
-                "and advertised guarantees still apply."
-            ),
-            "conditional": (
-                "Correct only under a condition the adapter cannot establish. The condition "
-                "appears in the resolved preconditions or confirmations."
-            ),
-            "speculative": (
-                "The adapter inferred intent from incomplete target evidence. The caller inspects "
-                "the resolved change's effects before accepting it."
-            ),
-        }
-    },
-)
-class ActionDescriptorApplicability(str, Enum):
-    """How much has to be checked before applying it."""
-
-    ALWAYS = "always"
-    CONDITIONAL = "conditional"
-    SPECULATIVE = "speculative"
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class ActionDescriptor(ClosedModel):
-    "An adapter's portable description of one discovered operation. Listing carries no edits because resolution computes only the selected action."
-
-    title: Field[str] = proto_field(
-        description="What the action is called, in the words the adapter would show a person.",
-        number=1,
-    )
-    kind: Field[ActionKind] = proto_field(
+    code: Field[str] = proto_field(
         description=(
-            "What this action does. Filtering by prefix is what makes it useful: a caller "
-            "that wants a fix asks for `quickfix` and never sees a refactor."
+            "Stable dotted identifier of the concern, such as `syntax.parse` or "
+            "`hooks.tests`."
+        ),
+        pattern="^[a-z][a-z0-9_.-]*$",
+        max_length=128,
+        examples=["syntax.parse", "hooks.tests"],
+        number=1,
+    )
+    severity: Field[Severity] = proto_field(
+        description=(
+            "How much it matters. `warning` is open and blocks publication until accepted; "
+            "`info` reports a checked verdict or a fact; `hint` suggests."
         ),
         number=2,
     )
-    preferred: Field[bool] = proto_field(
-        description=(
-            "Whether the adapter ranks this as the preferred action at the target. At most "
-            "one action in a list is preferred."
-        ),
+    message: Field[str] = proto_field(
+        description="The concern, in the emitter's words, naming the concrete places involved.",
+        max_length=4096,
         number=3,
     )
-    applicability: Field[ActionDescriptorApplicability] = proto_field(
-        description="How much has to be checked before applying it.",
+    checked: Field[bool] = proto_field(
+        description=(
+            "Whether the emitter verified the concern itself and found it settled. A checked "
+            "advisory never carries `warning` severity — a verdict must not absolve what it "
+            "did not check."
+        ),
         number=4,
     )
-    rationale: Field[str] = proto_field(
-        description="Why the adapter is offering it here.", number=5
-    )
-    target: Field[Address] = proto_field(
-        description="What the action applies to.", number=6
-    )
-    argument_contract: Field[ArgumentContract | None] = proto_field(
-        description=(
-            "Portable argument shape used by a standard refactor, or null when the adapter's "
-            "self-contained schema is the complete contract."
-        ),
-        number=7,
-    )
-    arguments_schema: Field[dict[str, Any] | None] = proto_field(
+    instruction: Field[str | None] = proto_field(
         default=None,
         description=(
-            "JSON Schema draft 2020-12 for the arguments this action takes. Remote references "
-            "are forbidden. When `argument_contract` is set, this schema may add language "
-            "constraints while preserving the portable fields and meanings. An adapter always "
-            "supplies it; Rift leaves it null in a listing page and carries it in the read "
-            "of one offer."
+            "The concrete step that settles an open advisory: the check to run, or the edit "
+            "to make. Null on a checked advisory."
         ),
-        number=8,
+        max_length=4096,
+        number=5,
     )
-    guarantees: Field[list[GuaranteeKind]] = proto_field(
-        description=(
-            "Properties this action promises to establish when resolution succeeds. Resolve "
-            "must return one complete `GuaranteeEvidence` entry for every kind listed here."
-        ),
-        number=9,
+    addresses: Field[list[Address]] = proto_field(
+        description="Symbols or nodes the concern involves.", number=6
+    )
+    paths: Field[list[ProjectPath]] = proto_field(
+        description="Files the concern involves.",
+        number=7,
         json_schema_extra={"uniqueItems": True},
     )
-    disabled_reason: Field[str | None] = proto_field(
-        description=(
-            "Why the action cannot run right now, where the adapter lists it but refuses it. "
-            "Null when it can run."
-        ),
-        number=10,
-    )
-    diagnostics: Field[list[Diagnostic]] = proto_field(
-        description="The findings this action would clear. Empty for an action nothing reported.",
-        number=11,
-    )
-    extensions: Field[Extensions] = proto_field(
-        description="Action fields the model has no place for, namespaced by the adapter that emitted them.",
-        number=12,
-    )
+
+    @model_validator(mode="after")
+    def checked_verdict_is_not_a_warning(self) -> Advisory:
+        if self.checked and self.severity is Severity.WARNING:
+            raise ValueError("a checked advisory cannot carry warning severity")
+        return self
 
 
 @definition(
@@ -3820,41 +3290,42 @@ class ActionDescriptor(ClosedModel):
     proto=Proto.enum(
         "FactFamily",
         (
-            EnumValue("origin_mappings", "FACT_FAMILY_ORIGIN_MAPPINGS", 1),
             EnumValue("symbols", "FACT_FAMILY_SYMBOLS", 2),
             EnumValue("nodes", "FACT_FAMILY_NODES", 3),
             EnumValue("relationships", "FACT_FAMILY_RELATIONSHIPS", 4),
             EnumValue("types", "FACT_FAMILY_TYPES", 5),
             EnumValue("diagnostics", "FACT_FAMILY_DIAGNOSTICS", 6),
+            EnumValue("history", "FACT_FAMILY_HISTORY", 7),
         ),
         named=True,
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "origin_mappings": (
-                "Relations from produced source ranges to the physical or generated source ranges "
-                "that contributed them."
-            ),
-            "symbols": "The declarations the adapter resolved in the file.",
+            "symbols": "The declarations the provider resolved in the file.",
             "nodes": "The nodes of the file's syntax tree, and which symbol each writes.",
-            "relationships": "The edges between symbols the adapter read out of this file.",
+            "relationships": "The edges between symbols the provider read out of this file.",
             "types": (
                 "The types carried by those symbols. Type facts live in `Symbol.types` and "
-                "`Signature`; this family records how completely the adapter resolved them."
+                "`Signature`; this family records how completely the provider resolved them."
             ),
-            "diagnostics": "What the adapter complained about while reading the file.",
+            "diagnostics": "What the provider complained about while reading the file.",
+            "history": (
+                "How symbols changed across the workspace's version-control revisions: "
+                "timelines and co-change coupling. `not_applicable` for a workspace with no "
+                "version control."
+            ),
         }
     },
 )
 class FactFamily(str, Enum):
-    "One kind of fact an adapter can emit for a file. Coverage, streaming, and invalidation use the family as their unit."
+    "One kind of fact a provider can emit. Coverage, streaming, and invalidation use the family as their unit."
 
-    ORIGIN_MAPPINGS = "origin_mappings"
     SYMBOLS = "symbols"
     NODES = "nodes"
     RELATIONSHIPS = "relationships"
     TYPES = "types"
     DIAGNOSTICS = "diagnostics"
+    HISTORY = "history"
 
 
 @mapping(
@@ -3867,62 +3338,137 @@ class SemanticCoverage(ProtocolRoot):
     """Coverage for every fact family. Absence is authoritative only where state is complete."""
 
 
+@scalar(
+    owner=CORE,
+    proto=ProtoFieldDescriptor.TYPE_STRING,
+    root=str,
+    pattern=r"^[A-Za-z0-9._/-]{1,128}$",
+    examples=["9fceb02d0ae598e95dc970b74767f19372d61af8"],
+)
+class RevisionId(ProtocolRoot):
+    """Identity of one revision in the workspace's version-control history, spelled the way
+    the version-control system spells it. Rift carries it opaquely and never orders two
+    revisions by comparing their identifiers."""
+
+
 @definition(
     owner=CORE,
-    public=True,
+    public=False,
     proto=Proto.enum(
-        "AdapterOperation",
+        "Kind",
         (
-            EnumValue("analyze", "ADAPTER_OPERATION_ANALYZE", 1),
-            EnumValue("validate", "ADAPTER_OPERATION_VALIDATE", 2),
-            EnumValue("format", "ADAPTER_OPERATION_FORMAT", 3),
-            EnumValue("match", "ADAPTER_OPERATION_MATCH", 4),
-            EnumValue("actions", "ADAPTER_OPERATION_ACTIONS", 5),
-            EnumValue("resolve", "ADAPTER_OPERATION_RESOLVE", 6),
-            EnumValue("replace_generated_sources", "ADAPTER_OPERATION_REPLACE_GENERATED_SOURCES", 7),
-            EnumValue("execute", "ADAPTER_OPERATION_EXECUTE", 8),
-            EnumValue("debug_start", "ADAPTER_OPERATION_DEBUG_START", 9),
-            EnumValue("debug_get_frame", "ADAPTER_OPERATION_DEBUG_GET_FRAME", 10),
-            EnumValue("debug_stop", "ADAPTER_OPERATION_DEBUG_STOP", 11),
+            EnumValue("introduced", "KIND_INTRODUCED", 1),
+            EnumValue("body_changed", "KIND_BODY_CHANGED", 2),
+            EnumValue("signature_changed", "KIND_SIGNATURE_CHANGED", 3),
+            EnumValue("moved", "KIND_MOVED", 4),
+            EnumValue("removed", "KIND_REMOVED", 5),
+            EnumValue("decorators_changed", "KIND_DECORATORS_CHANGED", 6),
         ),
-        named=True,
+        placement=Placement("kind", 3),
     ),
     schema_extra={
         "rift:enumDescriptions": {
-            "analyze": "Emit advertised fact families from source.",
-            "validate": "Check a changed source closure.",
-            "format": "Format selected source.",
-            "match": "Run structural matching.",
-            "actions": "Discover actions at an address.",
-            "resolve": "Resolve a discovered action to edits and evidence.",
-            "replace_generated_sources": "Consume generated source produced by another adapter.",
-            "execute": "Evaluate a caller-provided code block against one adapter state.",
-            "debug_start": "Start an inspect-only debugging session for a code block.",
-            "debug_get_frame": "Read one retained stack frame from a debugging session.",
-            "debug_stop": "Release a debugging session and its runtime state.",
+            "introduced": "The revision that first declares the symbol.",
+            "body_changed": "The implementation changed while the header stayed.",
+            "signature_changed": "The header changed, so every caller written before this revision predates the current shape.",
+            "moved": "The history provider matched the declaration across a file move; `path` records where it lives at this revision.",
+            "removed": "The declaration is gone after this revision.",
+            "decorators_changed": "The declaration's attached decorators changed while the header and body stayed. Behavior may change without either.",
         }
     },
 )
-class AdapterOperation(str, Enum):
-    """Optional adapter operations advertised before Rift issues a call."""
+class SymbolVersionKind(str, Enum):
+    """What the revision did to the symbol."""
 
-    ANALYZE = "analyze"
-    VALIDATE = "validate"
-    FORMAT = "format"
-    MATCH = "match"
-    ACTIONS = "actions"
-    RESOLVE = "resolve"
-    REPLACE_GENERATED_SOURCES = "replace_generated_sources"
-    EXECUTE = "execute"
-    DEBUG_START = "debug_start"
-    DEBUG_GET_FRAME = "debug_get_frame"
-    DEBUG_STOP = "debug_stop"
+    INTRODUCED = "introduced"
+    BODY_CHANGED = "body_changed"
+    SIGNATURE_CHANGED = "signature_changed"
+    MOVED = "moved"
+    REMOVED = "removed"
+    DECORATORS_CHANGED = "decorators_changed"
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class SymbolVersion(ClosedModel):
+    "One revision that touched a symbol. The history provider derives it by parsing the declaration at each revision that changed its file, so a version exists only where the parse found the symbol."
+
+    revision: Field[RevisionId] = proto_field(
+        description="The revision that touched the symbol.", number=1
+    )
+    path: Field[ProjectPath] = proto_field(
+        description="Where the declaration lived at that revision.", number=2
+    )
+    kind: Field[SymbolVersionKind] = proto_field(
+        description="What the revision did to the symbol.", number=3
+    )
+    timestamp: Field[str] = proto_field(
+        description="When the revision was recorded, as RFC 3339 date-time.",
+        examples=["2026-08-04T14:12:09Z"],
+        max_length=64,
+        number=4,
+        json_schema_extra={"format": "date-time"},
+    )
+    summary: Field[str | None] = proto_field(
+        default=None,
+        description="The revision's own first summary line, where the version control records one.",
+        max_length=4096,
+        number=5,
+    )
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class SymbolHistory(ClosedModel):
+    "One symbol's timeline across the workspace's version-control history, newest revision first. The walk is bounded by the configured history depth, so `coverage` says whether the timeline reaches the symbol's introduction."
+
+    symbol: Field[SymbolId] = proto_field(
+        description="The symbol the timeline is for.", number=1
+    )
+    versions: Field[list[SymbolVersion]] = proto_field(
+        description="Revisions that touched the symbol, newest first.", number=2
+    )
+    coverage: Field[Coverage] = proto_field(
+        description=(
+            "How far back the walk reached. Partial means the configured depth ended before "
+            "the symbol's introduction, so an absent `introduced` version proves nothing."
+        ),
+        number=3,
+    )
+
+
+@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
+class CoChange(ClosedModel):
+    "Empirical coupling between two symbols: how often revisions that touched one touched the other. The relation is observed from history rather than resolved from source, so it reaches coupling no reference graph carries — two implementations of one concept with no edge between them."
+
+    subject: Field[SymbolId] = proto_field(
+        description="The symbol the coupling is stated for.", number=1
+    )
+    partner: Field[SymbolId] = proto_field(
+        description="The symbol that historically changes with it.", number=2
+    )
+    together: Field[int] = proto_field(
+        description="Revisions inside the walked depth that touched both symbols.",
+        ge=1,
+        le=9007199254740991,
+        number=3,
+    )
+    touches: Field[int] = proto_field(
+        description="Revisions inside the walked depth that touched `subject` at all. Never below `together`.",
+        ge=1,
+        le=9007199254740991,
+        number=4,
+    )
+
+    @model_validator(mode="after")
+    def coupling_is_bounded(self) -> CoChange:
+        if self.together > self.touches:
+            raise ValueError("together cannot exceed touches")
+        return self
 
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class CodeBlock(ClosedModel):
-    """Caller-provided source evaluated against a session projection. It is never written back
-    to that projection."""
+    """Caller-provided source evaluated in the targeted tree's execution copy. It is never
+    written back to that tree."""
 
     source: Field[str] = proto_field(
         description="UTF-8 source to evaluate as one language-specific block.",
@@ -3934,7 +3480,7 @@ class CodeBlock(ClosedModel):
         default="",
         description=(
             "Project-relative directory used as the evaluation working directory. The empty "
-            "path selects the project root. It must name a directory in the projection."
+            "path selects the project root. It must name a directory in the evaluated tree."
         ),
         number=2,
     )
@@ -3975,8 +3521,7 @@ class CapturedText(ClosedModel):
 
 @definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
 class ExecutionBudget(ClosedModel):
-    """Exact server-selected bounds an adapter must enforce for one code-block evaluation.
-    The gRPC deadline may be shorter than `timeout_ms`; whichever expires first governs."""
+    """Exact server-enforced bounds for one code-block evaluation."""
 
     timeout_ms: Field[int] = proto_field(
         description="Maximum evaluation wall time in milliseconds.",
@@ -3989,34 +3534,6 @@ class ExecutionBudget(ClosedModel):
         ge=0,
         le=16384,
         number=2,
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class DebugBudget(ClosedModel):
-    """Execution and retained-frame bounds for one debugging session."""
-
-    execution: Field[ExecutionBudget] = proto_field(
-        description="Bounds for running and capturing the debugging evaluation.",
-        number=1,
-    )
-    frames: Field[int] = proto_field(
-        description="Maximum stack frames the adapter may retain, innermost first.",
-        ge=1,
-        le=256,
-        number=2,
-    )
-    bindings_per_frame: Field[int] = proto_field(
-        description="Maximum arguments plus locals returned for one frame.",
-        ge=1,
-        le=128,
-        number=3,
-    )
-    value_bytes: Field[int] = proto_field(
-        description="Captured prefix limit for each rendered debug binding value.",
-        ge=0,
-        le=8192,
-        number=4,
     )
 
 
@@ -4056,7 +3573,7 @@ class ExecutionResult(ClosedModel):
     )
     exit_code: Field[int | None] = proto_field(
         description=(
-            "Process exit status where the adapter used a process, or null for an in-process "
+            "Process exit status where the runtime used a process, or null for an in-process "
             "evaluator. A nonzero value accompanies `failed`."
         ),
         number=2,
@@ -4081,117 +3598,10 @@ class ExecutionResult(ClosedModel):
         return self
 
 
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class DebugBinding(ClosedModel):
-    """One visible name in a debug frame, rendered by the language adapter. Values are display
-    text rather than a portable object graph; future expansion can add a separate child-value
-    interface without changing frame identity."""
-
-    name: Field[str] = proto_field(
-        description="Name as the language presents it.",
-        min_length=1,
-        max_length=2048,
-        number=1,
-    )
-    type: Field[str | None] = proto_field(
-        description="Adapter-rendered runtime type, or null when unavailable.",
-        max_length=1024,
-        number=2,
-    )
-    value: Field[CapturedText] = proto_field(
-        description=(
-            "Bounded adapter-rendered value. Its digest identifies the complete rendering when "
-            "the session budget truncates it."
-        ),
-        number=3,
-    )
-
-
-@definition(owner=CORE, public=True, proto=Proto.message(), schema_extra={})
-class DebugFrame(ClosedModel):
-    """One stack frame retained by a debugging session. Depth zero is the innermost frame at
-    the inspection stop."""
-
-    depth: Field[int] = proto_field(
-        description="Zero-based depth, with the innermost frame first.",
-        ge=0,
-        le=4294967295,
-        number=1,
-    )
-    name: Field[str] = proto_field(
-        description="Function, method, or adapter-local frame name.",
-        min_length=1,
-        max_length=4096,
-        number=2,
-    )
-    source: Field[SourceSpan | None] = proto_field(
-        description=(
-            "Source location in the projection, or null for runtime and synthetic code. The "
-            "caller-provided block itself has no source span."
-        ),
-        number=3,
-    )
-    arguments: Field[list[DebugBinding]] = proto_field(
-        description="Visible arguments in adapter order.", number=4
-    )
-    locals: Field[list[DebugBinding]] = proto_field(
-        description="Visible local bindings in adapter order.", number=5
-    )
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern="^[a-z][a-z0-9_.-]*$",
-    max_length=128,
-)
-class ActionKind(ProtocolRoot):
-    """What an adapter action does, as a dotted hierarchical name. Rift fixes the standard families `quickfix`, `source`, `refactor.rename`, `refactor.move`, `refactor.safe_delete`, `refactor.change_signature`, `refactor.extract`, `refactor.inline`, `refactor.introduce`, `refactor.convert`, and `generate`; adapters may refine them with suffixes. Other roots are reverse-domain namespaced. Prefix filtering selects a whole family."""
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern="^rift://match/[A-Za-z0-9_-]{16,8192}$",
-    min_length=30,
-    max_length=8206,
-    examples=["rift://match/eyJzbmFwc2hvdCI6eyJraW5kIjoiY29tbWl0In19"],
-)
-class MatchId(ProtocolRoot):
-    """Identity of one match, carrying the file it was found in and the bytes it covered. Rift
-    revalidates it against that file, so a write elsewhere in the projection leaves it usable."""
-
-    @model_validator(mode="after")
-    def token_is_canonical(self) -> MatchId:
-        validate_base64url(self.root.removeprefix("rift://match/"))
-        return self
-
-
-@scalar(
-    owner=CORE,
-    proto=ProtoFieldDescriptor.TYPE_STRING,
-    root=str,
-    pattern="^rift://action/[A-Za-z0-9_-]{16,8192}$",
-    min_length=31,
-    max_length=8207,
-    examples=["rift://action/eyJsYW5ndWFnZSI6eyJuYW1lIjoicnVzdCJ9fQ"],
-)
-class ActionOfferId(ProtocolRoot):
-    """Identity of one adapter action, carrying the file its target was resolved in. Rift
-    revalidates it against that file, so a write elsewhere in the projection leaves it usable."""
-
-    @model_validator(mode="after")
-    def token_is_canonical(self) -> ActionOfferId:
-        validate_base64url(self.root.removeprefix("rift://action/"))
-        return self
-
-
 MODELS = (
-    ProtocolVersion,
     Digest,
-    SessionId,
+    ProviderId,
+    ProjectionId,
     ProjectionState,
     LanguageRegion,
     FileId,
@@ -4209,9 +3619,23 @@ MODELS = (
     TextRange,
     Severity,
     SourceSpan,
+    SourceUnitId,
+    SourceResolverId,
+    SourcePath,
+    PackageIdentity,
+    SourceLocationKind,
+    SourceLocation,
+    SourceKind,
+    SourceMappingPrecision,
+    SourceUnitSpan,
+    SourceMapping,
+    SourceUnit,
     TextEdit,
     Edit,
-    OriginMapping,
+    Freshness,
+    ProviderProvenance,
+    IndexSnapshot,
+    ReadSnapshot,
     CoverageScope,
     Coverage,
     SemanticCoverage,
@@ -4235,27 +3659,8 @@ MODELS = (
     RelationFilter,
     Filter,
     Address,
-    StructuralCaptureConstraint,
-    MatchQuery,
-    TextQuery,
-    StructuralQuery,
-    Capture,
-    StructuralMatchRanges,
-    CaptureName,
     DiagnosticRelated,
     Diagnostic,
-    ValidationReport,
-    FormattingPolicy,
-    MatchCardinality,
-    OperationScope,
-    Disposition,
-    SafeDeletePolicy,
-    SignatureChange,
-    RenameArguments,
-    MoveArguments,
-    SafeDeleteArguments,
-    ChangeSignatureArguments,
-    ArgumentContract,
     OperationVerifier,
     PreconditionValue,
     OperationPrecondition,
@@ -4264,19 +3669,15 @@ MODELS = (
     GuaranteeKind,
     GuaranteeEvidence,
     ConfirmationRequirement,
-    ActionSupport,
-    ActionDescriptor,
+    Advisory,
     FactFamily,
-    AdapterOperation,
+    RevisionId,
+    SymbolVersion,
+    SymbolHistory,
+    CoChange,
     CodeBlock,
     CapturedText,
     ExecutionBudget,
-    DebugBudget,
     ExecutionStatus,
     ExecutionResult,
-    DebugBinding,
-    DebugFrame,
-    ActionKind,
-    MatchId,
-    ActionOfferId,
 )

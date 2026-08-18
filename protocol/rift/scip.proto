@@ -13,7 +13,7 @@ message Omission {
     REASON_UNSPECIFIED = 0;
     // SCIP v0.9.0 has no field with the same meaning.
     REASON_UNREPRESENTABLE = 1;
-    // No adapter serves the file's language, or its adapter was unavailable while the export
+    // No provider serves the file's language, or its facts were unavailable while the export
     // ran.
     REASON_NO_ANALYSIS = 2;
     // SCIP cannot carry the path: a symbolic link, or a form the SCIP canonical-path rules
@@ -28,7 +28,7 @@ message Omission {
   // Why the value has no place in the projected index.
   rift.scip.Omission.Reason reason = 2;
   // What was dropped, named concretely: the meaning SCIP lacks a field for, the language with
-  // no adapter, or the forbidden path form.
+  // no provider, or the forbidden path form.
   optional string detail = 3;
   // How many populated values or files this record covers across the index.
   uint64 count = 4;
@@ -38,28 +38,28 @@ message Omission {
   // The file the omission covers. Absent when `field` names the unit.
   optional string path = 6;
 }
-// Selects a session projection to export as SCIP.
+// Selects the tree to export as SCIP.
 message Request {
-  // Session whose projection is exported. The export reads the projection as it stands, dirty
-  // content included, so a write landing mid-stream can make the index inconsistent; a consumer
-  // that needs a whole one reads again.
-  string session = 2;
+  // Projection to export, or absent for the workspace tree. The export reads the tree as it
+  // stands, unpublished content included, so a write landing mid-stream can make the index
+  // inconsistent; a consumer that needs a whole one reads again.
+  optional string projection = 2;
 }
-// Analysis coverage for one language over the whole projection.
+// Analysis coverage for one language over the whole exported tree.
 message LanguageCoverage {
   // The exact `Language` the coverage is stated for.
   rift.core.Language language = 1;
-  // The weakest per-file coverage the language's adapter reported for each fact family across
-  // the projection.
+  // The weakest per-file coverage the language's providers reported for each fact family across
+  // the exported tree.
   rift.core.SemanticCoverage coverage = 2;
 }
 // Identity and coverage emitted before index records.
 message Header {
-  // Session whose projection produced every following record.
-  string session = 2;
-  // The `metadata` of the projected `scip.Index`. `project_root` is the file URI of the session
-  // projection directory, `text_document_encoding` is UTF-8, and `tool_info` carries the name
-  // `rift` with the server build version.
+  // Projection that produced every following record, or absent for the workspace tree.
+  optional string projection = 2;
+  // The `metadata` of the projected `scip.Index`. `project_root` is the file URI of the
+  // exported tree's directory, `text_document_encoding` is UTF-8, and `tool_info` carries the
+  // name `rift` with the server build version.
   .scip.Metadata metadata = 3;
   // Analysis coverage per language, sorted by language name then dialect. It states what the
   // underlying analysis established; what the SCIP mapping then dropped is in `omissions`.
@@ -81,13 +81,13 @@ message Event {
     .scip.SymbolInformation external_symbol = 3;
   }
 }
-// Exports one Rift projection into the pinned SCIP schema. The service is served on the same
-// workspace rendezvous socket as the Rift server's other connections.
+// Exports one Rift tree into the pinned SCIP schema. The service is served by the workspace
+// server at the endpoint the `ServerLock` names.
 service Index {
   // Returns one header, then documents, then external symbols. The stream order is the
-  // canonical `scip.Index` order. `Read` fails with `NOT_FOUND` for a session the server does
-  // not hold and `INVALID_ARGUMENT` for a malformed `SessionId`. A session removed mid-stream
-  // terminates the stream with `ABORTED`; a stream that ends with `OK` carried the complete
-  // index.
+  // canonical `scip.Index` order. `Read` fails with `NOT_FOUND` for a projection the server
+  // does not hold and `INVALID_ARGUMENT` for a malformed `ProjectionId`. A projection removed
+  // mid-stream terminates the stream with `ABORTED`; a stream that ends with `OK` carried the
+  // complete index.
   rpc Read (rift.scip.Request) returns (stream rift.scip.Event);
 }

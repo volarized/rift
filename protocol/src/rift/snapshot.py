@@ -21,7 +21,6 @@ ARTIFACTS = (
     "rift.schema.json",
     "rift/core.proto",
     "rift/mcp.proto",
-    "rift/adapter.proto",
     "rift/scip.proto",
     "scip/scip.proto",
 )

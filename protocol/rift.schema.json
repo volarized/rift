@@ -1,36 +1,5 @@
 {
   "$defs": {
-    "AdapterProcessConfig": {
-      "additionalProperties": false,
-      "description": "How Rift starts one configured adapter process.",
-      "properties": {
-        "command": {
-          "description": "Executable followed by literal arguments used to start the adapter process.",
-          "items": {
-            "type": "string"
-          },
-          "minItems": 1,
-          "title": "Command",
-          "type": "array"
-        },
-        "env": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "description": "Environment additions supplied to the adapter process.",
-          "propertyNames": {
-            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
-          },
-          "title": "Env",
-          "type": "object"
-        }
-      },
-      "required": [
-        "command"
-      ],
-      "title": "AdapterProcessConfig",
-      "type": "object"
-    },
     "ByteSize": {
       "description": "A non-negative byte size using binary units where a suffix is present.",
       "pattern": "^(?:0|[1-9][0-9]*)(?:B|KiB|MiB|GiB|TiB)$",
@@ -39,7 +8,7 @@
     },
     "CommandHook": {
       "additionalProperties": false,
-      "description": "A hook that runs an executable, without a shell, inside the session's projection directory. Whatever it writes there is published with the projection. The command runs the tree it checks, so it executes unpublished changes.",
+      "description": "A hook that runs an executable, without a shell, inside the tree a change applied to \u2014 the workspace itself, or the projection the change named. The command executes that changed tree. The server imports visible filesystem writes from a projection; VCS-ignored output outside its manifest remains untracked.",
       "properties": {
         "type": {
           "const": "command",
@@ -62,7 +31,7 @@
           }
         },
         "argv": {
-          "description": "Executable followed by literal arguments. An absolute executable path is refused; a bare name resolves through the `PATH` of the merged environment the command runs with, and a relative path resolves below `working_directory` in the session projection. Rift performs no shell expansion.",
+          "description": "Executable followed by literal arguments. An absolute executable path is refused; a bare name resolves through the `PATH` of the merged environment the command runs with, and a relative path resolves below `working_directory` in the changed tree. Rift performs no shell expansion.",
           "items": {
             "type": "string"
           },
@@ -81,7 +50,7 @@
         },
         "working_directory": {
           "$ref": "#/$defs/ProjectPath",
-          "description": "Directory below the projection root in which the process starts. The empty path selects the root.",
+          "description": "Directory below the changed tree's root in which the process starts. The empty path selects the root.",
           "rift:proto": {
             "number": 5
           }
@@ -192,10 +161,10 @@
         "all"
       ],
       "rift:enumDescriptions": {
-        "all": "Everything the adapter could see: the workspace, its dependencies, and the standard library.",
+        "all": "Everything the provider could see: the workspace, its dependencies, and the standard library.",
         "dependencies": "Installed packages outside the workspace source.",
         "project": "Every file in the workspace, dependencies left out.",
-        "request": "Only what this request asked for. The adapter answered the question put to it and claims nothing past it."
+        "request": "Only what this request asked for. The provider answered the question put to it and claims nothing past it."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -260,7 +229,8 @@
           }
         ]
       },
-      "title": "CoverageScope"
+      "title": "CoverageScope",
+      "type": "object"
     },
     "CoverageScopeKind": {
       "additionalProperties": false,
@@ -328,22 +298,12 @@
       "description": "Workspace enablement and limits for caller-provided code.",
       "properties": {
         "allow": {
-          "description": "Exact languages enabled for execute when their adapters advertise the execute operation. Empty disables caller-provided code.",
+          "description": "Exact languages enabled for execute when a runtime serves them. Empty disables caller-provided code.",
           "items": {
             "$ref": "#/$defs/LanguageSelector"
           },
           "rift:selectsType": "Language",
           "title": "Allow",
-          "type": "array",
-          "uniqueItems": true
-        },
-        "debug": {
-          "description": "Subset of allow enabled for debugging when all three debug operations are advertised. Empty disables debugging.",
-          "items": {
-            "$ref": "#/$defs/LanguageSelector"
-          },
-          "rift:selectsType": "Language",
-          "title": "Debug",
           "type": "array",
           "uniqueItems": true
         },
@@ -364,7 +324,7 @@
         "max_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30s",
-          "description": "Wall-clock bound applied to each execution and debugging evaluation.",
+          "description": "Wall-clock bound applied to each evaluation.",
           "rift:bounds": {
             "field": "timeout_ms",
             "model": "ExecutionBudget"
@@ -396,68 +356,13 @@
           "minimum": 1,
           "title": "Max Concurrent",
           "type": "integer"
-        },
-        "max_debug_sessions": {
-          "default": 2,
-          "description": "Retained debugging sessions admitted across the workspace.",
-          "maximum": 16,
-          "minimum": 1,
-          "title": "Max Debug Sessions",
-          "type": "integer"
-        },
-        "debug_idle_timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "5m",
-          "description": "Idle time before Rift stops a debugging session and releases its lease.",
-          "rift:range": {
-            "max": "1d",
-            "min": "1ms"
-          }
-        },
-        "max_debug_frames": {
-          "default": 64,
-          "description": "Stack frames one failed debugging evaluation may retain.",
-          "maximum": 256,
-          "minimum": 1,
-          "rift:bounds": {
-            "field": "frames",
-            "model": "DebugBudget"
-          },
-          "title": "Max Debug Frames",
-          "type": "integer"
-        },
-        "max_debug_bindings": {
-          "default": 32,
-          "description": "Arguments plus locals returned for one debug frame.",
-          "maximum": 128,
-          "minimum": 1,
-          "rift:bounds": {
-            "field": "bindings_per_frame",
-            "model": "DebugBudget"
-          },
-          "title": "Max Debug Bindings",
-          "type": "integer"
-        },
-        "max_debug_value": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "1KiB",
-          "description": "Captured UTF-8 bytes in each adapter-rendered debug binding value.",
-          "rift:bounds": {
-            "field": "value_bytes",
-            "model": "DebugBudget"
-          },
-          "rift:conversion": "ByteSize.bytes",
-          "rift:range": {
-            "max": "8KiB",
-            "min": "0B"
-          }
         }
       },
       "title": "ExecutionConfig",
       "type": "object"
     },
     "FileId": {
-      "description": "Identity of one file in the session projection. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+      "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
       "examples": [
         "rift://file/pkg/util.py",
         "rift://file/src/%E2%98%83.ts",
@@ -475,18 +380,14 @@
       "type": "string"
     },
     "GuaranteeKind": {
-      "description": "A property an action claims and must establish with scoped evidence when resolved.",
+      "description": "A property a change claims and must establish with scoped evidence when resolved.",
       "enum": [
-        "syntax_validated",
-        "bindings_preserved",
-        "references_updated",
+        "syntax_checked",
         "behavior_checked"
       ],
       "rift:enumDescriptions": {
         "behavior_checked": "A named static analysis or workspace hook checked a stated behavioral property. The evidence is limited to that named property and scope.",
-        "bindings_preserved": "Unchanged references in scope resolve to the same symbols before and after the action.",
-        "references_updated": "Every resolved reference in scope that should follow the operation now reaches its intended target.",
-        "syntax_validated": "The language parser accepts the affected source under the stated scope."
+        "syntax_checked": "The language parser accepts the affected source under the stated scope."
       },
       "rift:package": "rift.core",
       "rift:proto": {
@@ -497,16 +398,8 @@
             "name": "GUARANTEE_KIND_BEHAVIOR_CHECKED",
             "number": 4
           },
-          "bindings_preserved": {
-            "name": "GUARANTEE_KIND_BINDINGS_PRESERVED",
-            "number": 2
-          },
-          "references_updated": {
-            "name": "GUARANTEE_KIND_REFERENCES_UPDATED",
-            "number": 3
-          },
-          "syntax_validated": {
-            "name": "GUARANTEE_KIND_SYNTAX_VALIDATED",
+          "syntax_checked": {
+            "name": "GUARANTEE_KIND_SYNTAX_CHECKED",
             "number": 1
           }
         }
@@ -514,8 +407,30 @@
       "title": "GuaranteeKind",
       "type": "string"
     },
+    "HistoryProviderConfig": {
+      "additionalProperties": false,
+      "description": "The built-in history provider, which reads the workspace's version-control history\nin place \u2014 no checkout, no subprocess.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether the history fact family is served at all. A workspace without version control reports the family `not_applicable` regardless.",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_revisions": {
+          "default": 500,
+          "description": "Most revisions the history walk crosses from the current head. Timelines and co-change coupling are computed inside this depth, and `SymbolHistory.coverage` reports partial when the walk ends before a symbol's introduction.",
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Revisions",
+          "type": "integer"
+        }
+      },
+      "title": "HistoryProviderConfig",
+      "type": "object"
+    },
     "Hook": {
-      "description": "One workspace hook from the workspace-root `rift.toml`, run inside the session's\nprojection each time a change applies. `type` selects how the hook runs; `command` is\nthe only type.",
+      "description": "One workspace hook from the workspace-root `rift.toml`, run inside the changed tree\neach time a change applies. `type` selects how the hook runs; `command` is the only\ntype.",
       "discriminator": {
         "mapping": {
           "command": "#/$defs/CommandHook"
@@ -540,7 +455,8 @@
           }
         ]
       },
-      "title": "Hook"
+      "title": "Hook",
+      "type": "object"
     },
     "HookDeterminism": {
       "description": "Whether an identical tree and environment are expected to produce the same result.",
@@ -666,35 +582,41 @@
       "title": "ProjectPath",
       "type": "string"
     },
-    "ValidationConfig": {
+    "ProvidersConfig": {
       "additionalProperties": false,
-      "description": "Adapter validation reports required for projection changes and publication.",
+      "description": "Built-in providers. Each is on by default and configured here only to bound or\ndisable it.",
       "properties": {
-        "require": {
+        "history": {
+          "$ref": "#/$defs/HistoryProviderConfig",
+          "description": "The version-control history provider."
+        }
+      },
+      "title": "ProvidersConfig",
+      "type": "object"
+    },
+    "SearchConfig": {
+      "additionalProperties": false,
+      "description": "The optional dense-ranking backend for the `search` tool. The lexical index runs\nwithout configuration; this table names the embedding model that adds dense ranking\non top of it.",
+      "properties": {
+        "embedding": {
           "anyOf": [
             {
-              "enum": [
-                "available",
-                "none"
-              ],
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._/:-]{0,255}$",
               "type": "string"
             },
             {
-              "items": {
-                "$ref": "#/$defs/LanguageSelector"
-              },
-              "minItems": 1,
-              "type": "array",
-              "uniqueItems": true
+              "type": "null"
             }
           ],
-          "default": "available",
-          "description": "`available` requires every affected adapter that advertises validation; `none` requires no adapter reports; an explicit list requires those exact core.Language pairs.",
-          "rift:selectsType": "Language",
-          "title": "Require"
+          "default": null,
+          "description": "Identifier of the embedding model that ranks search hits alongside the lexical index. Null keeps search lexical. Vectors are stored per model, so changing this value rebuilds the dense index.",
+          "examples": [
+            "potion-retrieval-32M"
+          ],
+          "title": "Embedding"
         }
       },
-      "title": "ValidationConfig",
+      "title": "SearchConfig",
       "type": "object"
     }
   },
@@ -704,28 +626,21 @@
     "execution": {
       "$ref": "#/$defs/ExecutionConfig"
     },
-    "validation": {
-      "$ref": "#/$defs/ValidationConfig"
+    "providers": {
+      "$ref": "#/$defs/ProvidersConfig",
+      "description": "Bounds and switches for the built-in providers."
+    },
+    "search": {
+      "$ref": "#/$defs/SearchConfig",
+      "description": "Ranking backends for the `search` tool."
     },
     "hooks": {
-      "description": "Hooks run in the projection each time a change applies, in list order.",
+      "description": "Hooks run in the changed tree each time a change applies, in list order.",
       "items": {
         "$ref": "#/$defs/Hook"
       },
       "title": "Hooks",
       "type": "array"
-    },
-    "adapters": {
-      "additionalProperties": {
-        "$ref": "#/$defs/AdapterProcessConfig"
-      },
-      "description": "Configured adapter processes keyed by workspace-local process name. Each process answers Describe with its exact core.Language and adapter capabilities.",
-      "propertyNames": {
-        "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
-      },
-      "rift:describesAs": "Capabilities",
-      "title": "Adapters",
-      "type": "object"
     }
   },
   "title": "Rift workspace configuration",

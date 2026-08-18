@@ -73,7 +73,6 @@ class Namespace:
 
 CORE = Namespace("core", "rift.core")
 MCP = Namespace("mcp", "rift.mcp")
-ADAPTER = Namespace("adapter", "rift.adapter")
 SCIP = Namespace("scip", "scip")
 RIFT_SCIP = Namespace("scip", "rift.scip")
 
@@ -651,6 +650,12 @@ def union(
     `variants`, so a branch cannot be added to one and missed in another. A branch
     named as a string becomes a `ForwardRef`, which Pydantic resolves against the
     module when the models are rebuilt.
+
+    Every branch is a message carrying the tag, so the union admits objects and
+    nothing else and says so at its root. The `oneOf` alone leaves it unsaid, and
+    a union is what a tool result is: MCP reads an advertised `outputSchema` as
+    an object schema, and a client that validates one rejects the entire
+    `tools/list` when the root omits `"type"`.
     """
 
     def decorate(cls: type[T]) -> type[T]:
@@ -670,7 +675,7 @@ def union(
             owner=owner,
             public=public,
             proto=Proto.union(Oneof(oneof), variants, named=named, placement=placement),
-            schema_extra=schema_extra or {},
+            schema_extra={"type": "object", **(schema_extra or {})},
         )(model)
 
     return decorate
@@ -728,14 +733,11 @@ def rebuild_models() -> None:
 
 
 __all__ = [
-    "ADAPTER",
     "CORE",
     "DEFINITIONS",
     "MCP",
     "PROTO_ENUMS",
     "PROTO_MESSAGES",
-    "RIFT_SCIP",
-    "SCIP",
     "Annotated",
     "Any",
     "ClosedModel",
@@ -752,6 +754,8 @@ __all__ = [
     "Oneof",
     "Placement",
     "Proto",
+    "RIFT_SCIP",
+    "SCIP",
     "ProtoEmpty",
     "ProtoFieldDescriptor",
     "ProtoFile",

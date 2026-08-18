@@ -23,6 +23,7 @@ class RiftConfigTests(TestCase):
         self.assertEqual(parsed.hooks, [])
         self.assertEqual(parsed.execution.allow, [])
         self.assertEqual(parsed.execution.max_timeout.milliseconds, 30_000)
+        self.assertIsNone(parsed.search.embedding)
 
     def test_tables_are_closed(self) -> None:
         with self.assertRaises(ValidationError):
@@ -58,11 +59,15 @@ class RiftConfigTests(TestCase):
                 {"hooks": [declaration.model_dump(), declaration.model_dump()]}
             )
 
-    def test_adapter_config_does_not_expose_internal_process_limits(self) -> None:
+    def test_search_embedding_names_one_model(self) -> None:
+        parsed = config.RiftConfig.model_validate(
+            {"search": {"embedding": "potion-retrieval-32M"}}
+        )
+        self.assertEqual(parsed.search.embedding, "potion-retrieval-32M")
         with self.assertRaises(ValidationError):
-            config.AdapterProcessConfig.model_validate(
-                {"command": ["rift-adapter-python"], "state-cap": 4}
-            )
+            config.RiftConfig.model_validate({"search": {"embedding": ""}})
+        with self.assertRaises(ValidationError):
+            config.RiftConfig.model_validate({"search": {"model": "x"}})
 
     def test_generated_schema_has_live_protocol_targets(self) -> None:
         schema = config_schema_output()
@@ -71,5 +76,5 @@ class RiftConfigTests(TestCase):
         validate_config_schema(content)
         self.assertEqual(
             set(schema["properties"]),
-            {"execution", "validation", "hooks", "adapters"},
+            {"execution", "providers", "search", "hooks"},
         )
