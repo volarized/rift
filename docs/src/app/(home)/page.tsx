@@ -81,13 +81,13 @@ const DIFFERENCES: {
   {
     statement: "Code facts with reported coverage.",
     title: "Programming language providers",
-    body: "rift combines syntax, semantic analysis and history to give agents the best available context.",
+    body: "Rift will combine syntax, semantic analysis, and history to give agents the best available context.",
     solid: "sphere",
   },
   {
     statement: "Staged changes with verification.",
     title: "Reversible filesystem projections",
-    body: "An agent can collect changes in a pinned projection, inspect them, then publish them into the workspace.",
+    body: "Rift will let agents collect changes in a pinned projection, inspect them, then publish them into the workspace.",
     line: "shimizu",
     // The butterfly stands in the x–z plane; turn it to face the camera.
     tilt: 1.5,
@@ -95,7 +95,7 @@ const DIFFERENCES: {
   {
     statement: "Structured reads and guarded edits.",
     title: "MCP tools and resources",
-    body: "Agents read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
+    body: "Agents will read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
@@ -121,7 +121,7 @@ export default function HomePage() {
             </h1>
 
             <Body className="max-w-115">
-              Agentic development toolkit for reading, discovering and editing codebases.
+              v0.0.1 release foundation for Rift's agentic development toolkit.
             </Body>
           </div>
 
@@ -147,9 +147,9 @@ export default function HomePage() {
           className="h-64 w-full justify-self-center sm:h-80 sm:min-w-96 md:w-80"
         />
         <div className="grid gap-5">
-          <Statement>Agents depend on context and tooling.</Statement>
+          <Statement>Designed for agents that depend on context and tooling.</Statement>
           <Body className="text-balance">
-            rift provides contextual, parser-precise codebase reading and editing tools.
+            Current release ships native binaries, verified installers, and command-line metadata.
           </Body>
         </div>
       </Section>
@@ -200,14 +200,11 @@ export default function HomePage() {
       <Section wide tall className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
           <Statement className="max-w-125">
-            Coming soon, reach out if you want to get involved.
+            Install v0.0.1 and inspect current CLI surface.
           </Statement>
-          <Link
-            href="mailto:contact@volar.sh"
-            className="flex items-center gap-2 text-sm font-medium w-0"
-          >
+          <Link href="/docs" className="flex items-center gap-2 text-sm font-medium w-0">
             <Button variant="outline" size="lg" className="w-fit text-base">
-              Get in touch
+              Read documentation
               <ArrowRightIcon weight="bold" className="h-4 w-4" />
             </Button>
           </Link>

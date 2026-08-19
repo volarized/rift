@@ -1,10 +1,47 @@
 ---
-title: Rift
+title: Rift v0.0.1
+description: Install Rift and inspect its current command-line interface.
 ---
 
-import { VersionRedirect } from "@/components/version-redirect";
+Rift v0.0.1 establishes the repository, validation gates, release pipeline, native binary, and
+verified installers. This page always describes the latest release.
 
-<VersionRedirect />
+## Since v0.0.1
 
-The documentation is versioned. The current tree is the [draft](/docs/draft), which tracks the
-protocol as it is written; a released version keeps its own dated snapshot alongside it.
+### Install
+
+Linux and macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://volar.sh/rift/install.ps1 | iex
+```
+
+Each installer selects the native x86-64 or Arm64 archive, verifies its SHA-256 checksum, and
+installs `rift` for the current user. Set `RIFT_VERSION=v0.0.1` before installation to select this
+release explicitly.
+
+### CLI
+
+Run:
+
+```sh
+rift --help
+```
+
+```text
+agentic development toolkit
+
+Usage: rift
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+v0.0.1 exposes help and version metadata. Operational commands arrive in later releases.
