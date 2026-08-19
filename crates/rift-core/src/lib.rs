@@ -4,6 +4,7 @@ mod error;
 mod identity;
 mod limits;
 mod measurement;
+mod name;
 mod path;
 
 pub mod constants;
@@ -19,6 +20,7 @@ pub use limits::{BudgetExhausted, LoopBudget};
 pub use measurement::{
     ClockRegression, MonotonicClock, PerformanceMeasurement, SystemMonotonicClock,
 };
+pub use name::is_canonical_ascii_name;
 /// Defines a property-like method as one visible field projection.
 ///
 /// Receiver and projection remain explicit at the call site. Use this only for
