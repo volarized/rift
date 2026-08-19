@@ -1,0 +1,10 @@
+[package]
+name = "rift-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Generated wire types and schemas for Rift"
+
+[lints]
+workspace = true

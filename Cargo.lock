@@ -136,9 +136,75 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "clap",
+ "rift-core",
+ "rift-index",
+ "rift-mcp",
+ "rift-model",
+ "rift-protocol",
+ "rift-provider",
+ "rift-server",
+ "rift-syntax",
+]
+
+[[package]]
+name = "rift-core"
+version = "0.0.1"
+
+[[package]]
+name = "rift-index"
+version = "0.0.1"
+dependencies = [
+ "rift-core",
+ "rift-model",
+ "rift-provider",
+]
+
+[[package]]
+name = "rift-mcp"
+version = "0.0.1"
+dependencies = [
+ "rift-core",
+ "rift-protocol",
+ "rift-server",
+]
+
+[[package]]
+name = "rift-model"
+version = "0.0.1"
+dependencies = [
+ "rift-core",
+]
+
+[[package]]
+name = "rift-protocol"
+version = "0.0.1"
+
+[[package]]
+name = "rift-provider"
+version = "0.0.1"
+dependencies = [
+ "rift-core",
+]
+
+[[package]]
+name = "rift-server"
+version = "0.0.1"
+dependencies = [
+ "rift-core",
+ "rift-index",
+ "rift-protocol",
+ "rift-provider",
+]
+
+[[package]]
+name = "rift-syntax"
+version = "0.0.1"
+dependencies = [
+ "rift-core",
+ "rift-provider",
 ]
 
 [[package]]

@@ -1,0 +1,1 @@
+//! Core Rift domain types.

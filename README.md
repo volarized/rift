@@ -20,3 +20,21 @@ and Protobuf outputs with:
 cd protocol
 uv run python -m rift.generate --check
 ```
+
+## Rust development
+
+Rust uses toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `cargo-audit`, and
+`cargo-deny`, then run same gates as CI from repository root:
+
+| Command | Gate |
+| --- | --- |
+| `just format` | Rust formatting |
+| `just generate-check` | Generated protocol drift |
+| `just check` | All targets, features, crate edges, and binary ownership |
+| `just test` | Workspace tests |
+| `just clippy` | Strict Clippy policy |
+| `just docs` | Warning-free Rust documentation |
+| `just audit` | Advisory, license, ban, and source policy |
+| `just rust-gate` | Every gate above |
+
+GitHub Actions runs each target separately so failed gate remains visible by name.

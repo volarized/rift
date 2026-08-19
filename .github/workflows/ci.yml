@@ -84,13 +84,8 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
-
-    # rustsec/audit-check needs these to publish its check run; the workflow's
-    # top-level grant is contents:read only.
     permissions:
       contents: read
-      checks: write
-      issues: write
 
     steps:
       - uses: actions/checkout@v7
@@ -100,15 +95,16 @@ jobs:
       # source of truth; a setup action here would silently override it.
       - uses: Swatinem/rust-cache@v2
 
-      # Verified green on main 2026-08-03, both of these.
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - run: cargo test --all-features
-
-      # RustSec advisory DB. Overlaps Dependabot's cargo security updates, but
-      # blocks at PR time rather than filing a PR after the fact.
-      # Pinned exactly: rustsec/audit-check publishes no floating major tag.
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: astral-sh/setup-uv@v7
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: just,cargo-audit,cargo-deny
+
+      # Keep every local just target visible as its own CI check step.
+      - run: just format
+      - run: just generate-check
+      - run: just check
+      - run: just test
+      - run: just clippy
+      - run: just docs
+      - run: just audit
