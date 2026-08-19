@@ -1,0 +1,16 @@
+[package]
+name = "rift-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Model Context Protocol transport for Rift"
+
+[lints]
+workspace = true
+
+[dependencies]
+rift-core.workspace = true
+rift-protocol.workspace = true
+rift-server.workspace = true

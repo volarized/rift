@@ -1,0 +1,11 @@
+[package]
+name = "rift-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Domain vocabulary and correctness primitives for Rift"
+
+[lints]
+workspace = true

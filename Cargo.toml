@@ -1,21 +1,38 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "protocol/rust"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.97"
-license = "Apache-2.0"
+license = "MIT"
+publish = false
 
 [workspace.dependencies]
-rift = { path = "crates/rift" }
+rift-core = { path = "crates/rift-core" }
+rift-index = { path = "crates/rift-index" }
+rift-mcp = { path = "crates/rift-mcp" }
+rift-model = { path = "crates/rift-model" }
+rift-protocol = { path = "protocol/rust" }
+rift-provider = { path = "crates/rift-provider" }
+rift-server = { path = "crates/rift-server" }
+rift-syntax = { path = "crates/rift-syntax" }
+
 clap = { version = "4.6.5", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unreachable_pub = "warn"
 missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+clone_on_ref_ptr = "warn"
+await_holding_lock = "deny"
+large_futures = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"

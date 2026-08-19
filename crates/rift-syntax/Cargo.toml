@@ -1,0 +1,15 @@
+[package]
+name = "rift-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Syntax fact extraction for Rift"
+
+[lints]
+workspace = true
+
+[dependencies]
+rift-core.workspace = true
+rift-provider.workspace = true
