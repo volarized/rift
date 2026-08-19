@@ -12,6 +12,11 @@ workspace = true
 
 [dependencies]
 clap.workspace = true
+reqwest.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 rift-core.workspace = true
 rift-index.workspace = true
 rift-mcp.workspace = true
@@ -20,7 +25,15 @@ rift-protocol.workspace = true
 rift-provider.workspace = true
 rift-server.workspace = true
 rift-syntax.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+flate2.workspace = true
+tar.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+zip.workspace = true
 
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }

@@ -1,5 +1,6 @@
 //! Rift CLI.
 
+mod update;
 use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
@@ -19,27 +20,11 @@ struct Cli {
 enum CliCommand {
     /// Serve read-only Rust workspace context over stdio MCP.
     Mcp,
-}
-
-#[derive(Debug)]
-enum CliError {
-    Mcp(rift_mcp::StdioServeError),
-}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Mcp(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for CliError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Mcp(error) => Some(error),
-        }
-    }
+    /// Replace current Rift binary with latest official release.
+    Update,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    __CleanupUpdate { parent_pid: u32 },
 }
 
 #[cfg(test)]
@@ -50,7 +35,11 @@ fn cli_command() -> Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Some(outcome)) => {
+            println!("{outcome}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("rift: {error}");
             ExitCode::FAILURE
@@ -58,12 +47,46 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), CliError> {
+#[derive(Debug)]
+enum CliError {
+    Mcp(rift_mcp::StdioServeError),
+    Update(update::UpdateError),
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mcp(error) => error.fmt(formatter),
+            Self::Update(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Mcp(error) => Some(error),
+            Self::Update(error) => Some(error),
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<Option<update::UpdateOutcome>, CliError> {
     match cli.command {
-        None => Ok(()),
-        Some(CliCommand::Mcp) => rift_mcp::serve_stdio(Path::new("."))
-            .await
-            .map_err(CliError::Mcp),
+        None => Ok(None),
+        Some(CliCommand::Mcp) => {
+            rift_mcp::serve_stdio(Path::new("."))
+                .await
+                .map_err(CliError::Mcp)?;
+            Ok(None)
+        }
+        Some(CliCommand::Update) => update::update().map(Some).map_err(CliError::Update),
+        #[cfg(windows)]
+        Some(CliCommand::__CleanupUpdate { parent_pid }) => {
+            let _ = parent_pid;
+            update::cleanup_replaced_binary().map_err(CliError::Update)?;
+            Ok(None)
+        }
     }
 }
 
@@ -87,6 +110,13 @@ mod tests {
     }
 
     #[test]
+    fn update_cli_error_preserves_message_and_source() {
+        let error = CliError::Update(super::update::error_for_test());
+        assert_eq!(error.to_string(), "release version is invalid");
+        assert!(error.source().is_some());
+    }
+
+    #[test]
     fn help_identifies_executable_and_mcp_command() {
         let mut command = cli_command();
         command.build();
@@ -97,7 +127,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp", "help"]
+            ["mcp", "update", "help"]
         );
     }
 
@@ -106,6 +136,13 @@ mod tests {
         let parsed = Cli::try_parse_from(["rift", "mcp"]).expect("mcp must parse");
         assert!(matches!(parsed.command, Some(CliCommand::Mcp)));
         assert!(Cli::try_parse_from(["rift", "mcp", "--root", "."]).is_err());
+    }
+
+    #[test]
+    fn update_command_accepts_no_extra_arguments() {
+        let parsed = Cli::try_parse_from(["rift", "update"]).expect("update must parse");
+        assert!(matches!(parsed.command, Some(CliCommand::Update)));
+        assert!(Cli::try_parse_from(["rift", "update", "--version", "v0.0.2"]).is_err());
     }
 
     #[test]
