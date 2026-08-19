@@ -18,6 +18,11 @@ skills-lock.json
 .env.*
 !.env.example
 
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
 # Machine-local Rift overrides, caches, state, and worktrees.
 .rift/
 

@@ -1,0 +1,23 @@
+[project]
+name = "rift-release"
+version = "0.0.1"
+description = "Rift release validation and packaging tools"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["typer>=0.20.0,<1"]
+
+[project.scripts]
+rift-release = "rift_release.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.4.0,<10"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rift_release"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,135 @@
+# Semantic tags publish Rift release artifacts.
+name: rift-release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+concurrency:
+  group: rift-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RIFT_TAG: ${{ github.ref_name }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tools/rift-release/uv.lock
+      - name: Validate release tag
+        run: uv run --locked --project tools/rift-release rift-release validate-tag
+      - name: Require commit from main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/rift
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: target/aarch64-unknown-linux-gnu/release/rift
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/rift
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/rift
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/rift.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: target/aarch64-pc-windows-msvc/release/rift.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RIFT_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tools/rift-release/uv.lock
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: release-${{ matrix.target }}
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}" --package rift
+      - name: Smoke test release binary
+        run: >-
+          uv run --locked --project tools/rift-release rift-release verify-binary
+          --binary "${{ matrix.binary }}"
+      - name: Package release archive
+        run: >-
+          uv run --locked --project tools/rift-release rift-release package
+          --binary "${{ matrix.binary }}"
+          --output dist
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: rift-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: rift-release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tools/rift-release/uv.lock
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          path: dist
+          pattern: rift-*
+          merge-multiple: true
+      - name: Write checksums
+        run: >-
+          uv run --locked --project tools/rift-release rift-release checksums
+          --directory dist
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v3.2.0
+        with:
+          subject-path: dist/*
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$RIFT_TAG" dist/*
+          --verify-tag
+          --latest
+          --title "Rift $RIFT_TAG"
+          --generate-notes
