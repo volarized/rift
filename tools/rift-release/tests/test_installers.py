@@ -1,14 +1,8 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = []
-# ///
 """Offline contract tests for downloadable Rift installers."""
 
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -17,19 +11,14 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 import textwrap
-import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
-REPOSITORY = Path(__file__).parents[2]
-RELEASE_SCRIPT = REPOSITORY / "scripts" / "release.py"
-SPEC = importlib.util.spec_from_file_location("rift_release", RELEASE_SCRIPT)
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError("could not load release helper")
-release = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(release)
+import pytest
+from rift_release import release
 
+REPOSITORY = Path(__file__).parents[3]
 VERSION = "v1.2.3"
 
 
@@ -57,7 +46,9 @@ def windows_target() -> str:
     return f"{architecture()}-pc-windows-msvc"
 
 
-def write_manifest(directory: Path, archive: Path, *, digest: str | None = None) -> Path:
+def write_manifest(
+    directory: Path, archive: Path, *, digest: str | None = None
+) -> Path:
     """Write combined release checksum manifest for one fixture archive."""
     value = digest or hashlib.sha256(archive.read_bytes()).hexdigest()
     manifest = directory / f"rift-{VERSION}-checksums.sha256"
@@ -70,7 +61,7 @@ def package_fixture(root: Path, target: str, binary_name: str, data: bytes) -> P
     repository = root / "repository"
     repository.mkdir()
     (repository / "README.md").write_text("Rift fixture\n", encoding="utf-8")
-    (repository / "LICENSE").write_text("Apache-2.0\n", encoding="utf-8")
+    (repository / "LICENSE.md").write_text("MIT\n", encoding="utf-8")
     binary = repository / binary_name
     binary.write_bytes(data)
     binary.chmod(0o755)
@@ -126,25 +117,17 @@ def fake_curl(directory: Path) -> Path:
     return executable
 
 
-@unittest.skipIf(os.name == "nt", "bash installer targets Unix")
-class BashInstallerTests(unittest.TestCase):
-    """Validate curl installer through fake HTTPS transport."""
+@dataclass(frozen=True)
+class BashInstallerFixture:
+    """Offline Bash installer fixture."""
 
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        self.binary = b"#!/usr/bin/env bash\nprintf 'fixture-rift %s\\n' \"$*\"\n"
-        self.archive = package_fixture(self.root, unix_target(), "rift", self.binary)
-        self.fake_bin = self.root / "bin"
-        self.fake_bin.mkdir()
-        fake_curl(self.fake_bin)
-        self.install_dir = self.root / "install"
-        self.log = self.root / "curl.log"
+    archive: Path
+    fake_bin: Path
+    install_dir: Path
+    log: Path
+    binary: bytes
 
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
-
-    def run_installer(
+    def run(
         self,
         version: str | None = VERSION,
         *,
@@ -166,7 +149,7 @@ class BashInstallerTests(unittest.TestCase):
         )
         command = ["bash", str(REPOSITORY / "scripts" / "install.sh")]
         if version is not None:
-            command.append(version)
+            command.extend(["--version", version])
         return subprocess.run(
             command,
             env=environment,
@@ -175,67 +158,99 @@ class BashInstallerTests(unittest.TestCase):
             text=True,
         )
 
-    def test_explicit_and_latest_install(self) -> None:
-        explicit = self.run_installer()
-        self.assertEqual(explicit.returncode, 0, explicit.stderr)
-        installed = self.install_dir / "rift"
-        self.assertEqual(installed.read_bytes(), self.binary)
-        self.assertTrue(os.access(installed, os.X_OK))
 
-        shutil.rmtree(self.install_dir)
-        latest = self.run_installer(None)
-        self.assertEqual(latest.returncode, 0, latest.stderr)
-        self.assertTrue(installed.is_file())
+@pytest.fixture
+def bash_installer(tmp_path: Path) -> BashInstallerFixture:
+    binary = b"#!/usr/bin/env bash\nprintf 'fixture-rift %s\\n' \"$*\"\n"
+    archive = package_fixture(tmp_path, unix_target(), "rift", binary)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_curl(fake_bin)
+    return BashInstallerFixture(
+        archive=archive,
+        fake_bin=fake_bin,
+        install_dir=tmp_path / "install",
+        log=tmp_path / "curl.log",
+        binary=binary,
+    )
 
-        requests = [json.loads(line) for line in self.log.read_text().splitlines()]
-        self.assertTrue(all("--proto-redir" in request for request in requests))
-        self.assertTrue(all("=https" in request for request in requests))
 
-    def test_bad_checksum_is_rejected_without_install(self) -> None:
-        write_manifest(self.archive.parent, self.archive, digest="0" * 64)
-        result = self.run_installer()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checksum mismatch", result.stderr)
-        self.assertFalse((self.install_dir / "rift").exists())
+@pytest.mark.skipif(os.name == "nt", reason="Bash installer targets Unix")
+class TestBashInstaller:
+    def test_explicit_and_latest_install(
+        self,
+        bash_installer: BashInstallerFixture,
+    ) -> None:
+        explicit = bash_installer.run()
+        assert explicit.returncode == 0, explicit.stderr
+        installed = bash_installer.install_dir / "rift"
+        assert installed.read_bytes() == bash_installer.binary
+        assert os.access(installed, os.X_OK)
 
-    def test_invalid_latest_tag_is_rejected(self) -> None:
-        result = self.run_installer(None, latest="2026-08-18")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid tag", result.stderr)
+        shutil.rmtree(bash_installer.install_dir)
+        latest = bash_installer.run(None)
+        assert latest.returncode == 0, latest.stderr
+        assert installed.is_file()
 
-    def test_non_https_download_is_rejected(self) -> None:
-        result = self.run_installer(download_base="http://fixture.invalid/download")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("non-HTTPS", result.stderr)
+        requests = [
+            json.loads(line) for line in bash_installer.log.read_text().splitlines()
+        ]
+        assert all("--proto-redir" in request for request in requests)
+        assert all("=https" in request for request in requests)
 
-    def test_archive_without_exact_binary_is_rejected(self) -> None:
-        root = self.archive.name.removesuffix(".tar.gz")
+    def test_bad_checksum_is_rejected_without_install(
+        self,
+        bash_installer: BashInstallerFixture,
+    ) -> None:
+        write_manifest(
+            bash_installer.archive.parent, bash_installer.archive, digest="0" * 64
+        )
+        result = bash_installer.run()
+        assert result.returncode != 0
+        assert "checksum mismatch" in result.stderr
+        assert not (bash_installer.install_dir / "rift").exists()
+
+    def test_invalid_latest_tag_is_rejected(
+        self,
+        bash_installer: BashInstallerFixture,
+    ) -> None:
+        result = bash_installer.run(None, latest="2026-08-18")
+        assert result.returncode != 0
+        assert "invalid tag" in result.stderr
+
+    def test_non_https_download_is_rejected(
+        self,
+        bash_installer: BashInstallerFixture,
+    ) -> None:
+        result = bash_installer.run(download_base="http://fixture.invalid/download")
+        assert result.returncode != 0
+        assert "non-HTTPS" in result.stderr
+
+    def test_archive_without_exact_binary_is_rejected(
+        self,
+        bash_installer: BashInstallerFixture,
+    ) -> None:
+        root = bash_installer.archive.name.removesuffix(".tar.gz")
         data = b"wrong binary"
-        with tarfile.open(self.archive, "w:gz") as archive:
+        with tarfile.open(bash_installer.archive, "w:gz") as archive:
             info = tarfile.TarInfo(f"{root}/not-rift")
             info.size = len(data)
             archive.addfile(info, io.BytesIO(data))
-        write_manifest(self.archive.parent, self.archive)
+        write_manifest(bash_installer.archive.parent, bash_installer.archive)
 
-        result = self.run_installer()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unexpected files", result.stderr)
-        self.assertFalse((self.install_dir / "rift").exists())
+        result = bash_installer.run()
+        assert result.returncode != 0
+        assert "unexpected files" in result.stderr
+        assert not (bash_installer.install_dir / "rift").exists()
 
 
-@unittest.skipUnless(os.name == "nt" and shutil.which("pwsh"), "Windows PowerShell is unavailable")
-class PowerShellInstallerTests(unittest.TestCase):
-    """Validate irm installer through overridden fetch boundary."""
+@dataclass(frozen=True)
+class PowerShellInstallerFixture:
+    """Offline PowerShell installer fixture."""
 
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        self.binary = b"fixture windows binary"
-        self.archive = package_fixture(self.root, windows_target(), "rift.exe", self.binary)
-        self.install_dir = self.root / "install"
-
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
+    archive: Path
+    install_dir: Path
+    root: Path
 
     def harness(self) -> Path:
         """Write PowerShell harness overriding only network boundary."""
@@ -267,30 +282,56 @@ class PowerShellInstallerTests(unittest.TestCase):
         )
         return harness
 
-    def test_windows_install(self) -> None:
-        command = ["pwsh", "-NoProfile", "-File", str(self.harness())]
+
+@pytest.fixture
+def powershell_installer(tmp_path: Path) -> PowerShellInstallerFixture:
+    archive = package_fixture(
+        tmp_path,
+        windows_target(),
+        "rift.exe",
+        b"fixture windows binary",
+    )
+    return PowerShellInstallerFixture(
+        archive=archive,
+        install_dir=tmp_path / "install",
+        root=tmp_path,
+    )
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="Windows PowerShell is unavailable",
+)
+class TestPowerShellInstaller:
+    def test_windows_install(
+        self,
+        powershell_installer: PowerShellInstallerFixture,
+    ) -> None:
+        command = ["pwsh", "-NoProfile", "-File", str(powershell_installer.harness())]
         for _ in range(2):
             result = subprocess.run(
-                command,
-                capture_output=True,
-                check=False,
-                text=True,
+                command, capture_output=True, check=False, text=True
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.install_dir / "rift.exe").read_bytes(), self.binary)
+            assert result.returncode == 0, result.stderr
+        assert (powershell_installer.install_dir / "rift.exe").read_bytes() == (
+            b"fixture windows binary"
+        )
 
-    def test_bad_checksum_is_rejected(self) -> None:
-        write_manifest(self.archive.parent, self.archive, digest="0" * 64)
+    def test_bad_checksum_is_rejected(
+        self,
+        powershell_installer: PowerShellInstallerFixture,
+    ) -> None:
+        write_manifest(
+            powershell_installer.archive.parent,
+            powershell_installer.archive,
+            digest="0" * 64,
+        )
         result = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(self.harness())],
+            ["pwsh", "-NoProfile", "-File", str(powershell_installer.harness())],
             capture_output=True,
             check=False,
             text=True,
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checksum mismatch", result.stderr)
-        self.assertFalse((self.install_dir / "rift.exe").exists())
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert result.returncode != 0
+        assert "checksum mismatch" in result.stderr
+        assert not (powershell_installer.install_dir / "rift.exe").exists()

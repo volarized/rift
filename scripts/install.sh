@@ -2,14 +2,14 @@
 # Install Rift from checksummed GitHub Release archive.
 #
 #   curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash
-#   curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash -s -- v1.2.3
+#   curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash -s -- --version v1.2.3
 set -euo pipefail
 
 readonly RIFT_REPOSITORY="${RIFT_REPOSITORY:-volarized/rift}"
 readonly RIFT_GITHUB_API="${RIFT_GITHUB_API:-https://api.github.com}"
 readonly RIFT_DOWNLOAD_BASE="${RIFT_DOWNLOAD_BASE:-https://github.com/${RIFT_REPOSITORY}/releases/download}"
 readonly RIFT_INSTALL_DIR="${RIFT_INSTALL_DIR:-${HOME}/.rift/bin}"
-readonly REQUESTED_VERSION="${1:-${RIFT_VERSION:-latest}}"
+REQUESTED_VERSION="${RIFT_VERSION:-latest}"
 
 work_dir=""
 candidate=""
@@ -17,6 +17,45 @@ candidate=""
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Install Rift from a checksummed GitHub Release archive.
+
+Usage: install.sh [--version vX.Y.Z]
+
+Options:
+  --version vX.Y.Z  Install exact release instead of latest.
+  --help            Print this help.
+
+Environment:
+  RIFT_VERSION      Exact release used when --version is absent.
+  RIFT_INSTALL_DIR  Destination directory for Rift binary.
+EOF
+}
+
+parse_arguments() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --version)
+        (( $# >= 2 )) || fail "--version requires vX.Y.Z"
+        REQUESTED_VERSION="$2"
+        shift 2
+        ;;
+      --version=*)
+        REQUESTED_VERSION="${1#*=}"
+        [[ -n "$REQUESTED_VERSION" ]] || fail "--version requires vX.Y.Z"
+        shift
+        ;;
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      *) fail "unknown argument: $1" ;;
+    esac
+  done
+  readonly REQUESTED_VERSION
 }
 
 cleanup() {
@@ -58,9 +97,10 @@ valid_version() {
 }
 
 resolve_version() {
-  if [[ "$REQUESTED_VERSION" != latest ]]; then
-    valid_version "$REQUESTED_VERSION" || fail "version must match vX.Y.Z: $REQUESTED_VERSION"
-    printf '%s\n' "$REQUESTED_VERSION"
+  local requested="$1"
+  if [[ "$requested" != latest ]]; then
+    valid_version "$requested" || fail "version must match vX.Y.Z: $requested"
+    printf '%s\n' "$requested"
     return
   fi
 
@@ -116,18 +156,19 @@ verify_archive() {
   local archive="$1" root="$2" expected actual
   expected="${root}/rift
 ${root}/README.md
-${root}/LICENSE"
+${root}/LICENSE.md"
   actual="$(tar -tzf "$archive")"
   [[ "$actual" == "$expected" ]] || fail "archive contains unexpected files"
 }
 
 main() {
+  parse_arguments "$@"
   command -v curl >/dev/null 2>&1 || fail "curl is required"
   command -v install >/dev/null 2>&1 || fail "install is required"
   command -v tar >/dev/null 2>&1 || fail "tar is required"
 
   local version target root archive checksums base
-  version="$(resolve_version)"
+  version="$(resolve_version "$REQUESTED_VERSION")"
   target="$(detect_target)"
   root="rift-${version}-${target}"
   archive="${root}.tar.gz"
@@ -154,4 +195,4 @@ main() {
   esac
 }
 
-main
+main "$@"

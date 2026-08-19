@@ -3,17 +3,39 @@
 .SYNOPSIS
     Installs Rift from checksummed GitHub Release archive.
 
+.PARAMETER Version
+    Installs exact vX.Y.Z release. Defaults to RIFT_VERSION or latest.
+
+.PARAMETER Help
+    Prints command usage.
+
 .EXAMPLE
     irm https://volar.sh/rift/install.ps1 | iex
 
 .EXAMPLE
-    $env:RIFT_VERSION = "v1.2.3"; irm https://volar.sh/rift/install.ps1 | iex
+    & ([scriptblock]::Create((irm https://volar.sh/rift/install.ps1))) -Version v1.2.3
 #>
 
 [CmdletBinding()]
 param(
-    [string]$Version = $(if ($env:RIFT_VERSION) { $env:RIFT_VERSION } else { "latest" })
+    [string]$Version = $(if ($env:RIFT_VERSION) { $env:RIFT_VERSION } else { "latest" }),
+    [switch]$Help
 )
+
+if ($Help) {
+    Write-Host @'
+Usage: install.ps1 [-Version vX.Y.Z]
+
+Options:
+  -Version vX.Y.Z  Install exact release instead of latest.
+  -Help             Print this help.
+
+Environment:
+  RIFT_VERSION      Exact release used when -Version is absent.
+  RIFT_INSTALL_DIR  Destination directory for Rift binary.
+'@
+    return
+}
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -176,7 +198,7 @@ function Expand-CheckedArchive {
                 } |
                 Sort-Object
         )
-        $expected = @("$Root/LICENSE", "$Root/README.md", "$Root/rift.exe") | Sort-Object
+        $expected = @("$Root/LICENSE.md", "$Root/README.md", "$Root/rift.exe") | Sort-Object
         if (Compare-Object $files $expected) {
             Stop-Install "archive contains unexpected files"
         }
@@ -184,7 +206,7 @@ function Expand-CheckedArchive {
     }
 
     $listing = @(& tar -tzf $Archive)
-    $expected = @("$Root/rift", "$Root/README.md", "$Root/LICENSE")
+    $expected = @("$Root/rift", "$Root/README.md", "$Root/LICENSE.md")
     if (Compare-Object $listing $expected -SyncWindow 0) {
         Stop-Install "archive contains unexpected files"
     }

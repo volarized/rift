@@ -140,5 +140,8 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v7.6.0
         with:
-          enable-cache: false
-      - run: uv run --script scripts/tests/test_installers.py
+          enable-cache: true
+          cache-dependency-glob: tools/rift-release/uv.lock
+      - run: >-
+          uv run --locked --project tools/rift-release pytest
+          tools/rift-release/tests/test_installers.py

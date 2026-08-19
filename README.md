@@ -19,15 +19,26 @@ Linux and macOS:
 curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash
 ```
 
+Pass `--version` after `bash -s --` to install an exact release:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash -s -- --version v0.0.1
+```
+
 Windows PowerShell:
 
 ```powershell
 irm https://volar.sh/rift/install.ps1 | iex
 ```
 
+Invoke the downloaded script block with `-Version` to install an exact release:
+
+```powershell
+& ([scriptblock]::Create((irm https://volar.sh/rift/install.ps1))) -Version v0.0.1
+```
+
 Installers select native x86-64 or Arm64 archive, verify release checksum, and install under current
-user account. Set the `RIFT_VERSION` environment variable to `vX.Y.Z` before running the command to
-select an exact release.
+user account. Without a version argument or `RIFT_VERSION`, each installer resolves latest release.
 
 ## Protocol development
 
