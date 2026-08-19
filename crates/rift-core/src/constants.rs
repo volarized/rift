@@ -38,3 +38,15 @@ pub const RIFT_STATE_DIRECTORY_PREFIX: &str = ".rift/";
 pub const STAGE_NAME_BYTES_MAX: usize = 64;
 /// Punctuation accepted in provider-composition stage names.
 pub const STAGE_NAME_PUNCTUATION: &[u8] = b"-";
+/// Default maximum Rust files indexed from one workspace.
+pub const WORKSPACE_FILES_MAX_DEFAULT: usize = 20_000;
+/// Shared default maximum bytes admitted from one Rust source.
+pub const RUST_SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
+/// Default maximum aggregate Rust source bytes indexed from one workspace.
+pub const WORKSPACE_BYTES_MAX_DEFAULT: usize = 128 * 1_024 * 1_024;
+/// Default maximum directory depth scanned from one workspace.
+pub const WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT: usize = 64;
+/// Default maximum results returned by one read query.
+pub const READ_RESULTS_MAX_DEFAULT: usize = 1_000;
+/// Directories excluded from current-workspace indexing.
+pub const WORKSPACE_IGNORED_DIRECTORIES: &[&str] = &[".git", ".rift", "target"];

@@ -1,9 +1,9 @@
 use std::fmt;
 
 use rift_core::ProjectPath;
+use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
 use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
 
-const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1024 * 1024;
 const SYNTAX_NODES_MAX_DEFAULT: usize = 250_000;
 const SYNTAX_DEPTH_MAX_DEFAULT: usize = 512;
 
@@ -77,7 +77,7 @@ impl RustSyntaxLimits {
 impl Default for RustSyntaxLimits {
     fn default() -> Self {
         Self {
-            source_bytes_max: SOURCE_BYTES_MAX_DEFAULT,
+            source_bytes_max: RUST_SOURCE_BYTES_MAX_DEFAULT,
             syntax_nodes_max: SYNTAX_NODES_MAX_DEFAULT,
             syntax_depth_max: SYNTAX_DEPTH_MAX_DEFAULT,
         }
@@ -187,7 +187,7 @@ impl RustQuery {
         if captures_max == 0 {
             return Err(RustSyntaxError::new(RustSyntaxViolation::ZeroLimit));
         }
-        if source.len() > SOURCE_BYTES_MAX_DEFAULT {
+        if source.len() > RUST_SOURCE_BYTES_MAX_DEFAULT {
             return Err(RustSyntaxError::new(RustSyntaxViolation::SourceTooLarge));
         }
         let language = rust_language();

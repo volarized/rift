@@ -22,6 +22,7 @@ rift-syntax = { path = "crates/rift-syntax" }
 clap = { version = "4.6.5", features = ["derive"] }
 tree-sitter = "=0.25.10"
 tree-sitter-rust = "=0.24.2"
+tempfile = "3.27.0"
 unicode-normalization = "0.1.24"
 
 [workspace.lints.rust]
