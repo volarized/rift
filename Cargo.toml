@@ -6,17 +6,18 @@ members = ["crates/*", "protocol/rust"]
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.97"
-license = "Apache-2.0"
+license = "MIT"
+publish = false
 
 [workspace.dependencies]
-rift-core = { path = "crates/rift-core", version = "=0.0.1" }
-rift-index = { path = "crates/rift-index", version = "=0.0.1" }
-rift-mcp = { path = "crates/rift-mcp", version = "=0.0.1" }
-rift-model = { path = "crates/rift-model", version = "=0.0.1" }
-rift-protocol = { path = "protocol/rust", version = "=0.0.1" }
-rift-provider = { path = "crates/rift-provider", version = "=0.0.1" }
-rift-server = { path = "crates/rift-server", version = "=0.0.1" }
-rift-syntax = { path = "crates/rift-syntax", version = "=0.0.1" }
+rift-core = { path = "crates/rift-core" }
+rift-index = { path = "crates/rift-index" }
+rift-mcp = { path = "crates/rift-mcp" }
+rift-model = { path = "crates/rift-model" }
+rift-protocol = { path = "protocol/rust" }
+rift-provider = { path = "crates/rift-provider" }
+rift-server = { path = "crates/rift-server" }
+rift-syntax = { path = "crates/rift-syntax" }
 
 clap = { version = "4.6.5", features = ["derive"] }
 
