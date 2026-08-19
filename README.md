@@ -36,9 +36,18 @@ Rust uses toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `carg
 | `just docs` | Warning-free Rust documentation |
 | `just audit` | Advisory, license, ban, and source policy |
 | `just coverage` | CLI coverage report and hard 86% line floor |
+| `just release-test` | Deterministic release archive contract |
 | `just rust-gate` | Every gate above |
 
 GitHub Actions runs each target separately so failed gate remains visible by name.
 
 Install pre-commit hook with `uvx pre-commit install`. It runs `just rust-gate`, including same
 coverage and Cargo policy checks enforced by CI.
+
+## Rift releases
+
+Pushing a `vX.Y.Z` tag on a commit from `main` starts Rift binary release. Tag version must match
+workspace version. Release environment approval gates publication after all native builds pass.
+
+Each release contains checksummed, provenance-attested archives for Linux, macOS, and Windows on
+x86-64 and Arm64. Unix archives contain `rift`; Windows archives contain `rift.exe`.

@@ -26,4 +26,7 @@ audit:
 coverage:
     cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 
-rust-gate: format generate-check check test clippy docs audit coverage
+release-test:
+    uv run python -m unittest scripts/tests/test_release.py
+
+rust-gate: format generate-check check test clippy docs audit coverage release-test
