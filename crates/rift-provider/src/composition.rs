@@ -1,7 +1,8 @@
 use std::any::{TypeId, type_name};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rift_core::constants::{STAGE_NAME_BYTES_MAX, STAGE_NAME_PUNCTUATION};
@@ -101,11 +102,32 @@ impl<T: 'static> Clone for Flow<T> {
     }
 }
 
+/// Typed keyed-publication output handle.
+#[derive(Debug)]
+pub struct KeyedFlow<K: 'static, T: 'static> {
+    owner: u64,
+    stage: usize,
+    _value: PhantomData<fn() -> (K, T)>,
+}
+
+impl<K: 'static, T: 'static> Copy for KeyedFlow<K, T> {}
+
+impl<K: 'static, T: 'static> Clone for KeyedFlow<K, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 /// Runtime cardinality retained after typed graph construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowCardinality {
     /// One immutable publication.
     Single,
+    /// Bounded publications keyed by named Rust type.
+    Keyed {
+        /// Canonical Rust key type name.
+        key_type: &'static str,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +138,7 @@ struct StageNode {
     component_input: ErasedType,
     output: ErasedType,
     cardinality: FlowCardinality,
+    key_join_policy: Option<KeyJoinPolicy>,
 }
 
 struct StageRegistration<'a> {
@@ -144,6 +167,25 @@ impl<'a> StageRegistration<'a> {
             cardinality: FlowCardinality::Single,
         }
     }
+
+    fn by_key<Key: 'static>(
+        path: StagePath,
+        component: &'a ProviderId,
+        inputs: &'a [usize],
+        component_input: ErasedType,
+        output: ErasedType,
+    ) -> Self {
+        Self {
+            path,
+            component,
+            inputs,
+            component_input,
+            output,
+            cardinality: FlowCardinality::Keyed {
+                key_type: type_name::<Key>(),
+            },
+        }
+    }
 }
 
 /// Read-only compiled stage description.
@@ -155,43 +197,43 @@ pub struct StageDescriptor {
     component_input_type: &'static str,
     output_type: &'static str,
     cardinality: FlowCardinality,
+    key_join_policy: Option<KeyJoinPolicy>,
 }
 
 impl StageDescriptor {
-    /// Returns stable scoped path.
-    #[must_use]
-    pub const fn path(&self) -> &StagePath {
-        &self.path
+    rift_core::property! {
+        /// Returns stable scoped path.
+        pub const fn path(&self) -> &StagePath = &self.path;
     }
 
-    /// Returns implementation identity.
-    #[must_use]
-    pub const fn component(&self) -> &ProviderId {
-        &self.component
+    rift_core::property! {
+        /// Returns implementation identity.
+        pub const fn component(&self) -> &ProviderId = &self.component;
     }
 
-    /// Returns ordered upstream stage paths.
-    #[must_use]
-    pub const fn inputs(&self) -> &[StagePath] {
-        &self.inputs
+    rift_core::property! {
+        /// Returns ordered upstream stage paths.
+        pub const fn inputs(&self) -> &[StagePath] = &self.inputs;
     }
 
-    /// Returns component input type recorded before erasure.
-    #[must_use]
-    pub const fn component_input_type(&self) -> &'static str {
-        self.component_input_type
+    rift_core::property! {
+        /// Returns component input type recorded before erasure.
+        pub const fn component_input_type(&self) -> &'static str = self.component_input_type;
     }
 
-    /// Returns concrete output type recorded before erasure.
-    #[must_use]
-    pub const fn output_type(&self) -> &'static str {
-        self.output_type
+    rift_core::property! {
+        /// Returns concrete output type recorded before erasure.
+        pub const fn output_type(&self) -> &'static str = self.output_type;
     }
 
-    /// Returns output cardinality.
-    #[must_use]
-    pub const fn cardinality(&self) -> FlowCardinality {
-        self.cardinality
+    rift_core::property! {
+        /// Returns output cardinality.
+        pub const fn cardinality(&self) -> FlowCardinality = self.cardinality;
+    }
+
+    rift_core::property! {
+        /// Returns keyed-join policy for join stages.
+        pub const fn key_join_policy(&self) -> Option<KeyJoinPolicy> = self.key_join_policy;
     }
 }
 
@@ -322,6 +364,26 @@ impl CompositionBuilder {
         Ok(self.flow(stage))
     }
 
+    /// Adds one keyed source stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] for invalid or duplicate name.
+    pub fn source_many<K: 'static, O: 'static>(
+        &mut self,
+        name: &str,
+        component: &Component<(), O>,
+    ) -> Result<KeyedFlow<K, O>, CompositionError> {
+        let stage = self.add(StageRegistration::by_key::<K>(
+            StagePath::root(&self.id, name)?,
+            component.id(),
+            &[],
+            ErasedType::of::<()>(),
+            ErasedType::of::<O>(),
+        ))?;
+        Ok(self.keyed_flow(stage))
+    }
+
     /// Connects one typed single input to next stage.
     ///
     /// # Errors
@@ -368,6 +430,79 @@ impl CompositionBuilder {
         Ok(self.flow(stage))
     }
 
+    /// Maps one nested typed stage over every key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    pub fn map_each<K: 'static, I: 'static, O: 'static>(
+        &mut self,
+        input: KeyedFlow<K, I>,
+        name: &str,
+        component: &Component<I, O>,
+    ) -> Result<KeyedFlow<K, O>, CompositionError> {
+        self.validate_owner(input.owner)?;
+        let stage = self.add(StageRegistration::by_key::<K>(
+            StagePath::root(&self.id, name)?,
+            component.id(),
+            &[input.stage],
+            ErasedType::of::<I>(),
+            ErasedType::of::<O>(),
+        ))?;
+        Ok(self.keyed_flow(stage))
+    }
+
+    /// Joins two keyed flows under one explicit missing-key policy.
+    ///
+    /// Policy is execution metadata; key type is enforced by signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    pub fn join_by_key<K: 'static, A: 'static, B: 'static>(
+        &mut self,
+        left: KeyedFlow<K, A>,
+        right: KeyedFlow<K, B>,
+        name: &str,
+        policy: KeyJoinPolicy,
+    ) -> Result<KeyedFlow<K, JoinItem<A, B>>, CompositionError> {
+        self.validate_owner(left.owner)?;
+        self.validate_owner(right.owner)?;
+        let component = ProviderId::new(format!("join.{name}"))
+            .map_err(|_| CompositionError::new(CompositionErrorKind::InvalidName))?;
+        let stage = self.add(StageRegistration::by_key::<K>(
+            StagePath::root(&self.id, name)?,
+            &component,
+            &[left.stage, right.stage],
+            ErasedType::of::<(A, B)>(),
+            ErasedType::of::<JoinItem<A, B>>(),
+        ))?;
+        self.stages[stage].key_join_policy = Some(policy);
+        Ok(self.keyed_flow(stage))
+    }
+
+    /// Aggregates keyed flow into one typed publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    pub fn aggregate<K: 'static, I: 'static, O: 'static>(
+        &mut self,
+        input: KeyedFlow<K, I>,
+        name: &str,
+        component: &Component<Vec<I>, O>,
+    ) -> Result<Flow<O>, CompositionError> {
+        self.validate_owner(input.owner)?;
+        let stage = self.add(StageRegistration::single(
+            StagePath::root(&self.id, name)?,
+            component.id(),
+            &[input.stage],
+            ErasedType::of::<Vec<I>>(),
+            ErasedType::of::<O>(),
+        ))?;
+        Ok(self.flow(stage))
+    }
+
     /// Selects composition output.
     ///
     /// # Errors
@@ -409,6 +544,7 @@ impl CompositionBuilder {
             component_input: registration.component_input,
             output: registration.output,
             cardinality: registration.cardinality,
+            key_join_policy: None,
         });
         Ok(stage)
     }
@@ -422,6 +558,14 @@ impl CompositionBuilder {
 
     const fn flow<T: 'static>(&self, stage: usize) -> Flow<T> {
         Flow {
+            owner: self.token,
+            stage,
+            _value: PhantomData,
+        }
+    }
+
+    const fn keyed_flow<K: 'static, T: 'static>(&self, stage: usize) -> KeyedFlow<K, T> {
+        KeyedFlow {
             owner: self.token,
             stage,
             _value: PhantomData,
@@ -503,6 +647,7 @@ impl ProviderComposition {
                 component_input_type: node.component_input.name,
                 output_type: node.output.name,
                 cardinality: node.cardinality,
+                key_join_policy: node.key_join_policy,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -598,6 +743,7 @@ impl CompositionEditor {
                 component_input: ErasedType::of::<T>(),
                 output: ErasedType::of::<T>(),
                 cardinality: FlowCardinality::Single,
+                key_join_policy: None,
             },
         );
         Ok(())
@@ -674,6 +820,215 @@ fn validate_name(name: &str) -> Result<(), CompositionError> {
     Ok(())
 }
 
+/// Explicit keyed join policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyJoinPolicy {
+    /// Require matching key sets; mismatches remain coverage entries.
+    Exact,
+    /// Emit only keys present on both sides.
+    Inner,
+    /// Emit every left key.
+    Left,
+    /// Emit union of both key sets.
+    Union,
+}
+
+/// Side absent from one joined key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSide {
+    /// Left input lacks key.
+    Left,
+    /// Right input lacks key.
+    Right,
+}
+
+/// One joined key with explicit optional sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinItem<L, R> {
+    /// Left value when present.
+    pub left: Option<L>,
+    /// Right value when present.
+    pub right: Option<R>,
+}
+
+/// Join output plus missing-item coverage retained under every policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinCoverage<K, L, R> {
+    /// Policy-selected output items.
+    pub items: BTreeMap<K, JoinItem<L, R>>,
+    /// Every absent side, including keys excluded by inner/left policy.
+    pub missing: Vec<(K, MissingSide)>,
+}
+
+/// Aligns keyed values without silently dropping missing-item coverage.
+#[must_use]
+pub fn join_keyed<K, L, R>(
+    policy: KeyJoinPolicy,
+    left: &BTreeMap<K, L>,
+    right: &BTreeMap<K, R>,
+) -> JoinCoverage<K, L, R>
+where
+    K: Clone + Ord,
+    L: Clone,
+    R: Clone,
+{
+    let keys = left
+        .keys()
+        .chain(right.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut items = BTreeMap::new();
+    let mut missing = Vec::new();
+    for key in keys {
+        let left_value = left.get(&key).cloned();
+        let right_value = right.get(&key).cloned();
+        if left_value.is_none() {
+            missing.push((key.clone(), MissingSide::Left));
+        }
+        if right_value.is_none() {
+            missing.push((key.clone(), MissingSide::Right));
+        }
+        let include = match policy {
+            KeyJoinPolicy::Exact | KeyJoinPolicy::Union => true,
+            KeyJoinPolicy::Inner => left_value.is_some() && right_value.is_some(),
+            KeyJoinPolicy::Left => left_value.is_some(),
+        };
+        if include {
+            items.insert(
+                key,
+                JoinItem {
+                    left: left_value,
+                    right: right_value,
+                },
+            );
+        }
+    }
+    JoinCoverage { items, missing }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheEntry<V> {
+    revision: u64,
+    value: V,
+}
+
+/// Per-key cache reuse counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheUpdate {
+    /// Entries reused with unchanged revision.
+    pub reused: usize,
+    /// Entries recomputed after insertion or revision change.
+    pub recomputed: usize,
+    /// Entries removed because input key disappeared.
+    pub removed: usize,
+}
+
+/// Per-key cache failure classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheViolation {
+    /// Requested key set exceeds configured cache bound.
+    TooManyKeys,
+}
+
+/// Opaque per-key cache failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheError {
+    violation: CacheViolation,
+}
+
+impl CacheError {
+    rift_core::property! {
+        /// Returns stable failure classification.
+        pub const fn violation(self) -> CacheViolation = self.violation;
+    }
+
+    /// Returns canonical registry metadata.
+    #[must_use]
+    pub const fn descriptor(self) -> ErrorDescriptor {
+        ErrorRegistry::descriptor(ErrorName::LimitExceeded)
+    }
+}
+
+impl fmt::Display for CacheError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.descriptor().explanation())
+    }
+}
+
+impl std::error::Error for CacheError {}
+
+/// Bounded-composition proof of revision-keyed reuse.
+#[derive(Debug, Clone)]
+pub struct PerKeyCache<K, V> {
+    entries: BTreeMap<K, CacheEntry<V>>,
+    max_entries: NonZeroUsize,
+}
+
+impl<K: Clone + Ord, V: Clone> PerKeyCache<K, V> {
+    /// Constructs empty cache with explicit key bound.
+    #[must_use]
+    pub const fn new(max_entries: NonZeroUsize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            max_entries,
+        }
+    }
+
+    /// Reconciles exact key/revision set, computing only changed entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError`] before mutation when key set exceeds configured bound.
+    pub fn update(
+        &mut self,
+        revisions: &BTreeMap<K, u64>,
+        mut compute: impl FnMut(&K) -> V,
+    ) -> Result<CacheUpdate, CacheError> {
+        if revisions.len() > self.max_entries.get() {
+            return Err(CacheError {
+                violation: CacheViolation::TooManyKeys,
+            });
+        }
+        let removed = self
+            .entries
+            .keys()
+            .filter(|key| !revisions.contains_key(*key))
+            .count();
+        self.entries.retain(|key, _| revisions.contains_key(key));
+        let mut reused = 0;
+        let mut recomputed = 0;
+        for (key, revision) in revisions {
+            if self
+                .entries
+                .get(key)
+                .is_some_and(|entry| entry.revision == *revision)
+            {
+                reused += 1;
+                continue;
+            }
+            self.entries.insert(
+                key.clone(),
+                CacheEntry {
+                    revision: *revision,
+                    value: compute(key),
+                },
+            );
+            recomputed += 1;
+        }
+        Ok(CacheUpdate {
+            reused,
+            recomputed,
+            removed,
+        })
+    }
+
+    /// Returns cached value.
+    #[must_use]
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +1093,137 @@ mod tests {
                 .iter()
                 .all(|stage| !stage.output_type().contains("Any"))
         );
+    }
+
+    #[test]
+    fn keyed_mapping_join_and_aggregate_retain_cardinality() {
+        let mut builder = CompositionBuilder::new(
+            CompositionId::new("history").expect("valid composition fixture"),
+        );
+        let revisions = builder
+            .source_many::<u64, Sources>("revisions", &component::<(), Sources>("git"))
+            .expect("keyed source");
+        let syntax = builder
+            .map_each(revisions, "syntax", &component::<Sources, Syntax>("syntax"))
+            .expect("keyed map");
+        let metadata = builder
+            .map_each(
+                revisions,
+                "metadata",
+                &component::<Sources, Metadata>("metadata"),
+            )
+            .expect("second keyed map");
+        let joined = builder
+            .join_by_key(syntax, metadata, "join", KeyJoinPolicy::Exact)
+            .expect("typed keyed join");
+        let aggregate = builder
+            .aggregate(
+                joined,
+                "aggregate",
+                &component::<Vec<JoinItem<Syntax, Metadata>>, Facts>("aggregate"),
+            )
+            .expect("aggregate");
+        builder.output(aggregate).expect("owned output");
+        let composition = builder.build().expect("complete graph");
+
+        assert!(matches!(
+            composition
+                .stage("history.join")
+                .expect("join stage")
+                .cardinality(),
+            FlowCardinality::Keyed { .. }
+        ));
+        assert_eq!(
+            composition
+                .stage("history.join")
+                .expect("join stage")
+                .key_join_policy(),
+            Some(KeyJoinPolicy::Exact)
+        );
+        assert_eq!(
+            composition
+                .stage("history.aggregate")
+                .expect("aggregate stage")
+                .cardinality(),
+            FlowCardinality::Single
+        );
+    }
+
+    #[test]
+    fn join_policies_report_every_missing_side() {
+        let left = BTreeMap::from([(1, "left-1"), (2, "left-2")]);
+        let right = BTreeMap::from([(2, "right-2"), (3, "right-3")]);
+        for (policy, expected_keys) in [
+            (KeyJoinPolicy::Exact, vec![1, 2, 3]),
+            (KeyJoinPolicy::Inner, vec![2]),
+            (KeyJoinPolicy::Left, vec![1, 2]),
+            (KeyJoinPolicy::Union, vec![1, 2, 3]),
+        ] {
+            let joined = join_keyed(policy, &left, &right);
+            assert_eq!(
+                joined.items.keys().copied().collect::<Vec<_>>(),
+                expected_keys
+            );
+            assert_eq!(
+                joined.missing,
+                vec![(1, MissingSide::Right), (3, MissingSide::Left)]
+            );
+        }
+    }
+
+    #[test]
+    fn per_key_cache_reuses_unchanged_items() {
+        let mut cache = PerKeyCache::<u64, String>::new(NonZeroUsize::new(3).expect("non-zero"));
+        let first = cache
+            .update(
+                &BTreeMap::from([(1, 10), (2, 20)]),
+                std::string::ToString::to_string,
+            )
+            .expect("within cache bound");
+        assert_eq!(
+            first,
+            CacheUpdate {
+                reused: 0,
+                recomputed: 2,
+                removed: 0
+            }
+        );
+        let second = cache
+            .update(&BTreeMap::from([(1, 10), (2, 21), (3, 30)]), |key| {
+                key.to_string()
+            })
+            .expect("at cache bound");
+        assert_eq!(
+            second,
+            CacheUpdate {
+                reused: 1,
+                recomputed: 2,
+                removed: 0
+            }
+        );
+        let third = cache
+            .update(
+                &BTreeMap::from([(2, 21), (3, 30)]),
+                std::string::ToString::to_string,
+            )
+            .expect("within cache bound");
+        assert_eq!(
+            third,
+            CacheUpdate {
+                reused: 2,
+                recomputed: 0,
+                removed: 1
+            }
+        );
+
+        let error = cache
+            .update(
+                &BTreeMap::from([(1, 1), (2, 2), (3, 3), (4, 4)]),
+                std::string::ToString::to_string,
+            )
+            .expect_err("cache bound must reject before mutation");
+        assert_eq!(error.violation(), CacheViolation::TooManyKeys);
+        assert_eq!(cache.get(&2).map(String::as_str), Some("2"));
     }
 
     #[test]
