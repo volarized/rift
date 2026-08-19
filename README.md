@@ -23,8 +23,8 @@ uv run python -m rift.generate --check
 
 ## Rust development
 
-Rust uses toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `cargo-audit`, and
-`cargo-deny`, then run same gates as CI from repository root:
+Rust uses toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `cargo-audit`,
+`cargo-deny`, and `cargo-llvm-cov`, then run same gates as CI from repository root:
 
 | Command | Gate |
 | --- | --- |
@@ -35,6 +35,10 @@ Rust uses toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `carg
 | `just clippy` | Strict Clippy policy |
 | `just docs` | Warning-free Rust documentation |
 | `just audit` | Advisory, license, ban, and source policy |
+| `just coverage` | CLI coverage report and hard 86% line floor |
 | `just rust-gate` | Every gate above |
 
 GitHub Actions runs each target separately so failed gate remains visible by name.
+
+Install pre-commit hook with `uvx pre-commit install`. It runs `just rust-gate`, including same
+coverage and Cargo policy checks enforced by CI.

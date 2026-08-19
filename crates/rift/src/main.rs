@@ -1,19 +1,23 @@
 //! Rift CLI.
 
-use clap::Parser;
+use clap::{Command, CommandFactory, Parser};
 
 #[derive(Debug, Parser)]
 #[command(name = "rift", version, about = "agentic development toolkit")]
 struct Cli;
 
+fn cli_command() -> Command {
+    Cli::command()
+}
+
 fn main() {
-    Cli::parse();
+    cli_command().get_matches();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
-    use clap::{CommandFactory, Parser};
+    use super::{Cli, cli_command};
+    use clap::Parser;
 
     #[test]
     fn test_cli_empty_invocation_is_valid() {
@@ -22,9 +26,20 @@ mod tests {
 
     #[test]
     fn test_cli_help_identifies_executable() {
-        let command = Cli::command();
+        let command = cli_command();
         assert_eq!(command.get_name(), "rift");
         assert!(command.get_about().is_some());
+    }
+
+    #[test]
+    fn test_cli_exposes_only_metadata_flags() {
+        let mut command = cli_command();
+        command.build();
+        let argument_ids: Vec<_> = command
+            .get_arguments()
+            .map(|argument| argument.get_id().as_str())
+            .collect();
+        assert_eq!(argument_ids, ["help", "version"]);
     }
 
     #[test]

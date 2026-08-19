@@ -1,5 +1,6 @@
 # Rust
 target/
+lcov.info
 
 # Plans: design documents live outside the tree until they become code.
 .plans/

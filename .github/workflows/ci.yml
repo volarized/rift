@@ -19,9 +19,11 @@ jobs:
       run:
         working-directory: docs
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
 
@@ -35,7 +37,7 @@ jobs:
       # `actions/cache` paths are relative to the workspace root, NOT to
       # `defaults.run.working-directory`. Hence the `docs/` prefixes below.
       - name: Cache bun install
-        uses: actions/cache@v6
+        uses: actions/cache@v6.1.0
         with:
           path: ~/.bun/install/cache # $BUN_INSTALL/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('docs/bun.lock') }}
@@ -45,7 +47,7 @@ jobs:
       # `output: export` is on, for the static render. Key on sources so a
       # content-only edit still gets a warm compiler cache via restore-keys.
       - name: Cache Next build
-        uses: actions/cache@v6
+        uses: actions/cache@v6.1.0
         with:
           path: docs/.next/cache
           key: >-
@@ -88,17 +90,19 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       # No toolchain action on purpose: rust-toolchain.toml already pins
       # 1.97 + rustfmt + clippy, and rustup on the runner honours it. One
       # source of truth; a setup action here would silently override it.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
 
-      - uses: astral-sh/setup-uv@v7
-      - uses: taiki-e/install-action@v2
+      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: taiki-e/install-action@v2.86.3
         with:
-          tool: just,cargo-audit,cargo-deny
+          tool: just,cargo-audit,cargo-deny,cargo-llvm-cov
 
       # Keep every local just target visible as its own CI check step.
       - run: just format
@@ -108,3 +112,14 @@ jobs:
       - run: just clippy
       - run: just docs
       - run: just audit
+      - run: just coverage
+
+      - name: Upload CLI coverage
+        uses: codecov/codecov-action@v5.5.5
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: lcov.info
+          flags: cli
+          name: rift-cli
+          token: ${{ secrets.CODECOV_TOKEN }}
