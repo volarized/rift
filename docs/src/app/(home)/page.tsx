@@ -79,9 +79,9 @@ const DIFFERENCES: {
   fit?: number;
 }[] = [
   {
-    statement: "Code facts with reported coverage.",
-    title: "Programming language providers",
-    body: "Rift will combine syntax, semantic analysis, and history to give agents the best available context.",
+    statement: "Rust declarations from current source.",
+    title: "Tree-sitter syntax provider",
+    body: "Rift reads Rust files into an in-memory syntax index and reports which provider produced each result.",
     solid: "sphere",
   },
   {
@@ -93,9 +93,9 @@ const DIFFERENCES: {
     tilt: 1.5,
   },
   {
-    statement: "Structured reads and guarded edits.",
-    title: "MCP tools and resources",
-    body: "Agents will read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
+    statement: "Structured reads over MCP.",
+    title: "MCP read tools",
+    body: "Agents can search source and retrieve declarations by name.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
@@ -121,7 +121,8 @@ export default function HomePage() {
             </h1>
 
             <Body className="max-w-115">
-              v0.0.1 release foundation for Rift's agentic development toolkit.
+              Rift is an agentic development toolkit for reading, discovering, and editing
+              codebases.
             </Body>
           </div>
 
@@ -147,9 +148,9 @@ export default function HomePage() {
           className="h-64 w-full justify-self-center sm:h-80 sm:min-w-96 md:w-80"
         />
         <div className="grid gap-5">
-          <Statement>Designed for agents that depend on context and tooling.</Statement>
+          <Statement>Agents depend on context and tooling.</Statement>
           <Body className="text-balance">
-            Current release ships native binaries, verified installers, and command-line metadata.
+            rift provides contextual, parser-precise codebase reading and editing tools.
           </Body>
         </div>
       </Section>
@@ -199,15 +200,24 @@ export default function HomePage() {
           scroll and unpicked again on the way back up */}
       <Section wide tall className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
-          <Statement className="max-w-125">
-            Install v0.0.1 and inspect current CLI surface.
-          </Statement>
-          <Link href="/docs" className="flex items-center gap-2 text-sm font-medium w-0">
-            <Button variant="outline" size="lg" className="w-fit text-base">
-              Read documentation
-              <ArrowRightIcon weight="bold" className="h-4 w-4" />
-            </Button>
-          </Link>
+          <Statement className="max-w-125">Time to create things. Differently</Statement>
+          <div className="flex flex-wrap items-center gap-3">
+            <Link href="/docs" className="flex items-center gap-2 text-sm font-medium">
+              <Button variant="outline" size="lg" className="w-fit text-base">
+                Read documentation
+                <ArrowRightIcon weight="bold" className="h-4 w-4" />
+              </Button>
+            </Link>
+            <Link
+              href="mailto:contact@volar.sh"
+              className="flex items-center gap-2 text-sm font-medium"
+            >
+              <Button variant="outline" size="lg" className="w-fit text-base">
+                Contact us
+                <ArrowRightIcon weight="bold" className="h-4 w-4" />
+              </Button>
+            </Link>
+          </div>
         </div>
 
         {/* The disk lies in x–y with the tube down z: face it near-on, so the
