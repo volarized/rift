@@ -3,7 +3,6 @@ import { DocsBody, DocsDescription, DocsPage, DocsTitle } from "fumadocs-ui/page
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { BackToTop } from "@/components/back-to-top";
-import { allPageData } from "@/lib/protocol-surface";
 import { source } from "@/lib/source";
 import { getMDXComponents } from "@/mdx-components";
 
@@ -14,18 +13,7 @@ export default async function Page(props: PageProps<"/docs/[[...slug]]">) {
 
   const MDXContent = page.data.body;
 
-  // A protocol page is hand-written prose followed by a component that renders
-  // the schemas. remark sees only the prose, so the component's headings are
-  // appended from the same derivation that produced them — see `pageData`.
-  //
-  // A heading written in the MDX *and* claimed by the derivation would appear
-  // twice and React would see two children with one key, so the MDX wins: it is
-  // the half remark actually rendered an anchor for.
-  const derived = allPageData[page.url];
-  const seen = new Set(page.data.toc.map((item) => item.url));
-  const toc = derived
-    ? [...page.data.toc, ...derived.toc.filter((item) => !seen.has(item.url))]
-    : page.data.toc;
+  const toc = page.data.toc;
 
   return (
     <DocsPage

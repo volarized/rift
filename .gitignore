@@ -32,6 +32,7 @@ CONTEXT.md
 __pycache__/
 *.py[cod]
 .playwright-mcp
+docs/public/schemas/
 
 AGENTS.md
 CLAUDE.md

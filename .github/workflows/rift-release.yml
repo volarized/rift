@@ -94,8 +94,36 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  docs:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+          no-cache: true
+      - run: bun install --frozen-lockfile
+      - run: bunx biome ci .
+      - run: bunx next typegen
+      - run: bunx tsc --noEmit
+      - run: bun run build
+      - run: bun run pack
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: docs-site
+          path: docs/dist
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
-    needs: build
+    needs: [build, docs]
     runs-on: ubuntu-24.04
     environment: rift-release
     permissions:
@@ -133,3 +161,37 @@ jobs:
           --latest
           --title "Rift $RIFT_TAG"
           --generate-notes
+
+  deploy-docs:
+    needs: publish
+    runs-on: ubuntu-24.04
+    environment:
+      name: production
+      url: https://volar.sh/rift/docs/
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: docs-site
+          path: docs/dist
+      - uses: cloudflare/wrangler-action@v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: docs
+          packageManager: bun
+          command: deploy
+      - name: Verify live release
+        run: |
+          curl --fail --silent --show-error -o /dev/null "https://volar.sh/rift/docs/"
+          curl --fail --silent --show-error -o /dev/null "https://volar.sh/rift/install.sh"
+          curl --fail --silent --show-error -o /dev/null "https://volar.sh/rift/install.ps1"

@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!**/.source", "!**/.next", "!**/bun.lock"]
+    "includes": ["**", "!**/.source", "!**/.next", "!**/bun.lock", "!deferred", "!public/schemas"]
   },
   "formatter": {
     "enabled": true,

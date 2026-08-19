@@ -2,14 +2,12 @@
 
 [![Rift — agentic development toolkit for codebases](docs/public/og.png)](https://volar.sh/rift/)
 
-Rift is an agentic development toolkit for reading, discovering, and editing codebases.
+Rift is an agentic development toolkit for reading, discovering, and editing codebases. v0.0.1
+establishes its repository, release pipeline, native binary, installers, and current documentation.
 
-Rift provides contextual, parser-precise codebase reading and editing tools. It combines syntax,
-semantic analysis, and history to give agents the best available context. Through MCP, agents read
-declarations and provider facts, then precisely edit symbols with a clear blast radius. Changes can
-be staged in filesystem projections, inspected, and published into the workspace.
+Current CLI exposes help and version metadata only. Operational commands land in later releases.
 
-📖 [Read the documentation](https://volar.sh/rift/docs/draft/)
+📖 [Read the documentation](https://volar.sh/rift/docs/)
 
 ## Install
 
@@ -76,8 +74,10 @@ coverage and Cargo policy checks enforced by CI.
 
 ## Rift releases
 
-Pushing a `vX.Y.Z` tag on a commit from `main` starts Rift binary release. Tag version must match
-workspace version. Release environment approval gates publication after all native builds pass.
+Pushing a `vX.Y.Z` tag on a commit from `main` starts one Rift release pipeline. Tag version must
+match workspace version. Release environment approval gates publication after native binaries and
+current documentation pass their validation gates.
 
 Each release contains checksummed, provenance-attested archives for Linux, macOS, and Windows on
-x86-64 and Arm64. Unix archives contain `rift`; Windows archives contain `rift.exe`.
+x86-64 and Arm64. Unix archives contain `rift`; Windows archives contain `rift.exe`. After release
+publication, same pipeline deploys latest documentation and installers to `volar.sh/rift`.
