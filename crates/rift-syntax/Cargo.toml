@@ -13,3 +13,5 @@ workspace = true
 [dependencies]
 rift-core.workspace = true
 rift-provider.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
