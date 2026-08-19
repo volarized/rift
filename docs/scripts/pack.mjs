@@ -4,7 +4,6 @@
  * then verifies it before it can reach production.
  *
  *   out/**         ->  dist/rift/**    the site; every URL prefixed /rift
- *   out/404.html   ->  dist/404.html   root-level not-found
  *
  * Next emits the export at the *root* of out/ even though basePath is /rift,
  * so the tree has to be nested one level by hand.
@@ -12,14 +11,13 @@
  * Usage: bun run pack
  */
 
-import { copyFile, mkdir, readdir, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { argv, exit } from "node:process";
 
 import { basePath } from "./base-path.mjs";
 
 const docsRoot = path.resolve(import.meta.dirname, "..");
-const repositoryRoot = path.resolve(docsRoot, "..");
 const outDir = path.join(docsRoot, "out");
 const distDir = path.join(docsRoot, "dist");
 const siteDir = path.join(distDir, basePath.replace(/^\//, ""));
@@ -32,7 +30,6 @@ const required = [
   path.join(basePath.replace(/^\//, ""), "install.sh"),
   path.join(basePath.replace(/^\//, ""), "install.ps1"),
   path.join(basePath.replace(/^\//, ""), "404.html"),
-  "404.html",
 ];
 
 /** Recursively yield every file under `dir` matching `predicate`. */
@@ -59,15 +56,6 @@ async function pack() {
   await rename(outDir, siteDir);
   // Workers Static Assets reads control files only from the asset root.
   await rename(path.join(siteDir, "_headers"), path.join(distDir, "_headers"));
-  await copyFile(
-    path.join(repositoryRoot, "scripts", "install.sh"),
-    path.join(siteDir, "install.sh"),
-  );
-  await copyFile(
-    path.join(repositoryRoot, "scripts", "install.ps1"),
-    path.join(siteDir, "install.ps1"),
-  );
-  await copyFile(path.join(siteDir, "404.html"), path.join(distDir, "404.html"));
 }
 
 /**

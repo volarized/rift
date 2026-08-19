@@ -147,7 +147,7 @@ class BashInstallerFixture:
                 "RIFT_INSTALL_DIR": str(self.install_dir),
             }
         )
-        command = ["bash", str(REPOSITORY / "scripts" / "install.sh")]
+        command = ["bash", str(REPOSITORY / "docs" / "public" / "install.sh")]
         if version is not None:
             command.extend(["--version", version])
         return subprocess.run(
@@ -255,7 +255,7 @@ class PowerShellInstallerFixture:
     def harness(self) -> Path:
         """Write PowerShell harness overriding only network boundary."""
         harness = self.root / "harness.ps1"
-        script = REPOSITORY / "scripts" / "install.ps1"
+        script = REPOSITORY / "docs" / "public" / "install.ps1"
         harness.write_text(
             textwrap.dedent(
                 f"""
