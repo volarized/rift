@@ -4,12 +4,16 @@ mod error;
 mod identity;
 mod limits;
 mod measurement;
+mod path;
+
+pub mod constants;
 
 pub use error::{ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, RetryPolicy, RiftError};
 pub use identity::{
     CompositionId, CompositionRevision, CursorId, IdError, IndexRevision, ModelId, ModelRevision,
-    ProviderId, ProviderRevision, RevisionError, SourceRevision, SourceUnitId, SymbolId,
-    TreeRevision, WorkspaceId,
+    ProviderId, ProviderRevision, RevisionError, SourceResolverId, SourceResolverIdError,
+    SourceResolverIdViolation, SourceRevision, SourceUnitId, SourceUnitIdError,
+    SourceUnitIdErrorKind, SymbolId, TreeRevision, WorkspaceId,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
 pub use measurement::{
@@ -36,6 +40,7 @@ macro_rules! property {
         }
     };
 }
+pub use path::{PathError, PathKind, PathViolation, ProjectPath, SourcePath};
 
 /// Iterates while charging one unit to a loop budget before each body execution.
 ///

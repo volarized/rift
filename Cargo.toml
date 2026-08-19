@@ -20,6 +20,7 @@ rift-server = { path = "crates/rift-server" }
 rift-syntax = { path = "crates/rift-syntax" }
 
 clap = { version = "4.6.5", features = ["derive"] }
+unicode-normalization = "0.1.24"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
