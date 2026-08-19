@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: rust-cli-gate
+        name: Rust CLI quality gate
+        entry: just rust-gate
+        language: system
+        pass_filenames: false
+        always_run: true

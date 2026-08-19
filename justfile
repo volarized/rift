@@ -23,4 +23,7 @@ audit:
     cargo audit
     cargo deny check
 
-rust-gate: format generate-check check test clippy docs audit
+coverage:
+    cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
+
+rust-gate: format generate-check check test clippy docs audit coverage
