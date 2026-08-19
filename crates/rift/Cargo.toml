@@ -20,3 +20,8 @@ rift-protocol.workspace = true
 rift-provider.workspace = true
 rift-server.workspace = true
 rift-syntax.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+serde_json.workspace = true

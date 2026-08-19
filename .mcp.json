@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rift": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "--", "mcp"]
+    }
+  }
+}
