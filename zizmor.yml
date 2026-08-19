@@ -1,4 +1,8 @@
 rules:
+  cache-poisoning:
+    ignore:
+      # Release jobs restore caches written only by protected branches and tags.
+      - rift-release.yml
   unpinned-uses:
     config:
       policies:

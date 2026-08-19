@@ -1,13 +1,7 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = []
-# ///
 """Validate and package Rift binary releases."""
 
 from __future__ import annotations
 
-import argparse
 import gzip
 import hashlib
 import io
@@ -15,7 +9,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -77,7 +70,7 @@ def validate_workspace_version(repository: Path, tag: str) -> None:
 
     required = (
         repository / "Cargo.lock",
-        repository / "LICENSE",
+        repository / "LICENSE.md",
         repository / "README.md",
     )
     missing = [path.name for path in required if not path.is_file()]
@@ -165,7 +158,7 @@ def package_release(
     members = (
         (f"{root}/{binary_name(target)}", binary.read_bytes(), 0o755),
         (f"{root}/README.md", (repository / "README.md").read_bytes(), 0o644),
-        (f"{root}/LICENSE", (repository / "LICENSE").read_bytes(), 0o644),
+        (f"{root}/LICENSE.md", (repository / "LICENSE.md").read_bytes(), 0o644),
     )
 
     output.mkdir(parents=True, exist_ok=True)
@@ -212,61 +205,3 @@ def checksum_manifest(tag: str, directory: Path) -> Path:
         lines.append(f"{digest}  {name}\n")
     manifest.write_text("".join(lines), encoding="utf-8")
     return manifest
-
-
-def parser() -> argparse.ArgumentParser:
-    """Build release command parser."""
-    root = argparse.ArgumentParser(description=__doc__)
-    commands = root.add_subparsers(dest="command", required=True)
-    tag = os.environ.get("RIFT_TAG")
-
-    validate = commands.add_parser("validate-tag")
-    validate.add_argument("--tag", default=tag, required=tag is None)
-    validate.add_argument("--repository", type=Path, default=Path.cwd())
-
-    verify = commands.add_parser("verify-binary")
-    verify.add_argument("--tag", default=tag, required=tag is None)
-    verify.add_argument("--binary", type=Path, required=True)
-
-    package = commands.add_parser("package")
-    package.add_argument("--tag", default=tag, required=tag is None)
-    target = os.environ.get("RIFT_TARGET")
-    package.add_argument("--target", default=target, required=target is None)
-    package.add_argument("--binary", type=Path, required=True)
-    package.add_argument("--output", type=Path, required=True)
-    package.add_argument("--repository", type=Path, default=Path.cwd())
-
-    checksums = commands.add_parser("checksums")
-    checksums.add_argument("--tag", default=tag, required=tag is None)
-    checksums.add_argument("--directory", type=Path, required=True)
-    return root
-
-
-def main() -> int:
-    """Run selected release operation."""
-    arguments = parser().parse_args()
-    try:
-        if arguments.command == "validate-tag":
-            validate_workspace_version(arguments.repository, arguments.tag)
-        elif arguments.command == "verify-binary":
-            verify_binary_version(arguments.binary, arguments.tag)
-        elif arguments.command == "package":
-            validate_workspace_version(arguments.repository, arguments.tag)
-            path = package_release(
-                arguments.repository,
-                arguments.tag,
-                arguments.target,
-                arguments.binary,
-                arguments.output,
-            )
-            print(path)
-        elif arguments.command == "checksums":
-            print(checksum_manifest(arguments.tag, arguments.directory))
-    except (OSError, RuntimeError, ValueError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

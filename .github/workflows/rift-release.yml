@@ -26,9 +26,10 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v7.6.0
         with:
-          enable-cache: false
+          enable-cache: true
+          cache-dependency-glob: tools/rift-release/uv.lock
       - name: Validate release tag
-        run: uv run --script scripts/release.py validate-tag
+        run: uv run --locked --project tools/rift-release rift-release validate-tag
       - name: Require commit from main
         run: |
           git fetch --no-tags origin main
@@ -68,18 +69,22 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v7.6.0
         with:
-          enable-cache: false
+          enable-cache: true
+          cache-dependency-glob: tools/rift-release/uv.lock
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: release-${{ matrix.target }}
       - name: Install target
         run: rustup target add "${{ matrix.target }}"
       - name: Build release binary
         run: cargo build --release --locked --target "${{ matrix.target }}" --package rift
       - name: Smoke test release binary
         run: >-
-          uv run --script scripts/release.py verify-binary
+          uv run --locked --project tools/rift-release rift-release verify-binary
           --binary "${{ matrix.binary }}"
       - name: Package release archive
         run: >-
-          uv run --script scripts/release.py package
+          uv run --locked --project tools/rift-release rift-release package
           --binary "${{ matrix.binary }}"
           --output dist
       - uses: actions/upload-artifact@v6.0.0
@@ -104,14 +109,17 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v7.6.0
         with:
-          enable-cache: false
+          enable-cache: true
+          cache-dependency-glob: tools/rift-release/uv.lock
       - uses: actions/download-artifact@v7.0.0
         with:
           path: dist
           pattern: rift-*
           merge-multiple: true
       - name: Write checksums
-        run: uv run --script scripts/release.py checksums --directory dist
+        run: >-
+          uv run --locked --project tools/rift-release rift-release checksums
+          --directory dist
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@v3.2.0
         with:
