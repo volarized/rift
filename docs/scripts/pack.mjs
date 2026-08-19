@@ -4,7 +4,6 @@
  * then verifies it before it can reach production.
  *
  *   out/**         ->  dist/rift/**    the site; every URL prefixed /rift
- *   out/404.html   ->  dist/404.html   root-level not-found
  *
  * Next emits the export at the *root* of out/ even though basePath is /rift,
  * so the tree has to be nested one level by hand.
@@ -12,7 +11,7 @@
  * Usage: bun run pack
  */
 
-import { copyFile, mkdir, readdir, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { argv, exit } from "node:process";
 
@@ -25,10 +24,12 @@ const siteDir = path.join(distDir, basePath.replace(/^\//, ""));
 
 /** Files that must exist once packing is done, relative to dist/. */
 const required = [
+  "_headers",
   path.join(basePath.replace(/^\//, ""), "index.html"),
   path.join(basePath.replace(/^\//, ""), "docs", "index.html"),
+  path.join(basePath.replace(/^\//, ""), "install.sh"),
+  path.join(basePath.replace(/^\//, ""), "install.ps1"),
   path.join(basePath.replace(/^\//, ""), "404.html"),
-  "404.html",
 ];
 
 /** Recursively yield every file under `dir` matching `predicate`. */
@@ -53,7 +54,8 @@ async function pack() {
   // `rename` rather than copy: the export is single-use build output, and
   // moving it keeps `out/` from lingering as a stale second copy.
   await rename(outDir, siteDir);
-  await copyFile(path.join(siteDir, "404.html"), path.join(distDir, "404.html"));
+  // Workers Static Assets reads control files only from the asset root.
+  await rename(path.join(siteDir, "_headers"), path.join(distDir, "_headers"));
 }
 
 /**
@@ -88,6 +90,14 @@ async function verify() {
 
   for (const { file, url } of await findUnprefixedRefs()) {
     problems.push(`${file}: "${url}" is missing the ${basePath} prefix`);
+  }
+
+  const headers = await readFile(path.join(distDir, "_headers"), "utf8");
+  for (const installer of ["install.sh", "install.ps1"]) {
+    const rule = `${basePath}/${installer}\n  Content-Type: text/plain; charset=utf-8`;
+    if (!headers.includes(rule)) {
+      problems.push(`_headers: missing text/plain rule for ${basePath}/${installer}`);
+    }
   }
 
   return problems;

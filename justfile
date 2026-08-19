@@ -27,6 +27,9 @@ coverage:
     cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 
 release-test:
-    uv run --locked --project tools/rift-release pytest tools/rift-release/tests
+    uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
 
-rust-gate: format generate-check check test clippy docs audit coverage release-test
+installer-test:
+    uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
+
+rust-gate: format generate-check check test clippy docs audit coverage release-test installer-test
