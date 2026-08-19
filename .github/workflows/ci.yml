@@ -73,6 +73,7 @@ jobs:
       - run: bunx tsc --noEmit
 
       - run: bun run build
+      - run: bun run pack
 
       # Dependabot supports version updates for bun but NOT security updates,
       # so nothing else would *block* a vulnerable JS dependency from landing.
@@ -114,6 +115,7 @@ jobs:
       - run: just audit
       - run: just coverage
       - run: just release-test
+      - run: just installer-test
 
       - name: Upload CLI coverage
         uses: codecov/codecov-action@v5.5.5
@@ -124,3 +126,19 @@ jobs:
           flags: cli
           name: rift-cli
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: false
+      - run: uv run --script scripts/tests/test_installers.py

@@ -29,6 +29,8 @@ __pycache__/
 CONTEXT.md
 
 .ruff_cache
+__pycache__/
+*.py[cod]
 .playwright-mcp
 
 AGENTS.md

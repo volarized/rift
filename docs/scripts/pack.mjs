@@ -19,14 +19,18 @@ import { argv, exit } from "node:process";
 import { basePath } from "./base-path.mjs";
 
 const docsRoot = path.resolve(import.meta.dirname, "..");
+const repositoryRoot = path.resolve(docsRoot, "..");
 const outDir = path.join(docsRoot, "out");
 const distDir = path.join(docsRoot, "dist");
 const siteDir = path.join(distDir, basePath.replace(/^\//, ""));
 
 /** Files that must exist once packing is done, relative to dist/. */
 const required = [
+  "_headers",
   path.join(basePath.replace(/^\//, ""), "index.html"),
   path.join(basePath.replace(/^\//, ""), "docs", "index.html"),
+  path.join(basePath.replace(/^\//, ""), "install.sh"),
+  path.join(basePath.replace(/^\//, ""), "install.ps1"),
   path.join(basePath.replace(/^\//, ""), "404.html"),
   "404.html",
 ];
@@ -53,6 +57,16 @@ async function pack() {
   // `rename` rather than copy: the export is single-use build output, and
   // moving it keeps `out/` from lingering as a stale second copy.
   await rename(outDir, siteDir);
+  // Workers Static Assets reads control files only from the asset root.
+  await rename(path.join(siteDir, "_headers"), path.join(distDir, "_headers"));
+  await copyFile(
+    path.join(repositoryRoot, "scripts", "install.sh"),
+    path.join(siteDir, "install.sh"),
+  );
+  await copyFile(
+    path.join(repositoryRoot, "scripts", "install.ps1"),
+    path.join(siteDir, "install.ps1"),
+  );
   await copyFile(path.join(siteDir, "404.html"), path.join(distDir, "404.html"));
 }
 
@@ -88,6 +102,14 @@ async function verify() {
 
   for (const { file, url } of await findUnprefixedRefs()) {
     problems.push(`${file}: "${url}" is missing the ${basePath} prefix`);
+  }
+
+  const headers = await readFile(path.join(distDir, "_headers"), "utf8");
+  for (const installer of ["install.sh", "install.ps1"]) {
+    const rule = `${basePath}/${installer}\n  Content-Type: text/plain; charset=utf-8`;
+    if (!headers.includes(rule)) {
+      problems.push(`_headers: missing text/plain rule for ${basePath}/${installer}`);
+    }
   }
 
   return problems;

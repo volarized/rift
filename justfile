@@ -29,4 +29,7 @@ coverage:
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests
 
-rust-gate: format generate-check check test clippy docs audit coverage release-test
+installer-test:
+    uv run --script scripts/tests/test_installers.py
+
+rust-gate: format generate-check check test clippy docs audit coverage release-test installer-test

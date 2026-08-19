@@ -11,6 +11,24 @@ be staged in filesystem projections, inspected, and published into the workspace
 
 📖 [Read the documentation](https://volar.sh/rift/docs/draft/)
 
+## Install
+
+Linux and macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://volar.sh/rift/install.ps1 | iex
+```
+
+Installers select native x86-64 or Arm64 archive, verify release checksum, and install under current
+user account. Set the `RIFT_VERSION` environment variable to `vX.Y.Z` before running the command to
+select an exact release.
+
 ## Protocol development
 
 The protocol and `rift.toml` models live in `protocol/src/rift/models`. Generate their JSON Schema
@@ -37,6 +55,7 @@ Rust uses toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `carg
 | `just audit` | Advisory, license, ban, and source policy |
 | `just coverage` | CLI coverage report and hard 86% line floor |
 | `just release-test` | Deterministic release archive contract |
+| `just installer-test` | Offline curl and irm installer contract |
 | `just rust-gate` | Every gate above |
 
 GitHub Actions runs each target separately so failed gate remains visible by name.
