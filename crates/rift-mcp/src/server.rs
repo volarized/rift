@@ -64,7 +64,7 @@ impl RiftMcp {
         self.snapshot()
             .get_symbol(&params)
             .map(Json)
-            .map_err(|error| tool_error(&error))
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
 
     /// Searches indexed Rust declarations and source lines by lexical `query`. Use
@@ -77,7 +77,7 @@ impl RiftMcp {
         self.snapshot()
             .search(&params)
             .map(Json)
-            .map_err(|error| tool_error(&error))
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
@@ -91,7 +91,7 @@ impl RiftMcp {
         self.snapshot()
             .nodes(params)
             .map(Json)
-            .map_err(|error| tool_error(&error))
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
 
     /// Replaces one declaration addressed by symbol. The parser derives the
@@ -161,7 +161,7 @@ impl RiftMcp {
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
         let mut result = operation(&self.snapshot(), &self.changes)
-            .map_err(|error| tool_error_in(&error, wire::ErrorPhase::Change))?;
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
         if let ChangeResult::Applied { summary } = &mut result {
             match ReadService::build(&self.root, self.limits) {
                 Ok(rebuilt) => {
@@ -211,53 +211,64 @@ impl ServerHandler for RiftMcp {
     }
 }
 
-/// Maps a read failure to the JSON-RPC error object the design documents:
-/// code `-32000`, the rendered failure line as `message`, and the typed
-/// [`wire::ErrorData`] as `data`.
-fn tool_error(error: &ReadError) -> ErrorData {
-    tool_error_in(error, wire::ErrorPhase::Read)
+/// Boundary view of a read failure: the projection a tool handler serves as
+/// the JSON-RPC error object the design documents — code `-32000`, the
+/// rendered failure line as `message`, and the typed [`wire::ErrorData`] as
+/// `data`.
+trait WireFailure {
+    /// The JSON-RPC error object for this failure, naming the phase it
+    /// stopped in.
+    fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData;
+
+    /// The typed wire payload for this failure.
+    fn wire_error(&self, phase: wire::ErrorPhase) -> wire::ErrorData;
+
+    /// The failure's source chain as bounded `causes` entries, outermost
+    /// first. Each level inherits the outer classification, which the read
+    /// error already resolved through the concrete failure it wraps.
+    fn wire_causes(&self) -> Vec<wire::ErrorCause>;
 }
 
-/// Maps one failure to the wire error object, naming the phase it stopped in.
-fn tool_error_in(error: &ReadError, phase: wire::ErrorPhase) -> ErrorData {
-    let message = error.to_string();
-    let data = serde_json::to_value(wire_error(error, phase)).ok();
-    ErrorData::new(RIFT_ERROR_CODE, message, data)
-}
+impl WireFailure for ReadError {
+    fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData {
+        let message = self.to_string();
+        let data = serde_json::to_value(self.wire_error(phase)).ok();
+        ErrorData::new(RIFT_ERROR_CODE, message, data)
+    }
 
-/// Builds the wire error payload for one read failure.
-fn wire_error(error: &ReadError, phase: wire::ErrorPhase) -> wire::ErrorData {
-    let descriptor = error.descriptor();
-    wire::ErrorData {
-        code: wire_code(descriptor.name()),
-        message: error.to_string(),
-        retry: descriptor.retry(),
-        phase,
-        diagnostics: Vec::new(),
-        limit: None,
-        causes: wire_causes(error),
+    fn wire_error(&self, phase: wire::ErrorPhase) -> wire::ErrorData {
+        let descriptor = self.descriptor();
+        wire::ErrorData {
+            code: wire_code(descriptor.name()),
+            message: self.to_string(),
+            retry: descriptor.retry(),
+            phase,
+            diagnostics: Vec::new(),
+            limit: None,
+            causes: self.wire_causes(),
+        }
+    }
+
+    fn wire_causes(&self) -> Vec<wire::ErrorCause> {
+        let descriptor = self.descriptor();
+        bounded_causes(
+            wire_code(descriptor.name()),
+            descriptor.retry(),
+            std::error::Error::source(self),
+        )
     }
 }
 
-/// The wire code for one registry identity. The registry composes the wire
-/// enum, so this is a projection, not a mapping; a CLI-only identity never
-/// reaches this boundary, and classifies as `internal_error` if one does.
-fn wire_code(name: ErrorName) -> wire::ErrorCode {
-    match name {
-        ErrorName::Wire(code) => code,
-        ErrorName::Cli(_) => wire::ErrorCode::InternalError,
-    }
-}
-
-/// Walks the failure's source chain into bounded `causes` entries, outermost
-/// first. Each level inherits the outer classification, which the read error
-/// already resolved through the concrete failure it wraps.
-fn wire_causes(error: &ReadError) -> Vec<wire::ErrorCause> {
-    let descriptor = error.descriptor();
-    let code = wire_code(descriptor.name());
-    let retry = descriptor.retry();
+/// Walks one source chain into bounded `causes` entries, outermost first.
+/// Every level inherits the classification and retry guidance passed in,
+/// which the failure already resolved through the concrete fault it wraps.
+fn bounded_causes(
+    code: wire::ErrorCode,
+    retry: wire::RetryDirective,
+    outermost: Option<&(dyn std::error::Error + 'static)>,
+) -> Vec<wire::ErrorCause> {
     let mut causes = Vec::new();
-    let mut source = std::error::Error::source(error);
+    let mut source = outermost;
     while let Some(current) = source {
         if causes.len() == ERROR_CAUSES_MAX {
             break;
@@ -272,6 +283,16 @@ fn wire_causes(error: &ReadError) -> Vec<wire::ErrorCause> {
     causes
 }
 
+/// The wire code for one registry identity. The registry composes the wire
+/// enum, so this is a projection, not a mapping; a CLI-only identity never
+/// reaches this boundary, and classifies as `internal_error` if one does.
+fn wire_code(name: ErrorName) -> wire::ErrorCode {
+    match name {
+        ErrorName::Wire(code) => code,
+        ErrorName::Cli(_) => wire::ErrorCode::InternalError,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -281,6 +302,8 @@ mod tests {
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::error as wire;
     use rift_server::{ReadFault, ReadService};
+
+    use super::WireFailure;
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
@@ -617,6 +640,50 @@ pub fn beacon() -> u64 {
         );
     }
 
+    #[derive(Debug)]
+    struct Link {
+        depth: usize,
+        inner: Option<Box<Link>>,
+    }
+
+    impl std::fmt::Display for Link {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "link {}", self.depth)
+        }
+    }
+
+    impl Error for Link {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.inner
+                .as_deref()
+                .map(|link| link as &(dyn Error + 'static))
+        }
+    }
+
+    #[test]
+    fn cause_walk_stops_at_the_declared_bound() {
+        let mut chained = Link {
+            depth: 0,
+            inner: None,
+        };
+        for depth in 1..=super::ERROR_CAUSES_MAX + 2 {
+            chained = Link {
+                depth,
+                inner: Some(Box::new(chained)),
+            };
+        }
+        let causes = super::bounded_causes(
+            wire::ErrorCode::StorageFailure,
+            wire::RetryDirective::Never,
+            Some(&chained),
+        );
+        assert_eq!(
+            causes.len(),
+            super::ERROR_CAUSES_MAX,
+            "a chain deeper than the bound must truncate at the bound"
+        );
+    }
+
     #[test]
     fn wire_causes_walk_the_source_chain_with_inherited_classification() {
         let error = ReadService::build(
@@ -624,7 +691,7 @@ pub fn beacon() -> u64 {
             WorkspaceIndexLimits::default(),
         )
         .expect_err("missing root must fail");
-        let causes = super::wire_causes(&error);
+        let causes = error.wire_causes();
         assert!(!causes.is_empty(), "sourced failure must yield causes");
         assert!(causes.len() <= super::ERROR_CAUSES_MAX);
         let code = super::wire_code(error.descriptor().name());
