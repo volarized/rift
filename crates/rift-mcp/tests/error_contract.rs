@@ -83,6 +83,15 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
             "replace_symbol",
             json!({ "symbol": "not-an-address", "body": "x" }),
         ),
+        ("patch", json!({ "patch": "not a diff" })),
+        (
+            "replace_node",
+            json!({ "node": "not-an-address", "body": "x" }),
+        ),
+        (
+            "insert_symbol",
+            json!({ "anchor": "not-an-address", "position": "after", "body": "x" }),
+        ),
         (
             "get_symbol",
             json!({ "name": "beacon", "include_history": true }),

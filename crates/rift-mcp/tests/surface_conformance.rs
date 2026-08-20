@@ -7,6 +7,10 @@
 //! the `null` arm from live results, the present arm by revalidating a page
 //! with a cursor spliced in. The walk also follows any cursor a result
 //! returns, so live pagination joins the gate as soon as a read mints one.
+//! Every `ChangeResult` arm is proven the same way: applied (with and
+//! without parser findings), and refused for a failed precondition, an
+//! ambiguous target, and an unsupported file-level change — plus a live
+//! witnessed `replace_node` that lands after the walk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -61,6 +65,45 @@ fn corpus() -> Vec<(&'static str, Value)> {
                 "body": "pub fn beacon_four() {}"
             }),
         ),
+        (
+            "replace_node",
+            json!({
+                "node": "rift://node/rust/lib.rs@0-18#00000000",
+                "body": "pub fn beacon_one() {}"
+            }),
+        ),
+        (
+            "patch",
+            json!({
+                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon_one() {}\n+pub fn beacon_one() -> u8 { 1 }\n"
+            }),
+        ),
+        (
+            "patch",
+            json!({
+                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn never_there() {}\n+pub fn never_there() -> u8 { 0 }\n"
+            }),
+        ),
+        (
+            "patch",
+            json!({
+                "patch": "--- /dev/null\n+++ b/fresh.rs\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n"
+            }),
+        ),
+        (
+            "replace_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/lib.rs/dual",
+                "body": "pub fn dual() -> u8 { 3 }"
+            }),
+        ),
+        (
+            "replace_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/lib.rs/beacon_three",
+                "body": "pub fn beacon_three( {"
+            }),
+        ),
     ]
 }
 
@@ -82,12 +125,17 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     );
 }
 
-#[tokio::test]
-async fn every_tool_result_validates_against_served_output_schema() -> TestResult {
+/// Builds the shared fixture workspace and serves it to one client.
+async fn served_fixture() -> TestResult<(
+    tempfile::TempDir,
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("lib.rs"),
-        "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n",
+        "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n\
+         #[cfg(unix)]\npub fn dual() {}\n#[cfg(windows)]\npub fn dual() {}\n",
     )?;
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
@@ -99,18 +147,15 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
         service.waiting().await.expect("server must stop cleanly");
     });
     let client = ().serve(client_transport).await?;
-    let tools = client.list_all_tools().await?;
+    Ok((directory, client, server_task))
+}
 
-    let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-    let covered: BTreeSet<&str> = corpus().iter().map(|(name, _)| *name).collect();
-    assert_eq!(
-        advertised, covered,
-        "every advertised tool needs a conformance corpus entry, and every \
-         corpus entry an advertised tool: extend `corpus` alongside the surface"
-    );
-
-    let mut validators: BTreeMap<String, (Validator, Validator)> = BTreeMap::new();
-    for tool in &tools {
+/// Compiles one input and one output validator per advertised tool.
+fn tool_validators(
+    tools: &[rmcp::model::Tool],
+) -> TestResult<BTreeMap<String, (Validator, Validator)>> {
+    let mut validators = BTreeMap::new();
+    for tool in tools {
         let input = Value::Object(tool.input_schema.as_ref().clone());
         let output = tool
             .output_schema
@@ -125,9 +170,29 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
             ),
         );
     }
+    Ok(validators)
+}
+
+#[tokio::test]
+async fn every_tool_result_validates_against_served_output_schema() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+
+    let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+    let covered: BTreeSet<&str> = corpus().iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        advertised, covered,
+        "every advertised tool needs a conformance corpus entry, and every \
+         corpus entry an advertised tool: extend `corpus` alongside the surface"
+    );
+
+    let validators = tool_validators(&tools)?;
 
     let mut null_cursor_pages = 0_usize;
     let mut present_cursor_pages = 0_usize;
+    let mut applied_changes = 0_usize;
+    let mut applied_with_findings = 0_usize;
+    let mut refusal_reasons: BTreeSet<String> = BTreeSet::new();
     for (name, request) in corpus() {
         let (input_validator, output_validator) = validators
             .get(name)
@@ -148,6 +213,23 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 .structured_content
                 .ok_or_else(|| format!("{name} must return structured content"))?;
             assert_validates(output_validator, &structured, &format!("{name} result"));
+            match structured["status"].as_str() {
+                Some("applied") => {
+                    applied_changes += 1;
+                    if structured["summary"]["diagnostics"]
+                        .as_array()
+                        .is_some_and(|findings| !findings.is_empty())
+                    {
+                        applied_with_findings += 1;
+                    }
+                }
+                Some("refused") => {
+                    if let Some(reason) = structured["reason"].as_str() {
+                        refusal_reasons.insert(reason.to_owned());
+                    }
+                }
+                _ => {}
+            }
             if structured.get("next_cursor").is_some() {
                 let mut continued = structured.clone();
                 continued["next_cursor"] = json!("b3BhcXVl");
@@ -176,6 +258,63 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
         null_cursor_pages > 0 && present_cursor_pages > 0,
         "the corpus must prove both next_cursor arms against the schema: \
          null_cursor_pages={null_cursor_pages}, present_cursor_pages={present_cursor_pages}"
+    );
+    assert!(
+        applied_changes >= 3 && applied_with_findings >= 1,
+        "the corpus must prove the applied arm with and without parser findings: \
+         applied={applied_changes}, with_findings={applied_with_findings}"
+    );
+    for reason in ["unmet_precondition", "ambiguous_target", "unsupported"] {
+        assert!(
+            refusal_reasons.contains(reason),
+            "the corpus must prove the {reason} refusal arm; proven: {refusal_reasons:?}"
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_witnessed_replace_node_lands_and_validates() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+
+    let listing = client
+        .call_tool(
+            CallToolRequestParams::new("nodes")
+                .with_arguments(arguments(&json!({ "path": "lib.rs", "position": 3 }))?),
+        )
+        .await?;
+    let listing = listing
+        .structured_content
+        .ok_or("nodes must return structured content")?;
+    let witnessed = listing["nodes"][0]["id"]
+        .as_str()
+        .ok_or("listing must carry a node id")?
+        .to_owned();
+    let replaced = client
+        .call_tool(
+            CallToolRequestParams::new("replace_node").with_arguments(arguments(
+                &json!({ "node": witnessed, "body": "pub fn beacon_one() {}" }),
+            )?),
+        )
+        .await?;
+    let replaced = replaced
+        .structured_content
+        .ok_or("replace_node must return structured content")?;
+    let (_, output_validator) = &validators["replace_node"];
+    assert_validates(
+        output_validator,
+        &replaced,
+        "live witnessed replace_node result",
+    );
+    assert_eq!(
+        replaced["status"],
+        json!("applied"),
+        "a fresh witnessed address must land: {replaced:#}"
     );
 
     client.cancel().await?;
