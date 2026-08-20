@@ -25,7 +25,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const FOLLOWED_PAGES_MAX: usize = 16;
 
 /// One request per advertised tool behavior worth proving: a single exact
-/// hit, a paginated prefix listing, and a body-free lookup.
+/// hit, a paginated prefix listing, a body-free lookup, and node listings
+/// at a declaration's first byte and inside its body.
 fn corpus() -> Vec<(&'static str, Value)> {
     vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
@@ -36,6 +37,8 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("search", json!({ "query": "beacon" })),
         ("search", json!({ "query": "beacon", "limit": 1 })),
+        ("nodes", json!({ "path": "lib.rs", "position": 0 })),
+        ("nodes", json!({ "path": "lib.rs", "position": 8 })),
     ]
 }
 

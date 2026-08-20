@@ -3,7 +3,9 @@ use std::path::Path;
 use rift_core::{ErrorName, RetryDirective};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::error as wire;
-use rift_protocol::read::{GetSymbolParams, GetSymbolResult, SearchParams, SearchResult};
+use rift_protocol::read::{
+    GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
+};
 use rift_server::{ReadError, ReadService};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
@@ -64,6 +66,20 @@ impl RiftMcp {
             .map(Json)
             .map_err(|error| tool_error(&error))
     }
+
+    /// Lists the syntax nodes covering one UTF-8 byte position in one file,
+    /// outermost first. Each identity carries a witness, so an address taken
+    /// from this listing refuses cleanly once the file's bytes drift.
+    #[tool]
+    fn nodes(
+        &self,
+        Parameters(params): Parameters<NodesParams>,
+    ) -> Result<Json<NodesResult>, ErrorData> {
+        self.reads
+            .nodes(params)
+            .map(Json)
+            .map_err(|error| tool_error(&error))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -71,7 +87,10 @@ impl ServerHandler for RiftMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Read current workspace with get_symbol and search.")
+            .with_instructions(
+                "Read the current workspace: get_symbol and search find declarations, \
+                 nodes lists witnessed syntax nodes at a byte position.",
+            )
     }
 }
 
@@ -221,7 +240,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
-            ["get_symbol", "search"]
+            ["get_symbol", "nodes", "search"]
         );
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
 
@@ -252,15 +271,42 @@ mod tests {
                 .is_empty()
         );
 
-        let absent = client
-            .call_tool(CallToolRequestParams::new("nodes"))
-            .await
-            .expect_err("unadvertised nodes tool must be absent");
-        assert!(absent.to_string().contains("tool not found"));
+        let nodes = client
+            .call_tool(
+                CallToolRequestParams::new("nodes")
+                    .with_arguments(arguments(&json!({"path": "lib.rs", "position": 8}))?),
+            )
+            .await?;
+        let structured = nodes
+            .structured_content
+            .ok_or("nodes must return structured content")?;
+        let listed = structured["nodes"]
+            .as_array()
+            .ok_or("nodes must be an array")?;
+        assert!(
+            !listed.is_empty(),
+            "position 8 sits inside `pub fn beacon`, so at least one node covers it"
+        );
+        let witness_suffix = has_witness_fragment(listed[0]["id"].as_str().unwrap_or_default());
+        assert!(
+            witness_suffix,
+            "every listed node id must end in an eight-hex-character witness: {}",
+            listed[0]["id"]
+        );
 
         client.cancel().await?;
         server_task.await?;
         Ok(())
+    }
+
+    /// Reports whether a node id ends in `#` plus eight lowercase hex digits.
+    fn has_witness_fragment(id: &str) -> bool {
+        id.rsplit_once('#').is_some_and(|(_, witness)| {
+            witness.len() == 8
+                && witness
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit() && !character.is_uppercase())
+        })
     }
 
     #[tokio::test]
