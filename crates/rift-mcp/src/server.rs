@@ -3,7 +3,9 @@ use std::sync::RwLock;
 
 use rift_core::{ErrorName, RetryDirective};
 use rift_index::WorkspaceIndexLimits;
-use rift_protocol::change::{ChangeResult, InsertSymbolParams, ReplaceSymbolParams};
+use rift_protocol::change::{
+    ChangeResult, InsertSymbolParams, PatchParams, ReplaceNodeParams, ReplaceSymbolParams,
+};
 use rift_protocol::error as wire;
 use rift_protocol::read::{
     GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
@@ -112,6 +114,28 @@ impl RiftMcp {
         self.change(|reads, changes| changes.insert_symbol(reads, &params))
     }
 
+    /// Replaces one syntax node through a witnessed address from `nodes`.
+    /// The server recomputes the witness before writing and refuses when the
+    /// bytes drifted, so a stale address never splices into moved code.
+    #[tool]
+    fn replace_node(
+        &self,
+        Parameters(params): Parameters<ReplaceNodeParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        self.change(|reads, changes| changes.replace_node(reads, &params))
+    }
+
+    /// Applies unified-diff hunks to workspace files atomically. Hunk
+    /// context guards the change: a context mismatch refuses with an unmet
+    /// precondition and the tree stays untouched.
+    #[tool]
+    fn patch(
+        &self,
+        Parameters(params): Parameters<PatchParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        self.change(|reads, changes| changes.patch(reads, &params))
+    }
+
     /// Takes the current read snapshot.
     ///
     /// # Panics
@@ -179,7 +203,8 @@ impl ServerHandler for RiftMcp {
             .with_instructions(
                 "Read and edit the current workspace: get_symbol and search find \
                  declarations, nodes lists witnessed syntax nodes at a byte position, \
-                 replace_symbol and insert_symbol change declarations atomically.",
+                 and replace_symbol, insert_symbol, replace_node, and patch change \
+                 code atomically behind verified preconditions.",
             )
     }
 }
@@ -339,6 +364,8 @@ mod tests {
                 "get_symbol",
                 "insert_symbol",
                 "nodes",
+                "patch",
+                "replace_node",
                 "replace_symbol",
                 "search"
             ]

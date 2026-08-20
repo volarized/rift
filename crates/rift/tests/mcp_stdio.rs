@@ -57,6 +57,8 @@ async fn rift_reads_its_own_rust_source_over_real_stdio_mcp() -> TestResult {
             "get_symbol",
             "insert_symbol",
             "nodes",
+            "patch",
+            "replace_node",
             "replace_symbol",
             "search"
         ]
