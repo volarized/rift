@@ -54,12 +54,13 @@ replaces current executable.
 
 ## Protocol development
 
-The protocol and `rift.toml` models live in `protocol/src/rift/models`. Generate their JSON Schema
-and Protobuf outputs with:
+The protocol models are Rust types in `crates/rift-protocol/src`, and the docs site renders the
+JSON Schema document exported from them into `docs/protocol`. Regenerate and verify the export
+with:
 
 ```sh
-cd protocol
-uv run python -m rift.generate --check
+just generate
+just generate-check
 ```
 
 ## Rust development
