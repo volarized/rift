@@ -11,8 +11,6 @@ pub struct ToolContract {
     pub request_model: &'static str,
     /// Protocol result model name.
     pub result_model: &'static str,
-    /// Canonical JSON fixture accepted by protocol model.
-    pub minimal_request_json: &'static str,
 }
 
 /// The `get_symbol` description an MCP client shows its agent.
@@ -31,13 +29,11 @@ pub const TOOL_CONTRACTS: &[ToolContract] = &[
         description: GET_SYMBOL_DESCRIPTION,
         request_model: "GetSymbolParams",
         result_model: "GetSymbolResult",
-        minimal_request_json: "{\"name\":\"BaseModel\"}",
     },
     ToolContract {
         name: "search",
         description: SEARCH_DESCRIPTION,
         request_model: "SearchParams",
         result_model: "SearchResult",
-        minimal_request_json: "{\"query\":\"BaseModel\"}",
     },
 ];
