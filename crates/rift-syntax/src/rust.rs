@@ -287,6 +287,7 @@ pub struct RustQueryCapture {
 }
 
 /// Rift-owned adapter around Tree-sitter Rust queries.
+#[derive(Debug)]
 pub struct RustQuery {
     inner: TreeSitterQuery,
 }
@@ -869,6 +870,8 @@ fn qualify(parent: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
 
     fn path() -> ProjectPath {
@@ -923,8 +926,7 @@ mod tests {
         );
         assert_eq!(
             RustQuery::new("(missing_node) @rift.name")
-                .err()
-                .expect("invalid node kind must fail")
+                .expect_err("invalid node kind must fail")
                 .violation(),
             RustSyntaxViolation::InvalidQuery
         );
@@ -979,5 +981,244 @@ mod tests {
                 })
                 .expect_err("depth bound");
         assert_eq!(depth_error.violation(), RustSyntaxViolation::TooDeep);
+    }
+
+    #[test]
+    fn test_provider_classifies_every_declaration_kind() {
+        let text = "enum E {}\ntrait T {}\ntype A = u8;\nconst C: u8 = 0;\nstatic S: u8 = 0;\nmacro_rules! m { () => {}; }";
+        let document = RustSyntaxProvider::default()
+            .analyze(RustSource {
+                path: &path(),
+                text,
+            })
+            .expect("Rust fixture must parse");
+        let kinds = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                RustSymbolKind::Enum,
+                RustSymbolKind::Trait,
+                RustSymbolKind::TypeAlias,
+                RustSymbolKind::Constant,
+                RustSymbolKind::Static,
+                RustSymbolKind::Macro,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_grammar_node_kind_round_trips_and_rejects_unknown() {
+        for kind in RustGrammarNodeKind::ALL {
+            assert_eq!(
+                kind.as_str()
+                    .parse::<RustGrammarNodeKind>()
+                    .expect("known kind"),
+                kind
+            );
+        }
+        let error = "flumph_item"
+            .parse::<RustGrammarNodeKind>()
+            .expect_err("unknown kind");
+        assert_eq!(error.violation(), RustSyntaxViolation::UnknownNodeKind);
+        assert!(error.source().is_none());
+        let message = error.to_string();
+        assert!(message.contains("flumph_item"), "names offender: {message}");
+        assert!(
+            message.contains("function_item") && message.contains("visibility_modifier"),
+            "lists interpreted vocabulary: {message}"
+        );
+    }
+
+    #[test]
+    fn test_visibility_from_authored_distinguishes_public_and_restricted() {
+        assert_eq!(RustVisibility::from_authored("pub"), RustVisibility::Public);
+        assert_eq!(
+            RustVisibility::from_authored("pub(super)"),
+            RustVisibility::Restricted("pub(super)".into())
+        );
+    }
+
+    #[test]
+    fn test_zero_limit_error_names_offending_bound_and_configuration_site() {
+        let cases = [
+            (RustSyntaxLimits::new(0, 1, 1), "source_bytes_max"),
+            (RustSyntaxLimits::new(1, 0, 1), "syntax_nodes_max"),
+            (RustSyntaxLimits::new(1, 1, 0), "syntax_depth_max"),
+        ];
+        for (result, bound_name) in cases {
+            let message = result.expect_err("zero bound").to_string();
+            assert!(message.contains(bound_name), "names bound: {message}");
+            assert!(
+                message.contains("RustSyntaxLimits::new"),
+                "names configuration site: {message}"
+            );
+        }
+        let query = RustQuery::new("(function_item) @rift.item").expect("valid Rust query");
+        let error = query
+            .captures("fn a() {}", 0)
+            .expect_err("zero captures_max");
+        assert_eq!(error.violation(), RustSyntaxViolation::ZeroLimit);
+        let message = error.to_string();
+        assert!(message.contains("captures_max"), "names bound: {message}");
+        assert!(
+            message.contains("RustQuery::captures"),
+            "names configuration site: {message}"
+        );
+    }
+
+    #[test]
+    fn test_source_too_large_error_reports_sizes_path_and_limit_origin() {
+        let error =
+            RustSyntaxProvider::new(RustSyntaxLimits::new(3, 10, 10).expect("positive limits"))
+                .analyze(RustSource {
+                    path: &path(),
+                    text: "fn x() {}",
+                })
+                .expect_err("source bound");
+        let message = error.to_string();
+        assert!(message.contains("src/lib.rs"), "names source: {message}");
+        assert!(message.contains("9 bytes"), "reports size: {message}");
+        assert!(
+            message.contains("source_bytes_max") && message.contains("3 bytes"),
+            "names violated limit: {message}"
+        );
+
+        let query = RustQuery::new("(function_item) @rift.item").expect("valid Rust query");
+        let oversized = "a".repeat(SOURCE_BYTES_MAX_DEFAULT + 1);
+        let error = query.captures(&oversized, 1).expect_err("oversized source");
+        assert_eq!(error.violation(), RustSyntaxViolation::SourceTooLarge);
+        let message = error.to_string();
+        assert!(
+            message.contains("SOURCE_BYTES_MAX_DEFAULT")
+                && message.contains("crates/rift-syntax/src/rust.rs"),
+            "names limit definition: {message}"
+        );
+    }
+
+    #[test]
+    fn test_tree_bound_errors_report_path_and_configured_limit() {
+        let node_message =
+            RustSyntaxProvider::new(RustSyntaxLimits::new(100, 1, 10).expect("positive limits"))
+                .analyze(RustSource {
+                    path: &path(),
+                    text: "fn x() {}",
+                })
+                .expect_err("node bound")
+                .to_string();
+        assert!(
+            node_message.contains("src/lib.rs") && node_message.contains("syntax_nodes_max of 1"),
+            "names path and limit: {node_message}"
+        );
+
+        let depth_message =
+            RustSyntaxProvider::new(RustSyntaxLimits::new(100, 20, 1).expect("positive limits"))
+                .analyze(RustSource {
+                    path: &path(),
+                    text: "fn x() { { 1 } }",
+                })
+                .expect_err("depth bound")
+                .to_string();
+        assert!(
+            depth_message.contains("src/lib.rs") && depth_message.contains("syntax_depth_max of 1"),
+            "names path and limit: {depth_message}"
+        );
+    }
+
+    #[test]
+    fn test_query_errors_report_line_reason_and_capture_limit() {
+        let error = RustQuery::new("(missing_node) @rift.name").expect_err("invalid node kind");
+        assert!(error.source().is_some(), "keeps tree-sitter source");
+        let message = error.to_string();
+        assert!(message.contains("line 1"), "names line: {message}");
+        assert!(
+            message.contains("(missing_node) @rift.name"),
+            "quotes offending line: {message}"
+        );
+        assert!(
+            message.contains("invalid node type") && message.contains("missing_node"),
+            "explains reason: {message}"
+        );
+
+        let query = RustQuery::new("(function_item name: (identifier) @rift.name)")
+            .expect("valid Rust query");
+        let message = query
+            .captures("fn first() {} fn second() {}", 1)
+            .expect_err("capture overflow")
+            .to_string();
+        assert!(
+            message.contains("capture limit of 1") && message.contains("RustQuery::captures"),
+            "names limit and site: {message}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_query_reason_covers_every_tree_sitter_error_kind() {
+        let cases = [
+            ("(((", "invalid syntax"),
+            (
+                "(function_item flumph: (identifier) @x)",
+                "invalid field name",
+            ),
+            ("((function_item) @x (#eq? @y @y))", "invalid capture name"),
+            ("((function_item) @x (#eq?))", "invalid predicate"),
+            ("(identifier (identifier))", "impossible pattern"),
+        ];
+        for (query, reason) in cases {
+            let error = RustQuery::new(query).expect_err("query must be rejected");
+            assert_eq!(error.violation(), RustSyntaxViolation::InvalidQuery);
+            let message = error.to_string();
+            assert!(message.contains(reason), "explains {reason}: {message}");
+        }
+        assert_eq!(
+            query_error_reason(&QueryErrorKind::Language),
+            "incompatible language",
+        );
+    }
+
+    #[test]
+    fn test_runtime_only_errors_render_full_context() {
+        let grammar = RustSyntaxError::incompatible_grammar(&rust_language());
+        assert_eq!(
+            grammar.violation(),
+            RustSyntaxViolation::IncompatibleGrammar
+        );
+        let message = grammar.to_string();
+        assert!(
+            message.contains("ABI version") && message.contains("Cargo.toml"),
+            "reports ABI mismatch and remedy: {message}"
+        );
+
+        let cancelled =
+            RustSyntaxError::new(RustSyntaxErrorKind::ParseCancelled { path: Some(path()) });
+        assert_eq!(cancelled.violation(), RustSyntaxViolation::ParseCancelled);
+        assert!(cancelled.source().is_none());
+        assert!(
+            cancelled.to_string().contains("src/lib.rs"),
+            "names source path"
+        );
+        let cancelled_query =
+            RustSyntaxError::new(RustSyntaxErrorKind::ParseCancelled { path: None });
+        assert!(
+            cancelled_query.to_string().contains("RustQuery::captures"),
+            "names query entry point"
+        );
+
+        let mut parser = rust_parser().expect("pinned grammar loads");
+        let tree = parser.parse("fn x() {}", None).expect("fixture parses");
+        let overflow = RustSyntaxError::position_overflow(
+            tree.root_node(),
+            u32::try_from(u64::MAX).expect_err("u64::MAX exceeds u32"),
+        );
+        assert_eq!(overflow.violation(), RustSyntaxViolation::PositionOverflow);
+        assert!(overflow.source().is_some(), "keeps conversion source");
+        let message = overflow.to_string();
+        assert!(
+            message.contains("source_file") && message.contains("u64"),
+            "names node kind and wire width: {message}"
+        );
     }
 }
