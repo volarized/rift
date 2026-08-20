@@ -144,11 +144,11 @@ impl ChangeService {
         if params.region.is_some() {
             return Err(ReadFault::unsupported("region-scoped replacement"));
         }
-        let address = parse_node_address(&params.node.0)?;
+        let address: NodeAddress = params.node.0.parse()?;
         let Some(file) = reads.index().file(&address.path) else {
-            return Ok(refused(
+            return Ok(ChangeResult::refused(
                 RefusalReason::UnmetPrecondition,
-                vec![precondition(
+                vec![OperationPrecondition::new(
                     OperationPreconditionKind::TargetExists,
                     OperationPreconditionStatus::Failed,
                     vec![PreconditionAddress::Node {
@@ -162,9 +162,9 @@ impl ChangeService {
         };
         let observed_witness = node_witness(file.source(), address.range);
         if observed_witness != address.witness {
-            return Ok(refused(
+            return Ok(ChangeResult::refused(
                 RefusalReason::UnmetPrecondition,
-                vec![precondition(
+                vec![OperationPrecondition::new(
                     OperationPreconditionKind::SourceUnchanged,
                     OperationPreconditionStatus::Failed,
                     vec![PreconditionAddress::Node {
@@ -380,7 +380,7 @@ impl ChangeService {
         let Some(file) = reads.index().file(path) else {
             return Ok(Resolution::Refused {
                 reason: RefusalReason::UnmetPrecondition,
-                preconditions: vec![precondition(
+                preconditions: vec![OperationPrecondition::new(
                     OperationPreconditionKind::TargetExists,
                     OperationPreconditionStatus::Failed,
                     symbol_address(),
@@ -400,7 +400,7 @@ impl ChangeService {
         match spans.as_slice() {
             [] => Ok(Resolution::Refused {
                 reason: RefusalReason::UnmetPrecondition,
-                preconditions: vec![precondition(
+                preconditions: vec![OperationPrecondition::new(
                     OperationPreconditionKind::TargetExists,
                     OperationPreconditionStatus::Failed,
                     symbol_address(),
@@ -412,7 +412,7 @@ impl ChangeService {
             [only] => self.verified_against_disk(reads, path, plan(*only)),
             several => Ok(Resolution::Refused {
                 reason: RefusalReason::AmbiguousTarget,
-                preconditions: vec![precondition(
+                preconditions: vec![OperationPrecondition::new(
                     OperationPreconditionKind::TargetExists,
                     OperationPreconditionStatus::Failed,
                     symbol_address(),
@@ -442,7 +442,7 @@ impl ChangeService {
         if disk != file.source() {
             return Ok(Resolution::Refused {
                 reason: RefusalReason::UnmetPrecondition,
-                preconditions: vec![precondition(
+                preconditions: vec![OperationPrecondition::new(
                     OperationPreconditionKind::SourceUnchanged,
                     OperationPreconditionStatus::Failed,
                     Vec::new(),
@@ -469,7 +469,7 @@ impl ChangeService {
             Resolution::Refused {
                 reason,
                 preconditions,
-            } => Ok(refused(reason, preconditions)),
+            } => Ok(ChangeResult::refused(reason, preconditions)),
             Resolution::Planned(plan) => self.apply(reads, plan),
         }
     }
@@ -617,29 +617,33 @@ fn parse_symbol_address(address: &str) -> Result<(CoreProjectPath, String), Read
     Ok((path, qualified_name))
 }
 
-/// Splits `rift://node/rust/<path>@<start>-<end>#<witness>` into its parts.
-fn parse_node_address(address: &str) -> Result<NodeAddress, ReadError> {
-    let malformed = || ReadFault::invalid("node", "not a witnessed rift node address");
-    let remainder = address
-        .strip_prefix("rift://node/rust/")
-        .ok_or_else(malformed)?;
-    let (located, witness) = remainder.rsplit_once('#').ok_or_else(malformed)?;
-    let (encoded_path, span) = located.rsplit_once('@').ok_or_else(malformed)?;
-    let (start, end) = span.split_once('-').ok_or_else(malformed)?;
-    let start: u64 = start.parse().map_err(|_| malformed())?;
-    let end: u64 = end.parse().map_err(|_| malformed())?;
-    if start > end || witness.len() != 8 {
-        return Err(malformed());
+impl std::str::FromStr for NodeAddress {
+    type Err = ReadError;
+
+    /// Parses `rift://node/rust/<path>@<start>-<end>#<witness>`.
+    fn from_str(address: &str) -> Result<Self, Self::Err> {
+        let malformed = || ReadFault::invalid("node", "not a witnessed rift node address");
+        let remainder = address
+            .strip_prefix("rift://node/rust/")
+            .ok_or_else(malformed)?;
+        let (located, witness) = remainder.rsplit_once('#').ok_or_else(malformed)?;
+        let (encoded_path, span) = located.rsplit_once('@').ok_or_else(malformed)?;
+        let (start, end) = span.split_once('-').ok_or_else(malformed)?;
+        let start: u64 = start.parse().map_err(|_| malformed())?;
+        let end: u64 = end.parse().map_err(|_| malformed())?;
+        if start > end || witness.len() != 8 {
+            return Err(malformed());
+        }
+        let path = decoded(encoded_path).ok_or_else(malformed)?;
+        let path = CoreProjectPath::new(path).map_err(|error| {
+            ReadFault::invalid("node", rift_core::fault_label(&error.fault().violation()))
+        })?;
+        Ok(Self {
+            path,
+            range: ByteRange { start, end },
+            witness: witness.to_owned(),
+        })
     }
-    let path = decoded(encoded_path).ok_or_else(malformed)?;
-    let path = CoreProjectPath::new(path).map_err(|error| {
-        ReadFault::invalid("node", rift_core::fault_label(&error.fault().violation()))
-    })?;
-    Ok(NodeAddress {
-        path,
-        range: ByteRange { start, end },
-        witness: witness.to_owned(),
-    })
 }
 
 fn decoded(encoded: &str) -> Option<String> {
@@ -647,35 +651,6 @@ fn decoded(encoded: &str) -> Option<String> {
         .decode_utf8()
         .ok()
         .map(std::borrow::Cow::into_owned)
-}
-
-fn refused(reason: RefusalReason, preconditions: Vec<OperationPrecondition>) -> ChangeResult {
-    ChangeResult::Refused {
-        reason,
-        preconditions,
-        diagnostics: Vec::new(),
-    }
-}
-
-fn precondition(
-    kind: OperationPreconditionKind,
-    status: OperationPreconditionStatus,
-    addresses: Vec<PreconditionAddress>,
-    paths: Vec<String>,
-    expected: PreconditionValue,
-    observed: PreconditionValue,
-) -> OperationPrecondition {
-    OperationPrecondition {
-        kind,
-        status,
-        addresses,
-        paths: paths
-            .into_iter()
-            .map(rift_protocol::read::ProjectPath)
-            .collect(),
-        expected,
-        observed,
-    }
 }
 
 /// First eight hex characters of the SHA-256 of one source text.

@@ -156,6 +156,29 @@ pub struct OperationPrecondition {
     pub observed: PreconditionValue,
 }
 
+impl OperationPrecondition {
+    /// Builds one checked-condition record, wrapping plain path strings in
+    /// the wire [`ProjectPath`].
+    #[must_use]
+    pub fn new(
+        kind: OperationPreconditionKind,
+        status: OperationPreconditionStatus,
+        addresses: Vec<PreconditionAddress>,
+        paths: Vec<String>,
+        expected: PreconditionValue,
+        observed: PreconditionValue,
+    ) -> Self {
+        Self {
+            kind,
+            status,
+            addresses,
+            paths: paths.into_iter().map(ProjectPath).collect(),
+            expected,
+            observed,
+        }
+    }
+}
+
 /// One applied change, with everything Rift learned while resolving it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +220,18 @@ pub enum ChangeResult {
         #[schemars(length(max = 256))]
         diagnostics: Vec<Diagnostic>,
     },
+}
+
+impl ChangeResult {
+    /// A refusal carrying its checked conditions and no diagnostics.
+    #[must_use]
+    pub fn refused(reason: RefusalReason, preconditions: Vec<OperationPrecondition>) -> Self {
+        Self::Refused {
+            reason,
+            preconditions,
+            diagnostics: Vec::new(),
+        }
+    }
 }
 
 /// Replaces one declaration addressed by symbol. The parser derives the span, so the
