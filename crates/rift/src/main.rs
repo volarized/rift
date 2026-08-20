@@ -22,6 +22,12 @@ enum CliCommand {
     Mcp,
     /// Replace current Rift binary with latest official release.
     Update,
+    /// Delete the backup binary left behind by a Windows self-update.
+    ///
+    /// Windows cannot delete a running executable, so after replacement the
+    /// updater spawns the new binary as a detached cleanup child that retries
+    /// deleting the renamed old binary until the parent process releases it.
+    /// The name must match `CLEANUP_SUBCOMMAND` in `update.rs`.
     #[cfg(windows)]
     #[command(hide = true)]
     __CleanupUpdate { parent_pid: u32 },
@@ -112,7 +118,10 @@ mod tests {
     #[test]
     fn update_cli_error_preserves_message_and_source() {
         let error = CliError::Update(super::update::error_for_test());
-        assert_eq!(error.to_string(), "release version is invalid");
+        assert_eq!(
+            error.to_string(),
+            "release tag `vinvalid` is invalid: expected the form `vMAJOR.MINOR.PATCH`, such as `v0.0.2`"
+        );
         assert!(error.source().is_some());
     }
 
