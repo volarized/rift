@@ -346,7 +346,7 @@ pub trait Fault: fmt::Debug {
 pub fn fault_label<K: Serialize + fmt::Debug>(kind: &K) -> String {
     match serde_json::to_value(kind) {
         Ok(serde_json::Value::String(label)) => label,
-        Ok(serde_json::Value::Object(map)) if !map.is_empty() => match map.into_iter().next() {
+        Ok(serde_json::Value::Object(map)) => match map.into_iter().next() {
             Some((label, _)) => label,
             None => format!("{kind:?}"),
         },
@@ -577,6 +577,15 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Serialize)]
+    struct Hollow {}
+
+    #[test]
+    fn fault_labels_fall_back_to_debug_for_unnamed_values() {
+        assert_eq!(fault_label(&7_u8), "7");
+        assert_eq!(fault_label(&Hollow {}), "Hollow");
+    }
+
     #[derive(Debug)]
     struct SourcedFault(std::io::Error);
 
@@ -595,5 +604,15 @@ mod tests {
         let error = Error::from(SourcedFault(std::io::Error::other("disk gone")));
         let source = std::error::Error::source(&error).expect("source must be exposed");
         assert_eq!(source.to_string(), "disk gone");
+        assert_eq!(error.descriptor().name.code(), "storage_failure");
+    }
+
+    #[test]
+    fn kind_without_an_underlying_failure_exposes_no_source() {
+        let error = Error::from(ProbeFault::Unreadable);
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "a fault that wraps nothing must expose no source"
+        );
     }
 }
