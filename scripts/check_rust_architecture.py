@@ -21,6 +21,7 @@ EXPECTED_EDGES = {
     "rift -> rift-provider",
     "rift -> rift-server",
     "rift -> rift-syntax",
+    "rift-core -> rift-protocol",
     "rift-index -> rift-core",
     "rift-index -> rift-model",
     "rift-index -> rift-provider",
