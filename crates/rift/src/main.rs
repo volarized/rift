@@ -108,6 +108,15 @@ mod tests {
         assert!(Cli::try_parse_from(["rift"]).is_ok());
     }
 
+    #[tokio::test]
+    async fn empty_invocation_runs_no_command() {
+        let cli = Cli::try_parse_from(["rift"]).expect("empty invocation must parse");
+        let outcome = super::run(cli)
+            .await
+            .expect("empty invocation must succeed");
+        assert!(outcome.is_none());
+    }
+
     #[test]
     fn mcp_cli_error_preserves_message_and_source() {
         let error = CliError::Mcp(rift_mcp::StdioServeError::UnexpectedQuit);
