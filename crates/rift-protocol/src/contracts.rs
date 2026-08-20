@@ -15,25 +15,27 @@ pub struct ToolContract {
     pub minimal_request_json: &'static str,
 }
 
+/// The `get_symbol` description an MCP client shows its agent.
+pub const GET_SYMBOL_DESCRIPTION: &str = "Finds Rust declarations and their source by exact \
+    symbol name. Each hit carries the declaration and its source excerpt; `include_body: false` \
+    omits both. Use `search` when the name is not exactly known.";
+
+/// The `search` description an MCP client shows its agent.
+pub const SEARCH_DESCRIPTION: &str = "Searches indexed Rust declarations and source lines by \
+    lexical `query`. Use `get_symbol` when the declaration name is known.";
+
 /// Read-only MCP tools implemented by this release.
 pub const TOOL_CONTRACTS: &[ToolContract] = &[
     ToolContract {
         name: "get_symbol",
-        description: "Gets project, dependency, or standard-library declarations by name. \
-            Each hit includes declaration source when the provider can read it; \
-            `include_body: false` omits it, and `include_history` adds project \
-            version-control history. Use `search` for lexical, filtered, or relationship \
-            discovery.",
+        description: GET_SYMBOL_DESCRIPTION,
         request_model: "GetSymbolParams",
         result_model: "GetSymbolResult",
         minimal_request_json: "{\"name\":\"BaseModel\"}",
     },
     ToolContract {
         name: "search",
-        description: "Searches symbols, nodes, and files by lexical `query`, provider \
-            `filter`, or bounded relationship `traversal`. `scope` selects project, \
-            dependency, or all sources. Use `traversal` for callers, callees, tests, edit \
-            ripple, or review context; use `get_symbol` when the declaration name is known.",
+        description: SEARCH_DESCRIPTION,
         request_model: "SearchParams",
         result_model: "SearchResult",
         minimal_request_json: "{\"query\":\"BaseModel\"}",
