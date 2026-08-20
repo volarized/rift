@@ -1240,4 +1240,25 @@ mod tests {
              retry once, and report the full message if the failure repeats"
         );
     }
+
+    #[test]
+    fn test_unknown_node_kind_and_zero_limit_report_code_and_context() {
+        let unknown = "bogus"
+            .parse::<RustGrammarNodeKind>()
+            .expect_err("unregistered kind");
+        assert_eq!(unknown.violation(), RustSyntaxViolation::UnknownNodeKind);
+        assert_eq!(unknown.descriptor().code(), "internal_error");
+        assert_eq!(
+            unknown.context(),
+            vec![ErrorContext::new("node_kind", "bogus")]
+        );
+
+        let zero = RustSyntaxLimits::new(0, 1, 1).expect_err("zero source bound");
+        assert_eq!(zero.violation(), RustSyntaxViolation::ZeroLimit);
+        assert_eq!(zero.descriptor().code(), "configuration_invalid");
+        assert_eq!(
+            zero.context(),
+            vec![ErrorContext::new("bound", "source_bytes_max")]
+        );
+    }
 }

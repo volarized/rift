@@ -314,4 +314,53 @@ mod tests {
              use a workspace-relative path with `/` separators and no `.` or `..` components"
         );
     }
+
+    #[test]
+    fn path_violation_labels_are_non_empty_lowercase() {
+        let violations = [
+            PathViolation::Empty,
+            PathViolation::TooLong,
+            PathViolation::Absolute,
+            PathViolation::DotSegment,
+            PathViolation::EmptySegment,
+            PathViolation::Backslash,
+            PathViolation::ControlCharacter,
+            PathViolation::NonCanonicalUnicode,
+            PathViolation::RiftState,
+        ];
+        for violation in violations {
+            let label = violation.label();
+            assert!(!label.is_empty(), "violation={violation:?}");
+            assert!(
+                label.chars().next().is_some_and(char::is_lowercase),
+                "label must start lowercase so it reads inside a rendered \
+                 failure line: violation={violation:?}, label={label}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_kind_labels_name_each_vocabulary() {
+        assert_eq!(PathKind::Project.label(), "project path");
+        assert_eq!(PathKind::Source.label(), "source path");
+    }
+
+    #[test]
+    fn path_error_display_covers_project_and_source_kinds() {
+        let project_error = ProjectPath::new("../outside").expect_err("dot segment is invalid");
+        assert_eq!(
+            project_error.to_string(),
+            "the path cannot be addressed by this workspace: \
+             path_kind project path, violation contains a dot segment; \
+             use a workspace-relative path with `/` separators and no `.` or `..` components"
+        );
+
+        let source_error = SourcePath::new("").expect_err("empty source path is invalid");
+        assert_eq!(
+            source_error.to_string(),
+            "the path cannot be addressed by this workspace: \
+             path_kind source path, violation empty; \
+             use a workspace-relative path with `/` separators and no `.` or `..` components"
+        );
+    }
 }

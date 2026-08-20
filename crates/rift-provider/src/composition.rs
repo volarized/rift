@@ -1392,6 +1392,10 @@ mod tests {
             .expect_err("cache bound must reject before mutation");
         assert_eq!(error.violation(), CacheViolation::TooManyKeys);
         assert_eq!(
+            error.context(),
+            vec![ErrorContext::new("violation", "too_many_keys")]
+        );
+        assert_eq!(
             error.to_string(),
             "the request exceeded a declared resource limit: violation too_many_keys; \
              resize the request below the named limit, or raise that limit \
@@ -1712,5 +1716,98 @@ mod tests {
             error.kind(),
             CompositionErrorKind::TypeMismatch(_)
         ));
+    }
+
+    #[test]
+    fn context_reports_rule_and_stage_for_every_composition_error_kind() {
+        let mut builder = CompositionBuilder::new(composition_id("ctx"));
+        let invalid = builder.source("Uppercase", &component::<(), Sources>("source"));
+        let invalid_error = builder
+            .output(invalid)
+            .build()
+            .expect_err("non-canonical name must fail");
+        assert_eq!(
+            invalid_error.context(),
+            vec![ErrorContext::new("rule", "stage name is not canonical")]
+        );
+
+        let mut builder = CompositionBuilder::new(composition_id("ctx"));
+        let flow = builder.source("stage", &component::<(), Sources>("stage"));
+        let _second = builder.source("stage", &component::<(), Sources>("again"));
+        let duplicate_error = builder
+            .output(flow)
+            .build()
+            .expect_err("duplicate scoped path must fail");
+        assert_eq!(
+            duplicate_error.context(),
+            vec![
+                ErrorContext::new("rule", "stage path already exists"),
+                ErrorContext::new("stage", "ctx.stage"),
+            ]
+        );
+
+        let mut foreign_source = CompositionBuilder::new(composition_id("foreign"));
+        let foreign_flow = foreign_source.source("source", &component::<(), Sources>("source"));
+        let mut foreign_target = CompositionBuilder::new(composition_id("target"));
+        let _own = foreign_target.source("source", &component::<(), Sources>("source"));
+        let foreign_error = foreign_target
+            .output(foreign_flow)
+            .build()
+            .expect_err("foreign output handle must fail");
+        assert_eq!(
+            foreign_error.context(),
+            vec![ErrorContext::new(
+                "rule",
+                "flow handle belongs to another builder"
+            )]
+        );
+
+        let missing_error = CompositionBuilder::new(composition_id("empty"))
+            .build()
+            .expect_err("missing output must fail");
+        assert_eq!(
+            missing_error.context(),
+            vec![ErrorContext::new("rule", "composition selects no output")]
+        );
+
+        let composition = project_syntax_composition();
+        let not_found_error = composition
+            .edit()
+            .replace("core.absent", &component::<Sources, Syntax>("other"))
+            .build()
+            .expect_err("unknown stage path must fail");
+        assert_eq!(
+            not_found_error.context(),
+            vec![
+                ErrorContext::new("rule", "stage does not exist"),
+                ErrorContext::new("stage", "core.absent"),
+            ]
+        );
+
+        let mismatch_error = composition
+            .edit()
+            .replace("core.syntax", &component::<Metadata, Syntax>("wrong-input"))
+            .build()
+            .expect_err("incompatible replacement must fail");
+        assert_eq!(
+            mismatch_error.context(),
+            vec![
+                ErrorContext::new("rule", "stage output type does not match consumer input"),
+                ErrorContext::new("stage", "core.syntax"),
+            ]
+        );
+
+        let dangling_error = composition
+            .edit()
+            .remove("core.project")
+            .build()
+            .expect_err("used source cannot be removed");
+        assert_eq!(
+            dangling_error.context(),
+            vec![
+                ErrorContext::new("rule", "removed stage still has a consumer"),
+                ErrorContext::new("stage", "core.project"),
+            ]
+        );
     }
 }
