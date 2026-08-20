@@ -41,7 +41,7 @@ pub struct CoChange {
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageCompleteState {
-    /// Wire value `complete`.
+    /// Everything in scope is present.
     Complete,
 }
 
@@ -49,7 +49,7 @@ pub enum CoverageCompleteState {
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoveragePartialState {
-    /// Wire value `partial`.
+    /// Some of what is in scope is missing.
     Partial,
 }
 
@@ -108,13 +108,13 @@ pub enum Coverage {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageReach {
-    /// Wire value `request`.
+    /// Only what this request touched.
     Request,
-    /// Wire value `project`.
+    /// Every visible file of the workspace.
     Project,
-    /// Wire value `dependencies`.
+    /// The workspace's resolved dependencies.
     Dependencies,
-    /// Wire value `all`.
+    /// The workspace, its dependencies, and the standard library together.
     All,
 }
 
@@ -128,7 +128,7 @@ pub enum CoverageScope {
         /// How far the claim reaches.
         reach: CoverageReach,
     },
-    /// One file. The claim holds for that path and says nothing about any other.
+    /// A single unit is just a file: the claim holds for that path and says nothing about any other.
     Unit {
         /// The file the claim is about.
         unit: FileId,
@@ -142,9 +142,9 @@ pub enum CoverageScope {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageStateState {
-    /// Wire value `unsupported`.
+    /// No provider produces this family for the language.
     Unsupported,
-    /// Wire value `not_applicable`.
+    /// The family has no meaning for this language.
     NotApplicable,
 }
 
@@ -232,11 +232,11 @@ pub struct DiagnosticContext {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticContextSource {
-    /// Wire value `provider`.
+    /// A language provider emitted the finding.
     Provider,
-    /// Wire value `hook`.
+    /// A configured hook emitted the finding.
     Hook,
-    /// Wire value `apply`.
+    /// Applying a change request emitted the finding.
     Apply,
 }
 
@@ -247,11 +247,11 @@ pub enum DiagnosticContextSource {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticContinuation {
-    /// Wire value `repairable`.
+    /// The producer recovered and later facts remain reliable.
     Repairable,
-    /// Wire value `unrepairable`.
+    /// The producer could not recover, so later facts are suspect.
     Unrepairable,
-    /// Wire value `unknown`.
+    /// The producer does not say whether it recovered.
     Unknown,
 }
 
@@ -274,9 +274,9 @@ pub struct DiagnosticRelated {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticReliability {
-    /// Wire value `reliable`.
+    /// The surrounding facts came off a clean parse.
     Reliable,
-    /// Wire value `recovered`.
+    /// The parser recovered nearby, so surrounding facts may be off.
     Recovered,
 }
 
@@ -287,9 +287,9 @@ pub enum DiagnosticReliability {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticTag {
-    /// Wire value `deprecated`.
+    /// The code the finding points at is deprecated.
     Deprecated,
-    /// Wire value `unnecessary`.
+    /// The code the finding points at is unused or has no effect.
     Unnecessary,
 }
 
@@ -318,9 +318,9 @@ pub struct Documentation {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentationFormat {
-    /// Wire value `plain`.
+    /// Plain text with no markup to render.
     Plain,
-    /// Wire value `markdown`.
+    /// Markdown as authored in the source.
     Markdown,
 }
 
@@ -382,17 +382,17 @@ pub struct Extensions(pub BTreeMap<ExtensionKey, ExtensionValue>);
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FactFamily {
-    /// Wire value `symbols`.
+    /// Declaration records a provider resolved.
     Symbols,
-    /// Wire value `nodes`.
+    /// Concrete syntax trees over file bytes.
     Nodes,
-    /// Wire value `relationships`.
+    /// Directed edges between symbols.
     Relationships,
-    /// Wire value `types`.
+    /// Type bindings attached to declarations.
     Types,
-    /// Wire value `diagnostics`.
+    /// Findings providers produced from source.
     Diagnostics,
-    /// Wire value `history`.
+    /// Version-control timelines of symbols.
     History,
 }
 
@@ -425,34 +425,34 @@ pub struct FieldFilter {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FieldFilterOp {
-    /// Wire value `eq`.
+    /// The field equals the value.
     Eq,
-    /// Wire value `ne`.
+    /// The field differs from the value.
     Ne,
-    /// Wire value `in`.
+    /// The field equals one of the listed values.
     In,
-    /// Wire value `contains`.
+    /// The array field holds the value as an entry.
     Contains,
-    /// Wire value `prefix`.
+    /// The field starts with the value.
     Prefix,
-    /// Wire value `regex`.
+    /// The field matches the value as a regular expression.
     Regex,
-    /// Wire value `gt`.
+    /// The field is greater than the value.
     Gt,
-    /// Wire value `gte`.
+    /// The field is greater than or equal to the value.
     Gte,
-    /// Wire value `lt`.
+    /// The field is less than the value.
     Lt,
-    /// Wire value `lte`.
+    /// The field is less than or equal to the value.
     Lte,
-    /// Wire value `exists`.
+    /// The field is present, whatever its value.
     Exists,
 }
 
 /// One file and the languages that read it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::symlink_carries_no_language_facts)]
+#[schemars(transform = schema::forbid_symlink_language_facts)]
 pub struct File {
     /// Project-relative source identity and the URI from which this record and its bytes
     /// are read.
@@ -553,9 +553,9 @@ pub enum Filter {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Freshness {
-    /// Wire value `current`.
+    /// The derived state covers the answer's captured revisions.
     Current,
-    /// Wire value `stale`.
+    /// The derived state lags behind the answer's captured revisions.
     Stale,
 }
 
@@ -670,9 +670,9 @@ pub struct GraphHop {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HopDirection {
-    /// Wire value `outgoing`.
+    /// The walk followed the edge from source to target.
     Outgoing,
-    /// Wire value `incoming`.
+    /// The walk followed the edge against its direction, from target to source.
     Incoming,
 }
 
@@ -726,17 +726,17 @@ pub struct LanguageRegion {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum MatchedField {
-    /// Wire value `name`.
+    /// The declaration's name matched.
     Name,
-    /// Wire value `signature`.
+    /// A rendered signature matched.
     Signature,
-    /// Wire value `documentation`.
+    /// An attached doc comment matched.
     Documentation,
-    /// Wire value `content`.
+    /// The file's contents matched.
     Content,
-    /// Wire value `path`.
+    /// The project-relative path matched.
     Path,
-    /// Wire value `relationship`.
+    /// A relationship traversal reached the hit.
     Relationship,
 }
 
@@ -783,41 +783,41 @@ pub struct Node {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum NodeFacet {
-    /// Wire value `declaration`.
+    /// Introduces a name.
     Declaration,
-    /// Wire value `definition`.
+    /// Supplies the implementation behind a declared name.
     Definition,
-    /// Wire value `body`.
+    /// The implementation part of a declaration.
     Body,
-    /// Wire value `block`.
+    /// A delimited group of statements.
     Block,
-    /// Wire value `statement`.
+    /// One executable step.
     Statement,
-    /// Wire value `expression`.
+    /// Computes a value.
     Expression,
-    /// Wire value `type_expression`.
+    /// Spells a type.
     TypeExpression,
-    /// Wire value `import`.
+    /// Brings an external name into scope.
     Import,
-    /// Wire value `export`.
+    /// Exposes a name outside its unit.
     Export,
-    /// Wire value `parameter`.
+    /// A declared input of a callable.
     Parameter,
-    /// Wire value `argument`.
+    /// A value passed at a call site.
     Argument,
-    /// Wire value `annotation`.
+    /// A decorator or attribute qualifying a construct.
     Annotation,
-    /// Wire value `comment`.
+    /// Commentary the language ignores.
     Comment,
-    /// Wire value `identifier`.
+    /// A name as written in the source.
     Identifier,
-    /// Wire value `literal`.
+    /// A value written out directly.
     Literal,
-    /// Wire value `pattern`.
+    /// A destructuring or match pattern.
     Pattern,
-    /// Wire value `generated`.
+    /// Produced by a tool rather than authored.
     Generated,
-    /// Wire value `test`.
+    /// Belongs to test code.
     Test,
 }
 
@@ -1025,26 +1025,26 @@ pub struct ReadSnapshot {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RegionRole {
-    /// Wire value `selection`.
+    /// The stretch that best identifies the node when presented.
     Selection,
-    /// Wire value `name`.
+    /// The name being declared.
     Name,
-    /// Wire value `header`.
+    /// The declaration up to where the body starts.
     Header,
-    /// Wire value `body`.
+    /// The implementation, without documentation or header.
     Body,
-    /// Wire value `content`.
+    /// The interior of the node without its delimiters.
     Content,
-    /// Wire value `documentation`.
+    /// The doc comment attached to the declaration.
     Documentation,
-    /// Wire value `enclosing`.
+    /// The full extent including what surrounds the node proper.
     Enclosing,
 }
 
 /// A predicate over an exact advertised relationship kind or portable facet.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::relation_filter_names_kind_or_facet)]
+#[schemars(transform = schema::require_kind_or_facet)]
 pub struct RelationFilter {
     /// Exact relationship kinds a provider emits. Any listed kind matches.
     #[serde(default)]
@@ -1081,11 +1081,11 @@ pub struct RelationFilter {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RelationFilterDirection {
-    /// Wire value `outgoing`.
+    /// The edge starts at the entity being filtered.
     Outgoing,
-    /// Wire value `incoming`.
+    /// The edge points at the entity being filtered.
     Incoming,
-    /// Wire value `either`.
+    /// The edge runs either way.
     Either,
 }
 
@@ -1095,9 +1095,9 @@ pub enum RelationFilterDirection {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RelationFilterQuantifier {
-    /// Wire value `exists`.
+    /// At least one such edge must exist.
     Exists,
-    /// Wire value `not_exists`.
+    /// No such edge may exist.
     NotExists,
 }
 
@@ -1139,11 +1139,11 @@ pub struct Relationship {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RelationshipDerivation {
-    /// Wire value `resolution`.
+    /// The provider resolved the edge semantically, so a consumer may act on it directly.
     Resolution,
-    /// Wire value `syntax`.
+    /// The edge was read from syntax alone, without semantic resolution.
     Syntax,
-    /// Wire value `heuristic`.
+    /// The edge is a guess, qualified by `confidence`.
     Heuristic,
 }
 
@@ -1154,63 +1154,63 @@ pub enum RelationshipDerivation {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RelationshipFacet {
-    /// Wire value `contains`.
+    /// The source contains the target within its scope.
     Contains,
-    /// Wire value `declares`.
+    /// The source declares the target.
     Declares,
-    /// Wire value `augments`.
+    /// The source adds to a declaration made elsewhere.
     Augments,
-    /// Wire value `references`.
+    /// The source mentions the target.
     References,
-    /// Wire value `calls`.
+    /// The source invokes the target.
     Calls,
-    /// Wire value `constructs`.
+    /// The source creates an instance of the target.
     Constructs,
-    /// Wire value `reads`.
+    /// The source reads the target's value.
     Reads,
-    /// Wire value `writes`.
+    /// The source assigns to the target.
     Writes,
-    /// Wire value `imports`.
+    /// The source brings the target into scope.
     Imports,
-    /// Wire value `exports`.
+    /// The source exposes the target outside its unit.
     Exports,
-    /// Wire value `extends`.
+    /// The source inherits from the target.
     Extends,
-    /// Wire value `implements`.
+    /// The source fulfils the target's interface.
     Implements,
-    /// Wire value `has_type`.
+    /// The source is typed by the target.
     HasType,
-    /// Wire value `overrides`.
+    /// The source replaces the target inherited from a supertype.
     Overrides,
-    /// Wire value `aliases`.
+    /// The source is another name for the target.
     Aliases,
-    /// Wire value `generates`.
+    /// The source produces the target as generated code.
     Generates,
-    /// Wire value `depends_on`.
+    /// The source requires the target to build or run.
     DependsOn,
-    /// Wire value `annotated_by`.
+    /// The source carries the target as an annotation.
     AnnotatedBy,
-    /// Wire value `throws`.
+    /// The source can raise the target.
     Throws,
-    /// Wire value `catches`.
+    /// The source handles the target when raised.
     Catches,
-    /// Wire value `bounded_by`.
+    /// The source's type parameter is constrained by the target.
     BoundedBy,
-    /// Wire value `instantiates`.
+    /// The source applies concrete arguments to the generic target.
     Instantiates,
-    /// Wire value `specializes`.
+    /// The source is a specialization of the generic target.
     Specializes,
-    /// Wire value `overloads`.
+    /// The source and target are separately dispatched forms of one name.
     Overloads,
-    /// Wire value `mixes_in`.
+    /// The source incorporates the target as a mixin.
     MixesIn,
-    /// Wire value `embeds`.
+    /// The source embeds the target within its own definition.
     Embeds,
-    /// Wire value `tests`.
+    /// The source exercises the target as a test.
     Tests,
-    /// Wire value `configures`.
+    /// The source supplies configuration for the target.
     Configures,
-    /// Wire value `binds`.
+    /// The source binds a name or value to the target.
     Binds,
 }
 
@@ -1222,11 +1222,11 @@ pub enum RelationshipFacet {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ResultOrder {
-    /// Wire value `relevance`.
+    /// Best score first, with identity breaking ties.
     Relevance,
-    /// Wire value `path`.
+    /// Project path order, with identity breaking ties.
     Path,
-    /// Wire value `identity`.
+    /// The result's own identity alone.
     Identity,
 }
 
@@ -1242,7 +1242,7 @@ pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] 
 /// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::search_hit_pairs_span_with_line)]
+#[schemars(transform = schema::pair_span_with_line)]
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file — whichever `target` allowed.
     pub hit: SearchHitTarget,
@@ -1310,13 +1310,13 @@ pub enum SearchHitTarget {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SearchInclude {
-    /// Wire value `source`.
+    /// The source around each hit, with its span.
     Source,
-    /// Wire value `signature`.
+    /// Rendered signatures for symbol hits.
     Signature,
-    /// Wire value `relationships`.
+    /// Edges from each hit.
     Relationships,
-    /// Wire value `diagnostics`.
+    /// Provider findings at each hit.
     Diagnostics,
 }
 
@@ -1327,13 +1327,13 @@ pub enum SearchInclude {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SearchIntent {
-    /// Wire value `trace`.
+    /// Follows execution outward from the seed.
     Trace,
-    /// Wire value `find_tests`.
+    /// Finds the tests that exercise the seed.
     FindTests,
-    /// Wire value `edit_ripple`.
+    /// Estimates what an edit to the seed would disturb.
     EditRipple,
-    /// Wire value `review_context`.
+    /// Gathers what a reviewer of the seed should see.
     ReviewContext,
 }
 
@@ -1342,8 +1342,8 @@ pub enum SearchIntent {
 /// narrows project-only searches.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::search_traversal_and_paths_stay_in_scope)]
-#[schemars(transform = schema::search_names_query_filter_or_traversal)]
+#[schemars(transform = schema::restrict_traversal_and_paths)]
+#[schemars(transform = schema::require_query_filter_or_traversal)]
 pub struct SearchParams {
     /// Which entity kinds may be returned — a kind selector, never the text to search for;
     /// that is `query`. Omitted, every kind may match. Type data is attached to the Symbol
@@ -1414,13 +1414,13 @@ fn default_search_params_scope() -> SearchScope {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SearchParamsTarget {
-    /// Wire value `symbol`.
+    /// Only declarations may match.
     Symbol,
-    /// Wire value `node`.
+    /// Only syntax-tree nodes may match.
     Node,
-    /// Wire value `file`.
+    /// Only tree entries may match.
     File,
-    /// Wire value `all`.
+    /// Any entity kind may match.
     All,
 }
 
@@ -1448,11 +1448,11 @@ pub struct SearchResult {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SearchScope {
-    /// Wire value `project`.
+    /// Only source the workspace owns.
     Project,
-    /// Wire value `dependencies`.
+    /// Only source of resolved dependencies.
     Dependencies,
-    /// Wire value `all`.
+    /// Project, dependency, and standard-library source alike.
     All,
 }
 
@@ -1509,13 +1509,13 @@ pub struct SemanticCoverage(pub BTreeMap<FactFamily, Coverage>);
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
-    /// Wire value `error`.
+    /// The provider judges the code wrong.
     Error,
-    /// Wire value `warning`.
+    /// Suspect but not necessarily wrong.
     Warning,
-    /// Wire value `info`.
+    /// Informational, with nothing to fix.
     Info,
-    /// Wire value `hint`.
+    /// A gentle suggestion a consumer may hide.
     Hint,
 }
 
@@ -1583,11 +1583,11 @@ pub struct SourceExcerpt {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
-    /// Wire value `authored`.
+    /// A person wrote it.
     Authored,
-    /// Wire value `generated`.
+    /// A tool produced it from other source.
     Generated,
-    /// Wire value `synthetic`.
+    /// The provider minted it without any source text.
     Synthetic,
 }
 
@@ -1706,65 +1706,65 @@ pub struct Symbol {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolFacet {
-    /// Wire value `namespace`.
+    /// A named scope that groups declarations.
     Namespace,
-    /// Wire value `module`.
+    /// A compilation or import unit.
     Module,
-    /// Wire value `type`.
+    /// Names a type.
     Type,
-    /// Wire value `value`.
+    /// Holds a runtime value.
     Value,
-    /// Wire value `callable`.
+    /// Can be invoked.
     Callable,
-    /// Wire value `member`.
+    /// Belongs to a containing type.
     Member,
-    /// Wire value `member_container`.
+    /// Owns members of its own.
     MemberContainer,
-    /// Wire value `parameter`.
+    /// A declared input of a callable.
     Parameter,
-    /// Wire value `type_parameter`.
+    /// A generic parameter a declaration abstracts over.
     TypeParameter,
-    /// Wire value `constructible`.
+    /// Instances of it can be created.
     Constructible,
-    /// Wire value `extensible`.
+    /// Other types can inherit from it.
     Extensible,
-    /// Wire value `implementable`.
+    /// Other types can fulfil it.
     Implementable,
-    /// Wire value `macro`.
+    /// Expands at compile time.
     Macro,
-    /// Wire value `test`.
+    /// Exercises other code as a test.
     Test,
-    /// Wire value `annotation`.
+    /// Decorates other declarations.
     Annotation,
-    /// Wire value `extension`.
+    /// Adds members to a type declared elsewhere.
     Extension,
-    /// Wire value `variant`.
+    /// One case of an enumeration.
     Variant,
-    /// Wire value `enumeration`.
+    /// A closed set of variants.
     Enumeration,
-    /// Wire value `alias`.
+    /// Another name for an existing symbol.
     Alias,
-    /// Wire value `property`.
+    /// A member accessed like a field but backed by code.
     Property,
-    /// Wire value `abstract`.
+    /// Declared without a complete implementation.
     Abstract,
-    /// Wire value `constructor`.
+    /// Creates instances of its container.
     Constructor,
-    /// Wire value `static`.
+    /// Belongs to the type rather than an instance.
     Static,
-    /// Wire value `mutable`.
+    /// Its value can change after initialization.
     Mutable,
-    /// Wire value `public`.
+    /// Visible outside its declaring scope.
     Public,
-    /// Wire value `deprecated`.
+    /// Marked as discouraged for new use.
     Deprecated,
-    /// Wire value `entrypoint`.
+    /// Where execution starts.
     Entrypoint,
-    /// Wire value `operator`.
+    /// Invoked through operator syntax.
     Operator,
-    /// Wire value `async`.
+    /// Runs asynchronously.
     Async,
-    /// Wire value `generator`.
+    /// Yields a sequence of values over time.
     Generator,
 }
 
@@ -1843,17 +1843,17 @@ pub struct SymbolVersion {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolVersionKind {
-    /// Wire value `introduced`.
+    /// The revision brought the symbol into existence.
     Introduced,
-    /// Wire value `body_changed`.
+    /// The revision changed the implementation without touching the signature.
     BodyChanged,
-    /// Wire value `signature_changed`.
+    /// The revision changed the declared interface.
     SignatureChanged,
-    /// Wire value `moved`.
+    /// The revision relocated the declaration to another path.
     Moved,
-    /// Wire value `removed`.
+    /// The revision deleted the declaration.
     Removed,
-    /// Wire value `decorators_changed`.
+    /// The revision changed the annotations on the declaration.
     DecoratorsChanged,
 }
 
@@ -1880,11 +1880,11 @@ pub struct TextRange {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TraversalDirection {
-    /// Wire value `outgoing`.
+    /// Walks edges leaving each visited symbol.
     Outgoing,
-    /// Wire value `incoming`.
+    /// Walks edges arriving at each visited symbol.
     Incoming,
-    /// Wire value `both`.
+    /// Walks edges in both directions.
     Both,
 }
 
@@ -1907,11 +1907,11 @@ pub struct TypeBinding {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TypeBindingOrigin {
-    /// Wire value `declared`.
+    /// Written in the source by the author.
     Declared,
-    /// Wire value `inferred`.
+    /// Worked out by the provider from usage.
     Inferred,
-    /// Wire value `expected`.
+    /// Required by the surrounding context.
     Expected,
 }
 
@@ -1921,29 +1921,29 @@ pub enum TypeBindingOrigin {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TypeBindingRole {
-    /// Wire value `receiver`.
+    /// The type of the implicit first parameter.
     Receiver,
-    /// Wire value `parameter`.
+    /// The type a parameter accepts.
     Parameter,
-    /// Wire value `return`.
+    /// The type a call yields.
     Return,
-    /// Wire value `field`.
+    /// The type a field holds.
     Field,
-    /// Wire value `bound`.
+    /// A constraint on a type parameter.
     Bound,
-    /// Wire value `element`.
+    /// The type of a collection's entries.
     Element,
-    /// Wire value `key`.
+    /// The type a map is indexed by.
     Key,
-    /// Wire value `error`.
+    /// The type of the failure a fallible result carries.
     Error,
-    /// Wire value `underlying`.
+    /// The type an alias or wrapper stands for.
     Underlying,
-    /// Wire value `yielded`.
+    /// The type a generator produces per step.
     Yielded,
-    /// Wire value `awaited`.
+    /// The type awaiting the value resolves to.
     Awaited,
-    /// Wire value `discriminant`.
+    /// The type that tags which variant a value holds.
     Discriminant,
 }
 
