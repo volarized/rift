@@ -752,6 +752,11 @@ def document_metadata(document: Document) -> dict[str, Any]:
             "description": tool.rpc.description,
             "params": _schema_ref(tool.rpc.request),
             "result": _schema_ref(tool.rpc.response),
+            **(
+                {"minimalRequest": tool.minimal_request}
+                if tool.minimal_request is not None
+                else {}
+            ),
         }
         for tool in document.tools
     }

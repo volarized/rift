@@ -39,6 +39,9 @@
         },
         "result": {
           "$ref": "#/$defs/GetSymbolResult"
+        },
+        "minimalRequest": {
+          "name": "BaseModel"
         }
       },
       "search": {
@@ -50,6 +53,9 @@
         },
         "result": {
           "$ref": "#/$defs/SearchResult"
+        },
+        "minimalRequest": {
+          "query": "BaseModel"
         }
       },
       "nodes": {
@@ -61,6 +67,10 @@
         },
         "result": {
           "$ref": "#/$defs/NodesResult"
+        },
+        "minimalRequest": {
+          "path": "src/lib.rs",
+          "position": 0
         }
       },
       "replace_symbol": {

@@ -2049,7 +2049,9 @@ class NodesParams(ClosedModel):
     address for an edit smaller than a declaration, such as one call expression."""
 
     path: Field[core.ProjectPath] = proto_field(
-        description="Project-relative file to inspect.", min_length=1, number=1
+        description="Project-relative file to inspect.",
+        json_schema_extra={"minLength": 1},
+        number=1,
     )
     position: Field[int] = proto_field(
         description=(
@@ -2065,6 +2067,12 @@ class NodesParams(ClosedModel):
         description="The projection to read. Null reads the workspace tree.",
         number=3,
     )
+
+    @model_validator(mode="after")
+    def path_names_a_file(self) -> NodesParams:
+        if not self.path.root:
+            raise ValueError("nodes path must name a file")
+        return self
 
 
 @definition(owner=MCP, public=True, proto=Proto.message(), schema_extra={})

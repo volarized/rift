@@ -39,6 +39,7 @@ class Tool:
     name: str
     rpc: Rpc
     group: str
+    minimal_request: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

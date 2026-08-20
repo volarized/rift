@@ -219,9 +219,24 @@ DOCUMENT = Document(
         ),
     ),
     tools=(
-        Tool(name="get_symbol", rpc=RPC_GET_SYMBOL, group="discovery"),
-        Tool(name="search", rpc=RPC_SEARCH, group="discovery"),
-        Tool(name="nodes", rpc=RPC_NODES, group="discovery"),
+        Tool(
+            name="get_symbol",
+            rpc=RPC_GET_SYMBOL,
+            group="discovery",
+            minimal_request={"name": "BaseModel"},
+        ),
+        Tool(
+            name="search",
+            rpc=RPC_SEARCH,
+            group="discovery",
+            minimal_request={"query": "BaseModel"},
+        ),
+        Tool(
+            name="nodes",
+            rpc=RPC_NODES,
+            group="discovery",
+            minimal_request={"path": "src/lib.rs", "position": 0},
+        ),
         Tool(name="replace_symbol", rpc=RPC_REPLACE_SYMBOL, group="changes"),
         Tool(name="insert_symbol", rpc=RPC_INSERT_SYMBOL, group="changes"),
         Tool(name="replace_node", rpc=RPC_REPLACE_NODE, group="changes"),
