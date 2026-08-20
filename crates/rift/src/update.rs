@@ -1624,4 +1624,65 @@ mod tests {
         server.join().expect("server thread must finish");
         Ok(())
     }
+
+    #[test]
+    fn transport_follows_secure_redirects_within_hop_budget() -> TestResult {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept must succeed");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nlocation: https://127.0.0.1:9/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .expect("response must send");
+        });
+
+        let transport = super::ReqwestTransport::new()?;
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("payload");
+        let error = super::DownloadTransport::download(
+            &transport,
+            &format!("http://{address}/redirect"),
+            &destination,
+            64,
+        )
+        .expect_err("followed secure redirect must fail to connect");
+        assert!(error.to_string().contains("release download failed"));
+        server.join().expect("server thread must finish");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "probe run by staging_error_reports_unknown_free_space in a child process"]
+    fn staging_error_free_space_probe() {
+        let error = super::staging_error(std::io::Error::other("fixture"));
+        assert!(error.to_string().contains("free space unknown"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_error_reports_unknown_free_space() -> TestResult {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "update::tests::staging_error_free_space_probe",
+                "--ignored",
+            ])
+            .env("TMPDIR", "/rift-nonexistent-staging-root")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "probe must pass: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
 }

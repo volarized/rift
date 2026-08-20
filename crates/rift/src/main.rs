@@ -148,6 +148,19 @@ mod tests {
     }
 
     #[test]
+    fn cli_error_descriptor_matches_wrapped_error() {
+        let update = super::update::error_for_test();
+        let update_code = update.descriptor().code();
+        assert!(!update_code.is_empty());
+        assert_eq!(CliError::Update(update).descriptor().code(), update_code);
+
+        let mcp = rift_mcp::StdioServeError::UnexpectedQuit;
+        let mcp_code = mcp.descriptor().code();
+        assert!(!mcp_code.is_empty());
+        assert_eq!(CliError::Mcp(mcp).descriptor().code(), mcp_code);
+    }
+
+    #[test]
     fn help_identifies_executable_and_mcp_command() {
         let mut command = cli_command();
         command.build();
