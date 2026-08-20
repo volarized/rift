@@ -12,7 +12,7 @@ port its lock file names.
 forwards frames unchanged and decides nothing.
 
 Requests do not open connection-scoped sessions. Each call names a
-[`ProjectionId`](/docs/planned/protocol/reference#ProjectionId), or the workspace tree when it
+[`ProjectionId`](/docs/protocol/reference#ProjectionId), or the workspace tree when it
 omits one, and carries every witnessed address it uses.
 
 A cursor names a process-local captured result. A projection retains its changes and recorded
@@ -22,8 +22,8 @@ A tool result rides MCP
 [`structuredContent`](https://modelcontextprotocol.io/specification/draft/server/tools#structured-content),
 typed by the tool's declared output schema, with the
 same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is such a result —
-[`ChangeResult`](/docs/planned/protocol/reference#ChangeResult) saying refused, never `isError` —
-while [`ErrorData`](/docs/planned/protocol/reference#ErrorData) travels as the
+[`ChangeResult`](/docs/protocol/reference#ChangeResult) saying refused, never `isError` —
+while [`ErrorData`](/docs/protocol/reference#ErrorData) travels as the
 [JSON-RPC error](https://www.jsonrpc.org/specification#error_object)
 object's `data`, under code `-32000`.
 
@@ -45,11 +45,34 @@ Callers read code through these tools:
 | [`search`](#tool-search) | ranked files, nodes, or symbols across a selected source scope |
 | [`nodes`](#tool-nodes) | the syntax nodes covering one position, with witnessed addresses |
 
+Each result carries a [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) identifying
+its project tree and source catalog. `search` and `get_symbol` also identify the index revision
+they used. Coverage lists provider fact revisions in merge precedence order and marks a revision
+stale when its tree or source-catalog input no longer matches.
+
+Every read accepts an optional `projection` and reads the workspace tree when it is absent.
+[`rift://fs`](#resource-fs) serves file bytes and directory listings to consumers without host
+filesystem tools.
+
+### get_symbol [#tool-get_symbol]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
 `get_symbol` is the read to start from when the name is known. Its default `scope: "all"` searches
 project, dependency, standard-library, and external declarations. A hit includes source when its
 resolver supplied readable bytes; synthetic and source-less dependency declarations still carry
 their signatures, documentation, types, and relationships. `include_history` applies to project
 symbols and attaches their version-control timeline and co-change coupling.
+
+### search [#tool-search]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
 
 `search` takes a lexical `query`, a `filter` over resolved provider facts, a bounded
 `traversal`, or a combination. A traversal starts from one symbol and states its intent.
@@ -94,7 +117,7 @@ For example, this request finds direct tests of one symbol without a separate gr
       "origin": {
         "location": { "kind": "project", "package": null },
         "source_kind": "authored",
-        "unit": "rift://source/src_bbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "unit": "rift://source/src_mfrggzdfmztwq2lknnwg23tpob"
       },
       "container": null,
       "modifiers": [],
@@ -109,7 +132,7 @@ For example, this request finds direct tests of one symbol without a separate gr
   "score": 1.0,
   "matched_by": ["relationship"],
   "span": {
-    "unit": "rift://source/src_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "unit": "rift://source/src_mfrggzdfmztwq2lknnwg23tpob",
     "range": { "start": 120, "end": 168 }
   },
   "line": 8,
@@ -196,18 +219,16 @@ A traversal with `max_hops: 3` exceeds the contract bound.
 }
 ```
 
+### nodes [#tool-nodes]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
 `nodes` lists the syntax regions covering one position, outermost first. Each identity carries
 the witness a later
 [`replace_node`](#tool-replace_node) verifies.
-
-Each result carries a [`ReadSnapshot`](/docs/planned/protocol/reference#ReadSnapshot) identifying
-its project tree and source catalog. `search` and `get_symbol` also identify the index revision
-they used. Coverage lists provider fact revisions in merge precedence order and marks a revision
-stale when its tree or source-catalog input no longer matches.
-
-Every read accepts an optional `projection` and reads the workspace tree when it is absent.
-[`rift://fs`](#resource-fs) serves file bytes and directory listings to consumers without host
-filesystem tools.
 
 ## Resources
 
@@ -229,7 +250,7 @@ Paginated answers stop before `max_response_bytes` and return a cursor. A file-r
 continues by byte offset; the payload's `digest` detects a file change and requires a restart from
 offset zero.
 
-The workspace resource pages through [`SourceUnit`](/docs/planned/protocol/reference#SourceUnit)
+The workspace resource pages through [`SourceUnit`](/docs/protocol/reference#SourceUnit)
 records from its captured source catalog. Each unit identifies its owner, package, source kind,
 language, and content digest; resolver summaries explain which discovery revisions produced that
 catalog.
@@ -244,21 +265,56 @@ first; a page requested after eviction or process restart returns `cursor_expire
 
 ## Changes
 
-[`replace_symbol`](#tool-replace_symbol) and [`insert_symbol`](#tool-insert_symbol) operate on
-whole declarations addressed by symbol. The parser derives their spans, so the caller supplies no
-offsets.
+### replace_symbol [#tool-replace_symbol]
 
-[`replace_node`](#tool-replace_node) reaches below a declaration through a witnessed node
-address. [`patch`](#tool-patch) expresses scattered hunks and file-level changes through a unified
-diff guarded by its context lines.
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
 
-All of them return the same `ChangeResult`. A request whose shape is wrong — an absolute path,
-a malformed patch header — fails as `invalid_request` before the server resolves anything.
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`replace_symbol` replaces one whole declaration addressed by symbol. The parser derives its
+span, so the caller supplies no offsets.
+
+### insert_symbol [#tool-insert_symbol]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`insert_symbol` inserts a new declaration before or after an existing one, addressed by its
+anchor symbol. The parser derives the anchor's span, so the caller supplies no offsets.
+
+### replace_node [#tool-replace_node]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`replace_node` reaches below a declaration through a witnessed node address from
+[`nodes`](#tool-nodes).
+
+### patch [#tool-patch]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`patch` expresses scattered hunks and file-level changes through a unified diff guarded by its
+context lines.
+
+### Change results
+
+All four change tools return the same `ChangeResult`. A request whose shape is wrong — an
+absolute path, a malformed patch header — fails as `invalid_request` before the server resolves
+anything.
 Otherwise the server resolves the whole operation before writing anything, and the result is one
 of two things.
 
 **Refused**, when resolution produced no edits. The targeted tree is untouched and
-[`RefusalReason`](/docs/planned/protocol/reference#RefusalReason) says what stopped it: the
+[`RefusalReason`](/docs/protocol/reference#RefusalReason) says what stopped it: the
 address hit several targets, or a witness or patch context no longer matches the bytes. A
 `replace_node` whose listing went stale shows the shape:
 
@@ -298,7 +354,7 @@ address hit several targets, or a witness or patch context no longer matches the
 
 **Applied**, when it produced edits. The change lands in the targeted tree and gets an id in
 that tree's changeset, along with its origin, changed paths, edits, effects, guarantee evidence,
-diagnostics, and its [`Advisory`](/docs/planned/protocol/reference#Advisory) list. An advisory
+diagnostics, and its [`Advisory`](/docs/protocol/reference#Advisory) list. An advisory
 rides the result rather than waiting behind a separate read, because the result is the one
 payload the caller is guaranteed to look at: a checked advisory reports a verdict the emitter
 verified itself, and an open warning carries the instruction — the check to run — that settles
@@ -340,7 +396,7 @@ This prevents a change to `src/app.py` from landing after the declaration it rea
 `max_projection_dependencies` and `max_projection_dependency_bytes` bound this read set. A read
 that would cross either limit fails before returning its data.
 
-Each [`DependencyConflict`](/docs/planned/protocol/reference#DependencyConflict) carries `path`,
+Each [`DependencyConflict`](/docs/protocol/reference#DependencyConflict) carries `path`,
 `observed`, and `current`. The caller can reread and revise its work, or pass that exact object in
 `accept_dependencies`. An acceptance with an older `current` digest does not match after another
 workspace edit and remains in `dependency_conflicts`.

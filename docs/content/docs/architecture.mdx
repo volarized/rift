@@ -24,11 +24,11 @@ resolvers identify project files, dependencies, and generated code. Providers an
 and produce facts such as symbols, syntax nodes, relationships, and diagnostics.
 
 The server stores searchable provider output in an embedded index under `.rift`. The
-[`search`](/docs/planned/protocol/mcp#tool-search) tool always retrieves lexical matches; when
+[`search`](/docs/protocol/mcp#tool-search) tool always retrieves lexical matches; when
 `rift.toml` selects an embedding model, a local model adds vector ranking.
 
 The server also owns edits. Its change tools resolve targets against provider facts and write the
-files. [Hooks](/docs/planned/configuration#hooks) extend this pipeline with configured tools such as
+files. [Hooks](/docs/configuration#hooks) extend this pipeline with configured tools such as
 formatters, linters, and test runners, which check each change after it lands.
 
 <IsoDiagram
@@ -58,7 +58,7 @@ formatters, linters, and test runners, which check each change after it lands.
 ## Server lifecycle
 
 When the server starts, it writes a special `.rift/server.json` file following the
-[`ServerLock`](/docs/planned/protocol/reference#ServerLock) model. For example:
+[`ServerLock`](/docs/protocol/reference#ServerLock) model. For example:
 
 ```json
 {
@@ -110,7 +110,7 @@ file decides:
 
 An edit to the file takes effect for later requests once it validates again; a change to
 `rift.toml` made in a projection carries a `configuration` confirmation into
-[`publish`](/docs/planned/protocol/mcp#tool-publish), because publishing it changes which hooks
+[`publish`](/docs/protocol/mcp#tool-publish), because publishing it changes which hooks
 and limits the server runs with. An invalid file keeps the workspace unusable until you fix it.
 
 The server exits after thirty minutes without a request. It removes its lock file on the way
@@ -124,7 +124,7 @@ toolchain already resolved. The built-in project resolver catalogs workspace fil
 package-manager resolvers inspect manifests, lockfiles, installed packages, standard libraries,
 and generated-source registries. They do not download dependencies or change the environment.
 
-Each readable file becomes a [`SourceUnit`](/docs/planned/protocol/reference#SourceUnit) in the
+Each readable file becomes a [`SourceUnit`](/docs/protocol/reference#SourceUnit) in the
 source catalog. Its `location` says whether it belongs to the project, a dependency, the standard
 library, or an external source. Its `source_kind` separately says whether a human authored it or a
 tool generated it. Generated project code and generated dependency code therefore keep both facts.
@@ -138,7 +138,7 @@ which package owns it or which generator produced it.
 ## Providers
 
 Providers analyze cataloged source at different depths. Each answer carries per-family
-[coverage](/docs/planned/protocol/reference#Coverage), which names the provider revisions that
+[coverage](/docs/protocol/reference#Coverage), which names the provider revisions that
 contributed, the tree and source-catalog revisions each one analyzed, their freshness, and how far
 the combined result reaches.
 
@@ -179,13 +179,13 @@ introduced, body changed, signature changed, moved — that survives renames and
 
 Co-change is observed rather than resolved, so it reaches coupling no reference graph
 carries — two implementations of one concept that never mention each other. The walk is
-bounded by [`providers.history.max_revisions`](/docs/planned/configuration#providers),
+bounded by [`providers.history.max_revisions`](/docs/configuration#providers),
 and a workspace without version control reports the family `not_applicable`.
 
 ### Custom
 
-Custom integrations implement a [source resolver](/docs/planned/protocol/core#source-discovery), a
-[fact provider](/docs/planned/protocol/core#semantic-facts), or both. The contracts stay separate even
+Custom integrations implement a [source resolver](/docs/protocol/core#source-discovery), a
+[fact provider](/docs/protocol/core#semantic-facts), or both. The contracts stay separate even
 when one language engine implements both capabilities. A family with no serving provider reports
 `unsupported` coverage, which keeps an empty answer distinct from a complete answer with no facts.
 
@@ -220,7 +220,7 @@ then owns scheduling, caching, and invalidation; MCP requests do not assemble or
 composition.
 
 The workspace resource assigns each provider a stable
-[`ProviderId`](/docs/planned/protocol/reference#ProviderId) and reports its lifecycle state. A
+[`ProviderId`](/docs/protocol/reference#ProviderId) and reports its lifecycle state. A
 provider derives a new immutable fact revision from one tree revision, then publishes the
 revision atomically. While it catches up after a change, requests may use its previous revision;
 the coverage entry marks those facts `stale`. A provider with no usable revision reports
@@ -231,7 +231,7 @@ revisions it uses. Later writes create new revisions; they do not alter the capt
 later cursor pages.
 
 Providers merge by the order reported for their language in
-[`LanguageSupport.providers`](/docs/planned/protocol/reference#LanguageSupport). The first provider
+[`LanguageSupport.providers`](/docs/protocol/reference#LanguageSupport). The first provider
 that supplies a scalar fact wins that field. Multi-valued facts, including relationships and
 diagnostics, are unioned by canonical identity, and each retained fact keeps its evidence.
 Coverage lists every revision that contributed in the same precedence order, so a consumer can
@@ -245,7 +245,7 @@ stored under `.rift`.
 
 The index build starts as a background task when `rift server` starts. If a query arrives while
 the index is still building, the server returns a response from the published portion and reports
-partial coverage. Its [`ReadSnapshot`](/docs/planned/protocol/reference#ReadSnapshot) carries the
+partial coverage. Its [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) carries the
 project-tree, source-catalog, and index revisions used for the answer. Index freshness requires both
 the project tree and source catalog to match.
 
@@ -258,16 +258,16 @@ use the newly published revision.
 Before returning a fresh indexed read, the server checks the tree and index revisions before and
 after it builds the result. If either changes, the server waits for the active index build, then
 retries the complete capture at most three times within one thirty-second deadline. Continued
-movement returns [`temporarily_unavailable`](/docs/planned/protocol/mcp#errors) with
+movement returns [`temporarily_unavailable`](/docs/protocol/mcp#errors) with
 `same_request`; a cursor page resumes its stored capture without consulting newer revisions.
 
 ### Search
 
-[`search`](/docs/planned/protocol/mcp#tool-search) is for reads where the exact name isn't known.
+[`search`](/docs/protocol/mcp#tool-search) is for reads where the exact name isn't known.
 It ranks symbol names, signatures, documentation, and file content from the index.
 
 The same tool walks relationships when the starting symbol is known. A
-[`SearchTraversal`](/docs/planned/protocol/reference#SearchTraversal) names that symbol and the
+[`SearchTraversal`](/docs/protocol/reference#SearchTraversal) names that symbol and the
 task: trace dependencies, find tests, estimate an edit's ripple, or collect review context. The
 task selects an edge direction and relationship facets unless the caller supplies them.
 
@@ -279,14 +279,14 @@ provider revisions used for the answer, so a caller can distinguish syntax-deriv
 resolved facts.
 
 Search is lexical by default. Naming an embedding model in
-[`search.embedding`](/docs/planned/configuration#search) adds dense ranking on top: the server
+[`search.embedding`](/docs/configuration#search) adds dense ranking on top: the server
 embeds indexed declarations, stores the vectors per model, and fuses cosine similarity into the
 lexical score. Per model, because two models' vectors aren't comparable — changing the
 configured model rebuilds the dense index rather than mixing spaces.
 
 ### Retrieve symbol
 
-[`get_symbol`](/docs/planned/protocol/mcp#tool-get_symbol) retrieves a declaration when its name is
+[`get_symbol`](/docs/protocol/mcp#tool-get_symbol) retrieves a declaration when its name is
 known. The answer carries the declaration's body inline, so reading a function takes one call
 rather than a search followed by a file read.
 
@@ -307,17 +307,17 @@ the witness before splicing, so an address read before the file changed refuses 
 change application per tree, so two agents editing at once collide as one clean refusal rather
 than as interleaved bytes.
 
-A change through MCP — [`replace_symbol`](/docs/planned/protocol/mcp#tool-replace_symbol),
-[`replace_node`](/docs/planned/protocol/mcp#tool-replace_node),
-[`patch`](/docs/planned/protocol/mcp#tool-patch), any of them — is resolved before Rift writes
+A change through MCP — [`replace_symbol`](/docs/protocol/mcp#tool-replace_symbol),
+[`replace_node`](/docs/protocol/mcp#tool-replace_node),
+[`patch`](/docs/protocol/mcp#tool-patch), any of them — is resolved before Rift writes
 anything. If resolution produced no bytes to write, that's a refusal and the tree is untouched:
 the address was ambiguous, the witness failed. If it produced edits, the change lands, is
 recorded in the tree's changeset, and comes back carrying everything Rift learned about it.
 
 What rides on the result is the part that changes agent behavior. Each applied change carries
 its diagnostics — the syntax provider re-parses what changed — the verdicts of the workspace's
-[hooks](/docs/planned/configuration#hooks), run inside the changed tree, and its
-[`Advisory`](/docs/planned/protocol/reference#Advisory) list: concerns a provider or hook attached
+[hooks](/docs/configuration#hooks), run inside the changed tree, and its
+[`Advisory`](/docs/protocol/reference#Advisory) list: concerns a provider or hook attached
 to exactly this change.
 
 An advisory the emitter could verify itself arrives already checked, and an open warning
@@ -330,9 +330,9 @@ not absolve what it did not check.
 Sometimes you don't want the agent writing into your files at all — a refactor you want to
 review whole, or several agents working the same workspace without treading on each other. A
 **projection** is the opt-in for that:
-[`projection_create`](/docs/planned/protocol/mcp#tool-projection_create) gives the agent a
+[`projection_create`](/docs/protocol/mcp#tool-projection_create) gives the agent a
 pinned copy of the workspace, every change tool takes the projection's identity as its
-target, and nothing reaches your files until [`publish`](/docs/planned/protocol/mcp#tool-publish).
+target, and nothing reaches your files until [`publish`](/docs/protocol/mcp#tool-publish).
 
 A fresh projection is a pinned, byte-identical snapshot of the workspace. The server records a
 tree digest and a manifest of every entry, then clones regular files with filesystem reflinks
@@ -348,25 +348,25 @@ The projection is a real directory, at a predictable place below the workspace:
 
 That's deliberate: plenty of what a developer runs can't be handed a protocol — `cargo test`,
 `prettier`, a linter your team wrote in 2019. They take a directory, so the projection is one,
-and the [projection resource](/docs/planned/protocol/mcp#resource-projection) hands out its path.
+and the [projection resource](/docs/protocol/mcp#resource-projection) hands out its path.
 
 A write into the directory lands in the projection alone because every entry belongs to that
 directory; reflinked file extents detach when written. The path stays put until
-[`projection_remove`](/docs/planned/protocol/mcp#tool-projection_remove) deletes the directory —
+[`projection_remove`](/docs/protocol/mcp#tool-projection_remove) deletes the directory —
 without waiting for whatever still runs inside it, because a lock there would let one abandoned
 `cargo watch` wedge cleanup forever.
 
 Rift change tools record their edits as they apply. An ordinary process can bypass those tools by
 writing into the projection directory, so the server also compares the directory with its
 manifest before each projection read and publication. It groups an observed delta into a
-[`ChangeSummary`](/docs/planned/protocol/reference#ChangeSummary) whose `origin` is `filesystem`,
+[`ChangeSummary`](/docs/protocol/reference#ChangeSummary) whose `origin` is `filesystem`,
 records the exact changed `paths`, reruns providers and hooks, and attaches an `external`
 confirmation. Binary files and new symlinks stay publishable even though their bytes have no
 portable `Edit` representation; their paths remain the authoritative scope.
 
 That reconciliation can discover a change during `publish`. In that case publication returns
 the newly minted change id in `unaccepted` and writes nothing. The caller reads
-[`rift://changes`](/docs/planned/protocol/mcp#resource-changes), reviews the imported delta, and
+[`rift://changes`](/docs/protocol/mcp#resource-changes), reviews the imported delta, and
 retries with that id in `accept`.
 
 Reconciliation follows project visibility. A tracked or unignored file enters the imported
@@ -374,7 +374,7 @@ change, while ignored output outside the projection manifest — `target/` in a 
 workspace — stays outside the changeset.
 
 In a projection, an open warning advisory mints a
-[`ConfirmationRequirement`](/docs/planned/protocol/reference#ConfirmationRequirement) on its
+[`ConfirmationRequirement`](/docs/protocol/reference#ConfirmationRequirement) on its
 change. The change remains inspectable in the projection, but `publish` refuses until the call
 accepts it by change id. Deletions and hooks that fail or do not finish produce the same gate,
 because publication is the step that writes the workspace.
@@ -393,7 +393,7 @@ returning its result.
 
 During `publish`, the server compares each read dependency that is not also a changed path with
 the current workspace file. A mismatch returns a
-[`DependencyConflict`](/docs/planned/protocol/reference#DependencyConflict) in
+[`DependencyConflict`](/docs/protocol/reference#DependencyConflict) in
 `dependency_conflicts`, and nothing is written. The caller can reread and revise the projection,
 or copy that exact conflict into `accept_dependencies`. The server recomputes the current digest
 while holding the workspace publication lock, so another workspace edit invalidates the copied
@@ -404,18 +404,18 @@ names no file to record, and a process reading the projection directory bypasses
 `rift://fs` reads the workspace tree and therefore does not add projection dependencies. Those
 cases require a fresh read when the task depends on absence or on bytes obtained outside Rift.
 
-[`projection_restore`](/docs/planned/protocol/mcp#tool-projection_restore) goes the other way,
+[`projection_restore`](/docs/protocol/mcp#tool-projection_restore) goes the other way,
 refreshing selected changed paths from the current workspace and dropping whole changes that
 touched them. The refreshed workspace entry becomes that path's new conflict baseline, while
 other paths retain their original baselines.
 
 Projections outlive the agent that made them. After a server restart,
-[`projection_list`](/docs/planned/protocol/mcp#tool-projection_list) returns the same pinned base.
+[`projection_list`](/docs/protocol/mcp#tool-projection_list) returns the same pinned base.
 `projection_remove` is the operation that deletes the directory and any unpublished work.
 
 ## Execution
 
-[`execute`](/docs/planned/protocol/mcp#tool-execute) evaluates a block of agent-written code in
+[`execute`](/docs/protocol/mcp#tool-execute) evaluates a block of agent-written code in
 the targeted tree's **execution copy** — a directory under `.rift/exec` the server keeps beside
 the tree, one per target. The copy persists between calls: before each evaluation the server
 refreshes its visible files to match the targeted tree, and everything else — a virtualenv the
@@ -429,4 +429,4 @@ visible file with the targeted tree's version; the server never synchronizes cop
 The execution copy does not sandbox code. The runtime uses the server's OS permissions, so an
 absolute path can reach outside the copy, including the workspace.
 
-`rift.toml` decides [which languages may execute at all](/docs/planned/configuration#execution).
+`rift.toml` decides [which languages may execute at all](/docs/configuration#execution).

@@ -11,10 +11,10 @@ The [`Index.Read`](#scip-rpc-Read) RPC exports the workspace tree or one project
 ## Endpoint
 
 The server exposes `Index` at the endpoint named by the workspace
-[`ServerLock`](/docs/planned/protocol/reference#ServerLock).
+[`ServerLock`](/docs/protocol/reference#ServerLock).
 
 `Read` accepts an optional
-[`ProjectionId`](/docs/planned/protocol/reference#ProjectionId). An omitted `projection` selects
+[`ProjectionId`](/docs/protocol/reference#ProjectionId). An omitted `projection` selects
 the workspace tree; a present value selects that projection, including unpublished content.
 
 **Request:**
@@ -63,7 +63,7 @@ their SCIP equivalents. `project_root` is a file URI for the exported tree, whil
 remain workspace-relative.
 
 Rift represents source locations as
-[`TextRange`](/docs/planned/protocol/reference#TextRange) UTF-8 byte offsets. The server converts
+[`TextRange`](/docs/protocol/reference#TextRange) UTF-8 byte offsets. The server converts
 them to SCIP line and character positions with `UTF8CodeUnitOffsetFromLineStart`, preserving
 byte-based character offsets.
 
@@ -73,12 +73,12 @@ stream bound.
 
 ## Symbols
 
-A [`SymbolId`](/docs/planned/protocol/reference#SymbolId) has the form
+A [`SymbolId`](/docs/protocol/reference#SymbolId) has the form
 `rift://symbol/{language}/{name}`. The server encodes it as one global SCIP symbol:
 
 - scheme `rift`
 - package manager `.`
-- package name set to the exact Rift [`Language`](/docs/planned/protocol/reference#Language)
+- package name set to the exact Rift [`Language`](/docs/protocol/reference#Language)
 - package version `.`
 - one term descriptor containing the complete qualified name
 
