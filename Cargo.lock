@@ -1453,6 +1453,7 @@ dependencies = [
  "rift-protocol",
  "rift-server",
  "rmcp",
+ "schemars",
  "serde_json",
  "tempfile",
  "tokio",

@@ -22,4 +22,5 @@ tokio.workspace = true
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client"] }
 jsonschema.workspace = true
+schemars.workspace = true
 tempfile.workspace = true
