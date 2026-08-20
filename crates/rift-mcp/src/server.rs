@@ -77,6 +77,7 @@ mod tests {
     use std::fs;
 
     use rift_index::WorkspaceIndexLimits;
+    use rift_server::ReadErrorKind;
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
@@ -100,6 +101,16 @@ mod tests {
             .as_object()
             .cloned()
             .ok_or_else(|| "tool arguments must be an object".into())
+    }
+
+    #[test]
+    fn build_propagates_workspace_index_failure() {
+        let error = RiftMcp::build(
+            std::path::Path::new("not-a-real-rift-workspace"),
+            WorkspaceIndexLimits::default(),
+        )
+        .expect_err("missing root must fail");
+        assert_eq!(error.kind(), ReadErrorKind::Index);
     }
 
     #[tokio::test]

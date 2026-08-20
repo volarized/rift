@@ -145,6 +145,7 @@ impl Error for ExportError {
 }
 
 /// One parsed export invocation.
+#[derive(Debug)]
 pub struct ExportRequest {
     /// Compare the existing document instead of writing it.
     check: bool,
