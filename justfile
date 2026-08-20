@@ -3,8 +3,11 @@ set dotenv-load := false
 format:
     cargo fmt --all --check
 
+generate:
+    cargo run -q -p rift-protocol --bin rift-schema-export -- docs/protocol
+
 generate-check:
-    uv run --project protocol python -m rift.generate --check
+    cargo run -q -p rift-protocol --bin rift-schema-export -- --check docs/protocol
 
 check:
     cargo check --workspace --all-targets --all-features

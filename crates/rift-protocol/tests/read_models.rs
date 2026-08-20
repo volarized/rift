@@ -1,27 +1,27 @@
-//! Generated read-only DTO integration tests.
+//! Read-tool wire model tests against canonical JSON fixtures.
 
 use std::collections::BTreeSet;
 use std::error::Error;
 
-use rift_protocol::MCP_SCHEMA;
-use rift_protocol::generated::read::{
+use rift_protocol::read::{
     Coverage, CoverageScope, FileContent, Filter, GetSymbolParams, GetSymbolResult, NodesParams,
     NodesResult, SearchHitTarget, SearchParams, SearchResult, SourceLocation,
 };
+use rift_protocol::schema::schema_document;
 use schemars::{JsonSchema, schema_for};
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-fn canonical_definition(name: &str) -> TestResult {
-    let document: Value = serde_json::from_str(MCP_SCHEMA)?;
+fn exported_definition(name: &str) -> Result<Value, Box<dyn Error>> {
+    let document: Value = serde_json::from_str(&schema_document())?;
     let definition = document
         .get("$defs")
         .and_then(Value::as_object)
         .and_then(|definitions| definitions.get(name))
-        .ok_or_else(|| format!("canonical schema has no {name} definition"))?;
+        .ok_or_else(|| format!("exported schema has no {name} definition"))?;
     assert!(definition.is_object(), "{name} must be an object schema");
-    Ok(())
+    Ok(definition.clone())
 }
 
 fn object_keys(value: &Value, field: &str) -> Result<BTreeSet<String>, String> {
@@ -50,27 +50,21 @@ fn required_fields(value: &Value) -> Result<BTreeSet<String>, String> {
 }
 
 fn assert_root_object<T: JsonSchema>(name: &str) -> TestResult {
-    let document: Value = serde_json::from_str(MCP_SCHEMA)?;
-    let canonical = document
-        .get("$defs")
-        .and_then(Value::as_object)
-        .and_then(|definitions| definitions.get(name))
-        .ok_or_else(|| format!("canonical schema has no {name} definition"))?;
+    let exported = exported_definition(name)?;
     let generated = serde_json::to_value(schema_for!(T))?;
 
-    canonical_definition(name)?;
-    assert_eq!(generated.get("type"), canonical.get("type"));
+    assert_eq!(generated.get("type"), exported.get("type"));
     assert_eq!(
         generated.get("additionalProperties"),
-        canonical.get("additionalProperties")
+        exported.get("additionalProperties")
     );
     assert_eq!(
         object_keys(&generated, "properties")?,
-        object_keys(canonical, "properties")?
+        object_keys(&exported, "properties")?
     );
-    assert_eq!(required_fields(&generated)?, required_fields(canonical)?);
-    assert_eq!(generated.get("allOf"), canonical.get("allOf"));
-    assert_eq!(generated.get("anyOf"), canonical.get("anyOf"));
+    assert_eq!(required_fields(&generated)?, required_fields(&exported)?);
+    assert_eq!(generated.get("allOf"), exported.get("allOf"));
+    assert_eq!(generated.get("anyOf"), exported.get("anyOf"));
     Ok(())
 }
 
@@ -85,29 +79,29 @@ where
 }
 
 #[test]
-fn nodes_roots_match_canonical_object_shapes() -> TestResult {
+fn nodes_roots_match_exported_object_shapes() -> TestResult {
     assert_root_object::<NodesParams>("NodesParams")?;
     assert_root_object::<NodesResult>("NodesResult")
 }
 
 #[test]
-fn get_symbol_roots_match_canonical_object_shapes() -> TestResult {
+fn get_symbol_roots_match_exported_object_shapes() -> TestResult {
     assert_root_object::<GetSymbolParams>("GetSymbolParams")?;
     assert_root_object::<GetSymbolResult>("GetSymbolResult")
 }
 
 #[test]
 fn get_symbol_params_apply_canonical_defaults_and_close_root() -> TestResult {
-    let params: GetSymbolParams = serde_json::from_value(json!({"name": "BaseModel"}))?;
+    let params: GetSymbolParams = serde_json::from_value(json!({"name": "ReadService"}))?;
     let encoded = serde_json::to_value(params)?;
-    assert_eq!(encoded["name"], "BaseModel");
+    assert_eq!(encoded["name"], "ReadService");
     assert_eq!(encoded["include_body"], true);
     assert_eq!(encoded["include_history"], false);
     assert_eq!(encoded["limit"], 5);
     assert_eq!(encoded["scope"], "all");
 
     assert_rejected::<GetSymbolParams>(json!({}));
-    assert_rejected::<GetSymbolParams>(json!({"name": "BaseModel", "extra": true}));
+    assert_rejected::<GetSymbolParams>(json!({"name": "ReadService", "extra": true}));
     Ok(())
 }
 
@@ -118,7 +112,7 @@ fn get_symbol_result_requires_present_nullable_cursor() -> TestResult {
         "coverage": {
             "state": "complete",
             "scope": {"kind": "reach", "reach": "request"},
-            "provenance": []
+            "origins": []
         },
         "next_cursor": null,
         "snapshot": {
@@ -170,22 +164,22 @@ fn source_location_accepts_only_closed_known_variants() -> TestResult {
 }
 
 #[test]
-fn search_roots_match_canonical_object_shapes() -> TestResult {
+fn search_roots_match_exported_object_shapes() -> TestResult {
     assert_root_object::<SearchParams>("SearchParams")?;
     assert_root_object::<SearchResult>("SearchResult")
 }
 
 #[test]
 fn search_params_apply_defaults_and_close_root() -> TestResult {
-    let params: SearchParams = serde_json::from_value(json!({"query": "BaseModel"}))?;
+    let params: SearchParams = serde_json::from_value(json!({"query": "ReadService"}))?;
     let encoded = serde_json::to_value(params)?;
-    assert_eq!(encoded["query"], "BaseModel");
+    assert_eq!(encoded["query"], "ReadService");
     assert_eq!(encoded["target"], "all");
     assert_eq!(encoded["order"], "relevance");
     assert_eq!(encoded["scope"], "project");
 
-    assert_rejected::<SearchParams>(json!("BaseModel"));
-    assert_rejected::<SearchParams>(json!({"query": "BaseModel", "extra": true}));
+    assert_rejected::<SearchParams>(json!("ReadService"));
+    assert_rejected::<SearchParams>(json!({"query": "ReadService", "extra": true}));
     Ok(())
 }
 
@@ -200,7 +194,7 @@ fn search_result_requires_present_nullable_cursor() -> TestResult {
         "coverage": {
             "state": "complete",
             "scope": {"kind": "reach", "reach": "request"},
-            "provenance": []
+            "origins": []
         },
         "results": [],
         "next_cursor": null
@@ -221,7 +215,7 @@ fn search_result_requires_present_nullable_cursor() -> TestResult {
 fn filter_accepts_recursive_closed_variants() -> TestResult {
     let field = json!({
         "kind": "field",
-        "field": {"field": "name", "op": "eq", "value": "BaseModel"}
+        "field": {"field": "name", "op": "eq", "value": "ReadService"}
     });
     let accepted = [
         field.clone(),
@@ -358,20 +352,20 @@ fn coverage_accepts_only_closed_state_shapes() -> TestResult {
         json!({
             "state": "complete",
             "scope": scope,
-            "provenance": []
+            "origins": []
         }),
         json!({
             "state": "partial",
             "scope": scope,
             "reason": "page boundary",
             "continuation": null,
-            "provenance": []
+            "origins": []
         }),
         json!({
             "state": "unsupported",
             "scope": scope,
             "reason": "provider lacks nodes",
-            "provenance": []
+            "origins": []
         }),
     ];
     for value in accepted {
@@ -382,18 +376,18 @@ fn coverage_accepts_only_closed_state_shapes() -> TestResult {
     assert_rejected::<Coverage>(json!({
         "state": "partial",
         "scope": scope,
-        "provenance": []
+        "origins": []
     }));
     assert_rejected::<Coverage>(json!({
         "state": "unknown",
         "scope": scope,
         "reason": "unknown state",
-        "provenance": []
+        "origins": []
     }));
     assert_rejected::<Coverage>(json!({
         "state": "complete",
         "scope": scope,
-        "provenance": [],
+        "origins": [],
         "extra": true
     }));
     Ok(())
