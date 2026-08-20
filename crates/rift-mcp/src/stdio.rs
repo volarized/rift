@@ -132,6 +132,11 @@ mod tests {
         let error = StdioServeError::Initialize(Box::new(ServerInitializeError::Cancelled));
         assert_eq!(error.to_string(), "MCP initialization failed");
         assert!(error.source().is_some());
+        assert_eq!(
+            error.descriptor().code(),
+            "temporarily_unavailable",
+            "an initialization failure must classify as transient"
+        );
     }
 
     #[tokio::test]

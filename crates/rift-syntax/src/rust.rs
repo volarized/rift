@@ -736,9 +736,13 @@ impl RustSyntaxProvider {
                     syntax_depth_max: self.limits.syntax_depth_max,
                 }));
             }
-            if nodes.len() >= self.limits.syntax_nodes_max {
-                return Err(self.too_many_nodes(source));
-            }
+            assert!(
+                nodes.len() < self.limits.syntax_nodes_max,
+                "the enqueue guard must keep the walker below the node bound: \
+                 nodes={}, syntax_nodes_max={}",
+                nodes.len(),
+                self.limits.syntax_nodes_max,
+            );
 
             let node_index = nodes.len();
             let range = ByteRange::from_node(node)?;
