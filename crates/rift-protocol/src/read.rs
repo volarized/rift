@@ -1860,8 +1860,8 @@ pub enum SymbolVersionKind {
 /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
 /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
 /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
-/// another, so that `end` is never below `start` is asserted by the conformance tests
-/// instead.
+/// another, so that `end` is never below `start` is asserted by the surface
+/// validation tests instead.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextRange {
