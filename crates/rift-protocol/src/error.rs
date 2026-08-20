@@ -163,9 +163,9 @@ pub struct ErrorData {
     /// What a provider reported while the request was failing. Empty where none ran.
     #[schemars(length(max = 64))]
     pub diagnostics: Vec<DiagnosticContext>,
-    /// Which advertised limit was hit, and by how much. Present exactly when `code` is
-    /// `limit_exceeded`, and forbidden otherwise.
-    #[serde(default)]
+    /// Which advertised limit was hit, and by how much. Present only when `code` is
+    /// `limit_exceeded` and the required value is known; any other code forbids it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<LimitEvidence>,
     /// What led to this failure, outermost first. A code alone rarely says whether the
     /// cause is worth waiting out.
@@ -238,9 +238,9 @@ mod tests {
         let clause = clauses
             .iter()
             .find(|clause| clause["if"]["properties"]["code"]["const"] == json!("limit_exceeded"))
-            .expect("limit_exceeded if/then/else clause");
+            .expect("limit_exceeded if/else clause");
         assert_eq!(clause["if"]["required"], json!(["code"]));
-        assert_eq!(clause["then"]["required"], json!(["limit"]));
+        assert_eq!(clause.get("then"), None);
         assert_eq!(clause["else"]["not"]["required"], json!(["limit"]));
     }
 

@@ -8,6 +8,7 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{
     RUST_READ_PROVIDER_ID, SEARCH_RESULTS_DEFAULT, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS,
 };
+use rift_core::{ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, render_failure};
 use rift_index::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits,
@@ -41,23 +42,47 @@ pub enum ReadErrorKind {
 #[derive(Debug)]
 pub struct ReadError {
     kind: ReadErrorKind,
-    message: &'static str,
+    context: Vec<ErrorContext>,
     source: Option<WorkspaceIndexError>,
 }
 
 impl ReadError {
-    fn new(kind: ReadErrorKind, message: &'static str) -> Self {
+    fn new(kind: ReadErrorKind, context: Vec<ErrorContext>) -> Self {
         Self {
             kind,
-            message,
+            context,
             source: None,
         }
+    }
+
+    fn unsupported(capability: &'static str) -> Self {
+        Self::new(
+            ReadErrorKind::Unsupported,
+            vec![ErrorContext::new("capability", capability)],
+        )
+    }
+
+    fn invalid(field: &'static str, violation: impl Into<String>) -> Self {
+        Self::new(
+            ReadErrorKind::Invalid,
+            vec![
+                ErrorContext::new("field", field),
+                ErrorContext::new("violation", violation),
+            ],
+        )
+    }
+
+    fn not_found(path: impl Into<String>) -> Self {
+        Self::new(
+            ReadErrorKind::NotFound,
+            vec![ErrorContext::new("path", path)],
+        )
     }
 
     fn index(source: WorkspaceIndexError) -> Self {
         Self {
             kind: ReadErrorKind::Index,
-            message: "workspace indexing failed",
+            context: source.context(),
             source: Some(source),
         }
     }
@@ -67,11 +92,37 @@ impl ReadError {
     pub const fn kind(&self) -> ReadErrorKind {
         self.kind
     }
+
+    /// Returns canonical registry metadata.
+    ///
+    /// An indexing failure keeps the classification of the
+    /// [`WorkspaceIndexError`] it wraps, so a crossed parse bound surfaces as
+    /// `limit_exceeded` rather than as an unclassified failure.
+    #[must_use]
+    pub fn descriptor(&self) -> ErrorDescriptor {
+        match self.kind {
+            ReadErrorKind::Index => self.source.as_ref().map_or_else(
+                || ErrorRegistry::descriptor(ErrorName::InternalError),
+                WorkspaceIndexError::descriptor,
+            ),
+            ReadErrorKind::Unsupported => {
+                ErrorRegistry::descriptor(ErrorName::CapabilityUnavailable)
+            }
+            ReadErrorKind::Invalid => ErrorRegistry::descriptor(ErrorName::InvalidRequest),
+            ReadErrorKind::NotFound => ErrorRegistry::descriptor(ErrorName::ResourceNotFound),
+        }
+    }
+
+    /// Returns ordered typed context.
+    #[must_use]
+    pub fn context(&self) -> &[ErrorContext] {
+        self.context.as_slice()
+    }
 }
 
 impl fmt::Display for ReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(&render_failure(self.descriptor(), &self.context))
     }
 }
 
@@ -117,17 +168,18 @@ impl ReadService {
     /// Returns [`ReadError`] for projections, invalid paths, or missing files.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
         if params.projection.is_some() {
-            return Err(unsupported("projections are not available"));
+            return Err(ReadError::unsupported("projection reads"));
         }
         let path = CoreProjectPath::new(params.path.0)
-            .map_err(|_| ReadError::new(ReadErrorKind::Invalid, "invalid project path"))?;
-        let file = self.index.file(&path).ok_or_else(|| {
-            ReadError::new(ReadErrorKind::NotFound, "Rust source was not indexed")
-        })?;
+            .map_err(|error| ReadError::invalid("path", error.violation().label()))?;
+        let file = self
+            .index
+            .file(&path)
+            .ok_or_else(|| ReadError::not_found(path.as_str()))?;
         let nodes = self
             .index
             .nodes(&path, params.position)
-            .ok_or_else(|| ReadError::new(ReadErrorKind::NotFound, "Rust source was not indexed"))?
+            .ok_or_else(|| ReadError::not_found(path.as_str()))?
             .into_iter()
             .map(|node| wire_node(file, node))
             .collect();
@@ -158,10 +210,9 @@ impl ReadService {
             params.scope,
         )?;
         if params.include_history {
-            return Err(unsupported("symbol history is not available"));
+            return Err(ReadError::unsupported("symbol history"));
         }
-        let limit = usize::try_from(params.limit)
-            .map_err(|_| ReadError::new(ReadErrorKind::Invalid, "result limit is invalid"))?;
+        let limit = admitted_limit(params.limit)?;
         let hits = self
             .index
             .symbols(&params.name, limit)
@@ -195,15 +246,11 @@ impl ReadService {
         let query = params
             .query
             .as_deref()
-            .ok_or_else(|| ReadError::new(ReadErrorKind::Invalid, "search query is required"))?;
+            .ok_or_else(|| ReadError::invalid("query", "missing"))?;
         if query.is_empty() {
-            return Err(ReadError::new(
-                ReadErrorKind::Invalid,
-                "search query is empty",
-            ));
+            return Err(ReadError::invalid("query", "empty"));
         }
-        let limit = usize::try_from(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))
-            .map_err(|_| ReadError::new(ReadErrorKind::Invalid, "result limit is invalid"))?;
+        let limit = admitted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
         let mut results = Vec::new();
         if matches!(
             params.target,
@@ -237,12 +284,22 @@ impl ReadService {
     }
 }
 
+/// Admits a caller-supplied result limit: positive, and inside this
+/// platform's addressable range.
+fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
+    if requested == 0 {
+        return Err(ReadError::invalid("limit", "zero"));
+    }
+    usize::try_from(requested)
+        .map_err(|_| ReadError::invalid("limit", format!("{requested} exceeds this platform")))
+}
+
 fn validate_common(cursor: bool, projection: bool, scope: SearchScope) -> Result<(), ReadError> {
     if cursor || projection {
-        return Err(unsupported("cursor and projection reads are not available"));
+        return Err(ReadError::unsupported("cursor and projection reads"));
     }
     if scope == SearchScope::Dependencies {
-        return Err(unsupported("dependency reads are not available"));
+        return Err(ReadError::unsupported("dependency reads"));
     }
     Ok(())
 }
@@ -254,18 +311,12 @@ fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
         params.scope,
     )?;
     if params.filter.is_some() || params.paths.is_some() || params.traversal.is_some() {
-        return Err(unsupported(
-            "filtered and traversal search is not available",
-        ));
+        return Err(ReadError::unsupported("filtered and traversal search"));
     }
     if params.target == SearchParamsTarget::Node {
-        return Err(unsupported("node search is not available"));
+        return Err(ReadError::unsupported("node search"));
     }
     Ok(())
-}
-
-fn unsupported(message: &'static str) -> ReadError {
-    ReadError::new(ReadErrorKind::Unsupported, message)
 }
 
 fn wire_node(file: &IndexedFile, node: &RustNode) -> Node {
@@ -929,12 +980,14 @@ pub fn compute() -> i32 {
 
         let zero_limit: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
+        let error = service
+            .search(&zero_limit)
+            .expect_err("zero limit must fail");
+        assert_eq!(error.kind(), ReadErrorKind::Invalid);
         assert_eq!(
-            service
-                .search(&zero_limit)
-                .expect_err("zero limit must fail")
-                .kind(),
-            ReadErrorKind::Index
+            error.to_string(),
+            "the request does not match the documented form: field limit, \
+             violation zero; correct the reported field and resend the request"
         );
         Ok(())
     }

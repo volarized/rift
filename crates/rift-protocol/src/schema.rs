@@ -88,8 +88,8 @@ fn nullable_without_type(object: &mut Map<String, Value>) {
     object.insert("anyOf".to_owned(), json!([inner, { "type": "null" }]));
 }
 
-/// An [`ErrorData`](crate::error::ErrorData) carries `limit` exactly when
-/// `code` is `limit_exceeded`, and forbids it otherwise.
+/// An [`ErrorData`](crate::error::ErrorData) carries `limit` only when
+/// `code` is `limit_exceeded`; any other code forbids it.
 pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
     append(
         schema,
@@ -99,7 +99,6 @@ pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
                 "properties": { "code": { "const": "limit_exceeded" } },
                 "required": ["code"]
             },
-            "then": { "required": ["limit"] },
             "else": { "not": { "required": ["limit"] } }
         }),
     );
