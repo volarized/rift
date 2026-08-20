@@ -26,8 +26,6 @@ const UPDATE_USER_AGENT: &str = "rift-updater";
 const GITHUB_JSON_ACCEPT: &str = "application/vnd.github+json";
 /// Two-space separator of the `sha256sum` text-mode manifest format.
 const SHA256SUM_SEPARATOR: &str = "  ";
-/// Bytes read per iteration while hashing one release file.
-const CHECKSUM_READ_BUFFER_BYTES: usize = 16 * 1024;
 /// Issue tracker for reporting update failures that persist across retries.
 const ISSUE_TRACKER_URL: &str = "https://github.com/volarized/rift/issues";
 
@@ -476,14 +474,7 @@ fn sha256(path: &Path) -> Result<String, UpdateError> {
     require_bounded_file(path, RELEASE_ARCHIVE_BYTES_MAX)?;
     let mut file = fs::File::open(path).map_err(checksum_error)?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; CHECKSUM_READ_BUFFER_BYTES];
-    loop {
-        let count = file.read(&mut buffer).map_err(checksum_error)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
+    io::copy(&mut file, &mut digest).map_err(checksum_error)?;
     Ok(format!("{:x}", digest.finalize()))
 }
 
