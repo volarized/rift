@@ -1402,8 +1402,9 @@ mod tests {
 
     #[test]
     fn patch_rejects_more_files_than_the_bound() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         use std::fmt::Write as _;
+
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         let mut patch = String::new();
         for index in 0..=super::PATCH_FILES_MAX {
             let _ = writeln!(
