@@ -1,5 +1,6 @@
 //! Model Context Protocol transport boundary.
 
+pub mod schema;
 mod server;
 
 pub use server::RiftMcp;
