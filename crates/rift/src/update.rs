@@ -1251,6 +1251,7 @@ mod tests {
     #[test]
     fn checksum_manifests_reject_malformed_entries() -> TestResult {
         use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
 
         let directory = tempfile::tempdir()?;
         let archive = directory.path().join("rift.tar.gz");
@@ -1259,7 +1260,7 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(b"archive"));
         let mut overflowing = String::new();
         for index in 0..=super::CHECKSUM_ENTRY_COUNT_MAX {
-            overflowing.push_str(&format!("{digest}  other-{index}.tar.gz\n"));
+            writeln!(overflowing, "{digest}  other-{index}.tar.gz")?;
         }
         for invalid in [
             "no separator\n".to_owned(),
