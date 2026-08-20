@@ -53,7 +53,7 @@ async fn rift_reads_its_own_rust_source_over_real_stdio_mcp() -> TestResult {
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>(),
-        ["get_symbol", "search"]
+        ["get_symbol", "nodes", "search"]
     );
 
     let called = client

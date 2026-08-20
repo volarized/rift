@@ -1917,6 +1917,813 @@
       }
     },
     {
+      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift.",
+      "input_schema": {
+        "$defs": {
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "maxLength": 1000,
+            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "type": "string"
+          },
+          "ProjectionId": {
+            "description": "Identity of one projection, and the URI that resolves it. The server mints it when\n`projection_create` materializes the projection and retires it when `projection_remove`\ndeletes the directory. A change request that omits its `projection` field applies to the\nworkspace tree itself.",
+            "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "$ref": "#/$defs/ProjectPath",
+            "description": "Project-relative file to inspect."
+          },
+          "position": {
+            "description": "UTF-8 byte offset the listed nodes must cover — one position, not a range; the nodes\nthemselves carry the spans.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProjectionId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The projection to read. Null reads the workspace tree."
+          }
+        },
+        "required": [
+          "path",
+          "position"
+        ],
+        "type": "object"
+      },
+      "name": "nodes",
+      "output_schema": {
+        "$defs": {
+          "Coverage": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "Everything in scope is here, so a fact that is missing is a fact that does not exist.",
+                "properties": {
+                  "origins": {
+                    "description": "Provider revisions that contributed this family, in merge precedence order. Empty\nonly when Rift establishes coverage without a provider.",
+                    "items": {
+                      "$ref": "#/$defs/ProviderOrigin"
+                    },
+                    "type": "array"
+                  },
+                  "scope": {
+                    "$ref": "#/$defs/CoverageScope",
+                    "description": "What the claim covers."
+                  },
+                  "state": {
+                    "$ref": "#/$defs/CoverageCompleteState",
+                    "description": "State tag `complete`."
+                  }
+                },
+                "required": [
+                  "state",
+                  "scope",
+                  "origins"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Some of what is in scope is missing. `reason` is required here because a caller that\nreads absence as proof would be wrong.",
+                "properties": {
+                  "continuation": {
+                    "default": null,
+                    "description": "How to ask for the rest, where there is a way to.",
+                    "maxLength": 4096,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "origins": {
+                    "description": "Provider revisions that contributed available facts, in merge precedence order.",
+                    "items": {
+                      "$ref": "#/$defs/ProviderOrigin"
+                    },
+                    "type": "array"
+                  },
+                  "reason": {
+                    "description": "Why the answer stops short — a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "scope": {
+                    "$ref": "#/$defs/CoverageScope",
+                    "description": "What the claim covers."
+                  },
+                  "state": {
+                    "$ref": "#/$defs/CoveragePartialState",
+                    "description": "State tag `partial`."
+                  }
+                },
+                "required": [
+                  "state",
+                  "scope",
+                  "reason",
+                  "origins"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The family was never produced at all, so there is nothing here to be complete about.",
+                "properties": {
+                  "origins": {
+                    "description": "Provider revisions consulted before reaching this state. Empty for `unsupported`\nand `not_applicable`.",
+                    "items": {
+                      "$ref": "#/$defs/ProviderOrigin"
+                    },
+                    "type": "array"
+                  },
+                  "reason": {
+                    "description": "Which of the two this is, in words: the feature no provider has, or the concept\nthe language lacks.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "scope": {
+                    "$ref": "#/$defs/CoverageScope",
+                    "description": "What the claim covers."
+                  },
+                  "state": {
+                    "$ref": "#/$defs/CoverageStateState",
+                    "description": "State tag: `unsupported` or `not_applicable`."
+                  }
+                },
+                "required": [
+                  "state",
+                  "scope",
+                  "reason",
+                  "origins"
+                ],
+                "type": "object"
+              }
+            ],
+            "description": "How much of one fact family or indexed result an answer covers. Absence proves that no\nmatching fact exists only where the state is `complete`."
+          },
+          "CoverageCompleteState": {
+            "description": "State tag carried by a complete coverage claim.",
+            "oneOf": [
+              {
+                "const": "complete",
+                "description": "Wire value `complete`.",
+                "type": "string"
+              }
+            ]
+          },
+          "CoveragePartialState": {
+            "description": "State tag carried by a partial coverage claim.",
+            "oneOf": [
+              {
+                "const": "partial",
+                "description": "Wire value `partial`.",
+                "type": "string"
+              }
+            ]
+          },
+          "CoverageReach": {
+            "description": "How far the claim reaches.",
+            "oneOf": [
+              {
+                "const": "request",
+                "description": "Wire value `request`.",
+                "type": "string"
+              },
+              {
+                "const": "project",
+                "description": "Wire value `project`.",
+                "type": "string"
+              },
+              {
+                "const": "dependencies",
+                "description": "Wire value `dependencies`.",
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "description": "Wire value `all`.",
+                "type": "string"
+              }
+            ]
+          },
+          "CoverageScope": {
+            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A standing scope identified by its name.",
+                "properties": {
+                  "kind": {
+                    "const": "reach",
+                    "type": "string"
+                  },
+                  "reach": {
+                    "$ref": "#/$defs/CoverageReach",
+                    "description": "How far the claim reaches."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "reach"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "One file. The claim holds for that path and says nothing about any other.",
+                "properties": {
+                  "kind": {
+                    "const": "unit",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file the claim is about."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "CoverageStateState": {
+            "description": "`unsupported` — no provider produces this family for the language. `not_applicable` — the\nfamily has no meaning for this language.",
+            "oneOf": [
+              {
+                "const": "unsupported",
+                "description": "Wire value `unsupported`.",
+                "type": "string"
+              },
+              {
+                "const": "not_applicable",
+                "description": "Wire value `not_applicable`.",
+                "type": "string"
+              }
+            ]
+          },
+          "Digest": {
+            "description": "SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes\nthe algorithm so every consumer produces the same identity for the same bytes.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "ExactKind": {
+            "description": "A provider-local kind preserving the construct name used by that language implementation.",
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
+            "type": "string"
+          },
+          "ExtensionValue": {
+            "additionalProperties": false,
+            "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
+            "properties": {
+              "data": {
+                "description": "The value itself, shaped by whatever that key and version advertise. Rift carries it\nand never interprets it."
+              },
+              "version": {
+                "description": "Which version of the key's advertised schema shaped `data`. A consumer skips a value\nwhose version it does not implement.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "data"
+            ],
+            "type": "object"
+          },
+          "Extensions": {
+            "additionalProperties": false,
+            "description": "Facts a provider carries that the model has no field for, under a reverse-domain key.\nKeys and values use RFC 8785 canonical JSON. Consumers skip entries they do not\nimplement.",
+            "patternProperties": {
+              "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$": {
+                "$ref": "#/$defs/ExtensionValue"
+              }
+            },
+            "type": "object"
+          },
+          "FileId": {
+            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+            "maxLength": 8192,
+            "minLength": 13,
+            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "Freshness": {
+            "description": "Whether derived state covers the tree and source-catalog revisions carried by the answer.",
+            "oneOf": [
+              {
+                "const": "current",
+                "description": "Wire value `current`.",
+                "type": "string"
+              },
+              {
+                "const": "stale",
+                "description": "Wire value `stale`.",
+                "type": "string"
+              }
+            ]
+          },
+          "IndexSnapshot": {
+            "additionalProperties": false,
+            "description": "The immutable search-index revision used for an answer.",
+            "properties": {
+              "freshness": {
+                "$ref": "#/$defs/Freshness",
+                "description": "Whether both indexed revisions equal the answer's captured revisions."
+              },
+              "revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "SHA-256 identity of the index revision."
+              },
+              "source_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "Source-catalog revision indexed by this revision."
+              },
+              "tree_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "Tree revision indexed by this revision."
+              }
+            },
+            "required": [
+              "revision",
+              "tree_revision",
+              "freshness",
+              "source_revision"
+            ],
+            "type": "object"
+          },
+          "Language": {
+            "additionalProperties": false,
+            "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
+            "properties": {
+              "dialect": {
+                "default": null,
+                "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          },
+          "Node": {
+            "additionalProperties": false,
+            "description": "One node of a file's concrete syntax tree. It identifies a source range and\nprovider-local syntax kind. `symbol` connects the node to semantic identity when the\nlanguage supplies one.",
+            "properties": {
+              "extensions": {
+                "$ref": "#/$defs/Extensions",
+                "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem."
+              },
+              "facets": {
+                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them.",
+                "items": {
+                  "$ref": "#/$defs/NodeFacet"
+                },
+                "type": "array"
+              },
+              "id": {
+                "$ref": "#/$defs/NodeId",
+                "description": "Unique identifier of this source region, and the URI that resolves it."
+              },
+              "kind": {
+                "$ref": "#/$defs/ExactKind",
+                "description": "What the node is in the provider's vocabulary, such as `fn_item`, `mapping.key`, or\n`selector.class`."
+              },
+              "language": {
+                "$ref": "#/$defs/Language",
+                "description": "The grammar that produced this node. It belongs to the identity because two\nproviders can produce different trees over the same file bytes."
+              },
+              "parent": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/NodeId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The region this one is nested inside. Absent at the top level of a unit."
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "The bytes it spans, as offsets into the file."
+              },
+              "regions": {
+                "description": "The node's named parts, so an operation can rewrite a function body without touching\nthe documentation above it.",
+                "items": {
+                  "$ref": "#/$defs/NodeRegion"
+                },
+                "type": "array"
+              },
+              "symbol": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The symbol written at this node. Absent where a node writes no symbol —\npunctuation, a keyword, a comment."
+              },
+              "unit": {
+                "$ref": "#/$defs/FileId",
+                "description": "The file the node is written in."
+              }
+            },
+            "required": [
+              "id",
+              "unit",
+              "language",
+              "kind",
+              "facets",
+              "range",
+              "regions",
+              "extensions"
+            ],
+            "type": "object"
+          },
+          "NodeFacet": {
+            "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
+            "oneOf": [
+              {
+                "const": "declaration",
+                "description": "Wire value `declaration`.",
+                "type": "string"
+              },
+              {
+                "const": "definition",
+                "description": "Wire value `definition`.",
+                "type": "string"
+              },
+              {
+                "const": "body",
+                "description": "Wire value `body`.",
+                "type": "string"
+              },
+              {
+                "const": "block",
+                "description": "Wire value `block`.",
+                "type": "string"
+              },
+              {
+                "const": "statement",
+                "description": "Wire value `statement`.",
+                "type": "string"
+              },
+              {
+                "const": "expression",
+                "description": "Wire value `expression`.",
+                "type": "string"
+              },
+              {
+                "const": "type_expression",
+                "description": "Wire value `type_expression`.",
+                "type": "string"
+              },
+              {
+                "const": "import",
+                "description": "Wire value `import`.",
+                "type": "string"
+              },
+              {
+                "const": "export",
+                "description": "Wire value `export`.",
+                "type": "string"
+              },
+              {
+                "const": "parameter",
+                "description": "Wire value `parameter`.",
+                "type": "string"
+              },
+              {
+                "const": "argument",
+                "description": "Wire value `argument`.",
+                "type": "string"
+              },
+              {
+                "const": "annotation",
+                "description": "Wire value `annotation`.",
+                "type": "string"
+              },
+              {
+                "const": "comment",
+                "description": "Wire value `comment`.",
+                "type": "string"
+              },
+              {
+                "const": "identifier",
+                "description": "Wire value `identifier`.",
+                "type": "string"
+              },
+              {
+                "const": "literal",
+                "description": "Wire value `literal`.",
+                "type": "string"
+              },
+              {
+                "const": "pattern",
+                "description": "Wire value `pattern`.",
+                "type": "string"
+              },
+              {
+                "const": "generated",
+                "description": "Wire value `generated`.",
+                "type": "string"
+              },
+              {
+                "const": "test",
+                "description": "Wire value `test`.",
+                "type": "string"
+              }
+            ]
+          },
+          "NodeId": {
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "maxLength": 8192,
+            "minLength": 27,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "type": "string"
+          },
+          "NodeRegion": {
+            "additionalProperties": false,
+            "description": "One named part of a node, and the bytes it spans.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Offsets into the file, on the same scale as `Node.range`."
+              },
+              "role": {
+                "$ref": "#/$defs/RegionRole",
+                "description": "Which part of the node this is."
+              }
+            },
+            "required": [
+              "role",
+              "range"
+            ],
+            "type": "object"
+          },
+          "ProviderId": {
+            "description": "Stable identity of one provider implementation. The identity remains unchanged across\nprovider restarts and fact revisions, so callers can compare origins from separate\nanswers.",
+            "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+            "type": "string"
+          },
+          "ProviderOrigin": {
+            "additionalProperties": false,
+            "description": "The immutable provider state used for one fact-family answer. A provider publishes a new\n`revision` only after it has finished deriving facts from one workspace tree and source\ncatalog revision.",
+            "properties": {
+              "freshness": {
+                "$ref": "#/$defs/Freshness",
+                "description": "Whether both input revisions equal the answer's captured revisions."
+              },
+              "provider": {
+                "$ref": "#/$defs/ProviderId",
+                "description": "Stable identity of the provider that contributed facts."
+              },
+              "revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "SHA-256 identity of the immutable provider fact revision."
+              },
+              "source_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "Source-catalog revision from which the provider derived these facts."
+              },
+              "tree_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "Tree revision from which the provider derived this fact revision."
+              }
+            },
+            "required": [
+              "provider",
+              "revision",
+              "tree_revision",
+              "freshness",
+              "source_revision"
+            ],
+            "type": "object"
+          },
+          "ReadSnapshot": {
+            "additionalProperties": false,
+            "description": "Immutable state captured for one read. Every page produced from one cursor carries the\nsame snapshot.",
+            "properties": {
+              "index": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/IndexSnapshot"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Search-index state used by the read, or null when the read did not use the index."
+              },
+              "source_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "Source-catalog revision captured for the read."
+              },
+              "tree_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "SHA-256 identity of the targeted tree when the read began. The digest covers visible\npaths, entry kinds, executable bits, and contents."
+              }
+            },
+            "required": [
+              "tree_revision",
+              "source_revision"
+            ],
+            "type": "object"
+          },
+          "RegionRole": {
+            "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
+            "oneOf": [
+              {
+                "const": "selection",
+                "description": "Wire value `selection`.",
+                "type": "string"
+              },
+              {
+                "const": "name",
+                "description": "Wire value `name`.",
+                "type": "string"
+              },
+              {
+                "const": "header",
+                "description": "Wire value `header`.",
+                "type": "string"
+              },
+              {
+                "const": "body",
+                "description": "Wire value `body`.",
+                "type": "string"
+              },
+              {
+                "const": "content",
+                "description": "Wire value `content`.",
+                "type": "string"
+              },
+              {
+                "const": "documentation",
+                "description": "Wire value `documentation`.",
+                "type": "string"
+              },
+              {
+                "const": "enclosing",
+                "description": "Wire value `enclosing`.",
+                "type": "string"
+              }
+            ]
+          },
+          "SemanticCoverage": {
+            "additionalProperties": {
+              "$ref": "#/$defs/Coverage"
+            },
+            "description": "Coverage for every fact family. Absence is authoritative only where state is complete.",
+            "type": "object"
+          },
+          "SourceExcerpt": {
+            "additionalProperties": false,
+            "description": "A copy of source from the catalog. The unit may belong to the project, a dependency, or\nthe standard library; the excerpt preserves bytes as they were when the answer was\nproduced.",
+            "properties": {
+              "span": {
+                "$ref": "#/$defs/SourceUnitSpan",
+                "description": "The source unit and byte range the text was taken from."
+              },
+              "text": {
+                "description": "The source bytes returned by the request.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "span",
+              "text"
+            ],
+            "type": "object"
+          },
+          "SourceUnitId": {
+            "description": "Stable identity of one source unit in the source catalog. Rift derives it from the\nresolver identity and that resolver's canonical unit key, so the same installed source\nkeeps its identity across catalog revisions.",
+            "pattern": "^rift://source/src_[a-z2-7]{26}$",
+            "type": "string"
+          },
+          "SourceUnitSpan": {
+            "additionalProperties": false,
+            "description": "One byte range in a source-catalog unit.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Half-open UTF-8 byte range in that unit."
+              },
+              "unit": {
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "Source unit containing the bytes."
+              }
+            },
+            "required": [
+              "unit",
+              "range"
+            ],
+            "type": "object"
+          },
+          "SymbolId": {
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "TextRange": {
+            "additionalProperties": false,
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the conformance tests\ninstead.",
+            "properties": {
+              "end": {
+                "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "description": "First byte of the range, counted from the start of the file.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start",
+              "end"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/$defs/SemanticCoverage",
+            "description": "Completeness of the node facts used to build the listing."
+          },
+          "nodes": {
+            "description": "Nodes covering the position, outermost first.",
+            "items": {
+              "$ref": "#/$defs/Node"
+            },
+            "type": "array"
+          },
+          "snapshot": {
+            "$ref": "#/$defs/ReadSnapshot",
+            "description": "Tree revision and provider state used for this listing."
+          },
+          "source": {
+            "description": "The source of each node, in the same order.",
+            "items": {
+              "$ref": "#/$defs/SourceExcerpt"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes",
+          "source",
+          "coverage",
+          "snapshot"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "description": "Searches indexed Rust declarations and source lines by lexical `query`. Use\n`get_symbol` when the declaration name is known.",
       "input_schema": {
         "$defs": {
