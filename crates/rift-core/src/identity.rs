@@ -428,10 +428,10 @@ mod tests {
     use std::error::Error as _;
 
     use super::{
-        CompositionId, CompositionRevision, CursorId, IndexRevision, ModelId, ModelRevision,
-        ProviderId, ProviderRevision, SourceResolverId, SourceResolverIdViolation, SourceRevision,
-        SourceUnitId, SourceUnitIdError, SourceUnitIdErrorKind, SymbolId, TreeRevision,
-        WorkspaceId,
+        CompositionId, CompositionRevision, CursorId, IdError, IndexRevision, ModelId,
+        ModelRevision, ProviderId, ProviderRevision, RevisionError, SourceResolverId,
+        SourceResolverIdViolation, SourceRevision, SourceUnitId, SourceUnitIdError,
+        SourceUnitIdErrorKind, SymbolId, TreeRevision, WorkspaceId,
     };
     use crate::SourcePath;
     use crate::constants::{SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX};
@@ -514,9 +514,28 @@ mod tests {
     }
 
     #[test]
+    fn id_error_displays_and_implements_std_error() {
+        let error = WorkspaceId::new("").expect_err("empty value must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "identity must be non-empty and contain no control characters"
+        );
+        let _: &dyn std::error::Error = &error;
+        assert_eq!(error, IdError);
+    }
+
+    #[test]
     fn revisions_are_non_zero() {
         assert!(TreeRevision::new(0).is_err());
         assert_eq!(TreeRevision::new(7).map(TreeRevision::get), Ok(7));
+    }
+
+    #[test]
+    fn revision_error_displays_and_implements_std_error() {
+        let error = TreeRevision::new(0).expect_err("zero revision must be rejected");
+        assert_eq!(error.to_string(), "revision must be greater than zero");
+        let _: &dyn std::error::Error = &error;
+        assert_eq!(error, RevisionError);
     }
 
     #[test]
