@@ -1,16 +1,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::time::SystemTime;
 
-use rift_core::ErrorName;
+use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
+use rift_core::{ErrorName, Fault};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::change::{
     ChangeResult, InsertSymbolParams, PatchParams, ReplaceNodeParams, ReplaceSymbolParams,
 };
+use rift_protocol::configuration::WorkspaceConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::read::{
     GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
 };
-use rift_server::{ChangeService, ReadError, ReadService};
+use rift_server::{ChangeService, ConfigurationError, ReadError, ReadService, load_configuration};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
@@ -33,7 +36,38 @@ pub struct RiftMcp {
     limits: WorkspaceIndexLimits,
     reads: RwLock<ReadService>,
     changes: ChangeService,
+    configuration: RwLock<ConfigurationState>,
     tool_router: ToolRouter<Self>,
+}
+
+/// The last admission of the workspace's `rift.toml`, kept with the file
+/// state it was read from so an edited file is re-admitted on the next
+/// request and an unchanged one is not re-parsed per call.
+#[derive(Debug)]
+struct ConfigurationState {
+    admitted: Result<WorkspaceConfiguration, ConfigurationError>,
+    fingerprint: Option<ConfigurationFingerprint>,
+}
+
+impl ConfigurationState {
+    /// Admits the workspace's current `rift.toml`.
+    fn admit(root: &Path) -> Self {
+        Self {
+            admitted: load_configuration(root),
+            fingerprint: configuration_fingerprint(root),
+        }
+    }
+}
+
+/// The file state one admission was read from. Size rides modification
+/// time because same-second edits are common at a shell.
+type ConfigurationFingerprint = (SystemTime, u64);
+
+/// The current `rift.toml` file state, or null when the file is absent or
+/// unreadable — either way the next admission decides what that means.
+fn configuration_fingerprint(root: &Path) -> Option<ConfigurationFingerprint> {
+    let metadata = std::fs::metadata(root.join(WORKSPACE_CONFIGURATION_FILE)).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
@@ -49,6 +83,7 @@ impl RiftMcp {
             limits,
             reads: RwLock::new(ReadService::build(root, limits)?),
             changes: ChangeService::new(root),
+            configuration: RwLock::new(ConfigurationState::admit(root)),
             tool_router: Self::tool_router(),
         })
     }
@@ -61,6 +96,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
+        self.admitted_configuration(wire::ErrorPhase::Read)?;
         self.snapshot()
             .get_symbol(&params)
             .map(Json)
@@ -74,6 +110,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
+        self.admitted_configuration(wire::ErrorPhase::Read)?;
         self.snapshot()
             .search(&params)
             .map(Json)
@@ -88,6 +125,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ErrorData> {
+        self.admitted_configuration(wire::ErrorPhase::Read)?;
         self.snapshot()
             .nodes(params)
             .map(Json)
@@ -150,6 +188,38 @@ impl RiftMcp {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// The admitted workspace configuration, re-admitting `rift.toml` when
+    /// the file changed since the last request. While the file is invalid,
+    /// every request fails as `configuration_invalid` until it is fixed.
+    ///
+    /// # Panics
+    ///
+    /// Recovers a poisoned lock instead of panicking: the admission is
+    /// replaced whole, so a poisoned guard still holds a coherent value.
+    fn admitted_configuration(
+        &self,
+        phase: wire::ErrorPhase,
+    ) -> Result<WorkspaceConfiguration, ErrorData> {
+        let current = configuration_fingerprint(&self.root);
+        {
+            let state = self
+                .configuration
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.fingerprint == current {
+                return admitted(&state, phase);
+            }
+        }
+        let mut state = self
+            .configuration
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.fingerprint != current {
+            *state = ConfigurationState::admit(&self.root);
+        }
+        admitted(&state, phase)
+    }
+
     /// Runs one change against the current snapshot and, when it lands,
     /// swaps in a snapshot of the changed workspace.
     ///
@@ -160,6 +230,7 @@ impl RiftMcp {
         &self,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
+        self.admitted_configuration(wire::ErrorPhase::Change)?;
         let mut result = operation(&self.snapshot(), &self.changes)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
         if let ChangeResult::Applied { summary } = &mut result {
@@ -174,6 +245,18 @@ impl RiftMcp {
             }
         }
         Ok(Json(result))
+    }
+}
+
+/// The admission's outcome as one request sees it: the configuration to
+/// serve under, or the typed refusal naming what to fix.
+fn admitted(
+    state: &ConfigurationState,
+    phase: wire::ErrorPhase,
+) -> Result<WorkspaceConfiguration, ErrorData> {
+    match &state.admitted {
+        Ok(configuration) => Ok(configuration.clone()),
+        Err(error) => Err(error.tool_error(phase)),
     }
 }
 
@@ -229,7 +312,7 @@ trait WireFailure {
     fn wire_causes(&self) -> Vec<wire::ErrorCause>;
 }
 
-impl WireFailure for ReadError {
+impl<K: Fault> WireFailure for rift_core::Error<K> {
     fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData {
         let message = self.to_string();
         let data = serde_json::to_value(self.wire_error(phase)).ok();

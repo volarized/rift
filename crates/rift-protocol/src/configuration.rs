@@ -349,6 +349,7 @@ impl HistoryConfiguration {
 /// languages caller-provided code may run as.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_execution_ranges)]
 pub struct ExecutionConfiguration {
     /// Language selectors enabled for `execute`: a language name, or
     /// `name:dialect` to pin a dialect. Empty keeps execution off.

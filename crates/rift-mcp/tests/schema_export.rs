@@ -22,10 +22,53 @@ fn run_without_arguments_writes_default_output_directory() -> TestResult {
 
     let written = fs::read_to_string(directory.path().join("docs/protocol/mcp.json"))?;
     assert_eq!(written, schema::schema_document());
+    let configuration =
+        fs::read_to_string(directory.path().join("docs/protocol/rift.schema.json"))?;
+    assert_eq!(configuration, schema::configuration_schema_document());
 
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.starts_with("wrote "));
     assert!(stdout.contains("docs/protocol/mcp.json"));
+    assert!(stdout.contains("docs/protocol/rift.schema.json"));
+    Ok(())
+}
+
+#[test]
+fn check_fails_when_configuration_schema_is_stale() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
+    schema::run(&write_request)?;
+    fs::write(directory.path().join("rift.schema.json"), "{}")?;
+
+    let check_request =
+        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
+    let error = schema::run(&check_request).expect_err("stale configuration schema must fail");
+    let ExportError::CheckMismatch { path } = error else {
+        panic!("expected CheckMismatch, got {error:?}");
+    };
+    assert!(path.ends_with("rift.schema.json"));
+    Ok(())
+}
+
+#[test]
+fn configuration_schema_document_is_deterministic_and_validates_hooks() -> TestResult {
+    let first = schema::configuration_schema_document();
+    assert_eq!(first, schema::configuration_schema_document());
+    let document: Value = serde_json::from_str(&first)?;
+    assert_eq!(document["title"], "WorkspaceConfiguration");
+    let hook = &document["$defs"]["CommandHook"];
+    assert_eq!(hook["additionalProperties"], Value::Bool(false));
+    let required = hook["required"]
+        .as_array()
+        .ok_or("hook required must be an array")?;
+    assert_eq!(
+        required.len(),
+        hook["properties"]
+            .as_object()
+            .ok_or("hook properties must be an object")?
+            .len(),
+        "every hook key is required: the schema carries no defaults"
+    );
     Ok(())
 }
 
