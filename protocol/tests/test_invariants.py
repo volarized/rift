@@ -154,6 +154,17 @@ class FactFamilyTests(TestCase):
         )
 
 
+class NodesParamsTests(TestCase):
+    def test_path_must_name_a_file(self) -> None:
+        params = mcp.NodesParams.model_validate(
+            {"path": "src/lib.rs", "position": 0}
+        )
+        self.assertEqual(params.path, core.ProjectPath("src/lib.rs"))
+
+        with self.assertRaises(ValidationError):
+            mcp.NodesParams.model_validate({"path": "", "position": 0})
+
+
 class SourceDiscoveryTests(TestCase):
     def test_location_and_source_kind_are_independent(self) -> None:
         unit = core.SourceUnit.model_validate(
