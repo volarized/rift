@@ -1051,8 +1051,82 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn release_members(artifact: &ReleaseArtifact) -> Vec<(String, Vec<u8>)> {
+        vec![
+            (artifact.binary_member(), b"binary".to_vec()),
+            (format!("{}/README.md", artifact.root), b"readme".to_vec()),
+            (format!("{}/LICENSE.md", artifact.root), b"license".to_vec()),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn write_tar_gz(archive_path: &std::path::Path, entries: &[(String, Vec<u8>)]) -> TestResult {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let raw = fs::File::create(archive_path)?;
+        let zipped = GzEncoder::new(raw, Compression::default());
+        let mut archive = tar::Builder::new(zipped);
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, bytes.as_slice())?;
+        }
+        archive.into_inner()?.finish()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[test]
     fn tar_archive_extracts_only_exact_release_surface() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let artifact = ReleaseArtifact::new(version("0.0.2"));
+        let archive_path = directory.path().join(&artifact.archive_name);
+        write_tar_gz(&archive_path, &release_members(&artifact))?;
+        let candidate = super::extract_candidate(&archive_path, directory.path(), &artifact)?;
+        assert_eq!(fs::read(candidate)?, b"binary");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_archives_off_the_release_surface_are_rejected() -> TestResult {
+        let artifact = ReleaseArtifact::new(version("0.0.2"));
+        let complete = release_members(&artifact);
+        let mut extra = complete.clone();
+        extra.push((format!("{}/EXTRA.md", artifact.root), b"extra".to_vec()));
+        let mut renamed = complete.clone();
+        renamed[0].0 = format!("{}/other", artifact.root);
+        let mut duplicated = complete.clone();
+        duplicated[1] = complete[0].clone();
+        let mut empty_binary = complete.clone();
+        empty_binary[0].1 = Vec::new();
+        for entries in [
+            extra,
+            renamed,
+            duplicated,
+            empty_binary,
+            complete[..2].to_vec(),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let archive_path = directory.path().join(&artifact.archive_name);
+            write_tar_gz(&archive_path, &entries)?;
+            let error = super::extract_candidate(&archive_path, directory.path(), &artifact)
+                .expect_err("off-surface archive must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("release archive contents are invalid")
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_directory_entries_are_rejected() -> TestResult {
         use flate2::Compression;
         use flate2::write::GzEncoder;
 
@@ -1062,24 +1136,14 @@ mod tests {
         let raw = fs::File::create(&archive_path)?;
         let zipped = GzEncoder::new(raw, Compression::default());
         let mut archive = tar::Builder::new(zipped);
-        for (name, bytes) in [
-            (artifact.binary_member(), b"binary".as_slice()),
-            (format!("{}/README.md", artifact.root), b"readme".as_slice()),
-            (
-                format!("{}/LICENSE.md", artifact.root),
-                b"license".as_slice(),
-            ),
-        ] {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            archive.append_data(&mut header, name, bytes)?;
-        }
-        let zipped = archive.into_inner()?;
-        zipped.finish()?;
-        let candidate = super::extract_candidate(&archive_path, directory.path(), &artifact)?;
-        assert_eq!(fs::read(candidate)?, b"binary");
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append_data(&mut header, &artifact.root, b"".as_slice())?;
+        archive.into_inner()?.finish()?;
+        assert!(super::extract_candidate(&archive_path, directory.path(), &artifact).is_err());
         Ok(())
     }
 
@@ -1100,6 +1164,340 @@ mod tests {
         );
         assert_eq!(fs::read(&current)?, b"new");
         assert_eq!(fs::metadata(&current)?.permissions().mode() & 0o777, 0o751);
+        Ok(())
+    }
+
+    #[test]
+    fn error_constructors_name_paths_and_causes() {
+        let cause = || std::io::Error::other("fixture cause");
+
+        let locate = super::locate_error(cause());
+        assert!(locate.to_string().contains("could not be located"));
+        assert!(locate.to_string().contains("fixture cause"));
+        assert!(locate.source().is_some());
+
+        let semver_error = Version::parse("bogus").expect_err("bogus version must fail");
+        let invalid_version = super::version_error(
+            "bogus",
+            std::path::Path::new("/opt/rift/rift"),
+            semver_error,
+        );
+        assert!(invalid_version.to_string().contains("`bogus`"));
+        assert!(invalid_version.to_string().contains("/opt/rift/rift"));
+        assert!(invalid_version.source().is_some());
+
+        let staging = super::staging_error(cause());
+        let text = staging.to_string();
+        assert!(text.contains(&std::env::temp_dir().display().to_string()));
+        assert!(text.contains("bytes free") || text.contains("free space unknown"));
+        assert!(text.contains("fixture cause"));
+
+        let publish =
+            super::publish_error("replacing", std::path::Path::new("/opt/rift/rift"), cause());
+        assert!(
+            publish
+                .to_string()
+                .contains("replacing `/opt/rift/rift` failed")
+        );
+        assert!(publish.to_string().contains("fixture cause"));
+
+        let no_parent = super::no_parent_error(std::path::Path::new("/"));
+        assert!(no_parent.to_string().contains("has no parent directory"));
+    }
+
+    #[test]
+    fn bounded_file_errors_report_kind_and_size() -> TestResult {
+        let directory = tempfile::tempdir()?;
+
+        let missing = directory.path().join("missing");
+        let error = super::require_bounded_file(&missing, 4).expect_err("missing must fail");
+        assert!(error.to_string().contains("could not be inspected"));
+        assert!(error.to_string().contains("missing"));
+
+        let error =
+            super::require_bounded_file(directory.path(), 4).expect_err("directory must fail");
+        assert!(error.to_string().contains("is not a regular file"));
+        assert!(error.to_string().contains(super::ISSUE_TRACKER_URL));
+
+        let oversized = directory.path().join("oversized");
+        fs::write(&oversized, b"12345")?;
+        let error = super::require_bounded_file(&oversized, 4).expect_err("oversize must fail");
+        assert!(error.to_string().contains("incorrect size of 5 bytes"));
+        assert!(error.to_string().contains("between 1 and 4 bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn checksum_mismatch_reports_both_digests() -> TestResult {
+        use sha2::{Digest as _, Sha256};
+
+        let directory = tempfile::tempdir()?;
+        let archive = directory.path().join("rift.tar.gz");
+        let manifest = directory.path().join("checksums");
+        fs::write(&archive, b"archive")?;
+        let expected = "0".repeat(64);
+        fs::write(&manifest, format!("{expected}  rift.tar.gz\n"))?;
+        let error =
+            verify_checksum(&archive, &manifest, "rift.tar.gz").expect_err("mismatch must fail");
+        let text = error.to_string();
+        let actual = format!("{:x}", Sha256::digest(b"archive"));
+        assert!(text.starts_with("Here be dragons 🐉!"));
+        assert!(text.contains(&expected));
+        assert!(text.contains(&actual));
+        assert!(text.contains(super::ISSUE_TRACKER_URL));
+        Ok(())
+    }
+
+    #[test]
+    fn checksum_manifests_reject_malformed_entries() -> TestResult {
+        use sha2::{Digest as _, Sha256};
+
+        let directory = tempfile::tempdir()?;
+        let archive = directory.path().join("rift.tar.gz");
+        let manifest = directory.path().join("checksums");
+        fs::write(&archive, b"archive")?;
+        let digest = format!("{:x}", Sha256::digest(b"archive"));
+        let mut overflowing = String::new();
+        for index in 0..=super::CHECKSUM_ENTRY_COUNT_MAX {
+            overflowing.push_str(&format!("{digest}  other-{index}.tar.gz\n"));
+        }
+        for invalid in [
+            "no separator\n".to_owned(),
+            format!("{}  rift.tar.gz\n", "0".repeat(8)),
+            format!("{digest}  rift.tar.gz\n{digest}  rift.tar.gz\n"),
+            overflowing,
+        ] {
+            fs::write(&manifest, invalid)?;
+            let error = verify_checksum(&archive, &manifest, "rift.tar.gz")
+                .expect_err("malformed manifest must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("release checksum manifest is invalid")
+            );
+        }
+        Ok(())
+    }
+
+    struct FixtureTransport {
+        metadata: Vec<u8>,
+        manifest: Vec<u8>,
+        archive: Vec<u8>,
+    }
+
+    impl super::DownloadTransport for FixtureTransport {
+        fn download(
+            &self,
+            url: &str,
+            destination: &std::path::Path,
+            _bytes_max: u64,
+        ) -> Result<(), UpdateError> {
+            let bytes = if url == rift_core::constants::RELEASE_API_URL {
+                &self.metadata
+            } else if url.ends_with(".sha256") {
+                &self.manifest
+            } else {
+                &self.archive
+            };
+            if bytes.is_empty() {
+                return Err(super::download_error(std::io::Error::other(
+                    "fixture download unavailable",
+                )));
+            }
+            fs::write(destination, bytes).map_err(super::download_error)
+        }
+    }
+
+    #[test]
+    fn github_source_propagates_download_failures() -> TestResult {
+        for (manifest, archive) in [(Vec::new(), b"x".to_vec()), (b"x".to_vec(), Vec::new())] {
+            let staging = tempfile::tempdir()?;
+            let source = super::GitHubReleaseSource {
+                transport: FixtureTransport {
+                    metadata: Vec::new(),
+                    manifest,
+                    archive,
+                },
+            };
+            let error = source
+                .stage(staging.path(), version("0.0.3"))
+                .expect_err("unavailable release asset must fail");
+            assert!(error.to_string().contains("release download failed"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn github_source_parses_latest_release_metadata() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source = super::GitHubReleaseSource {
+            transport: FixtureTransport {
+                metadata: br#"{"tag_name":"v0.0.3"}"#.to_vec(),
+                manifest: Vec::new(),
+                archive: Vec::new(),
+            },
+        };
+        assert_eq!(source.latest_version(directory.path())?, version("0.0.3"));
+
+        let source = super::GitHubReleaseSource {
+            transport: FixtureTransport {
+                metadata: b"not json".to_vec(),
+                manifest: Vec::new(),
+                archive: Vec::new(),
+            },
+        };
+        let error = source
+            .latest_version(directory.path())
+            .expect_err("malformed metadata must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("latest release metadata is invalid")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_source_stages_checksummed_candidate() -> TestResult {
+        use sha2::{Digest as _, Sha256};
+
+        let build = tempfile::tempdir()?;
+        let artifact = ReleaseArtifact::new(version("0.0.3"));
+        let archive_path = build.path().join(&artifact.archive_name);
+        write_tar_gz(&archive_path, &release_members(&artifact))?;
+        let archive = fs::read(&archive_path)?;
+        let digest = format!("{:x}", Sha256::digest(&archive));
+        let manifest = format!("{digest}  {}\n", artifact.archive_name).into_bytes();
+
+        let staging = tempfile::tempdir()?;
+        let source = super::GitHubReleaseSource {
+            transport: FixtureTransport {
+                metadata: Vec::new(),
+                manifest,
+                archive: archive.clone(),
+            },
+        };
+        let candidate = source.stage(staging.path(), version("0.0.3"))?;
+        assert_eq!(fs::read(candidate)?, b"binary");
+
+        let staging = tempfile::tempdir()?;
+        let source = super::GitHubReleaseSource {
+            transport: FixtureTransport {
+                metadata: Vec::new(),
+                manifest: format!("{}  {}\n", "0".repeat(64), artifact.archive_name).into_bytes(),
+                archive,
+            },
+        };
+        let error = source
+            .stage(staging.path(), version("0.0.3"))
+            .expect_err("corrupted archive must fail");
+        assert!(error.to_string().starts_with("Here be dragons 🐉!"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_publish_reports_failing_operation_and_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let current = directory.path().join("rift");
+        fs::write(&current, b"old")?;
+
+        let missing = directory.path().join("missing");
+        let error = AtomicPublisher
+            .publish(&current, &missing)
+            .expect_err("missing candidate must fail");
+        assert!(error.to_string().contains("opening the downloaded binary"));
+        assert!(error.to_string().contains("missing"));
+
+        let empty = directory.path().join("empty");
+        fs::write(&empty, [])?;
+        let error = AtomicPublisher
+            .publish(&current, &empty)
+            .expect_err("empty candidate must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("copying the downloaded binary into")
+        );
+
+        let ghost = directory.path().join("ghost");
+        let candidate = directory.path().join("candidate");
+        fs::write(&candidate, b"new")?;
+        let error = AtomicPublisher
+            .publish(&ghost, &candidate)
+            .expect_err("missing current binary must fail");
+        assert!(error.to_string().contains("reading permissions of"));
+
+        let error = AtomicPublisher
+            .publish(std::path::Path::new("/"), &candidate)
+            .expect_err("rootless current path must fail");
+        assert!(error.to_string().contains("has no parent directory"));
+        Ok(())
+    }
+
+    #[test]
+    fn transport_download_enforces_status_and_bounds() -> TestResult {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let responses: Vec<Vec<u8>> = vec![
+            b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\npayload".to_vec(),
+            b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\npayload".to_vec(),
+            b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_vec(),
+        ];
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept must succeed");
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                stream.write_all(&response).expect("response must send");
+            }
+        });
+
+        let transport = super::ReqwestTransport::new()?;
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("payload");
+        super::DownloadTransport::download(
+            &transport,
+            &format!("http://{address}/ok"),
+            &destination,
+            64,
+        )?;
+        assert_eq!(fs::read(&destination)?, b"payload");
+
+        let error = super::DownloadTransport::download(
+            &transport,
+            &format!("http://{address}/large"),
+            &destination,
+            3,
+        )
+        .expect_err("oversized download must fail");
+        assert!(error.to_string().contains("exceeded 3 bytes"));
+
+        let error = super::DownloadTransport::download(
+            &transport,
+            &format!("http://{address}/absent"),
+            &destination,
+            64,
+        )
+        .expect_err("missing asset must fail");
+        assert!(error.to_string().contains("release download failed"));
+
+        let error = super::DownloadTransport::download(
+            &transport,
+            &format!("http://{address}/redirect"),
+            &destination,
+            64,
+        )
+        .expect_err("insecure redirect must stop with an empty body");
+        assert!(error.to_string().contains("was empty or exceeded"));
+
+        server.join().expect("server thread must finish");
         Ok(())
     }
 }
