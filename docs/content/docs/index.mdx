@@ -53,7 +53,7 @@ the source-to-syntax-to-index pipeline.
 The scanner skips symlinks and the `.git`, `.rift`, and `target` directories. It writes no index or
 projection state to the codebase.
 
-The MCP server advertises three read tools:
+The MCP server advertises the read tools:
 
 - `search` finds declarations and matching source lines.
 - `get_symbol` returns declarations with source excerpts when the name is known.
@@ -63,7 +63,7 @@ The MCP server advertises three read tools:
 
 ## Changes
 
-Four tools edit the workspace. Each resolves its address against the served snapshot, proves its
+The change tools edit the workspace. Each resolves its address against the served snapshot, proves its
 preconditions against the bytes on disk, and only then writes — atomically, behind one
 application lock, so two concurrent changes collide as a clean refusal rather than as
 interleaved bytes:
