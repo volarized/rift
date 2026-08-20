@@ -1429,6 +1429,10 @@ dependencies = [
 name = "rift-core"
 version = "0.0.3"
 dependencies = [
+ "rift-protocol",
+ "serde",
+ "serde_json",
+ "strum",
  "unicode-normalization",
 ]
 
@@ -1473,6 +1477,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "strum",
 ]
 
 [[package]]
