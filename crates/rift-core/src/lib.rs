@@ -10,8 +10,8 @@ mod path;
 pub mod constants;
 
 pub use error::{
-    ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, RetryDirective, RiftError,
-    render_failure,
+    CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, RetryDirective,
+    RiftError, fault_label, render_failure,
 };
 pub use identity::{
     CompositionId, CompositionRevision, CursorId, IdError, IndexRevision, ModelId, ModelRevision,

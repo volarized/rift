@@ -8,7 +8,7 @@ use crate::constants::{
     SOURCE_RESOLVER_PUNCTUATION, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_SAFE_PUNCTUATION,
     SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX,
 };
-use crate::{ErrorDescriptor, ErrorName, ErrorRegistry, PathError, SourcePath};
+use crate::{ErrorCode, ErrorDescriptor, ErrorName, PathError, SourcePath};
 
 /// Invalid stable identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,7 @@ impl SourceResolverIdError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+        ErrorName::Wire(ErrorCode::ConfigurationInvalid).descriptor()
     }
 }
 
@@ -198,7 +198,7 @@ impl SourceUnitIdError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+        ErrorName::Wire(ErrorCode::ConfigurationInvalid).descriptor()
     }
 }
 

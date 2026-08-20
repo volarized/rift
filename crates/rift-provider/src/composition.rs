@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rift_core::constants::{STAGE_NAME_BYTES_MAX, STAGE_NAME_PUNCTUATION};
 use rift_core::{
-    CompositionId, ErrorDescriptor, ErrorName, ErrorRegistry, ProviderId, is_canonical_ascii_name,
+    CompositionId, ErrorCode, ErrorDescriptor, ErrorName, ProviderId, is_canonical_ascii_name,
 };
 
 // Process-local builder origin. Mutable allocation remains provider-owned.
@@ -290,7 +290,7 @@ impl CompositionError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(&self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+        ErrorName::Wire(ErrorCode::ConfigurationInvalid).descriptor()
     }
 }
 
@@ -1030,7 +1030,7 @@ impl CacheError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::LimitExceeded)
+        ErrorName::Wire(ErrorCode::LimitExceeded).descriptor()
     }
 }
 
