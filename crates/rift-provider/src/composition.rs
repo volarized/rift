@@ -936,4 +936,162 @@ mod tests {
             .expect_err("oversized stage name must fail");
         assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
     }
+
+    #[test]
+    fn descriptors_expose_identity_paths_and_recorded_types() {
+        let mut builder = CompositionBuilder::new(composition_id("catalog"));
+        let source = builder.source("project", &component::<(), Sources>("project"));
+        let syntax = builder.then(source, "syntax", &component::<Sources, Syntax>("syntax"));
+        let composition = builder.output(syntax).build().expect("complete graph");
+
+        assert_eq!(composition.id().as_str(), "catalog");
+        let stage = composition.stage("catalog.syntax").expect("syntax stage");
+        assert_eq!(stage.path().to_string(), "catalog.syntax");
+        assert_eq!(stage.component_input_type(), type_name::<Sources>());
+        assert_eq!(stage.cardinality(), FlowCardinality::Single);
+    }
+
+    #[test]
+    fn error_context_names_offending_stage_when_present() {
+        let mut builder = CompositionBuilder::new(composition_id("dup"));
+        let flow = builder.source("stage", &component::<(), Sources>("stage"));
+        let _second = builder.source("stage", &component::<(), Sources>("again"));
+        let duplicate = builder
+            .output(flow)
+            .build()
+            .expect_err("duplicate stage path");
+        assert_eq!(duplicate.stage().map(StagePath::as_str), Some("dup.stage"));
+
+        let missing = CompositionBuilder::new(composition_id("empty"))
+            .build()
+            .expect_err("missing output");
+        assert!(missing.stage().is_none());
+    }
+
+    #[test]
+    fn cloned_flow_handle_stays_connectable() {
+        let mut builder = CompositionBuilder::new(composition_id("clone"));
+        let flow = builder.source("project", &component::<(), Sources>("project"));
+        #[expect(clippy::clone_on_copy, reason = "exercises the manual Clone impl")]
+        let cloned = flow.clone();
+        let syntax = builder.then(cloned, "syntax", &component::<Sources, Syntax>("syntax"));
+        let composition = builder.output(syntax).build().expect("complete graph");
+        assert_eq!(
+            composition.stage("clone.syntax").expect("stage").inputs()[0].as_str(),
+            "clone.project"
+        );
+    }
+
+    #[test]
+    fn non_canonical_scope_name_fails_at_build() {
+        let mut builder = CompositionBuilder::new(composition_id("scoped"));
+        let source = builder.source("project", &component::<(), Sources>("project"));
+        let scoped = builder.scope("Uppercase").then(
+            source,
+            "syntax",
+            &component::<Sources, Syntax>("syntax"),
+        );
+        let error = builder
+            .output(scoped)
+            .build()
+            .expect_err("scope name must be canonical");
+        assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+    }
+
+    #[test]
+    fn output_handle_from_another_builder_is_foreign() {
+        let mut first = CompositionBuilder::new(composition_id("one"));
+        let flow = first.source("source", &component::<(), Sources>("source"));
+        let mut second = CompositionBuilder::new(composition_id("two"));
+        let _own = second.source("source", &component::<(), Sources>("source"));
+        let error = second
+            .output(flow)
+            .build()
+            .expect_err("foreign output handle");
+        assert_eq!(error.kind(), &CompositionErrorKind::ForeignFlow);
+    }
+
+    fn project_syntax_composition() -> ProviderComposition {
+        let mut builder = CompositionBuilder::new(composition_id("core"));
+        let source = builder.source("project", &component::<(), Sources>("project"));
+        let syntax = builder.then(source, "syntax", &component::<Sources, Syntax>("syntax"));
+        builder.output(syntax).build().expect("complete graph")
+    }
+
+    #[test]
+    fn editor_rejects_missing_stage_incompatible_and_duplicate_inserts() {
+        let composition = project_syntax_composition();
+
+        let not_found = composition
+            .edit()
+            .replace("core.absent", &component::<Sources, Syntax>("other"))
+            .build()
+            .expect_err("unknown stage path");
+        assert!(matches!(
+            not_found.kind(),
+            CompositionErrorKind::StageNotFound(_)
+        ));
+        assert_eq!(
+            not_found.stage().map(StagePath::as_str),
+            Some("core.absent")
+        );
+
+        let mismatch = composition
+            .edit()
+            .insert_after(
+                "core.project",
+                "cleanup",
+                &component::<Syntax, Syntax>("cleanup"),
+            )
+            .build()
+            .expect_err("transform type must match stage output");
+        assert!(matches!(
+            mismatch.kind(),
+            CompositionErrorKind::TypeMismatch(_)
+        ));
+        assert_eq!(
+            mismatch.stage().map(StagePath::as_str),
+            Some("core.project")
+        );
+
+        let duplicate = composition
+            .edit()
+            .insert_after(
+                "core.syntax",
+                "project",
+                &component::<Syntax, Syntax>("shadow"),
+            )
+            .build()
+            .expect_err("inserted stage path already exists");
+        assert!(matches!(
+            duplicate.kind(),
+            CompositionErrorKind::DuplicateStage(_)
+        ));
+
+        let invalid = composition
+            .edit()
+            .insert_after(
+                "core.syntax",
+                "Bad-Name",
+                &component::<Syntax, Syntax>("bad"),
+            )
+            .build()
+            .expect_err("inserted stage name must be canonical");
+        assert_eq!(invalid.kind(), &CompositionErrorKind::InvalidName);
+    }
+
+    #[test]
+    fn editor_reports_first_failure_across_chained_edits() {
+        let composition = project_syntax_composition();
+        let error = composition
+            .edit()
+            .replace("core.syntax", &component::<Metadata, Syntax>("wrong-input"))
+            .remove("core.absent")
+            .build()
+            .expect_err("first failure must win");
+        assert!(matches!(
+            error.kind(),
+            CompositionErrorKind::TypeMismatch(_)
+        ));
+    }
 }
