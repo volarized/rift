@@ -1429,6 +1429,10 @@ dependencies = [
 name = "rift-core"
 version = "0.0.3"
 dependencies = [
+ "rift-protocol",
+ "serde",
+ "serde_json",
+ "strum",
  "unicode-normalization",
 ]
 
@@ -1440,6 +1444,7 @@ dependencies = [
  "rift-model",
  "rift-provider",
  "rift-syntax",
+ "serde",
  "tempfile",
 ]
 
@@ -1473,6 +1478,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "strum",
 ]
 
 [[package]]
@@ -1480,6 +1486,7 @@ name = "rift-provider"
 version = "0.0.3"
 dependencies = [
  "rift-core",
+ "serde",
 ]
 
 [[package]]
@@ -1504,6 +1511,7 @@ version = "0.0.3"
 dependencies = [
  "rift-core",
  "rift-provider",
+ "serde",
  "tree-sitter",
  "tree-sitter-rust",
 ]
