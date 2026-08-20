@@ -127,6 +127,22 @@ jobs:
           name: rift-cli
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # Feature resolution is per target: a dependency graph that compiles on
+  # Linux proves nothing about the Windows graph (v0.0.2 shipped a Windows
+  # build break CI never saw). Every OS in the release build matrix needs a
+  # compile gate here.
+  rust-windows:
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo check --workspace --all-targets --all-features
+
   installers:
     strategy:
       fail-fast: false
