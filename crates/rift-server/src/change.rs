@@ -360,6 +360,7 @@ impl ChangeService {
                 paths,
                 edits,
                 diagnostics,
+                guarantees: Vec::new(),
             },
         })
     }
@@ -538,6 +539,7 @@ impl ChangeService {
                 )],
                 edits: vec![edit],
                 diagnostics: reparse_diagnostics(reads, &plan.path, &next_source),
+                guarantees: Vec::new(),
             },
         })
     }
