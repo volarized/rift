@@ -707,6 +707,7 @@ mod tests {
             "the request does not match the documented form; \
              correct the reported field and resend the request"
         );
+        assert_eq!(error.descriptor().code(), "invalid_request");
         let _: &dyn std::error::Error = &error;
         assert_eq!(error, IdError);
     }
@@ -725,8 +726,105 @@ mod tests {
             "the request does not match the documented form; \
              correct the reported field and resend the request"
         );
+        assert_eq!(error.descriptor().code(), "invalid_request");
         let _: &dyn std::error::Error = &error;
         assert_eq!(error, RevisionError);
+    }
+
+    fn context_pairs(error: SourceUnitIdError) -> Vec<(&'static str, String)> {
+        error
+            .context()
+            .into_iter()
+            .map(|entry| (entry.key(), entry.value().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn source_unit_id_error_context_covers_every_kind() {
+        let too_long = SourceUnitId::parse(&format!(
+            "{SOURCE_UNIT_URI_PREFIX}{}",
+            "a".repeat(SOURCE_UNIT_ID_BYTES_MAX)
+        ))
+        .expect_err("oversized address must be rejected");
+        assert_eq!(
+            context_pairs(too_long),
+            vec![
+                ("identity", "source unit".to_string()),
+                ("violation", "longer than the byte bound".to_string()),
+            ]
+        );
+
+        let invalid_address = SourceUnitId::parse("not-a-rift-source-uri")
+            .expect_err("missing prefix must be rejected");
+        assert_eq!(
+            context_pairs(invalid_address),
+            vec![
+                ("identity", "source unit".to_string()),
+                (
+                    "violation",
+                    "not a canonical rift source address".to_string()
+                ),
+            ]
+        );
+
+        let invalid_resolver = SourceUnitId::parse("rift://source/Rift/src/lib.rs")
+            .expect_err("uppercase resolver must be rejected");
+        assert_eq!(
+            context_pairs(invalid_resolver),
+            vec![
+                ("identity", "source unit".to_string()),
+                ("identity", "source resolver".to_string()),
+                ("violation", "not canonical lowercase syntax".to_string()),
+            ]
+        );
+
+        let invalid_encoding = SourceUnitId::parse("rift://source/r/%G0")
+            .expect_err("malformed percent escape must be rejected");
+        assert_eq!(
+            context_pairs(invalid_encoding),
+            vec![
+                ("identity", "source unit".to_string()),
+                (
+                    "violation",
+                    "contains malformed percent encoding or invalid UTF-8".to_string()
+                ),
+            ]
+        );
+
+        let invalid_key = SourceUnitId::parse("rift://source/rift.sources.project/..")
+            .expect_err("dot-segment key must be rejected");
+        assert_eq!(
+            context_pairs(invalid_key),
+            vec![
+                ("identity", "source unit".to_string()),
+                ("path_kind", "source path".to_string()),
+                ("violation", "contains a dot segment".to_string()),
+            ]
+        );
+
+        let non_canonical = SourceUnitId::parse("rift://source/rift.sources.project/src%2flib.rs")
+            .expect_err("non-canonical encoding must be rejected");
+        assert_eq!(
+            context_pairs(non_canonical),
+            vec![
+                ("identity", "source unit".to_string()),
+                ("violation", "not encoded in canonical form".to_string()),
+            ]
+        );
+
+        assert_eq!(
+            too_long.to_string(),
+            "the request does not match the documented form: \
+             identity source unit, violation longer than the byte bound; \
+             correct the reported field and resend the request"
+        );
+        assert_eq!(
+            invalid_key.to_string(),
+            "the request does not match the documented form: \
+             identity source unit, path_kind source path, \
+             violation contains a dot segment; \
+             correct the reported field and resend the request"
+        );
     }
 
     #[test]
