@@ -8,7 +8,7 @@ use rift_core::constants::{
     WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{CompositionId, ProjectPath, ProviderId};
-use rift_provider::{Component, CompositionBuilder, CompositionError, ProviderComposition};
+use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxProvider};
 
 #[derive(Debug)]
@@ -404,48 +404,27 @@ fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceIndexError> {
 }
 
 fn composition() -> Result<ProviderComposition, WorkspaceIndexError> {
+    let source = component::<(), WorkspaceFiles>("workspace-source")?;
+    let syntax = component::<WorkspaceFiles, RustFacts>("rust-tree-sitter")?;
+    let index = component::<RustFacts, ReadIndex>("memory-index")?;
     let mut builder =
         CompositionBuilder::new(CompositionId::new("rust-read").map_err(composition_error)?);
-    let source = Component::<(), WorkspaceFiles>::new(
-        ProviderId::new("workspace-source").map_err(composition_error)?,
-    );
-    let syntax = Component::<WorkspaceFiles, RustFacts>::new(
-        ProviderId::new("rust-tree-sitter").map_err(composition_error)?,
-    );
-    let index = Component::<RustFacts, ReadIndex>::new(
-        ProviderId::new("memory-index").map_err(composition_error)?,
-    );
     let files = builder.source("project", &source);
     let facts = builder.then(files, "syntax", &syntax);
     let reads = builder.then(facts, "index", &index);
     builder.output(reads).build().map_err(composition_error)
 }
 
-fn composition_error(source: impl IntoCompositionSource) -> WorkspaceIndexError {
-    WorkspaceIndexError::caused_by(
-        WorkspaceIndexViolation::Composition,
-        None,
-        source.into_composition_source(),
-    )
+fn component<Input: 'static, Output: 'static>(
+    id: &str,
+) -> Result<Component<Input, Output>, WorkspaceIndexError> {
+    Ok(Component::new(ProviderId::new(id).map_err(composition_error)?))
 }
 
-trait IntoCompositionSource {
-    type Error: std::error::Error + Send + Sync + 'static;
-    fn into_composition_source(self) -> Self::Error;
-}
-
-impl IntoCompositionSource for rift_core::IdError {
-    type Error = rift_core::IdError;
-    fn into_composition_source(self) -> Self::Error {
-        self
-    }
-}
-
-impl IntoCompositionSource for CompositionError {
-    type Error = CompositionError;
-    fn into_composition_source(self) -> Self::Error {
-        self
-    }
+fn composition_error(
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> WorkspaceIndexError {
+    WorkspaceIndexError::caused_by(WorkspaceIndexViolation::Composition, None, source)
 }
 
 fn discover(
