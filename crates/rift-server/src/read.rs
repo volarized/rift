@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::Path;
 
 use data_encoding::BASE32_NOPAD;
@@ -8,7 +7,7 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{
     RUST_READ_PROVIDER_ID, SEARCH_RESULTS_DEFAULT, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS,
 };
-use rift_core::{ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, render_failure};
+use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_index::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits,
@@ -25,112 +24,89 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
 
-/// Stable read-service failure classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadErrorKind {
+/// One read-service failure: what was asked, and why it cannot be served.
+///
+/// An indexing failure keeps the classification of the
+/// [`WorkspaceIndexError`] it wraps, so a crossed parse bound surfaces as
+/// `limit_exceeded` rather than as an unclassified failure.
+#[derive(Debug)]
+pub enum ReadFault {
     /// Workspace could not be indexed.
-    Index,
-    /// Request uses functionality not served by v0.0.2.
-    Unsupported,
+    Index(WorkspaceIndexError),
+    /// Request uses functionality this release does not serve.
+    Unsupported {
+        /// The unserved capability the request named.
+        capability: &'static str,
+    },
     /// Request is invalid for direct workspace reads.
-    Invalid,
+    Invalid {
+        /// The rejected request field.
+        field: &'static str,
+        /// The rule the field's value broke.
+        violation: String,
+    },
     /// Requested source does not exist.
-    NotFound,
+    NotFound {
+        /// The path the request addressed.
+        path: String,
+    },
+}
+
+impl Fault for ReadFault {
+    fn name(&self) -> ErrorName {
+        match self {
+            Self::Index(source) => source.descriptor().name(),
+            Self::Unsupported { .. } => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
+            Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
+            Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
+        }
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        match self {
+            Self::Index(source) => source.context(),
+            Self::Unsupported { capability } => {
+                vec![ErrorContext::new("capability", *capability)]
+            }
+            Self::Invalid { field, violation } => vec![
+                ErrorContext::new("field", *field),
+                ErrorContext::new("violation", violation.clone()),
+            ],
+            Self::NotFound { path } => vec![ErrorContext::new("path", path.clone())],
+        }
+    }
+
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Index(source) => Some(source),
+            Self::Unsupported { .. } | Self::Invalid { .. } | Self::NotFound { .. } => None,
+        }
+    }
+}
+
+impl ReadFault {
+    fn unsupported(capability: &'static str) -> ReadError {
+        Error::new(Self::Unsupported { capability })
+    }
+
+    fn invalid(field: &'static str, violation: impl Into<String>) -> ReadError {
+        Error::new(Self::Invalid {
+            field,
+            violation: violation.into(),
+        })
+    }
+
+    fn not_found(path: impl Into<String>) -> ReadError {
+        Error::new(Self::NotFound { path: path.into() })
+    }
+
+    fn index(source: WorkspaceIndexError) -> ReadError {
+        Error::new(Self::Index(source))
+    }
 }
 
 /// Opaque read-service failure.
-#[derive(Debug)]
-pub struct ReadError {
-    kind: ReadErrorKind,
-    context: Vec<ErrorContext>,
-    source: Option<WorkspaceIndexError>,
-}
-
-impl ReadError {
-    fn new(kind: ReadErrorKind, context: Vec<ErrorContext>) -> Self {
-        Self {
-            kind,
-            context,
-            source: None,
-        }
-    }
-
-    fn unsupported(capability: &'static str) -> Self {
-        Self::new(
-            ReadErrorKind::Unsupported,
-            vec![ErrorContext::new("capability", capability)],
-        )
-    }
-
-    fn invalid(field: &'static str, violation: impl Into<String>) -> Self {
-        Self::new(
-            ReadErrorKind::Invalid,
-            vec![
-                ErrorContext::new("field", field),
-                ErrorContext::new("violation", violation),
-            ],
-        )
-    }
-
-    fn not_found(path: impl Into<String>) -> Self {
-        Self::new(
-            ReadErrorKind::NotFound,
-            vec![ErrorContext::new("path", path)],
-        )
-    }
-
-    fn index(source: WorkspaceIndexError) -> Self {
-        Self {
-            kind: ReadErrorKind::Index,
-            context: source.context(),
-            source: Some(source),
-        }
-    }
-
-    /// Returns stable failure classification.
-    #[must_use]
-    pub const fn kind(&self) -> ReadErrorKind {
-        self.kind
-    }
-
-    /// Returns canonical registry metadata.
-    ///
-    /// An indexing failure keeps the classification of the
-    /// [`WorkspaceIndexError`] it wraps, so a crossed parse bound surfaces as
-    /// `limit_exceeded` rather than as an unclassified failure.
-    #[must_use]
-    pub fn descriptor(&self) -> ErrorDescriptor {
-        match self.kind {
-            ReadErrorKind::Index => self.source.as_ref().map_or_else(
-                || ErrorName::Wire(ErrorCode::InternalError).descriptor(),
-                WorkspaceIndexError::descriptor,
-            ),
-            ReadErrorKind::Unsupported => {
-                ErrorName::Wire(ErrorCode::CapabilityUnavailable).descriptor()
-            }
-            ReadErrorKind::Invalid => ErrorName::Wire(ErrorCode::InvalidRequest).descriptor(),
-            ReadErrorKind::NotFound => ErrorName::Wire(ErrorCode::ResourceNotFound).descriptor(),
-        }
-    }
-
-    /// Returns ordered typed context.
-    #[must_use]
-    pub fn context(&self) -> &[ErrorContext] {
-        self.context.as_slice()
-    }
-}
-
-impl fmt::Display for ReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context))
-    }
-}
-
-impl std::error::Error for ReadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|source| source as _)
-    }
-}
+pub type ReadError = Error<ReadFault>;
 
 /// Immutable direct-filesystem Rust read service.
 #[derive(Debug)]
@@ -146,7 +122,7 @@ impl ReadService {
     ///
     /// Returns [`ReadError`] when root cannot be indexed within bounds.
     pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let index = WorkspaceIndex::build(root, limits).map_err(ReadError::index)?;
+        let index = WorkspaceIndex::build(root, limits).map_err(ReadFault::index)?;
         let digest = workspace_digest(&index);
         let snapshot = ReadSnapshot {
             tree_revision: Digest(digest.clone()),
@@ -168,19 +144,19 @@ impl ReadService {
     /// Returns [`ReadError`] for projections, invalid paths, or missing files.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
         if params.projection.is_some() {
-            return Err(ReadError::unsupported("projection reads"));
+            return Err(ReadFault::unsupported("projection reads"));
         }
         let path = CoreProjectPath::new(params.path.0).map_err(|error| {
-            ReadError::invalid("path", rift_core::fault_label(&error.fault().violation()))
+            ReadFault::invalid("path", rift_core::fault_label(&error.fault().violation()))
         })?;
         let file = self
             .index
             .file(&path)
-            .ok_or_else(|| ReadError::not_found(path.as_str()))?;
+            .ok_or_else(|| ReadFault::not_found(path.as_str()))?;
         let nodes = self
             .index
             .nodes(&path, params.position)
-            .ok_or_else(|| ReadError::not_found(path.as_str()))?
+            .ok_or_else(|| ReadFault::not_found(path.as_str()))?
             .into_iter()
             .map(|node| wire_node(file, node))
             .collect();
@@ -211,13 +187,13 @@ impl ReadService {
             params.scope,
         )?;
         if params.include_history {
-            return Err(ReadError::unsupported("symbol history"));
+            return Err(ReadFault::unsupported("symbol history"));
         }
         let limit = admitted_limit(params.limit)?;
         let hits = self
             .index
             .symbols(&params.name, limit)
-            .map_err(ReadError::index)?
+            .map_err(ReadFault::index)?
             .into_iter()
             .map(|matched| GetSymbolHit {
                 symbol: wire_symbol(matched),
@@ -247,9 +223,9 @@ impl ReadService {
         let query = params
             .query
             .as_deref()
-            .ok_or_else(|| ReadError::invalid("query", "missing"))?;
+            .ok_or_else(|| ReadFault::invalid("query", "missing"))?;
         if query.is_empty() {
-            return Err(ReadError::invalid("query", "empty"));
+            return Err(ReadFault::invalid("query", "empty"));
         }
         let limit = admitted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
         let mut results = Vec::new();
@@ -257,7 +233,7 @@ impl ReadService {
             params.target,
             SearchParamsTarget::All | SearchParamsTarget::Symbol
         ) {
-            for matched in self.index.symbols(query, limit).map_err(ReadError::index)? {
+            for matched in self.index.symbols(query, limit).map_err(ReadFault::index)? {
                 results.push(symbol_search_hit(matched));
             }
         }
@@ -270,7 +246,7 @@ impl ReadService {
             for (file, line, text) in self
                 .index
                 .source_matches(query, limit - results.len())
-                .map_err(ReadError::index)?
+                .map_err(ReadFault::index)?
             {
                 results.push(file_search_hit(file, line, text));
             }
@@ -289,18 +265,18 @@ impl ReadService {
 /// platform's addressable range.
 fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
     if requested == 0 {
-        return Err(ReadError::invalid("limit", "zero"));
+        return Err(ReadFault::invalid("limit", "zero"));
     }
     usize::try_from(requested)
-        .map_err(|_| ReadError::invalid("limit", format!("{requested} exceeds this platform")))
+        .map_err(|_| ReadFault::invalid("limit", format!("{requested} exceeds this platform")))
 }
 
 fn validate_common(cursor: bool, projection: bool, scope: SearchScope) -> Result<(), ReadError> {
     if cursor || projection {
-        return Err(ReadError::unsupported("cursor and projection reads"));
+        return Err(ReadFault::unsupported("cursor and projection reads"));
     }
     if scope == SearchScope::Dependencies {
-        return Err(ReadError::unsupported("dependency reads"));
+        return Err(ReadFault::unsupported("dependency reads"));
     }
     Ok(())
 }
@@ -312,10 +288,10 @@ fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
         params.scope,
     )?;
     if params.filter.is_some() || params.paths.is_some() || params.traversal.is_some() {
-        return Err(ReadError::unsupported("filtered and traversal search"));
+        return Err(ReadFault::unsupported("filtered and traversal search"));
     }
     if params.target == SearchParamsTarget::Node {
-        return Err(ReadError::unsupported("node search"));
+        return Err(ReadFault::unsupported("node search"));
     }
     Ok(())
 }
@@ -698,7 +674,7 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{ReadErrorKind, ReadService, WorkspaceIndexLimits, symbol_match_score};
+    use super::{ReadFault, ReadService, WorkspaceIndexLimits, symbol_match_score};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -856,20 +832,20 @@ pub fn compute() -> i32 {
             position: 0,
             projection: Some(projection),
         });
-        assert_eq!(
-            nodes.expect_err("projection must fail").kind(),
-            ReadErrorKind::Unsupported
-        );
+        assert!(matches!(
+            nodes.expect_err("projection must fail").fault(),
+            ReadFault::Unsupported { .. }
+        ));
 
         let mut symbol: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         symbol.include_history = true;
-        assert_eq!(
+        assert!(matches!(
             service
                 .get_symbol(&symbol)
                 .expect_err("history must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
         Ok(())
     }
 
@@ -880,23 +856,23 @@ pub fn compute() -> i32 {
             "query": "Beacon",
             "filter": {"kind": "field", "field": {"field": "name", "op": "eq", "value": "Beacon"}}
         }))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&search)
                 .expect_err("filter must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
 
         let missing = service.nodes(NodesParams {
             path: ProjectPath("src/missing.rs".to_owned()),
             position: 0,
             projection: None,
         });
-        assert_eq!(
-            missing.expect_err("missing source must fail").kind(),
-            ReadErrorKind::NotFound
-        );
+        assert!(matches!(
+            missing.expect_err("missing source must fail").fault(),
+            ReadFault::NotFound { .. }
+        ));
         Ok(())
     }
 
@@ -908,7 +884,7 @@ pub fn compute() -> i32 {
         )
         .expect_err("missing root must fail");
 
-        assert_eq!(error.kind(), ReadErrorKind::Index);
+        assert!(matches!(error.fault(), ReadFault::Index(_)));
         assert!(std::error::Error::source(&error).is_some());
     }
 
@@ -920,10 +896,10 @@ pub fn compute() -> i32 {
             position: 0,
             projection: None,
         });
-        assert_eq!(
-            result.expect_err("absolute path must fail").kind(),
-            ReadErrorKind::Invalid
-        );
+        assert!(matches!(
+            result.expect_err("absolute path must fail").fault(),
+            ReadFault::Invalid { .. }
+        ));
         Ok(())
     }
 
@@ -932,13 +908,13 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams =
             serde_json::from_value(json!({"name": "Beacon", "scope": "dependencies"}))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .get_symbol(&params)
                 .expect_err("dependency scope must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
         Ok(())
     }
 
@@ -947,23 +923,23 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let cursor: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "cursor": "page-two"}))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&cursor)
                 .expect_err("cursor reads must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
 
         let node_target: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "target": "node"}))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&node_target)
                 .expect_err("node target must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
         Ok(())
     }
 
@@ -971,20 +947,20 @@ pub fn compute() -> i32 {
     fn search_requires_query_and_rejects_zero_limit() -> TestResult {
         let (_directory, service) = fixture()?;
         let missing_query: SearchParams = serde_json::from_value(json!({}))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&missing_query)
                 .expect_err("missing query must fail")
-                .kind(),
-            ReadErrorKind::Invalid
-        );
+                .fault(),
+            ReadFault::Invalid { .. }
+        ));
 
         let zero_limit: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
         let error = service
             .search(&zero_limit)
             .expect_err("zero limit must fail");
-        assert_eq!(error.kind(), ReadErrorKind::Invalid);
+        assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
         assert_eq!(
             error.to_string(),
             "the request does not match the documented form: field limit, \
@@ -1001,13 +977,13 @@ pub fn compute() -> i32 {
             "target": "file",
             "limit": READ_RESULTS_MAX_DEFAULT as u64 + 1
         }))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&params)
                 .expect_err("oversized file-target limit must fail")
-                .kind(),
-            ReadErrorKind::Index
-        );
+                .fault(),
+            ReadFault::Index(_)
+        ));
         Ok(())
     }
 
