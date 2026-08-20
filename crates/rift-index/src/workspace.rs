@@ -42,24 +42,27 @@ impl WorkspaceIndexLimits {
         directory_depth_max: usize,
         results_max: usize,
     ) -> Result<Self, WorkspaceIndexError> {
-        if [
+        let limits = Self {
             files_max,
             file_bytes_max,
             workspace_bytes_max,
             directory_depth_max,
             results_max,
-        ]
-        .contains(&0)
-        {
-            return Err(WorkspaceIndexError::new(WorkspaceIndexViolation::ZeroLimit));
+        };
+        for bound in limits.bounds() {
+            positive_bound(bound)?;
         }
-        Ok(Self {
-            files_max,
-            file_bytes_max,
-            workspace_bytes_max,
-            directory_depth_max,
-            results_max,
-        })
+        Ok(limits)
+    }
+
+    const fn bounds(self) -> [usize; 5] {
+        [
+            self.files_max,
+            self.file_bytes_max,
+            self.workspace_bytes_max,
+            self.directory_depth_max,
+            self.results_max,
+        ]
     }
 
     /// Returns maximum result count accepted per query.
@@ -373,6 +376,13 @@ impl WorkspaceIndex {
         }
         Ok(())
     }
+}
+
+fn positive_bound(bound: usize) -> Result<(), WorkspaceIndexError> {
+    if bound == 0 {
+        return Err(WorkspaceIndexError::new(WorkspaceIndexViolation::ZeroLimit));
+    }
+    Ok(())
 }
 
 fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceIndexError> {
