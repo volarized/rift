@@ -638,9 +638,10 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
+    use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
     use rift_index::SymbolMatchRank;
     use rift_protocol::read::{
-        GetSymbolParams, NodesParams, ProjectPath, ProjectionId, SearchParams,
+        GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, SearchParams,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -659,6 +660,58 @@ mod tests {
         fs::write(directory.path().join("README.md"), "Beacon docs")?;
         let service = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
         Ok((directory, service))
+    }
+
+    /// Exercises every Rust declaration kind, a private and a restricted
+    /// visibility, and a comment plus an expression statement.
+    const RICH_SOURCE: &str = r#"pub enum Level { Low, High }
+
+pub trait Speaks {
+    fn say(&self);
+}
+
+pub type Alias = u32;
+
+pub const MAX: u32 = 10;
+
+pub static NAME: &str = "beacon";
+
+pub mod inner {
+    pub fn nested() {}
+}
+
+macro_rules! noop {
+    () => {};
+}
+
+struct Hidden;
+
+pub(crate) fn scoped() {}
+
+pub fn compute() -> i32 {
+    // lookout marker
+    let total = 1 + 2;
+    total;
+    0
+}
+"#;
+
+    fn rich_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), RICH_SOURCE)?;
+        let service = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        Ok((directory, service))
+    }
+
+    fn any_node_has_facet(result: &NodesResult, facet: &str) -> TestResult<bool> {
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        Ok(nodes.iter().any(|node| {
+            node["facets"]
+                .as_array()
+                .is_some_and(|facets| facets.contains(&json!(facet)))
+        }))
     }
 
     #[test]
@@ -805,5 +858,210 @@ mod tests {
 
         assert_eq!(error.kind(), ReadErrorKind::Index);
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn nodes_rejects_path_outside_project_root() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("/etc/passwd".to_owned()),
+            position: 0,
+            projection: None,
+        });
+        assert_eq!(
+            result.expect_err("absolute path must fail").kind(),
+            ReadErrorKind::Invalid
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_symbol_rejects_dependency_scope() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "scope": "dependencies"}))?;
+        assert_eq!(
+            service
+                .get_symbol(&params)
+                .expect_err("dependency scope must fail")
+                .kind(),
+            ReadErrorKind::Unsupported
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_rejects_cursor_and_node_target() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let cursor: SearchParams =
+            serde_json::from_value(json!({"query": "Beacon", "cursor": "page-two"}))?;
+        assert_eq!(
+            service
+                .search(&cursor)
+                .expect_err("cursor reads must fail")
+                .kind(),
+            ReadErrorKind::Unsupported
+        );
+
+        let node_target: SearchParams =
+            serde_json::from_value(json!({"query": "Beacon", "target": "node"}))?;
+        assert_eq!(
+            service
+                .search(&node_target)
+                .expect_err("node target must fail")
+                .kind(),
+            ReadErrorKind::Unsupported
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_requires_query_and_rejects_zero_limit() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let missing_query: SearchParams = serde_json::from_value(json!({}))?;
+        assert_eq!(
+            service
+                .search(&missing_query)
+                .expect_err("missing query must fail")
+                .kind(),
+            ReadErrorKind::Invalid
+        );
+
+        let zero_limit: SearchParams =
+            serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
+        assert_eq!(
+            service
+                .search(&zero_limit)
+                .expect_err("zero limit must fail")
+                .kind(),
+            ReadErrorKind::Index
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_target_file_propagates_oversized_result_limit() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "Beacon",
+            "target": "file",
+            "limit": READ_RESULTS_MAX_DEFAULT as u64 + 1
+        }))?;
+        assert_eq!(
+            service
+                .search(&params)
+                .expect_err("oversized file-target limit must fail")
+                .kind(),
+            ReadErrorKind::Index
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_target_symbol_excludes_file_hits() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "Beacon",
+            "target": "symbol",
+            "limit": 5
+        }))?;
+        let value = serde_json::to_value(service.search(&params)?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|hit| hit["hit"]["target"] == "symbol"));
+        Ok(())
+    }
+
+    #[test]
+    fn search_reports_multi_line_file_match_position() -> TestResult {
+        let (_directory, service) = rich_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "lookout marker",
+            "target": "file"
+        }))?;
+        let value = serde_json::to_value(service.search(&params)?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["line"].as_u64().is_some_and(|line| line > 1));
+        assert_eq!(results[0]["source"]["text"], "    // lookout marker");
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_facets_identify_expression_statement_and_comment() -> TestResult {
+        let (_directory, service) = rich_fixture()?;
+
+        let expression_position = RICH_SOURCE
+            .find("1 + 2")
+            .ok_or("fixture must contain expression")? as u64
+            + 2;
+        let expression = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: expression_position,
+            projection: None,
+        })?;
+        assert!(any_node_has_facet(&expression, "expression")?);
+
+        let statement_position = RICH_SOURCE
+            .find("total;")
+            .ok_or("fixture must contain statement")? as u64;
+        let statement = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: statement_position,
+            projection: None,
+        })?;
+        assert!(any_node_has_facet(&statement, "statement")?);
+
+        let comment_position = RICH_SOURCE
+            .find("lookout")
+            .ok_or("fixture must contain comment")? as u64;
+        let comment = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: comment_position,
+            projection: None,
+        })?;
+        assert!(any_node_has_facet(&comment, "comment")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn search_resolves_every_rust_symbol_kind_and_visibility() -> TestResult {
+        let (_directory, service) = rich_fixture()?;
+        let cases = [
+            ("Level", "rust.enum", None),
+            ("Speaks", "rust.trait", None),
+            ("Alias", "rust.type_alias", None),
+            ("MAX", "rust.constant", None),
+            ("NAME", "rust.static", None),
+            ("inner", "rust.module", None),
+            ("noop", "rust.macro", None),
+            ("Hidden", "rust.struct", Some("private")),
+            ("scoped", "rust.function", Some("pub(crate)")),
+        ];
+        for (name, kind, visibility) in cases {
+            let params: SearchParams = serde_json::from_value(json!({
+                "query": name,
+                "target": "symbol",
+                "limit": 1
+            }))?;
+            let value = serde_json::to_value(service.search(&params)?)?;
+            let hit = &value["results"][0]["hit"]["symbol"];
+            assert_eq!(hit["kind"], kind, "unexpected kind for {name}");
+            if let Some(expected_visibility) = visibility {
+                assert_eq!(
+                    hit["visibility"], expected_visibility,
+                    "unexpected visibility for {name}"
+                );
+                assert!(
+                    !hit["facets"]
+                        .as_array()
+                        .ok_or("facets must be array")?
+                        .contains(&json!("public")),
+                    "{name} must not carry public facet"
+                );
+            }
+        }
+        Ok(())
     }
 }

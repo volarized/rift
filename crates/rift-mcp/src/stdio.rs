@@ -56,7 +56,15 @@ pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
         .serve(transport::stdio())
         .await
         .map_err(|error| StdioServeError::Initialize(Box::new(error)))?;
-    match service.waiting().await.map_err(StdioServeError::Task)? {
+    let reason = service.waiting().await.map_err(StdioServeError::Task)?;
+    quit_reason_result(reason)
+}
+
+/// Maps a service quit reason to its outcome.
+///
+/// Split from [`serve_stdio`] so the mapping is testable without live stdio I/O.
+fn quit_reason_result(reason: QuitReason) -> Result<(), StdioServeError> {
+    match reason {
         QuitReason::Closed | QuitReason::Cancelled => Ok(()),
         QuitReason::JoinError(error) => Err(StdioServeError::Task(error)),
         _ => Err(StdioServeError::UnexpectedQuit),
@@ -68,9 +76,9 @@ mod tests {
     use std::error::Error as _;
 
     use rift_index::WorkspaceIndexLimits;
-    use rmcp::service::ServerInitializeError;
+    use rmcp::service::{QuitReason, ServerInitializeError};
 
-    use super::StdioServeError;
+    use super::{StdioServeError, quit_reason_result};
     use crate::RiftMcp;
 
     #[test]
@@ -103,6 +111,16 @@ mod tests {
         let task = tokio::spawn(async { panic!("test join failure") });
         let join = task.await.expect_err("test task must fail");
         let error = StdioServeError::Task(join);
+        assert_eq!(error.to_string(), "MCP service task failed");
+        assert!(error.source().is_some());
+    }
+
+    #[tokio::test]
+    async fn join_error_quit_reason_maps_to_task_error() {
+        let task = tokio::spawn(async { panic!("test join failure") });
+        let join = task.await.expect_err("test task must fail");
+        let error = quit_reason_result(QuitReason::JoinError(join))
+            .expect_err("join error quit reason must fail");
         assert_eq!(error.to_string(), "MCP service task failed");
         assert!(error.source().is_some());
     }

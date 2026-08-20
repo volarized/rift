@@ -16,9 +16,9 @@ rift-core.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
 rift-server.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client"] }
-serde_json.workspace = true
 tempfile.workspace = true
