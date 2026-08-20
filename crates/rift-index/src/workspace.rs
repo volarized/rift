@@ -7,9 +7,14 @@ use rift_core::constants::{
     WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
     WORKSPACE_IGNORED_DIRECTORIES,
 };
-use rift_core::{CompositionId, ProjectPath, ProviderId};
+use rift_core::{
+    CompositionId, ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, ProjectPath,
+    ProviderId, render_failure,
+};
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
-use rift_syntax::{RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxProvider};
+use rift_syntax::{
+    RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxError, RustSyntaxProvider,
+};
 
 #[derive(Debug)]
 struct WorkspaceFiles;
@@ -161,30 +166,83 @@ impl WorkspaceIndexError {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+
+    /// Returns canonical registry metadata for this failure.
+    ///
+    /// A syntax failure delegates to the underlying [`RustSyntaxError`]'s
+    /// descriptor when the source downcasts to one.
+    #[must_use]
+    pub fn descriptor(&self) -> ErrorDescriptor {
+        match self.violation {
+            WorkspaceIndexViolation::ZeroLimit
+            | WorkspaceIndexViolation::InvalidRoot
+            | WorkspaceIndexViolation::Composition => {
+                ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+            }
+            WorkspaceIndexViolation::TooDeep
+            | WorkspaceIndexViolation::TooManyFiles
+            | WorkspaceIndexViolation::FileTooLarge
+            | WorkspaceIndexViolation::WorkspaceTooLarge
+            | WorkspaceIndexViolation::ResultLimit => {
+                ErrorRegistry::descriptor(ErrorName::LimitExceeded)
+            }
+            WorkspaceIndexViolation::InvalidPath => {
+                ErrorRegistry::descriptor(ErrorName::UnsupportedPath)
+            }
+            WorkspaceIndexViolation::InvalidSource => {
+                ErrorRegistry::descriptor(ErrorName::ContentUnavailable)
+            }
+            WorkspaceIndexViolation::Filesystem => {
+                ErrorRegistry::descriptor(ErrorName::StorageFailure)
+            }
+            WorkspaceIndexViolation::Syntax => self
+                .source
+                .as_deref()
+                .and_then(|source| source.downcast_ref::<RustSyntaxError>())
+                .map_or_else(
+                    || ErrorRegistry::descriptor(ErrorName::InternalError),
+                    RustSyntaxError::descriptor,
+                ),
+        }
+    }
+
+    /// Returns ordered typed context: violation label, then path when present.
+    #[must_use]
+    pub fn context(&self) -> Vec<ErrorContext> {
+        let mut context = vec![ErrorContext::new(
+            "violation",
+            violation_label(self.violation),
+        )];
+        if let Some(path) = &self.path {
+            context.push(ErrorContext::new("path", path.display().to_string()));
+        }
+        context
+    }
+}
+
+const fn violation_label(violation: WorkspaceIndexViolation) -> &'static str {
+    match violation {
+        WorkspaceIndexViolation::ZeroLimit => "zero_limit",
+        WorkspaceIndexViolation::InvalidRoot => "invalid_root",
+        WorkspaceIndexViolation::TooDeep => "too_deep",
+        WorkspaceIndexViolation::TooManyFiles => "too_many_files",
+        WorkspaceIndexViolation::FileTooLarge => "file_too_large",
+        WorkspaceIndexViolation::WorkspaceTooLarge => "workspace_too_large",
+        WorkspaceIndexViolation::InvalidPath => "invalid_path",
+        WorkspaceIndexViolation::InvalidSource => "invalid_source",
+        WorkspaceIndexViolation::Filesystem => "filesystem",
+        WorkspaceIndexViolation::Syntax => "syntax",
+        WorkspaceIndexViolation::Composition => "composition",
+        WorkspaceIndexViolation::ResultLimit => "result_limit",
+    }
 }
 
 // Failure context is carried by the error itself: the offending path renders
-// below and the underlying cause (I/O, UTF-8, syntax) stays on Error::source.
+// as named context and the underlying cause (I/O, UTF-8, syntax) stays on
+// Error::source.
 impl fmt::Display for WorkspaceIndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self.violation {
-            WorkspaceIndexViolation::ZeroLimit => "workspace index limits must be positive",
-            WorkspaceIndexViolation::InvalidRoot => "workspace root must be a readable directory",
-            WorkspaceIndexViolation::TooDeep => "workspace directory exceeds depth limit",
-            WorkspaceIndexViolation::TooManyFiles => "workspace exceeds Rust file limit",
-            WorkspaceIndexViolation::FileTooLarge => "Rust source exceeds file byte limit",
-            WorkspaceIndexViolation::WorkspaceTooLarge => "workspace exceeds source byte limit",
-            WorkspaceIndexViolation::InvalidPath => "workspace contains invalid project path",
-            WorkspaceIndexViolation::InvalidSource => "Rust source must be UTF-8",
-            WorkspaceIndexViolation::Filesystem => "workspace filesystem operation failed",
-            WorkspaceIndexViolation::Syntax => "Rust syntax analysis failed",
-            WorkspaceIndexViolation::Composition => "provider composition is invalid",
-            WorkspaceIndexViolation::ResultLimit => "requested result limit is too large",
-        };
-        match &self.path {
-            Some(path) => write!(formatter, "{message}: {}", path.display()),
-            None => formatter.write_str(message),
-        }
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -756,51 +814,69 @@ mod tests {
         let cases = [
             (
                 WorkspaceIndexViolation::ZeroLimit,
-                "workspace index limits must be positive",
+                "the workspace configuration failed validation: violation zero_limit; \
+                 correct the reported configuration field, then retry",
             ),
             (
                 WorkspaceIndexViolation::InvalidRoot,
-                "workspace root must be a readable directory",
+                "the workspace configuration failed validation: violation invalid_root; \
+                 correct the reported configuration field, then retry",
             ),
             (
                 WorkspaceIndexViolation::TooDeep,
-                "workspace directory exceeds depth limit",
+                "the request exceeded a declared resource limit: violation too_deep; \
+                 resize the request below the named limit, or raise that limit \
+                 in the workspace configuration",
             ),
             (
                 WorkspaceIndexViolation::TooManyFiles,
-                "workspace exceeds Rust file limit",
+                "the request exceeded a declared resource limit: violation too_many_files; \
+                 resize the request below the named limit, or raise that limit \
+                 in the workspace configuration",
             ),
             (
                 WorkspaceIndexViolation::FileTooLarge,
-                "Rust source exceeds file byte limit",
+                "the request exceeded a declared resource limit: violation file_too_large; \
+                 resize the request below the named limit, or raise that limit \
+                 in the workspace configuration",
             ),
             (
                 WorkspaceIndexViolation::WorkspaceTooLarge,
-                "workspace exceeds source byte limit",
+                "the request exceeded a declared resource limit: violation workspace_too_large; \
+                 resize the request below the named limit, or raise that limit \
+                 in the workspace configuration",
             ),
             (
                 WorkspaceIndexViolation::InvalidPath,
-                "workspace contains invalid project path",
+                "the path cannot be addressed by this workspace: violation invalid_path; \
+                 use a workspace-relative path with `/` separators and no `.` or `..` components",
             ),
             (
                 WorkspaceIndexViolation::InvalidSource,
-                "Rust source must be UTF-8",
+                "the addressed content exists but its bytes cannot be served: \
+                 violation invalid_source; request the declaration without its body, \
+                 or read a source-backed unit",
             ),
             (
                 WorkspaceIndexViolation::Filesystem,
-                "workspace filesystem operation failed",
+                "workspace state could not be read or written: violation filesystem; \
+                 check filesystem permissions and free space, then retry",
             ),
             (
                 WorkspaceIndexViolation::Syntax,
-                "Rust syntax analysis failed",
+                "the server failed in a way it did not classify: violation syntax; \
+                 retry once, and report the full message if the failure repeats",
             ),
             (
                 WorkspaceIndexViolation::Composition,
-                "provider composition is invalid",
+                "the workspace configuration failed validation: violation composition; \
+                 correct the reported configuration field, then retry",
             ),
             (
                 WorkspaceIndexViolation::ResultLimit,
-                "requested result limit is too large",
+                "the request exceeded a declared resource limit: violation result_limit; \
+                 resize the request below the named limit, or raise that limit \
+                 in the workspace configuration",
             ),
         ];
         for (violation, message) in cases {
@@ -816,7 +892,10 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "Rust source exceeds file byte limit: src/big.rs"
+            "the request exceeded a declared resource limit: \
+             violation file_too_large, path src/big.rs; \
+             resize the request below the named limit, or raise that limit \
+             in the workspace configuration"
         );
     }
 

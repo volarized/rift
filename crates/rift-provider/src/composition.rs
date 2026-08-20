@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rift_core::constants::{STAGE_NAME_BYTES_MAX, STAGE_NAME_PUNCTUATION};
 use rift_core::{
-    CompositionId, ErrorDescriptor, ErrorName, ErrorRegistry, ProviderId, is_canonical_ascii_name,
+    CompositionId, ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, ProviderId,
+    is_canonical_ascii_name, render_failure,
 };
 
 // Process-local builder origin. Mutable allocation remains provider-owned.
@@ -292,11 +293,33 @@ impl CompositionError {
     pub const fn descriptor(&self) -> ErrorDescriptor {
         ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
     }
+
+    /// Returns ordered typed context: violated rule, then stage when present.
+    #[must_use]
+    pub fn context(&self) -> Vec<ErrorContext> {
+        let mut context = vec![ErrorContext::new("rule", kind_label(&self.kind))];
+        if let Some(stage) = self.stage() {
+            context.push(ErrorContext::new("stage", stage.to_string()));
+        }
+        context
+    }
+}
+
+fn kind_label(kind: &CompositionErrorKind) -> &'static str {
+    match kind {
+        CompositionErrorKind::InvalidName => "stage name is not canonical",
+        CompositionErrorKind::DuplicateStage(_) => "stage path already exists",
+        CompositionErrorKind::ForeignFlow => "flow handle belongs to another builder",
+        CompositionErrorKind::TypeMismatch(_) => "stage output type does not match consumer input",
+        CompositionErrorKind::StageNotFound(_) => "stage does not exist",
+        CompositionErrorKind::DanglingInput(_) => "removed stage still has a consumer",
+        CompositionErrorKind::MissingOutput => "composition selects no output",
+    }
 }
 
 impl fmt::Display for CompositionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.descriptor().explanation())
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -1032,11 +1055,22 @@ impl CacheError {
     pub const fn descriptor(self) -> ErrorDescriptor {
         ErrorRegistry::descriptor(ErrorName::LimitExceeded)
     }
+
+    /// Returns ordered typed context: violated bound.
+    #[must_use]
+    pub fn context(self) -> Vec<ErrorContext> {
+        vec![ErrorContext::new(
+            "violation",
+            match self.violation {
+                CacheViolation::TooManyKeys => "too_many_keys",
+            },
+        )]
+    }
 }
 
 impl fmt::Display for CacheError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.descriptor().explanation())
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -1357,7 +1391,12 @@ mod tests {
             )
             .expect_err("cache bound must reject before mutation");
         assert_eq!(error.violation(), CacheViolation::TooManyKeys);
-        assert_eq!(error.to_string(), error.descriptor().explanation());
+        assert_eq!(
+            error.to_string(),
+            "the request exceeded a declared resource limit: violation too_many_keys; \
+             resize the request below the named limit, or raise that limit \
+             in the workspace configuration"
+        );
         assert_eq!(cache.get(&2).map(String::as_str), Some("2"));
     }
 
@@ -1391,7 +1430,12 @@ mod tests {
             error.kind(),
             CompositionErrorKind::DanglingInput(_)
         ));
-        assert_eq!(error.to_string(), error.descriptor().explanation());
+        assert_eq!(
+            error.to_string(),
+            "the workspace configuration failed validation: \
+             rule removed stage still has a consumer, stage core-syntax.project; \
+             correct the reported configuration field, then retry"
+        );
 
         let edited = composition
             .edit()

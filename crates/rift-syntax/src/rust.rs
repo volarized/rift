@@ -2,9 +2,9 @@ use std::fmt;
 
 use rift_core::ProjectPath;
 use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
+use rift_core::{ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, render_failure};
 use tree_sitter::{
-    Node, Parser, Query as TreeSitterQuery, QueryCursor, QueryError, QueryErrorKind,
-    StreamingIterator,
+    Node, Parser, Query as TreeSitterQuery, QueryCursor, QueryError, StreamingIterator,
 };
 
 const SYNTAX_NODES_MAX_DEFAULT: usize = 250_000;
@@ -463,13 +463,6 @@ impl RustSyntaxBound {
             Self::Captures => "captures_max",
         }
     }
-
-    const fn configured_in(self) -> &'static str {
-        match self {
-            Self::SourceBytes | Self::SyntaxNodes | Self::SyntaxDepth => "RustSyntaxLimits::new",
-            Self::Captures => "RustQuery::captures",
-        }
-    }
 }
 
 /// Failure context behind one [`RustSyntaxError`].
@@ -575,112 +568,111 @@ impl RustSyntaxError {
             RustSyntaxErrorKind::UnknownNodeKind { .. } => RustSyntaxViolation::UnknownNodeKind,
         }
     }
-}
 
-const fn query_error_reason(kind: &QueryErrorKind) -> &'static str {
-    match kind {
-        QueryErrorKind::Syntax => "invalid syntax",
-        QueryErrorKind::NodeType => "invalid node type",
-        QueryErrorKind::Field => "invalid field name",
-        QueryErrorKind::Capture => "invalid capture name",
-        QueryErrorKind::Predicate => "invalid predicate",
-        QueryErrorKind::Structure => "impossible pattern",
-        QueryErrorKind::Language => "incompatible language",
+    /// Returns canonical registry metadata.
+    #[must_use]
+    pub const fn descriptor(&self) -> ErrorDescriptor {
+        match self.kind {
+            RustSyntaxErrorKind::ZeroLimit { .. } => {
+                ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+            }
+            RustSyntaxErrorKind::SourceTooLarge { .. }
+            | RustSyntaxErrorKind::TooManyNodes { .. }
+            | RustSyntaxErrorKind::TooDeep { .. }
+            | RustSyntaxErrorKind::TooManyCaptures { .. } => {
+                ErrorRegistry::descriptor(ErrorName::LimitExceeded)
+            }
+            RustSyntaxErrorKind::ParseCancelled { .. } => {
+                ErrorRegistry::descriptor(ErrorName::Cancelled)
+            }
+            RustSyntaxErrorKind::IncompatibleGrammar { .. }
+            | RustSyntaxErrorKind::PositionOverflow { .. }
+            | RustSyntaxErrorKind::InvalidQuery { .. }
+            | RustSyntaxErrorKind::UnknownNodeKind { .. } => {
+                ErrorRegistry::descriptor(ErrorName::InternalError)
+            }
+        }
     }
-}
 
-impl fmt::Display for RustSyntaxError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// Returns registry context this failure carries.
+    #[must_use]
+    pub fn context(&self) -> Vec<ErrorContext> {
         match &self.kind {
-            RustSyntaxErrorKind::ZeroLimit { bound } => write!(
-                formatter,
-                "Rust syntax limits must be positive but {} passed to {} is zero; pass a bound of at least 1",
-                bound.name(),
-                bound.configured_in(),
-            ),
+            RustSyntaxErrorKind::ZeroLimit { bound } => {
+                vec![ErrorContext::new("bound", bound.name())]
+            }
             RustSyntaxErrorKind::SourceTooLarge {
-                path: Some(path),
+                path,
                 source_bytes,
                 source_bytes_max,
-            } => write!(
-                formatter,
-                "Rust source {path} is {source_bytes} bytes but source_bytes_max configured in RustSyntaxLimits is {source_bytes_max} bytes; raise the limit or shrink the source",
-            ),
-            RustSyntaxErrorKind::SourceTooLarge {
-                path: None,
-                source_bytes,
-                source_bytes_max,
-            } => write!(
-                formatter,
-                "Rust source passed to RustQuery::captures is {source_bytes} bytes but RUST_SOURCE_BYTES_MAX_DEFAULT in rift-core constants is {source_bytes_max} bytes; shrink the source",
-            ),
+            } => vec![
+                ErrorContext::new(
+                    "path",
+                    path.as_ref()
+                        .map_or_else(|| "<raw text>".to_string(), ToString::to_string),
+                ),
+                ErrorContext::new("source_bytes", source_bytes.to_string()),
+                ErrorContext::new("source_bytes_max", source_bytes_max.to_string()),
+            ],
             RustSyntaxErrorKind::TooManyNodes {
                 path,
                 syntax_nodes_max,
-            } => write!(
-                formatter,
-                "Rust syntax tree for {path} exceeds syntax_nodes_max of {syntax_nodes_max} configured in RustSyntaxLimits; raise the limit or split the source",
-            ),
+            } => vec![
+                ErrorContext::new("path", path.to_string()),
+                ErrorContext::new("syntax_nodes_max", syntax_nodes_max.to_string()),
+            ],
             RustSyntaxErrorKind::TooDeep {
                 path,
                 syntax_depth_max,
-            } => write!(
-                formatter,
-                "Rust syntax tree for {path} exceeds syntax_depth_max of {syntax_depth_max} configured in RustSyntaxLimits; raise the limit or flatten nested syntax",
-            ),
+            } => vec![
+                ErrorContext::new("path", path.to_string()),
+                ErrorContext::new("syntax_depth_max", syntax_depth_max.to_string()),
+            ],
             RustSyntaxErrorKind::IncompatibleGrammar {
                 grammar_abi_version,
                 runtime_abi_min,
                 runtime_abi_max,
-            } => write!(
-                formatter,
-                "Rust grammar tree-sitter-rust reports ABI version {grammar_abi_version} but the tree-sitter runtime supports {runtime_abi_min} through {runtime_abi_max}; align tree-sitter and tree-sitter-rust versions in the workspace Cargo.toml",
-            ),
-            RustSyntaxErrorKind::ParseCancelled { path: Some(path) } => write!(
-                formatter,
-                "Rust parse of {path} produced no tree although rift-syntax sets no timeout or cancellation flag; report this as a rift-syntax bug",
-            ),
-            RustSyntaxErrorKind::ParseCancelled { path: None } => write!(
-                formatter,
-                "Rust parse of RustQuery::captures source produced no tree although rift-syntax sets no timeout or cancellation flag; report this as a rift-syntax bug",
-            ),
+            } => vec![
+                ErrorContext::new("grammar_abi_version", grammar_abi_version.to_string()),
+                ErrorContext::new("runtime_abi_min", runtime_abi_min.to_string()),
+                ErrorContext::new("runtime_abi_max", runtime_abi_max.to_string()),
+            ],
+            RustSyntaxErrorKind::ParseCancelled { path } => {
+                path.as_ref().map_or_else(Vec::new, |path| {
+                    vec![ErrorContext::new("path", path.to_string())]
+                })
+            }
             RustSyntaxErrorKind::PositionOverflow {
                 node_kind,
                 start_byte,
                 end_byte,
                 source: _,
-            } => write!(
-                formatter,
-                "Rust {node_kind} node at bytes {start_byte}..{end_byte} does not fit the u64 wire position; keep sources below u64::MAX bytes",
-            ),
+            } => vec![
+                ErrorContext::new("node_kind", *node_kind),
+                ErrorContext::new("start_byte", start_byte.to_string()),
+                ErrorContext::new("end_byte", end_byte.to_string()),
+            ],
             RustSyntaxErrorKind::InvalidQuery {
                 line_number,
                 line_text,
-                source,
-            } => write!(
-                formatter,
-                "Rust syntax query is invalid at line {line_number} `{line_text}`: {} {}; fix the query against the pinned tree-sitter-rust grammar",
-                query_error_reason(&source.kind),
-                source.message,
-            ),
-            RustSyntaxErrorKind::TooManyCaptures { captures_max } => write!(
-                formatter,
-                "Rust syntax query exceeds capture limit of {captures_max} passed to RustQuery::captures; raise captures_max or narrow the query",
-            ),
+                source: _,
+            } => vec![
+                ErrorContext::new("line_number", line_number.to_string()),
+                ErrorContext::new("line_text", line_text.clone()),
+            ],
+            RustSyntaxErrorKind::TooManyCaptures { captures_max } => {
+                vec![ErrorContext::new("captures_max", captures_max.to_string())]
+            }
             RustSyntaxErrorKind::UnknownNodeKind { kind } => {
-                write!(
-                    formatter,
-                    "Rust node kind \"{kind}\" is outside the vocabulary interpreted by rift-syntax; expected one of the pinned tree-sitter-rust grammar kinds: ",
-                )?;
-                for (index, known) in RustGrammarNodeKind::ALL.iter().enumerate() {
-                    if index > 0 {
-                        formatter.write_str(", ")?;
-                    }
-                    formatter.write_str(known.as_str())?;
-                }
-                Ok(())
+                vec![ErrorContext::new("node_kind", kind.clone())]
             }
         }
+    }
+}
+
+impl fmt::Display for RustSyntaxError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -1024,12 +1016,13 @@ mod tests {
             .parse::<RustGrammarNodeKind>()
             .expect_err("unknown kind");
         assert_eq!(error.violation(), RustSyntaxViolation::UnknownNodeKind);
+        assert_eq!(error.descriptor().name(), ErrorName::InternalError);
         assert!(error.source().is_none());
-        let message = error.to_string();
-        assert!(message.contains("flumph_item"), "names offender: {message}");
-        assert!(
-            message.contains("function_item") && message.contains("visibility_modifier"),
-            "lists interpreted vocabulary: {message}"
+        assert_eq!(
+            error.to_string(),
+            "the server failed in a way it did not classify: \
+             node_kind flumph_item; \
+             retry once, and report the full message if the failure repeats"
         );
     }
 
@@ -1050,11 +1043,14 @@ mod tests {
             (RustSyntaxLimits::new(1, 1, 0), "syntax_depth_max"),
         ];
         for (result, bound_name) in cases {
-            let message = result.expect_err("zero bound").to_string();
-            assert!(message.contains(bound_name), "names bound: {message}");
-            assert!(
-                message.contains("RustSyntaxLimits::new"),
-                "names configuration site: {message}"
+            let error = result.expect_err("zero bound");
+            assert_eq!(error.descriptor().name(), ErrorName::ConfigurationInvalid);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the workspace configuration failed validation: bound {bound_name}; \
+                     correct the reported configuration field, then retry"
+                )
             );
         }
         let query = RustQuery::new("(function_item) @rift.item").expect("valid Rust query");
@@ -1062,11 +1058,10 @@ mod tests {
             .captures("fn a() {}", 0)
             .expect_err("zero captures_max");
         assert_eq!(error.violation(), RustSyntaxViolation::ZeroLimit);
-        let message = error.to_string();
-        assert!(message.contains("captures_max"), "names bound: {message}");
-        assert!(
-            message.contains("RustQuery::captures"),
-            "names configuration site: {message}"
+        assert_eq!(
+            error.to_string(),
+            "the workspace configuration failed validation: bound captures_max; \
+             correct the reported configuration field, then retry"
         );
     }
 
@@ -1079,52 +1074,62 @@ mod tests {
                     text: "fn x() {}",
                 })
                 .expect_err("source bound");
-        let message = error.to_string();
-        assert!(message.contains("src/lib.rs"), "names source: {message}");
-        assert!(message.contains("9 bytes"), "reports size: {message}");
-        assert!(
-            message.contains("source_bytes_max") && message.contains("3 bytes"),
-            "names violated limit: {message}"
+        assert_eq!(error.descriptor().name(), ErrorName::LimitExceeded);
+        assert_eq!(
+            error.to_string(),
+            "the request exceeded a declared resource limit: \
+             path src/lib.rs, source_bytes 9, source_bytes_max 3; \
+             resize the request below the named limit, or raise that limit \
+             in the workspace configuration"
         );
 
         let query = RustQuery::new("(function_item) @rift.item").expect("valid Rust query");
         let oversized = "a".repeat(RUST_SOURCE_BYTES_MAX_DEFAULT + 1);
         let error = query.captures(&oversized, 1).expect_err("oversized source");
         assert_eq!(error.violation(), RustSyntaxViolation::SourceTooLarge);
-        let message = error.to_string();
-        assert!(
-            message.contains("RUST_SOURCE_BYTES_MAX_DEFAULT")
-                && message.contains("rift-core constants"),
-            "names limit definition: {message}"
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the request exceeded a declared resource limit: \
+                 path <raw text>, source_bytes {bytes}, source_bytes_max {max}; \
+                 resize the request below the named limit, or raise that limit \
+                 in the workspace configuration",
+                bytes = RUST_SOURCE_BYTES_MAX_DEFAULT + 1,
+                max = RUST_SOURCE_BYTES_MAX_DEFAULT,
+            )
         );
     }
 
     #[test]
     fn test_tree_bound_errors_report_path_and_configured_limit() {
-        let node_message =
+        let node_error =
             RustSyntaxProvider::new(RustSyntaxLimits::new(100, 1, 10).expect("positive limits"))
                 .analyze(RustSource {
                     path: &path(),
                     text: "fn x() {}",
                 })
-                .expect_err("node bound")
-                .to_string();
-        assert!(
-            node_message.contains("src/lib.rs") && node_message.contains("syntax_nodes_max of 1"),
-            "names path and limit: {node_message}"
+                .expect_err("node bound");
+        assert_eq!(
+            node_error.to_string(),
+            "the request exceeded a declared resource limit: \
+             path src/lib.rs, syntax_nodes_max 1; \
+             resize the request below the named limit, or raise that limit \
+             in the workspace configuration"
         );
 
-        let depth_message =
+        let depth_error =
             RustSyntaxProvider::new(RustSyntaxLimits::new(100, 20, 1).expect("positive limits"))
                 .analyze(RustSource {
                     path: &path(),
                     text: "fn x() { { 1 } }",
                 })
-                .expect_err("depth bound")
-                .to_string();
-        assert!(
-            depth_message.contains("src/lib.rs") && depth_message.contains("syntax_depth_max of 1"),
-            "names path and limit: {depth_message}"
+                .expect_err("depth bound");
+        assert_eq!(
+            depth_error.to_string(),
+            "the request exceeded a declared resource limit: \
+             path src/lib.rs, syntax_depth_max 1; \
+             resize the request below the named limit, or raise that limit \
+             in the workspace configuration"
         );
     }
 
@@ -1132,51 +1137,53 @@ mod tests {
     fn test_query_errors_report_line_reason_and_capture_limit() {
         let error = RustQuery::new("(missing_node) @rift.name").expect_err("invalid node kind");
         assert!(error.source().is_some(), "keeps tree-sitter source");
-        let message = error.to_string();
-        assert!(message.contains("line 1"), "names line: {message}");
-        assert!(
-            message.contains("(missing_node) @rift.name"),
-            "quotes offending line: {message}"
-        );
-        assert!(
-            message.contains("invalid node type") && message.contains("missing_node"),
-            "explains reason: {message}"
+        assert_eq!(error.descriptor().name(), ErrorName::InternalError);
+        assert_eq!(
+            error.to_string(),
+            "the server failed in a way it did not classify: \
+             line_number 1, line_text (missing_node) @rift.name; \
+             retry once, and report the full message if the failure repeats"
         );
 
         let query = RustQuery::new("(function_item name: (identifier) @rift.name)")
             .expect("valid Rust query");
-        let message = query
+        let error = query
             .captures("fn first() {} fn second() {}", 1)
-            .expect_err("capture overflow")
-            .to_string();
-        assert!(
-            message.contains("capture limit of 1") && message.contains("RustQuery::captures"),
-            "names limit and site: {message}"
+            .expect_err("capture overflow");
+        assert_eq!(error.descriptor().name(), ErrorName::LimitExceeded);
+        assert_eq!(
+            error.to_string(),
+            "the request exceeded a declared resource limit: \
+             captures_max 1; \
+             resize the request below the named limit, or raise that limit \
+             in the workspace configuration"
         );
     }
 
     #[test]
     fn test_invalid_query_reason_covers_every_tree_sitter_error_kind() {
+        use tree_sitter::QueryErrorKind;
+
         let cases = [
-            ("(((", "invalid syntax"),
+            ("(((", QueryErrorKind::Syntax),
             (
                 "(function_item flumph: (identifier) @x)",
-                "invalid field name",
+                QueryErrorKind::Field,
             ),
-            ("((function_item) @x (#eq? @y @y))", "invalid capture name"),
-            ("((function_item) @x (#eq?))", "invalid predicate"),
-            ("(identifier (identifier))", "impossible pattern"),
+            ("((function_item) @x (#eq? @y @y))", QueryErrorKind::Capture),
+            ("((function_item) @x (#eq?))", QueryErrorKind::Predicate),
+            ("(identifier (identifier))", QueryErrorKind::Structure),
         ];
-        for (query, reason) in cases {
+        for (query, kind) in cases {
             let error = RustQuery::new(query).expect_err("query must be rejected");
             assert_eq!(error.violation(), RustSyntaxViolation::InvalidQuery);
-            let message = error.to_string();
-            assert!(message.contains(reason), "explains {reason}: {message}");
+            match &error.kind {
+                RustSyntaxErrorKind::InvalidQuery { source, .. } => {
+                    assert_eq!(source.kind, kind, "classifies {query}");
+                }
+                other => panic!("expected InvalidQuery, got {other:?}"),
+            }
         }
-        assert_eq!(
-            query_error_reason(&QueryErrorKind::Language),
-            "incompatible language",
-        );
     }
 
     #[test]
@@ -1186,25 +1193,35 @@ mod tests {
             grammar.violation(),
             RustSyntaxViolation::IncompatibleGrammar
         );
-        let message = grammar.to_string();
-        assert!(
-            message.contains("ABI version") && message.contains("Cargo.toml"),
-            "reports ABI mismatch and remedy: {message}"
+        assert_eq!(grammar.descriptor().name(), ErrorName::InternalError);
+        assert_eq!(
+            grammar.to_string(),
+            format!(
+                "the server failed in a way it did not classify: \
+                 grammar_abi_version {abi}, runtime_abi_min {min}, runtime_abi_max {max}; \
+                 retry once, and report the full message if the failure repeats",
+                abi = rust_language().abi_version(),
+                min = tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,
+                max = tree_sitter::LANGUAGE_VERSION,
+            )
         );
 
         let cancelled =
             RustSyntaxError::new(RustSyntaxErrorKind::ParseCancelled { path: Some(path()) });
         assert_eq!(cancelled.violation(), RustSyntaxViolation::ParseCancelled);
+        assert_eq!(cancelled.descriptor().name(), ErrorName::Cancelled);
         assert!(cancelled.source().is_none());
-        assert!(
-            cancelled.to_string().contains("src/lib.rs"),
-            "names source path"
+        assert_eq!(
+            cancelled.to_string(),
+            "the request was cancelled before it completed: path src/lib.rs; \
+             resend the request if the result is still needed"
         );
         let cancelled_query =
             RustSyntaxError::new(RustSyntaxErrorKind::ParseCancelled { path: None });
-        assert!(
-            cancelled_query.to_string().contains("RustQuery::captures"),
-            "names query entry point"
+        assert_eq!(
+            cancelled_query.to_string(),
+            "the request was cancelled before it completed; \
+             resend the request if the result is still needed"
         );
 
         let mut parser = rust_parser().expect("pinned grammar loads");
@@ -1214,11 +1231,13 @@ mod tests {
             u32::try_from(u64::MAX).expect_err("u64::MAX exceeds u32"),
         );
         assert_eq!(overflow.violation(), RustSyntaxViolation::PositionOverflow);
+        assert_eq!(overflow.descriptor().name(), ErrorName::InternalError);
         assert!(overflow.source().is_some(), "keeps conversion source");
-        let message = overflow.to_string();
-        assert!(
-            message.contains("source_file") && message.contains("u64"),
-            "names node kind and wire width: {message}"
+        assert_eq!(
+            overflow.to_string(),
+            "the server failed in a way it did not classify: \
+             node_kind source_file, start_byte 0, end_byte 9; \
+             retry once, and report the full message if the failure repeats"
         );
     }
 }

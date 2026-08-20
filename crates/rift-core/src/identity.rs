@@ -8,15 +8,31 @@ use crate::constants::{
     SOURCE_RESOLVER_PUNCTUATION, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_SAFE_PUNCTUATION,
     SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX,
 };
-use crate::{ErrorDescriptor, ErrorName, ErrorRegistry, PathError, SourcePath};
+use crate::{
+    ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, PathError, SourcePath, render_failure,
+};
 
 /// Invalid stable identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdError;
 
+impl IdError {
+    /// Returns canonical registry metadata.
+    #[must_use]
+    pub const fn descriptor(self) -> ErrorDescriptor {
+        ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+    }
+
+    /// Returns ordered typed context.
+    #[must_use]
+    pub fn context(self) -> Vec<ErrorContext> {
+        Vec::new()
+    }
+}
+
 impl fmt::Display for IdError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("identity must be non-empty and contain no control characters")
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -95,13 +111,29 @@ impl SourceResolverIdError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+        ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+    }
+
+    /// Returns ordered typed context.
+    #[must_use]
+    pub fn context(self) -> Vec<ErrorContext> {
+        vec![
+            ErrorContext::new("identity", "source resolver"),
+            ErrorContext::new(
+                "violation",
+                match self.violation {
+                    SourceResolverIdViolation::Empty => "empty",
+                    SourceResolverIdViolation::TooLong => "longer than the byte bound",
+                    SourceResolverIdViolation::InvalidCharacter => "not canonical lowercase syntax",
+                },
+            ),
+        ]
     }
 }
 
 impl fmt::Display for SourceResolverIdError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.descriptor().explanation())
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -198,13 +230,45 @@ impl SourceUnitIdError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+        ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+    }
+
+    /// Returns ordered typed context.
+    #[must_use]
+    pub fn context(self) -> Vec<ErrorContext> {
+        let mut context = vec![ErrorContext::new("identity", "source unit")];
+        match self.kind {
+            SourceUnitIdErrorKind::TooLong => {
+                context.push(ErrorContext::new("violation", "longer than the byte bound"));
+            }
+            SourceUnitIdErrorKind::InvalidAddress => {
+                context.push(ErrorContext::new(
+                    "violation",
+                    "not a canonical rift source address",
+                ));
+            }
+            SourceUnitIdErrorKind::InvalidResolver(error) => context.extend(error.context()),
+            SourceUnitIdErrorKind::InvalidEncoding => {
+                context.push(ErrorContext::new(
+                    "violation",
+                    "contains malformed percent encoding or invalid UTF-8",
+                ));
+            }
+            SourceUnitIdErrorKind::InvalidKey(error) => context.extend(error.context()),
+            SourceUnitIdErrorKind::NonCanonical => {
+                context.push(ErrorContext::new(
+                    "violation",
+                    "not encoded in canonical form",
+                ));
+            }
+        }
+        context
     }
 }
 
 impl fmt::Display for SourceUnitIdError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.descriptor().explanation())
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -383,9 +447,23 @@ fn is_unit_key_safe(byte: u8) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RevisionError;
 
+impl RevisionError {
+    /// Returns canonical registry metadata.
+    #[must_use]
+    pub const fn descriptor(self) -> ErrorDescriptor {
+        ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+    }
+
+    /// Returns ordered typed context.
+    #[must_use]
+    pub fn context(self) -> Vec<ErrorContext> {
+        Vec::new()
+    }
+}
+
 impl fmt::Display for RevisionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("revision must be greater than zero")
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -505,7 +583,9 @@ mod tests {
         );
         assert_eq!(
             resolver_error.to_string(),
-            resolver_error.descriptor().explanation()
+            "the request does not match the documented form: \
+             identity source resolver, violation not canonical lowercase syntax; \
+             correct the reported field and resend the request"
         );
 
         let unit_error = SourceUnitId::parse("rift://source/Rift/src/lib.rs")
@@ -513,7 +593,10 @@ mod tests {
         assert!(unit_error.source().is_some());
         assert_eq!(
             unit_error.to_string(),
-            unit_error.descriptor().explanation()
+            "the request does not match the documented form: \
+             identity source unit, identity source resolver, \
+             violation not canonical lowercase syntax; \
+             correct the reported field and resend the request"
         );
     }
 
@@ -621,7 +704,8 @@ mod tests {
         let error = WorkspaceId::new("").expect_err("empty value must be rejected");
         assert_eq!(
             error.to_string(),
-            "identity must be non-empty and contain no control characters"
+            "the request does not match the documented form; \
+             correct the reported field and resend the request"
         );
         let _: &dyn std::error::Error = &error;
         assert_eq!(error, IdError);
@@ -636,7 +720,11 @@ mod tests {
     #[test]
     fn revision_error_displays_and_implements_std_error() {
         let error = TreeRevision::new(0).expect_err("zero revision must be rejected");
-        assert_eq!(error.to_string(), "revision must be greater than zero");
+        assert_eq!(
+            error.to_string(),
+            "the request does not match the documented form; \
+             correct the reported field and resend the request"
+        );
         let _: &dyn std::error::Error = &error;
         assert_eq!(error, RevisionError);
     }
