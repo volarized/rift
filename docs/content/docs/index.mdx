@@ -1,12 +1,14 @@
 ---
-title: Rift v0.0.1
-description: Install Rift and inspect its current command-line interface.
+title: Rift
+description: Install Rift, connect its MCP server, and read Rust workspaces.
 ---
 
-Rift v0.0.1 establishes the repository, validation gates, release pipeline, native binary, and
-verified installers. This page always describes the latest release.
+<VersionBadge version="v0.0.2" />
 
-<VersionBadge version="v0.0.1" />
+Rift is an agentic development toolkit for reading, discovering, and editing codebases.
+
+Rift gives [MCP](https://modelcontextprotocol.io/specification/2026-07-28) agents structured reads
+over Rust code in the current folder.
 
 ## Install
 
@@ -22,26 +24,63 @@ Windows PowerShell:
 irm https://volar.sh/rift/install.ps1 | iex
 ```
 
-Each installer selects the native x86-64 or Arm64 archive, verifies its SHA-256 checksum, and
-installs `rift` for the current user. Set `RIFT_VERSION=v0.0.1` before installation to select this
-release explicitly.
+The installer downloads the latest verified release for your platform and installs it for the
+current user. To install a specific version, set the `RIFT_VERSION` environment variable to its
+release tag.
 
-## CLI
+## MCP configuration
 
-Run:
+An MCP client launches `rift mcp` in the folder containing the codebase. Register it in the
+client's MCP configuration — for Claude Code, `.mcp.json` in the project root:
+
+```json
+{
+  "mcpServers": {
+    "rift": {
+      "command": "rift",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+## Rust index
+
+`rift mcp` reads `.rs` files from the current folder into one immutable in-memory snapshot.
+Tree-sitter extracts Rust declarations and syntax nodes, while the typed provider composition records
+the source-to-syntax-to-index pipeline.
+
+The scanner skips symlinks and the `.git`, `.rift`, and `target` directories. It writes no index or
+projection state to the codebase.
+
+The MCP server advertises these read tools:
+
+- `search` finds declarations and matching source lines.
+- `get_symbol` returns declarations with source excerpts when the name is known.
+
+## Update
 
 ```sh
-rift --help
+rift update
 ```
+
+The command downloads the latest checksummed native release into a temporary staging directory,
+validates its version, then replaces the current executable. Unix uses a same-folder atomic rename;
+Windows keeps a rollback binary until replacement starts.
+
+## CLI
 
 ```text
 agentic development toolkit
 
-Usage: rift
+Usage: rift [COMMAND]
+
+Commands:
+  mcp     Serve read-only Rust workspace context over stdio MCP
+  update  Replace current Rift binary with latest official release
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help
   -V, --version  Print version
 ```
-
-v0.0.1 exposes help and version metadata. Operational commands arrive in later releases.

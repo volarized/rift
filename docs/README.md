@@ -1,8 +1,8 @@
 # Documentation site
 
 This directory contains the Fumadocs site for Rift. Hand-written pages live under
-`content/docs`; reference components read the generated MCP and `rift.toml` JSON Schemas and
-Protobuf files from `../protocol`.
+`content/docs`; `protocol/mcp.json` carries the served MCP tool surface exported from the Rust
+workspace.
 
 Install the JavaScript dependencies and start the development server:
 
@@ -13,12 +13,11 @@ bun run dev
 
 The site is then available at <http://localhost:3000>.
 
-When a Pydantic model, configuration field, or protocol description changes, regenerate the schemas
-and Protobuf files from the repository root before building the site:
+When a protocol model or a tool doc comment changes, regenerate the exported surface from the
+repository root before building the site:
 
 ```sh
-cd protocol
-uv run python -m rift.generate
+just generate
 ```
 
 Use these checks for documentation changes:
