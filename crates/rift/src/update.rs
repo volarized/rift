@@ -6,6 +6,7 @@ use rift_core::constants::{
     RELEASE_BINARY_BYTES_MAX, RELEASE_DOCUMENT_BYTES_MAX, RELEASE_DOWNLOAD_BASE_URL,
     RELEASE_DOWNLOAD_TIMEOUT, RELEASE_METADATA_BYTES_MAX, SHA256_HEX_LENGTH,
 };
+use rift_core::{ErrorDescriptor, ErrorName, ErrorRegistry};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -129,26 +130,35 @@ impl fmt::Display for UpdateOutcome {
 /// Opaque updater failure.
 #[derive(Debug)]
 pub(super) struct UpdateError {
+    name: ErrorName,
     message: Cow<'static, str>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl UpdateError {
-    fn new(message: impl Into<Cow<'static, str>>) -> Self {
+    fn new(name: ErrorName, message: impl Into<Cow<'static, str>>) -> Self {
         Self {
+            name,
             message: message.into(),
             source: None,
         }
     }
 
     fn caused_by(
+        name: ErrorName,
         message: impl Into<Cow<'static, str>>,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         Self {
+            name,
             message: message.into(),
             source: Some(Box::new(source)),
         }
+    }
+
+    /// Returns canonical registry metadata for this failure.
+    pub(super) fn descriptor(&self) -> ErrorDescriptor {
+        ErrorRegistry::descriptor(self.name)
     }
 }
 
@@ -278,6 +288,7 @@ fn locate_error(error: io::Error) -> UpdateError {
         |argument| Cow::Owned(argument.to_string_lossy().into_owned()),
     );
     UpdateError::caused_by(
+        ErrorName::UpdateBinaryInvalid,
         format!(
             "current Rift executable (invoked as `{invoked_as}`) could not be located: {error}: reinstall Rift if the binary was moved or deleted"
         ),
@@ -287,6 +298,7 @@ fn locate_error(error: io::Error) -> UpdateError {
 
 fn version_error(raw: &str, installed_at: &Path, error: semver::Error) -> UpdateError {
     UpdateError::caused_by(
+        ErrorName::UpdateBinaryInvalid,
         format!(
             "installed Rift version `{raw}` at `{}` is invalid: {error}: reinstall Rift from an official release",
             installed_at.display()
@@ -302,6 +314,7 @@ fn staging_error(error: io::Error) -> UpdateError {
         |bytes| Cow::Owned(format!("{bytes} bytes free")),
     );
     UpdateError::caused_by(
+        ErrorName::UpdateStagingFailed,
         format!(
             "update staging directory could not be created under `{}` ({space}): {error}: ensure the directory is writable and has free space, then retry `rift update`",
             staging_root.display()
@@ -391,15 +404,23 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
 }
 
 fn parse_release_tag(tag: &str) -> Result<Version, UpdateError> {
-    let value = tag
-        .strip_prefix('v')
-        .ok_or_else(|| UpdateError::new(release_tag_invalid(tag)))?;
-    let version = Version::parse(value)
-        .map_err(|error| UpdateError::caused_by(release_tag_invalid(tag), error))?;
+    let value = tag.strip_prefix('v').ok_or_else(|| {
+        UpdateError::new(ErrorName::UpdateReleaseInvalid, release_tag_invalid(tag))
+    })?;
+    let version = Version::parse(value).map_err(|error| {
+        UpdateError::caused_by(
+            ErrorName::UpdateReleaseInvalid,
+            release_tag_invalid(tag),
+            error,
+        )
+    })?;
     if !version.pre.is_empty() || !version.build.is_empty() {
-        return Err(UpdateError::new(format!(
-            "release tag `{tag}` is a pre-release or build: only stable releases of the form `vMAJOR.MINOR.PATCH` are supported"
-        )));
+        return Err(UpdateError::new(
+            ErrorName::UpdateReleaseInvalid,
+            format!(
+                "release tag `{tag}` is a pre-release or build: only stable releases of the form `vMAJOR.MINOR.PATCH` are supported"
+            ),
+        ));
     }
     Ok(version)
 }
@@ -415,9 +436,10 @@ pub(super) fn error_for_test() -> UpdateError {
     parse_release_tag("vinvalid").expect_err("fixture tag must be invalid")
 }
 
-fn require_bounded_file(path: &Path, bytes_max: u64) -> Result<u64, UpdateError> {
+fn require_bounded_file(name: ErrorName, path: &Path, bytes_max: u64) -> Result<u64, UpdateError> {
     let metadata = fs::metadata(path).map_err(|error| {
         UpdateError::caused_by(
+            name,
             format!(
                 "downloaded release file at `{}` could not be inspected: {error}: retry `rift update`",
                 path.display()
@@ -426,23 +448,33 @@ fn require_bounded_file(path: &Path, bytes_max: u64) -> Result<u64, UpdateError>
         )
     })?;
     if !metadata.is_file() {
-        return Err(UpdateError::new(format!(
-            "Something went wrong with the release - the file at `{}` is not a regular file. Please retry `rift update` or create an issue at {ISSUE_TRACKER_URL}",
-            path.display()
-        )));
+        return Err(UpdateError::new(
+            name,
+            format!(
+                "downloaded release file at `{}` is not a regular file: retry `rift update` or create an issue at {ISSUE_TRACKER_URL}",
+                path.display()
+            ),
+        ));
     }
     let length = metadata.len();
     if length == 0 || length > bytes_max {
-        return Err(UpdateError::new(format!(
-            "Something went wrong with the release - the file at `{}` has incorrect size of {length} bytes, expected between 1 and {bytes_max} bytes. Please retry `rift update` or create an issue at {ISSUE_TRACKER_URL}",
-            path.display()
-        )));
+        return Err(UpdateError::new(
+            name,
+            format!(
+                "downloaded release file at `{}` has incorrect size of {length} bytes, expected between 1 and {bytes_max} bytes: retry `rift update` or create an issue at {ISSUE_TRACKER_URL}",
+                path.display()
+            ),
+        ));
     }
     Ok(length)
 }
 
 fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Result<(), UpdateError> {
-    require_bounded_file(manifest, CHECKSUM_MANIFEST_BYTES_MAX)?;
+    require_bounded_file(
+        ErrorName::UpdateReleaseInvalid,
+        manifest,
+        CHECKSUM_MANIFEST_BYTES_MAX,
+    )?;
     let content = fs::read_to_string(manifest).map_err(checksum_error)?;
     let mut expected = None;
     for (index, line) in content.lines().enumerate() {
@@ -463,15 +495,22 @@ fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Resul
     let expected = expected.ok_or_else(checksum_invalid)?;
     let actual = sha256(archive)?;
     if !actual.eq_ignore_ascii_case(expected) {
-        return Err(UpdateError::new(format!(
-            "Here be dragons 🐉! The checksum doesn't match (expected {expected}, actual {actual}) - please retry `rift update` and if that doesn't help raise an issue on {ISSUE_TRACKER_URL}"
-        )));
+        return Err(UpdateError::new(
+            ErrorName::UpdateChecksumMismatch,
+            format!(
+                "the downloaded release does not match its published checksum: expected {expected}, actual {actual}; retry `rift update`, and raise an issue at {ISSUE_TRACKER_URL} if the mismatch repeats"
+            ),
+        ));
     }
     Ok(())
 }
 
 fn sha256(path: &Path) -> Result<String, UpdateError> {
-    require_bounded_file(path, RELEASE_ARCHIVE_BYTES_MAX)?;
+    require_bounded_file(
+        ErrorName::UpdateArchiveInvalid,
+        path,
+        RELEASE_ARCHIVE_BYTES_MAX,
+    )?;
     let mut file = fs::File::open(path).map_err(checksum_error)?;
     let mut digest = Sha256::new();
     io::copy(&mut file, &mut digest).map_err(checksum_error)?;
@@ -480,12 +519,14 @@ fn sha256(path: &Path) -> Result<String, UpdateError> {
 
 fn checksum_invalid() -> UpdateError {
     UpdateError::new(
+        ErrorName::UpdateChecksumMismatch,
         "release checksum manifest is invalid: expected `sha256sum`-format lines naming the release archive exactly once; retry `rift update`",
     )
 }
 
 fn checksum_error(error: io::Error) -> UpdateError {
     UpdateError::caused_by(
+        ErrorName::UpdateChecksumMismatch,
         "release checksum could not be verified: retry `rift update`",
         error,
     )
@@ -493,6 +534,7 @@ fn checksum_error(error: io::Error) -> UpdateError {
 
 fn release_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
     UpdateError::caused_by(
+        ErrorName::UpdateReleaseInvalid,
         "latest release metadata is invalid: retry `rift update` or check https://github.com/volarized/rift/releases",
         error,
     )
@@ -500,15 +542,19 @@ fn release_error(error: impl std::error::Error + Send + Sync + 'static) -> Updat
 
 fn download_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
     UpdateError::caused_by(
+        ErrorName::UpdateDownloadFailed,
         "release download failed: check network access to github.com and retry `rift update`",
         error,
     )
 }
 
 fn download_too_large(bytes_max: u64) -> UpdateError {
-    UpdateError::new(format!(
-        "release download was empty or exceeded {bytes_max} bytes: retry `rift update`; if this persists the release assets may be malformed"
-    ))
+    UpdateError::new(
+        ErrorName::UpdateDownloadFailed,
+        format!(
+            "release download was empty or exceeded {bytes_max} bytes: retry `rift update`; if this persists the release assets may be malformed"
+        ),
+    )
 }
 
 /// Read limit admitting one sentinel byte past `bytes_max` to detect oversized payloads.
@@ -527,9 +573,12 @@ fn copy_bounded(
     )
     .map_err(archive_error)?;
     if copied == 0 || copied > bytes_max {
-        return Err(UpdateError::new(format!(
-            "release archive member is empty or exceeds {bytes_max} bytes: retry `rift update`; if this persists the release may be malformed"
-        )));
+        return Err(UpdateError::new(
+            ErrorName::UpdateArchiveInvalid,
+            format!(
+                "release archive member is empty or exceeds {bytes_max} bytes: retry `rift update`; if this persists the release may be malformed"
+            ),
+        ));
     }
     Ok(())
 }
@@ -628,7 +677,11 @@ fn extract_candidate(
 }
 
 fn validate_candidate(path: &Path) -> Result<(), UpdateError> {
-    require_bounded_file(path, RELEASE_BINARY_BYTES_MAX)?;
+    require_bounded_file(
+        ErrorName::UpdateArchiveInvalid,
+        path,
+        RELEASE_BINARY_BYTES_MAX,
+    )?;
     Ok(())
 }
 
@@ -642,12 +695,14 @@ const fn member_bytes_max(position: usize) -> u64 {
 
 fn archive_invalid() -> UpdateError {
     UpdateError::new(
+        ErrorName::UpdateArchiveInvalid,
         "release archive contents are invalid: expected exactly one binary, README.md, and LICENSE.md member; retry `rift update`",
     )
 }
 
 fn archive_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
     UpdateError::caused_by(
+        ErrorName::UpdateArchiveInvalid,
         "release archive could not be extracted: retry `rift update`; if this persists the download may be corrupted",
         error,
     )
@@ -673,6 +728,7 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanu
     )
     .map_err(|error| {
         UpdateError::caused_by(
+            ErrorName::UpdatePublishFailed,
             format!(
                 "Rift update could not be published: copying the downloaded binary into `{}` failed: ensure the directory is writable and has free space, then retry `rift update`",
                 parent.display()
@@ -704,10 +760,13 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanu
     let prepared = sibling(current, WINDOWS_UPDATE_PREPARED_NAME)?;
     let backup = sibling(current, WINDOWS_UPDATE_BACKUP_NAME)?;
     if backup.exists() {
-        return Err(UpdateError::new(format!(
-            "another Rift update is pending cleanup: retry after the previous Rift process exits, or delete `{}`",
-            backup.display()
-        )));
+        return Err(UpdateError::new(
+            ErrorName::UpdatePublishFailed,
+            format!(
+                "another Rift update is pending cleanup: retry after the previous Rift process exits, or delete `{}`",
+                backup.display()
+            ),
+        ));
     }
     if prepared.exists() {
         fs::remove_file(&prepared)
@@ -724,6 +783,7 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanu
         return match fs::rename(&backup, current) {
             Ok(()) => Err(publish_error("replacing", current, publish)),
             Err(rollback) => Err(UpdateError::caused_by(
+                ErrorName::UpdateRollbackFailed,
                 format!(
                     "Rift update publish and rollback of `{}` both failed: reinstall Rift from an official release",
                     current.display()
@@ -755,14 +815,18 @@ fn sibling(current: &Path, name: &str) -> Result<PathBuf, UpdateError> {
 }
 
 fn no_parent_error(current: &Path) -> UpdateError {
-    UpdateError::new(format!(
-        "current executable `{}` has no parent directory: install Rift in a regular directory before updating",
-        current.display()
-    ))
+    UpdateError::new(
+        ErrorName::UpdatePublishFailed,
+        format!(
+            "current executable `{}` has no parent directory: install Rift in a regular directory before updating",
+            current.display()
+        ),
+    )
 }
 
 fn publish_error(action: &str, path: &Path, error: io::Error) -> UpdateError {
     UpdateError::caused_by(
+        ErrorName::UpdatePublishFailed,
         format!(
             "Rift update could not be published: {action} `{}` failed: {error}: ensure the directory is writable and retry `rift update`",
             path.display()
@@ -805,6 +869,7 @@ pub(super) fn cleanup_replaced_binary() -> Result<(), UpdateError> {
     }
     fs::remove_file(&backup).map_err(|error| {
         UpdateError::caused_by(
+            ErrorName::UpdateRollbackFailed,
             format!(
                 "We were not able to clean up the old binary at `{}`: {error}: delete the file manually",
                 backup.display()
@@ -1210,20 +1275,62 @@ mod tests {
         let directory = tempfile::tempdir()?;
 
         let missing = directory.path().join("missing");
-        let error = super::require_bounded_file(&missing, 4).expect_err("missing must fail");
+        let error =
+            super::require_bounded_file(super::ErrorName::UpdateArchiveInvalid, &missing, 4)
+                .expect_err("missing must fail");
         assert!(error.to_string().contains("could not be inspected"));
         assert!(error.to_string().contains("missing"));
 
-        let error =
-            super::require_bounded_file(directory.path(), 4).expect_err("directory must fail");
+        let error = super::require_bounded_file(
+            super::ErrorName::UpdateArchiveInvalid,
+            directory.path(),
+            4,
+        )
+        .expect_err("directory must fail");
         assert!(error.to_string().contains("is not a regular file"));
         assert!(error.to_string().contains(super::ISSUE_TRACKER_URL));
 
         let oversized = directory.path().join("oversized");
         fs::write(&oversized, b"12345")?;
-        let error = super::require_bounded_file(&oversized, 4).expect_err("oversize must fail");
+        let error =
+            super::require_bounded_file(super::ErrorName::UpdateArchiveInvalid, &oversized, 4)
+                .expect_err("oversize must fail");
         assert!(error.to_string().contains("incorrect size of 5 bytes"));
         assert!(error.to_string().contains("between 1 and 4 bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn update_errors_carry_registry_codes() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let missing = directory.path().join("missing");
+
+        let release_tag = parse_release_tag("vinvalid").expect_err("tag must be invalid");
+        assert_eq!(release_tag.descriptor().code(), "update_release_invalid");
+
+        let archive =
+            super::require_bounded_file(super::ErrorName::UpdateArchiveInvalid, &missing, 4)
+                .expect_err("missing must fail");
+        assert_eq!(archive.descriptor().code(), "update_archive_invalid");
+
+        let staging = super::staging_error(std::io::Error::other("fixture"));
+        assert_eq!(staging.descriptor().code(), "update_staging_failed");
+
+        let download = super::download_error(std::io::Error::other("fixture"));
+        assert_eq!(download.descriptor().code(), "update_download_failed");
+
+        let checksum = super::checksum_error(std::io::Error::other("fixture"));
+        assert_eq!(checksum.descriptor().code(), "update_checksum_mismatch");
+
+        let publish = super::publish_error(
+            "replacing",
+            std::path::Path::new("/opt/rift/rift"),
+            std::io::Error::other("fixture"),
+        );
+        assert_eq!(publish.descriptor().code(), "update_publish_failed");
+
+        let locate = super::locate_error(std::io::Error::other("fixture"));
+        assert_eq!(locate.descriptor().code(), "update_binary_invalid");
         Ok(())
     }
 
@@ -1241,7 +1348,7 @@ mod tests {
             verify_checksum(&archive, &manifest, "rift.tar.gz").expect_err("mismatch must fail");
         let text = error.to_string();
         let actual = format!("{:x}", Sha256::digest(b"archive"));
-        assert!(text.starts_with("Here be dragons 🐉!"));
+        assert!(text.starts_with("the downloaded release does not match its published checksum"));
         assert!(text.contains(&expected));
         assert!(text.contains(&actual));
         assert!(text.contains(super::ISSUE_TRACKER_URL));
@@ -1393,7 +1500,11 @@ mod tests {
         let error = source
             .stage(staging.path(), version("0.0.3"))
             .expect_err("corrupted archive must fail");
-        assert!(error.to_string().starts_with("Here be dragons 🐉!"));
+        assert!(
+            error
+                .to_string()
+                .starts_with("the downloaded release does not match its published checksum")
+        );
         Ok(())
     }
 
