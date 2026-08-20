@@ -48,14 +48,16 @@ pub struct PathError {
 }
 
 impl PathError {
-    crate::property! {
-        /// Returns path vocabulary that rejected input.
-        pub const fn kind(self) -> PathKind = self.kind;
+    /// Returns path vocabulary that rejected input.
+    #[must_use]
+    pub const fn kind(self) -> PathKind {
+        self.kind
     }
 
-    crate::property! {
-        /// Returns violated path rule.
-        pub const fn violation(self) -> PathViolation = self.violation;
+    /// Returns violated path rule.
+    #[must_use]
+    pub const fn violation(self) -> PathViolation {
+        self.violation
     }
 
     /// Returns canonical registry metadata.

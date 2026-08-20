@@ -93,8 +93,13 @@ def main() -> int:
         for target in package["targets"]
         if "bin" in target["kind"]
     )
-    if binaries != ["rift:rift"]:
-        raise RuntimeError(f"expected only rift:rift binary target, got {binaries}")
+    # rift is the only released binary; rift-schema-export is the repo-internal
+    # generator that writes docs/protocol from the Rust protocol models.
+    if binaries != ["rift-protocol:rift-schema-export", "rift:rift"]:
+        raise RuntimeError(
+            "expected exactly rift:rift and rift-protocol:rift-schema-export "
+            f"binary targets, got {binaries}"
+        )
     return 0
 
 
