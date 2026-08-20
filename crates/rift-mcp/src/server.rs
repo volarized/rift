@@ -11,7 +11,9 @@ use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
 
-/// JSON-RPC error code every Rift operating failure travels under. The
+/// JSON-RPC error code every Rift operating failure travels under: the
+/// first code of the server-defined range (-32000 to -32099), which rmcp
+/// exports no constant for — its constants name only MCP-defined codes. The
 /// machine-readable classification is the [`wire::ErrorData`] in `data`.
 const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
 
