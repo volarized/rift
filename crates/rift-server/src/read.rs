@@ -1103,6 +1103,18 @@ pub fn compute() -> i32 {
     }
 
     #[test]
+    fn storage_fault_renders_path_operation_and_io_in_order() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sealed");
+        let error = ReadFault::storage("src/lib.rs", "stage", &io);
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        let context = error.context();
+        let keys: Vec<&str> = context.iter().map(rift_core::ErrorContext::key).collect();
+        assert_eq!(keys, ["path", "operation", "io"]);
+        assert_eq!(context[0].value(), "src/lib.rs");
+        assert_eq!(context[2].value(), "sealed");
+    }
+
+    #[test]
     fn search_resolves_every_rust_symbol_kind_and_visibility() -> TestResult {
         let (_directory, service) = rich_fixture()?;
         let cases = [
