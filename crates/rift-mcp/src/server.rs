@@ -136,8 +136,10 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
+    use rift_core::{CliCode, ErrorName};
     use rift_index::WorkspaceIndexLimits;
-    use rift_server::ReadFault;
+    use rift_protocol::error as wire;
+    use rift_server::{ReadFault, ReadService};
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
@@ -324,5 +326,30 @@ mod tests {
         let wire = data.data.ok_or("wire error data must be present")?;
         assert_eq!(wire["code"], json!("invalid_request"));
         Ok(())
+    }
+
+    #[test]
+    fn cli_identity_projects_to_internal_error_on_the_wire() {
+        assert_eq!(
+            super::wire_code(ErrorName::Cli(CliCode::ArtifactStale)),
+            wire::ErrorCode::InternalError
+        );
+    }
+
+    #[test]
+    fn wire_causes_walk_the_source_chain_with_inherited_classification() {
+        let error = ReadService::build(
+            std::path::Path::new("not-a-real-rift-workspace"),
+            WorkspaceIndexLimits::default(),
+        )
+        .expect_err("missing root must fail");
+        let causes = super::wire_causes(&error);
+        assert!(!causes.is_empty(), "sourced failure must yield causes");
+        assert!(causes.len() <= super::ERROR_CAUSES_MAX);
+        let code = super::wire_code(error.descriptor().name());
+        for cause in &causes {
+            assert!(!cause.message.is_empty(), "cause message must be rendered");
+            assert_eq!(cause.code, code);
+        }
     }
 }
