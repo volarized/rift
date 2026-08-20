@@ -1,6 +1,6 @@
-//! Search DTO generation smoke test.
+//! Search wire model smoke test.
 
-use rift_protocol::generated::read::{SearchParams, SearchResult};
+use rift_protocol::read::{SearchParams, SearchResult};
 use schemars::schema_for;
 
 #[test]

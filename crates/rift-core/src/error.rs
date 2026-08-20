@@ -39,29 +39,34 @@ pub struct ErrorDescriptor {
 }
 
 impl ErrorDescriptor {
-    crate::property! {
-        /// Returns stable symbolic identity.
-        pub const fn name(self) -> ErrorName = self.name;
+    /// Returns stable symbolic identity.
+    #[must_use]
+    pub const fn name(self) -> ErrorName {
+        self.name
     }
 
-    crate::property! {
-        /// Returns stable numeric code.
-        pub const fn code(self) -> u16 = self.code;
+    /// Returns stable numeric code.
+    #[must_use]
+    pub const fn code(self) -> u16 {
+        self.code
     }
 
-    crate::property! {
-        /// Returns canonical explanation.
-        pub const fn explanation(self) -> &'static str = self.explanation;
+    /// Returns canonical explanation.
+    #[must_use]
+    pub const fn explanation(self) -> &'static str {
+        self.explanation
     }
 
-    crate::property! {
-        /// Returns retry guidance.
-        pub const fn retry(self) -> RetryPolicy = self.retry;
+    /// Returns retry guidance.
+    #[must_use]
+    pub const fn retry(self) -> RetryPolicy {
+        self.retry
     }
 
-    crate::property! {
-        /// Returns canonical suggested action.
-        pub const fn action(self) -> &'static str = self.action;
+    /// Returns canonical suggested action.
+    #[must_use]
+    pub const fn action(self) -> &'static str {
+        self.action
     }
 }
 
@@ -152,14 +157,16 @@ impl ErrorContext {
         }
     }
 
-    crate::property! {
-        /// Returns stable context key.
-        pub const fn key(&self) -> &'static str = self.key;
+    /// Returns stable context key.
+    #[must_use]
+    pub const fn key(&self) -> &'static str {
+        self.key
     }
 
-    crate::property! {
-        /// Returns context value.
-        pub fn value(&self) -> &str = self.value.as_str();
+    /// Returns context value.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        self.value.as_str()
     }
 }
 
@@ -187,14 +194,16 @@ impl RiftError {
         self
     }
 
-    crate::property! {
-        /// Returns canonical descriptor.
-        pub const fn descriptor(&self) -> ErrorDescriptor = self.descriptor;
+    /// Returns canonical descriptor.
+    #[must_use]
+    pub const fn descriptor(&self) -> ErrorDescriptor {
+        self.descriptor
     }
 
-    crate::property! {
-        /// Returns ordered typed context.
-        pub fn context(&self) -> &[ErrorContext] = self.context.as_slice();
+    /// Returns ordered typed context.
+    #[must_use]
+    pub fn context(&self) -> &[ErrorContext] {
+        self.context.as_slice()
     }
 }
 
