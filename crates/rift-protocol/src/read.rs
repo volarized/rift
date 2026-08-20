@@ -452,7 +452,7 @@ pub enum FieldFilterOp {
 /// One file and the languages that read it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::symlink_carries_no_language_facts)]
+#[schemars(transform = schema::forbid_symlink_language_facts)]
 pub struct File {
     /// Project-relative source identity and the URI from which this record and its bytes
     /// are read.
@@ -1044,7 +1044,7 @@ pub enum RegionRole {
 /// A predicate over an exact advertised relationship kind or portable facet.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::relation_filter_names_kind_or_facet)]
+#[schemars(transform = schema::require_kind_or_facet)]
 pub struct RelationFilter {
     /// Exact relationship kinds a provider emits. Any listed kind matches.
     #[serde(default)]
@@ -1242,7 +1242,7 @@ pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] 
 /// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::search_hit_pairs_span_with_line)]
+#[schemars(transform = schema::pair_span_with_line)]
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file — whichever `target` allowed.
     pub hit: SearchHitTarget,
@@ -1342,8 +1342,8 @@ pub enum SearchIntent {
 /// narrows project-only searches.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::search_traversal_and_paths_stay_in_scope)]
-#[schemars(transform = schema::search_names_query_filter_or_traversal)]
+#[schemars(transform = schema::restrict_traversal_and_paths)]
+#[schemars(transform = schema::require_query_filter_or_traversal)]
 pub struct SearchParams {
     /// Which entity kinds may be returned — a kind selector, never the text to search for;
     /// that is `query`. Omitted, every kind may match. Type data is attached to the Symbol

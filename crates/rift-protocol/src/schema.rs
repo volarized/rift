@@ -215,7 +215,7 @@ fn nullable_without_type(object: &mut Map<String, Value>) {
 
 /// A symlink [`File`](crate::read::File) carries no language facts: languages
 /// and regions stay empty and `semantic` stays false.
-pub fn symlink_carries_no_language_facts(schema: &mut Schema) {
+pub fn forbid_symlink_language_facts(schema: &mut Schema) {
     use crate::read::File;
     append(
         schema,
@@ -239,7 +239,7 @@ pub fn symlink_carries_no_language_facts(schema: &mut Schema) {
 
 /// A [`RelationFilter`](crate::read::RelationFilter) names what it matches by:
 /// an exact `kind` in one language's vocabulary, or a portable `facet`.
-pub fn relation_filter_names_kind_or_facet(schema: &mut Schema) {
+pub fn require_kind_or_facet(schema: &mut Schema) {
     use crate::read::RelationFilter;
     append(
         schema,
@@ -261,7 +261,7 @@ pub fn relation_filter_names_kind_or_facet(schema: &mut Schema) {
 
 /// A [`SearchHit`] carries `span` and `line` together or not at all, and node
 /// and file hits always carry both.
-pub fn search_hit_pairs_span_with_line(schema: &mut Schema) {
+pub fn pair_span_with_line(schema: &mut Schema) {
     let span_and_line = [property!(SearchHit, span), property!(SearchHit, line)];
     append(
         schema,
@@ -292,7 +292,7 @@ pub fn search_hit_pairs_span_with_line(schema: &mut Schema) {
 
 /// [`SearchParams`] with a `traversal` keep `target` at `symbol` or `all`,
 /// and `paths` only narrow project-scoped searches.
-pub fn search_traversal_and_paths_stay_in_scope(schema: &mut Schema) {
+pub fn restrict_traversal_and_paths(schema: &mut Schema) {
     append(
         schema,
         Composition::All,
@@ -319,7 +319,7 @@ pub fn search_traversal_and_paths_stay_in_scope(schema: &mut Schema) {
 
 /// [`SearchParams`] ask for something: a text `query`, a provider `filter`,
 /// or a bounded relationship `traversal`.
-pub fn search_names_query_filter_or_traversal(schema: &mut Schema) {
+pub fn require_query_filter_or_traversal(schema: &mut Schema) {
     append(
         schema,
         Composition::Any,
