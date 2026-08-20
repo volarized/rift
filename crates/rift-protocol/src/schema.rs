@@ -22,6 +22,7 @@ mod keyword {
     pub(super) const NOT: &str = "not";
     pub(super) const IF: &str = "if";
     pub(super) const THEN: &str = "then";
+    pub(super) const ELSE: &str = "else";
     pub(super) const PROPERTIES: &str = "properties";
     pub(super) const REQUIRED: &str = "required";
     pub(super) const CONST: &str = "const";
@@ -131,6 +132,28 @@ fn when(condition: Value, outcome: Value) -> Value {
     Value::Object(clause)
 }
 
+/// A conditional clause with both arms: where `condition` holds `outcome`
+/// must hold, anywhere else `alternative` must.
+fn when_or_else(condition: Value, outcome: Value, alternative: Value) -> Value {
+    let mut clause = Map::new();
+    clause.insert(keyword::IF.to_owned(), condition);
+    clause.insert(keyword::THEN.to_owned(), outcome);
+    clause.insert(keyword::ELSE.to_owned(), alternative);
+    Value::Object(clause)
+}
+
+/// One clause carrying several keyword facets at once, shallow-merging
+/// single-keyword clauses such as [`properties`] with [`requires`].
+fn merged(clauses: Vec<Value>) -> Value {
+    let mut map = Map::new();
+    for clause in clauses {
+        if let Value::Object(facets) = clause {
+            map.extend(facets);
+        }
+    }
+    Value::Object(map)
+}
+
 /// A subclause pinning a property to the wire form of one model value.
 fn constant<T: Serialize>(value: &T) -> Value {
     json!({ keyword::CONST: wire(value) })
@@ -215,17 +238,20 @@ fn nullable_without_type(object: &mut Map<String, Value>) {
 /// An [`ErrorData`](crate::error::ErrorData) carries `limit` exactly when
 /// `code` is `limit_exceeded`, and forbids it otherwise.
 pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
+    use crate::error::{ErrorCode, ErrorData};
+    let code = property!(ErrorData, code);
+    let limit = property!(ErrorData, limit);
     append(
         schema,
         Composition::All,
-        json!({
-            "if": {
-                "properties": { "code": { "const": "limit_exceeded" } },
-                "required": ["code"]
-            },
-            "then": { "required": ["limit"] },
-            "else": { "not": { "required": ["limit"] } }
-        }),
+        when_or_else(
+            merged(vec![
+                properties(vec![(code, constant(&ErrorCode::LimitExceeded))]),
+                requires(&[code]),
+            ]),
+            requires(&[limit]),
+            not(requires(&[limit])),
+        ),
     );
 }
 
@@ -480,6 +506,25 @@ mod tests {
         assert_eq!(
             any_of(vec![requires(&["a"]), requires(&["b"])]),
             json!({ "anyOf": [{ "required": ["a"] }, { "required": ["b"] }] })
+        );
+        assert_eq!(
+            when_or_else(
+                requires(&["code"]),
+                requires(&["limit"]),
+                not(requires(&["limit"]))
+            ),
+            json!({
+                "if": { "required": ["code"] },
+                "then": { "required": ["limit"] },
+                "else": { "not": { "required": ["limit"] } }
+            })
+        );
+        assert_eq!(
+            merged(vec![
+                properties(vec![("code", constant(&"x"))]),
+                requires(&["code"])
+            ]),
+            json!({ "properties": { "code": { "const": "x" } }, "required": ["code"] })
         );
     }
 
