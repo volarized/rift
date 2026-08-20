@@ -107,6 +107,7 @@ jobs:
 
       # Keep every local just target visible as its own CI check step.
       - run: just format
+      - run: just generate-check
       - run: just check
       - run: just test
       - run: just clippy
