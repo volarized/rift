@@ -9,6 +9,6 @@ import { type DocVersion, DRAFT } from "@/lib/versions";
 
 export function protocolDirFor(version: DocVersion): string {
   return version === DRAFT
-    ? join(process.cwd(), "..", "protocol")
-    : join(process.cwd(), "..", "protocol", "versions", version);
+    ? join(process.cwd(), "protocol")
+    : join(process.cwd(), "protocol", "versions", version);
 }
