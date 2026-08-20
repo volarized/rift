@@ -8,7 +8,7 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{
     RUST_READ_PROVIDER_ID, SEARCH_RESULTS_DEFAULT, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS,
 };
-use rift_core::{ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, render_failure};
+use rift_core::{ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, render_failure};
 use rift_index::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits,
@@ -102,14 +102,14 @@ impl ReadError {
     pub fn descriptor(&self) -> ErrorDescriptor {
         match self.kind {
             ReadErrorKind::Index => self.source.as_ref().map_or_else(
-                || ErrorRegistry::descriptor(ErrorName::InternalError),
+                || ErrorName::Wire(ErrorCode::InternalError).descriptor(),
                 WorkspaceIndexError::descriptor,
             ),
             ReadErrorKind::Unsupported => {
-                ErrorRegistry::descriptor(ErrorName::CapabilityUnavailable)
+                ErrorName::Wire(ErrorCode::CapabilityUnavailable).descriptor()
             }
-            ReadErrorKind::Invalid => ErrorRegistry::descriptor(ErrorName::InvalidRequest),
-            ReadErrorKind::NotFound => ErrorRegistry::descriptor(ErrorName::ResourceNotFound),
+            ReadErrorKind::Invalid => ErrorName::Wire(ErrorCode::InvalidRequest).descriptor(),
+            ReadErrorKind::NotFound => ErrorName::Wire(ErrorCode::ResourceNotFound).descriptor(),
         }
     }
 
@@ -170,8 +170,9 @@ impl ReadService {
         if params.projection.is_some() {
             return Err(ReadError::unsupported("projection reads"));
         }
-        let path = CoreProjectPath::new(params.path.0)
-            .map_err(|error| ReadError::invalid("path", error.violation().label()))?;
+        let path = CoreProjectPath::new(params.path.0).map_err(|error| {
+            ReadError::invalid("path", rift_core::fault_label(&error.fault().violation()))
+        })?;
         let file = self
             .index
             .file(&path)
