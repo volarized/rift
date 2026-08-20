@@ -163,6 +163,8 @@ impl WorkspaceIndexError {
     }
 }
 
+// Failure context is carried by the error itself: the offending path renders
+// below and the underlying cause (I/O, UTF-8, syntax) stays on Error::source.
 impl fmt::Display for WorkspaceIndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self.violation {
@@ -179,7 +181,10 @@ impl fmt::Display for WorkspaceIndexError {
             WorkspaceIndexViolation::Composition => "provider composition is invalid",
             WorkspaceIndexViolation::ResultLimit => "requested result limit is too large",
         };
-        formatter.write_str(message)
+        match &self.path {
+            Some(path) => write!(formatter, "{message}: {}", path.display()),
+            None => formatter.write_str(message),
+        }
     }
 }
 
