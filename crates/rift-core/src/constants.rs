@@ -58,3 +58,27 @@ pub const RUST_READ_PROVIDER_ID: &str = "rift.rust.read";
 pub const SHA256_HEX_LENGTH: usize = 64;
 /// Base32 characters kept from one SHA-256 digest in a source-unit identity.
 pub const SOURCE_UNIT_DIGEST_CHARS: usize = 26;
+/// GitHub API endpoint naming the latest official Rift release.
+pub const RELEASE_API_URL: &str = "https://api.github.com/repos/volarized/rift/releases/latest";
+/// Base URL below which official Rift release assets are downloaded.
+pub const RELEASE_DOWNLOAD_BASE_URL: &str = "https://github.com/volarized/rift/releases/download";
+/// Maximum bytes in one release-metadata response.
+pub const RELEASE_METADATA_BYTES_MAX: u64 = 1_024 * 1_024;
+/// Maximum bytes in one release checksum manifest.
+pub const CHECKSUM_MANIFEST_BYTES_MAX: u64 = 16 * 1_024;
+/// Maximum bytes in one release archive download.
+pub const RELEASE_ARCHIVE_BYTES_MAX: u64 = 128 * 1_024 * 1_024;
+/// Maximum bytes in one released Rift binary.
+pub const RELEASE_BINARY_BYTES_MAX: u64 = 128 * 1_024 * 1_024;
+/// Maximum bytes in one release document member.
+pub const RELEASE_DOCUMENT_BYTES_MAX: u64 = 4 * 1_024 * 1_024;
+/// Exact file count inside one official release archive.
+pub const RELEASE_ARCHIVE_MEMBER_COUNT: usize = 3;
+/// Maximum entries in one release checksum manifest.
+pub const CHECKSUM_ENTRY_COUNT_MAX: usize = 16;
+/// Wall-clock limit for one release download request.
+pub const RELEASE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+/// Maximum redirect hops followed during one release download.
+pub const REDIRECT_HOPS_MAX: usize = 5;
+/// Sole URL scheme accepted for release downloads and redirects.
+pub const HTTPS_SCHEME: &str = "https";
