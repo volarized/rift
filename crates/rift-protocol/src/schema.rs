@@ -526,6 +526,19 @@ mod tests {
         values
     }
 
+    /// The generator has emitted tags both as a `const` and as a one-value
+    /// `enum` across schemars versions; the collector must read both forms.
+    #[test]
+    fn tag_values_read_const_and_enum_representations() {
+        let schema = json!({
+            "oneOf": [
+                { "properties": { "kind": { "const": "text" } } },
+                { "properties": { "kind": { "enum": ["symlink"] } } },
+            ]
+        });
+        assert_eq!(tag_values(&schema, "kind"), vec!["text", "symlink"]);
+    }
+
     /// The tag constants cannot be proven by `property!`; this pins them to
     /// the generated union schemas instead.
     #[test]
