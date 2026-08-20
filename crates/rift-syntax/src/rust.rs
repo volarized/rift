@@ -1,7 +1,10 @@
 use std::fmt;
 
 use rift_core::ProjectPath;
-use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
+use tree_sitter::{
+    Node, Parser, Query as TreeSitterQuery, QueryCursor, QueryError, QueryErrorKind,
+    StreamingIterator,
+};
 
 const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1024 * 1024;
 const SYNTAX_NODES_MAX_DEFAULT: usize = 250_000;
@@ -18,12 +21,10 @@ pub struct ByteRange {
 
 impl ByteRange {
     fn from_node(node: Node<'_>) -> Result<Self, RustSyntaxError> {
-        let start = u64::try_from(node.start_byte()).map_err(|source| {
-            RustSyntaxError::with_source(RustSyntaxViolation::PositionOverflow, source)
-        })?;
-        let end = u64::try_from(node.end_byte()).map_err(|source| {
-            RustSyntaxError::with_source(RustSyntaxViolation::PositionOverflow, source)
-        })?;
+        let start = u64::try_from(node.start_byte())
+            .map_err(|source| RustSyntaxError::position_overflow(node, source))?;
+        let end = u64::try_from(node.end_byte())
+            .map_err(|source| RustSyntaxError::position_overflow(node, source))?;
         Ok(Self { start, end })
     }
 
@@ -57,14 +58,23 @@ impl RustSyntaxLimits {
     ///
     /// # Errors
     ///
-    /// Returns [`RustSyntaxError`] when any bound is zero.
+    /// Returns [`RustSyntaxError`] naming the first zero bound.
     pub fn new(
         source_bytes_max: usize,
         syntax_nodes_max: usize,
         syntax_depth_max: usize,
     ) -> Result<Self, RustSyntaxError> {
-        if source_bytes_max == 0 || syntax_nodes_max == 0 || syntax_depth_max == 0 {
-            return Err(RustSyntaxError::new(RustSyntaxViolation::ZeroLimit));
+        let bounds = [
+            (source_bytes_max, RustSyntaxBound::SourceBytes),
+            (syntax_nodes_max, RustSyntaxBound::SyntaxNodes),
+            (syntax_depth_max, RustSyntaxBound::SyntaxDepth),
+        ];
+        for (value, bound) in bounds {
+            if value == 0 {
+                return Err(RustSyntaxError::new(RustSyntaxErrorKind::ZeroLimit {
+                    bound,
+                }));
+            }
         }
         Ok(Self {
             source_bytes_max,
@@ -155,9 +165,8 @@ impl RustQuery {
     /// Returns [`RustSyntaxError`] when query cannot compile.
     pub fn new(source: &str) -> Result<Self, RustSyntaxError> {
         let language = rust_language();
-        let inner = TreeSitterQuery::new(&language, source).map_err(|error| {
-            RustSyntaxError::with_source(RustSyntaxViolation::InvalidQuery, error)
-        })?;
+        let inner = TreeSitterQuery::new(&language, source)
+            .map_err(|error| RustSyntaxError::invalid_query(source, error))?;
         Ok(Self { inner })
     }
 
@@ -185,25 +194,29 @@ impl RustQuery {
         captures_max: usize,
     ) -> Result<Vec<RustQueryCapture>, RustSyntaxError> {
         if captures_max == 0 {
-            return Err(RustSyntaxError::new(RustSyntaxViolation::ZeroLimit));
+            return Err(RustSyntaxError::new(RustSyntaxErrorKind::ZeroLimit {
+                bound: RustSyntaxBound::Captures,
+            }));
         }
         if source.len() > SOURCE_BYTES_MAX_DEFAULT {
-            return Err(RustSyntaxError::new(RustSyntaxViolation::SourceTooLarge));
+            return Err(RustSyntaxError::new(RustSyntaxErrorKind::SourceTooLarge {
+                path: None,
+                source_bytes: source.len(),
+                source_bytes_max: SOURCE_BYTES_MAX_DEFAULT,
+            }));
         }
-        let language = rust_language();
-        let mut parser = Parser::new();
-        parser.set_language(&language).map_err(|error| {
-            RustSyntaxError::with_source(RustSyntaxViolation::IncompatibleGrammar, error)
+        let mut parser = rust_parser()?;
+        let tree = parser.parse(source, None).ok_or_else(|| {
+            RustSyntaxError::new(RustSyntaxErrorKind::ParseCancelled { path: None })
         })?;
-        let tree = parser
-            .parse(source, None)
-            .ok_or_else(|| RustSyntaxError::new(RustSyntaxViolation::ParseCancelled))?;
         let mut cursor = QueryCursor::new();
         let mut query_captures = cursor.captures(&self.inner, tree.root_node(), source.as_bytes());
         let mut captures = Vec::new();
         while let Some((query_match, capture_index)) = query_captures.next() {
             if captures.len() >= captures_max {
-                return Err(RustSyntaxError::new(RustSyntaxViolation::TooManyCaptures));
+                return Err(RustSyntaxError::new(RustSyntaxErrorKind::TooManyCaptures {
+                    captures_max,
+                }));
             }
             let capture = query_match.captures[*capture_index];
             captures.push(RustQueryCapture {
@@ -295,60 +308,235 @@ pub enum RustSyntaxViolation {
     TooManyCaptures,
 }
 
-/// Opaque Rust syntax failure.
-#[derive(Debug)]
-pub struct RustSyntaxError {
-    violation: RustSyntaxViolation,
-    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+/// Configurable Rust syntax bound named in diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustSyntaxBound {
+    SourceBytes,
+    SyntaxNodes,
+    SyntaxDepth,
+    Captures,
 }
 
-impl RustSyntaxError {
-    fn new(violation: RustSyntaxViolation) -> Self {
-        Self {
-            violation,
-            source: None,
+impl RustSyntaxBound {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::SourceBytes => "source_bytes_max",
+            Self::SyntaxNodes => "syntax_nodes_max",
+            Self::SyntaxDepth => "syntax_depth_max",
+            Self::Captures => "captures_max",
         }
     }
 
-    fn with_source(
-        violation: RustSyntaxViolation,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            violation,
-            source: Some(Box::new(source)),
+    const fn configured_in(self) -> &'static str {
+        match self {
+            Self::SourceBytes | Self::SyntaxNodes | Self::SyntaxDepth => "RustSyntaxLimits::new",
+            Self::Captures => "RustQuery::captures",
         }
+    }
+}
+
+/// Failure context behind one [`RustSyntaxError`].
+///
+/// `path` is `None` when the failing source reached [`RustQuery::captures`],
+/// which admits raw text without a project path.
+#[derive(Debug)]
+enum RustSyntaxErrorKind {
+    ZeroLimit {
+        bound: RustSyntaxBound,
+    },
+    SourceTooLarge {
+        path: Option<ProjectPath>,
+        source_bytes: usize,
+        source_bytes_max: usize,
+    },
+    TooManyNodes {
+        path: ProjectPath,
+        syntax_nodes_max: usize,
+    },
+    TooDeep {
+        path: ProjectPath,
+        syntax_depth_max: usize,
+    },
+    IncompatibleGrammar {
+        grammar_abi_version: usize,
+        runtime_abi_min: usize,
+        runtime_abi_max: usize,
+    },
+    ParseCancelled {
+        path: Option<ProjectPath>,
+    },
+    PositionOverflow {
+        node_kind: &'static str,
+        start_byte: usize,
+        end_byte: usize,
+        source: std::num::TryFromIntError,
+    },
+    InvalidQuery {
+        line_number: usize,
+        line_text: String,
+        source: QueryError,
+    },
+    TooManyCaptures {
+        captures_max: usize,
+    },
+}
+
+/// Opaque Rust syntax failure.
+#[derive(Debug)]
+pub struct RustSyntaxError {
+    kind: RustSyntaxErrorKind,
+}
+
+impl RustSyntaxError {
+    const fn new(kind: RustSyntaxErrorKind) -> Self {
+        Self { kind }
+    }
+
+    fn incompatible_grammar(language: &tree_sitter::Language) -> Self {
+        Self::new(RustSyntaxErrorKind::IncompatibleGrammar {
+            grammar_abi_version: language.abi_version(),
+            runtime_abi_min: tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,
+            runtime_abi_max: tree_sitter::LANGUAGE_VERSION,
+        })
+    }
+
+    fn position_overflow(node: Node<'_>, source: std::num::TryFromIntError) -> Self {
+        Self::new(RustSyntaxErrorKind::PositionOverflow {
+            node_kind: node.kind(),
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            source,
+        })
+    }
+
+    fn invalid_query(query_source: &str, source: QueryError) -> Self {
+        Self::new(RustSyntaxErrorKind::InvalidQuery {
+            line_number: source.row + 1,
+            line_text: query_source.lines().nth(source.row).unwrap_or("").into(),
+            source,
+        })
     }
 
     /// Returns stable failure classification.
     #[must_use]
     pub const fn violation(&self) -> RustSyntaxViolation {
-        self.violation
+        match self.kind {
+            RustSyntaxErrorKind::ZeroLimit { .. } => RustSyntaxViolation::ZeroLimit,
+            RustSyntaxErrorKind::SourceTooLarge { .. } => RustSyntaxViolation::SourceTooLarge,
+            RustSyntaxErrorKind::TooManyNodes { .. } => RustSyntaxViolation::TooManyNodes,
+            RustSyntaxErrorKind::TooDeep { .. } => RustSyntaxViolation::TooDeep,
+            RustSyntaxErrorKind::IncompatibleGrammar { .. } => {
+                RustSyntaxViolation::IncompatibleGrammar
+            }
+            RustSyntaxErrorKind::ParseCancelled { .. } => RustSyntaxViolation::ParseCancelled,
+            RustSyntaxErrorKind::PositionOverflow { .. } => RustSyntaxViolation::PositionOverflow,
+            RustSyntaxErrorKind::InvalidQuery { .. } => RustSyntaxViolation::InvalidQuery,
+            RustSyntaxErrorKind::TooManyCaptures { .. } => RustSyntaxViolation::TooManyCaptures,
+        }
+    }
+}
+
+const fn query_error_reason(kind: &QueryErrorKind) -> &'static str {
+    match kind {
+        QueryErrorKind::Syntax => "invalid syntax",
+        QueryErrorKind::NodeType => "invalid node type",
+        QueryErrorKind::Field => "invalid field name",
+        QueryErrorKind::Capture => "invalid capture name",
+        QueryErrorKind::Predicate => "invalid predicate",
+        QueryErrorKind::Structure => "impossible pattern",
+        QueryErrorKind::Language => "incompatible language",
     }
 }
 
 impl fmt::Display for RustSyntaxError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self.violation {
-            RustSyntaxViolation::ZeroLimit => "Rust syntax limits must be positive",
-            RustSyntaxViolation::SourceTooLarge => "Rust source exceeds syntax byte limit",
-            RustSyntaxViolation::TooManyNodes => "Rust syntax tree exceeds node limit",
-            RustSyntaxViolation::TooDeep => "Rust syntax tree exceeds depth limit",
-            RustSyntaxViolation::IncompatibleGrammar => "Rust grammar is incompatible",
-            RustSyntaxViolation::ParseCancelled => "Rust parse was cancelled",
-            RustSyntaxViolation::PositionOverflow => "Rust syntax position exceeds wire width",
-            RustSyntaxViolation::InvalidQuery => "Rust syntax query is invalid",
-            RustSyntaxViolation::TooManyCaptures => "Rust syntax query exceeds capture limit",
-        };
-        formatter.write_str(message)
+        match &self.kind {
+            RustSyntaxErrorKind::ZeroLimit { bound } => write!(
+                formatter,
+                "Rust syntax limits must be positive but {} passed to {} is zero; pass a bound of at least 1",
+                bound.name(),
+                bound.configured_in(),
+            ),
+            RustSyntaxErrorKind::SourceTooLarge {
+                path: Some(path),
+                source_bytes,
+                source_bytes_max,
+            } => write!(
+                formatter,
+                "Rust source {path} is {source_bytes} bytes but source_bytes_max configured in RustSyntaxLimits is {source_bytes_max} bytes; raise the limit or shrink the source",
+            ),
+            RustSyntaxErrorKind::SourceTooLarge {
+                path: None,
+                source_bytes,
+                source_bytes_max,
+            } => write!(
+                formatter,
+                "Rust source passed to RustQuery::captures is {source_bytes} bytes but SOURCE_BYTES_MAX_DEFAULT in crates/rift-syntax/src/rust.rs is {source_bytes_max} bytes; shrink the source",
+            ),
+            RustSyntaxErrorKind::TooManyNodes {
+                path,
+                syntax_nodes_max,
+            } => write!(
+                formatter,
+                "Rust syntax tree for {path} exceeds syntax_nodes_max of {syntax_nodes_max} configured in RustSyntaxLimits; raise the limit or split the source",
+            ),
+            RustSyntaxErrorKind::TooDeep {
+                path,
+                syntax_depth_max,
+            } => write!(
+                formatter,
+                "Rust syntax tree for {path} exceeds syntax_depth_max of {syntax_depth_max} configured in RustSyntaxLimits; raise the limit or flatten nested syntax",
+            ),
+            RustSyntaxErrorKind::IncompatibleGrammar {
+                grammar_abi_version,
+                runtime_abi_min,
+                runtime_abi_max,
+            } => write!(
+                formatter,
+                "Rust grammar tree-sitter-rust reports ABI version {grammar_abi_version} but the tree-sitter runtime supports {runtime_abi_min} through {runtime_abi_max}; align tree-sitter and tree-sitter-rust versions in the workspace Cargo.toml",
+            ),
+            RustSyntaxErrorKind::ParseCancelled { path: Some(path) } => write!(
+                formatter,
+                "Rust parse of {path} produced no tree although rift-syntax sets no timeout or cancellation flag; report this as a rift-syntax bug",
+            ),
+            RustSyntaxErrorKind::ParseCancelled { path: None } => write!(
+                formatter,
+                "Rust parse of RustQuery::captures source produced no tree although rift-syntax sets no timeout or cancellation flag; report this as a rift-syntax bug",
+            ),
+            RustSyntaxErrorKind::PositionOverflow {
+                node_kind,
+                start_byte,
+                end_byte,
+                source: _,
+            } => write!(
+                formatter,
+                "Rust {node_kind} node at bytes {start_byte}..{end_byte} does not fit the u64 wire position; keep sources below u64::MAX bytes",
+            ),
+            RustSyntaxErrorKind::InvalidQuery {
+                line_number,
+                line_text,
+                source,
+            } => write!(
+                formatter,
+                "Rust syntax query is invalid at line {line_number} `{line_text}`: {} {}; fix the query against the pinned tree-sitter-rust grammar",
+                query_error_reason(&source.kind),
+                source.message,
+            ),
+            RustSyntaxErrorKind::TooManyCaptures { captures_max } => write!(
+                formatter,
+                "Rust syntax query exceeds capture limit of {captures_max} passed to RustQuery::captures; raise captures_max or narrow the query",
+            ),
+        }
     }
 }
 
 impl std::error::Error for RustSyntaxError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
+        match &self.kind {
+            RustSyntaxErrorKind::PositionOverflow { source, .. } => Some(source),
+            RustSyntaxErrorKind::InvalidQuery { source, .. } => Some(source),
+            _ => None,
+        }
     }
 }
 
@@ -372,17 +560,19 @@ impl RustSyntaxProvider {
     /// Returns [`RustSyntaxError`] for incompatible grammar, cancellation, or exceeded bound.
     pub fn analyze(&self, source: RustSource<'_>) -> Result<RustSyntaxDocument, RustSyntaxError> {
         if source.text.len() > self.limits.source_bytes_max {
-            return Err(RustSyntaxError::new(RustSyntaxViolation::SourceTooLarge));
+            return Err(RustSyntaxError::new(RustSyntaxErrorKind::SourceTooLarge {
+                path: Some(source.path.clone()),
+                source_bytes: source.text.len(),
+                source_bytes_max: self.limits.source_bytes_max,
+            }));
         }
-        let language = rust_language();
-        let mut parser = Parser::new();
-        parser.set_language(&language).map_err(|error| {
-            RustSyntaxError::with_source(RustSyntaxViolation::IncompatibleGrammar, error)
+        let mut parser = rust_parser()?;
+        let tree = parser.parse(source.text, None).ok_or_else(|| {
+            RustSyntaxError::new(RustSyntaxErrorKind::ParseCancelled {
+                path: Some(source.path.clone()),
+            })
         })?;
-        let tree = parser
-            .parse(source.text, None)
-            .ok_or_else(|| RustSyntaxError::new(RustSyntaxViolation::ParseCancelled))?;
-        let (nodes, symbols) = self.extract(tree.root_node(), source.text)?;
+        let (nodes, symbols) = self.extract(tree.root_node(), source)?;
         Ok(RustSyntaxDocument {
             path: source.path.clone(),
             nodes,
@@ -394,17 +584,21 @@ impl RustSyntaxProvider {
     fn extract(
         &self,
         root: Node<'_>,
-        text: &str,
+        source: RustSource<'_>,
     ) -> Result<(Vec<RustNode>, Vec<RustSymbol>), RustSyntaxError> {
+        let text = source.text;
         let mut nodes = Vec::new();
         let mut symbols = Vec::new();
         let mut pending = vec![(root, None, String::new(), 0_usize)];
         while let Some((node, parent, qualification, depth)) = pending.pop() {
             if depth > self.limits.syntax_depth_max {
-                return Err(RustSyntaxError::new(RustSyntaxViolation::TooDeep));
+                return Err(RustSyntaxError::new(RustSyntaxErrorKind::TooDeep {
+                    path: source.path.clone(),
+                    syntax_depth_max: self.limits.syntax_depth_max,
+                }));
             }
             if nodes.len() >= self.limits.syntax_nodes_max {
-                return Err(RustSyntaxError::new(RustSyntaxViolation::TooManyNodes));
+                return Err(self.too_many_nodes(source));
             }
 
             let node_index = nodes.len();
@@ -439,7 +633,7 @@ impl RustSyntaxProvider {
                     continue;
                 }
                 if pending.len() + nodes.len() >= self.limits.syntax_nodes_max {
-                    return Err(RustSyntaxError::new(RustSyntaxViolation::TooManyNodes));
+                    return Err(self.too_many_nodes(source));
                 }
                 pending.push((
                     child,
@@ -451,10 +645,26 @@ impl RustSyntaxProvider {
         }
         Ok((nodes, symbols))
     }
+
+    fn too_many_nodes(&self, source: RustSource<'_>) -> RustSyntaxError {
+        RustSyntaxError::new(RustSyntaxErrorKind::TooManyNodes {
+            path: source.path.clone(),
+            syntax_nodes_max: self.limits.syntax_nodes_max,
+        })
+    }
 }
 
 fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
+}
+
+fn rust_parser() -> Result<Parser, RustSyntaxError> {
+    let language = rust_language();
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language)
+        .map_err(|_| RustSyntaxError::incompatible_grammar(&language))?;
+    Ok(parser)
 }
 
 impl Default for RustSyntaxProvider {
