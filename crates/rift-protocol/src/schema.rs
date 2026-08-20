@@ -2,9 +2,10 @@
 //! with `#[schemars(transform = schema::...)]`.
 //!
 //! Every rule is built from the vocabulary in this module: JSON Schema
-//! keywords are spelled once in [`keyword`], model property names are proven
-//! against the model structs by [`property!`], and wire values come from
-//! serializing the model enums themselves. [`nullable`] is the field-level
+//! keywords are spelled once in the private `keyword` module, model property
+//! names are proven against the model structs by the `property!` macro, and
+//! wire values come from serializing the model enums themselves.
+//! [`nullable`] is the field-level
 //! rule: it restores the `null` arm that `#[schemars(required)]` removes
 //! from an `Option` field.
 
