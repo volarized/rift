@@ -3,12 +3,6 @@ set dotenv-load := false
 format:
     cargo fmt --all --check
 
-generate:
-    cargo run -q -p rift-protocol --bin rift-schema-export -- docs/protocol
-
-generate-check:
-    cargo run -q -p rift-protocol --bin rift-schema-export -- --check docs/protocol
-
 check:
     cargo check --workspace --all-targets --all-features
     uv run --script scripts/check_rust_architecture.py
@@ -35,4 +29,4 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-rust-gate: format generate-check check test clippy docs audit coverage release-test installer-test
+rust-gate: format check test clippy docs audit coverage release-test installer-test

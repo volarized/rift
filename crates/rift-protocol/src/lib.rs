@@ -1,10 +1,9 @@
-//! Hand-authored protocol models and exported schemas for Rift.
+//! Hand-authored wire models for the Rift MCP surface.
 //!
-//! The Rust models in this crate are the single source of truth for the Rift
-//! MCP wire surface. [`schema::schema_document`] renders the JSON Schema
-//! document the docs site publishes, and the `rift-schema-export` binary
-//! writes it to disk.
+//! The Rust models in [`read`] are the single source of truth for what the
+//! Rift MCP server accepts and returns. The server derives its request and
+//! response schemas from these types, and the same derivation is exported
+//! into the docs, so the served surface and the documented surface cannot
+//! drift apart.
 
-pub mod contracts;
 pub mod read;
-pub mod schema;
