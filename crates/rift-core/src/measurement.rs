@@ -136,15 +136,13 @@ mod tests {
 
     #[test]
     fn regression_is_reported() {
-        let result = PerformanceMeasurement::between(
+        let error = PerformanceMeasurement::between(
             "index",
             Duration::from_millis(8),
             Duration::from_millis(3),
-        );
+        )
+        .expect_err("finish before start must report clock regression");
 
-        let Err(error) = result else {
-            panic!("finish before start must report clock regression");
-        };
         assert_eq!(error.start(), Duration::from_millis(8));
         assert_eq!(error.finish(), Duration::from_millis(3));
         assert_eq!(
