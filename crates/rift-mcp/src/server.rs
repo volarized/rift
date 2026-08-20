@@ -492,6 +492,62 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn applied_change_reports_failed_snapshot_rebuild_as_warning() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}
+",
+        )?;
+        let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
+            .map_err(|error| error.to_string())?;
+        let server = RiftMcp::build(directory.path(), tight)?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+
+        let grown = "/// Grown far beyond the configured workspace byte bound.
+pub fn beacon() -> u64 {
+    7_000_000_000_000_000_000
+}";
+        let change = client
+            .call_tool(
+                CallToolRequestParams::new("replace_symbol").with_arguments(arguments(&json!({
+                    "symbol": "rift://symbol/rust/lib.rs/beacon",
+                    "body": grown
+                }))?),
+            )
+            .await?;
+        let structured = change
+            .structured_content
+            .ok_or("replace_symbol must return structured content")?;
+        assert_eq!(structured["status"], json!("applied"));
+        let findings = structured["summary"]["diagnostics"]
+            .as_array()
+            .ok_or("summary must carry diagnostics")?;
+        assert!(
+            findings.iter().any(|finding| {
+                finding["severity"] == json!("warning")
+                    && finding["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("could not refresh"))
+            }),
+            "a failed rebuild after a landed change must ride the result as a \
+             warning: {structured:#}"
+        );
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
     /// Calls one tool expecting a Rift wire error and returns the JSON-RPC
     /// error object.
     async fn failing_call(
