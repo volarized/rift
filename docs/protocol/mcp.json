@@ -2135,17 +2135,17 @@
             "oneOf": [
               {
                 "const": "repairable",
-                "description": "Wire value `repairable`.",
+                "description": "The producer recovered and later facts remain reliable.",
                 "type": "string"
               },
               {
                 "const": "unrepairable",
-                "description": "Wire value `unrepairable`.",
+                "description": "The producer could not recover, so later facts are suspect.",
                 "type": "string"
               },
               {
                 "const": "unknown",
-                "description": "Wire value `unknown`.",
+                "description": "The producer does not say whether it recovered.",
                 "type": "string"
               }
             ]
@@ -2175,12 +2175,12 @@
             "oneOf": [
               {
                 "const": "reliable",
-                "description": "Wire value `reliable`.",
+                "description": "The surrounding facts came off a clean parse.",
                 "type": "string"
               },
               {
                 "const": "recovered",
-                "description": "Wire value `recovered`.",
+                "description": "The parser recovered nearby, so surrounding facts may be off.",
                 "type": "string"
               }
             ]
@@ -2190,12 +2190,12 @@
             "oneOf": [
               {
                 "const": "deprecated",
-                "description": "Wire value `deprecated`.",
+                "description": "The code the finding points at is deprecated.",
                 "type": "string"
               },
               {
                 "const": "unnecessary",
-                "description": "Wire value `unnecessary`.",
+                "description": "The code the finding points at is unused or has no effect.",
                 "type": "string"
               }
             ]
@@ -2491,22 +2491,22 @@
             "oneOf": [
               {
                 "const": "error",
-                "description": "Wire value `error`.",
+                "description": "The provider judges the code wrong.",
                 "type": "string"
               },
               {
                 "const": "warning",
-                "description": "Wire value `warning`.",
+                "description": "Suspect but not necessarily wrong.",
                 "type": "string"
               },
               {
                 "const": "info",
-                "description": "Wire value `info`.",
+                "description": "Informational, with nothing to fix.",
                 "type": "string"
               },
               {
                 "const": "hint",
-                "description": "Wire value `hint`.",
+                "description": "A gentle suggestion a consumer may hide.",
                 "type": "string"
               }
             ]
@@ -3440,37 +3440,37 @@
             "oneOf": [
               {
                 "const": "selection",
-                "description": "Wire value `selection`.",
+                "description": "The stretch that best identifies the node when presented.",
                 "type": "string"
               },
               {
                 "const": "name",
-                "description": "Wire value `name`.",
+                "description": "The name being declared.",
                 "type": "string"
               },
               {
                 "const": "header",
-                "description": "Wire value `header`.",
+                "description": "The declaration up to where the body starts.",
                 "type": "string"
               },
               {
                 "const": "body",
-                "description": "Wire value `body`.",
+                "description": "The implementation, without documentation or header.",
                 "type": "string"
               },
               {
                 "const": "content",
-                "description": "Wire value `content`.",
+                "description": "The interior of the node without its delimiters.",
                 "type": "string"
               },
               {
                 "const": "documentation",
-                "description": "Wire value `documentation`.",
+                "description": "The doc comment attached to the declaration.",
                 "type": "string"
               },
               {
                 "const": "enclosing",
-                "description": "Wire value `enclosing`.",
+                "description": "The full extent including what surrounds the node proper.",
                 "type": "string"
               }
             ]
@@ -3682,17 +3682,17 @@
             "oneOf": [
               {
                 "const": "repairable",
-                "description": "Wire value `repairable`.",
+                "description": "The producer recovered and later facts remain reliable.",
                 "type": "string"
               },
               {
                 "const": "unrepairable",
-                "description": "Wire value `unrepairable`.",
+                "description": "The producer could not recover, so later facts are suspect.",
                 "type": "string"
               },
               {
                 "const": "unknown",
-                "description": "Wire value `unknown`.",
+                "description": "The producer does not say whether it recovered.",
                 "type": "string"
               }
             ]
@@ -3722,12 +3722,12 @@
             "oneOf": [
               {
                 "const": "reliable",
-                "description": "Wire value `reliable`.",
+                "description": "The surrounding facts came off a clean parse.",
                 "type": "string"
               },
               {
                 "const": "recovered",
-                "description": "Wire value `recovered`.",
+                "description": "The parser recovered nearby, so surrounding facts may be off.",
                 "type": "string"
               }
             ]
@@ -3737,12 +3737,12 @@
             "oneOf": [
               {
                 "const": "deprecated",
-                "description": "Wire value `deprecated`.",
+                "description": "The code the finding points at is deprecated.",
                 "type": "string"
               },
               {
                 "const": "unnecessary",
-                "description": "Wire value `unnecessary`.",
+                "description": "The code the finding points at is unused or has no effect.",
                 "type": "string"
               }
             ]
@@ -4038,22 +4038,22 @@
             "oneOf": [
               {
                 "const": "error",
-                "description": "Wire value `error`.",
+                "description": "The provider judges the code wrong.",
                 "type": "string"
               },
               {
                 "const": "warning",
-                "description": "Wire value `warning`.",
+                "description": "Suspect but not necessarily wrong.",
                 "type": "string"
               },
               {
                 "const": "info",
-                "description": "Wire value `info`.",
+                "description": "Informational, with nothing to fix.",
                 "type": "string"
               },
               {
                 "const": "hint",
-                "description": "Wire value `hint`.",
+                "description": "A gentle suggestion a consumer may hide.",
                 "type": "string"
               }
             ]
