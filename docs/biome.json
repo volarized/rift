@@ -7,7 +7,15 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!**/.source", "!**/.next", "!**/bun.lock", "!deferred", "!public/schemas"]
+    "includes": [
+      "**",
+      "!**/.source",
+      "!**/.next",
+      "!**/bun.lock",
+      "!deferred",
+      "!protocol",
+      "!public/schemas"
+    ]
   },
   "formatter": {
     "enabled": true,
