@@ -190,8 +190,14 @@ jobs:
           workingDirectory: docs
           packageManager: bun
           command: deploy
+      # Deploys propagate through Cloudflare asynchronously; a single
+      # immediate probe flakes. Retry each URL for up to 30 seconds.
       - name: Verify live release
         run: |
-          curl --fail --silent --show-error -o /dev/null "https://volar.sh/rift/docs/"
-          curl --fail --silent --show-error -o /dev/null "https://volar.sh/rift/install.sh"
-          curl --fail --silent --show-error -o /dev/null "https://volar.sh/rift/install.ps1"
+          for url in \
+            "https://volar.sh/rift/docs/" \
+            "https://volar.sh/rift/install.sh" \
+            "https://volar.sh/rift/install.ps1"; do
+            curl --fail --silent --show-error -o /dev/null \
+              --retry 10 --retry-all-errors --retry-max-time 30 "$url"
+          done
