@@ -4,7 +4,10 @@
 //! the server accepts and returns, and the MCP server derives its advertised
 //! request and response schemas from these definitions.
 
-use crate::read::{Diagnostic, NodeId, ProjectPath, RegionRole, SourceSpan, SymbolId};
+use crate::configuration::GuaranteeKind;
+use crate::read::{
+    CoverageScope, Diagnostic, NodeId, ProjectPath, RegionRole, SourceSpan, SymbolId,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -179,6 +182,26 @@ impl OperationPrecondition {
     }
 }
 
+/// A property a passing hook established about one applied change. The
+/// server mints one entry per configured guarantee of each hook that
+/// passed, so a green run carries what it actually proved rather than an
+/// unexplained tick.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuaranteeEvidence {
+    /// Which property is established.
+    pub kind: GuaranteeKind,
+    /// What the check covered.
+    pub scope: CoverageScope,
+    /// The configured hook whose passing run established the property.
+    #[schemars(length(min = 1, max = 64))]
+    pub hook: String,
+    /// The exact property checked and the limits on reading a pass, from
+    /// the hook's configuration.
+    #[schemars(length(min = 1, max = 1_024))]
+    pub detail: String,
+}
+
 /// One applied change, with everything Rift learned while resolving it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -191,9 +214,14 @@ pub struct ChangeSummary {
     /// Concrete edits in canonical file-and-range order.
     #[schemars(length(max = 256))]
     pub edits: Vec<Edit>,
-    /// Resolution findings in source order.
+    /// Resolution findings in source order, then one finding per hook that
+    /// did not pass.
     #[schemars(length(max = 256))]
     pub diagnostics: Vec<Diagnostic>,
+    /// Properties the workspace's passing hooks established about this
+    /// change, in hook list order.
+    #[schemars(length(max = 512))]
+    pub guarantees: Vec<GuaranteeEvidence>,
 }
 
 /// An applied change or semantic refusal. For every refusal the targeted tree is
@@ -311,6 +339,14 @@ mod tests {
                     text: "fn f() {}".to_owned(),
                 }],
                 diagnostics: Vec::new(),
+                guarantees: vec![GuaranteeEvidence {
+                    kind: GuaranteeKind::BehaviorChecked,
+                    scope: CoverageScope::Reach {
+                        reach: crate::read::CoverageReach::Project,
+                    },
+                    hook: "tests".to_owned(),
+                    detail: "cargo test passes on the changed tree".to_owned(),
+                }],
             },
         };
         let value = serde_json::to_value(&result).expect("serialize");
