@@ -9,8 +9,8 @@ use rift_core::{
     CompositionId, ErrorDescriptor, ErrorName, ErrorRegistry, ProviderId, is_canonical_ascii_name,
 };
 
-// Process-local provenance token. Mutable allocation remains provider-owned.
-static NEXT_BUILDER_TOKEN: AtomicU64 = AtomicU64::new(1);
+// Process-local builder origin. Mutable allocation remains provider-owned.
+static NEXT_BUILDER_ORIGIN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
 struct ErasedType {
@@ -88,7 +88,7 @@ impl<Input: 'static, Output: 'static> Component<Input, Output> {
 /// Typed single-publication output handle.
 #[derive(Debug)]
 pub struct Flow<T: 'static> {
-    owner: u64,
+    origin: u64,
     stage: usize,
     _value: PhantomData<fn() -> T>,
 }
@@ -264,7 +264,7 @@ impl std::error::Error for CompositionError {}
 #[derive(Debug)]
 pub struct CompositionBuilder {
     id: CompositionId,
-    token: u64,
+    origin: u64,
     stages: Vec<StageNode>,
     paths: BTreeSet<StagePath>,
     output: Option<usize>,
@@ -283,7 +283,7 @@ impl CompositionBuilder {
     pub fn new(id: CompositionId) -> Self {
         Self {
             id,
-            token: NEXT_BUILDER_TOKEN.fetch_add(1, Ordering::Relaxed),
+            origin: NEXT_BUILDER_ORIGIN.fetch_add(1, Ordering::Relaxed),
             stages: Vec::new(),
             paths: BTreeSet::new(),
             output: None,
@@ -334,7 +334,7 @@ impl CompositionBuilder {
         name: &str,
         component: &Component<I, O>,
     ) -> Result<Flow<O>, CompositionError> {
-        self.validate_owner(input.owner)?;
+        self.validate_origin(input.origin)?;
         let stage = self.add(StageRegistration::single(
             StagePath::root(&self.id, name)?,
             component.id(),
@@ -357,8 +357,8 @@ impl CompositionBuilder {
         name: &str,
         component: &Component<(Left, Right), Output>,
     ) -> Result<Flow<Output>, CompositionError> {
-        self.validate_owner(left.owner)?;
-        self.validate_owner(right.owner)?;
+        self.validate_origin(left.origin)?;
+        self.validate_origin(right.origin)?;
         let stage = self.add(StageRegistration::single(
             StagePath::root(&self.id, name)?,
             component.id(),
@@ -375,7 +375,7 @@ impl CompositionBuilder {
     ///
     /// Returns [`CompositionError`] when handle belongs to another builder.
     pub fn output<T: 'static>(&mut self, output: Flow<T>) -> Result<(), CompositionError> {
-        self.validate_owner(output.owner)?;
+        self.validate_origin(output.origin)?;
         self.output = Some(output.stage);
         Ok(())
     }
@@ -414,8 +414,8 @@ impl CompositionBuilder {
         Ok(stage)
     }
 
-    fn validate_owner(&self, owner: u64) -> Result<(), CompositionError> {
-        if owner != self.token {
+    fn validate_origin(&self, origin: u64) -> Result<(), CompositionError> {
+        if origin != self.origin {
             return Err(CompositionError::new(CompositionErrorKind::ForeignFlow));
         }
         Ok(())
@@ -423,7 +423,7 @@ impl CompositionBuilder {
 
     const fn flow<T: 'static>(&self, stage: usize) -> Flow<T> {
         Flow {
-            owner: self.token,
+            origin: self.origin,
             stage,
             _value: PhantomData,
         }
@@ -442,7 +442,7 @@ impl CompositionScope<'_> {
         name: &str,
         component: &Component<I, O>,
     ) -> Result<Flow<O>, CompositionError> {
-        self.builder.validate_owner(input.owner)?;
+        self.builder.validate_origin(input.origin)?;
         let path = StagePath::nested(&self.builder.id, &self.name, name)?;
         let stage = self.builder.add(StageRegistration::single(
             path,
@@ -466,8 +466,8 @@ impl CompositionScope<'_> {
         name: &str,
         component: &Component<(Left, Right), Output>,
     ) -> Result<Flow<Output>, CompositionError> {
-        self.builder.validate_owner(left.owner)?;
-        self.builder.validate_owner(right.owner)?;
+        self.builder.validate_origin(left.origin)?;
+        self.builder.validate_origin(right.origin)?;
         let path = StagePath::nested(&self.builder.id, &self.name, name)?;
         let stage = self.builder.add(StageRegistration::single(
             path,
