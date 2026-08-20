@@ -39,6 +39,28 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ("search", json!({ "query": "beacon", "limit": 1 })),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
+        (
+            "replace_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/lib.rs/beacon_two",
+                "body": "pub fn beacon_two() -> u8 {\n    2\n}"
+            }),
+        ),
+        (
+            "replace_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/lib.rs/vanished",
+                "body": "pub fn vanished() {}"
+            }),
+        ),
+        (
+            "insert_symbol",
+            json!({
+                "anchor": "rift://symbol/rust/lib.rs/beacon_three",
+                "position": "after",
+                "body": "pub fn beacon_four() {}"
+            }),
+        ),
     ]
 }
 

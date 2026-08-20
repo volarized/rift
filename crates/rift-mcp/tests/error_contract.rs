@@ -80,6 +80,10 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
         ("get_symbol", json!({ "name": "beacon", "limit": 0 })),
         ("nodes", json!({ "path": "missing.rs", "position": 0 })),
         (
+            "replace_symbol",
+            json!({ "symbol": "not-an-address", "body": "x" }),
+        ),
+        (
             "get_symbol",
             json!({ "name": "beacon", "include_history": true }),
         ),
