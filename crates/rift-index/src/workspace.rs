@@ -8,7 +8,7 @@ use rift_core::constants::{
     WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{CompositionId, ProjectPath, ProviderId};
-use rift_provider::{Component, CompositionBuilder, CompositionError, ProviderComposition};
+use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxProvider};
 
 #[derive(Debug)]
@@ -42,24 +42,27 @@ impl WorkspaceIndexLimits {
         directory_depth_max: usize,
         results_max: usize,
     ) -> Result<Self, WorkspaceIndexError> {
-        if [
+        let limits = Self {
             files_max,
             file_bytes_max,
             workspace_bytes_max,
             directory_depth_max,
             results_max,
-        ]
-        .contains(&0)
-        {
-            return Err(WorkspaceIndexError::new(WorkspaceIndexViolation::ZeroLimit));
+        };
+        for bound in limits.bounds() {
+            positive_bound(bound)?;
         }
-        Ok(Self {
-            files_max,
-            file_bytes_max,
-            workspace_bytes_max,
-            directory_depth_max,
-            results_max,
-        })
+        Ok(limits)
+    }
+
+    const fn bounds(self) -> [usize; 5] {
+        [
+            self.files_max,
+            self.file_bytes_max,
+            self.workspace_bytes_max,
+            self.directory_depth_max,
+            self.results_max,
+        ]
     }
 
     /// Returns maximum result count accepted per query.
@@ -160,6 +163,8 @@ impl WorkspaceIndexError {
     }
 }
 
+// Failure context is carried by the error itself: the offending path renders
+// below and the underlying cause (I/O, UTF-8, syntax) stays on Error::source.
 impl fmt::Display for WorkspaceIndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self.violation {
@@ -176,7 +181,10 @@ impl fmt::Display for WorkspaceIndexError {
             WorkspaceIndexViolation::Composition => "provider composition is invalid",
             WorkspaceIndexViolation::ResultLimit => "requested result limit is too large",
         };
-        formatter.write_str(message)
+        match &self.path {
+            Some(path) => write!(formatter, "{message}: {}", path.display()),
+            None => formatter.write_str(message),
+        }
     }
 }
 
@@ -375,6 +383,13 @@ impl WorkspaceIndex {
     }
 }
 
+fn positive_bound(bound: usize) -> Result<(), WorkspaceIndexError> {
+    if bound == 0 {
+        return Err(WorkspaceIndexError::new(WorkspaceIndexViolation::ZeroLimit));
+    }
+    Ok(())
+}
+
 fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceIndexError> {
     let canonical = fs::canonicalize(root).map_err(|error| {
         WorkspaceIndexError::caused_by(WorkspaceIndexViolation::InvalidRoot, Some(root), error)
@@ -389,55 +404,29 @@ fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceIndexError> {
 }
 
 fn composition() -> Result<ProviderComposition, WorkspaceIndexError> {
+    let source = component::<(), WorkspaceFiles>("workspace-source")?;
+    let syntax = component::<WorkspaceFiles, RustFacts>("rust-tree-sitter")?;
+    let index = component::<RustFacts, ReadIndex>("memory-index")?;
     let mut builder =
         CompositionBuilder::new(CompositionId::new("rust-read").map_err(composition_error)?);
-    let source = Component::<(), WorkspaceFiles>::new(
-        ProviderId::new("workspace-source").map_err(composition_error)?,
-    );
-    let syntax = Component::<WorkspaceFiles, RustFacts>::new(
-        ProviderId::new("rust-tree-sitter").map_err(composition_error)?,
-    );
-    let index = Component::<RustFacts, ReadIndex>::new(
-        ProviderId::new("memory-index").map_err(composition_error)?,
-    );
-    let files = builder
-        .source("project", &source)
-        .map_err(composition_error)?;
-    let facts = builder
-        .then(files, "syntax", &syntax)
-        .map_err(composition_error)?;
-    let reads = builder
-        .then(facts, "index", &index)
-        .map_err(composition_error)?;
-    builder.output(reads).map_err(composition_error)?;
-    builder.build().map_err(composition_error)
+    let files = builder.source("project", &source);
+    let facts = builder.then(files, "syntax", &syntax);
+    let reads = builder.then(facts, "index", &index);
+    builder.output(reads).build().map_err(composition_error)
 }
 
-fn composition_error(source: impl IntoCompositionSource) -> WorkspaceIndexError {
-    WorkspaceIndexError::caused_by(
-        WorkspaceIndexViolation::Composition,
-        None,
-        source.into_composition_source(),
-    )
+fn component<Input: 'static, Output: 'static>(
+    id: &str,
+) -> Result<Component<Input, Output>, WorkspaceIndexError> {
+    Ok(Component::new(
+        ProviderId::new(id).map_err(composition_error)?,
+    ))
 }
 
-trait IntoCompositionSource {
-    type Error: std::error::Error + Send + Sync + 'static;
-    fn into_composition_source(self) -> Self::Error;
-}
-
-impl IntoCompositionSource for rift_core::IdError {
-    type Error = rift_core::IdError;
-    fn into_composition_source(self) -> Self::Error {
-        self
-    }
-}
-
-impl IntoCompositionSource for CompositionError {
-    type Error = CompositionError;
-    fn into_composition_source(self) -> Self::Error {
-        self
-    }
+fn composition_error(
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> WorkspaceIndexError {
+    WorkspaceIndexError::caused_by(WorkspaceIndexViolation::Composition, None, source)
 }
 
 fn discover(
@@ -454,14 +443,7 @@ fn discover(
             ));
         }
         let mut entries = fs::read_dir(&directory)
-            .map_err(|error| {
-                WorkspaceIndexError::caused_by(
-                    WorkspaceIndexViolation::Filesystem,
-                    Some(&directory),
-                    error,
-                )
-            })?
-            .collect::<Result<Vec<_>, _>>()
+            .and_then(Iterator::collect::<Result<Vec<_>, _>>)
             .map_err(|error| {
                 WorkspaceIndexError::caused_by(
                     WorkspaceIndexViolation::Filesystem,
@@ -588,6 +570,7 @@ fn symbol_rank(symbol: &RustSymbol, query: &str) -> SymbolMatchRank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_syntax::RustSyntaxLimits;
     #[cfg(unix)]
     use std::os::unix::fs as unix_fs;
 
@@ -823,6 +806,86 @@ mod tests {
         for (violation, message) in cases {
             assert_eq!(WorkspaceIndexError::new(violation).to_string(), message);
         }
+    }
+
+    #[test]
+    fn test_error_display_appends_offending_path() {
+        let error = WorkspaceIndexError::at(
+            WorkspaceIndexViolation::FileTooLarge,
+            Path::new("src/big.rs"),
+        );
+        assert_eq!(
+            error.to_string(),
+            "Rust source exceeds file byte limit: src/big.rs"
+        );
+    }
+
+    #[test]
+    fn test_component_identity_failure_surfaces_as_composition_error() {
+        let error = component::<(), WorkspaceFiles>("").expect_err("empty component id");
+        assert_eq!(error.violation(), WorkspaceIndexViolation::Composition);
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn test_read_file_classifies_syntax_and_non_nfc_path_failures() {
+        let directory = fixture();
+        let limits = WorkspaceIndexLimits::default();
+        let mut bytes = 0;
+        let strict_parser =
+            RustSyntaxProvider::new(RustSyntaxLimits::new(1, 1, 1).expect("positive bounds"));
+        let source_path = directory.path().join("src/lib.rs");
+        let syntax_error = read_file(
+            directory.path(),
+            &source_path,
+            &strict_parser,
+            limits,
+            &mut bytes,
+        )
+        .expect_err("syntax byte bound");
+        assert_eq!(syntax_error.violation(), WorkspaceIndexViolation::Syntax);
+        assert_eq!(syntax_error.path(), Some(source_path.as_path()));
+        assert!(std::error::Error::source(&syntax_error).is_some());
+
+        let parser = RustSyntaxProvider::default();
+        let decomposed = directory.path().join("src/cafe\u{301}.rs");
+        fs::write(&decomposed, "fn accent() {}").expect("decomposed source");
+        let path_error = read_file(directory.path(), &decomposed, &parser, limits, &mut bytes)
+            .expect_err("non-NFC project path");
+        assert_eq!(path_error.violation(), WorkspaceIndexViolation::InvalidPath);
+        assert!(std::error::Error::source(&path_error).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_classifies_unreadable_and_unsearchable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = fixture();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let locked = root.join("locked");
+        fs::create_dir(&locked).expect("locked directory");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("remove read");
+        let unreadable = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
+            .expect_err("unreadable directory");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
+        assert_eq!(unreadable.violation(), WorkspaceIndexViolation::Filesystem);
+        assert_eq!(unreadable.path(), Some(locked.as_path()));
+
+        let unsearchable = root.join("unsearchable");
+        fs::create_dir(&unsearchable).expect("unsearchable directory");
+        fs::write(unsearchable.join("entry.rs"), "fn entry() {}").expect("entry source");
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o444))
+            .expect("remove search");
+        let stat_error = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
+            .expect_err("unsearchable directory");
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755))
+            .expect("restore search");
+        assert_eq!(stat_error.violation(), WorkspaceIndexViolation::Filesystem);
+        assert_eq!(
+            stat_error.path(),
+            Some(unsearchable.join("entry.rs").as_path())
+        );
     }
 
     #[test]

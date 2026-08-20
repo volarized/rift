@@ -1,19 +1,25 @@
-//! Writes the exported protocol schema document to disk.
+//! Deterministic export of the served MCP tool surface.
 //!
-//! `rift-schema-export [--check] [OUTPUT_DIR]` renders
-//! [`rift_protocol::schema::schema_document`] into `OUTPUT_DIR/mcp.json`
-//! (default `docs/protocol`). With `--check` it compares instead of writing,
-//! so CI can prove the committed document matches the models.
+//! [`schema_document`] serializes the same tool router [`RiftMcp`] runs, so
+//! the exported document and the served surface come from one definition:
+//! tool names and descriptions from the `#[tool]` methods, request and
+//! response schemas derived from the `rift_protocol` wire models. The
+//! `rift-schema-export` binary writes the document into the docs; the rest of
+//! this module is the binary's logic, kept here so it is testable.
 
-use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
-use rift_protocol::schema;
+use serde_json::json;
+
+use crate::RiftMcp;
+
+/// One-line summary rendered at the top of the exported document.
+const DOCUMENT_DESCRIPTION: &str =
+    "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.";
 
 /// Directory the schema document lands in when no argument names one.
 const OUTPUT_DIR_DEFAULT: &str = "docs/protocol";
@@ -25,21 +31,71 @@ const SCHEMA_FILE_NAME: &str = "mcp.json";
 const USAGE: &str = "usage: rift-schema-export [--check] [OUTPUT_DIR]";
 
 /// Command to run when the committed document is out of date.
-const REGENERATE_COMMAND: &str = "cargo run -p rift-protocol --bin rift-schema-export";
+const REGENERATE_COMMAND: &str = "cargo run -p rift-mcp --bin rift-schema-export";
+
+/// Renders the document the docs site publishes: one entry per served tool
+/// with its name, description, input schema, and output schema, sorted by
+/// name.
+///
+/// Output is pretty-printed, ends with a trailing newline, and is
+/// byte-identical across calls because `serde_json` stores objects as sorted
+/// maps.
+#[must_use]
+pub fn schema_document() -> String {
+    let mut tools = RiftMcp::tool_router().list_all();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    let tools: Vec<_> = tools
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+                "output_schema": tool.output_schema,
+            })
+        })
+        .collect();
+    let document = json!({
+        "description": DOCUMENT_DESCRIPTION,
+        "tools": tools,
+    });
+    let mut rendered = format!("{document:#}");
+    rendered.push('\n');
+    rendered
+}
 
 /// Why an export run could not complete.
 #[derive(Debug)]
-enum ExportError {
+pub enum ExportError {
     /// An argument started with `-` but is not a supported flag.
-    UnknownFlag { argument: String },
+    UnknownFlag {
+        /// The argument as given.
+        argument: String,
+    },
     /// A second positional argument followed the output directory.
-    ExtraArgument { argument: String },
+    ExtraArgument {
+        /// The argument as given.
+        argument: String,
+    },
     /// The document to check against could not be read.
-    CheckUnreadable { path: PathBuf, source: io::Error },
-    /// The committed document differs from the current models.
-    CheckMismatch { path: PathBuf },
+    CheckUnreadable {
+        /// The document that should have been readable.
+        path: PathBuf,
+        /// What reading it returned.
+        source: io::Error,
+    },
+    /// The committed document differs from the served tool surface.
+    CheckMismatch {
+        /// The document that is out of date.
+        path: PathBuf,
+    },
     /// The output directory or document could not be written.
-    WriteFailed { path: PathBuf, source: io::Error },
+    WriteFailed {
+        /// The directory or document that could not be written.
+        path: PathBuf,
+        /// What writing it returned.
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for ExportError {
@@ -63,7 +119,7 @@ impl fmt::Display for ExportError {
             ),
             Self::CheckMismatch { path } => write!(
                 formatter,
-                "`{path}` does not match the current protocol models; regenerate it with \
+                "`{path}` does not match the served tool surface; regenerate it with \
                  `{REGENERATE_COMMAND}`",
                 path = path.display()
             ),
@@ -89,14 +145,20 @@ impl Error for ExportError {
 }
 
 /// One parsed export invocation.
-struct ExportRequest {
+#[derive(Debug)]
+pub struct ExportRequest {
     /// Compare the existing document instead of writing it.
     check: bool,
     /// Directory holding the schema document.
     output_dir: PathBuf,
 }
 
-fn parse_arguments<Arguments>(arguments: Arguments) -> Result<ExportRequest, ExportError>
+/// Parses `rift-schema-export` arguments, without the program name.
+///
+/// # Errors
+///
+/// Returns [`ExportError`] for an unknown flag or a second output directory.
+pub fn parse_arguments<Arguments>(arguments: Arguments) -> Result<ExportRequest, ExportError>
 where
     Arguments: IntoIterator<Item = String>,
 {
@@ -119,8 +181,15 @@ where
     })
 }
 
-fn run(request: &ExportRequest) -> Result<(), ExportError> {
-    let document = schema::schema_document();
+/// Writes the schema document, or with `--check` proves the committed copy
+/// matches the served surface.
+///
+/// # Errors
+///
+/// Returns [`ExportError`] when the document cannot be read, differs, or
+/// cannot be written.
+pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
+    let document = schema_document();
     let document_path = request.output_dir.join(SCHEMA_FILE_NAME);
     if request.check {
         let committed =
@@ -146,15 +215,4 @@ fn run(request: &ExportRequest) -> Result<(), ExportError> {
     })?;
     println!("wrote {}", document_path.display());
     Ok(())
-}
-
-fn main() -> ExitCode {
-    let outcome = parse_arguments(env::args().skip(1)).and_then(|request| run(&request));
-    match outcome {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("rift-schema-export: {error}");
-            ExitCode::FAILURE
-        }
-    }
 }

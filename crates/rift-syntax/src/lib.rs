@@ -3,9 +3,9 @@
 mod rust;
 
 pub use rust::{
-    ByteRange, RustNode, RustQuery, RustQueryCapture, RustSource, RustSymbol, RustSymbolKind,
-    RustSyntaxDocument, RustSyntaxError, RustSyntaxLimits, RustSyntaxProvider, RustSyntaxViolation,
-    RustVisibility,
+    ByteRange, RustGrammarNodeKind, RustNode, RustQuery, RustQueryCapture, RustSource, RustSymbol,
+    RustSymbolKind, RustSyntaxDocument, RustSyntaxError, RustSyntaxLimits, RustSyntaxProvider,
+    RustSyntaxViolation, RustVisibility,
 };
 
 /// Compile-time marker for syntax-layer ownership.
