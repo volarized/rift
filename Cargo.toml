@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "protocol/rust"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.0.1"
@@ -14,7 +14,7 @@ rift-core = { path = "crates/rift-core" }
 rift-index = { path = "crates/rift-index" }
 rift-mcp = { path = "crates/rift-mcp" }
 rift-model = { path = "crates/rift-model" }
-rift-protocol = { path = "protocol/rust" }
+rift-protocol = { path = "crates/rift-protocol" }
 rift-provider = { path = "crates/rift-provider" }
 rift-server = { path = "crates/rift-server" }
 rift-syntax = { path = "crates/rift-syntax" }
