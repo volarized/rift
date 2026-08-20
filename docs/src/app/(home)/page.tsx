@@ -79,9 +79,9 @@ const DIFFERENCES: {
   fit?: number;
 }[] = [
   {
-    statement: "Rust declarations from current source.",
-    title: "Tree-sitter syntax provider",
-    body: "Rift reads Rust files into an in-memory syntax index and reports which provider produced each result.",
+    statement: "Code facts with reported coverage.",
+    title: "Programming language providers",
+    body: "Rift will combine syntax, semantic analysis, and history to give agents the best available context.",
     solid: "sphere",
   },
   {
@@ -93,9 +93,9 @@ const DIFFERENCES: {
     tilt: 1.5,
   },
   {
-    statement: "Structured reads over MCP.",
-    title: "MCP read tools",
-    body: "Agents can search source and retrieve declarations by name.",
+    statement: "Structured reads and guarded edits.",
+    title: "MCP tools and resources",
+    body: "Agents will read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
