@@ -10,7 +10,7 @@ use rift_core::{
     CompositionId, ErrorDescriptor, ErrorName, ErrorRegistry, ProviderId, is_canonical_ascii_name,
 };
 
-// Process-local provenance token. Mutable allocation remains provider-owned.
+// Process-local builder identity token. Mutable allocation remains provider-owned.
 static NEXT_BUILDER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]

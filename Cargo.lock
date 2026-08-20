@@ -646,6 +646,7 @@ name = "rift-mcp"
 version = "0.0.1"
 dependencies = [
  "rift-core",
+ "rift-index",
  "rift-protocol",
  "rift-server",
  "rmcp",
