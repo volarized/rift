@@ -95,9 +95,13 @@ def main() -> int:
         for target in package["targets"]
         if "bin" in target["kind"]
     )
-    # rift is the only binary target: one released CLI, nothing else.
-    if binaries != ["rift:rift"]:
-        raise RuntimeError(f"expected exactly the rift:rift binary target, got {binaries}")
+    # rift is the only released binary; rift-schema-export is the repo-internal
+    # generator that writes the served tool surface into docs/protocol.
+    if binaries != ["rift-mcp:rift-schema-export", "rift:rift"]:
+        raise RuntimeError(
+            "expected exactly rift:rift and rift-mcp:rift-schema-export "
+            f"binary targets, got {binaries}"
+        )
     return 0
 
 
