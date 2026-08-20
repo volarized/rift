@@ -88,6 +88,23 @@ fn nullable_without_type(object: &mut Map<String, Value>) {
     object.insert("anyOf".to_owned(), json!([inner, { "type": "null" }]));
 }
 
+/// An [`ErrorData`](crate::error::ErrorData) carries `limit` exactly when
+/// `code` is `limit_exceeded`, and forbids it otherwise.
+pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
+    append(
+        schema,
+        Composition::All,
+        json!({
+            "if": {
+                "properties": { "code": { "const": "limit_exceeded" } },
+                "required": ["code"]
+            },
+            "then": { "required": ["limit"] },
+            "else": { "not": { "required": ["limit"] } }
+        }),
+    );
+}
+
 /// A symlink [`File`](crate::read::File) carries no language facts: languages
 /// and regions stay empty and `semantic` stays false.
 pub fn symlink_carries_no_language_facts(schema: &mut Schema) {
