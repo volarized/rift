@@ -10,8 +10,8 @@ use rift_core::{
     CompositionId, ErrorDescriptor, ErrorName, ErrorRegistry, ProviderId, is_canonical_ascii_name,
 };
 
-// Process-local provenance token. Mutable allocation remains provider-owned.
-static NEXT_BUILDER_TOKEN: AtomicU64 = AtomicU64::new(1);
+// Process-local builder origin. Mutable allocation remains provider-owned.
+static NEXT_BUILDER_ORIGIN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
 struct ErasedType {
@@ -33,19 +33,12 @@ impl ErasedType {
 pub struct StagePath(String);
 
 impl StagePath {
-    fn root(composition: &CompositionId, name: &str) -> Result<Self, CompositionError> {
-        validate_name(name)?;
-        Ok(Self(format!("{composition}.{name}")))
+    fn root(composition: &CompositionId, name: &str) -> Self {
+        Self(format!("{composition}.{name}"))
     }
 
-    fn nested(
-        composition: &CompositionId,
-        scope: &str,
-        name: &str,
-    ) -> Result<Self, CompositionError> {
-        validate_name(scope)?;
-        validate_name(name)?;
-        Ok(Self(format!("{composition}.{scope}.{name}")))
+    fn nested(composition: &CompositionId, scope: &str, name: &str) -> Self {
+        Self(format!("{composition}.{scope}.{name}"))
     }
 
     /// Returns dot-separated stage path.
@@ -89,7 +82,7 @@ impl<Input: 'static, Output: 'static> Component<Input, Output> {
 /// Typed single-publication output handle.
 #[derive(Debug)]
 pub struct Flow<T: 'static> {
-    owner: u64,
+    origin: u64,
     stage: usize,
     _value: PhantomData<fn() -> T>,
 }
@@ -105,7 +98,7 @@ impl<T: 'static> Clone for Flow<T> {
 /// Typed keyed-publication output handle.
 #[derive(Debug)]
 pub struct KeyedFlow<K: 'static, T: 'static> {
-    owner: u64,
+    origin: u64,
     stage: usize,
     _value: PhantomData<fn() -> (K, T)>,
 }
@@ -310,13 +303,17 @@ impl fmt::Display for CompositionError {
 impl std::error::Error for CompositionError {}
 
 /// Typed composition builder. Concrete flow types erase only at [`build`](Self::build).
+///
+/// Stage methods chain without intermediate results; every recorded
+/// construction failure surfaces once, at [`build`](Self::build).
 #[derive(Debug)]
 pub struct CompositionBuilder {
     id: CompositionId,
-    token: u64,
+    origin: u64,
     stages: Vec<StageNode>,
     paths: BTreeSet<StagePath>,
     output: Option<usize>,
+    errors: Vec<CompositionError>,
 }
 
 /// Borrowed builder for one stable nested stage path.
@@ -332,202 +329,211 @@ impl CompositionBuilder {
     pub fn new(id: CompositionId) -> Self {
         Self {
             id,
-            token: NEXT_BUILDER_TOKEN.fetch_add(1, Ordering::Relaxed),
+            origin: NEXT_BUILDER_ORIGIN.fetch_add(1, Ordering::Relaxed),
             stages: Vec::new(),
             paths: BTreeSet::new(),
             output: None,
+            errors: Vec::new(),
         }
     }
 
     /// Opens one named nested scope.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] when scope name is not canonical.
-    pub fn scope(&mut self, name: &str) -> Result<CompositionScope<'_>, CompositionError> {
-        validate_name(name)?;
-        Ok(CompositionScope {
+    /// A non-canonical scope name is reported by [`build`](Self::build).
+    #[must_use]
+    pub fn scope(&mut self, name: &str) -> CompositionScope<'_> {
+        record_failure(&mut self.errors, validate_name(name));
+        CompositionScope {
             builder: self,
             name: name.into(),
-        })
+        }
     }
 
     /// Adds one single source stage.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for invalid or duplicate name.
-    pub fn source<O: 'static>(
-        &mut self,
-        name: &str,
-        component: &Component<(), O>,
-    ) -> Result<Flow<O>, CompositionError> {
+    /// An invalid or duplicate name is reported by [`build`](Self::build).
+    #[must_use]
+    pub fn source<O: 'static>(&mut self, name: &str, component: &Component<(), O>) -> Flow<O> {
+        record_failure(&mut self.errors, validate_name(name));
         let stage = self.add(StageRegistration::single(
-            StagePath::root(&self.id, name)?,
+            StagePath::root(&self.id, name),
             component.id(),
             &[],
             ErasedType::of::<()>(),
             ErasedType::of::<O>(),
-        ))?;
-        Ok(self.flow(stage))
+        ));
+        self.flow(stage)
     }
 
     /// Adds one keyed source stage.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for invalid or duplicate name.
+    /// An invalid or duplicate name is reported by [`build`](Self::build).
+    #[must_use]
     pub fn source_many<K: 'static, O: 'static>(
         &mut self,
         name: &str,
         component: &Component<(), O>,
-    ) -> Result<KeyedFlow<K, O>, CompositionError> {
+    ) -> KeyedFlow<K, O> {
+        record_failure(&mut self.errors, validate_name(name));
         let stage = self.add(StageRegistration::by_key::<K>(
-            StagePath::root(&self.id, name)?,
+            StagePath::root(&self.id, name),
             component.id(),
             &[],
             ErasedType::of::<()>(),
             ErasedType::of::<O>(),
-        ))?;
-        Ok(self.keyed_flow(stage))
+        ));
+        self.keyed_flow(stage)
     }
 
     /// Connects one typed single input to next stage.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    /// A foreign handle, invalid name, or duplicate stage is reported by
+    /// [`build`](Self::build).
+    #[must_use]
     pub fn then<I: 'static, O: 'static>(
         &mut self,
         input: Flow<I>,
         name: &str,
         component: &Component<I, O>,
-    ) -> Result<Flow<O>, CompositionError> {
-        self.validate_owner(input.owner)?;
+    ) -> Flow<O> {
+        record_failure(&mut self.errors, validate_origin(input.origin, self.origin));
+        record_failure(&mut self.errors, validate_name(name));
         let stage = self.add(StageRegistration::single(
-            StagePath::root(&self.id, name)?,
+            StagePath::root(&self.id, name),
             component.id(),
             &[input.stage],
             ErasedType::of::<I>(),
             ErasedType::of::<O>(),
-        ))?;
-        Ok(self.flow(stage))
+        ));
+        self.flow(stage)
     }
 
     /// Connects two heterogeneous typed inputs to one stage.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    /// A foreign handle, invalid name, or duplicate stage is reported by
+    /// [`build`](Self::build).
+    #[must_use]
     pub fn combine<Left: 'static, Right: 'static, Output: 'static>(
         &mut self,
         left: Flow<Left>,
         right: Flow<Right>,
         name: &str,
         component: &Component<(Left, Right), Output>,
-    ) -> Result<Flow<Output>, CompositionError> {
-        self.validate_owner(left.owner)?;
-        self.validate_owner(right.owner)?;
+    ) -> Flow<Output> {
+        record_failure(&mut self.errors, validate_origin(left.origin, self.origin));
+        record_failure(&mut self.errors, validate_origin(right.origin, self.origin));
+        record_failure(&mut self.errors, validate_name(name));
         let stage = self.add(StageRegistration::single(
-            StagePath::root(&self.id, name)?,
+            StagePath::root(&self.id, name),
             component.id(),
             &[left.stage, right.stage],
             ErasedType::of::<(Left, Right)>(),
             ErasedType::of::<Output>(),
-        ))?;
-        Ok(self.flow(stage))
+        ));
+        self.flow(stage)
     }
 
     /// Maps one nested typed stage over every key.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    /// A foreign handle, invalid name, or duplicate stage is reported by
+    /// [`build`](Self::build).
+    #[must_use]
     pub fn map_each<K: 'static, I: 'static, O: 'static>(
         &mut self,
         input: KeyedFlow<K, I>,
         name: &str,
         component: &Component<I, O>,
-    ) -> Result<KeyedFlow<K, O>, CompositionError> {
-        self.validate_owner(input.owner)?;
+    ) -> KeyedFlow<K, O> {
+        record_failure(&mut self.errors, validate_origin(input.origin, self.origin));
+        record_failure(&mut self.errors, validate_name(name));
         let stage = self.add(StageRegistration::by_key::<K>(
-            StagePath::root(&self.id, name)?,
+            StagePath::root(&self.id, name),
             component.id(),
             &[input.stage],
             ErasedType::of::<I>(),
             ErasedType::of::<O>(),
-        ))?;
-        Ok(self.keyed_flow(stage))
+        ));
+        self.keyed_flow(stage)
     }
 
     /// Joins two keyed flows under one explicit missing-key policy.
     ///
     /// Policy is execution metadata; key type is enforced by signature.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    /// A foreign handle, invalid name, or duplicate stage is reported by
+    /// [`build`](Self::build).
+    #[must_use]
     pub fn join_by_key<K: 'static, A: 'static, B: 'static>(
         &mut self,
         left: KeyedFlow<K, A>,
         right: KeyedFlow<K, B>,
         name: &str,
         policy: KeyJoinPolicy,
-    ) -> Result<KeyedFlow<K, JoinItem<A, B>>, CompositionError> {
-        self.validate_owner(left.owner)?;
-        self.validate_owner(right.owner)?;
-        let component = ProviderId::new(format!("join.{name}"))
-            .map_err(|_| CompositionError::new(CompositionErrorKind::InvalidName))?;
+    ) -> KeyedFlow<K, JoinItem<A, B>> {
+        record_failure(&mut self.errors, validate_origin(left.origin, self.origin));
+        record_failure(&mut self.errors, validate_origin(right.origin, self.origin));
+        record_failure(&mut self.errors, validate_name(name));
+        let Ok(component) = ProviderId::new(format!("join.{name}")) else {
+            // Reachable only for a non-canonical name, already recorded above;
+            // build reports it before any stage index is read.
+            return self.keyed_flow(self.stages.len());
+        };
         let stage = self.add(StageRegistration::by_key::<K>(
-            StagePath::root(&self.id, name)?,
+            StagePath::root(&self.id, name),
             &component,
             &[left.stage, right.stage],
             ErasedType::of::<(A, B)>(),
             ErasedType::of::<JoinItem<A, B>>(),
-        ))?;
+        ));
         self.stages[stage].key_join_policy = Some(policy);
-        Ok(self.keyed_flow(stage))
+        self.keyed_flow(stage)
     }
 
     /// Aggregates keyed flow into one typed publication.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    /// A foreign handle, invalid name, or duplicate stage is reported by
+    /// [`build`](Self::build).
+    #[must_use]
     pub fn aggregate<K: 'static, I: 'static, O: 'static>(
         &mut self,
         input: KeyedFlow<K, I>,
         name: &str,
         component: &Component<Vec<I>, O>,
-    ) -> Result<Flow<O>, CompositionError> {
-        self.validate_owner(input.owner)?;
+    ) -> Flow<O> {
+        record_failure(&mut self.errors, validate_origin(input.origin, self.origin));
+        record_failure(&mut self.errors, validate_name(name));
         let stage = self.add(StageRegistration::single(
-            StagePath::root(&self.id, name)?,
+            StagePath::root(&self.id, name),
             component.id(),
             &[input.stage],
             ErasedType::of::<Vec<I>>(),
             ErasedType::of::<O>(),
-        ))?;
-        Ok(self.flow(stage))
+        ));
+        self.flow(stage)
     }
 
     /// Selects composition output.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] when handle belongs to another builder.
-    pub fn output<T: 'static>(&mut self, output: Flow<T>) -> Result<(), CompositionError> {
-        self.validate_owner(output.owner)?;
+    /// A handle from another builder is reported by [`build`](Self::build).
+    #[must_use]
+    pub fn output<T: 'static>(mut self, output: Flow<T>) -> Self {
+        record_failure(
+            &mut self.errors,
+            validate_origin(output.origin, self.origin),
+        );
         self.output = Some(output.stage);
-        Ok(())
+        self
     }
 
     /// Compiles immutable type-erased graph metadata.
     ///
     /// # Errors
     ///
-    /// Returns [`CompositionError`] when no output was selected.
+    /// Returns the first recorded construction failure: non-canonical name,
+    /// duplicate stage path, foreign flow handle, or missing output selection.
     pub fn build(self) -> Result<ProviderComposition, CompositionError> {
+        if let Some(error) = self.errors.into_iter().next() {
+            return Err(error);
+        }
         let output = self
             .output
             .ok_or_else(|| CompositionError::new(CompositionErrorKind::MissingOutput))?;
@@ -538,11 +544,14 @@ impl CompositionBuilder {
         ))
     }
 
-    fn add(&mut self, registration: StageRegistration<'_>) -> Result<usize, CompositionError> {
+    // Registers the stage unconditionally so flow indices stay consistent;
+    // a duplicate path is recorded and later reported by build.
+    fn add(&mut self, registration: StageRegistration<'_>) -> usize {
         if !self.paths.insert(registration.path.clone()) {
-            return Err(CompositionError::new(CompositionErrorKind::DuplicateStage(
-                registration.path,
-            )));
+            self.errors
+                .push(CompositionError::new(CompositionErrorKind::DuplicateStage(
+                    registration.path.clone(),
+                )));
         }
         let stage = self.stages.len();
         self.stages.push(StageNode {
@@ -554,19 +563,12 @@ impl CompositionBuilder {
             cardinality: registration.cardinality,
             key_join_policy: None,
         });
-        Ok(stage)
-    }
-
-    fn validate_owner(&self, owner: u64) -> Result<(), CompositionError> {
-        if owner != self.token {
-            return Err(CompositionError::new(CompositionErrorKind::ForeignFlow));
-        }
-        Ok(())
+        stage
     }
 
     const fn flow<T: 'static>(&self, stage: usize) -> Flow<T> {
         Flow {
-            owner: self.token,
+            origin: self.origin,
             stage,
             _value: PhantomData,
         }
@@ -574,7 +576,7 @@ impl CompositionBuilder {
 
     const fn keyed_flow<K: 'static, T: 'static>(&self, stage: usize) -> KeyedFlow<K, T> {
         KeyedFlow {
-            owner: self.token,
+            origin: self.origin,
             stage,
             _value: PhantomData,
         }
@@ -584,50 +586,61 @@ impl CompositionBuilder {
 impl CompositionScope<'_> {
     /// Connects one typed input inside this scope.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    /// A foreign handle, invalid name, or duplicate stage is reported by the
+    /// builder's [`build`](CompositionBuilder::build).
+    #[must_use]
     pub fn then<I: 'static, O: 'static>(
         &mut self,
         input: Flow<I>,
         name: &str,
         component: &Component<I, O>,
-    ) -> Result<Flow<O>, CompositionError> {
-        self.builder.validate_owner(input.owner)?;
-        let path = StagePath::nested(&self.builder.id, &self.name, name)?;
+    ) -> Flow<O> {
+        record_failure(
+            &mut self.builder.errors,
+            validate_origin(input.origin, self.builder.origin),
+        );
+        record_failure(&mut self.builder.errors, validate_name(name));
+        let path = StagePath::nested(&self.builder.id, &self.name, name);
         let stage = self.builder.add(StageRegistration::single(
             path,
             component.id(),
             &[input.stage],
             ErasedType::of::<I>(),
             ErasedType::of::<O>(),
-        ))?;
-        Ok(self.builder.flow(stage))
+        ));
+        self.builder.flow(stage)
     }
 
     /// Connects two typed inputs inside this scope.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for foreign handle, invalid name, or duplicate stage.
+    /// A foreign handle, invalid name, or duplicate stage is reported by the
+    /// builder's [`build`](CompositionBuilder::build).
+    #[must_use]
     pub fn combine<Left: 'static, Right: 'static, Output: 'static>(
         &mut self,
         left: Flow<Left>,
         right: Flow<Right>,
         name: &str,
         component: &Component<(Left, Right), Output>,
-    ) -> Result<Flow<Output>, CompositionError> {
-        self.builder.validate_owner(left.owner)?;
-        self.builder.validate_owner(right.owner)?;
-        let path = StagePath::nested(&self.builder.id, &self.name, name)?;
+    ) -> Flow<Output> {
+        record_failure(
+            &mut self.builder.errors,
+            validate_origin(left.origin, self.builder.origin),
+        );
+        record_failure(
+            &mut self.builder.errors,
+            validate_origin(right.origin, self.builder.origin),
+        );
+        record_failure(&mut self.builder.errors, validate_name(name));
+        let path = StagePath::nested(&self.builder.id, &self.name, name);
         let stage = self.builder.add(StageRegistration::single(
             path,
             component.id(),
             &[left.stage, right.stage],
             ErasedType::of::<(Left, Right)>(),
             ErasedType::of::<Output>(),
-        ))?;
-        Ok(self.builder.flow(stage))
+        ));
+        self.builder.flow(stage)
     }
 }
 
@@ -692,25 +705,82 @@ impl ProviderComposition {
             id: self.id.clone(),
             nodes: self.nodes.to_vec(),
             output: self.output,
+            errors: Vec::new(),
         }
     }
 }
 
 /// Immutable composition recipe editor.
+///
+/// Edits chain by value; every recorded edit failure surfaces once, at
+/// [`build`](Self::build).
 #[derive(Debug)]
 pub struct CompositionEditor {
     id: CompositionId,
     nodes: Vec<StageNode>,
     output: usize,
+    errors: Vec<CompositionError>,
 }
 
 impl CompositionEditor {
     /// Inserts one type-preserving transform after named stage and rewires consumers.
     ///
+    /// A missing stage, invalid or duplicate name, or type mismatch is
+    /// reported by [`build`](Self::build).
+    #[must_use]
+    pub fn insert_after<T: 'static>(
+        mut self,
+        path: &str,
+        name: &str,
+        component: &Component<T, T>,
+    ) -> Self {
+        let result = self.try_insert_after::<T>(path, name, component);
+        record_failure(&mut self.errors, result);
+        self
+    }
+
+    /// Replaces implementation while preserving exact output type.
+    ///
+    /// A missing stage or incompatible type is reported by [`build`](Self::build).
+    #[must_use]
+    pub fn replace<I: 'static, O: 'static>(
+        mut self,
+        path: &str,
+        component: &Component<I, O>,
+    ) -> Self {
+        let result = self.try_replace::<I, O>(path, component);
+        record_failure(&mut self.errors, result);
+        self
+    }
+
+    /// Removes an unused non-output stage.
+    ///
+    /// A missing or still-referenced stage is reported by [`build`](Self::build).
+    #[must_use]
+    pub fn remove(mut self, path: &str) -> Self {
+        let result = self.try_remove(path);
+        record_failure(&mut self.errors, result);
+        self
+    }
+
+    /// Builds edited immutable composition.
+    ///
     /// # Errors
     ///
-    /// Returns [`CompositionError`] for missing stage, invalid/duplicate name, or type mismatch.
-    pub fn insert_after<T: 'static>(
+    /// Returns the first recorded edit failure: missing stage, non-canonical or
+    /// duplicate name, incompatible types, or removal of a referenced stage.
+    pub fn build(self) -> Result<ProviderComposition, CompositionError> {
+        if let Some(error) = self.errors.into_iter().next() {
+            return Err(error);
+        }
+        Ok(ProviderComposition::from_nodes(
+            self.id,
+            self.nodes,
+            self.output,
+        ))
+    }
+
+    fn try_insert_after<T: 'static>(
         &mut self,
         path: &str,
         name: &str,
@@ -722,26 +792,14 @@ impl CompositionEditor {
                 self.nodes[index].path.clone(),
             )));
         }
-        let new_path = StagePath::root(&self.id, name)?;
+        validate_name(name)?;
+        let new_path = StagePath::root(&self.id, name);
         if self.nodes.iter().any(|node| node.path == new_path) {
             return Err(CompositionError::new(CompositionErrorKind::DuplicateStage(
                 new_path,
             )));
         }
-        for node in &mut self.nodes {
-            for input in &mut node.inputs {
-                if *input == index {
-                    *input = index + 1;
-                } else if *input > index {
-                    *input += 1;
-                }
-            }
-        }
-        if self.output == index {
-            self.output = index + 1;
-        } else if self.output > index {
-            self.output += 1;
-        }
+        self.remap_stage_references(|stage| if stage >= index { stage + 1 } else { stage });
         self.nodes.insert(
             index + 1,
             StageNode {
@@ -757,12 +815,7 @@ impl CompositionEditor {
         Ok(())
     }
 
-    /// Replaces implementation while preserving exact output type.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] for missing stage or incompatible output type.
-    pub fn replace<I: 'static, O: 'static>(
+    fn try_replace<I: 'static, O: 'static>(
         &mut self,
         path: &str,
         component: &Component<I, O>,
@@ -779,12 +832,7 @@ impl CompositionEditor {
         Ok(())
     }
 
-    /// Removes an unused non-output stage.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError`] when stage is missing or still referenced.
-    pub fn remove(&mut self, path: &str) -> Result<(), CompositionError> {
+    fn try_remove(&mut self, path: &str) -> Result<(), CompositionError> {
         let index = self.index(path)?;
         if index == self.output || self.nodes.iter().any(|node| node.inputs.contains(&index)) {
             return Err(CompositionError::new(CompositionErrorKind::DanglingInput(
@@ -792,23 +840,8 @@ impl CompositionEditor {
             )));
         }
         self.nodes.remove(index);
-        for node in &mut self.nodes {
-            for input in &mut node.inputs {
-                if *input > index {
-                    *input -= 1;
-                }
-            }
-        }
-        if self.output > index {
-            self.output -= 1;
-        }
+        self.remap_stage_references(|stage| if stage > index { stage - 1 } else { stage });
         Ok(())
-    }
-
-    /// Builds edited immutable composition.
-    #[must_use]
-    pub fn build(self) -> ProviderComposition {
-        ProviderComposition::from_nodes(self.id, self.nodes, self.output)
     }
 
     fn index(&self, path: &str) -> Result<usize, CompositionError> {
@@ -819,6 +852,17 @@ impl CompositionEditor {
                 CompositionError::new(CompositionErrorKind::StageNotFound(StagePath(path.into())))
             })
     }
+
+    // Every stage index lives in node inputs and the output selector; one remap
+    // keeps both consistent when insertion or removal shifts positions.
+    fn remap_stage_references(&mut self, remap: impl Fn(usize) -> usize) {
+        for node in &mut self.nodes {
+            for input in &mut node.inputs {
+                *input = remap(*input);
+            }
+        }
+        self.output = remap(self.output);
+    }
 }
 
 fn validate_name(name: &str) -> Result<(), CompositionError> {
@@ -826,6 +870,21 @@ fn validate_name(name: &str) -> Result<(), CompositionError> {
         return Err(CompositionError::new(CompositionErrorKind::InvalidName));
     }
     Ok(())
+}
+
+fn validate_origin(flow_origin: u64, builder_origin: u64) -> Result<(), CompositionError> {
+    if flow_origin != builder_origin {
+        return Err(CompositionError::new(CompositionErrorKind::ForeignFlow));
+    }
+    Ok(())
+}
+
+// Deferred-validation kernel: chained construction records failures here and
+// build reports the first one.
+fn record_failure(errors: &mut Vec<CompositionError>, result: Result<(), CompositionError>) {
+    if let Err(error) = result {
+        errors.push(error);
+    }
 }
 
 /// Explicit keyed join policy.
@@ -868,28 +927,45 @@ pub struct JoinCoverage<K, L, R> {
     pub missing: Vec<(K, MissingSide)>,
 }
 
+/// Both keyed inputs of one join, named by side.
+#[derive(Debug)]
+pub struct JoinSides<'a, K, L, R> {
+    /// Left keyed input.
+    pub left: &'a BTreeMap<K, L>,
+    /// Right keyed input.
+    pub right: &'a BTreeMap<K, R>,
+}
+
+impl<K, L, R> Copy for JoinSides<'_, K, L, R> {}
+
+impl<K, L, R> Clone for JoinSides<'_, K, L, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 /// Aligns keyed values without silently dropping missing-item coverage.
 #[must_use]
 pub fn join_keyed<K, L, R>(
     policy: KeyJoinPolicy,
-    left: &BTreeMap<K, L>,
-    right: &BTreeMap<K, R>,
+    sides: JoinSides<'_, K, L, R>,
 ) -> JoinCoverage<K, L, R>
 where
     K: Clone + Ord,
     L: Clone,
     R: Clone,
 {
-    let keys = left
+    let keys = sides
+        .left
         .keys()
-        .chain(right.keys())
+        .chain(sides.right.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut items = BTreeMap::new();
     let mut missing = Vec::new();
     for key in keys {
-        let left_value = left.get(&key).cloned();
-        let right_value = right.get(&key).cloned();
+        let left_value = sides.left.get(&key).cloned();
+        let right_value = sides.right.get(&key).cloned();
         if left_value.is_none() {
             missing.push((key.clone(), MissingSide::Left));
         }
@@ -1061,37 +1137,28 @@ mod tests {
         Component::new(ProviderId::new(id).expect("valid component fixture"))
     }
 
+    fn composition_id(id: &str) -> CompositionId {
+        CompositionId::new(id).expect("valid composition fixture")
+    }
+
     #[test]
     fn linear_and_multi_input_flows_compile_without_visible_downcast() {
-        let mut builder = CompositionBuilder::new(
-            CompositionId::new("python-context").expect("valid composition fixture"),
+        let mut builder = CompositionBuilder::new(composition_id("python-context"));
+        let source = builder.source("project", &component::<(), Sources>("project"));
+        let syntax = builder.then(source, "syntax", &component::<Sources, Syntax>("syntax"));
+        let semantics = builder.scope("semantics").combine(
+            source,
+            syntax,
+            "ty",
+            &component::<(Sources, Syntax), Semantics>("semantics"),
         );
-        let source = builder
-            .source("project", &component::<(), Sources>("project"))
-            .expect("source stage must build");
-        let syntax = builder
-            .then(source, "syntax", &component::<Sources, Syntax>("syntax"))
-            .expect("syntax stage must build");
-        let semantics = builder
-            .scope("semantics")
-            .expect("nested scope")
-            .combine(
-                source,
-                syntax,
-                "ty",
-                &component::<(Sources, Syntax), Semantics>("semantics"),
-            )
-            .expect("multi-input stage must build");
-        let facts = builder
-            .combine(
-                syntax,
-                semantics,
-                "merge",
-                &component::<(Syntax, Semantics), Facts>("merge"),
-            )
-            .expect("merge stage must build");
-        builder.output(facts).expect("owned output");
-        let composition = builder.build().expect("complete graph");
+        let facts = builder.combine(
+            syntax,
+            semantics,
+            "merge",
+            &component::<(Syntax, Semantics), Facts>("merge"),
+        );
+        let composition = builder.output(facts).build().expect("complete graph");
 
         assert_eq!(composition.steps().len(), 4);
         assert_eq!(composition.steps()[2].inputs().len(), 2);
@@ -1106,34 +1173,22 @@ mod tests {
 
     #[test]
     fn keyed_mapping_join_and_aggregate_retain_cardinality() {
-        let mut builder = CompositionBuilder::new(
-            CompositionId::new("history").expect("valid composition fixture"),
+        let mut builder = CompositionBuilder::new(composition_id("history"));
+        let revisions =
+            builder.source_many::<u64, Sources>("revisions", &component::<(), Sources>("git"));
+        let syntax = builder.map_each(revisions, "syntax", &component::<Sources, Syntax>("syntax"));
+        let metadata = builder.map_each(
+            revisions,
+            "metadata",
+            &component::<Sources, Metadata>("metadata"),
         );
-        let revisions = builder
-            .source_many::<u64, Sources>("revisions", &component::<(), Sources>("git"))
-            .expect("keyed source");
-        let syntax = builder
-            .map_each(revisions, "syntax", &component::<Sources, Syntax>("syntax"))
-            .expect("keyed map");
-        let metadata = builder
-            .map_each(
-                revisions,
-                "metadata",
-                &component::<Sources, Metadata>("metadata"),
-            )
-            .expect("second keyed map");
-        let joined = builder
-            .join_by_key(syntax, metadata, "join", KeyJoinPolicy::Exact)
-            .expect("typed keyed join");
-        let aggregate = builder
-            .aggregate(
-                joined,
-                "aggregate",
-                &component::<Vec<JoinItem<Syntax, Metadata>>, Facts>("aggregate"),
-            )
-            .expect("aggregate");
-        builder.output(aggregate).expect("owned output");
-        let composition = builder.build().expect("complete graph");
+        let joined = builder.join_by_key(syntax, metadata, "join", KeyJoinPolicy::Exact);
+        let aggregate = builder.aggregate(
+            joined,
+            "aggregate",
+            &component::<Vec<JoinItem<Syntax, Metadata>>, Facts>("aggregate"),
+        );
+        let composition = builder.output(aggregate).build().expect("complete graph");
 
         assert!(matches!(
             composition
@@ -1159,6 +1214,70 @@ mod tests {
     }
 
     #[test]
+    fn cloned_keyed_flow_handle_stays_connectable() {
+        let mut builder = CompositionBuilder::new(composition_id("keyed-clone"));
+        let revisions =
+            builder.source_many::<u64, Sources>("revisions", &component::<(), Sources>("git"));
+        #[expect(clippy::clone_on_copy, reason = "exercises the manual Clone impl")]
+        let cloned = revisions.clone();
+        let syntax = builder.map_each(cloned, "syntax", &component::<Sources, Syntax>("syntax"));
+        let aggregate = builder.aggregate(
+            syntax,
+            "aggregate",
+            &component::<Vec<Syntax>, Facts>("aggregate"),
+        );
+        let composition = builder.output(aggregate).build().expect("complete graph");
+        assert_eq!(
+            composition
+                .stage("keyed-clone.syntax")
+                .expect("stage")
+                .inputs()[0]
+                .as_str(),
+            "keyed-clone.revisions"
+        );
+    }
+
+    #[test]
+    fn join_with_control_character_name_fails_at_build() {
+        let mut builder = CompositionBuilder::new(composition_id("history"));
+        let revisions =
+            builder.source_many::<u64, Sources>("revisions", &component::<(), Sources>("git"));
+        let syntax = builder.map_each(revisions, "syntax", &component::<Sources, Syntax>("syntax"));
+        let metadata = builder.map_each(
+            revisions,
+            "metadata",
+            &component::<Sources, Metadata>("metadata"),
+        );
+        let joined = builder.join_by_key(syntax, metadata, "join\u{0}", KeyJoinPolicy::Inner);
+        let aggregate = builder.aggregate(
+            joined,
+            "aggregate",
+            &component::<Vec<JoinItem<Syntax, Metadata>>, Facts>("aggregate"),
+        );
+        let error = builder
+            .output(aggregate)
+            .build()
+            .expect_err("control character in join name must fail");
+        assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+    }
+
+    #[test]
+    fn join_sides_copy_and_clone_agree() {
+        let left = BTreeMap::from([(1, "left-1")]);
+        let right = BTreeMap::from([(1, "right-1")]);
+        let sides = JoinSides {
+            left: &left,
+            right: &right,
+        };
+        #[expect(clippy::clone_on_copy, reason = "exercises the manual Clone impl")]
+        let cloned = sides.clone();
+        assert_eq!(
+            join_keyed(KeyJoinPolicy::Exact, sides).items,
+            join_keyed(KeyJoinPolicy::Exact, cloned).items
+        );
+    }
+
+    #[test]
     fn join_policies_report_every_missing_side() {
         let left = BTreeMap::from([(1, "left-1"), (2, "left-2")]);
         let right = BTreeMap::from([(2, "right-2"), (3, "right-3")]);
@@ -1168,7 +1287,13 @@ mod tests {
             (KeyJoinPolicy::Left, vec![1, 2]),
             (KeyJoinPolicy::Union, vec![1, 2, 3]),
         ] {
-            let joined = join_keyed(policy, &left, &right);
+            let joined = join_keyed(
+                policy,
+                JoinSides {
+                    left: &left,
+                    right: &right,
+                },
+            );
             assert_eq!(
                 joined.items.keys().copied().collect::<Vec<_>>(),
                 expected_keys
@@ -1232,61 +1357,56 @@ mod tests {
             )
             .expect_err("cache bound must reject before mutation");
         assert_eq!(error.violation(), CacheViolation::TooManyKeys);
+        assert_eq!(error.to_string(), error.descriptor().explanation());
         assert_eq!(cache.get(&2).map(String::as_str), Some("2"));
     }
 
     #[test]
     fn editing_replaces_compatible_stage_and_rejects_dangling_remove() {
-        let mut builder = CompositionBuilder::new(
-            CompositionId::new("core-syntax").expect("valid composition fixture"),
-        );
-        let source = builder
-            .source("project", &component::<(), Sources>("project"))
-            .expect("source");
-        let _spare = builder
-            .source("spare", &component::<(), Sources>("spare"))
-            .expect("unused source");
-        let syntax = builder
-            .then(source, "syntax", &component::<Sources, Syntax>("syntax"))
-            .expect("syntax");
-        builder.output(syntax).expect("output");
-        let composition = builder.build().expect("complete graph");
-        let mut editor = composition.edit();
-        editor
-            .insert_after(
-                "core-syntax.syntax",
-                "normalize-docs",
-                &component::<Syntax, Syntax>("normalize-docs"),
-            )
-            .expect("type-preserving transform insertion");
-        let mismatch = editor
+        let mut builder = CompositionBuilder::new(composition_id("core-syntax"));
+        let source = builder.source("project", &component::<(), Sources>("project"));
+        let _spare = builder.source("spare", &component::<(), Sources>("spare"));
+        let syntax = builder.then(source, "syntax", &component::<Sources, Syntax>("syntax"));
+        let composition = builder.output(syntax).build().expect("complete graph");
+
+        let mismatch = composition
+            .edit()
             .replace(
                 "core-syntax.syntax",
                 &component::<Metadata, Syntax>("wrong-input"),
             )
+            .build()
             .expect_err("replacement input type must match");
         assert!(matches!(
             mismatch.kind(),
             CompositionErrorKind::TypeMismatch(_)
         ));
-        editor
-            .replace(
-                "core-syntax.syntax",
-                &component::<Sources, Syntax>("custom-syntax"),
-            )
-            .expect("same output type replacement");
-        editor
-            .remove("core-syntax.spare")
-            .expect("unused stage can be removed");
-        let error = editor
+
+        let error = composition
+            .edit()
             .remove("core-syntax.project")
+            .build()
             .expect_err("used source cannot be removed");
         assert!(matches!(
             error.kind(),
             CompositionErrorKind::DanglingInput(_)
         ));
         assert_eq!(error.to_string(), error.descriptor().explanation());
-        let edited = editor.build();
+
+        let edited = composition
+            .edit()
+            .insert_after(
+                "core-syntax.syntax",
+                "normalize-docs",
+                &component::<Syntax, Syntax>("normalize-docs"),
+            )
+            .replace(
+                "core-syntax.syntax",
+                &component::<Sources, Syntax>("custom-syntax"),
+            )
+            .remove("core-syntax.spare")
+            .build()
+            .expect("chained edits");
         assert_eq!(
             edited
                 .stage("core-syntax.syntax")
@@ -1307,48 +1427,31 @@ mod tests {
 
     #[test]
     fn routed_external_output_reenters_typed_syntax_flow() {
-        let mut builder = CompositionBuilder::new(
-            CompositionId::new("tailwind").expect("valid composition fixture"),
+        let mut builder = CompositionBuilder::new(composition_id("tailwind"));
+        let authored = builder.source("css", &component::<(), Sources>("css-source"));
+        let templates = builder.source("templates", &component::<(), Templates>("templates"));
+        let generated = builder.scope("external").then(
+            templates,
+            "tailwind",
+            &component::<Templates, GeneratedSource>("tailwind-command"),
         );
-        let authored = builder
-            .source("css", &component::<(), Sources>("css-source"))
-            .expect("authored css source");
-        let templates = builder
-            .source("templates", &component::<(), Templates>("templates"))
-            .expect("template source");
-        let generated = builder
-            .scope("external")
-            .expect("external scope")
-            .then(
-                templates,
-                "tailwind",
-                &component::<Templates, GeneratedSource>("tailwind-command"),
-            )
-            .expect("fake external command stage");
-        let generated_syntax = builder
-            .then(
-                generated,
-                "generated-syntax",
-                &component::<GeneratedSource, Syntax>("css-syntax"),
-            )
-            .expect("generated source returns to syntax");
-        let authored_syntax = builder
-            .then(
-                authored,
-                "authored-syntax",
-                &component::<Sources, Syntax>("css-syntax"),
-            )
-            .expect("authored syntax");
-        let merged = builder
-            .combine(
-                authored_syntax,
-                generated_syntax,
-                "merge",
-                &component::<(Syntax, Syntax), Facts>("css-merge"),
-            )
-            .expect("typed merge");
-        builder.output(merged).expect("owned output");
-        let composition = builder.build().expect("complete route");
+        let generated_syntax = builder.then(
+            generated,
+            "generated-syntax",
+            &component::<GeneratedSource, Syntax>("css-syntax"),
+        );
+        let authored_syntax = builder.then(
+            authored,
+            "authored-syntax",
+            &component::<Sources, Syntax>("css-syntax"),
+        );
+        let merged = builder.combine(
+            authored_syntax,
+            generated_syntax,
+            "merge",
+            &component::<(Syntax, Syntax), Facts>("css-merge"),
+        );
+        let composition = builder.output(merged).build().expect("complete route");
 
         assert_eq!(
             composition
@@ -1360,29 +1463,29 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_foreign_flow_duplicate_stage_and_missing_output() {
-        let mut first = CompositionBuilder::new(
-            CompositionId::new("first").expect("valid composition fixture"),
-        );
-        let flow = first
-            .source("source", &component::<(), Sources>("source"))
-            .expect("source");
+    fn build_reports_first_of_duplicate_foreign_and_missing_output() {
+        let mut first = CompositionBuilder::new(composition_id("first"));
+        let flow = first.source("source", &component::<(), Sources>("source"));
+        let _duplicate = first.source("source", &component::<(), Sources>("other"));
         let duplicate = first
-            .source("source", &component::<(), Sources>("other"))
+            .output(flow)
+            .build()
             .expect_err("duplicate scoped path must fail");
         assert!(matches!(
             duplicate.kind(),
             CompositionErrorKind::DuplicateStage(_)
         ));
 
-        let mut second = CompositionBuilder::new(
-            CompositionId::new("second").expect("valid composition fixture"),
-        );
+        let mut second = CompositionBuilder::new(composition_id("second"));
+        let _foreign = second.then(flow, "syntax", &component::<Sources, Syntax>("syntax"));
         let foreign = second
-            .then(flow, "syntax", &component::<Sources, Syntax>("syntax"))
-            .expect_err("foreign handle must fail");
+            .build()
+            .expect_err("foreign handle must fail before missing output");
         assert_eq!(foreign.kind(), &CompositionErrorKind::ForeignFlow);
-        let missing = second.build().expect_err("output is required");
+
+        let missing = CompositionBuilder::new(composition_id("third"))
+            .build()
+            .expect_err("output is required");
         assert_eq!(missing.kind(), &CompositionErrorKind::MissingOutput);
     }
 
@@ -1390,22 +1493,180 @@ mod tests {
     fn stage_names_are_bounded_canonical_ascii() {
         let invalid = ["", "Uppercase", "two.words"];
         for name in invalid {
-            let mut builder = CompositionBuilder::new(
-                CompositionId::new("names").expect("valid composition fixture"),
-            );
+            let mut builder = CompositionBuilder::new(composition_id("names"));
+            let flow = builder.source(name, &component::<(), Sources>("source"));
             let error = builder
-                .source(name, &component::<(), Sources>("source"))
+                .output(flow)
+                .build()
                 .expect_err("non-canonical stage name must fail");
             assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
         }
 
-        let mut builder = CompositionBuilder::new(
-            CompositionId::new("names").expect("valid composition fixture"),
-        );
+        let mut builder = CompositionBuilder::new(composition_id("names"));
         let over_limit = "x".repeat(STAGE_NAME_BYTES_MAX + 1);
+        let flow = builder.source(&over_limit, &component::<(), Sources>("source"));
         let error = builder
-            .source(&over_limit, &component::<(), Sources>("source"))
+            .output(flow)
+            .build()
             .expect_err("oversized stage name must fail");
         assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+    }
+
+    #[test]
+    fn descriptors_expose_identity_paths_and_recorded_types() {
+        let mut builder = CompositionBuilder::new(composition_id("catalog"));
+        let source = builder.source("project", &component::<(), Sources>("project"));
+        let syntax = builder.then(source, "syntax", &component::<Sources, Syntax>("syntax"));
+        let composition = builder.output(syntax).build().expect("complete graph");
+
+        assert_eq!(composition.id().as_str(), "catalog");
+        let stage = composition.stage("catalog.syntax").expect("syntax stage");
+        assert_eq!(stage.path().to_string(), "catalog.syntax");
+        assert_eq!(stage.component_input_type(), type_name::<Sources>());
+        assert_eq!(stage.cardinality(), FlowCardinality::Single);
+    }
+
+    #[test]
+    fn error_context_names_offending_stage_when_present() {
+        let mut builder = CompositionBuilder::new(composition_id("dup"));
+        let flow = builder.source("stage", &component::<(), Sources>("stage"));
+        let _second = builder.source("stage", &component::<(), Sources>("again"));
+        let duplicate = builder
+            .output(flow)
+            .build()
+            .expect_err("duplicate stage path");
+        assert_eq!(duplicate.stage().map(StagePath::as_str), Some("dup.stage"));
+
+        let missing = CompositionBuilder::new(composition_id("empty"))
+            .build()
+            .expect_err("missing output");
+        assert!(missing.stage().is_none());
+    }
+
+    #[test]
+    fn cloned_flow_handle_stays_connectable() {
+        let mut builder = CompositionBuilder::new(composition_id("clone"));
+        let flow = builder.source("project", &component::<(), Sources>("project"));
+        #[expect(clippy::clone_on_copy, reason = "exercises the manual Clone impl")]
+        let cloned = flow.clone();
+        let syntax = builder.then(cloned, "syntax", &component::<Sources, Syntax>("syntax"));
+        let composition = builder.output(syntax).build().expect("complete graph");
+        assert_eq!(
+            composition.stage("clone.syntax").expect("stage").inputs()[0].as_str(),
+            "clone.project"
+        );
+    }
+
+    #[test]
+    fn non_canonical_scope_name_fails_at_build() {
+        let mut builder = CompositionBuilder::new(composition_id("scoped"));
+        let source = builder.source("project", &component::<(), Sources>("project"));
+        let scoped = builder.scope("Uppercase").then(
+            source,
+            "syntax",
+            &component::<Sources, Syntax>("syntax"),
+        );
+        let error = builder
+            .output(scoped)
+            .build()
+            .expect_err("scope name must be canonical");
+        assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+    }
+
+    #[test]
+    fn output_handle_from_another_builder_is_foreign() {
+        let mut first = CompositionBuilder::new(composition_id("one"));
+        let flow = first.source("source", &component::<(), Sources>("source"));
+        let mut second = CompositionBuilder::new(composition_id("two"));
+        let _own = second.source("source", &component::<(), Sources>("source"));
+        let error = second
+            .output(flow)
+            .build()
+            .expect_err("foreign output handle");
+        assert_eq!(error.kind(), &CompositionErrorKind::ForeignFlow);
+    }
+
+    fn project_syntax_composition() -> ProviderComposition {
+        let mut builder = CompositionBuilder::new(composition_id("core"));
+        let source = builder.source("project", &component::<(), Sources>("project"));
+        let syntax = builder.then(source, "syntax", &component::<Sources, Syntax>("syntax"));
+        builder.output(syntax).build().expect("complete graph")
+    }
+
+    #[test]
+    fn editor_rejects_missing_stage_incompatible_and_duplicate_inserts() {
+        let composition = project_syntax_composition();
+
+        let not_found = composition
+            .edit()
+            .replace("core.absent", &component::<Sources, Syntax>("other"))
+            .build()
+            .expect_err("unknown stage path");
+        assert!(matches!(
+            not_found.kind(),
+            CompositionErrorKind::StageNotFound(_)
+        ));
+        assert_eq!(
+            not_found.stage().map(StagePath::as_str),
+            Some("core.absent")
+        );
+
+        let mismatch = composition
+            .edit()
+            .insert_after(
+                "core.project",
+                "cleanup",
+                &component::<Syntax, Syntax>("cleanup"),
+            )
+            .build()
+            .expect_err("transform type must match stage output");
+        assert!(matches!(
+            mismatch.kind(),
+            CompositionErrorKind::TypeMismatch(_)
+        ));
+        assert_eq!(
+            mismatch.stage().map(StagePath::as_str),
+            Some("core.project")
+        );
+
+        let duplicate = composition
+            .edit()
+            .insert_after(
+                "core.syntax",
+                "project",
+                &component::<Syntax, Syntax>("shadow"),
+            )
+            .build()
+            .expect_err("inserted stage path already exists");
+        assert!(matches!(
+            duplicate.kind(),
+            CompositionErrorKind::DuplicateStage(_)
+        ));
+
+        let invalid = composition
+            .edit()
+            .insert_after(
+                "core.syntax",
+                "Bad-Name",
+                &component::<Syntax, Syntax>("bad"),
+            )
+            .build()
+            .expect_err("inserted stage name must be canonical");
+        assert_eq!(invalid.kind(), &CompositionErrorKind::InvalidName);
+    }
+
+    #[test]
+    fn editor_reports_first_failure_across_chained_edits() {
+        let composition = project_syntax_composition();
+        let error = composition
+            .edit()
+            .replace("core.syntax", &component::<Metadata, Syntax>("wrong-input"))
+            .remove("core.absent")
+            .build()
+            .expect_err("first failure must win");
+        assert!(matches!(
+            error.kind(),
+            CompositionErrorKind::TypeMismatch(_)
+        ));
     }
 }

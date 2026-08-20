@@ -165,13 +165,19 @@ fn validate_common(value: &str, kind: PathKind, bytes_max: usize) -> Result<(), 
     if value.chars().any(char::is_control) {
         return Err(path_error(kind, PathViolation::ControlCharacter));
     }
-    if value
-        .split('/')
-        .any(|segment| matches!(segment, "." | ".."))
-    {
+    if value.split('/').any(is_dot_segment) {
         return Err(path_error(kind, PathViolation::DotSegment));
     }
     Ok(())
+}
+
+// Explicit match per review request; equivalent `matches!` trips clippy needlessly.
+#[allow(clippy::match_like_matches_macro)]
+fn is_dot_segment(segment: &str) -> bool {
+    match segment {
+        "." | ".." => true,
+        _ => false,
+    }
 }
 
 const fn path_error(kind: PathKind, violation: PathViolation) -> PathError {
