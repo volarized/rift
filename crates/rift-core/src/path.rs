@@ -151,24 +151,24 @@ impl fmt::Display for SourcePath {
 }
 
 fn validate_common(value: &str, kind: PathKind, bytes_max: usize) -> Result<(), PathError> {
-    if value.len() > bytes_max {
-        return Err(path_error(kind, PathViolation::TooLong));
+    match path_violation(value, bytes_max) {
+        Some(violation) => Err(path_error(kind, violation)),
+        None => Ok(()),
     }
-    if value.starts_with('/')
-        || matches!(value.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
-    {
-        return Err(path_error(kind, PathViolation::Absolute));
+}
+
+/// Classifies one path value against the rules every path kind shares. Arms
+/// are ordered by precedence: the first matching rule names the violation.
+fn path_violation(value: &str, bytes_max: usize) -> Option<PathViolation> {
+    match value.as_bytes() {
+        bytes if bytes.len() > bytes_max => Some(PathViolation::TooLong),
+        [b'/', ..] => Some(PathViolation::Absolute),
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => Some(PathViolation::Absolute),
+        bytes if bytes.contains(&b'\\') => Some(PathViolation::Backslash),
+        _ if value.chars().any(char::is_control) => Some(PathViolation::ControlCharacter),
+        _ if value.split('/').any(is_dot_segment) => Some(PathViolation::DotSegment),
+        _ => None,
     }
-    if value.contains('\\') {
-        return Err(path_error(kind, PathViolation::Backslash));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(path_error(kind, PathViolation::ControlCharacter));
-    }
-    if value.split('/').any(is_dot_segment) {
-        return Err(path_error(kind, PathViolation::DotSegment));
-    }
-    Ok(())
 }
 
 // Explicit match per review request; equivalent `matches!` trips clippy needlessly.
