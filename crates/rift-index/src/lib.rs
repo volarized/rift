@@ -4,7 +4,7 @@ mod workspace;
 
 pub use workspace::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
-    WorkspaceIndexLimits, WorkspaceIndexViolation,
+    WorkspaceIndexFault, WorkspaceIndexLimits, WorkspaceIndexViolation,
 };
 
 /// Compile-time marker for index-layer ownership.

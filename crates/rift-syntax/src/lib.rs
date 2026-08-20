@@ -4,8 +4,8 @@ mod rust;
 
 pub use rust::{
     ByteRange, RustGrammarNodeKind, RustNode, RustQuery, RustQueryCapture, RustSource, RustSymbol,
-    RustSymbolKind, RustSyntaxDocument, RustSyntaxError, RustSyntaxLimits, RustSyntaxProvider,
-    RustSyntaxViolation, RustVisibility,
+    RustSymbolKind, RustSyntaxBound, RustSyntaxDocument, RustSyntaxError, RustSyntaxFault,
+    RustSyntaxLimits, RustSyntaxProvider, RustSyntaxViolation, RustVisibility,
 };
 
 /// Compile-time marker for syntax-layer ownership.
