@@ -7,9 +7,10 @@ pub struct BudgetExhausted {
 }
 
 impl BudgetExhausted {
-    crate::property! {
-        /// Returns configured iteration limit.
-        pub const fn limit(self) -> usize = self.limit;
+    /// Returns configured iteration limit.
+    #[must_use]
+    pub const fn limit(self) -> usize {
+        self.limit
     }
 }
 
