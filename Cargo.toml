@@ -21,6 +21,7 @@ rift-syntax = { path = "crates/rift-syntax" }
 
 clap = { version = "4.6.5", features = ["derive"] }
 data-encoding = "2.6.0"
+diffy = "0.5.1"
 flate2 = "1.1.9"
 fs4 = "1.1.0"
 percent-encoding = "2.3.1"

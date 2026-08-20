@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 data-encoding.workspace = true
+diffy.workspace = true
 percent-encoding.workspace = true
 rift-core.workspace = true
 rift-index.workspace = true
