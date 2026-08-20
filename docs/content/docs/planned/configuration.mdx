@@ -1,0 +1,152 @@
+---
+title: Configuration
+---
+
+<VersionBadge version="planned" />
+
+Rift reads `rift.toml` from the workspace root. The generated
+[`rift.schema.json`](https://github.com/volarized/rift/blob/main/protocol/rift.schema.json) defines
+the file and rejects any key it doesn't know, so a typo fails at load rather than being silently
+ignored. Edits take effect for later requests once validation passes; while the file is
+invalid, requests fail with `configuration_invalid` until you fix it.
+
+An editor that supports TOML schema directives can load the generated schema:
+
+```toml
+#:schema ./protocol/rift.schema.json
+```
+
+Treat `rift.toml` as executable workspace configuration. Hooks named by a repository run after
+Rift applies a change, using the server's OS permissions, so inspect the file before enabling the
+workspace.
+
+A change to `rift.toml` made in a projection carries a `configuration` confirmation into
+[`publish`](/docs/planned/protocol/mcp#tool-publish), because publishing it changes which hooks
+and limits the server runs with.
+
+## Execution
+
+[`execute`](/docs/planned/protocol/mcp#tool-execute) runs a block of code your agent wrote in the
+targeted tree's execution copy. The code still runs on your machine, so `execute` stays off
+until you name the languages it's allowed for. A selector is a language name, or
+`name:dialect` to pin a dialect.
+
+```toml
+[execution]
+allow = ["python"]
+max_code = "16KiB"
+max_timeout = "30s"
+max_output = "8KiB"
+max_concurrent = 2
+```
+
+Every key below `allow` is shown at its default:
+
+- `max_code` bounds one submitted block, 1B to 32KiB
+- `max_timeout` bounds one evaluation, 1ms to 1d — the evaluation only: refreshing the
+  execution copy is extra, and a refresh that outruns the same bound fails the call with
+  `deadline_exceeded`
+- `max_output` bounds each captured stream separately, up to 16KiB, so a program that floods
+  stdout gets a prefix and a byte count rather than a hung request
+- `max_concurrent` caps evaluations running at once across the whole workspace, 1 to 64
+
+The schema states each range as `rift:range` on the key, and the server enforces it at load —
+schema validation alone can't compare `"16KiB"` against a ceiling.
+
+Durations take `ms`, `s`, `m`, `h`, or `d`; byte sizes take `B`, `KiB`, `MiB`, `GiB`, or `TiB`.
+
+A runtime has to serve the language as well. Listing a language under `allow` does nothing when
+no runtime serves it. The [`rift://workspace`](/docs/planned/protocol/mcp#resource-workspace)
+resource reports what survived that intersection per language.
+
+## Providers
+
+The built-in providers run without configuration; the `providers` table exists to bound or
+disable them. The history provider is the one with a budget worth setting, because its cost
+scales with how far back it walks:
+
+```toml
+[providers.history]
+enabled = true
+max_revisions = 500
+```
+
+`max_revisions` bounds the walk from the current head, 1 to 100000. Timelines and co-change
+coupling are computed inside that depth, and a
+[`SymbolHistory`](/docs/planned/protocol/reference#SymbolHistory) whose walk ended early reports
+partial coverage rather than pretending the symbol has no earlier past. A workspace without
+version control reports the family `not_applicable` whatever this table says.
+
+Provider configuration does not set merge order or freshness. The server reports provider order,
+state, and revision through `rift://workspace`; each answer reports the exact provider revisions
+it used through coverage. A provider rebuilding after a file change can serve its previous
+immutable revision as stale without presenting it as current.
+
+## Search
+
+[`search`](/docs/planned/protocol/mcp#tool-search) runs on a lexical index with nothing to
+configure. The `search` table names the embedding model that adds dense ranking on top of it:
+
+```toml
+[search]
+embedding = "potion-retrieval-32M"
+```
+
+With `embedding` set, the server embeds indexed declarations and fuses cosine similarity into
+the lexical score. Vectors are stored per model — two models' vectors aren't comparable — so
+changing the value rebuilds the dense index. Leaving the table out keeps search lexical.
+
+## Hooks
+
+`hooks` adds your own checks, run in the changed tree each time a change applies — your
+workspace itself, unless the change named a projection. A hook's `type` selects how it runs;
+`command` — an executable Rift starts directly, without a shell — is the only type:
+
+```toml
+[[hooks]]
+type = "command"
+id = "tests"
+kind = "test"
+argv = ["cargo", "test"]
+changed_paths = "none"
+working_directory = ""
+environment = {}
+timeout_ms = 120000
+output_limit_bytes = 4096
+guarantees = []
+determinism = "deterministic"
+```
+
+The keys that shape how the command runs:
+
+- `id` — unique within the list, labels the result
+- `argv` — refuses an absolute executable path; a bare name resolves through the `PATH` of the
+  environment the command runs with — the server's, with `environment` applied on top — and a
+  relative one below `working_directory`, which is itself relative to the changed tree's root and
+  defaults to it
+- `changed_paths` — `"append"` adds the changed project paths to `argv` in byte order, for a
+  linter that takes files; `"none"` leaves `argv` alone
+
+A hook runs the tree it checks — `cargo test` compiles the very change it's checking — so
+a configured hook executes the agent's change each time one applies.
+
+Every key in the block is required — the schema carries no defaults, so a missing `environment`
+fails the file with `configuration_invalid`. Two keys carry bounds: `timeout_ms`, when Rift kills
+the process, takes 1 to 3600000, and `output_limit_bytes`, how much of each stream Rift keeps,
+takes 256 to 4096. The full size is still reported, so you can tell a truncated log from a short
+one.
+
+`guarantees` declares what a pass actually establishes, which is what turns a green run into
+[`GuaranteeEvidence`](/docs/planned/protocol/reference#GuaranteeEvidence) on the change rather than
+an unexplained tick. `determinism` says whether the
+same tree and environment are expected to give the same answer twice.
+
+A command starts from the environment the server inherited, with `environment` values added on
+top. Store secrets outside the committed `rift.toml` and inject them into the server environment.
+Every configured hook inherits that environment and can read those secrets.
+
+<Callout type="warn">
+A hook can write into the tree it checks. In a projection, Rift imports tracked or unignored
+writes as a `filesystem` change with an `external` confirmation; VCS-ignored output outside the
+manifest stays outside the changeset. A hook run against the workspace writes there directly.
+</Callout>

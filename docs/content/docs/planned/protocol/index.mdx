@@ -1,0 +1,42 @@
+---
+title: Protocol
+---
+
+<VersionBadge version="planned" />
+
+Rift publishes one generated contract through these definitions:
+
+- [Core model](/docs/planned/protocol/core) — source discovery, identities, provider facts, and
+  changes shared by protocol surfaces
+- [MCP](/docs/planned/protocol/mcp) — the tools and resources an agent calls
+- [SCIP](/docs/planned/protocol/scip) — a read-only export for tools that consume SCIP indexes
+
+Pydantic models under `protocol/src/rift/models` generate JSON Schema, Protobuf, and the
+[reference](/docs/planned/protocol/reference). Generated artifacts settle fields, enums, and wire
+numbers; these pages explain their mechanisms.
+
+## How a request finds its target
+
+An agent's `rift mcp` reads the workspace's
+[`ServerLock`](/docs/planned/protocol/reference#ServerLock) — or starts the server that writes
+it — and forwards MCP to the endpoint it names. Calls do not open connection-scoped sessions.
+Each call names a [projection](/docs/planned/protocol/mcp#projections), or the workspace tree by
+omitting one, and carries any witnessed address it uses.
+
+Cursors refer to process-local captured results. Projections retain changes and read dependencies
+across calls.
+
+Node addresses carry content witnesses, so a stale write refuses before replacing moved bytes.
+When two projections change the same workspace path,
+[`publish`](/docs/planned/protocol/mcp#tool-publish) checks directly by comparing the paths it's
+about to write.
+
+## Versioning
+
+Rift uses [MCP's protocol versioning](https://modelcontextprotocol.io/specification/draft/basic/versioning)
+without adding another version field. The MCP client carries standard MCP version metadata; Rift
+tool arguments contain only arguments declared by each tool's input schema.
+
+The server advertises its current tool and resource schemas through MCP. Dated snapshots under
+`protocol/versions` freeze released Rift contracts for implementers and generated clients; callers
+do not select a snapshot on each request.
