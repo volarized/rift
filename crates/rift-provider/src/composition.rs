@@ -1214,6 +1214,70 @@ mod tests {
     }
 
     #[test]
+    fn cloned_keyed_flow_handle_stays_connectable() {
+        let mut builder = CompositionBuilder::new(composition_id("keyed-clone"));
+        let revisions =
+            builder.source_many::<u64, Sources>("revisions", &component::<(), Sources>("git"));
+        #[expect(clippy::clone_on_copy, reason = "exercises the manual Clone impl")]
+        let cloned = revisions.clone();
+        let syntax = builder.map_each(cloned, "syntax", &component::<Sources, Syntax>("syntax"));
+        let aggregate = builder.aggregate(
+            syntax,
+            "aggregate",
+            &component::<Vec<Syntax>, Facts>("aggregate"),
+        );
+        let composition = builder.output(aggregate).build().expect("complete graph");
+        assert_eq!(
+            composition
+                .stage("keyed-clone.syntax")
+                .expect("stage")
+                .inputs()[0]
+                .as_str(),
+            "keyed-clone.revisions"
+        );
+    }
+
+    #[test]
+    fn join_with_control_character_name_fails_at_build() {
+        let mut builder = CompositionBuilder::new(composition_id("history"));
+        let revisions =
+            builder.source_many::<u64, Sources>("revisions", &component::<(), Sources>("git"));
+        let syntax = builder.map_each(revisions, "syntax", &component::<Sources, Syntax>("syntax"));
+        let metadata = builder.map_each(
+            revisions,
+            "metadata",
+            &component::<Sources, Metadata>("metadata"),
+        );
+        let joined = builder.join_by_key(syntax, metadata, "join\u{0}", KeyJoinPolicy::Inner);
+        let aggregate = builder.aggregate(
+            joined,
+            "aggregate",
+            &component::<Vec<JoinItem<Syntax, Metadata>>, Facts>("aggregate"),
+        );
+        let error = builder
+            .output(aggregate)
+            .build()
+            .expect_err("control character in join name must fail");
+        assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+    }
+
+    #[test]
+    fn join_sides_copy_and_clone_agree() {
+        let left = BTreeMap::from([(1, "left-1")]);
+        let right = BTreeMap::from([(1, "right-1")]);
+        let sides = JoinSides {
+            left: &left,
+            right: &right,
+        };
+        #[expect(clippy::clone_on_copy, reason = "exercises the manual Clone impl")]
+        let cloned = sides.clone();
+        assert_eq!(
+            join_keyed(KeyJoinPolicy::Exact, sides).items,
+            join_keyed(KeyJoinPolicy::Exact, cloned).items
+        );
+    }
+
+    #[test]
     fn join_policies_report_every_missing_side() {
         let left = BTreeMap::from([(1, "left-1"), (2, "left-2")]);
         let right = BTreeMap::from([(2, "right-2"), (3, "right-3")]);
@@ -1293,6 +1357,7 @@ mod tests {
             )
             .expect_err("cache bound must reject before mutation");
         assert_eq!(error.violation(), CacheViolation::TooManyKeys);
+        assert_eq!(error.to_string(), error.descriptor().explanation());
         assert_eq!(cache.get(&2).map(String::as_str), Some("2"));
     }
 
