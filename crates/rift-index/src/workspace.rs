@@ -888,6 +888,11 @@ mod tests {
         );
         assert_eq!(syntax_error.fault().path(), Some(source_path.as_path()));
         assert!(std::error::Error::source(&syntax_error).is_some());
+        assert_eq!(
+            syntax_error.descriptor().code(),
+            "limit_exceeded",
+            "a syntax failure must keep the underlying syntax classification"
+        );
 
         let parser = RustSyntaxProvider::default();
         let decomposed = directory.path().join("src/cafe\u{301}.rs");
