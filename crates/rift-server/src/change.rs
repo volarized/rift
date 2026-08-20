@@ -269,6 +269,19 @@ impl ChangeService {
         self.apply_rewrites(reads, &rewrites)
     }
 
+    /// Restores the files a partial publish already renamed, rewriting each
+    /// from its indexed source. Rollback is best-effort inside the failure
+    /// path: a file whose index entry cannot serve its source stays as
+    /// published, and the storage error the caller returns names the file
+    /// that stopped the publish.
+    fn roll_back_published(&self, reads: &ReadService, published: &[&FileRewrite]) {
+        for landed in published {
+            if let Some(file) = reads.index().file(&landed.path) {
+                let _ = fs::write(self.root.join(landed.path.as_str()), file.source());
+            }
+        }
+    }
+
     /// Stages and publishes whole-file rewrites, all or none.
     ///
     /// Every stage lands before the first rename; a failed rename restores
@@ -289,9 +302,7 @@ impl ChangeService {
                 .join(rewrite.path.as_str())
                 .with_extension("rift-staged");
             if let Err(error) = fs::write(&staged, &rewrite.next_source) {
-                for staged in &staged_paths {
-                    let _ = fs::remove_file(staged);
-                }
+                discard_staged(&staged_paths);
                 let _ = fs::remove_file(&staged);
                 return Err(ReadFault::storage(rewrite.path.as_str(), "stage", &error));
             }
@@ -301,14 +312,8 @@ impl ChangeService {
         for (rewrite, staged) in rewrites.iter().zip(&staged_paths) {
             let absolute = self.root.join(rewrite.path.as_str());
             if let Err(error) = fs::rename(staged, &absolute) {
-                for landed in &published {
-                    if let Some(file) = reads.index().file(&landed.path) {
-                        let _ = fs::write(self.root.join(landed.path.as_str()), file.source());
-                    }
-                }
-                for staged in &staged_paths {
-                    let _ = fs::remove_file(staged);
-                }
+                self.roll_back_published(reads, &published);
+                discard_staged(&staged_paths);
                 return Err(ReadFault::storage(rewrite.path.as_str(), "publish", &error));
             }
             published.push(rewrite);
@@ -546,12 +551,25 @@ struct FileRewrite {
     next_source: String,
 }
 
+/// Removes every staged sidecar file, ignoring entries already gone.
+fn discard_staged(staged_paths: &[PathBuf]) {
+    for staged in staged_paths {
+        let _ = fs::remove_file(staged);
+    }
+}
+
 /// Splits one unified diff into its per-file segments. Only a header line
 /// opens a segment: hunk body lines never start with `---` at column zero,
 /// because context lines carry a leading space and removals a single `-`.
+///
+/// Hunk body bytes pass through untouched — a CRLF patch keeps its `\r`
+/// so its context matches a CRLF source, and an ending mismatch surfaces
+/// as hunk-context drift, never a silent rewrite. Only structural lines
+/// shed a CRLF ending, because the diff parser rejects `\r` in headers.
 fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
     let mut segments: Vec<String> = Vec::new();
-    for line in patch.lines() {
+    let mut segment_line = 0_usize;
+    for line in patch.split_inclusive('\n') {
         if line.starts_with("--- ") {
             if segments.len() == PATCH_FILES_MAX {
                 return Err(ReadFault::invalid(
@@ -560,10 +578,14 @@ fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
                 ));
             }
             segments.push(String::new());
+            segment_line = 0;
         }
         if let Some(segment) = segments.last_mut() {
-            segment.push_str(line);
-            segment.push('\n');
+            let structural = segment_line == 0
+                || (segment_line == 1 && line.starts_with("+++ "))
+                || line.starts_with("@@");
+            push_segment_line(segment, line, structural);
+            segment_line += 1;
         }
     }
     if segments.is_empty() {
@@ -572,13 +594,38 @@ fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
     Ok(segments)
 }
 
+/// Appends one diff line to its segment. A structural line — the `---` and
+/// `+++` file headers and `@@` hunk headers — sheds a CRLF ending, because
+/// the diff parser rejects `\r` there; body lines keep their exact bytes so
+/// hunk content matches the stored source byte-for-byte.
+fn push_segment_line(segment: &mut String, line: &str, structural: bool) {
+    match (structural, line.strip_suffix("\r\n")) {
+        (true, Some(stripped)) => {
+            segment.push_str(stripped);
+            segment.push('\n');
+        }
+        _ => segment.push_str(line),
+    }
+}
+
 /// Resolves the project path one parsed segment addresses, or the refusal
 /// for file-level changes this release does not serve.
+///
+/// Patch paths are wire values, not OS paths: forward-slash relative on
+/// every platform, with git's literal `a/`, `b/`, and `/dev/null`
+/// conventions, which git emits unchanged on Windows and macOS alike.
 fn patched_project_path(
     parsed: &Patch<'_, str>,
 ) -> Result<Result<CoreProjectPath, ChangeResult>, ReadError> {
     let original = parsed.original().unwrap_or_default();
     let modified = parsed.modified().unwrap_or_default();
+    if original.contains('\\') || modified.contains('\\') {
+        return Err(ReadFault::invalid(
+            "patch",
+            "path uses backslash separators; project paths are forward-slash \
+             relative on every platform, such as `src/lib.rs`",
+        ));
+    }
     if original == "/dev/null" || modified == "/dev/null" {
         return Ok(Err(ChangeResult::refused(
             RefusalReason::Unsupported,
@@ -1425,6 +1472,89 @@ mod tests {
         assert_eq!(reason, RefusalReason::Unsupported);
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(untouched, "pub fn beacon() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_with_crlf_endings_applies_and_preserves_them() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\r\npub fn steady() {}\r\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/lib.rs",
+            "@@ -1,2 +1,2 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            " pub fn steady() {}",
+            "",
+        ]
+        .join("\r\n");
+        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written, "pub fn beacon() -> u8 { 7 }\r\npub fn steady() {}\r\n",
+            "CRLF endings must survive the rewrite byte-for-byte"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_with_lf_context_refuses_a_crlf_source() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\r\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/lib.rs",
+            "@@ -1 +1 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
+        let ChangeResult::Refused { reason, .. } = result else {
+            panic!("an ending mismatch must refuse as context drift, not rewrite endings");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() {}\r\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_without_a_trailing_newline_applies() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }";
+        let result = changes.patch(
+            &reads,
+            &rift_protocol::change::PatchParams {
+                patch: patch.to_owned(),
+            },
+        )?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "pub fn beacon() -> u8 { 7 }");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_with_backslash_paths_names_the_expected_form() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = "--- \"a\\\\lib.rs\"\n+++ \"b\\\\lib.rs\"\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
+        let error = changes
+            .patch(
+                &reads,
+                &rift_protocol::change::PatchParams {
+                    patch: patch.to_owned(),
+                },
+            )
+            .expect_err("backslash separators must fail as an invalid path");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("forward-slash"),
+            "message must name the expected form: {error}"
+        );
         Ok(())
     }
 
