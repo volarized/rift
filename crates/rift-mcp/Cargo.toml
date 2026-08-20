@@ -11,6 +11,13 @@ description = "Model Context Protocol transport for Rift"
 workspace = true
 
 [dependencies]
+rmcp.workspace = true
 rift-core.workspace = true
 rift-protocol.workspace = true
 rift-server.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
+serde_json.workspace = true
+tempfile.workspace = true
