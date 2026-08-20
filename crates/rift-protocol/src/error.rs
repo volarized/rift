@@ -8,65 +8,64 @@ use crate::read::DiagnosticContext;
 use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use strum::VariantArray;
 
 /// Stable failure class for one request. `ErrorData.retry` carries the
 /// instance-specific retry decision; unsupported coverage and edit refusal
 /// use typed domain results instead.
 #[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    VariantArray,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// The request does not satisfy the schema, or names something the schema forbids: a
     /// `limit` above the advertised maximum, a filter field that does not exist.
-    #[serde(rename = "invalid_request")]
     InvalidRequest,
     /// The caller cannot perform this operation: a path addresses through a symlink
     /// component, which following could take outside the workspace.
-    #[serde(rename = "permission_denied")]
     PermissionDenied,
     /// The identity is well-formed and resolves to nothing, such as a missing symbol or
     /// filesystem entry.
-    #[serde(rename = "resource_not_found")]
     ResourceNotFound,
     /// The entry is known but its bytes cannot be read.
-    #[serde(rename = "content_unavailable")]
     ContentUnavailable,
     /// The cursor is malformed, or it was minted for a different request, order or page
     /// size.
-    #[serde(rename = "cursor_invalid")]
     CursorInvalid,
     /// The cursor is valid, but its captured result page set left the process-local cache
     /// through eviction or process restart.
-    #[serde(rename = "cursor_expired")]
     CursorExpired,
     /// The caller cancelled, or the connection closed before the request finished.
-    #[serde(rename = "cancelled")]
     Cancelled,
     /// A request, response, or capture crossed an advertised limit. `limit` identifies the
     /// bound and required value.
-    #[serde(rename = "limit_exceeded")]
     LimitExceeded,
     /// Rift could not read or write workspace files.
-    #[serde(rename = "storage_failure")]
     StorageFailure,
     /// A violated Rift invariant. `causes` identifies the operation and concrete failure.
-    #[serde(rename = "internal_error")]
     InternalError,
     /// The workspace contains a path the protocol cannot represent safely.
-    #[serde(rename = "unsupported_path")]
     UnsupportedPath,
     /// The resource exists but cannot serve this request now, such as a fresh indexed read
     /// that could not capture stable revisions. The instance's `retry` field says whether
     /// the same request is worth sending again.
-    #[serde(rename = "temporarily_unavailable")]
     TemporarilyUnavailable,
     /// The workspace configuration does not satisfy its schema. New requests remain
     /// blocked until it is valid.
-    #[serde(rename = "configuration_invalid")]
     ConfigurationInvalid,
     /// The tool exists, but workspace configuration and the served providers cannot answer
     /// this operation for the requested language.
-    #[serde(rename = "capability_unavailable")]
     CapabilityUnavailable,
 }
 
@@ -75,16 +74,14 @@ pub enum ErrorCode {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RetryDirective {
     /// The request fails the same way every time. Change it before sending it again.
-    #[serde(rename = "never")]
     Never,
     /// Send the same bytes again. The cause was transient, such as an index still filling.
-    #[serde(rename = "same_request")]
     SameRequest,
     /// Resolve the condition with a local state command or configuration change, then send
     /// the request again.
-    #[serde(rename = "operator_action")]
     OperatorAction,
 }
 
@@ -94,18 +91,15 @@ pub enum RetryDirective {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorPhase {
     /// Reading workspace or provider data.
-    #[serde(rename = "read")]
     Read,
     /// Turning an address or a cursor into the concrete thing it names at a state.
-    #[serde(rename = "resolve")]
     Resolve,
     /// Checking a proposed change against the state it was pinned to.
-    #[serde(rename = "check")]
     Check,
     /// Resolving the operation and writing the result into the targeted tree.
-    #[serde(rename = "change")]
     Change,
 }
 

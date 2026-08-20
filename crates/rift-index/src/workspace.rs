@@ -8,8 +8,8 @@ use rift_core::constants::{
     WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, ProjectPath,
-    ProviderId, render_failure,
+    CompositionId, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, ProjectPath, ProviderId,
+    render_failure,
 };
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{
@@ -177,30 +177,30 @@ impl WorkspaceIndexError {
             WorkspaceIndexViolation::ZeroLimit
             | WorkspaceIndexViolation::InvalidRoot
             | WorkspaceIndexViolation::Composition => {
-                ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+                ErrorName::Wire(ErrorCode::ConfigurationInvalid).descriptor()
             }
             WorkspaceIndexViolation::TooDeep
             | WorkspaceIndexViolation::TooManyFiles
             | WorkspaceIndexViolation::FileTooLarge
             | WorkspaceIndexViolation::WorkspaceTooLarge
             | WorkspaceIndexViolation::ResultLimit => {
-                ErrorRegistry::descriptor(ErrorName::LimitExceeded)
+                ErrorName::Wire(ErrorCode::LimitExceeded).descriptor()
             }
             WorkspaceIndexViolation::InvalidPath => {
-                ErrorRegistry::descriptor(ErrorName::UnsupportedPath)
+                ErrorName::Wire(ErrorCode::UnsupportedPath).descriptor()
             }
             WorkspaceIndexViolation::InvalidSource => {
-                ErrorRegistry::descriptor(ErrorName::ContentUnavailable)
+                ErrorName::Wire(ErrorCode::ContentUnavailable).descriptor()
             }
             WorkspaceIndexViolation::Filesystem => {
-                ErrorRegistry::descriptor(ErrorName::StorageFailure)
+                ErrorName::Wire(ErrorCode::StorageFailure).descriptor()
             }
             WorkspaceIndexViolation::Syntax => self
                 .source
                 .as_deref()
                 .and_then(|source| source.downcast_ref::<RustSyntaxError>())
                 .map_or_else(
-                    || ErrorRegistry::descriptor(ErrorName::InternalError),
+                    || ErrorName::Wire(ErrorCode::InternalError).descriptor(),
                     RustSyntaxError::descriptor,
                 ),
         }

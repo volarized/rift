@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rift_core::constants::{STAGE_NAME_BYTES_MAX, STAGE_NAME_PUNCTUATION};
 use rift_core::{
-    CompositionId, ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, ProviderId,
+    CompositionId, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, ProviderId,
     is_canonical_ascii_name, render_failure,
 };
 
@@ -291,7 +291,7 @@ impl CompositionError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(&self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+        ErrorName::Wire(ErrorCode::ConfigurationInvalid).descriptor()
     }
 
     /// Returns ordered typed context: violated rule, then stage when present.
@@ -1053,7 +1053,7 @@ impl CacheError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::LimitExceeded)
+        ErrorName::Wire(ErrorCode::LimitExceeded).descriptor()
     }
 
     /// Returns ordered typed context: violated bound.

@@ -9,7 +9,7 @@ use crate::constants::{
     SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX,
 };
 use crate::{
-    ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, PathError, SourcePath, render_failure,
+    ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, PathError, SourcePath, render_failure,
 };
 
 /// Invalid stable identity.
@@ -20,7 +20,7 @@ impl IdError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+        ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
     }
 
     /// Returns ordered typed context.
@@ -111,7 +111,7 @@ impl SourceResolverIdError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+        ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
     }
 
     /// Returns ordered typed context.
@@ -230,7 +230,7 @@ impl SourceUnitIdError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+        ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
     }
 
     /// Returns ordered typed context.
@@ -451,7 +451,7 @@ impl RevisionError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+        ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
     }
 
     /// Returns ordered typed context.

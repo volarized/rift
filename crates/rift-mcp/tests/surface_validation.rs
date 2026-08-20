@@ -1,4 +1,4 @@
-//! Conformance gate for the served MCP surface.
+//! Validation gate for the served MCP surface.
 //!
 //! Every advertised tool has request coverage in the corpus below, every
 //! corpus request satisfies the tool's advertised input schema, and every
@@ -80,7 +80,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
     let covered: BTreeSet<&str> = corpus().iter().map(|(name, _)| *name).collect();
     assert_eq!(
         advertised, covered,
-        "every advertised tool needs a conformance corpus entry, and every \
+        "every advertised tool needs a validation corpus entry, and every \
          corpus entry an advertised tool: extend `corpus` alongside the surface"
     );
 

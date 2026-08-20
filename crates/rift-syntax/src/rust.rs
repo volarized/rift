@@ -2,7 +2,7 @@ use std::fmt;
 
 use rift_core::ProjectPath;
 use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
-use rift_core::{ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, render_failure};
+use rift_core::{ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, render_failure};
 use tree_sitter::{
     Node, Parser, Query as TreeSitterQuery, QueryCursor, QueryError, StreamingIterator,
 };
@@ -574,22 +574,22 @@ impl RustSyntaxError {
     pub const fn descriptor(&self) -> ErrorDescriptor {
         match self.kind {
             RustSyntaxErrorKind::ZeroLimit { .. } => {
-                ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+                ErrorName::Wire(ErrorCode::ConfigurationInvalid).descriptor()
             }
             RustSyntaxErrorKind::SourceTooLarge { .. }
             | RustSyntaxErrorKind::TooManyNodes { .. }
             | RustSyntaxErrorKind::TooDeep { .. }
             | RustSyntaxErrorKind::TooManyCaptures { .. } => {
-                ErrorRegistry::descriptor(ErrorName::LimitExceeded)
+                ErrorName::Wire(ErrorCode::LimitExceeded).descriptor()
             }
             RustSyntaxErrorKind::ParseCancelled { .. } => {
-                ErrorRegistry::descriptor(ErrorName::Cancelled)
+                ErrorName::Wire(ErrorCode::Cancelled).descriptor()
             }
             RustSyntaxErrorKind::IncompatibleGrammar { .. }
             | RustSyntaxErrorKind::PositionOverflow { .. }
             | RustSyntaxErrorKind::InvalidQuery { .. }
             | RustSyntaxErrorKind::UnknownNodeKind { .. } => {
-                ErrorRegistry::descriptor(ErrorName::InternalError)
+                ErrorName::Wire(ErrorCode::InternalError).descriptor()
             }
         }
     }
@@ -1016,7 +1016,7 @@ mod tests {
             .parse::<RustGrammarNodeKind>()
             .expect_err("unknown kind");
         assert_eq!(error.violation(), RustSyntaxViolation::UnknownNodeKind);
-        assert_eq!(error.descriptor().name(), ErrorName::InternalError);
+        assert_eq!(error.descriptor().name(), ErrorName::Wire(ErrorCode::InternalError));
         assert!(error.source().is_none());
         assert_eq!(
             error.to_string(),
@@ -1044,7 +1044,7 @@ mod tests {
         ];
         for (result, bound_name) in cases {
             let error = result.expect_err("zero bound");
-            assert_eq!(error.descriptor().name(), ErrorName::ConfigurationInvalid);
+            assert_eq!(error.descriptor().name(), ErrorName::Wire(ErrorCode::ConfigurationInvalid));
             assert_eq!(
                 error.to_string(),
                 format!(
@@ -1074,7 +1074,7 @@ mod tests {
                     text: "fn x() {}",
                 })
                 .expect_err("source bound");
-        assert_eq!(error.descriptor().name(), ErrorName::LimitExceeded);
+        assert_eq!(error.descriptor().name(), ErrorName::Wire(ErrorCode::LimitExceeded));
         assert_eq!(
             error.to_string(),
             "the request exceeded a declared resource limit: \
@@ -1137,7 +1137,7 @@ mod tests {
     fn test_query_errors_report_line_reason_and_capture_limit() {
         let error = RustQuery::new("(missing_node) @rift.name").expect_err("invalid node kind");
         assert!(error.source().is_some(), "keeps tree-sitter source");
-        assert_eq!(error.descriptor().name(), ErrorName::InternalError);
+        assert_eq!(error.descriptor().name(), ErrorName::Wire(ErrorCode::InternalError));
         assert_eq!(
             error.to_string(),
             "the server failed in a way it did not classify: \
@@ -1150,7 +1150,7 @@ mod tests {
         let error = query
             .captures("fn first() {} fn second() {}", 1)
             .expect_err("capture overflow");
-        assert_eq!(error.descriptor().name(), ErrorName::LimitExceeded);
+        assert_eq!(error.descriptor().name(), ErrorName::Wire(ErrorCode::LimitExceeded));
         assert_eq!(
             error.to_string(),
             "the request exceeded a declared resource limit: \
@@ -1193,7 +1193,7 @@ mod tests {
             grammar.violation(),
             RustSyntaxViolation::IncompatibleGrammar
         );
-        assert_eq!(grammar.descriptor().name(), ErrorName::InternalError);
+        assert_eq!(grammar.descriptor().name(), ErrorName::Wire(ErrorCode::InternalError));
         assert_eq!(
             grammar.to_string(),
             format!(
@@ -1209,7 +1209,7 @@ mod tests {
         let cancelled =
             RustSyntaxError::new(RustSyntaxErrorKind::ParseCancelled { path: Some(path()) });
         assert_eq!(cancelled.violation(), RustSyntaxViolation::ParseCancelled);
-        assert_eq!(cancelled.descriptor().name(), ErrorName::Cancelled);
+        assert_eq!(cancelled.descriptor().name(), ErrorName::Wire(ErrorCode::Cancelled));
         assert!(cancelled.source().is_none());
         assert_eq!(
             cancelled.to_string(),
@@ -1231,7 +1231,7 @@ mod tests {
             u32::try_from(u64::MAX).expect_err("u64::MAX exceeds u32"),
         );
         assert_eq!(overflow.violation(), RustSyntaxViolation::PositionOverflow);
-        assert_eq!(overflow.descriptor().name(), ErrorName::InternalError);
+        assert_eq!(overflow.descriptor().name(), ErrorName::Wire(ErrorCode::InternalError));
         assert!(overflow.source().is_some(), "keeps conversion source");
         assert_eq!(
             overflow.to_string(),

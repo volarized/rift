@@ -6,7 +6,7 @@ use crate::constants::{
     PROJECT_PATH_BYTES_MAX, RIFT_STATE_DIRECTORY, RIFT_STATE_DIRECTORY_PREFIX,
     SOURCE_PATH_BYTES_MAX,
 };
-use crate::{ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, render_failure};
+use crate::{ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, render_failure};
 
 /// Path vocabulary being validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +92,7 @@ impl PathError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::UnsupportedPath)
+        ErrorName::Wire(ErrorCode::UnsupportedPath).descriptor()
     }
 
     /// Returns ordered typed context.
