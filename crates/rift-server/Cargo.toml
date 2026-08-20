@@ -11,7 +11,15 @@ description = "Workspace application service for Rift"
 workspace = true
 
 [dependencies]
+data-encoding.workspace = true
+percent-encoding.workspace = true
 rift-core.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
 rift-provider.workspace = true
+rift-syntax.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
