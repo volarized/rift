@@ -346,7 +346,7 @@ pub trait Fault: fmt::Debug {
 pub fn fault_label<K: Serialize + fmt::Debug>(kind: &K) -> String {
     match serde_json::to_value(kind) {
         Ok(serde_json::Value::String(label)) => label,
-        Ok(serde_json::Value::Object(map)) if !map.is_empty() => match map.into_iter().next() {
+        Ok(serde_json::Value::Object(map)) => match map.into_iter().next() {
             Some((label, _)) => label,
             None => format!("{kind:?}"),
         },
@@ -575,6 +575,15 @@ mod tests {
             }),
             "missing_target"
         );
+    }
+
+    #[derive(Debug, Serialize)]
+    struct Hollow {}
+
+    #[test]
+    fn fault_labels_fall_back_to_debug_for_unnamed_values() {
+        assert_eq!(fault_label(&7_u8), "7");
+        assert_eq!(fault_label(&Hollow {}), "Hollow");
     }
 
     #[derive(Debug)]
