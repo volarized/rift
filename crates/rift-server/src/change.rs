@@ -1476,6 +1476,66 @@ mod tests {
     }
 
     #[test]
+    fn patch_refuses_a_path_the_index_does_not_serve() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = "--- a/ghost.rs\n+++ b/ghost.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
+        let result = changes.patch(
+            &reads,
+            &rift_protocol::change::PatchParams {
+                patch: patch.to_owned(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a patch for an unindexed path must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        assert_eq!(
+            preconditions[0].paths,
+            vec![ProjectPath("ghost.rs".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_when_disk_drifted_from_snapshot() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() { }\n")?;
+        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
+        let result = changes.patch(
+            &reads,
+            &rift_protocol::change::PatchParams {
+                patch: patch.to_owned(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a drifted file under a patch must refuse before writing");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        assert_ne!(preconditions[0].expected, preconditions[0].observed);
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() { }\n");
+        Ok(())
+    }
+
+    #[test]
     fn patch_with_crlf_endings_applies_and_preserves_them() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\r\npub fn steady() {}\r\n")?;
         let patch = [
