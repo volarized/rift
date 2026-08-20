@@ -10,7 +10,7 @@ use rift_core::{
     CompositionId, ErrorDescriptor, ErrorName, ErrorRegistry, ProviderId, is_canonical_ascii_name,
 };
 
-// Process-local provenance token. Mutable allocation remains provider-owned.
+// Process-local builder identity token. Mutable allocation remains provider-owned.
 static NEXT_BUILDER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
@@ -201,39 +201,46 @@ pub struct StageDescriptor {
 }
 
 impl StageDescriptor {
-    rift_core::property! {
-        /// Returns stable scoped path.
-        pub const fn path(&self) -> &StagePath = &self.path;
+    /// Returns stable scoped path.
+    #[must_use]
+    pub const fn path(&self) -> &StagePath {
+        &self.path
     }
 
-    rift_core::property! {
-        /// Returns implementation identity.
-        pub const fn component(&self) -> &ProviderId = &self.component;
+    /// Returns implementation identity.
+    #[must_use]
+    pub const fn component(&self) -> &ProviderId {
+        &self.component
     }
 
-    rift_core::property! {
-        /// Returns ordered upstream stage paths.
-        pub const fn inputs(&self) -> &[StagePath] = &self.inputs;
+    /// Returns ordered upstream stage paths.
+    #[must_use]
+    pub const fn inputs(&self) -> &[StagePath] {
+        &self.inputs
     }
 
-    rift_core::property! {
-        /// Returns component input type recorded before erasure.
-        pub const fn component_input_type(&self) -> &'static str = self.component_input_type;
+    /// Returns component input type recorded before erasure.
+    #[must_use]
+    pub const fn component_input_type(&self) -> &'static str {
+        self.component_input_type
     }
 
-    rift_core::property! {
-        /// Returns concrete output type recorded before erasure.
-        pub const fn output_type(&self) -> &'static str = self.output_type;
+    /// Returns concrete output type recorded before erasure.
+    #[must_use]
+    pub const fn output_type(&self) -> &'static str {
+        self.output_type
     }
 
-    rift_core::property! {
-        /// Returns output cardinality.
-        pub const fn cardinality(&self) -> FlowCardinality = self.cardinality;
+    /// Returns output cardinality.
+    #[must_use]
+    pub const fn cardinality(&self) -> FlowCardinality {
+        self.cardinality
     }
 
-    rift_core::property! {
-        /// Returns keyed-join policy for join stages.
-        pub const fn key_join_policy(&self) -> Option<KeyJoinPolicy> = self.key_join_policy;
+    /// Returns keyed-join policy for join stages.
+    #[must_use]
+    pub const fn key_join_policy(&self) -> Option<KeyJoinPolicy> {
+        self.key_join_policy
     }
 }
 
@@ -267,9 +274,10 @@ impl CompositionError {
         Self { kind }
     }
 
-    rift_core::property! {
-        /// Returns stable failure classification and context.
-        pub const fn kind(&self) -> &CompositionErrorKind = &self.kind;
+    /// Returns stable failure classification and context.
+    #[must_use]
+    pub const fn kind(&self) -> &CompositionErrorKind {
+        &self.kind
     }
 
     /// Returns stage path attached to failure when present.
@@ -937,9 +945,10 @@ pub struct CacheError {
 }
 
 impl CacheError {
-    rift_core::property! {
-        /// Returns stable failure classification.
-        pub const fn violation(self) -> CacheViolation = self.violation;
+    /// Returns stable failure classification.
+    #[must_use]
+    pub const fn violation(self) -> CacheViolation {
+        self.violation
     }
 
     /// Returns canonical registry metadata.

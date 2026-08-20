@@ -1,9 +1,7 @@
 use std::path::Path;
 
 use rift_index::WorkspaceIndexLimits;
-use rift_protocol::generated::read::{
-    GetSymbolParams, GetSymbolResult, SearchParams, SearchResult,
-};
+use rift_protocol::read::{GetSymbolParams, GetSymbolResult, SearchParams, SearchResult};
 use rift_server::{ReadError, ReadErrorKind, ReadService};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -32,7 +30,9 @@ impl RiftMcp {
 
     #[tool(
         name = "get_symbol",
-        description = "Find Rust declarations and source by symbol name."
+        description = "Finds Rust declarations and their source by exact symbol name. Each hit \
+            carries the declaration and its source excerpt; `include_body: false` omits both. \
+            Use `search` when the name is not exactly known."
     )]
     fn get_symbol(
         &self,
@@ -43,7 +43,8 @@ impl RiftMcp {
 
     #[tool(
         name = "search",
-        description = "Search indexed Rust declarations and source lines."
+        description = "Searches indexed Rust declarations and source lines by lexical `query`. \
+            Use `get_symbol` when the declaration name is known."
     )]
     fn search(
         &self,
@@ -80,8 +81,10 @@ mod tests {
     use std::fs;
 
     use rift_index::WorkspaceIndexLimits;
+    use rift_protocol::contracts::TOOL_CONTRACTS;
+    use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
-    use rmcp::model::CallToolRequestParams;
+    use rmcp::model::{CallToolRequestParams, ErrorCode};
     use serde_json::json;
 
     use super::RiftMcp;
@@ -159,6 +162,100 @@ mod tests {
             .await
             .expect_err("unadvertised nodes tool must be absent");
         assert!(absent.to_string().contains("tool not found"));
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_sees_contract_tool_descriptions() -> TestResult {
+        let (_directory, server) = fixture()?;
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+        let tools = client.list_all_tools().await?;
+
+        for contract in TOOL_CONTRACTS {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == contract.name)
+                .ok_or_else(|| format!("tool {} must be advertised", contract.name))?;
+            assert_eq!(
+                tool.description.as_deref(),
+                Some(contract.description),
+                "advertised description must match the protocol contract for {}",
+                contract.name,
+            );
+        }
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_rejects_empty_search_query_with_invalid_params() -> TestResult {
+        let (_directory, server) = fixture()?;
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+
+        let error = client
+            .call_tool(
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments(&json!({"query": ""}))?),
+            )
+            .await
+            .expect_err("empty search query must be rejected");
+        let ServiceError::McpError(data) = error else {
+            panic!("expected protocol-level McpError, got {error:?}");
+        };
+        assert_eq!(data.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(data.message.as_ref(), "search query is empty");
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_rejects_zero_result_limit_with_internal_error() -> TestResult {
+        let (_directory, server) = fixture()?;
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+
+        let error = client
+            .call_tool(
+                CallToolRequestParams::new("get_symbol")
+                    .with_arguments(arguments(&json!({"name": "beacon", "limit": 0}))?),
+            )
+            .await
+            .expect_err("zero result limit must be rejected");
+        let ServiceError::McpError(data) = error else {
+            panic!("expected protocol-level McpError, got {error:?}");
+        };
+        assert_eq!(data.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(data.message.as_ref(), "workspace indexing failed");
 
         client.cancel().await?;
         server_task.await?;

@@ -50,3 +50,11 @@ pub const WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT: usize = 64;
 pub const READ_RESULTS_MAX_DEFAULT: usize = 1_000;
 /// Directories excluded from current-workspace indexing.
 pub const WORKSPACE_IGNORED_DIRECTORIES: &[&str] = &[".git", ".rift", "target"];
+/// Default maximum results returned by one search call.
+pub const SEARCH_RESULTS_DEFAULT: usize = 20;
+/// Canonical identity of the built-in Rust read provider.
+pub const RUST_READ_PROVIDER_ID: &str = "rift.rust.read";
+/// Hexadecimal characters in one SHA-256 digest.
+pub const SHA256_HEX_LENGTH: usize = 64;
+/// Base32 characters kept from one SHA-256 digest in a source-unit identity.
+pub const SOURCE_UNIT_DIGEST_CHARS: usize = 26;
