@@ -765,15 +765,18 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
+    use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
         ChangeResult, InsertPosition, InsertSymbolParams, OperationPreconditionKind,
-        PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
+        PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams,
+        ReplaceSymbolParams,
     };
     use rift_protocol::read::{NodeId, NodesParams, ProjectPath, SymbolId};
+    use rift_syntax::ByteRange;
 
     use super::ChangeService;
-    use crate::read::ReadService;
+    use crate::read::{ReadService, node_witness};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1201,6 +1204,294 @@ mod tests {
             )
             .expect_err("inverted span must error");
         assert_eq!(node_error.descriptor().code(), "invalid_request");
+        Ok(())
+    }
+
+    #[test]
+    fn replace_symbol_refuses_when_the_addressed_file_is_unindexed() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: SymbolId("rift://symbol/rust/ghost.rs/beacon".to_owned()),
+                region: None,
+                body: "pub fn beacon() {}".to_owned(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("unindexed file must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        assert_eq!(
+            preconditions[0].paths,
+            vec![ProjectPath("ghost.rs".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_refusal_names_the_missing_anchor_address() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: symbol("vanished"),
+                position: InsertPosition::After,
+                body: "pub fn late() {}".to_owned(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("missing anchor must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        assert_eq!(
+            preconditions[0].addresses,
+            vec![PreconditionAddress::Symbol {
+                symbol: symbol("vanished")
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_address_with_invalid_path_reports_the_violation() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let error = changes
+            .replace_symbol(
+                &reads,
+                &ReplaceSymbolParams {
+                    symbol: SymbolId("rift://symbol/rust/%2Fetc%2Fpasswd/beacon".to_owned()),
+                    region: None,
+                    body: "x".to_owned(),
+                },
+            )
+            .expect_err("absolute path inside a symbol address must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("violation"),
+            "message must name the broken rule: {error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_workspace_surfaces_stage_storage_failure() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o555))?;
+        let result = changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("beacon"),
+                region: None,
+                body: "pub fn beacon() -> u8 { 7 }".to_owned(),
+            },
+        );
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))?;
+        let error = result.expect_err("read-only tree must fail to stage");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation stage"),
+            "failure must name the stage operation: {error}"
+        );
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_replacement_lands_but_reports_reparse_bound() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let body = format!(
+            "pub fn beacon() {{}}\n// {}",
+            "x".repeat(RUST_SOURCE_BYTES_MAX_DEFAULT)
+        );
+        let result = changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("beacon"),
+                region: None,
+                body,
+            },
+        )?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(
+            summary.diagnostics[0]
+                .message
+                .contains("no longer parses within bounds"),
+            "diagnostic must name the crossed bound: {}",
+            summary.diagnostics[0].message
+        );
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert!(written.len() > RUST_SOURCE_BYTES_MAX_DEFAULT);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_node_refuses_region_scope_as_unserved() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let error = changes
+            .replace_node(
+                &reads,
+                &ReplaceNodeParams {
+                    node: NodeId("rift://node/rust/lib.rs@0-18#aaaaaaaa".to_owned()),
+                    region: Some(rift_protocol::read::RegionRole::Body),
+                    body: "7".to_owned(),
+                },
+            )
+            .expect_err("region replacement must be refused as unserved");
+        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn replace_node_refusal_names_the_missing_file_by_node_address() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let node = NodeId("rift://node/rust/ghost.rs@0-5#aaaaaaaa".to_owned());
+        let result = changes.replace_node(
+            &reads,
+            &ReplaceNodeParams {
+                node: node.clone(),
+                region: None,
+                body: "pub fn beacon() {}".to_owned(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("unindexed file must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        assert_eq!(
+            preconditions[0].addresses,
+            vec![PreconditionAddress::Node { node }]
+        );
+        assert_eq!(
+            preconditions[0].paths,
+            vec![ProjectPath("ghost.rs".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_rejects_more_files_than_the_bound() -> TestResult {
+        use std::fmt::Write as _;
+
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let mut patch = String::new();
+        for index in 0..=super::PATCH_FILES_MAX {
+            let _ = writeln!(
+                patch,
+                "--- a/f{index}.rs\n+++ b/f{index}.rs\n@@ -1 +1 @@\n-x\n+y"
+            );
+        }
+        let error = changes
+            .patch(&reads, &rift_protocol::change::PatchParams { patch })
+            .expect_err("a diff past the file bound must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("more than {} files", super::PATCH_FILES_MAX)),
+            "message must name the bound: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_file_rename_as_unsupported() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/other.rs",
+            "@@ -1 +1 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
+        let ChangeResult::Refused { reason, .. } = result else {
+            panic!("file rename must refuse this release");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn node_address_with_invalid_path_reports_the_violation() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let error = changes
+            .replace_node(
+                &reads,
+                &ReplaceNodeParams {
+                    node: NodeId("rift://node/rust/%2Fetc%2Fpasswd@0-5#aaaaaaaa".to_owned()),
+                    region: None,
+                    body: "x".to_owned(),
+                },
+            )
+            .expect_err("absolute path inside a node address must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("violation"),
+            "message must name the broken rule: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_node_span_beyond_the_file_fails_as_invalid() -> TestResult {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, changes) = fixture(source)?;
+        let end = source.len() as u64 + 10;
+        let range = ByteRange { start: 0, end };
+        let witness = node_witness(source, range);
+        let error = changes
+            .replace_node(
+                &reads,
+                &ReplaceNodeParams {
+                    node: NodeId(format!("rift://node/rust/lib.rs@0-{end}#{witness}")),
+                    region: None,
+                    body: "pub fn beacon() -> u8 { 7 }".to_owned(),
+                },
+            )
+            .expect_err("a span past the file end must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("outside the addressed file"),
+            "message must name the span fault: {error}"
+        );
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, source);
         Ok(())
     }
 }
