@@ -29,7 +29,7 @@ enum CliCommand {
     /// deleting the renamed old binary until the parent process releases it.
     /// The name must match `CLEANUP_SUBCOMMAND` in `update.rs`.
     #[cfg(windows)]
-    #[command(hide = true)]
+    #[command(name = "__cleanup-update", hide = true)]
     __CleanupUpdate { parent_pid: u32 },
 }
 
