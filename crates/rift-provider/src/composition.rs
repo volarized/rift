@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rift_core::constants::{STAGE_NAME_BYTES_MAX, STAGE_NAME_PUNCTUATION};
 use rift_core::{
-    CompositionId, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, ProviderId,
-    is_canonical_ascii_name, render_failure,
+    CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProviderId, fault_label,
+    is_canonical_ascii_name,
 };
+use serde::Serialize;
 
 // Process-local builder origin. Mutable allocation remains provider-owned.
 static NEXT_BUILDER_ORIGIN: AtomicU64 = AtomicU64::new(1);
@@ -240,7 +241,7 @@ impl StageDescriptor {
 
 /// Stable composition-build failure classification and context.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompositionErrorKind {
+pub enum CompositionFault {
     /// Stage name is empty or not canonical lowercase syntax.
     InvalidName,
     /// Scoped stage path already exists.
@@ -257,47 +258,36 @@ pub enum CompositionErrorKind {
     MissingOutput,
 }
 
-/// Opaque composition-build failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompositionError {
-    kind: CompositionErrorKind,
-}
-
-impl CompositionError {
-    fn new(kind: CompositionErrorKind) -> Self {
-        Self { kind }
-    }
-
-    /// Returns stable failure classification and context.
-    #[must_use]
-    pub const fn kind(&self) -> &CompositionErrorKind {
-        &self.kind
-    }
-
+impl CompositionFault {
     /// Returns stage path attached to failure when present.
     #[must_use]
     pub const fn stage(&self) -> Option<&StagePath> {
-        match &self.kind {
-            CompositionErrorKind::DuplicateStage(path)
-            | CompositionErrorKind::TypeMismatch(path)
-            | CompositionErrorKind::StageNotFound(path)
-            | CompositionErrorKind::DanglingInput(path) => Some(path),
-            CompositionErrorKind::InvalidName
-            | CompositionErrorKind::ForeignFlow
-            | CompositionErrorKind::MissingOutput => None,
+        match self {
+            Self::DuplicateStage(path)
+            | Self::TypeMismatch(path)
+            | Self::StageNotFound(path)
+            | Self::DanglingInput(path) => Some(path),
+            Self::InvalidName | Self::ForeignFlow | Self::MissingOutput => None,
         }
     }
+}
 
-    /// Returns canonical registry metadata.
-    #[must_use]
-    pub const fn descriptor(&self) -> ErrorDescriptor {
-        ErrorName::Wire(ErrorCode::ConfigurationInvalid).descriptor()
+impl Fault for CompositionFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
     }
 
-    /// Returns ordered typed context: violated rule, then stage when present.
-    #[must_use]
-    pub fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("rule", kind_label(&self.kind))];
+    fn context(&self) -> Vec<ErrorContext> {
+        let rule = match self {
+            Self::InvalidName => "invalid_name",
+            Self::DuplicateStage(_) => "duplicate_stage",
+            Self::ForeignFlow => "foreign_flow",
+            Self::TypeMismatch(_) => "type_mismatch",
+            Self::StageNotFound(_) => "stage_not_found",
+            Self::DanglingInput(_) => "dangling_input",
+            Self::MissingOutput => "missing_output",
+        };
+        let mut context = vec![ErrorContext::new("rule", rule)];
         if let Some(stage) = self.stage() {
             context.push(ErrorContext::new("stage", stage.to_string()));
         }
@@ -305,25 +295,8 @@ impl CompositionError {
     }
 }
 
-fn kind_label(kind: &CompositionErrorKind) -> &'static str {
-    match kind {
-        CompositionErrorKind::InvalidName => "stage name is not canonical",
-        CompositionErrorKind::DuplicateStage(_) => "stage path already exists",
-        CompositionErrorKind::ForeignFlow => "flow handle belongs to another builder",
-        CompositionErrorKind::TypeMismatch(_) => "stage output type does not match consumer input",
-        CompositionErrorKind::StageNotFound(_) => "stage does not exist",
-        CompositionErrorKind::DanglingInput(_) => "removed stage still has a consumer",
-        CompositionErrorKind::MissingOutput => "composition selects no output",
-    }
-}
-
-impl fmt::Display for CompositionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
-    }
-}
-
-impl std::error::Error for CompositionError {}
+/// Composition-build failure.
+pub type CompositionError = Error<CompositionFault>;
 
 /// Typed composition builder. Concrete flow types erase only at [`build`](Self::build).
 ///
@@ -559,7 +532,7 @@ impl CompositionBuilder {
         }
         let output = self
             .output
-            .ok_or_else(|| CompositionError::new(CompositionErrorKind::MissingOutput))?;
+            .ok_or_else(|| CompositionError::new(CompositionFault::MissingOutput))?;
         Ok(ProviderComposition::from_nodes(
             self.id,
             self.stages,
@@ -572,7 +545,7 @@ impl CompositionBuilder {
     fn add(&mut self, registration: StageRegistration<'_>) -> usize {
         if !self.paths.insert(registration.path.clone()) {
             self.errors
-                .push(CompositionError::new(CompositionErrorKind::DuplicateStage(
+                .push(CompositionError::new(CompositionFault::DuplicateStage(
                     registration.path.clone(),
                 )));
         }
@@ -811,14 +784,14 @@ impl CompositionEditor {
     ) -> Result<(), CompositionError> {
         let index = self.index(path)?;
         if self.nodes[index].output.id != TypeId::of::<T>() {
-            return Err(CompositionError::new(CompositionErrorKind::TypeMismatch(
+            return Err(CompositionError::new(CompositionFault::TypeMismatch(
                 self.nodes[index].path.clone(),
             )));
         }
         validate_name(name)?;
         let new_path = StagePath::root(&self.id, name);
         if self.nodes.iter().any(|node| node.path == new_path) {
-            return Err(CompositionError::new(CompositionErrorKind::DuplicateStage(
+            return Err(CompositionError::new(CompositionFault::DuplicateStage(
                 new_path,
             )));
         }
@@ -847,7 +820,7 @@ impl CompositionEditor {
         if self.nodes[index].component_input.id != TypeId::of::<I>()
             || self.nodes[index].output.id != TypeId::of::<O>()
         {
-            return Err(CompositionError::new(CompositionErrorKind::TypeMismatch(
+            return Err(CompositionError::new(CompositionFault::TypeMismatch(
                 self.nodes[index].path.clone(),
             )));
         }
@@ -858,7 +831,7 @@ impl CompositionEditor {
     fn try_remove(&mut self, path: &str) -> Result<(), CompositionError> {
         let index = self.index(path)?;
         if index == self.output || self.nodes.iter().any(|node| node.inputs.contains(&index)) {
-            return Err(CompositionError::new(CompositionErrorKind::DanglingInput(
+            return Err(CompositionError::new(CompositionFault::DanglingInput(
                 self.nodes[index].path.clone(),
             )));
         }
@@ -872,7 +845,7 @@ impl CompositionEditor {
             .iter()
             .position(|node| node.path.as_str() == path)
             .ok_or_else(|| {
-                CompositionError::new(CompositionErrorKind::StageNotFound(StagePath(path.into())))
+                CompositionError::new(CompositionFault::StageNotFound(StagePath(path.into())))
             })
     }
 
@@ -890,14 +863,14 @@ impl CompositionEditor {
 
 fn validate_name(name: &str) -> Result<(), CompositionError> {
     if !is_canonical_ascii_name(name, STAGE_NAME_BYTES_MAX, STAGE_NAME_PUNCTUATION) {
-        return Err(CompositionError::new(CompositionErrorKind::InvalidName));
+        return Err(CompositionError::new(CompositionFault::InvalidName));
     }
     Ok(())
 }
 
 fn validate_origin(flow_origin: u64, builder_origin: u64) -> Result<(), CompositionError> {
     if flow_origin != builder_origin {
-        return Err(CompositionError::new(CompositionErrorKind::ForeignFlow));
+        return Err(CompositionError::new(CompositionFault::ForeignFlow));
     }
     Ok(())
 }
@@ -1031,50 +1004,39 @@ pub struct CacheUpdate {
 }
 
 /// Per-key cache failure classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheViolation {
     /// Requested key set exceeds configured cache bound.
     TooManyKeys,
 }
 
-/// Opaque per-key cache failure.
+/// One rejected per-key cache request: which rule it broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheError {
+pub struct CacheFault {
     violation: CacheViolation,
 }
 
-impl CacheError {
+impl CacheFault {
     /// Returns stable failure classification.
     #[must_use]
     pub const fn violation(self) -> CacheViolation {
         self.violation
     }
+}
 
-    /// Returns canonical registry metadata.
-    #[must_use]
-    pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorName::Wire(ErrorCode::LimitExceeded).descriptor()
+impl Fault for CacheFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::LimitExceeded)
     }
 
-    /// Returns ordered typed context: violated bound.
-    #[must_use]
-    pub fn context(self) -> Vec<ErrorContext> {
-        vec![ErrorContext::new(
-            "violation",
-            match self.violation {
-                CacheViolation::TooManyKeys => "too_many_keys",
-            },
-        )]
+    fn context(&self) -> Vec<ErrorContext> {
+        vec![ErrorContext::new("violation", fault_label(&self.violation))]
     }
 }
 
-impl fmt::Display for CacheError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
-    }
-}
-
-impl std::error::Error for CacheError {}
+/// Per-key cache failure.
+pub type CacheError = Error<CacheFault>;
 
 /// Bounded-composition proof of revision-keyed reuse.
 #[derive(Debug, Clone)]
@@ -1104,9 +1066,9 @@ impl<K: Clone + Ord, V: Clone> PerKeyCache<K, V> {
         mut compute: impl FnMut(&K) -> V,
     ) -> Result<CacheUpdate, CacheError> {
         if revisions.len() > self.max_entries.get() {
-            return Err(CacheError {
+            return Err(CacheError::new(CacheFault {
                 violation: CacheViolation::TooManyKeys,
-            });
+            }));
         }
         let removed = self
             .entries
@@ -1292,7 +1254,7 @@ mod tests {
             .output(aggregate)
             .build()
             .expect_err("control character in join name must fail");
-        assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+        assert_eq!(error.fault(), &CompositionFault::InvalidName);
     }
 
     #[test]
@@ -1390,7 +1352,7 @@ mod tests {
                 std::string::ToString::to_string,
             )
             .expect_err("cache bound must reject before mutation");
-        assert_eq!(error.violation(), CacheViolation::TooManyKeys);
+        assert_eq!(error.fault().violation(), CacheViolation::TooManyKeys);
         assert_eq!(
             error.context(),
             vec![ErrorContext::new("violation", "too_many_keys")]
@@ -1421,8 +1383,8 @@ mod tests {
             .build()
             .expect_err("replacement input type must match");
         assert!(matches!(
-            mismatch.kind(),
-            CompositionErrorKind::TypeMismatch(_)
+            mismatch.fault(),
+            CompositionFault::TypeMismatch(_)
         ));
 
         let error = composition
@@ -1430,14 +1392,11 @@ mod tests {
             .remove("core-syntax.project")
             .build()
             .expect_err("used source cannot be removed");
-        assert!(matches!(
-            error.kind(),
-            CompositionErrorKind::DanglingInput(_)
-        ));
+        assert!(matches!(error.fault(), CompositionFault::DanglingInput(_)));
         assert_eq!(
             error.to_string(),
             "the workspace configuration failed validation: \
-             rule removed stage still has a consumer, stage core-syntax.project; \
+             rule dangling_input, stage core-syntax.project; \
              correct the reported configuration field, then retry"
         );
 
@@ -1520,8 +1479,8 @@ mod tests {
             .build()
             .expect_err("duplicate scoped path must fail");
         assert!(matches!(
-            duplicate.kind(),
-            CompositionErrorKind::DuplicateStage(_)
+            duplicate.fault(),
+            CompositionFault::DuplicateStage(_)
         ));
 
         let mut second = CompositionBuilder::new(composition_id("second"));
@@ -1529,12 +1488,12 @@ mod tests {
         let foreign = second
             .build()
             .expect_err("foreign handle must fail before missing output");
-        assert_eq!(foreign.kind(), &CompositionErrorKind::ForeignFlow);
+        assert_eq!(foreign.fault(), &CompositionFault::ForeignFlow);
 
         let missing = CompositionBuilder::new(composition_id("third"))
             .build()
             .expect_err("output is required");
-        assert_eq!(missing.kind(), &CompositionErrorKind::MissingOutput);
+        assert_eq!(missing.fault(), &CompositionFault::MissingOutput);
     }
 
     #[test]
@@ -1547,7 +1506,7 @@ mod tests {
                 .output(flow)
                 .build()
                 .expect_err("non-canonical stage name must fail");
-            assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+            assert_eq!(error.fault(), &CompositionFault::InvalidName);
         }
 
         let mut builder = CompositionBuilder::new(composition_id("names"));
@@ -1557,7 +1516,7 @@ mod tests {
             .output(flow)
             .build()
             .expect_err("oversized stage name must fail");
-        assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+        assert_eq!(error.fault(), &CompositionFault::InvalidName);
     }
 
     #[test]
@@ -1583,12 +1542,15 @@ mod tests {
             .output(flow)
             .build()
             .expect_err("duplicate stage path");
-        assert_eq!(duplicate.stage().map(StagePath::as_str), Some("dup.stage"));
+        assert_eq!(
+            duplicate.fault().stage().map(StagePath::as_str),
+            Some("dup.stage")
+        );
 
         let missing = CompositionBuilder::new(composition_id("empty"))
             .build()
             .expect_err("missing output");
-        assert!(missing.stage().is_none());
+        assert!(missing.fault().stage().is_none());
     }
 
     #[test]
@@ -1618,7 +1580,7 @@ mod tests {
             .output(scoped)
             .build()
             .expect_err("scope name must be canonical");
-        assert_eq!(error.kind(), &CompositionErrorKind::InvalidName);
+        assert_eq!(error.fault(), &CompositionFault::InvalidName);
     }
 
     #[test]
@@ -1631,7 +1593,7 @@ mod tests {
             .output(flow)
             .build()
             .expect_err("foreign output handle");
-        assert_eq!(error.kind(), &CompositionErrorKind::ForeignFlow);
+        assert_eq!(error.fault(), &CompositionFault::ForeignFlow);
     }
 
     fn project_syntax_composition() -> ProviderComposition {
@@ -1651,11 +1613,11 @@ mod tests {
             .build()
             .expect_err("unknown stage path");
         assert!(matches!(
-            not_found.kind(),
-            CompositionErrorKind::StageNotFound(_)
+            not_found.fault(),
+            CompositionFault::StageNotFound(_)
         ));
         assert_eq!(
-            not_found.stage().map(StagePath::as_str),
+            not_found.fault().stage().map(StagePath::as_str),
             Some("core.absent")
         );
 
@@ -1669,11 +1631,11 @@ mod tests {
             .build()
             .expect_err("transform type must match stage output");
         assert!(matches!(
-            mismatch.kind(),
-            CompositionErrorKind::TypeMismatch(_)
+            mismatch.fault(),
+            CompositionFault::TypeMismatch(_)
         ));
         assert_eq!(
-            mismatch.stage().map(StagePath::as_str),
+            mismatch.fault().stage().map(StagePath::as_str),
             Some("core.project")
         );
 
@@ -1687,8 +1649,8 @@ mod tests {
             .build()
             .expect_err("inserted stage path already exists");
         assert!(matches!(
-            duplicate.kind(),
-            CompositionErrorKind::DuplicateStage(_)
+            duplicate.fault(),
+            CompositionFault::DuplicateStage(_)
         ));
 
         let invalid = composition
@@ -1700,7 +1662,7 @@ mod tests {
             )
             .build()
             .expect_err("inserted stage name must be canonical");
-        assert_eq!(invalid.kind(), &CompositionErrorKind::InvalidName);
+        assert_eq!(invalid.fault(), &CompositionFault::InvalidName);
     }
 
     #[test]
@@ -1712,10 +1674,7 @@ mod tests {
             .remove("core.absent")
             .build()
             .expect_err("first failure must win");
-        assert!(matches!(
-            error.kind(),
-            CompositionErrorKind::TypeMismatch(_)
-        ));
+        assert!(matches!(error.fault(), CompositionFault::TypeMismatch(_)));
     }
 
     #[test]
@@ -1728,7 +1687,7 @@ mod tests {
             .expect_err("non-canonical name must fail");
         assert_eq!(
             invalid_error.context(),
-            vec![ErrorContext::new("rule", "stage name is not canonical")]
+            vec![ErrorContext::new("rule", "invalid_name")]
         );
 
         let mut builder = CompositionBuilder::new(composition_id("ctx"));
@@ -1741,7 +1700,7 @@ mod tests {
         assert_eq!(
             duplicate_error.context(),
             vec![
-                ErrorContext::new("rule", "stage path already exists"),
+                ErrorContext::new("rule", "duplicate_stage"),
                 ErrorContext::new("stage", "ctx.stage"),
             ]
         );
@@ -1756,10 +1715,7 @@ mod tests {
             .expect_err("foreign output handle must fail");
         assert_eq!(
             foreign_error.context(),
-            vec![ErrorContext::new(
-                "rule",
-                "flow handle belongs to another builder"
-            )]
+            vec![ErrorContext::new("rule", "foreign_flow")]
         );
 
         let missing_error = CompositionBuilder::new(composition_id("empty"))
@@ -1767,7 +1723,7 @@ mod tests {
             .expect_err("missing output must fail");
         assert_eq!(
             missing_error.context(),
-            vec![ErrorContext::new("rule", "composition selects no output")]
+            vec![ErrorContext::new("rule", "missing_output")]
         );
 
         let composition = project_syntax_composition();
@@ -1779,7 +1735,7 @@ mod tests {
         assert_eq!(
             not_found_error.context(),
             vec![
-                ErrorContext::new("rule", "stage does not exist"),
+                ErrorContext::new("rule", "stage_not_found"),
                 ErrorContext::new("stage", "core.absent"),
             ]
         );
@@ -1792,7 +1748,7 @@ mod tests {
         assert_eq!(
             mismatch_error.context(),
             vec![
-                ErrorContext::new("rule", "stage output type does not match consumer input"),
+                ErrorContext::new("rule", "type_mismatch"),
                 ErrorContext::new("stage", "core.syntax"),
             ]
         );
@@ -1805,7 +1761,7 @@ mod tests {
         assert_eq!(
             dangling_error.context(),
             vec![
-                ErrorContext::new("rule", "removed stage still has a consumer"),
+                ErrorContext::new("rule", "dangling_input"),
                 ErrorContext::new("stage", "core.project"),
             ]
         );

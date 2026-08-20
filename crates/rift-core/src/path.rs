@@ -6,10 +6,12 @@ use crate::constants::{
     PROJECT_PATH_BYTES_MAX, RIFT_STATE_DIRECTORY, RIFT_STATE_DIRECTORY_PREFIX,
     SOURCE_PATH_BYTES_MAX,
 };
-use crate::{ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, render_failure};
+use crate::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
+use serde::Serialize;
 
 /// Path vocabulary being validated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PathKind {
     /// Workspace-relative filesystem path.
     Project,
@@ -17,19 +19,9 @@ pub enum PathKind {
     Source,
 }
 
-impl PathKind {
-    /// Returns short lowercase phrase naming the path vocabulary.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Project => "project path",
-            Self::Source => "source path",
-        }
-    }
-}
-
 /// Reason a path is outside its domain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PathViolation {
     /// Source paths cannot be empty.
     Empty,
@@ -51,32 +43,14 @@ pub enum PathViolation {
     RiftState,
 }
 
-impl PathViolation {
-    /// Returns short lowercase phrase naming the violated rule.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Empty => "empty",
-            Self::TooLong => "longer than the byte bound",
-            Self::Absolute => "absolute",
-            Self::DotSegment => "contains a dot segment",
-            Self::EmptySegment => "contains an empty segment",
-            Self::Backslash => "contains a backslash separator",
-            Self::ControlCharacter => "contains a control character",
-            Self::NonCanonicalUnicode => "not Unicode NFC",
-            Self::RiftState => "addresses rift state under `.rift`",
-        }
-    }
-}
-
-/// Invalid project or source path.
+/// One rejected path: which vocabulary refused it, and which rule it broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PathError {
+pub struct PathFault {
     kind: PathKind,
     violation: PathViolation,
 }
 
-impl PathError {
+impl PathFault {
     /// Returns path vocabulary that rejected input.
     #[must_use]
     pub const fn kind(self) -> PathKind {
@@ -88,30 +62,23 @@ impl PathError {
     pub const fn violation(self) -> PathViolation {
         self.violation
     }
+}
 
-    /// Returns canonical registry metadata.
-    #[must_use]
-    pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorName::Wire(ErrorCode::UnsupportedPath).descriptor()
+impl Fault for PathFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::UnsupportedPath)
     }
 
-    /// Returns ordered typed context.
-    #[must_use]
-    pub fn context(self) -> Vec<ErrorContext> {
+    fn context(&self) -> Vec<ErrorContext> {
         vec![
-            ErrorContext::new("path_kind", self.kind.label()),
-            ErrorContext::new("violation", self.violation.label()),
+            ErrorContext::new("path_kind", fault_label(&self.kind)),
+            ErrorContext::new("violation", fault_label(&self.violation)),
         ]
     }
 }
 
-impl fmt::Display for PathError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
-    }
-}
-
-impl std::error::Error for PathError {}
+/// Invalid project or source path.
+pub type PathError = Error<PathFault>;
 
 /// Validated path below a workspace root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -218,8 +185,8 @@ fn is_dot_segment(segment: &str) -> bool {
     }
 }
 
-const fn path_error(kind: PathKind, violation: PathViolation) -> PathError {
-    PathError { kind, violation }
+fn path_error(kind: PathKind, violation: PathViolation) -> PathError {
+    Error::new(PathFault { kind, violation })
 }
 
 #[cfg(test)]
@@ -254,8 +221,8 @@ mod tests {
 
         for (value, violation) in cases {
             let error = ProjectPath::new(value).expect_err("fixture must be rejected");
-            assert_eq!(error.kind(), PathKind::Project);
-            assert_eq!(error.violation(), violation);
+            assert_eq!(error.fault().kind(), PathKind::Project);
+            assert_eq!(error.fault().violation(), violation);
         }
     }
 
@@ -264,7 +231,7 @@ mod tests {
         assert!(ProjectPath::new("a".repeat(1_000)).is_ok());
         let value = "\u{e9}".repeat(501);
         assert_eq!(
-            ProjectPath::new(value).map_err(super::PathError::violation),
+            ProjectPath::new(value).map_err(|error| error.fault().violation()),
             Err(PathViolation::TooLong)
         );
     }
@@ -276,21 +243,21 @@ mod tests {
             Ok(String::from("serde/1.0.197/src//lib.rs"))
         );
         assert_eq!(
-            SourcePath::new("").map_err(super::PathError::violation),
+            SourcePath::new("").map_err(|error| error.fault().violation()),
             Err(PathViolation::Empty)
         );
         assert_eq!(
-            SourcePath::new("../outside.rs").map_err(super::PathError::violation),
+            SourcePath::new("../outside.rs").map_err(|error| error.fault().violation()),
             Err(PathViolation::DotSegment)
         );
         assert!(SourcePath::new("a".repeat(4_096)).is_ok());
         assert!(SourcePath::new("é".repeat(2_048)).is_ok());
         assert_eq!(
-            SourcePath::new("a".repeat(4_097)).map_err(super::PathError::violation),
+            SourcePath::new("a".repeat(4_097)).map_err(|error| error.fault().violation()),
             Err(PathViolation::TooLong)
         );
         assert_eq!(
-            SourcePath::new("é".repeat(2_049)).map_err(super::PathError::violation),
+            SourcePath::new("é".repeat(2_049)).map_err(|error| error.fault().violation()),
             Err(PathViolation::TooLong)
         );
         for value in [
@@ -310,7 +277,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "the path cannot be addressed by this workspace: \
-             path_kind project path, violation contains a dot segment; \
+             path_kind project, violation dot_segment; \
              use a workspace-relative path with `/` separators and no `.` or `..` components"
         );
     }
@@ -329,20 +296,20 @@ mod tests {
             PathViolation::RiftState,
         ];
         for violation in violations {
-            let label = violation.label();
+            let label = crate::fault_label(&violation);
             assert!(!label.is_empty(), "violation={violation:?}");
             assert!(
-                label.chars().next().is_some_and(char::is_lowercase),
-                "label must start lowercase so it reads inside a rendered \
-                 failure line: violation={violation:?}, label={label}"
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "label must be the serde snake_case name so the rendered line \
+                 and the wire spelling cannot drift: violation={violation:?}, label={label}"
             );
         }
     }
 
     #[test]
     fn path_kind_labels_name_each_vocabulary() {
-        assert_eq!(PathKind::Project.label(), "project path");
-        assert_eq!(PathKind::Source.label(), "source path");
+        assert_eq!(crate::fault_label(&PathKind::Project), "project");
+        assert_eq!(crate::fault_label(&PathKind::Source), "source");
     }
 
     #[test]
@@ -351,7 +318,7 @@ mod tests {
         assert_eq!(
             project_error.to_string(),
             "the path cannot be addressed by this workspace: \
-             path_kind project path, violation contains a dot segment; \
+             path_kind project, violation dot_segment; \
              use a workspace-relative path with `/` separators and no `.` or `..` components"
         );
 
@@ -359,7 +326,7 @@ mod tests {
         assert_eq!(
             source_error.to_string(),
             "the path cannot be addressed by this workspace: \
-             path_kind source path, violation empty; \
+             path_kind source, violation empty; \
              use a workspace-relative path with `/` separators and no `.` or `..` components"
         );
     }

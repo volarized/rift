@@ -8,35 +8,21 @@ use crate::constants::{
     SOURCE_RESOLVER_PUNCTUATION, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_SAFE_PUNCTUATION,
     SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX,
 };
-use crate::{
-    ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, PathError, SourcePath, render_failure,
-};
+use crate::{Error, ErrorCode, ErrorContext, ErrorName, Fault, PathError, SourcePath};
+use serde::Serialize;
+
+/// An identity value that is empty or carries a control character.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdFault;
+
+impl Fault for IdFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::InvalidRequest)
+    }
+}
 
 /// Invalid stable identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IdError;
-
-impl IdError {
-    /// Returns canonical registry metadata.
-    #[must_use]
-    pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
-    }
-
-    /// Returns ordered typed context.
-    #[must_use]
-    pub fn context(self) -> Vec<ErrorContext> {
-        Vec::new()
-    }
-}
-
-impl fmt::Display for IdError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
-    }
-}
-
-impl std::error::Error for IdError {}
+pub type IdError = Error<IdFault>;
 
 macro_rules! define_id {
     ($name:ident, $docs:literal) => {
@@ -53,7 +39,7 @@ macro_rules! define_id {
             pub fn new(value: impl Into<String>) -> Result<Self, IdError> {
                 let value = value.into();
                 if value.is_empty() || value.chars().any(char::is_control) {
-                    return Err(IdError);
+                    return Err(Error::new(IdFault));
                 }
                 Ok(Self(value))
             }
@@ -81,7 +67,8 @@ define_id!(ModelId, "Resolved embedding model identity.");
 define_id!(CursorId, "Opaque search cursor identity.");
 
 /// Violated source-resolver identity rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceResolverIdViolation {
     /// Resolver identity is empty.
     Empty,
@@ -91,53 +78,39 @@ pub enum SourceResolverIdViolation {
     InvalidCharacter,
 }
 
-/// Invalid source-resolver identity.
+/// A source-resolver identity that broke one rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceResolverIdError {
+pub struct SourceResolverIdFault {
     violation: SourceResolverIdViolation,
 }
 
-impl SourceResolverIdError {
-    const fn new(violation: SourceResolverIdViolation) -> Self {
-        Self { violation }
-    }
-
+impl SourceResolverIdFault {
     /// Returns violated resolver-identity rule.
     #[must_use]
     pub const fn violation(self) -> SourceResolverIdViolation {
         self.violation
     }
+}
 
-    /// Returns canonical registry metadata.
-    #[must_use]
-    pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
+impl Fault for SourceResolverIdFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::InvalidRequest)
     }
 
-    /// Returns ordered typed context.
-    #[must_use]
-    pub fn context(self) -> Vec<ErrorContext> {
+    fn context(&self) -> Vec<ErrorContext> {
         vec![
-            ErrorContext::new("identity", "source resolver"),
-            ErrorContext::new(
-                "violation",
-                match self.violation {
-                    SourceResolverIdViolation::Empty => "empty",
-                    SourceResolverIdViolation::TooLong => "longer than the byte bound",
-                    SourceResolverIdViolation::InvalidCharacter => "not canonical lowercase syntax",
-                },
-            ),
+            ErrorContext::new("identity", "source_resolver"),
+            ErrorContext::new("violation", crate::fault_label(&self.violation)),
         ]
     }
 }
 
-impl fmt::Display for SourceResolverIdError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
-    }
-}
+/// Invalid source-resolver identity.
+pub type SourceResolverIdError = Error<SourceResolverIdFault>;
 
-impl std::error::Error for SourceResolverIdError {}
+fn resolver_id_error(violation: SourceResolverIdViolation) -> SourceResolverIdError {
+    Error::new(SourceResolverIdFault { violation })
+}
 
 /// Stable identity of one source resolver.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -152,18 +125,16 @@ impl SourceResolverId {
     pub fn new(value: impl Into<String>) -> Result<Self, SourceResolverIdError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(SourceResolverIdError::new(SourceResolverIdViolation::Empty));
+            return Err(resolver_id_error(SourceResolverIdViolation::Empty));
         }
         if value.len() > SOURCE_RESOLVER_ID_BYTES_MAX {
-            return Err(SourceResolverIdError::new(
-                SourceResolverIdViolation::TooLong,
-            ));
+            return Err(resolver_id_error(SourceResolverIdViolation::TooLong));
         }
         let mut bytes = value.bytes();
         if !bytes.next().is_some_and(is_resolver_first_byte)
             || !bytes.all(is_resolver_continuation_byte)
         {
-            return Err(SourceResolverIdError::new(
+            return Err(resolver_id_error(
                 SourceResolverIdViolation::InvalidCharacter,
             ));
         }
@@ -194,8 +165,8 @@ impl fmt::Display for SourceResolverId {
 }
 
 /// Resolver-owned source-unit identity failure classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceUnitIdErrorKind {
+#[derive(Debug, PartialEq, Eq)]
+pub enum SourceUnitIdFault {
     /// Canonical identity exceeds protocol limit.
     TooLong,
     /// Identity does not contain canonical Rift source address structure.
@@ -210,80 +181,41 @@ pub enum SourceUnitIdErrorKind {
     NonCanonical,
 }
 
-/// Invalid resolver-owned source-unit identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceUnitIdError {
-    kind: SourceUnitIdErrorKind,
-}
-
-impl SourceUnitIdError {
-    const fn new(kind: SourceUnitIdErrorKind) -> Self {
-        Self { kind }
+impl Fault for SourceUnitIdFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::InvalidRequest)
     }
 
-    /// Returns source-unit identity failure classification.
-    #[must_use]
-    pub const fn kind(self) -> SourceUnitIdErrorKind {
-        self.kind
-    }
-
-    /// Returns canonical registry metadata.
-    #[must_use]
-    pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
-    }
-
-    /// Returns ordered typed context.
-    #[must_use]
-    pub fn context(self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("identity", "source unit")];
-        match self.kind {
-            SourceUnitIdErrorKind::TooLong => {
-                context.push(ErrorContext::new("violation", "longer than the byte bound"));
+    fn context(&self) -> Vec<ErrorContext> {
+        let mut context = vec![ErrorContext::new("identity", "source_unit")];
+        match self {
+            Self::TooLong => context.push(ErrorContext::new("violation", "too_long")),
+            Self::InvalidAddress => {
+                context.push(ErrorContext::new("violation", "invalid_address"));
             }
-            SourceUnitIdErrorKind::InvalidAddress => {
-                context.push(ErrorContext::new(
-                    "violation",
-                    "not a canonical rift source address",
-                ));
+            Self::InvalidResolver(error) => context.extend(error.context()),
+            Self::InvalidEncoding => {
+                context.push(ErrorContext::new("violation", "invalid_encoding"));
             }
-            SourceUnitIdErrorKind::InvalidResolver(error) => context.extend(error.context()),
-            SourceUnitIdErrorKind::InvalidEncoding => {
-                context.push(ErrorContext::new(
-                    "violation",
-                    "contains malformed percent encoding or invalid UTF-8",
-                ));
-            }
-            SourceUnitIdErrorKind::InvalidKey(error) => context.extend(error.context()),
-            SourceUnitIdErrorKind::NonCanonical => {
-                context.push(ErrorContext::new(
-                    "violation",
-                    "not encoded in canonical form",
-                ));
-            }
+            Self::InvalidKey(error) => context.extend(error.context()),
+            Self::NonCanonical => context.push(ErrorContext::new("violation", "non_canonical")),
         }
         context
     }
-}
 
-impl fmt::Display for SourceUnitIdError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
-    }
-}
-
-impl std::error::Error for SourceUnitIdError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.kind {
-            SourceUnitIdErrorKind::InvalidResolver(error) => Some(error),
-            SourceUnitIdErrorKind::InvalidKey(error) => Some(error),
-            SourceUnitIdErrorKind::TooLong
-            | SourceUnitIdErrorKind::InvalidAddress
-            | SourceUnitIdErrorKind::InvalidEncoding
-            | SourceUnitIdErrorKind::NonCanonical => None,
+        match self {
+            Self::InvalidResolver(error) => Some(error),
+            Self::InvalidKey(error) => Some(error),
+            Self::TooLong | Self::InvalidAddress | Self::InvalidEncoding | Self::NonCanonical => {
+                None
+            }
         }
     }
 }
+
+/// Invalid resolver-owned source-unit identity.
+pub type SourceUnitIdError = Error<SourceUnitIdFault>;
 
 /// Stable resolver identity plus canonical source-unit key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -301,7 +233,7 @@ impl SourceUnitId {
     pub fn new(resolver: SourceResolverId, key: SourcePath) -> Result<Self, SourceUnitIdError> {
         let identity = Self { resolver, key };
         if identity.encoded_len() > SOURCE_UNIT_ID_BYTES_MAX {
-            return Err(SourceUnitIdError::new(SourceUnitIdErrorKind::TooLong));
+            return Err(Error::new(SourceUnitIdFault::TooLong));
         }
         Ok(identity)
     }
@@ -313,28 +245,22 @@ impl SourceUnitId {
     /// Returns [`SourceUnitIdError`] for invalid structure, coordinates, or encoding.
     pub fn parse(value: &str) -> Result<Self, SourceUnitIdError> {
         if value.len() > SOURCE_UNIT_ID_BYTES_MAX {
-            return Err(SourceUnitIdError::new(SourceUnitIdErrorKind::TooLong));
+            return Err(Error::new(SourceUnitIdFault::TooLong));
         }
         let address = value
             .strip_prefix(SOURCE_UNIT_URI_PREFIX)
-            .ok_or(SourceUnitIdError::new(
-                SourceUnitIdErrorKind::InvalidAddress,
-            ))?;
-        let (resolver, encoded_key) =
-            address
-                .split_once(SOURCE_UNIT_SEPARATOR)
-                .ok_or(SourceUnitIdError::new(
-                    SourceUnitIdErrorKind::InvalidAddress,
-                ))?;
-        let resolver = SourceResolverId::new(resolver).map_err(|error| {
-            SourceUnitIdError::new(SourceUnitIdErrorKind::InvalidResolver(error))
-        })?;
+            .ok_or(SourceUnitIdError::new(SourceUnitIdFault::InvalidAddress))?;
+        let (resolver, encoded_key) = address
+            .split_once(SOURCE_UNIT_SEPARATOR)
+            .ok_or(SourceUnitIdError::new(SourceUnitIdFault::InvalidAddress))?;
+        let resolver = SourceResolverId::new(resolver)
+            .map_err(|error| Error::new(SourceUnitIdFault::InvalidResolver(error)))?;
         let decoded = decode_unit_key(encoded_key)?;
         let key = SourcePath::new(decoded)
-            .map_err(|error| SourceUnitIdError::new(SourceUnitIdErrorKind::InvalidKey(error)))?;
+            .map_err(|error| Error::new(SourceUnitIdFault::InvalidKey(error)))?;
         let identity = Self::new(resolver, key)?;
         if identity.to_string() != value {
-            return Err(SourceUnitIdError::new(SourceUnitIdErrorKind::NonCanonical));
+            return Err(Error::new(SourceUnitIdFault::NonCanonical));
         }
         Ok(identity)
     }
@@ -405,29 +331,22 @@ fn decode_unit_key(value: &str) -> Result<String, SourceUnitIdError> {
             let high = bytes
                 .get(index + PERCENT_ESCAPE_HIGH_OFFSET)
                 .and_then(|byte| hex_value(*byte))
-                .ok_or(SourceUnitIdError::new(
-                    SourceUnitIdErrorKind::InvalidEncoding,
-                ))?;
+                .ok_or(SourceUnitIdError::new(SourceUnitIdFault::InvalidEncoding))?;
             let low = bytes
                 .get(index + PERCENT_ESCAPE_LOW_OFFSET)
                 .and_then(|byte| hex_value(*byte))
-                .ok_or(SourceUnitIdError::new(
-                    SourceUnitIdErrorKind::InvalidEncoding,
-                ))?;
+                .ok_or(SourceUnitIdError::new(SourceUnitIdFault::InvalidEncoding))?;
             decoded.push((high << HEX_NIBBLE_BITS) | low);
             index += PERCENT_ESCAPE_BYTES;
         } else {
             if !is_unit_key_safe(bytes[index]) {
-                return Err(SourceUnitIdError::new(
-                    SourceUnitIdErrorKind::InvalidEncoding,
-                ));
+                return Err(SourceUnitIdError::new(SourceUnitIdFault::InvalidEncoding));
             }
             decoded.push(bytes[index]);
             index += 1;
         }
     }
-    String::from_utf8(decoded)
-        .map_err(|_| SourceUnitIdError::new(SourceUnitIdErrorKind::InvalidEncoding))
+    String::from_utf8(decoded).map_err(|_| Error::new(SourceUnitIdFault::InvalidEncoding))
 }
 
 const fn hex_value(byte: u8) -> Option<u8> {
@@ -443,31 +362,18 @@ fn is_unit_key_safe(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || SOURCE_UNIT_SAFE_PUNCTUATION.contains(&byte)
 }
 
-/// Invalid zero revision.
+/// A revision of zero, which no counter mints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RevisionError;
+pub struct RevisionFault;
 
-impl RevisionError {
-    /// Returns canonical registry metadata.
-    #[must_use]
-    pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
-    }
-
-    /// Returns ordered typed context.
-    #[must_use]
-    pub fn context(self) -> Vec<ErrorContext> {
-        Vec::new()
+impl Fault for RevisionFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::InvalidRequest)
     }
 }
 
-impl fmt::Display for RevisionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
-    }
-}
-
-impl std::error::Error for RevisionError {}
+/// Invalid zero revision.
+pub type RevisionError = Error<RevisionFault>;
 
 macro_rules! define_revision {
     ($name:ident, $docs:literal) => {
@@ -482,7 +388,9 @@ macro_rules! define_revision {
             ///
             /// Returns [`RevisionError`] for zero.
             pub fn new(value: u64) -> Result<Self, RevisionError> {
-                NonZeroU64::new(value).map(Self).ok_or(RevisionError)
+                NonZeroU64::new(value)
+                    .map(Self)
+                    .ok_or_else(|| Error::new(RevisionFault))
             }
 
             /// Returns revision number.
@@ -503,15 +411,13 @@ define_revision!(ModelRevision, "Resolved model revision.");
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as _;
     use std::fmt::Write as _;
     use std::str::FromStr as _;
 
     use super::{
-        CompositionId, CompositionRevision, CursorId, IdError, IndexRevision, ModelId,
-        ModelRevision, ProviderId, ProviderRevision, RevisionError, SourceResolverId,
-        SourceResolverIdViolation, SourceRevision, SourceUnitId, SourceUnitIdError,
-        SourceUnitIdErrorKind, SymbolId, TreeRevision, WorkspaceId,
+        CompositionId, CompositionRevision, CursorId, IndexRevision, ModelId, ModelRevision,
+        ProviderId, ProviderRevision, SourceResolverId, SourceResolverIdViolation, SourceRevision,
+        SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
     };
     use crate::SourcePath;
     use crate::constants::{
@@ -535,17 +441,19 @@ mod tests {
                 SourcePath::new("src/lib.rs").expect("valid key"),
             )
         );
-        assert_eq!(
-            SourceUnitId::parse("rift://source/Rift/src/lib.rs").map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::InvalidResolver(
-                SourceResolverId::new("Rift").expect_err("uppercase is invalid")
-            ))
-        );
-        assert_eq!(
-            SourceUnitId::parse("rift://source/rift.sources.project/src%2flib.rs")
-                .map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::NonCanonical)
-        );
+        let invalid_resolver = SourceUnitId::parse("rift://source/Rift/src/lib.rs")
+            .expect_err("uppercase resolver is invalid");
+        assert!(matches!(
+            invalid_resolver.fault(),
+            SourceUnitIdFault::InvalidResolver(inner)
+                if inner.fault().violation() == SourceResolverIdViolation::InvalidCharacter
+        ));
+        let non_canonical = SourceUnitId::parse("rift://source/rift.sources.project/src%2flib.rs")
+            .expect_err("non-canonical escape is invalid");
+        assert!(matches!(
+            non_canonical.fault(),
+            SourceUnitIdFault::NonCanonical
+        ));
     }
 
     #[test]
@@ -564,38 +472,36 @@ mod tests {
         assert_eq!(exact.to_string().len(), SOURCE_UNIT_ID_BYTES_MAX);
 
         let over_key = format!("{}%", exact.key());
-        assert_eq!(
-            SourceUnitId::new(
-                resolver,
-                SourcePath::new(over_key).expect("decoded key remains bounded"),
-            )
-            .map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::TooLong)
-        );
+        let over_bound = SourceUnitId::new(
+            resolver,
+            SourcePath::new(over_key).expect("decoded key remains bounded"),
+        )
+        .expect_err("identity above the encoded bound is invalid");
+        assert!(matches!(over_bound.fault(), SourceUnitIdFault::TooLong));
     }
 
     #[test]
     fn resolver_identity_reports_stable_violation() {
         let resolver_error = SourceResolverId::new("Rift").expect_err("uppercase is invalid");
         assert_eq!(
-            resolver_error.violation(),
+            resolver_error.fault().violation(),
             SourceResolverIdViolation::InvalidCharacter
         );
         assert_eq!(
             resolver_error.to_string(),
             "the request does not match the documented form: \
-             identity source resolver, violation not canonical lowercase syntax; \
+             identity source_resolver, violation invalid_character; \
              correct the reported field and resend the request"
         );
 
         let unit_error = SourceUnitId::parse("rift://source/Rift/src/lib.rs")
             .expect_err("invalid resolver must fail unit identity");
-        assert!(unit_error.source().is_some());
+        assert!(std::error::Error::source(&unit_error).is_some());
         assert_eq!(
             unit_error.to_string(),
             "the request does not match the documented form: \
-             identity source unit, identity source resolver, \
-             violation not canonical lowercase syntax; \
+             identity source_unit, identity source_resolver, \
+             violation invalid_character; \
              correct the reported field and resend the request"
         );
     }
@@ -603,71 +509,78 @@ mod tests {
     #[test]
     fn resolver_identity_rejects_empty_and_oversized_values() {
         let empty_error = SourceResolverId::new("").expect_err("empty resolver is invalid");
-        assert_eq!(empty_error.violation(), SourceResolverIdViolation::Empty);
+        assert_eq!(
+            empty_error.fault().violation(),
+            SourceResolverIdViolation::Empty
+        );
 
         let oversized = "a".repeat(SOURCE_RESOLVER_ID_BYTES_MAX + 1);
         let oversized_error =
             SourceResolverId::new(oversized.as_str()).expect_err("oversized resolver");
         assert_eq!(
-            oversized_error.violation(),
+            oversized_error.fault().violation(),
             SourceResolverIdViolation::TooLong
         );
     }
 
     #[test]
     fn unit_identity_rejects_malformed_addresses() {
-        assert_eq!(
-            SourceUnitId::parse("not-a-rift-source-uri").map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::InvalidAddress)
-        );
-        assert_eq!(
-            SourceUnitId::parse("rift://source/resolverwithoutseparator")
-                .map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::InvalidAddress)
-        );
+        let missing_prefix =
+            SourceUnitId::parse("not-a-rift-source-uri").expect_err("missing prefix is invalid");
+        assert!(matches!(
+            missing_prefix.fault(),
+            SourceUnitIdFault::InvalidAddress
+        ));
+        let missing_separator = SourceUnitId::parse("rift://source/resolverwithoutseparator")
+            .expect_err("missing separator is invalid");
+        assert!(matches!(
+            missing_separator.fault(),
+            SourceUnitIdFault::InvalidAddress
+        ));
 
         let oversized = format!(
             "{SOURCE_UNIT_URI_PREFIX}{}",
             "a".repeat(SOURCE_UNIT_ID_BYTES_MAX)
         );
-        assert_eq!(
-            SourceUnitId::parse(&oversized).map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::TooLong)
-        );
+        let over_bound = SourceUnitId::parse(&oversized).expect_err("oversized address");
+        assert!(matches!(over_bound.fault(), SourceUnitIdFault::TooLong));
     }
 
     #[test]
     fn unit_identity_rejects_malformed_percent_escapes() {
-        assert_eq!(
-            SourceUnitId::parse("rift://source/r/%G0").map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::InvalidEncoding)
-        );
-        assert_eq!(
-            SourceUnitId::parse("rift://source/r/%1").map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::InvalidEncoding)
-        );
-        assert_eq!(
-            SourceUnitId::parse("rift://source/r/%FF").map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::InvalidEncoding)
-        );
-        assert_eq!(
-            SourceUnitId::parse("rift://source/r/a b").map_err(SourceUnitIdError::kind),
-            Err(SourceUnitIdErrorKind::InvalidEncoding)
-        );
+        for address in [
+            "rift://source/r/%G0",
+            "rift://source/r/%1",
+            "rift://source/r/%FF",
+            "rift://source/r/a b",
+        ] {
+            let error = SourceUnitId::parse(address).expect_err("malformed escape is invalid");
+            assert!(
+                matches!(error.fault(), SourceUnitIdFault::InvalidEncoding),
+                "{address} must classify as invalid_encoding, got {fault:?}",
+                fault = error.fault()
+            );
+        }
     }
 
     #[test]
     fn unit_identity_reports_decoded_key_violation_as_source() {
         let error = SourceUnitId::parse("rift://source/rift.sources.project/..")
             .expect_err("dot-segment key must be rejected");
-        let key_error = SourcePath::new("..").expect_err("dot segment is invalid");
-        assert_eq!(error.kind(), SourceUnitIdErrorKind::InvalidKey(key_error));
-        assert!(error.source().is_some());
+        assert!(matches!(
+            error.fault(),
+            SourceUnitIdFault::InvalidKey(key_error)
+                if key_error.fault().violation() == crate::PathViolation::DotSegment
+        ));
+        assert!(std::error::Error::source(&error).is_some());
 
         let non_canonical = SourceUnitId::parse("rift://source/rift.sources.project/src%2flib.rs")
             .expect_err("non-canonical encoding must be rejected");
-        assert_eq!(non_canonical.kind(), SourceUnitIdErrorKind::NonCanonical);
-        assert!(non_canonical.source().is_none());
+        assert!(matches!(
+            non_canonical.fault(),
+            SourceUnitIdFault::NonCanonical
+        ));
+        assert!(std::error::Error::source(&non_canonical).is_none());
     }
 
     #[test]
@@ -709,7 +622,7 @@ mod tests {
         );
         assert_eq!(error.descriptor().code(), "invalid_request");
         let _: &dyn std::error::Error = &error;
-        assert_eq!(error, IdError);
+        assert!(matches!(error.fault(), super::IdFault));
     }
 
     #[test]
@@ -728,10 +641,10 @@ mod tests {
         );
         assert_eq!(error.descriptor().code(), "invalid_request");
         let _: &dyn std::error::Error = &error;
-        assert_eq!(error, RevisionError);
+        assert!(matches!(error.fault(), super::RevisionFault));
     }
 
-    fn context_pairs(error: SourceUnitIdError) -> Vec<(&'static str, String)> {
+    fn context_pairs(error: &SourceUnitIdError) -> Vec<(&'static str, String)> {
         error
             .context()
             .into_iter()
@@ -747,82 +660,75 @@ mod tests {
         ))
         .expect_err("oversized address must be rejected");
         assert_eq!(
-            context_pairs(too_long),
+            context_pairs(&too_long),
             vec![
-                ("identity", "source unit".to_string()),
-                ("violation", "longer than the byte bound".to_string()),
+                ("identity", "source_unit".to_string()),
+                ("violation", "too_long".to_string()),
             ]
         );
 
         let invalid_address = SourceUnitId::parse("not-a-rift-source-uri")
             .expect_err("missing prefix must be rejected");
         assert_eq!(
-            context_pairs(invalid_address),
+            context_pairs(&invalid_address),
             vec![
-                ("identity", "source unit".to_string()),
-                (
-                    "violation",
-                    "not a canonical rift source address".to_string()
-                ),
+                ("identity", "source_unit".to_string()),
+                ("violation", "invalid_address".to_string()),
             ]
         );
 
         let invalid_resolver = SourceUnitId::parse("rift://source/Rift/src/lib.rs")
             .expect_err("uppercase resolver must be rejected");
         assert_eq!(
-            context_pairs(invalid_resolver),
+            context_pairs(&invalid_resolver),
             vec![
-                ("identity", "source unit".to_string()),
-                ("identity", "source resolver".to_string()),
-                ("violation", "not canonical lowercase syntax".to_string()),
+                ("identity", "source_unit".to_string()),
+                ("identity", "source_resolver".to_string()),
+                ("violation", "invalid_character".to_string()),
             ]
         );
 
         let invalid_encoding = SourceUnitId::parse("rift://source/r/%G0")
             .expect_err("malformed percent escape must be rejected");
         assert_eq!(
-            context_pairs(invalid_encoding),
+            context_pairs(&invalid_encoding),
             vec![
-                ("identity", "source unit".to_string()),
-                (
-                    "violation",
-                    "contains malformed percent encoding or invalid UTF-8".to_string()
-                ),
+                ("identity", "source_unit".to_string()),
+                ("violation", "invalid_encoding".to_string()),
             ]
         );
 
         let invalid_key = SourceUnitId::parse("rift://source/rift.sources.project/..")
             .expect_err("dot-segment key must be rejected");
         assert_eq!(
-            context_pairs(invalid_key),
+            context_pairs(&invalid_key),
             vec![
-                ("identity", "source unit".to_string()),
-                ("path_kind", "source path".to_string()),
-                ("violation", "contains a dot segment".to_string()),
+                ("identity", "source_unit".to_string()),
+                ("path_kind", "source".to_string()),
+                ("violation", "dot_segment".to_string()),
             ]
         );
 
         let non_canonical = SourceUnitId::parse("rift://source/rift.sources.project/src%2flib.rs")
             .expect_err("non-canonical encoding must be rejected");
         assert_eq!(
-            context_pairs(non_canonical),
+            context_pairs(&non_canonical),
             vec![
-                ("identity", "source unit".to_string()),
-                ("violation", "not encoded in canonical form".to_string()),
+                ("identity", "source_unit".to_string()),
+                ("violation", "non_canonical".to_string()),
             ]
         );
 
         assert_eq!(
             too_long.to_string(),
             "the request does not match the documented form: \
-             identity source unit, violation longer than the byte bound; \
+             identity source_unit, violation too_long; \
              correct the reported field and resend the request"
         );
         assert_eq!(
             invalid_key.to_string(),
             "the request does not match the documented form: \
-             identity source unit, path_kind source path, \
-             violation contains a dot segment; \
+             identity source_unit, path_kind source, violation dot_segment; \
              correct the reported field and resend the request"
         );
     }

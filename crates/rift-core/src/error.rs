@@ -339,13 +339,17 @@ pub trait Fault: fmt::Debug {
 /// The serde name of a fault kind's variant: a unit variant serializes to a
 /// string, a payload variant to a single-key map. Fault kinds derive
 /// `Serialize` with `rename_all = "snake_case"` and use this as their label,
-/// so a kind's label and its wire spelling cannot drift.
+/// so a kind's label and its wire spelling cannot drift. A value serde does
+/// not name falls back to its `Debug` form.
 #[must_use]
-pub fn fault_label<K: Serialize>(kind: &K) -> Option<String> {
+pub fn fault_label<K: Serialize + fmt::Debug>(kind: &K) -> String {
     match serde_json::to_value(kind) {
-        Ok(serde_json::Value::String(label)) => Some(label),
-        Ok(serde_json::Value::Object(map)) => map.into_iter().next().map(|(label, _)| label),
-        _ => None,
+        Ok(serde_json::Value::String(label)) => label,
+        Ok(serde_json::Value::Object(map)) if !map.is_empty() => match map.into_iter().next() {
+            Some((label, _)) => label,
+            None => format!("{kind:?}"),
+        },
+        _ => format!("{kind:?}"),
     }
 }
 
@@ -353,8 +357,9 @@ pub fn fault_label<K: Serialize>(kind: &K) -> Option<String> {
 ///
 /// Every crate's public error is this type over its own [`Fault`] kind, so
 /// context threading, rendering, and `source` exist once. Display prints the
-/// registry rule for the kind's identity.
-#[derive(Debug)]
+/// registry rule for the kind's identity. Equality follows the fault kind:
+/// it is derived, so it exists exactly where the kind supports it.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Error<K: Fault> {
     kind: K,
     context: Vec<ErrorContext>,
@@ -379,7 +384,7 @@ impl<K: Fault> Error<K> {
 
     /// Returns the fault kind.
     #[must_use]
-    pub fn kind(&self) -> &K {
+    pub fn fault(&self) -> &K {
         &self.kind
     }
 
@@ -535,9 +540,7 @@ mod tests {
 
         fn context(&self) -> Vec<ErrorContext> {
             let mut context = Vec::new();
-            if let Some(label) = fault_label(self) {
-                context.push(ErrorContext::new("fault", label));
-            }
+            context.push(ErrorContext::new("fault", fault_label(self)));
             if let Self::MissingTarget { path } = self {
                 context.push(ErrorContext::new("path", path.clone()));
             }
@@ -564,16 +567,12 @@ mod tests {
 
     #[test]
     fn fault_labels_come_from_serde_for_unit_and_payload_variants() {
-        assert_eq!(
-            fault_label(&ProbeFault::Unreadable).as_deref(),
-            Some("unreadable")
-        );
+        assert_eq!(fault_label(&ProbeFault::Unreadable), "unreadable");
         assert_eq!(
             fault_label(&ProbeFault::MissingTarget {
                 path: String::new()
-            })
-            .as_deref(),
-            Some("missing_target")
+            }),
+            "missing_target"
         );
     }
 
