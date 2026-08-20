@@ -92,16 +92,16 @@ fn get_symbol_roots_match_exported_object_shapes() -> TestResult {
 
 #[test]
 fn get_symbol_params_apply_canonical_defaults_and_close_root() -> TestResult {
-    let params: GetSymbolParams = serde_json::from_value(json!({"name": "BaseModel"}))?;
+    let params: GetSymbolParams = serde_json::from_value(json!({"name": "ReadService"}))?;
     let encoded = serde_json::to_value(params)?;
-    assert_eq!(encoded["name"], "BaseModel");
+    assert_eq!(encoded["name"], "ReadService");
     assert_eq!(encoded["include_body"], true);
     assert_eq!(encoded["include_history"], false);
     assert_eq!(encoded["limit"], 5);
     assert_eq!(encoded["scope"], "all");
 
     assert_rejected::<GetSymbolParams>(json!({}));
-    assert_rejected::<GetSymbolParams>(json!({"name": "BaseModel", "extra": true}));
+    assert_rejected::<GetSymbolParams>(json!({"name": "ReadService", "extra": true}));
     Ok(())
 }
 
@@ -171,15 +171,15 @@ fn search_roots_match_exported_object_shapes() -> TestResult {
 
 #[test]
 fn search_params_apply_defaults_and_close_root() -> TestResult {
-    let params: SearchParams = serde_json::from_value(json!({"query": "BaseModel"}))?;
+    let params: SearchParams = serde_json::from_value(json!({"query": "ReadService"}))?;
     let encoded = serde_json::to_value(params)?;
-    assert_eq!(encoded["query"], "BaseModel");
+    assert_eq!(encoded["query"], "ReadService");
     assert_eq!(encoded["target"], "all");
     assert_eq!(encoded["order"], "relevance");
     assert_eq!(encoded["scope"], "project");
 
-    assert_rejected::<SearchParams>(json!("BaseModel"));
-    assert_rejected::<SearchParams>(json!({"query": "BaseModel", "extra": true}));
+    assert_rejected::<SearchParams>(json!("ReadService"));
+    assert_rejected::<SearchParams>(json!({"query": "ReadService", "extra": true}));
     Ok(())
 }
 
@@ -215,7 +215,7 @@ fn search_result_requires_present_nullable_cursor() -> TestResult {
 fn filter_accepts_recursive_closed_variants() -> TestResult {
     let field = json!({
         "kind": "field",
-        "field": {"field": "name", "op": "eq", "value": "BaseModel"}
+        "field": {"field": "name", "op": "eq", "value": "ReadService"}
     });
     let accepted = [
         field.clone(),
