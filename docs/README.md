@@ -13,12 +13,11 @@ bun run dev
 
 The site is then available at <http://localhost:3000>.
 
-When a Pydantic model, configuration field, or protocol description changes, regenerate the schemas
-and Protobuf files from the repository root before building the site:
+When a protocol model or tool description changes, regenerate the exported schema from the
+repository root before building the site:
 
 ```sh
-cd protocol
-uv run python -m rift.generate
+just generate
 ```
 
 Use these checks for documentation changes:
