@@ -36,11 +36,29 @@ pub enum ErrorName {
     ConfigurationInvalid,
     /// No configured provider serves the request.
     CapabilityUnavailable,
+    /// Installed rift binary cannot be inspected.
+    UpdateBinaryInvalid,
+    /// Published release does not match the expected form.
+    UpdateReleaseInvalid,
+    /// Release could not be downloaded.
+    UpdateDownloadFailed,
+    /// Update staging directory could not be prepared.
+    UpdateStagingFailed,
+    /// Downloaded release does not match its published checksum.
+    UpdateChecksumMismatch,
+    /// Downloaded release archive is not valid.
+    UpdateArchiveInvalid,
+    /// New rift binary could not be installed.
+    UpdatePublishFailed,
+    /// Previous rift binary could not be restored.
+    UpdateRollbackFailed,
+    /// Generated artifact no longer matches its source.
+    ArtifactStale,
 }
 
 impl ErrorName {
     /// Every registered identity, in registry order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 23] = [
         Self::InvalidRequest,
         Self::PermissionDenied,
         Self::ResourceNotFound,
@@ -55,6 +73,15 @@ impl ErrorName {
         Self::TemporarilyUnavailable,
         Self::ConfigurationInvalid,
         Self::CapabilityUnavailable,
+        Self::UpdateBinaryInvalid,
+        Self::UpdateReleaseInvalid,
+        Self::UpdateDownloadFailed,
+        Self::UpdateStagingFailed,
+        Self::UpdateChecksumMismatch,
+        Self::UpdateArchiveInvalid,
+        Self::UpdatePublishFailed,
+        Self::UpdateRollbackFailed,
+        Self::ArtifactStale,
     ];
 }
 
@@ -134,6 +161,11 @@ impl ErrorRegistry {
 
     /// Returns canonical metadata for one error identity.
     #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive match is the registry's single definition table; \
+                  splitting it would scatter the catalog this module exists to hold"
+    )]
     pub const fn descriptor(name: ErrorName) -> ErrorDescriptor {
         match name {
             ErrorName::InvalidRequest => ErrorDescriptor {
@@ -233,6 +265,69 @@ impl ErrorRegistry {
                 explanation: "no configured provider serves this request",
                 retry: RetryDirective::OperatorAction,
                 action: "adjust the request to a served capability, or configure a provider that serves it",
+            },
+            ErrorName::UpdateBinaryInvalid => ErrorDescriptor {
+                name,
+                code: "update_binary_invalid",
+                explanation: "the installed rift binary cannot be inspected",
+                retry: RetryDirective::OperatorAction,
+                action: "reinstall rift from an official release",
+            },
+            ErrorName::UpdateReleaseInvalid => ErrorDescriptor {
+                name,
+                code: "update_release_invalid",
+                explanation: "the published release does not match the expected form",
+                retry: RetryDirective::SameRequest,
+                action: "retry `rift update`, and report the release if the failure repeats",
+            },
+            ErrorName::UpdateDownloadFailed => ErrorDescriptor {
+                name,
+                code: "update_download_failed",
+                explanation: "the release could not be downloaded",
+                retry: RetryDirective::SameRequest,
+                action: "check network connectivity, then retry `rift update`",
+            },
+            ErrorName::UpdateStagingFailed => ErrorDescriptor {
+                name,
+                code: "update_staging_failed",
+                explanation: "the update staging directory could not be prepared",
+                retry: RetryDirective::OperatorAction,
+                action: "ensure the temporary directory is writable and has free space, then retry `rift update`",
+            },
+            ErrorName::UpdateChecksumMismatch => ErrorDescriptor {
+                name,
+                code: "update_checksum_mismatch",
+                explanation: "the downloaded release does not match its published checksum",
+                retry: RetryDirective::SameRequest,
+                action: "retry `rift update`, and report the release if the mismatch repeats",
+            },
+            ErrorName::UpdateArchiveInvalid => ErrorDescriptor {
+                name,
+                code: "update_archive_invalid",
+                explanation: "the downloaded release archive is not valid",
+                retry: RetryDirective::SameRequest,
+                action: "retry `rift update`, and report the release if the failure repeats",
+            },
+            ErrorName::UpdatePublishFailed => ErrorDescriptor {
+                name,
+                code: "update_publish_failed",
+                explanation: "the new rift binary could not be installed",
+                retry: RetryDirective::OperatorAction,
+                action: "ensure the install directory is writable, then retry `rift update`",
+            },
+            ErrorName::UpdateRollbackFailed => ErrorDescriptor {
+                name,
+                code: "update_rollback_failed",
+                explanation: "the previous rift binary could not be restored",
+                retry: RetryDirective::OperatorAction,
+                action: "reinstall rift from an official release",
+            },
+            ErrorName::ArtifactStale => ErrorDescriptor {
+                name,
+                code: "artifact_stale",
+                explanation: "a generated artifact no longer matches its source",
+                retry: RetryDirective::OperatorAction,
+                action: "regenerate the artifact with the printed command",
             },
         }
     }
