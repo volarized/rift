@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -37,7 +37,7 @@ tree-sitter = "=0.25.10"
 tree-sitter-rust = "=0.24.2"
 tempfile = "3.27.0"
 unicode-normalization = "0.1.24"
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
