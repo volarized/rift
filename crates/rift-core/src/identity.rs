@@ -426,6 +426,8 @@ define_revision!(ModelRevision, "Resolved model revision.");
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::fmt::Write as _;
+    use std::str::FromStr as _;
 
     use super::{
         CompositionId, CompositionRevision, CursorId, IdError, IndexRevision, ModelId,
@@ -434,7 +436,9 @@ mod tests {
         SourceUnitIdErrorKind, SymbolId, TreeRevision, WorkspaceId,
     };
     use crate::SourcePath;
-    use crate::constants::{SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX};
+    use crate::constants::{
+        SOURCE_RESOLVER_ID_BYTES_MAX, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX,
+    };
 
     #[test]
     fn identities_reject_ambiguous_values() {
@@ -511,6 +515,105 @@ mod tests {
             unit_error.to_string(),
             unit_error.descriptor().explanation()
         );
+    }
+
+    #[test]
+    fn resolver_identity_rejects_empty_and_oversized_values() {
+        let empty_error = SourceResolverId::new("").expect_err("empty resolver is invalid");
+        assert_eq!(empty_error.violation(), SourceResolverIdViolation::Empty);
+
+        let oversized = "a".repeat(SOURCE_RESOLVER_ID_BYTES_MAX + 1);
+        let oversized_error =
+            SourceResolverId::new(oversized.as_str()).expect_err("oversized resolver");
+        assert_eq!(
+            oversized_error.violation(),
+            SourceResolverIdViolation::TooLong
+        );
+    }
+
+    #[test]
+    fn unit_identity_rejects_malformed_addresses() {
+        assert_eq!(
+            SourceUnitId::parse("not-a-rift-source-uri").map_err(SourceUnitIdError::kind),
+            Err(SourceUnitIdErrorKind::InvalidAddress)
+        );
+        assert_eq!(
+            SourceUnitId::parse("rift://source/resolverwithoutseparator")
+                .map_err(SourceUnitIdError::kind),
+            Err(SourceUnitIdErrorKind::InvalidAddress)
+        );
+
+        let oversized = format!(
+            "{SOURCE_UNIT_URI_PREFIX}{}",
+            "a".repeat(SOURCE_UNIT_ID_BYTES_MAX)
+        );
+        assert_eq!(
+            SourceUnitId::parse(&oversized).map_err(SourceUnitIdError::kind),
+            Err(SourceUnitIdErrorKind::TooLong)
+        );
+    }
+
+    #[test]
+    fn unit_identity_rejects_malformed_percent_escapes() {
+        assert_eq!(
+            SourceUnitId::parse("rift://source/r/%G0").map_err(SourceUnitIdError::kind),
+            Err(SourceUnitIdErrorKind::InvalidEncoding)
+        );
+        assert_eq!(
+            SourceUnitId::parse("rift://source/r/%1").map_err(SourceUnitIdError::kind),
+            Err(SourceUnitIdErrorKind::InvalidEncoding)
+        );
+        assert_eq!(
+            SourceUnitId::parse("rift://source/r/%FF").map_err(SourceUnitIdError::kind),
+            Err(SourceUnitIdErrorKind::InvalidEncoding)
+        );
+        assert_eq!(
+            SourceUnitId::parse("rift://source/r/a b").map_err(SourceUnitIdError::kind),
+            Err(SourceUnitIdErrorKind::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn unit_identity_reports_decoded_key_violation_as_source() {
+        let error = SourceUnitId::parse("rift://source/rift.sources.project/..")
+            .expect_err("dot-segment key must be rejected");
+        let key_error = SourcePath::new("..").expect_err("dot segment is invalid");
+        assert_eq!(error.kind(), SourceUnitIdErrorKind::InvalidKey(key_error));
+        assert!(error.source().is_some());
+
+        let non_canonical = SourceUnitId::parse("rift://source/rift.sources.project/src%2flib.rs")
+            .expect_err("non-canonical encoding must be rejected");
+        assert_eq!(non_canonical.kind(), SourceUnitIdErrorKind::NonCanonical);
+        assert!(non_canonical.source().is_none());
+    }
+
+    #[test]
+    fn unit_identity_exposes_resolver_and_implements_from_str() {
+        let identity = SourceUnitId::parse("rift://source/rift.sources.project/src/lib.rs")
+            .expect("canonical identity parses");
+        assert_eq!(identity.resolver().as_str(), "rift.sources.project");
+
+        let parsed = SourceUnitId::from_str("rift://source/rift.sources.project/src/lib.rs")
+            .expect("FromStr delegates to parse");
+        assert_eq!(parsed, identity);
+    }
+
+    #[test]
+    fn unit_identity_display_propagates_writer_failure() {
+        struct FailingWriter;
+
+        impl std::fmt::Write for FailingWriter {
+            fn write_str(&mut self, _value: &str) -> std::fmt::Result {
+                Err(std::fmt::Error)
+            }
+        }
+
+        let resolver = SourceResolverId::new("r").expect("valid resolver");
+        let key = SourcePath::new("lib.rs").expect("valid key");
+        let identity = SourceUnitId::new(resolver, key).expect("identity fits protocol bound");
+
+        let mut sink = FailingWriter;
+        assert!(write!(sink, "{identity}").is_err());
     }
 
     #[test]
