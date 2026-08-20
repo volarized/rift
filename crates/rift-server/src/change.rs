@@ -215,9 +215,9 @@ impl ChangeService {
                 Err(refusal) => return Ok(refusal),
             };
             let Some(file) = reads.index().file(&path) else {
-                return Ok(refused(
+                return Ok(ChangeResult::refused(
                     RefusalReason::UnmetPrecondition,
-                    vec![precondition(
+                    vec![OperationPrecondition::new(
                         OperationPreconditionKind::TargetExists,
                         OperationPreconditionStatus::Failed,
                         Vec::new(),
@@ -239,7 +239,7 @@ impl ChangeService {
                     text: String::new(),
                 },
             )? {
-                return Ok(refused(reason, preconditions));
+                return Ok(ChangeResult::refused(reason, preconditions));
             }
             match diffy::apply(file.source(), &parsed) {
                 Ok(next_source) => rewrites.push(FileRewrite {
@@ -250,9 +250,9 @@ impl ChangeService {
                 Err(error) => {
                     let mut detail = error.to_string();
                     detail.truncate(PATCH_MISMATCH_DETAIL_BYTES_MAX);
-                    return Ok(refused(
+                    return Ok(ChangeResult::refused(
                         RefusalReason::UnmetPrecondition,
-                        vec![precondition(
+                        vec![OperationPrecondition::new(
                             OperationPreconditionKind::SourceUnchanged,
                             OperationPreconditionStatus::Failed,
                             Vec::new(),
@@ -580,12 +580,18 @@ fn patched_project_path(
     let original = parsed.original().unwrap_or_default();
     let modified = parsed.modified().unwrap_or_default();
     if original == "/dev/null" || modified == "/dev/null" {
-        return Ok(Err(refused(RefusalReason::Unsupported, Vec::new())));
+        return Ok(Err(ChangeResult::refused(
+            RefusalReason::Unsupported,
+            Vec::new(),
+        )));
     }
     let original = original.strip_prefix("a/").unwrap_or(original);
     let modified = modified.strip_prefix("b/").unwrap_or(modified);
     if original != modified {
-        return Ok(Err(refused(RefusalReason::Unsupported, Vec::new())));
+        return Ok(Err(ChangeResult::refused(
+            RefusalReason::Unsupported,
+            Vec::new(),
+        )));
     }
     let path = CoreProjectPath::new(original).map_err(|error| {
         ReadFault::invalid("patch", rift_core::fault_label(&error.fault().violation()))
