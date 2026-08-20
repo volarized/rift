@@ -1,0 +1,457 @@
+---
+title: MCP
+---
+
+<VersionBadge version="planned" />
+
+
+The Rift server terminates MCP over [Streamable
+HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports#streamable-http) on the
+port its lock file names.
+`rift mcp` is a small stdio proxy for harnesses that launch MCP servers as subprocesses: it
+forwards frames unchanged and decides nothing.
+
+Requests do not open connection-scoped sessions. Each call names a
+[`ProjectionId`](/docs/protocol/reference#ProjectionId), or the workspace tree when it
+omits one, and carries every witnessed address it uses.
+
+A cursor names a process-local captured result. A projection retains its changes and recorded
+read dependencies across calls, so either identity can refer to server state created earlier.
+
+A tool result rides MCP
+[`structuredContent`](https://modelcontextprotocol.io/specification/draft/server/tools#structured-content),
+typed by the tool's declared output schema, with the
+same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is such a result —
+[`ChangeResult`](/docs/protocol/reference#ChangeResult) saying refused, never `isError` —
+while [`ErrorData`](/docs/protocol/reference#ErrorData) travels as the
+[JSON-RPC error](https://www.jsonrpc.org/specification#error_object)
+object's `data`, under code `-32000`.
+
+The server serializes change application per targeted tree: two concurrent changes against one
+tree apply one after the other, and the later one meets its preconditions against the earlier
+one's result. Reads run concurrently.
+
+An MCP [cancellation
+notification](https://modelcontextprotocol.io/specification/draft/basic/utilities/cancellation)
+drops a queued change. A running change completes or rolls back whole.
+
+## Reads
+
+Callers read code through these tools:
+
+| Tool | Result |
+| --- | --- |
+| [`get_symbol`](#tool-get_symbol) | project and dependency declarations by known name |
+| [`search`](#tool-search) | ranked files, nodes, or symbols across a selected source scope |
+| [`nodes`](#tool-nodes) | the syntax nodes covering one position, with witnessed addresses |
+
+Each result carries a [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) identifying
+its project tree and source catalog. `search` and `get_symbol` also identify the index revision
+they used. Coverage lists provider fact revisions in merge precedence order and marks a revision
+stale when its tree or source-catalog input no longer matches.
+
+Every read accepts an optional `projection` and reads the workspace tree when it is absent.
+[`rift://fs`](#resource-fs) serves file bytes and directory listings to consumers without host
+filesystem tools.
+
+### get_symbol [#tool-get_symbol]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`get_symbol` is the read to start from when the name is known. Its default `scope: "all"` searches
+project, dependency, standard-library, and external declarations. A hit includes source when its
+resolver supplied readable bytes; synthetic and source-less dependency declarations still carry
+their signatures, documentation, types, and relationships. `include_history` applies to project
+symbols and attaches their version-control timeline and co-change coupling.
+
+### search [#tool-search]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`search` takes a lexical `query`, a `filter` over resolved provider facts, a bounded
+`traversal`, or a combination. A traversal starts from one symbol and states its intent.
+`trace` follows outgoing `calls`; `find_tests` follows incoming `tests`; `edit_ripple` follows
+incoming `calls`; and `review_context` follows `calls` in both directions. `direction` and
+`facets` override those defaults.
+
+Search defaults to `scope: "project"`. `scope: "dependencies"` searches resolved dependencies;
+`scope: "all"` also includes project, standard-library, and external declarations. A `paths`
+selector only applies to project scope because dependency paths belong to their packages, not the
+workspace folder.
+
+The server walks one hop unless `max_hops` asks for two, and visits no more than `max_nodes`.
+Each reached symbol carries `distance` and a `path` of audited relationship steps. This makes a
+two-hop result distinguishable from direct callers. Each relationship carries its source-node
+evidence and derivation; result coverage names the contributing provider revisions.
+
+For example, this request finds direct tests of one symbol without a separate graph tool:
+
+```json
+{
+  "traversal": {
+    "seed": "rift://symbol/python/pkg.solver.fit~1",
+    "intent": "find_tests",
+    "max_nodes": 10
+  }
+}
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/python/tests.test_solver.test_fit",
+      "language": { "name": "python" },
+      "name": "test_fit",
+      "kind": "function",
+      "facets": ["callable", "test"],
+      "origin": {
+        "location": { "kind": "project", "package": null },
+        "source_kind": "authored",
+        "unit": "rift://source/src_mfrggzdfmztwq2lknnwg23tpob"
+      },
+      "container": null,
+      "modifiers": [],
+      "visibility": null,
+      "types": [],
+      "signatures": [],
+      "documentation": [],
+      "extensions": {},
+      "document_local": true
+    }
+  },
+  "score": 1.0,
+  "matched_by": ["relationship"],
+  "span": {
+    "unit": "rift://source/src_mfrggzdfmztwq2lknnwg23tpob",
+    "range": { "start": 120, "end": 168 }
+  },
+  "line": 8,
+  "path": [
+    {
+      "relationship": {
+        "from": "rift://symbol/python/tests.test_solver.test_fit",
+        "kind": "call",
+        "facets": ["calls", "tests"],
+        "to": "rift://symbol/python/pkg.solver.fit",
+        "evidence": [],
+        "derivation": "syntax",
+        "confidence": null,
+        "extensions": {}
+      },
+      "direction": "incoming"
+    }
+  ],
+  "distance": 1
+}
+```
+
+When the caller does not know whether a name comes from local code or a package, dependency scope
+keeps that choice explicit:
+
+```json
+{
+  "target": "symbol",
+  "query": "BaseModel",
+  "scope": "dependencies",
+  "include": ["signature"]
+}
+```
+
+A provider can return a declaration even when installed source is unavailable:
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/python/pydantic.main.BaseModel",
+      "language": { "name": "python", "dialect": null },
+      "name": "BaseModel",
+      "kind": "class",
+      "facets": ["type"],
+      "origin": {
+        "location": {
+          "kind": "dependency",
+          "package": { "manager": "pypi", "name": "pydantic", "version": "2.8.2" }
+        },
+        "source_kind": "authored",
+        "unit": null
+      },
+      "container": null,
+      "modifiers": [],
+      "visibility": "public",
+      "types": [],
+      "signatures": [],
+      "documentation": [],
+      "extensions": {},
+      "document_local": false
+    }
+  },
+  "score": 0.98,
+  "matched_by": ["name"],
+  "span": null,
+  "line": null
+}
+```
+
+A traversal with `max_hops: 3` exceeds the contract bound.
+
+**Error data:**
+
+```json
+{
+  "code": "invalid_request",
+  "message": "max_hops must be less than or equal to 2",
+  "retry": "never",
+  "phase": "read",
+  "diagnostics": [],
+  "causes": []
+}
+```
+
+### nodes [#tool-nodes]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`nodes` lists the syntax regions covering one position, outermost first. Each identity carries
+the witness a later
+[`replace_node`](#tool-replace_node) verifies.
+
+## Resources
+
+Resources expose workspace state to consumers such as a UI. They carry data shaped for paging:
+
+| Resource | Content |
+| --- | --- |
+| [`rift://workspace{?cursor}`](#resource-workspace) | source catalog, per-language providers, limits, and hooks |
+| [`rift://projection/{id}`](#resource-projection) | one projection's path on disk and its state |
+| [`rift://changes{?projection,cursor}`](#resource-changes) | one changeset, each change with its evidence |
+| [`rift://fs{/path}{?start,length,cursor}`](#resource-fs) | a directory's entries, or a bounded range of file bytes |
+
+[`projection_create`](#tool-projection_create) materializes the complete pinned directory.
+Reading `rift://projection/{id}` returns its stable path and base revision. Before returning
+projection state or changes, the server reconciles direct filesystem writes against the
+projection manifest, so a shell write appears in the same changeset as a server-applied change.
+
+Paginated answers stop before `max_response_bytes` and return a cursor. A file-range read instead
+continues by byte offset; the payload's `digest` detects a file change and requires a restart from
+offset zero.
+
+The workspace resource pages through [`SourceUnit`](/docs/protocol/reference#SourceUnit)
+records from its captured source catalog. Each unit identifies its owner, package, source kind,
+language, and content digest; resolver summaries explain which discovery revisions produced that
+catalog.
+
+Every cursor binds the request, order, and page size that produced it. A mismatch returns
+`cursor_invalid`.
+
+`get_symbol` and `search` retain complete result captures. `max_capture_items` and
+`max_capture_bytes` bound one capture, while `max_active_cursors` and
+`max_retained_capture_bytes` bound the workspace cache. The server evicts the oldest capture
+first; a page requested after eviction or process restart returns `cursor_expired`.
+
+## Changes
+
+### replace_symbol [#tool-replace_symbol]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`replace_symbol` replaces one whole declaration addressed by symbol. The parser derives its
+span, so the caller supplies no offsets.
+
+### insert_symbol [#tool-insert_symbol]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`insert_symbol` inserts a new declaration before or after an existing one, addressed by its
+anchor symbol. The parser derives the anchor's span, so the caller supplies no offsets.
+
+### replace_node [#tool-replace_node]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`replace_node` reaches below a declaration through a witnessed node address from
+[`nodes`](#tool-nodes).
+
+### patch [#tool-patch]
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
+
+v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
+authoritative served shape.
+
+`patch` expresses scattered hunks and file-level changes through a unified diff guarded by its
+context lines.
+
+### Change results
+
+All four change tools return the same `ChangeResult`. A request whose shape is wrong — an
+absolute path, a malformed patch header — fails as `invalid_request` before the server resolves
+anything.
+Otherwise the server resolves the whole operation before writing anything, and the result is one
+of two things.
+
+**Refused**, when resolution produced no edits. The targeted tree is untouched and
+[`RefusalReason`](/docs/protocol/reference#RefusalReason) says what stopped it: the
+address hit several targets, or a witness or patch context no longer matches the bytes. A
+`replace_node` whose listing went stale shows the shape:
+
+**Request:**
+
+```json
+{
+  "node": "rift://node/python/src/config.py@1204-1266#3f9a1c2e",
+  "body": "retries = 5"
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "refused",
+  "reason": "unmet_precondition",
+  "preconditions": [
+    {
+      "kind": "source_unchanged",
+      "status": "failed",
+      "verifier": { "kind": "rift" },
+      "addresses": [
+        { "kind": "node", "node": "rift://node/python/src/config.py@1204-1266#3f9a1c2e" }
+      ],
+      "paths": ["src/config.py"],
+      "expected": { "kind": "text", "value": "3f9a1c2e" },
+      "observed": { "kind": "text", "value": "b81d02aa" },
+      "diagnostics": []
+    }
+  ],
+  "blockers": [],
+  "diagnostics": []
+}
+```
+
+**Applied**, when it produced edits. The change lands in the targeted tree and gets an id in
+that tree's changeset, along with its origin, changed paths, edits, effects, guarantee evidence,
+diagnostics, and its [`Advisory`](/docs/protocol/reference#Advisory) list. An advisory
+rides the result rather than waiting behind a separate read, because the result is the one
+payload the caller is guaranteed to look at: a checked advisory reports a verdict the emitter
+verified itself, and an open warning carries the instruction — the check to run — that settles
+it.
+
+A change that names no `projection` writes the workspace tree, and there is nothing further to
+settle: the confirmations list stays empty, and the advisories are the caller's to act on. A
+change into a projection carries its open warnings forward as confirmations, which is what
+[`publish`](#tool-publish) checks.
+
+## Projections
+
+| Tool | What it does |
+| --- | --- |
+| [`projection_create`](#tool-projection_create) | materializes a pinned workspace snapshot |
+| [`projection_list`](#tool-projection_list) | lists projections and the state of each |
+| [`projection_remove`](#tool-projection_remove) | deletes one projection, unpublished changes included |
+| [`projection_restore`](#tool-projection_restore) | refreshes changed paths from the workspace |
+| [`publish`](#tool-publish) | writes one projection's changes into the workspace |
+
+`publish` takes the list of change ids whose confirmations the caller accepts, and writes
+nothing unless it can write everything:
+
+- a change carrying a confirmation the call didn't accept comes back in `unaccepted`
+- a path the projection changed that the workspace changed too comes back in `conflicts`
+- a file returned by a projection read that the workspace changed comes back in
+  `dependency_conflicts`
+
+Before those checks, the server compares the directory against its manifest. A process-written delta
+becomes one `filesystem` change with exact `paths`, current provider and hook evidence, and an
+`external` confirmation. If this scan discovers new writes, their ids return in `unaccepted`;
+the caller reads `rift://changes` and retries after reviewing them.
+
+Projection-scoped `get_symbol`, `search`, and `nodes` calls record exact returned files and their
+digests. `publish` checks those read dependencies even when the projection did not change them.
+This prevents a change to `src/app.py` from landing after the declaration it read from
+`src/config.py` moved in the workspace.
+
+`max_projection_dependencies` and `max_projection_dependency_bytes` bound this read set. A read
+that would cross either limit fails before returning its data.
+
+Each [`DependencyConflict`](/docs/protocol/reference#DependencyConflict) carries `path`,
+`observed`, and `current`. The caller can reread and revise its work, or pass that exact object in
+`accept_dependencies`. An acceptance with an older `current` digest does not match after another
+workspace edit and remains in `dependency_conflicts`.
+
+An empty search has no returned file to record. Reads performed directly against the projection
+directory also bypass the read set. A caller whose work depends on either result reads again
+before publishing.
+
+For every refusal, the server leaves both trees unchanged. Publication is serialized
+workspace-wide, so a `publish` that cannot take the workspace inside the call budget fails with
+`temporarily_unavailable` and is worth sending again once the holder finishes. On success the server
+writes every changed path, removes directories its deletions left empty — the workspace root
+excluded — rebuilds the pinned projection from the resulting workspace, advances its base
+revision, and clears its changeset and read dependencies.
+
+`projection_restore` goes the other way: it refreshes selected changed paths from the workspace
+and drops the changes that touched them. A change is dropped whole — naming one of its paths
+restores every path it touched, because restoring one path of a change without the others would
+leave a change record that no longer describes the tree. Restored paths take their new conflict
+baseline from the current workspace; other paths retain their earlier baselines.
+
+## Execution
+
+[`execute`](#tool-execute) evaluates a block of code in the targeted tree's execution copy. The
+copy persists between calls — a dependency one evaluation installs is still there for the next —
+and the server refreshes its visible files to match the targeted tree before each evaluation, so
+the code always runs against the tree as it stands.
+
+Writes addressed inside the execution directory stay there and are not synchronized into the
+targeted tree. The execution directory is not a sandbox; the runtime uses the server's OS
+permissions, so an absolute path can reach outside it.
+
+A workspace already at `max_concurrent` evaluations returns `temporarily_unavailable`. The
+caller may send the same request after an evaluation slot becomes free.
+
+`execute` needs `rift.toml` to allow the language and a runtime to serve it. The
+[`rift://workspace`](#resource-workspace) resource reports what survives that intersection; a
+call that outruns a stale read of it comes back as `capability_unavailable`, and reading the
+resource again shows what changed.
+
+## Errors
+
+A refusal is a normal tool result: the server understood the operation and declined to change the
+tree. `ErrorData` reports request and infrastructure failures such as invalid input, an expired
+cursor, a crossed limit, a timeout, or a storage failure.
+
+Every one carries a `retry` directive, which is the field to branch on — it rides each error
+instance rather than the code, because the same `storage_failure` can be transient once and
+permanent the next time:
+
+- `never` — the same bytes will fail the same way
+- `same_request` — it was transient: an index still filling, a tree with a filesystem
+  write in flight
+- `operator_action` — the workspace requires a local state or configuration change before retry
+
+A `limit_exceeded` also carries which limit and by how much, so a request can be resized without
+parsing the message meant for a human.
+

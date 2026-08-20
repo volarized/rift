@@ -9,19 +9,22 @@ mod path;
 
 pub mod constants;
 
-pub use error::{ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, RetryPolicy, RiftError};
+pub use error::{
+    CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, RetryDirective,
+    RiftError, fault_label, render_failure,
+};
 pub use identity::{
-    CompositionId, CompositionRevision, CursorId, IdError, IndexRevision, ModelId, ModelRevision,
-    ProviderId, ProviderRevision, RevisionError, SourceResolverId, SourceResolverIdError,
-    SourceResolverIdViolation, SourceRevision, SourceUnitId, SourceUnitIdError,
-    SourceUnitIdErrorKind, SymbolId, TreeRevision, WorkspaceId,
+    CompositionId, CompositionRevision, CursorId, IdError, IdFault, IndexRevision, ModelId,
+    ModelRevision, ProviderId, ProviderRevision, RevisionError, RevisionFault, SourceResolverId,
+    SourceResolverIdError, SourceResolverIdFault, SourceResolverIdViolation, SourceRevision,
+    SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
 pub use measurement::{
     ClockRegression, MonotonicClock, PerformanceMeasurement, SystemMonotonicClock,
 };
 pub use name::is_canonical_ascii_name;
-pub use path::{PathError, PathKind, PathViolation, ProjectPath, SourcePath};
+pub use path::{PathError, PathFault, PathKind, PathViolation, ProjectPath, SourcePath};
 
 /// Iterates while charging one unit to a loop budget before each body execution.
 ///

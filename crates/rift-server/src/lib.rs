@@ -1,8 +1,10 @@
 //! Long-lived workspace application service.
 
+mod change;
 mod read;
 
-pub use read::{ReadError, ReadErrorKind, ReadService};
+pub use change::ChangeService;
+pub use read::{ReadError, ReadFault, ReadService};
 
 /// Compile-time marker for server-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

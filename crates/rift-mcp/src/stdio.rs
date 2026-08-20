@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::Path;
 
+use rift_core::{ErrorCode, ErrorDescriptor, ErrorName};
 use rift_index::WorkspaceIndexLimits;
 use rift_server::ReadError;
 use rmcp::service::{QuitReason, ServerInitializeError};
@@ -40,6 +41,25 @@ impl std::error::Error for StdioServeError {
             Self::Initialize(source) => Some(source.as_ref()),
             Self::Task(source) => Some(source),
             Self::UnexpectedQuit => None,
+        }
+    }
+}
+
+impl StdioServeError {
+    /// Returns canonical registry metadata.
+    ///
+    /// A workspace read failure keeps the classification of the
+    /// [`ReadError`] it wraps. Initialization keeps the transport failure
+    /// transient; a task join or an unexpected quit are invariants the
+    /// server did not classify.
+    #[must_use]
+    pub fn descriptor(&self) -> ErrorDescriptor {
+        match self {
+            Self::Read(source) => source.descriptor(),
+            Self::Initialize(_) => ErrorName::Wire(ErrorCode::TemporarilyUnavailable).descriptor(),
+            Self::Task(_) | Self::UnexpectedQuit => {
+                ErrorName::Wire(ErrorCode::InternalError).descriptor()
+            }
         }
     }
 }
@@ -94,9 +114,17 @@ mod tests {
         let missing = directory.path().join("missing");
         let read = RiftMcp::build(&missing, WorkspaceIndexLimits::default())
             .expect_err("missing workspace must fail");
+        let expected = read.descriptor();
         let error = StdioServeError::Read(read);
         assert_eq!(error.to_string(), "workspace read service failed");
         assert!(error.source().is_some());
+        assert_eq!(error.descriptor(), expected);
+    }
+
+    #[test]
+    fn unexpected_quit_descriptor_is_internal_error() {
+        let error = StdioServeError::UnexpectedQuit;
+        assert_eq!(error.descriptor().code(), "internal_error");
     }
 
     #[test]
@@ -104,6 +132,11 @@ mod tests {
         let error = StdioServeError::Initialize(Box::new(ServerInitializeError::Cancelled));
         assert_eq!(error.to_string(), "MCP initialization failed");
         assert!(error.source().is_some());
+        assert_eq!(
+            error.descriptor().code(),
+            "temporarily_unavailable",
+            "an initialization failure must classify as transient"
+        );
     }
 
     #[tokio::test]

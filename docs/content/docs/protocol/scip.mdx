@@ -1,0 +1,93 @@
+---
+title: SCIP
+---
+
+<VersionBadge version="planned" />
+
+
+The [`Index.Read`](#scip-rpc-Read) RPC exports the workspace tree or one projection as a
+[SCIP v0.9.0](https://github.com/sourcegraph/scip) index.
+
+## Endpoint
+
+The server exposes `Index` at the endpoint named by the workspace
+[`ServerLock`](/docs/protocol/reference#ServerLock).
+
+`Read` accepts an optional
+[`ProjectionId`](/docs/protocol/reference#ProjectionId). An omitted `projection` selects
+the workspace tree; a present value selects that projection, including unpublished content.
+
+**Request:**
+
+```json
+{
+  "projection": "rift://projection/prj_bbbbbbbbbbbbbbbbbbbbbbbbbb"
+}
+```
+
+The server **MUST** reject a malformed projection identity with `INVALID_ARGUMENT`. It **MUST**
+return `NOT_FOUND` when it does not hold the named projection.
+
+## Stream
+
+The server emits one [`Header`](#scip-Header), then [`Document`](#scip-Document) events in
+canonical project-path order, then external symbols in byte order of their encoded SCIP symbol
+strings. A stream that ends with `OK` contains every event the header describes.
+
+The server **MUST NOT** emit an event larger than 4 MiB. When one document cannot fit in that
+bound, the server omits it and records an [`Omission`](#scip-Omission) with reason
+`REASON_TOO_LARGE` in the header.
+
+`Read` does not lock the exported tree. A concurrent filesystem write can therefore leave one
+stream internally inconsistent; a consumer that requires one tree revision **SHOULD** retry the
+read after writes stop. If `projection_remove` removes the projection during the stream, the
+server **MUST** terminate it with `ABORTED`.
+
+## Header
+
+The first event carries one `Header` with:
+
+- `projection` — selected projection, or absent for the workspace tree
+- `metadata` — projected `scip.Index.metadata`, including the exported directory as
+  `project_root`
+- `coverage` — weakest per-file semantic coverage for each language and fact family
+- `omissions` — populated Rift data absent from the SCIP mapping
+
+Coverage describes what providers established. Omissions describe what the mapping then dropped,
+so an empty relationship list is distinguishable from unavailable analysis.
+
+## Mapping
+
+The server maps documents, occurrences, symbols, relationships, signatures, and documentation to
+their SCIP equivalents. `project_root` is a file URI for the exported tree, while document paths
+remain workspace-relative.
+
+Rift represents source locations as
+[`TextRange`](/docs/protocol/reference#TextRange) UTF-8 byte offsets. The server converts
+them to SCIP line and character positions with `UTF8CodeUnitOffsetFromLineStart`, preserving
+byte-based character offsets.
+
+`Omission` records each populated field or file the mapping cannot carry. Reasons distinguish an
+unrepresentable fact, unavailable analysis, a path forbidden by SCIP, and a unit exceeding the
+stream bound.
+
+## Symbols
+
+A [`SymbolId`](/docs/protocol/reference#SymbolId) has the form
+`rift://symbol/{language}/{name}`. The server encodes it as one global SCIP symbol:
+
+- scheme `rift`
+- package manager `.`
+- package name set to the exact Rift [`Language`](/docs/protocol/reference#Language)
+- package version `.`
+- one term descriptor containing the complete qualified name
+
+For example, `rift://symbol/python/frobnicate.Frobnicator.connect~2` becomes:
+
+```text
+rift . python . `frobnicate.Frobnicator.connect~2`.
+```
+
+The server backtick-escapes a qualified name outside SCIP's simple-identifier grammar. It retains
+the `~N` disambiguator inside that descriptor, making the encoding reversible to `SymbolId`.
+

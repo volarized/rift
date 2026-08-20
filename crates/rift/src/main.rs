@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Serve read-only Rust workspace context over stdio MCP.
+    /// Serve Rust workspace reads and edits over stdio MCP.
     Mcp,
     /// Replace current Rift binary with latest official release.
     Update,
@@ -47,7 +47,10 @@ async fn main() -> ExitCode {
         }
         Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("rift: {error}");
+            eprintln!(
+                "rift: error[{code}]: {error}",
+                code = error.descriptor().code()
+            );
             ExitCode::FAILURE
         }
     }
@@ -57,6 +60,16 @@ async fn main() -> ExitCode {
 enum CliError {
     Mcp(rift_mcp::StdioServeError),
     Update(update::UpdateError),
+}
+
+impl CliError {
+    /// Returns canonical registry metadata from the wrapped failure.
+    fn descriptor(&self) -> rift_core::ErrorDescriptor {
+        match self {
+            Self::Mcp(error) => error.descriptor(),
+            Self::Update(error) => error.descriptor(),
+        }
+    }
 }
 
 impl fmt::Display for CliError {
@@ -132,6 +145,19 @@ mod tests {
             "release tag `vinvalid` is invalid: expected the form `vMAJOR.MINOR.PATCH`, such as `v0.0.2`"
         );
         assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn cli_error_descriptor_matches_wrapped_error() {
+        let update = super::update::error_for_test();
+        let update_code = update.descriptor().code();
+        assert!(!update_code.is_empty());
+        assert_eq!(CliError::Update(update).descriptor().code(), update_code);
+
+        let mcp = rift_mcp::StdioServeError::UnexpectedQuit;
+        let mcp_code = mcp.descriptor().code();
+        assert!(!mcp_code.is_empty());
+        assert_eq!(CliError::Mcp(mcp).descriptor().code(), mcp_code);
     }
 
     #[test]

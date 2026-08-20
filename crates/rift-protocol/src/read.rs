@@ -1,9 +1,10 @@
-//! Wire models for the read-only Rift MCP tools.
+//! Wire models for the Rift MCP read tools.
 //!
 //! Every type here is a wire contract: serde attributes define exactly what
 //! the server accepts and returns, and the MCP server derives its advertised
 //! request and response schemas from these definitions.
 
+use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -14,150 +15,6 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer)
-}
-
-/// Cross-field rules the derive attributes cannot express, attached to models
-/// with `#[schemars(transform = constraint::...)]`.
-///
-/// Each function appends one composition clause to its model's schema. The
-/// clauses are authored as structured [`serde_json::json!`] values so every
-/// rule reads as indented data with one field per line.
-pub mod constraint {
-    use schemars::Schema;
-    use serde_json::{Value, json};
-
-    /// Appends `clause` to the `keyword` array of `schema`, creating the array
-    /// on first use so several rules can target the same keyword.
-    fn append(schema: &mut Schema, keyword: &str, clause: Value) {
-        let clauses = schema
-            .ensure_object()
-            .entry(keyword)
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Value::Array(values) = clauses {
-            values.push(clause);
-        }
-    }
-
-    /// A symlink [`File`](super::File) carries no language facts: languages and
-    /// regions stay empty and `semantic` stays false.
-    pub fn symlink_carries_no_language_facts(schema: &mut Schema) {
-        append(
-            schema,
-            "allOf",
-            json!({
-                "if": {
-                    "properties": {
-                        "content": { "properties": { "kind": { "const": "symlink" } } }
-                    }
-                },
-                "then": {
-                    "properties": {
-                        "languages": { "maxItems": 0 },
-                        "regions": { "maxItems": 0 },
-                        "semantic": { "const": false }
-                    }
-                }
-            }),
-        );
-    }
-
-    /// A [`RelationFilter`](super::RelationFilter) names what it matches by:
-    /// an exact `kind` in one language's vocabulary, or a portable `facet`.
-    pub fn relation_filter_names_kind_or_facet(schema: &mut Schema) {
-        append(
-            schema,
-            "anyOf",
-            json!({
-                "description": "Matching by exact kind, in one language's vocabulary.",
-                "required": ["kind"]
-            }),
-        );
-        append(
-            schema,
-            "anyOf",
-            json!({
-                "description": "Matching by portable facet, which reaches every served language.",
-                "required": ["facet"]
-            }),
-        );
-    }
-
-    /// A [`SearchHit`](super::SearchHit) carries `span` and `line` together or
-    /// not at all, and node and file hits always carry both.
-    pub fn search_hit_pairs_span_with_line(schema: &mut Schema) {
-        append(
-            schema,
-            "allOf",
-            json!({
-                "oneOf": [
-                    { "required": ["span", "line"] },
-                    { "not": { "anyOf": [ { "required": ["span"] }, { "required": ["line"] } ] } }
-                ]
-            }),
-        );
-        append(
-            schema,
-            "allOf",
-            json!({
-                "if": {
-                    "properties": {
-                        "hit": { "properties": { "target": { "enum": ["node", "file"] } } }
-                    }
-                },
-                "then": { "required": ["span", "line"] }
-            }),
-        );
-    }
-
-    /// [`SearchParams`](super::SearchParams) with a `traversal` keep `target`
-    /// at `symbol` or `all`, and `paths` only narrow project-scoped searches.
-    pub fn search_traversal_and_paths_stay_in_scope(schema: &mut Schema) {
-        append(
-            schema,
-            "allOf",
-            json!({
-                "if": { "required": ["traversal"] },
-                "then": { "properties": { "target": { "enum": ["symbol", "all"] } } }
-            }),
-        );
-        append(
-            schema,
-            "allOf",
-            json!({
-                "if": { "required": ["paths"] },
-                "then": { "properties": { "scope": { "const": "project" } } }
-            }),
-        );
-    }
-
-    /// [`SearchParams`](super::SearchParams) ask for something: a text `query`,
-    /// a provider `filter`, or a bounded relationship `traversal`.
-    pub fn search_names_query_filter_or_traversal(schema: &mut Schema) {
-        append(
-            schema,
-            "anyOf",
-            json!({
-                "description": "Satisfied by a text query, with or without a filter alongside it.",
-                "required": ["query"]
-            }),
-        );
-        append(
-            schema,
-            "anyOf",
-            json!({
-                "description": "Satisfied by a filter alone, for a search with no text to match.",
-                "required": ["filter"]
-            }),
-        );
-        append(
-            schema,
-            "anyOf",
-            json!({
-                "description": "Satisfied by a bounded relationship traversal.",
-                "required": ["traversal"]
-            }),
-        );
-    }
 }
 
 /// Empirical coupling between two symbols: how often revisions that touched one touched the
@@ -182,17 +39,17 @@ pub struct CoChange {
 
 /// State tag carried by a complete coverage claim.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CoverageCompleteState {
-    /// Wire value `complete`.
-    #[serde(rename = "complete")]
+    /// Everything in scope is present.
     Complete,
 }
 
 /// State tag carried by a partial coverage claim.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CoveragePartialState {
-    /// Wire value `partial`.
-    #[serde(rename = "partial")]
+    /// Some of what is in scope is missing.
     Partial,
 }
 
@@ -249,34 +106,29 @@ pub enum Coverage {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum CoverageReach {
-    /// Wire value `request`.
-    #[serde(rename = "request")]
+    /// Only what this request touched.
     Request,
-    /// Wire value `project`.
-    #[serde(rename = "project")]
+    /// Every visible file of the workspace.
     Project,
-    /// Wire value `dependencies`.
-    #[serde(rename = "dependencies")]
+    /// The workspace's resolved dependencies.
     Dependencies,
-    /// Wire value `all`.
-    #[serde(rename = "all")]
+    /// The workspace, its dependencies, and the standard library together.
     All,
 }
 
 /// What a completeness statement covers — everything the request asked for, one file, or a
 /// standing scope the answer holds over.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum CoverageScope {
-    #[serde(rename = "reach")]
     /// A standing scope identified by its name.
     Reach {
         /// How far the claim reaches.
         reach: CoverageReach,
     },
-    #[serde(rename = "unit")]
-    /// One file. The claim holds for that path and says nothing about any other.
+    /// A single unit is just a file: the claim holds for that path and says nothing about any other.
     Unit {
         /// The file the claim is about.
         unit: FileId,
@@ -288,12 +140,11 @@ pub enum CoverageScope {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum CoverageStateState {
-    /// Wire value `unsupported`.
-    #[serde(rename = "unsupported")]
+    /// No provider produces this family for the language.
     Unsupported,
-    /// Wire value `not_applicable`.
-    #[serde(rename = "not_applicable")]
+    /// The family has no meaning for this language.
     NotApplicable,
 }
 
@@ -321,14 +172,14 @@ pub struct Diagnostic {
     /// The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the
     /// provider issues none.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub code: Option<String>,
     /// What the provider said, in its own words.
     #[schemars(length(max = 4096))]
     pub message: String,
     /// Where it applies. Null for a finding about the file as a whole, or about the build.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub span: Option<SourceSpan>,
     /// Other places the provider pointed at while explaining this one.
     pub related: Vec<DiagnosticRelated>,
@@ -345,7 +196,7 @@ pub struct Diagnostic {
     pub extensions: Extensions,
     /// The language whose provider produced this. Null for a finding Rift itself raised.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub language: Option<Language>,
 }
 
@@ -361,16 +212,16 @@ pub struct DiagnosticContext {
     /// One-based line the finding starts on. Null where the diagnostic has no span — a
     /// whole-project error has nowhere to point.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub line: Option<u64>,
     /// One-based column within that line, counted in UTF-8 bytes. Null for the same reason
     /// as `line`.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub column: Option<u64>,
     /// The source the finding points at. Null where there is no span to copy from.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub excerpt: Option<SourceExcerpt>,
 }
 
@@ -379,15 +230,13 @@ pub struct DiagnosticContext {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticContextSource {
-    /// Wire value `provider`.
-    #[serde(rename = "provider")]
+    /// A language provider emitted the finding.
     Provider,
-    /// Wire value `hook`.
-    #[serde(rename = "hook")]
+    /// A configured hook emitted the finding.
     Hook,
-    /// Wire value `apply`.
-    #[serde(rename = "apply")]
+    /// Applying a change request emitted the finding.
     Apply,
 }
 
@@ -396,15 +245,13 @@ pub enum DiagnosticContextSource {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticContinuation {
-    /// Wire value `repairable`.
-    #[serde(rename = "repairable")]
+    /// The producer recovered and later facts remain reliable.
     Repairable,
-    /// Wire value `unrepairable`.
-    #[serde(rename = "unrepairable")]
+    /// The producer could not recover, so later facts are suspect.
     Unrepairable,
-    /// Wire value `unknown`.
-    #[serde(rename = "unknown")]
+    /// The producer does not say whether it recovered.
     Unknown,
 }
 
@@ -425,12 +272,11 @@ pub struct DiagnosticRelated {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticReliability {
-    /// Wire value `reliable`.
-    #[serde(rename = "reliable")]
+    /// The surrounding facts came off a clean parse.
     Reliable,
-    /// Wire value `recovered`.
-    #[serde(rename = "recovered")]
+    /// The parser recovered nearby, so surrounding facts may be off.
     Recovered,
 }
 
@@ -439,12 +285,11 @@ pub enum DiagnosticReliability {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticTag {
-    /// Wire value `deprecated`.
-    #[serde(rename = "deprecated")]
+    /// The code the finding points at is deprecated.
     Deprecated,
-    /// Wire value `unnecessary`.
-    #[serde(rename = "unnecessary")]
+    /// The code the finding points at is unused or has no effect.
     Unnecessary,
 }
 
@@ -471,12 +316,11 @@ pub struct Documentation {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DocumentationFormat {
-    /// Wire value `plain`.
-    #[serde(rename = "plain")]
+    /// Plain text with no markup to render.
     Plain,
-    /// Wire value `markdown`.
-    #[serde(rename = "markdown")]
+    /// Markdown as authored in the source.
     Markdown,
 }
 
@@ -536,24 +380,19 @@ pub struct Extensions(pub BTreeMap<ExtensionKey, ExtensionValue>);
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum FactFamily {
-    /// Wire value `symbols`.
-    #[serde(rename = "symbols")]
+    /// Declaration records a provider resolved.
     Symbols,
-    /// Wire value `nodes`.
-    #[serde(rename = "nodes")]
+    /// Concrete syntax trees over file bytes.
     Nodes,
-    /// Wire value `relationships`.
-    #[serde(rename = "relationships")]
+    /// Directed edges between symbols.
     Relationships,
-    /// Wire value `types`.
-    #[serde(rename = "types")]
+    /// Type bindings attached to declarations.
     Types,
-    /// Wire value `diagnostics`.
-    #[serde(rename = "diagnostics")]
+    /// Findings providers produced from source.
     Diagnostics,
-    /// Wire value `history`.
-    #[serde(rename = "history")]
+    /// Version-control timelines of symbols.
     History,
 }
 
@@ -584,46 +423,36 @@ pub struct FieldFilter {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum FieldFilterOp {
-    /// Wire value `eq`.
-    #[serde(rename = "eq")]
+    /// The field equals the value.
     Eq,
-    /// Wire value `ne`.
-    #[serde(rename = "ne")]
+    /// The field differs from the value.
     Ne,
-    /// Wire value `in`.
-    #[serde(rename = "in")]
+    /// The field equals one of the listed values.
     In,
-    /// Wire value `contains`.
-    #[serde(rename = "contains")]
+    /// The array field holds the value as an entry.
     Contains,
-    /// Wire value `prefix`.
-    #[serde(rename = "prefix")]
+    /// The field starts with the value.
     Prefix,
-    /// Wire value `regex`.
-    #[serde(rename = "regex")]
+    /// The field matches the value as a regular expression.
     Regex,
-    /// Wire value `gt`.
-    #[serde(rename = "gt")]
+    /// The field is greater than the value.
     Gt,
-    /// Wire value `gte`.
-    #[serde(rename = "gte")]
+    /// The field is greater than or equal to the value.
     Gte,
-    /// Wire value `lt`.
-    #[serde(rename = "lt")]
+    /// The field is less than the value.
     Lt,
-    /// Wire value `lte`.
-    #[serde(rename = "lte")]
+    /// The field is less than or equal to the value.
     Lte,
-    /// Wire value `exists`.
-    #[serde(rename = "exists")]
+    /// The field is present, whatever its value.
     Exists,
 }
 
 /// One file and the languages that read it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = constraint::symlink_carries_no_language_facts)]
+#[schemars(transform = schema::forbid_symlink_language_facts)]
 pub struct File {
     /// Project-relative source identity and the URI from which this record and its bytes
     /// are read.
@@ -644,9 +473,8 @@ pub struct File {
 
 /// The bytes of a regular file or the target of a symbolic link.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum FileContent {
-    #[serde(rename = "regular")]
     /// A physical or generated file with bytes in it. Every node and symbol with readable
     /// source comes from this kind.
     Regular {
@@ -656,7 +484,6 @@ pub enum FileContent {
         /// Whether the file is executable.
         executable: bool,
     },
-    #[serde(rename = "symlink")]
     /// A symbolic link whose target is carried as canonical base64.
     Symlink {
         /// Canonical padded base64 of the raw target bytes. Rift does not follow the
@@ -686,39 +513,33 @@ pub struct FileId(
 
 /// A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum Filter {
-    #[serde(rename = "field")]
     /// A test on one field of the entity.
     Field {
         /// The field and the comparison.
         field: FieldFilter,
     },
-    #[serde(rename = "relation")]
     /// A test on the edges the entity has.
     Relation {
         /// The edges to look for, and what they must reach.
         relation: Box<RelationFilter>,
     },
-    #[serde(rename = "all")]
     /// Conjunction: every member has to hold.
     All {
         /// The filters that must all hold.
         all: Vec<Filter>,
     },
-    #[serde(rename = "any")]
     /// Disjunction: at least one member has to hold.
     Any {
         /// The filters, of which one is enough.
         any: Vec<Filter>,
     },
-    #[serde(rename = "not")]
     /// Negation of what it holds.
     Not {
         /// The filter being negated.
         not: Box<Filter>,
     },
-    #[serde(rename = "element")]
     /// A test on one entry of a list the entity holds.
     Element {
         /// The list to walk, and what one of its entries has to satisfy.
@@ -730,12 +551,11 @@ pub enum Filter {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum Freshness {
-    /// Wire value `current`.
-    #[serde(rename = "current")]
+    /// The derived state covers the answer's captured revisions.
     Current,
-    /// Wire value `stale`.
-    #[serde(rename = "stale")]
+    /// The derived state lags behind the answer's captured revisions.
     Stale,
 }
 
@@ -827,7 +647,7 @@ pub struct GetSymbolResult {
     pub coverage: Coverage,
     /// Cursor for the next page, or null after the final hit.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub next_cursor: Option<Cursor>,
     /// Tree and index revisions used for this result page.
     pub snapshot: ReadSnapshot,
@@ -848,12 +668,11 @@ pub struct GraphHop {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum HopDirection {
-    /// Wire value `outgoing`.
-    #[serde(rename = "outgoing")]
+    /// The walk followed the edge from source to target.
     Outgoing,
-    /// Wire value `incoming`.
-    #[serde(rename = "incoming")]
+    /// The walk followed the edge against its direction, from target to source.
     Incoming,
 }
 
@@ -905,24 +724,19 @@ pub struct LanguageRegion {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum MatchedField {
-    /// Wire value `name`.
-    #[serde(rename = "name")]
+    /// The declaration's name matched.
     Name,
-    /// Wire value `signature`.
-    #[serde(rename = "signature")]
+    /// A rendered signature matched.
     Signature,
-    /// Wire value `documentation`.
-    #[serde(rename = "documentation")]
+    /// An attached doc comment matched.
     Documentation,
-    /// Wire value `content`.
-    #[serde(rename = "content")]
+    /// The file's contents matched.
     Content,
-    /// Wire value `path`.
-    #[serde(rename = "path")]
+    /// The project-relative path matched.
     Path,
-    /// Wire value `relationship`.
-    #[serde(rename = "relationship")]
+    /// A relationship traversal reached the hit.
     Relationship,
 }
 
@@ -967,60 +781,43 @@ pub struct Node {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum NodeFacet {
-    /// Wire value `declaration`.
-    #[serde(rename = "declaration")]
+    /// Introduces a name.
     Declaration,
-    /// Wire value `definition`.
-    #[serde(rename = "definition")]
+    /// Supplies the implementation behind a declared name.
     Definition,
-    /// Wire value `body`.
-    #[serde(rename = "body")]
+    /// The implementation part of a declaration.
     Body,
-    /// Wire value `block`.
-    #[serde(rename = "block")]
+    /// A delimited group of statements.
     Block,
-    /// Wire value `statement`.
-    #[serde(rename = "statement")]
+    /// One executable step.
     Statement,
-    /// Wire value `expression`.
-    #[serde(rename = "expression")]
+    /// Computes a value.
     Expression,
-    /// Wire value `type_expression`.
-    #[serde(rename = "type_expression")]
+    /// Spells a type.
     TypeExpression,
-    /// Wire value `import`.
-    #[serde(rename = "import")]
+    /// Brings an external name into scope.
     Import,
-    /// Wire value `export`.
-    #[serde(rename = "export")]
+    /// Exposes a name outside its unit.
     Export,
-    /// Wire value `parameter`.
-    #[serde(rename = "parameter")]
+    /// A declared input of a callable.
     Parameter,
-    /// Wire value `argument`.
-    #[serde(rename = "argument")]
+    /// A value passed at a call site.
     Argument,
-    /// Wire value `annotation`.
-    #[serde(rename = "annotation")]
+    /// A decorator or attribute qualifying a construct.
     Annotation,
-    /// Wire value `comment`.
-    #[serde(rename = "comment")]
+    /// Commentary the language ignores.
     Comment,
-    /// Wire value `identifier`.
-    #[serde(rename = "identifier")]
+    /// A name as written in the source.
     Identifier,
-    /// Wire value `literal`.
-    #[serde(rename = "literal")]
+    /// A value written out directly.
     Literal,
-    /// Wire value `pattern`.
-    #[serde(rename = "pattern")]
+    /// A destructuring or match pattern.
     Pattern,
-    /// Wire value `generated`.
-    #[serde(rename = "generated")]
+    /// Produced by a tool rather than authored.
     Generated,
-    /// Wire value `test`.
-    #[serde(rename = "test")]
+    /// Belongs to test code.
     Test,
 }
 
@@ -1107,7 +904,7 @@ pub struct Parameter {
     /// What the parameter is called. Null where the language allows an unnamed one, as a
     /// positional parameter in a function type.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub name: Option<String>,
     /// Where this parameter is written in the source.
     #[serde(default)]
@@ -1121,7 +918,7 @@ pub struct Parameter {
     pub variadic: bool,
     /// The default value as written in the source. Null where there is none.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub default: Option<String>,
     /// Parameter facts the model has no field for, namespaced by the provider that emitted
     /// them.
@@ -1226,34 +1023,28 @@ pub struct ReadSnapshot {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RegionRole {
-    /// Wire value `selection`.
-    #[serde(rename = "selection")]
+    /// The stretch that best identifies the node when presented.
     Selection,
-    /// Wire value `name`.
-    #[serde(rename = "name")]
+    /// The name being declared.
     Name,
-    /// Wire value `header`.
-    #[serde(rename = "header")]
+    /// The declaration up to where the body starts.
     Header,
-    /// Wire value `body`.
-    #[serde(rename = "body")]
+    /// The implementation, without documentation or header.
     Body,
-    /// Wire value `content`.
-    #[serde(rename = "content")]
+    /// The interior of the node without its delimiters.
     Content,
-    /// Wire value `documentation`.
-    #[serde(rename = "documentation")]
+    /// The doc comment attached to the declaration.
     Documentation,
-    /// Wire value `enclosing`.
-    #[serde(rename = "enclosing")]
+    /// The full extent including what surrounds the node proper.
     Enclosing,
 }
 
 /// A predicate over an exact advertised relationship kind or portable facet.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = constraint::relation_filter_names_kind_or_facet)]
+#[schemars(transform = schema::require_kind_or_facet)]
 pub struct RelationFilter {
     /// Exact relationship kinds a provider emits. Any listed kind matches.
     #[serde(default)]
@@ -1288,15 +1079,13 @@ pub struct RelationFilter {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RelationFilterDirection {
-    /// Wire value `outgoing`.
-    #[serde(rename = "outgoing")]
+    /// The edge starts at the entity being filtered.
     Outgoing,
-    /// Wire value `incoming`.
-    #[serde(rename = "incoming")]
+    /// The edge points at the entity being filtered.
     Incoming,
-    /// Wire value `either`.
-    #[serde(rename = "either")]
+    /// The edge runs either way.
     Either,
 }
 
@@ -1304,12 +1093,11 @@ pub enum RelationFilterDirection {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RelationFilterQuantifier {
-    /// Wire value `exists`.
-    #[serde(rename = "exists")]
+    /// At least one such edge must exist.
     Exists,
-    /// Wire value `not_exists`.
-    #[serde(rename = "not_exists")]
+    /// No such edge may exist.
     NotExists,
 }
 
@@ -1349,15 +1137,13 @@ pub struct Relationship {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RelationshipDerivation {
-    /// Wire value `resolution`.
-    #[serde(rename = "resolution")]
+    /// The provider resolved the edge semantically, so a consumer may act on it directly.
     Resolution,
-    /// Wire value `syntax`.
-    #[serde(rename = "syntax")]
+    /// The edge was read from syntax alone, without semantic resolution.
     Syntax,
-    /// Wire value `heuristic`.
-    #[serde(rename = "heuristic")]
+    /// The edge is a guess, qualified by `confidence`.
     Heuristic,
 }
 
@@ -1366,93 +1152,65 @@ pub enum RelationshipDerivation {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RelationshipFacet {
-    /// Wire value `contains`.
-    #[serde(rename = "contains")]
+    /// The source contains the target within its scope.
     Contains,
-    /// Wire value `declares`.
-    #[serde(rename = "declares")]
+    /// The source declares the target.
     Declares,
-    /// Wire value `augments`.
-    #[serde(rename = "augments")]
+    /// The source adds to a declaration made elsewhere.
     Augments,
-    /// Wire value `references`.
-    #[serde(rename = "references")]
+    /// The source mentions the target.
     References,
-    /// Wire value `calls`.
-    #[serde(rename = "calls")]
+    /// The source invokes the target.
     Calls,
-    /// Wire value `constructs`.
-    #[serde(rename = "constructs")]
+    /// The source creates an instance of the target.
     Constructs,
-    /// Wire value `reads`.
-    #[serde(rename = "reads")]
+    /// The source reads the target's value.
     Reads,
-    /// Wire value `writes`.
-    #[serde(rename = "writes")]
+    /// The source assigns to the target.
     Writes,
-    /// Wire value `imports`.
-    #[serde(rename = "imports")]
+    /// The source brings the target into scope.
     Imports,
-    /// Wire value `exports`.
-    #[serde(rename = "exports")]
+    /// The source exposes the target outside its unit.
     Exports,
-    /// Wire value `extends`.
-    #[serde(rename = "extends")]
+    /// The source inherits from the target.
     Extends,
-    /// Wire value `implements`.
-    #[serde(rename = "implements")]
+    /// The source fulfils the target's interface.
     Implements,
-    /// Wire value `has_type`.
-    #[serde(rename = "has_type")]
+    /// The source is typed by the target.
     HasType,
-    /// Wire value `overrides`.
-    #[serde(rename = "overrides")]
+    /// The source replaces the target inherited from a supertype.
     Overrides,
-    /// Wire value `aliases`.
-    #[serde(rename = "aliases")]
+    /// The source is another name for the target.
     Aliases,
-    /// Wire value `generates`.
-    #[serde(rename = "generates")]
+    /// The source produces the target as generated code.
     Generates,
-    /// Wire value `depends_on`.
-    #[serde(rename = "depends_on")]
+    /// The source requires the target to build or run.
     DependsOn,
-    /// Wire value `annotated_by`.
-    #[serde(rename = "annotated_by")]
+    /// The source carries the target as an annotation.
     AnnotatedBy,
-    /// Wire value `throws`.
-    #[serde(rename = "throws")]
+    /// The source can raise the target.
     Throws,
-    /// Wire value `catches`.
-    #[serde(rename = "catches")]
+    /// The source handles the target when raised.
     Catches,
-    /// Wire value `bounded_by`.
-    #[serde(rename = "bounded_by")]
+    /// The source's type parameter is constrained by the target.
     BoundedBy,
-    /// Wire value `instantiates`.
-    #[serde(rename = "instantiates")]
+    /// The source applies concrete arguments to the generic target.
     Instantiates,
-    /// Wire value `specializes`.
-    #[serde(rename = "specializes")]
+    /// The source is a specialization of the generic target.
     Specializes,
-    /// Wire value `overloads`.
-    #[serde(rename = "overloads")]
+    /// The source and target are separately dispatched forms of one name.
     Overloads,
-    /// Wire value `mixes_in`.
-    #[serde(rename = "mixes_in")]
+    /// The source incorporates the target as a mixin.
     MixesIn,
-    /// Wire value `embeds`.
-    #[serde(rename = "embeds")]
+    /// The source embeds the target within its own definition.
     Embeds,
-    /// Wire value `tests`.
-    #[serde(rename = "tests")]
+    /// The source exercises the target as a test.
     Tests,
-    /// Wire value `configures`.
-    #[serde(rename = "configures")]
+    /// The source supplies configuration for the target.
     Configures,
-    /// Wire value `binds`.
-    #[serde(rename = "binds")]
+    /// The source binds a name or value to the target.
     Binds,
 }
 
@@ -1462,15 +1220,13 @@ pub enum RelationshipFacet {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum ResultOrder {
-    /// Wire value `relevance`.
-    #[serde(rename = "relevance")]
+    /// Best score first, with identity breaking ties.
     Relevance,
-    /// Wire value `path`.
-    #[serde(rename = "path")]
+    /// Project path order, with identity breaking ties.
     Path,
-    /// Wire value `identity`.
-    #[serde(rename = "identity")]
+    /// The result's own identity alone.
     Identity,
 }
 
@@ -1486,7 +1242,7 @@ pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] 
 /// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = constraint::search_hit_pairs_span_with_line)]
+#[schemars(transform = schema::pair_span_with_line)]
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file — whichever `target` allowed.
     pub hit: SearchHitTarget,
@@ -1527,22 +1283,19 @@ pub struct SearchHit {
 
 /// What a search hit is. Tagged, so the payload correlation survives code generation.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "target", deny_unknown_fields)]
+#[serde(tag = "target", deny_unknown_fields, rename_all = "snake_case")]
 pub enum SearchHitTarget {
-    #[serde(rename = "symbol")]
     /// A symbol hit: the declaration a provider resolved.
     Symbol {
         /// The declaration that matched.
         symbol: Symbol,
     },
-    #[serde(rename = "node")]
     /// A node hit: one place in a syntax tree, without its enclosing symbol record.
     Node {
         /// The syntax-tree node that matched, and the symbol written at it where there is
         /// one.
         node: Node,
     },
-    #[serde(rename = "file")]
     /// A file hit: one entry of the tree, whether or not any provider reads it.
     File {
         /// The tree entry that matched: what it holds, and which languages read it.
@@ -1555,18 +1308,15 @@ pub enum SearchHitTarget {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SearchInclude {
-    /// Wire value `source`.
-    #[serde(rename = "source")]
+    /// The source around each hit, with its span.
     Source,
-    /// Wire value `signature`.
-    #[serde(rename = "signature")]
+    /// Rendered signatures for symbol hits.
     Signature,
-    /// Wire value `relationships`.
-    #[serde(rename = "relationships")]
+    /// Edges from each hit.
     Relationships,
-    /// Wire value `diagnostics`.
-    #[serde(rename = "diagnostics")]
+    /// Provider findings at each hit.
     Diagnostics,
 }
 
@@ -1575,18 +1325,15 @@ pub enum SearchInclude {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SearchIntent {
-    /// Wire value `trace`.
-    #[serde(rename = "trace")]
+    /// Follows execution outward from the seed.
     Trace,
-    /// Wire value `find_tests`.
-    #[serde(rename = "find_tests")]
+    /// Finds the tests that exercise the seed.
     FindTests,
-    /// Wire value `edit_ripple`.
-    #[serde(rename = "edit_ripple")]
+    /// Estimates what an edit to the seed would disturb.
     EditRipple,
-    /// Wire value `review_context`.
-    #[serde(rename = "review_context")]
+    /// Gathers what a reviewer of the seed should see.
     ReviewContext,
 }
 
@@ -1595,8 +1342,8 @@ pub enum SearchIntent {
 /// narrows project-only searches.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = constraint::search_traversal_and_paths_stay_in_scope)]
-#[schemars(transform = constraint::search_names_query_filter_or_traversal)]
+#[schemars(transform = schema::restrict_traversal_and_paths)]
+#[schemars(transform = schema::require_query_filter_or_traversal)]
 pub struct SearchParams {
     /// Which entity kinds may be returned — a kind selector, never the text to search for;
     /// that is `query`. Omitted, every kind may match. Type data is attached to the Symbol
@@ -1665,18 +1412,15 @@ fn default_search_params_scope() -> SearchScope {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SearchParamsTarget {
-    /// Wire value `symbol`.
-    #[serde(rename = "symbol")]
+    /// Only declarations may match.
     Symbol,
-    /// Wire value `node`.
-    #[serde(rename = "node")]
+    /// Only syntax-tree nodes may match.
     Node,
-    /// Wire value `file`.
-    #[serde(rename = "file")]
+    /// Only tree entries may match.
     File,
-    /// Wire value `all`.
-    #[serde(rename = "all")]
+    /// Any entity kind may match.
     All,
 }
 
@@ -1694,7 +1438,7 @@ pub struct SearchResult {
     pub results: Vec<SearchHit>,
     /// Cursor for the next page, or null after the final result.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub next_cursor: Option<Cursor>,
 }
 
@@ -1702,15 +1446,13 @@ pub struct SearchResult {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SearchScope {
-    /// Wire value `project`.
-    #[serde(rename = "project")]
+    /// Only source the workspace owns.
     Project,
-    /// Wire value `dependencies`.
-    #[serde(rename = "dependencies")]
+    /// Only source of resolved dependencies.
     Dependencies,
-    /// Wire value `all`.
-    #[serde(rename = "all")]
+    /// Project, dependency, and standard-library source alike.
     All,
 }
 
@@ -1765,18 +1507,15 @@ pub struct SemanticCoverage(pub BTreeMap<FactFamily, Coverage>);
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum Severity {
-    /// Wire value `error`.
-    #[serde(rename = "error")]
+    /// The provider judges the code wrong.
     Error,
-    /// Wire value `warning`.
-    #[serde(rename = "warning")]
+    /// Suspect but not necessarily wrong.
     Warning,
-    /// Wire value `info`.
-    #[serde(rename = "info")]
+    /// Informational, with nothing to fix.
     Info,
-    /// Wire value `hint`.
-    #[serde(rename = "hint")]
+    /// A gentle suggestion a consumer may hide.
     Hint,
 }
 
@@ -1795,7 +1534,7 @@ pub struct Signature {
     /// The implicit first parameter — `self`, `this`. Null for a free function, and for
     /// languages that have no such thing.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub receiver: Option<Parameter>,
     /// Declared parameters, in source order.
     pub parameters: Vec<Parameter>,
@@ -1842,24 +1581,21 @@ pub struct SourceExcerpt {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SourceKind {
-    /// Wire value `authored`.
-    #[serde(rename = "authored")]
+    /// A person wrote it.
     Authored,
-    /// Wire value `generated`.
-    #[serde(rename = "generated")]
+    /// A tool produced it from other source.
     Generated,
-    /// Wire value `synthetic`.
-    #[serde(rename = "synthetic")]
+    /// The provider minted it without any source text.
     Synthetic,
 }
 
 /// Where source belongs. Package ownership is separate from whether source was authored or
 /// generated.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum SourceLocation {
-    #[serde(rename = "project")]
     /// Source owned by the current workspace.
     Project {
         /// Local package that owns the source, or null when no package manifest assigns
@@ -1867,16 +1603,13 @@ pub enum SourceLocation {
         #[serde(default)]
         package: Option<PackageIdentity>,
     },
-    #[serde(rename = "dependency")]
     /// Source owned by one resolved dependency.
     Dependency {
         /// Resolved dependency that owns the source.
         package: PackageIdentity,
     },
-    #[serde(rename = "stdlib")]
     /// Source installed with the language toolchain.
     Stdlib {},
-    #[serde(rename = "external")]
     /// Source outside the project, dependency graph, and standard library.
     External {},
 }
@@ -1946,7 +1679,7 @@ pub struct Symbol {
     /// How widely the symbol is visible, in the language's own terms — `public`, `private`,
     /// `pub(crate)`. Null where the language has no such concept.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub visibility: Option<String>,
     /// The types this symbol carries, each tagged with the role it plays: a return type, a
     /// field type, a bound.
@@ -1971,96 +1704,67 @@ pub struct Symbol {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SymbolFacet {
-    /// Wire value `namespace`.
-    #[serde(rename = "namespace")]
+    /// A named scope that groups declarations.
     Namespace,
-    /// Wire value `module`.
-    #[serde(rename = "module")]
+    /// A compilation or import unit.
     Module,
-    /// Wire value `type`.
-    #[serde(rename = "type")]
+    /// Names a type.
     Type,
-    /// Wire value `value`.
-    #[serde(rename = "value")]
+    /// Holds a runtime value.
     Value,
-    /// Wire value `callable`.
-    #[serde(rename = "callable")]
+    /// Can be invoked.
     Callable,
-    /// Wire value `member`.
-    #[serde(rename = "member")]
+    /// Belongs to a containing type.
     Member,
-    /// Wire value `member_container`.
-    #[serde(rename = "member_container")]
+    /// Owns members of its own.
     MemberContainer,
-    /// Wire value `parameter`.
-    #[serde(rename = "parameter")]
+    /// A declared input of a callable.
     Parameter,
-    /// Wire value `type_parameter`.
-    #[serde(rename = "type_parameter")]
+    /// A generic parameter a declaration abstracts over.
     TypeParameter,
-    /// Wire value `constructible`.
-    #[serde(rename = "constructible")]
+    /// Instances of it can be created.
     Constructible,
-    /// Wire value `extensible`.
-    #[serde(rename = "extensible")]
+    /// Other types can inherit from it.
     Extensible,
-    /// Wire value `implementable`.
-    #[serde(rename = "implementable")]
+    /// Other types can fulfil it.
     Implementable,
-    /// Wire value `macro`.
-    #[serde(rename = "macro")]
+    /// Expands at compile time.
     Macro,
-    /// Wire value `test`.
-    #[serde(rename = "test")]
+    /// Exercises other code as a test.
     Test,
-    /// Wire value `annotation`.
-    #[serde(rename = "annotation")]
+    /// Decorates other declarations.
     Annotation,
-    /// Wire value `extension`.
-    #[serde(rename = "extension")]
+    /// Adds members to a type declared elsewhere.
     Extension,
-    /// Wire value `variant`.
-    #[serde(rename = "variant")]
+    /// One case of an enumeration.
     Variant,
-    /// Wire value `enumeration`.
-    #[serde(rename = "enumeration")]
+    /// A closed set of variants.
     Enumeration,
-    /// Wire value `alias`.
-    #[serde(rename = "alias")]
+    /// Another name for an existing symbol.
     Alias,
-    /// Wire value `property`.
-    #[serde(rename = "property")]
+    /// A member accessed like a field but backed by code.
     Property,
-    /// Wire value `abstract`.
-    #[serde(rename = "abstract")]
+    /// Declared without a complete implementation.
     Abstract,
-    /// Wire value `constructor`.
-    #[serde(rename = "constructor")]
+    /// Creates instances of its container.
     Constructor,
-    /// Wire value `static`.
-    #[serde(rename = "static")]
+    /// Belongs to the type rather than an instance.
     Static,
-    /// Wire value `mutable`.
-    #[serde(rename = "mutable")]
+    /// Its value can change after initialization.
     Mutable,
-    /// Wire value `public`.
-    #[serde(rename = "public")]
+    /// Visible outside its declaring scope.
     Public,
-    /// Wire value `deprecated`.
-    #[serde(rename = "deprecated")]
+    /// Marked as discouraged for new use.
     Deprecated,
-    /// Wire value `entrypoint`.
-    #[serde(rename = "entrypoint")]
+    /// Where execution starts.
     Entrypoint,
-    /// Wire value `operator`.
-    #[serde(rename = "operator")]
+    /// Invoked through operator syntax.
     Operator,
-    /// Wire value `async`.
-    #[serde(rename = "async")]
+    /// Runs asynchronously.
     Async,
-    /// Wire value `generator`.
-    #[serde(rename = "generator")]
+    /// Yields a sequence of values over time.
     Generator,
 }
 
@@ -2137,32 +1841,27 @@ pub struct SymbolVersion {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SymbolVersionKind {
-    /// Wire value `introduced`.
-    #[serde(rename = "introduced")]
+    /// The revision brought the symbol into existence.
     Introduced,
-    /// Wire value `body_changed`.
-    #[serde(rename = "body_changed")]
+    /// The revision changed the implementation without touching the signature.
     BodyChanged,
-    /// Wire value `signature_changed`.
-    #[serde(rename = "signature_changed")]
+    /// The revision changed the declared interface.
     SignatureChanged,
-    /// Wire value `moved`.
-    #[serde(rename = "moved")]
+    /// The revision relocated the declaration to another path.
     Moved,
-    /// Wire value `removed`.
-    #[serde(rename = "removed")]
+    /// The revision deleted the declaration.
     Removed,
-    /// Wire value `decorators_changed`.
-    #[serde(rename = "decorators_changed")]
+    /// The revision changed the annotations on the declaration.
     DecoratorsChanged,
 }
 
 /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
 /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
 /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
-/// another, so that `end` is never below `start` is asserted by the conformance tests
-/// instead.
+/// another, so that `end` is never below `start` is asserted by the surface
+/// validation tests instead.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextRange {
@@ -2179,15 +1878,13 @@ pub struct TextRange {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum TraversalDirection {
-    /// Wire value `outgoing`.
-    #[serde(rename = "outgoing")]
+    /// Walks edges leaving each visited symbol.
     Outgoing,
-    /// Wire value `incoming`.
-    #[serde(rename = "incoming")]
+    /// Walks edges arriving at each visited symbol.
     Incoming,
-    /// Wire value `both`.
-    #[serde(rename = "both")]
+    /// Walks edges in both directions.
     Both,
 }
 
@@ -2208,15 +1905,13 @@ pub struct TypeBinding {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum TypeBindingOrigin {
-    /// Wire value `declared`.
-    #[serde(rename = "declared")]
+    /// Written in the source by the author.
     Declared,
-    /// Wire value `inferred`.
-    #[serde(rename = "inferred")]
+    /// Worked out by the provider from usage.
     Inferred,
-    /// Wire value `expected`.
-    #[serde(rename = "expected")]
+    /// Required by the surrounding context.
     Expected,
 }
 
@@ -2224,42 +1919,31 @@ pub enum TypeBindingOrigin {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum TypeBindingRole {
-    /// Wire value `receiver`.
-    #[serde(rename = "receiver")]
+    /// The type of the implicit first parameter.
     Receiver,
-    /// Wire value `parameter`.
-    #[serde(rename = "parameter")]
+    /// The type a parameter accepts.
     Parameter,
-    /// Wire value `return`.
-    #[serde(rename = "return")]
+    /// The type a call yields.
     Return,
-    /// Wire value `field`.
-    #[serde(rename = "field")]
+    /// The type a field holds.
     Field,
-    /// Wire value `bound`.
-    #[serde(rename = "bound")]
+    /// A constraint on a type parameter.
     Bound,
-    /// Wire value `element`.
-    #[serde(rename = "element")]
+    /// The type of a collection's entries.
     Element,
-    /// Wire value `key`.
-    #[serde(rename = "key")]
+    /// The type a map is indexed by.
     Key,
-    /// Wire value `error`.
-    #[serde(rename = "error")]
+    /// The type of the failure a fallible result carries.
     Error,
-    /// Wire value `underlying`.
-    #[serde(rename = "underlying")]
+    /// The type an alias or wrapper stands for.
     Underlying,
-    /// Wire value `yielded`.
-    #[serde(rename = "yielded")]
+    /// The type a generator produces per step.
     Yielded,
-    /// Wire value `awaited`.
-    #[serde(rename = "awaited")]
+    /// The type awaiting the value resolves to.
     Awaited,
-    /// Wire value `discriminant`.
-    #[serde(rename = "discriminant")]
+    /// The type that tags which variant a value holds.
     Discriminant,
 }
 
@@ -2276,7 +1960,7 @@ pub struct TypeExpression {
     /// The symbol that declares this type, where one does. Null for a structural type,
     /// which has a spelling and nothing to open.
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(required, transform = schema::nullable)]
     pub resolved: Option<SymbolId>,
     /// Type facts the model has no field for, namespaced by the provider that emitted them.
     pub extensions: Extensions,

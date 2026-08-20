@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::Path;
 
 use data_encoding::BASE32_NOPAD;
@@ -8,6 +7,7 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{
     RUST_READ_PROVIDER_ID, SEARCH_RESULTS_DEFAULT, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS,
 };
+use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_index::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits,
@@ -24,62 +24,123 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
 
-/// Stable read-service failure classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadErrorKind {
+/// One read-service failure: what was asked, and why it cannot be served.
+///
+/// An indexing failure keeps the classification of the
+/// [`WorkspaceIndexError`] it wraps, so a crossed parse bound surfaces as
+/// `limit_exceeded` rather than as an unclassified failure.
+#[derive(Debug)]
+pub enum ReadFault {
     /// Workspace could not be indexed.
-    Index,
-    /// Request uses functionality not served by v0.0.2.
-    Unsupported,
+    Index(WorkspaceIndexError),
+    /// Request uses functionality this release does not serve.
+    Unsupported {
+        /// The unserved capability the request named.
+        capability: &'static str,
+    },
     /// Request is invalid for direct workspace reads.
-    Invalid,
+    Invalid {
+        /// The rejected request field.
+        field: &'static str,
+        /// The rule the field's value broke.
+        violation: String,
+    },
     /// Requested source does not exist.
-    NotFound,
+    NotFound {
+        /// The path the request addressed.
+        path: String,
+    },
+    /// Workspace files could not be read or written.
+    Storage {
+        /// The path being read or written.
+        path: String,
+        /// The filesystem operation that failed.
+        operation: &'static str,
+        /// The rendered I/O failure.
+        io: String,
+    },
+}
+
+impl Fault for ReadFault {
+    fn name(&self) -> ErrorName {
+        match self {
+            Self::Index(source) => source.descriptor().name(),
+            Self::Unsupported { .. } => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
+            Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
+            Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
+            Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
+        }
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        match self {
+            Self::Index(source) => source.context(),
+            Self::Unsupported { capability } => {
+                vec![ErrorContext::new("capability", *capability)]
+            }
+            Self::Invalid { field, violation } => vec![
+                ErrorContext::new("field", *field),
+                ErrorContext::new("violation", violation.clone()),
+            ],
+            Self::NotFound { path } => vec![ErrorContext::new("path", path.clone())],
+            Self::Storage {
+                path,
+                operation,
+                io,
+            } => vec![
+                ErrorContext::new("path", path.clone()),
+                ErrorContext::new("operation", *operation),
+                ErrorContext::new("io", io.clone()),
+            ],
+        }
+    }
+
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Index(source) => Some(source),
+            Self::Unsupported { .. }
+            | Self::Invalid { .. }
+            | Self::NotFound { .. }
+            | Self::Storage { .. } => None,
+        }
+    }
+}
+
+impl ReadFault {
+    pub(crate) fn unsupported(capability: &'static str) -> ReadError {
+        Error::new(Self::Unsupported { capability })
+    }
+
+    pub(crate) fn invalid(field: &'static str, violation: impl Into<String>) -> ReadError {
+        Error::new(Self::Invalid {
+            field,
+            violation: violation.into(),
+        })
+    }
+
+    pub(crate) fn not_found(path: impl Into<String>) -> ReadError {
+        Error::new(Self::NotFound { path: path.into() })
+    }
+
+    pub(crate) fn storage(
+        path: impl Into<String>,
+        operation: &'static str,
+        io: &std::io::Error,
+    ) -> ReadError {
+        Error::new(Self::Storage {
+            path: path.into(),
+            operation,
+            io: io.to_string(),
+        })
+    }
+
+    fn index(source: WorkspaceIndexError) -> ReadError {
+        Error::new(Self::Index(source))
+    }
 }
 
 /// Opaque read-service failure.
-#[derive(Debug)]
-pub struct ReadError {
-    kind: ReadErrorKind,
-    message: &'static str,
-    source: Option<WorkspaceIndexError>,
-}
-
-impl ReadError {
-    fn new(kind: ReadErrorKind, message: &'static str) -> Self {
-        Self {
-            kind,
-            message,
-            source: None,
-        }
-    }
-
-    fn index(source: WorkspaceIndexError) -> Self {
-        Self {
-            kind: ReadErrorKind::Index,
-            message: "workspace indexing failed",
-            source: Some(source),
-        }
-    }
-
-    /// Returns stable failure classification.
-    #[must_use]
-    pub const fn kind(&self) -> ReadErrorKind {
-        self.kind
-    }
-}
-
-impl fmt::Display for ReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
-    }
-}
-
-impl std::error::Error for ReadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|source| source as _)
-    }
-}
+pub type ReadError = Error<ReadFault>;
 
 /// Immutable direct-filesystem Rust read service.
 #[derive(Debug)]
@@ -95,7 +156,7 @@ impl ReadService {
     ///
     /// Returns [`ReadError`] when root cannot be indexed within bounds.
     pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let index = WorkspaceIndex::build(root, limits).map_err(ReadError::index)?;
+        let index = WorkspaceIndex::build(root, limits).map_err(ReadFault::index)?;
         let digest = workspace_digest(&index);
         let snapshot = ReadSnapshot {
             tree_revision: Digest(digest.clone()),
@@ -110,6 +171,11 @@ impl ReadService {
         Ok(Self { index, snapshot })
     }
 
+    /// Returns the immutable workspace index this snapshot serves.
+    pub(crate) const fn index(&self) -> &WorkspaceIndex {
+        &self.index
+    }
+
     /// Reads Rust syntax nodes covering one UTF-8 byte position.
     ///
     /// # Errors
@@ -117,17 +183,19 @@ impl ReadService {
     /// Returns [`ReadError`] for projections, invalid paths, or missing files.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
         if params.projection.is_some() {
-            return Err(unsupported("projections are not available"));
+            return Err(ReadFault::unsupported("projection reads"));
         }
-        let path = CoreProjectPath::new(params.path.0)
-            .map_err(|_| ReadError::new(ReadErrorKind::Invalid, "invalid project path"))?;
-        let file = self.index.file(&path).ok_or_else(|| {
-            ReadError::new(ReadErrorKind::NotFound, "Rust source was not indexed")
+        let path = CoreProjectPath::new(params.path.0).map_err(|error| {
+            ReadFault::invalid("path", rift_core::fault_label(&error.fault().violation()))
         })?;
+        let file = self
+            .index
+            .file(&path)
+            .ok_or_else(|| ReadFault::not_found(path.as_str()))?;
         let nodes = self
             .index
             .nodes(&path, params.position)
-            .ok_or_else(|| ReadError::new(ReadErrorKind::NotFound, "Rust source was not indexed"))?
+            .ok_or_else(|| ReadFault::not_found(path.as_str()))?
             .into_iter()
             .map(|node| wire_node(file, node))
             .collect();
@@ -158,14 +226,13 @@ impl ReadService {
             params.scope,
         )?;
         if params.include_history {
-            return Err(unsupported("symbol history is not available"));
+            return Err(ReadFault::unsupported("symbol history"));
         }
-        let limit = usize::try_from(params.limit)
-            .map_err(|_| ReadError::new(ReadErrorKind::Invalid, "result limit is invalid"))?;
+        let limit = admitted_limit(params.limit)?;
         let hits = self
             .index
             .symbols(&params.name, limit)
-            .map_err(ReadError::index)?
+            .map_err(ReadFault::index)?
             .into_iter()
             .map(|matched| GetSymbolHit {
                 symbol: wire_symbol(matched),
@@ -195,21 +262,17 @@ impl ReadService {
         let query = params
             .query
             .as_deref()
-            .ok_or_else(|| ReadError::new(ReadErrorKind::Invalid, "search query is required"))?;
+            .ok_or_else(|| ReadFault::invalid("query", "missing"))?;
         if query.is_empty() {
-            return Err(ReadError::new(
-                ReadErrorKind::Invalid,
-                "search query is empty",
-            ));
+            return Err(ReadFault::invalid("query", "empty"));
         }
-        let limit = usize::try_from(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))
-            .map_err(|_| ReadError::new(ReadErrorKind::Invalid, "result limit is invalid"))?;
+        let limit = admitted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
         let mut results = Vec::new();
         if matches!(
             params.target,
             SearchParamsTarget::All | SearchParamsTarget::Symbol
         ) {
-            for matched in self.index.symbols(query, limit).map_err(ReadError::index)? {
+            for matched in self.index.symbols(query, limit).map_err(ReadFault::index)? {
                 results.push(symbol_search_hit(matched));
             }
         }
@@ -222,7 +285,7 @@ impl ReadService {
             for (file, line, text) in self
                 .index
                 .source_matches(query, limit - results.len())
-                .map_err(ReadError::index)?
+                .map_err(ReadFault::index)?
             {
                 results.push(file_search_hit(file, line, text));
             }
@@ -237,12 +300,22 @@ impl ReadService {
     }
 }
 
+/// Admits a caller-supplied result limit: positive, and inside this
+/// platform's addressable range.
+fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
+    if requested == 0 {
+        return Err(ReadFault::invalid("limit", "zero"));
+    }
+    usize::try_from(requested)
+        .map_err(|_| ReadFault::invalid("limit", format!("{requested} exceeds this platform")))
+}
+
 fn validate_common(cursor: bool, projection: bool, scope: SearchScope) -> Result<(), ReadError> {
     if cursor || projection {
-        return Err(unsupported("cursor and projection reads are not available"));
+        return Err(ReadFault::unsupported("cursor and projection reads"));
     }
     if scope == SearchScope::Dependencies {
-        return Err(unsupported("dependency reads are not available"));
+        return Err(ReadFault::unsupported("dependency reads"));
     }
     Ok(())
 }
@@ -254,18 +327,12 @@ fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
         params.scope,
     )?;
     if params.filter.is_some() || params.paths.is_some() || params.traversal.is_some() {
-        return Err(unsupported(
-            "filtered and traversal search is not available",
-        ));
+        return Err(ReadFault::unsupported("filtered and traversal search"));
     }
     if params.target == SearchParamsTarget::Node {
-        return Err(unsupported("node search is not available"));
+        return Err(ReadFault::unsupported("node search"));
     }
     Ok(())
-}
-
-fn unsupported(message: &'static str) -> ReadError {
-    ReadError::new(ReadErrorKind::Unsupported, message)
 }
 
 fn wire_node(file: &IndexedFile, node: &RustNode) -> Node {
@@ -292,7 +359,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
         .find(|node| node.range == matched.symbol.range);
     node.map_or_else(
         || Node {
-            id: NodeId(node_address(matched.file, "item", matched.symbol.range)),
+            id: NodeId(node_address(matched.file, matched.symbol.range)),
             symbol: Some(symbol_id(matched.file, matched.symbol)),
             unit: file_id(matched.file),
             language: rust_language(),
@@ -407,7 +474,7 @@ fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
     }
 }
 
-fn source_span(file: &IndexedFile, range: ByteRange) -> SourceUnitSpan {
+pub(crate) fn source_span(file: &IndexedFile, range: ByteRange) -> SourceUnitSpan {
     SourceUnitSpan {
         unit: source_unit_id(file),
         range: text_range(range),
@@ -428,11 +495,11 @@ fn rust_language() -> Language {
     }
 }
 
-fn file_id(file: &IndexedFile) -> FileId {
+pub(crate) fn file_id(file: &IndexedFile) -> FileId {
     FileId(format!("rift://file/{}", encode_path(file.path().as_str())))
 }
 
-fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
+pub(crate) fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
     let digest = Sha256::digest(file.path().as_str().as_bytes());
     SourceUnitId(format!(
         "rift://source/src_{}",
@@ -449,25 +516,16 @@ fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
 }
 
 fn node_id(file: &IndexedFile, node: &RustNode) -> NodeId {
-    NodeId(node_address(file, &node.kind, node.range))
+    NodeId(node_address(file, node.range))
 }
 
-fn node_address(file: &IndexedFile, kind: &str, range: ByteRange) -> String {
-    let fingerprint = Sha256::digest(format!(
-        "{}:{kind}:{}:{}",
-        file.path(),
-        range.start,
-        range.end
-    ));
+fn node_address(file: &IndexedFile, range: ByteRange) -> String {
     format!(
-        "rift://node/rust/{}@{}-{}#{:02x}{:02x}{:02x}{:02x}",
+        "rift://node/rust/{}@{}-{}#{}",
         encode_path(file.path().as_str()),
         range.start,
         range.end,
-        fingerprint[0],
-        fingerprint[1],
-        fingerprint[2],
-        fingerprint[3]
+        node_witness(file.source(), range)
     )
 }
 
@@ -486,7 +544,24 @@ fn workspace_digest(index: &WorkspaceIndex) -> String {
 ///
 /// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with
 /// `O`, `I`, `B`, and `g`; source-unit identities use its lowercase form.
-fn digest_prefix_base32(bytes: &[u8]) -> String {
+/// The witness a node address carries: the first eight lowercase hex
+/// characters of the SHA-256 of the node's source bytes. Recomputing it is
+/// how resolution proves the bytes behind an address have not drifted.
+pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
+    let start = usize::try_from(range.start)
+        .unwrap_or(source.len())
+        .min(source.len());
+    let end = usize::try_from(range.end)
+        .unwrap_or(source.len())
+        .min(source.len());
+    let fingerprint = Sha256::digest(source.get(start..end).unwrap_or_default().as_bytes());
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        fingerprint[0], fingerprint[1], fingerprint[2], fingerprint[3]
+    )
+}
+
+pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
     let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
     encoded.truncate(SOURCE_UNIT_DIGEST_CHARS);
     encoded
@@ -516,7 +591,7 @@ const PATH_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'-');
 
-fn encode_path(value: &str) -> String {
+pub(crate) fn encode_path(value: &str) -> String {
     utf8_percent_encode(value, PATH_ESCAPE_SET).to_string()
 }
 
@@ -646,7 +721,7 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{ReadErrorKind, ReadService, WorkspaceIndexLimits, symbol_match_score};
+    use super::{ReadFault, ReadService, WorkspaceIndexLimits, symbol_match_score};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -804,20 +879,20 @@ pub fn compute() -> i32 {
             position: 0,
             projection: Some(projection),
         });
-        assert_eq!(
-            nodes.expect_err("projection must fail").kind(),
-            ReadErrorKind::Unsupported
-        );
+        assert!(matches!(
+            nodes.expect_err("projection must fail").fault(),
+            ReadFault::Unsupported { .. }
+        ));
 
         let mut symbol: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         symbol.include_history = true;
-        assert_eq!(
+        assert!(matches!(
             service
                 .get_symbol(&symbol)
                 .expect_err("history must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
         Ok(())
     }
 
@@ -828,23 +903,23 @@ pub fn compute() -> i32 {
             "query": "Beacon",
             "filter": {"kind": "field", "field": {"field": "name", "op": "eq", "value": "Beacon"}}
         }))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&search)
                 .expect_err("filter must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
 
         let missing = service.nodes(NodesParams {
             path: ProjectPath("src/missing.rs".to_owned()),
             position: 0,
             projection: None,
         });
-        assert_eq!(
-            missing.expect_err("missing source must fail").kind(),
-            ReadErrorKind::NotFound
-        );
+        assert!(matches!(
+            missing.expect_err("missing source must fail").fault(),
+            ReadFault::NotFound { .. }
+        ));
         Ok(())
     }
 
@@ -856,7 +931,7 @@ pub fn compute() -> i32 {
         )
         .expect_err("missing root must fail");
 
-        assert_eq!(error.kind(), ReadErrorKind::Index);
+        assert!(matches!(error.fault(), ReadFault::Index(_)));
         assert!(std::error::Error::source(&error).is_some());
     }
 
@@ -868,10 +943,10 @@ pub fn compute() -> i32 {
             position: 0,
             projection: None,
         });
-        assert_eq!(
-            result.expect_err("absolute path must fail").kind(),
-            ReadErrorKind::Invalid
-        );
+        assert!(matches!(
+            result.expect_err("absolute path must fail").fault(),
+            ReadFault::Invalid { .. }
+        ));
         Ok(())
     }
 
@@ -880,13 +955,13 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams =
             serde_json::from_value(json!({"name": "Beacon", "scope": "dependencies"}))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .get_symbol(&params)
                 .expect_err("dependency scope must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
         Ok(())
     }
 
@@ -895,23 +970,23 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let cursor: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "cursor": "page-two"}))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&cursor)
                 .expect_err("cursor reads must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
 
         let node_target: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "target": "node"}))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&node_target)
                 .expect_err("node target must fail")
-                .kind(),
-            ReadErrorKind::Unsupported
-        );
+                .fault(),
+            ReadFault::Unsupported { .. }
+        ));
         Ok(())
     }
 
@@ -919,22 +994,24 @@ pub fn compute() -> i32 {
     fn search_requires_query_and_rejects_zero_limit() -> TestResult {
         let (_directory, service) = fixture()?;
         let missing_query: SearchParams = serde_json::from_value(json!({}))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&missing_query)
                 .expect_err("missing query must fail")
-                .kind(),
-            ReadErrorKind::Invalid
-        );
+                .fault(),
+            ReadFault::Invalid { .. }
+        ));
 
         let zero_limit: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
+        let error = service
+            .search(&zero_limit)
+            .expect_err("zero limit must fail");
+        assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
         assert_eq!(
-            service
-                .search(&zero_limit)
-                .expect_err("zero limit must fail")
-                .kind(),
-            ReadErrorKind::Index
+            error.to_string(),
+            "the request does not match the documented form: field limit, \
+             violation zero; correct the reported field and resend the request"
         );
         Ok(())
     }
@@ -947,13 +1024,13 @@ pub fn compute() -> i32 {
             "target": "file",
             "limit": READ_RESULTS_MAX_DEFAULT as u64 + 1
         }))?;
-        assert_eq!(
+        assert!(matches!(
             service
                 .search(&params)
                 .expect_err("oversized file-target limit must fail")
-                .kind(),
-            ReadErrorKind::Index
-        );
+                .fault(),
+            ReadFault::Index(_)
+        ));
         Ok(())
     }
 
@@ -1023,6 +1100,18 @@ pub fn compute() -> i32 {
         assert!(any_node_has_facet(&comment, "comment")?);
 
         Ok(())
+    }
+
+    #[test]
+    fn storage_fault_renders_path_operation_and_io_in_order() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sealed");
+        let error = ReadFault::storage("src/lib.rs", "stage", &io);
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        let context = error.context();
+        let keys: Vec<&str> = context.iter().map(rift_core::ErrorContext::key).collect();
+        assert_eq!(keys, ["path", "operation", "io"]);
+        assert_eq!(context[0].value(), "src/lib.rs");
+        assert_eq!(context[2].value(), "sealed");
     }
 
     #[test]
