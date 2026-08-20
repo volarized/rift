@@ -63,7 +63,7 @@ impl PathError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::InvalidConfiguration)
+        ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
     }
 }
 
