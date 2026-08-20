@@ -156,7 +156,7 @@ mod tests {
     use std::fs;
 
     use rift_index::WorkspaceIndexLimits;
-    use rift_server::ReadErrorKind;
+    use rift_server::ReadFault;
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
@@ -189,7 +189,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
         )
         .expect_err("missing root must fail");
-        assert_eq!(error.kind(), ReadErrorKind::Index);
+        assert!(matches!(error.fault(), ReadFault::Index(_)));
     }
 
     #[tokio::test]
