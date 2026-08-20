@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "protocol/rust"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.0.1"
@@ -14,12 +14,19 @@ rift-core = { path = "crates/rift-core" }
 rift-index = { path = "crates/rift-index" }
 rift-mcp = { path = "crates/rift-mcp" }
 rift-model = { path = "crates/rift-model" }
-rift-protocol = { path = "protocol/rust" }
+rift-protocol = { path = "crates/rift-protocol" }
 rift-provider = { path = "crates/rift-provider" }
 rift-server = { path = "crates/rift-server" }
 rift-syntax = { path = "crates/rift-syntax" }
 
 clap = { version = "4.6.5", features = ["derive"] }
+schemars = { version = "=1.2.2", default-features = false, features = ["derive", "std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tree-sitter = "=0.25.10"
+tree-sitter-rust = "=0.24.2"
+tempfile = "3.27.0"
+unicode-normalization = "0.1.24"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

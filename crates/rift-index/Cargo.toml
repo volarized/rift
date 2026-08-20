@@ -14,3 +14,7 @@ workspace = true
 rift-core.workspace = true
 rift-model.workspace = true
 rift-provider.workspace = true
+rift-syntax.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

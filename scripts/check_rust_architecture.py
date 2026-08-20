@@ -24,6 +24,7 @@ EXPECTED_EDGES = {
     "rift-index -> rift-core",
     "rift-index -> rift-model",
     "rift-index -> rift-provider",
+    "rift-index -> rift-syntax",
     "rift-mcp -> rift-core",
     "rift-mcp -> rift-protocol",
     "rift-mcp -> rift-server",
@@ -92,8 +93,9 @@ def main() -> int:
         for target in package["targets"]
         if "bin" in target["kind"]
     )
+    # rift is the only binary target: one released CLI, nothing else.
     if binaries != ["rift:rift"]:
-        raise RuntimeError(f"expected only rift:rift binary target, got {binaries}")
+        raise RuntimeError(f"expected exactly the rift:rift binary target, got {binaries}")
     return 0
 
 
