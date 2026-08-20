@@ -568,6 +568,7 @@ fn symbol_rank(symbol: &RustSymbol, query: &str) -> SymbolMatchRank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_syntax::RustSyntaxLimits;
     #[cfg(unix)]
     use std::os::unix::fs as unix_fs;
 
@@ -803,6 +804,80 @@ mod tests {
         for (violation, message) in cases {
             assert_eq!(WorkspaceIndexError::new(violation).to_string(), message);
         }
+    }
+
+    #[test]
+    fn test_error_display_appends_offending_path() {
+        let error = WorkspaceIndexError::at(
+            WorkspaceIndexViolation::FileTooLarge,
+            Path::new("src/big.rs"),
+        );
+        assert_eq!(
+            error.to_string(),
+            "Rust source exceeds file byte limit: src/big.rs"
+        );
+    }
+
+    #[test]
+    fn test_component_identity_failure_surfaces_as_composition_error() {
+        let error = component::<(), WorkspaceFiles>("").expect_err("empty component id");
+        assert_eq!(error.violation(), WorkspaceIndexViolation::Composition);
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn test_read_file_classifies_syntax_and_non_nfc_path_failures() {
+        let directory = fixture();
+        let limits = WorkspaceIndexLimits::default();
+        let mut bytes = 0;
+        let strict_parser =
+            RustSyntaxProvider::new(RustSyntaxLimits::new(1, 1, 1).expect("positive bounds"));
+        let source_path = directory.path().join("src/lib.rs");
+        let syntax_error = read_file(directory.path(), &source_path, &strict_parser, limits, &mut bytes)
+            .expect_err("syntax byte bound");
+        assert_eq!(syntax_error.violation(), WorkspaceIndexViolation::Syntax);
+        assert_eq!(syntax_error.path(), Some(source_path.as_path()));
+        assert!(std::error::Error::source(&syntax_error).is_some());
+
+        let parser = RustSyntaxProvider::default();
+        let decomposed = directory.path().join("src/cafe\u{301}.rs");
+        fs::write(&decomposed, "fn accent() {}").expect("decomposed source");
+        let path_error = read_file(directory.path(), &decomposed, &parser, limits, &mut bytes)
+            .expect_err("non-NFC project path");
+        assert_eq!(path_error.violation(), WorkspaceIndexViolation::InvalidPath);
+        assert!(std::error::Error::source(&path_error).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_classifies_unreadable_and_unsearchable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = fixture();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let locked = root.join("locked");
+        fs::create_dir(&locked).expect("locked directory");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("remove read");
+        let unreadable = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
+            .expect_err("unreadable directory");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
+        assert_eq!(unreadable.violation(), WorkspaceIndexViolation::Filesystem);
+        assert_eq!(unreadable.path(), Some(locked.as_path()));
+
+        let unsearchable = root.join("unsearchable");
+        fs::create_dir(&unsearchable).expect("unsearchable directory");
+        fs::write(unsearchable.join("entry.rs"), "fn entry() {}").expect("entry source");
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o444))
+            .expect("remove search");
+        let stat_error = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
+            .expect_err("unsearchable directory");
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755))
+            .expect("restore search");
+        assert_eq!(stat_error.violation(), WorkspaceIndexViolation::Filesystem);
+        assert_eq!(
+            stat_error.path(),
+            Some(unsearchable.join("entry.rs").as_path())
+        );
     }
 
     #[test]
