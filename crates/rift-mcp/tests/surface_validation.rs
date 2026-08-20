@@ -317,3 +317,107 @@ async fn live_witnessed_replace_node_lands_and_validates() -> TestResult {
     server_task.await?;
     Ok(())
 }
+
+/// A configured hook's verdicts ride the applied change: a passing hook's
+/// guarantees become validated evidence, a failing hook an error finding.
+#[cfg(unix)]
+#[tokio::test]
+async fn hooked_change_carries_validated_guarantees_and_findings() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon_one() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        r#"
+[[hooks]]
+type = "command"
+id = "echoes"
+kind = "other"
+argv = ["echo", "checked"]
+changed_paths = "append"
+working_directory = ""
+environment = {}
+timeout_ms = 30000
+output_limit_bytes = 4096
+guarantees = [
+    { kind = "behavior_checked", scope = { kind = "reach", reach = "project" }, detail = "echo ran over the changed paths" },
+]
+determinism = "deterministic"
+
+[[hooks]]
+type = "command"
+id = "refuses"
+kind = "other"
+argv = ["false"]
+changed_paths = "none"
+working_directory = ""
+environment = {}
+timeout_ms = 30000
+output_limit_bytes = 4096
+guarantees = []
+determinism = "deterministic"
+"#,
+    )?;
+    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())?;
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        let service = server
+            .serve(server_transport)
+            .await
+            .expect("server must initialize");
+        service.waiting().await.expect("server must stop cleanly");
+    });
+    let client = ().serve(client_transport).await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+
+    let changed = client
+        .call_tool(
+            CallToolRequestParams::new("replace_symbol").with_arguments(arguments(&json!({
+                "symbol": "rift://symbol/rust/lib.rs/beacon_one",
+                "body": "pub fn beacon_one() -> u8 { 1 }"
+            }))?),
+        )
+        .await?;
+    let structured = changed
+        .structured_content
+        .ok_or("replace_symbol must return structured content")?;
+    let (_, output_validator) = &validators["replace_symbol"];
+    assert_validates(
+        output_validator,
+        &structured,
+        "hooked replace_symbol result",
+    );
+    assert_eq!(structured["status"], json!("applied"));
+
+    let guarantees = structured["summary"]["guarantees"]
+        .as_array()
+        .ok_or("summary must carry guarantees")?;
+    assert_eq!(
+        guarantees,
+        &vec![json!({
+            "kind": "behavior_checked",
+            "scope": { "kind": "reach", "reach": "project" },
+            "hook": "echoes",
+            "detail": "echo ran over the changed paths"
+        })],
+        "the passing hook's configured guarantee must ride the change"
+    );
+
+    let findings = structured["summary"]["diagnostics"]
+        .as_array()
+        .ok_or("summary must carry diagnostics")?;
+    let failure = findings
+        .iter()
+        .find(|finding| finding["code"] == json!("rift.hook.failed"))
+        .ok_or("the failing hook must contribute a rift.hook.failed finding")?;
+    assert_eq!(failure["severity"], json!("error"));
+    let message = failure["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("refuses") && message.contains("exited 1"),
+        "the finding must name the hook and what ended it: {message}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
