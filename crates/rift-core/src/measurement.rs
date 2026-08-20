@@ -27,14 +27,16 @@ pub struct ClockRegression {
 }
 
 impl ClockRegression {
-    crate::property! {
-        /// Returns start tick.
-        pub const fn start(self) -> Duration = self.start;
+    /// Returns start tick.
+    #[must_use]
+    pub const fn start(self) -> Duration {
+        self.start
     }
 
-    crate::property! {
-        /// Returns regressed finish tick.
-        pub const fn finish(self) -> Duration = self.finish;
+    /// Returns regressed finish tick.
+    #[must_use]
+    pub const fn finish(self) -> Duration {
+        self.finish
     }
 }
 
@@ -74,14 +76,16 @@ impl PerformanceMeasurement {
         Ok(Self { operation, elapsed })
     }
 
-    crate::property! {
-        /// Returns stable operation name.
-        pub const fn operation(self) -> &'static str = self.operation;
+    /// Returns stable operation name.
+    #[must_use]
+    pub const fn operation(self) -> &'static str {
+        self.operation
     }
 
-    crate::property! {
-        /// Returns measured elapsed duration.
-        pub const fn elapsed(self) -> Duration = self.elapsed;
+    /// Returns measured elapsed duration.
+    #[must_use]
+    pub const fn elapsed(self) -> Duration {
+        self.elapsed
     }
 }
 
