@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 rift-core.workspace = true
+serde.workspace = true
 rift-model.workspace = true
 rift-provider.workspace = true
 rift-syntax.workspace = true

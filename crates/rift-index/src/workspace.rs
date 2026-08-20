@@ -1,4 +1,3 @@
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,13 +7,14 @@ use rift_core::constants::{
     WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, ProjectPath,
-    ProviderId, render_failure,
+    CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
+    fault_label,
 };
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{
     RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxError, RustSyntaxProvider,
 };
+use serde::Serialize;
 
 #[derive(Debug)]
 struct WorkspaceFiles;
@@ -90,7 +90,8 @@ impl Default for WorkspaceIndexLimits {
 }
 
 /// Stable workspace indexing failure classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkspaceIndexViolation {
     /// Limit was configured as zero.
     ZeroLimit,
@@ -118,43 +119,16 @@ pub enum WorkspaceIndexViolation {
     ResultLimit,
 }
 
-/// Opaque workspace indexing failure.
+/// One workspace indexing failure: its violation, the offending path when
+/// known, and the underlying cause (I/O, UTF-8, syntax).
 #[derive(Debug)]
-pub struct WorkspaceIndexError {
+pub struct WorkspaceIndexFault {
     violation: WorkspaceIndexViolation,
     path: Option<PathBuf>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
-impl WorkspaceIndexError {
-    fn new(violation: WorkspaceIndexViolation) -> Self {
-        Self {
-            violation,
-            path: None,
-            source: None,
-        }
-    }
-
-    fn at(violation: WorkspaceIndexViolation, path: &Path) -> Self {
-        Self {
-            violation,
-            path: Some(path.to_path_buf()),
-            source: None,
-        }
-    }
-
-    fn caused_by(
-        violation: WorkspaceIndexViolation,
-        path: Option<&Path>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            violation,
-            path: path.map(Path::to_path_buf),
-            source: Some(Box::new(source)),
-        }
-    }
-
+impl WorkspaceIndexFault {
     /// Returns stable failure classification.
     #[must_use]
     pub const fn violation(&self) -> WorkspaceIndexViolation {
@@ -166,92 +140,83 @@ impl WorkspaceIndexError {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+}
 
-    /// Returns canonical registry metadata for this failure.
-    ///
+impl Fault for WorkspaceIndexFault {
     /// A syntax failure delegates to the underlying [`RustSyntaxError`]'s
-    /// descriptor when the source downcasts to one.
-    #[must_use]
-    pub fn descriptor(&self) -> ErrorDescriptor {
+    /// identity when the source downcasts to one.
+    fn name(&self) -> ErrorName {
         match self.violation {
             WorkspaceIndexViolation::ZeroLimit
             | WorkspaceIndexViolation::InvalidRoot
             | WorkspaceIndexViolation::Composition => {
-                ErrorRegistry::descriptor(ErrorName::ConfigurationInvalid)
+                ErrorName::Wire(ErrorCode::ConfigurationInvalid)
             }
             WorkspaceIndexViolation::TooDeep
             | WorkspaceIndexViolation::TooManyFiles
             | WorkspaceIndexViolation::FileTooLarge
             | WorkspaceIndexViolation::WorkspaceTooLarge
-            | WorkspaceIndexViolation::ResultLimit => {
-                ErrorRegistry::descriptor(ErrorName::LimitExceeded)
-            }
-            WorkspaceIndexViolation::InvalidPath => {
-                ErrorRegistry::descriptor(ErrorName::UnsupportedPath)
-            }
+            | WorkspaceIndexViolation::ResultLimit => ErrorName::Wire(ErrorCode::LimitExceeded),
+            WorkspaceIndexViolation::InvalidPath => ErrorName::Wire(ErrorCode::UnsupportedPath),
             WorkspaceIndexViolation::InvalidSource => {
-                ErrorRegistry::descriptor(ErrorName::ContentUnavailable)
+                ErrorName::Wire(ErrorCode::ContentUnavailable)
             }
-            WorkspaceIndexViolation::Filesystem => {
-                ErrorRegistry::descriptor(ErrorName::StorageFailure)
-            }
+            WorkspaceIndexViolation::Filesystem => ErrorName::Wire(ErrorCode::StorageFailure),
             WorkspaceIndexViolation::Syntax => self
                 .source
                 .as_deref()
                 .and_then(|source| source.downcast_ref::<RustSyntaxError>())
                 .map_or_else(
-                    || ErrorRegistry::descriptor(ErrorName::InternalError),
-                    RustSyntaxError::descriptor,
+                    || ErrorName::Wire(ErrorCode::InternalError),
+                    |error| error.descriptor().name(),
                 ),
         }
     }
 
-    /// Returns ordered typed context: violation label, then path when present.
-    #[must_use]
-    pub fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new(
-            "violation",
-            violation_label(self.violation),
-        )];
+    fn context(&self) -> Vec<ErrorContext> {
+        let mut context = vec![ErrorContext::new("violation", fault_label(&self.violation))];
         if let Some(path) = &self.path {
             context.push(ErrorContext::new("path", path.display().to_string()));
         }
         context
     }
-}
 
-const fn violation_label(violation: WorkspaceIndexViolation) -> &'static str {
-    match violation {
-        WorkspaceIndexViolation::ZeroLimit => "zero_limit",
-        WorkspaceIndexViolation::InvalidRoot => "invalid_root",
-        WorkspaceIndexViolation::TooDeep => "too_deep",
-        WorkspaceIndexViolation::TooManyFiles => "too_many_files",
-        WorkspaceIndexViolation::FileTooLarge => "file_too_large",
-        WorkspaceIndexViolation::WorkspaceTooLarge => "workspace_too_large",
-        WorkspaceIndexViolation::InvalidPath => "invalid_path",
-        WorkspaceIndexViolation::InvalidSource => "invalid_source",
-        WorkspaceIndexViolation::Filesystem => "filesystem",
-        WorkspaceIndexViolation::Syntax => "syntax",
-        WorkspaceIndexViolation::Composition => "composition",
-        WorkspaceIndexViolation::ResultLimit => "result_limit",
-    }
-}
-
-// Failure context is carried by the error itself: the offending path renders
-// as named context and the underlying cause (I/O, UTF-8, syntax) stays on
-// Error::source.
-impl fmt::Display for WorkspaceIndexError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
-    }
-}
-
-impl std::error::Error for WorkspaceIndexError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.source
             .as_deref()
             .map(|source| source as &(dyn std::error::Error + 'static))
     }
+}
+
+/// Opaque workspace indexing failure.
+pub type WorkspaceIndexError = Error<WorkspaceIndexFault>;
+
+fn index_error(violation: WorkspaceIndexViolation) -> WorkspaceIndexError {
+    Error::new(WorkspaceIndexFault {
+        violation,
+        path: None,
+        source: None,
+    })
+}
+
+fn index_error_at(violation: WorkspaceIndexViolation, path: &Path) -> WorkspaceIndexError {
+    Error::new(WorkspaceIndexFault {
+        violation,
+        path: Some(path.to_path_buf()),
+        source: None,
+    })
+}
+
+fn index_error_caused_by(
+    violation: WorkspaceIndexViolation,
+    path: Option<&Path>,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> WorkspaceIndexError {
+    Error::new(WorkspaceIndexFault {
+        violation,
+        path: path.map(Path::to_path_buf),
+        source: Some(Box::new(source)),
+    })
 }
 
 /// One immutable indexed Rust file.
@@ -433,9 +398,7 @@ impl WorkspaceIndex {
 
     fn validate_result_limit(&self, limit: usize) -> Result<(), WorkspaceIndexError> {
         if limit == 0 || limit > self.limits.results_max {
-            return Err(WorkspaceIndexError::new(
-                WorkspaceIndexViolation::ResultLimit,
-            ));
+            return Err(index_error(WorkspaceIndexViolation::ResultLimit));
         }
         Ok(())
     }
@@ -443,17 +406,17 @@ impl WorkspaceIndex {
 
 fn positive_bound(bound: usize) -> Result<(), WorkspaceIndexError> {
     if bound == 0 {
-        return Err(WorkspaceIndexError::new(WorkspaceIndexViolation::ZeroLimit));
+        return Err(index_error(WorkspaceIndexViolation::ZeroLimit));
     }
     Ok(())
 }
 
 fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceIndexError> {
     let canonical = fs::canonicalize(root).map_err(|error| {
-        WorkspaceIndexError::caused_by(WorkspaceIndexViolation::InvalidRoot, Some(root), error)
+        index_error_caused_by(WorkspaceIndexViolation::InvalidRoot, Some(root), error)
     })?;
     if !canonical.is_dir() {
-        return Err(WorkspaceIndexError::at(
+        return Err(index_error_at(
             WorkspaceIndexViolation::InvalidRoot,
             &canonical,
         ));
@@ -484,7 +447,7 @@ fn component<Input: 'static, Output: 'static>(
 fn composition_error(
     source: impl std::error::Error + Send + Sync + 'static,
 ) -> WorkspaceIndexError {
-    WorkspaceIndexError::caused_by(WorkspaceIndexViolation::Composition, None, source)
+    index_error_caused_by(WorkspaceIndexViolation::Composition, None, source)
 }
 
 fn discover(
@@ -495,19 +458,12 @@ fn discover(
     let mut files = Vec::new();
     while let Some((directory, depth)) = pending.pop() {
         if depth > limits.directory_depth_max {
-            return Err(WorkspaceIndexError::at(
-                WorkspaceIndexViolation::TooDeep,
-                &directory,
-            ));
+            return Err(index_error_at(WorkspaceIndexViolation::TooDeep, &directory));
         }
         let mut entries = fs::read_dir(&directory)
             .and_then(Iterator::collect::<Result<Vec<_>, _>>)
             .map_err(|error| {
-                WorkspaceIndexError::caused_by(
-                    WorkspaceIndexViolation::Filesystem,
-                    Some(&directory),
-                    error,
-                )
+                index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(&directory), error)
             })?;
         entries.sort_by_key(fs::DirEntry::file_name);
         for entry in entries.into_iter().rev() {
@@ -527,7 +483,7 @@ fn discover_entry(
 ) -> Result<(), WorkspaceIndexError> {
     let path = entry.path();
     let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        WorkspaceIndexError::caused_by(WorkspaceIndexViolation::Filesystem, Some(&path), error)
+        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(&path), error)
     })?;
     if metadata.file_type().is_symlink() {
         return Ok(());
@@ -538,10 +494,7 @@ fn discover_entry(
         }
     } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
         if files.len() >= limits.files_max {
-            return Err(WorkspaceIndexError::at(
-                WorkspaceIndexViolation::TooManyFiles,
-                &path,
-            ));
+            return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, &path));
         }
         files.push(path);
     }
@@ -561,28 +514,25 @@ fn read_file(
     workspace_bytes: &mut usize,
 ) -> Result<IndexedFile, WorkspaceIndexError> {
     let bytes = fs::read(path).map_err(|error| {
-        WorkspaceIndexError::caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
     if bytes.len() > limits.file_bytes_max {
-        return Err(WorkspaceIndexError::at(
-            WorkspaceIndexViolation::FileTooLarge,
-            path,
-        ));
+        return Err(index_error_at(WorkspaceIndexViolation::FileTooLarge, path));
     }
     *workspace_bytes = workspace_bytes
         .checked_add(bytes.len())
-        .ok_or_else(|| WorkspaceIndexError::at(WorkspaceIndexViolation::WorkspaceTooLarge, path))?;
+        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, path))?;
     if *workspace_bytes > limits.workspace_bytes_max {
-        return Err(WorkspaceIndexError::at(
+        return Err(index_error_at(
             WorkspaceIndexViolation::WorkspaceTooLarge,
             path,
         ));
     }
     let source = String::from_utf8(bytes).map_err(|error| {
-        WorkspaceIndexError::caused_by(WorkspaceIndexViolation::InvalidSource, Some(path), error)
+        index_error_caused_by(WorkspaceIndexViolation::InvalidSource, Some(path), error)
     })?;
     let relative = path.strip_prefix(root).map_err(|error| {
-        WorkspaceIndexError::caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
+        index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
     })?;
     let project_path = relative_path(relative)?;
     let syntax = parser
@@ -591,7 +541,7 @@ fn read_file(
             text: &source,
         })
         .map_err(|error| {
-            WorkspaceIndexError::caused_by(WorkspaceIndexViolation::Syntax, Some(path), error)
+            index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(path), error)
         })?;
     Ok(IndexedFile {
         path: project_path,
@@ -605,10 +555,10 @@ fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
         .components()
         .map(|component| component.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| WorkspaceIndexError::at(WorkspaceIndexViolation::InvalidPath, path))?
+        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::InvalidPath, path))?
         .join("/");
     ProjectPath::new(value).map_err(|error| {
-        WorkspaceIndexError::caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
+        index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
     })
 }
 
@@ -688,7 +638,7 @@ mod tests {
         )
         .expect_err("file byte bound");
         assert_eq!(
-            file_error.violation(),
+            file_error.fault().violation(),
             WorkspaceIndexViolation::FileTooLarge
         );
 
@@ -698,6 +648,7 @@ mod tests {
             index
                 .symbols("Rift", index.limits.results_max() + 1)
                 .expect_err("result bound")
+                .fault()
                 .violation(),
             WorkspaceIndexViolation::ResultLimit,
         );
@@ -705,6 +656,7 @@ mod tests {
             index
                 .source_matches("Rift", 0)
                 .expect_err("zero result bound")
+                .fault()
                 .violation(),
             WorkspaceIndexViolation::ResultLimit,
         );
@@ -715,6 +667,7 @@ mod tests {
         assert_eq!(
             WorkspaceIndexLimits::new(0, 1, 1, 1, 1)
                 .expect_err("zero bound")
+                .fault()
                 .violation(),
             WorkspaceIndexViolation::ZeroLimit,
         );
@@ -723,10 +676,10 @@ mod tests {
         let missing_error = WorkspaceIndex::build(&missing, WorkspaceIndexLimits::default())
             .expect_err("missing root");
         assert_eq!(
-            missing_error.violation(),
+            missing_error.fault().violation(),
             WorkspaceIndexViolation::InvalidRoot
         );
-        assert_eq!(missing_error.path(), Some(missing.as_path()));
+        assert_eq!(missing_error.fault().path(), Some(missing.as_path()));
         assert!(std::error::Error::source(&missing_error).is_some());
 
         let directory = fixture();
@@ -734,6 +687,7 @@ mod tests {
         assert_eq!(
             WorkspaceIndex::build(&file_root, WorkspaceIndexLimits::default())
                 .expect_err("file root")
+                .fault()
                 .violation(),
             WorkspaceIndexViolation::InvalidRoot,
         );
@@ -745,6 +699,7 @@ mod tests {
                 WorkspaceIndexLimits::new(1, 1_000, 2_000, 4, 5).expect("limits"),
             )
             .expect_err("file count bound")
+            .fault()
             .violation(),
             WorkspaceIndexViolation::TooManyFiles,
         );
@@ -754,6 +709,7 @@ mod tests {
                 WorkspaceIndexLimits::new(5, 1_000, 8, 4, 5).expect("limits"),
             )
             .expect_err("workspace byte bound")
+            .fault()
             .violation(),
             WorkspaceIndexViolation::WorkspaceTooLarge,
         );
@@ -767,6 +723,7 @@ mod tests {
                 WorkspaceIndexLimits::new(5, 1_000, 2_000, 1, 5).expect("limits"),
             )
             .expect_err("depth bound")
+            .fault()
             .violation(),
             WorkspaceIndexViolation::TooDeep,
         );
@@ -880,13 +837,13 @@ mod tests {
             ),
         ];
         for (violation, message) in cases {
-            assert_eq!(WorkspaceIndexError::new(violation).to_string(), message);
+            assert_eq!(index_error(violation).to_string(), message);
         }
     }
 
     #[test]
     fn test_error_display_appends_offending_path() {
-        let error = WorkspaceIndexError::at(
+        let error = index_error_at(
             WorkspaceIndexViolation::FileTooLarge,
             Path::new("src/big.rs"),
         );
@@ -902,7 +859,10 @@ mod tests {
     #[test]
     fn test_component_identity_failure_surfaces_as_composition_error() {
         let error = component::<(), WorkspaceFiles>("").expect_err("empty component id");
-        assert_eq!(error.violation(), WorkspaceIndexViolation::Composition);
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Composition
+        );
         assert!(std::error::Error::source(&error).is_some());
     }
 
@@ -922,8 +882,11 @@ mod tests {
             &mut bytes,
         )
         .expect_err("syntax byte bound");
-        assert_eq!(syntax_error.violation(), WorkspaceIndexViolation::Syntax);
-        assert_eq!(syntax_error.path(), Some(source_path.as_path()));
+        assert_eq!(
+            syntax_error.fault().violation(),
+            WorkspaceIndexViolation::Syntax
+        );
+        assert_eq!(syntax_error.fault().path(), Some(source_path.as_path()));
         assert!(std::error::Error::source(&syntax_error).is_some());
 
         let parser = RustSyntaxProvider::default();
@@ -931,7 +894,10 @@ mod tests {
         fs::write(&decomposed, "fn accent() {}").expect("decomposed source");
         let path_error = read_file(directory.path(), &decomposed, &parser, limits, &mut bytes)
             .expect_err("non-NFC project path");
-        assert_eq!(path_error.violation(), WorkspaceIndexViolation::InvalidPath);
+        assert_eq!(
+            path_error.fault().violation(),
+            WorkspaceIndexViolation::InvalidPath
+        );
         assert!(std::error::Error::source(&path_error).is_some());
     }
 
@@ -948,8 +914,11 @@ mod tests {
         let unreadable = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
             .expect_err("unreadable directory");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
-        assert_eq!(unreadable.violation(), WorkspaceIndexViolation::Filesystem);
-        assert_eq!(unreadable.path(), Some(locked.as_path()));
+        assert_eq!(
+            unreadable.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert_eq!(unreadable.fault().path(), Some(locked.as_path()));
 
         let unsearchable = root.join("unsearchable");
         fs::create_dir(&unsearchable).expect("unsearchable directory");
@@ -960,9 +929,12 @@ mod tests {
             .expect_err("unsearchable directory");
         fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755))
             .expect("restore search");
-        assert_eq!(stat_error.violation(), WorkspaceIndexViolation::Filesystem);
         assert_eq!(
-            stat_error.path(),
+            stat_error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert_eq!(
+            stat_error.fault().path(),
             Some(unsearchable.join("entry.rs").as_path())
         );
     }
@@ -977,6 +949,7 @@ mod tests {
         assert_eq!(
             read_file(directory.path(), &missing, &parser, limits, &mut bytes)
                 .expect_err("missing source")
+                .fault()
                 .violation(),
             WorkspaceIndexViolation::Filesystem,
         );
@@ -987,6 +960,7 @@ mod tests {
         assert_eq!(
             read_file(directory.path(), &outside_file, &parser, limits, &mut bytes,)
                 .expect_err("outside project path")
+                .fault()
                 .violation(),
             WorkspaceIndexViolation::InvalidPath,
         );
@@ -995,6 +969,7 @@ mod tests {
         assert_eq!(
             WorkspaceIndex::build(directory.path(), limits)
                 .expect_err("invalid source")
+                .fault()
                 .violation(),
             WorkspaceIndexViolation::InvalidSource,
         );
@@ -1009,6 +984,7 @@ mod tests {
                 &mut overflow,
             )
             .expect_err("workspace byte overflow")
+            .fault()
             .violation(),
             WorkspaceIndexViolation::WorkspaceTooLarge,
         );

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rift_core::{ErrorName, RetryDirective};
+use rift_core::ErrorName;
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::error as wire;
 use rift_protocol::read::{
@@ -109,7 +109,7 @@ fn wire_error(error: &ReadError, phase: wire::ErrorPhase) -> wire::ErrorData {
     wire::ErrorData {
         code: wire_code(descriptor.name()),
         message: error.to_string(),
-        retry: wire_retry(descriptor.retry()),
+        retry: descriptor.retry(),
         phase,
         diagnostics: Vec::new(),
         limit: None,
@@ -117,42 +117,13 @@ fn wire_error(error: &ReadError, phase: wire::ErrorPhase) -> wire::ErrorData {
     }
 }
 
-/// Maps a registry identity to its wire code. CLI-only identities never
-/// reach this boundary; they classify as `internal_error` if one ever does.
+/// The wire code for one registry identity. The registry composes the wire
+/// enum, so this is a projection, not a mapping; a CLI-only identity never
+/// reaches this boundary, and classifies as `internal_error` if one does.
 fn wire_code(name: ErrorName) -> wire::ErrorCode {
     match name {
-        ErrorName::InvalidRequest => wire::ErrorCode::InvalidRequest,
-        ErrorName::PermissionDenied => wire::ErrorCode::PermissionDenied,
-        ErrorName::ResourceNotFound => wire::ErrorCode::ResourceNotFound,
-        ErrorName::ContentUnavailable => wire::ErrorCode::ContentUnavailable,
-        ErrorName::CursorInvalid => wire::ErrorCode::CursorInvalid,
-        ErrorName::CursorExpired => wire::ErrorCode::CursorExpired,
-        ErrorName::Cancelled => wire::ErrorCode::Cancelled,
-        ErrorName::LimitExceeded => wire::ErrorCode::LimitExceeded,
-        ErrorName::StorageFailure => wire::ErrorCode::StorageFailure,
-        ErrorName::UnsupportedPath => wire::ErrorCode::UnsupportedPath,
-        ErrorName::TemporarilyUnavailable => wire::ErrorCode::TemporarilyUnavailable,
-        ErrorName::ConfigurationInvalid => wire::ErrorCode::ConfigurationInvalid,
-        ErrorName::CapabilityUnavailable => wire::ErrorCode::CapabilityUnavailable,
-        ErrorName::InternalError
-        | ErrorName::UpdateBinaryInvalid
-        | ErrorName::UpdateReleaseInvalid
-        | ErrorName::UpdateDownloadFailed
-        | ErrorName::UpdateStagingFailed
-        | ErrorName::UpdateChecksumMismatch
-        | ErrorName::UpdateArchiveInvalid
-        | ErrorName::UpdatePublishFailed
-        | ErrorName::UpdateRollbackFailed
-        | ErrorName::ArtifactStale => wire::ErrorCode::InternalError,
-    }
-}
-
-/// Maps registry retry guidance to the wire directive.
-fn wire_retry(retry: RetryDirective) -> wire::RetryDirective {
-    match retry {
-        RetryDirective::Never => wire::RetryDirective::Never,
-        RetryDirective::SameRequest => wire::RetryDirective::SameRequest,
-        RetryDirective::OperatorAction => wire::RetryDirective::OperatorAction,
+        ErrorName::Wire(code) => code,
+        ErrorName::Cli(_) => wire::ErrorCode::InternalError,
     }
 }
 
@@ -162,7 +133,7 @@ fn wire_retry(retry: RetryDirective) -> wire::RetryDirective {
 fn wire_causes(error: &ReadError) -> Vec<wire::ErrorCause> {
     let descriptor = error.descriptor();
     let code = wire_code(descriptor.name());
-    let retry = wire_retry(descriptor.retry());
+    let retry = descriptor.retry();
     let mut causes = Vec::new();
     let mut source = std::error::Error::source(error);
     while let Some(current) = source {
@@ -185,7 +156,7 @@ mod tests {
     use std::fs;
 
     use rift_index::WorkspaceIndexLimits;
-    use rift_server::ReadErrorKind;
+    use rift_server::ReadFault;
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
@@ -218,7 +189,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
         )
         .expect_err("missing root must fail");
-        assert_eq!(error.kind(), ReadErrorKind::Index);
+        assert!(matches!(error.fault(), ReadFault::Index(_)));
     }
 
     #[tokio::test]

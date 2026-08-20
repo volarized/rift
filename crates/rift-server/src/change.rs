@@ -24,7 +24,7 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, RustSource, RustSyntaxLimits, RustSyntaxProvider};
 use sha2::{Digest as _, Sha256};
 
-use crate::read::{ReadError, ReadService, file_id, node_witness};
+use crate::read::{ReadError, ReadFault, ReadService, file_id, node_witness};
 
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
@@ -82,7 +82,7 @@ impl ChangeService {
         params: &ReplaceSymbolParams,
     ) -> Result<ChangeResult, ReadError> {
         if params.region.is_some() {
-            return Err(ReadError::unsupported("region-scoped replacement"));
+            return Err(ReadFault::unsupported("region-scoped replacement"));
         }
         let (path, qualified_name) = parse_symbol_address(&params.symbol.0)?;
         let resolution =
@@ -135,7 +135,7 @@ impl ChangeService {
         params: &ReplaceNodeParams,
     ) -> Result<ChangeResult, ReadError> {
         if params.region.is_some() {
-            return Err(ReadError::unsupported("region-scoped replacement"));
+            return Err(ReadFault::unsupported("region-scoped replacement"));
         }
         let address = parse_node_address(&params.node.0)?;
         let Some(file) = reads.index().file(&address.path) else {
@@ -261,10 +261,10 @@ impl ChangeService {
         plan: ChangePlan,
     ) -> Result<Resolution, ReadError> {
         let Some(file) = reads.index().file(path) else {
-            return Err(ReadError::not_found(path.as_str()));
+            return Err(ReadFault::not_found(path.as_str()));
         };
         let disk = fs::read_to_string(self.root.join(path.as_str()))
-            .map_err(|error| ReadError::storage(path.as_str(), "read", &error))?;
+            .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
         if disk != file.source() {
             return Ok(Resolution::Refused {
                 reason: RefusalReason::UnmetPrecondition,
@@ -311,7 +311,7 @@ impl ChangeService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(file) = reads.index().file(&plan.path) else {
-            return Err(ReadError::not_found(plan.path.as_str()));
+            return Err(ReadFault::not_found(plan.path.as_str()));
         };
         let source = file.source();
         let start = usize::try_from(plan.range.start)
@@ -321,10 +321,10 @@ impl ChangeService {
             .ok()
             .filter(|end| *end <= source.len() && source.is_char_boundary(*end));
         let (Some(start), Some(end)) = (start, end) else {
-            return Err(ReadError::invalid("span", "outside the addressed file"));
+            return Err(ReadFault::invalid("span", "outside the addressed file"));
         };
         if start > end {
-            return Err(ReadError::invalid("span", "start beyond end"));
+            return Err(ReadFault::invalid("span", "start beyond end"));
         }
         let mut next_source = String::with_capacity(source.len() - (end - start) + plan.text.len());
         next_source.push_str(&source[..start]);
@@ -334,10 +334,10 @@ impl ChangeService {
         let absolute = self.root.join(plan.path.as_str());
         let staged = absolute.with_extension("rift-staged");
         fs::write(&staged, &next_source)
-            .map_err(|error| ReadError::storage(plan.path.as_str(), "stage", &error))?;
+            .map_err(|error| ReadFault::storage(plan.path.as_str(), "stage", &error))?;
         if let Err(error) = fs::rename(&staged, &absolute) {
             let _ = fs::remove_file(&staged);
-            return Err(ReadError::storage(plan.path.as_str(), "publish", &error));
+            return Err(ReadFault::storage(plan.path.as_str(), "publish", &error));
         }
         drop(guard);
 
@@ -375,21 +375,22 @@ struct NodeAddress {
 /// Splits `rift://symbol/rust/<path>/<qualified-name>` into its decoded
 /// parts.
 fn parse_symbol_address(address: &str) -> Result<(CoreProjectPath, String), ReadError> {
-    let malformed = || ReadError::invalid("symbol", "not a rift symbol address");
+    let malformed = || ReadFault::invalid("symbol", "not a rift symbol address");
     let remainder = address
         .strip_prefix("rift://symbol/rust/")
         .ok_or_else(malformed)?;
     let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or_else(malformed)?;
     let path = decoded(encoded_path).ok_or_else(malformed)?;
     let qualified_name = decoded(encoded_name).ok_or_else(malformed)?;
-    let path = CoreProjectPath::new(path)
-        .map_err(|error| ReadError::invalid("symbol", error.violation().label()))?;
+    let path = CoreProjectPath::new(path).map_err(|error| {
+        ReadFault::invalid("symbol", rift_core::fault_label(&error.fault().violation()))
+    })?;
     Ok((path, qualified_name))
 }
 
 /// Splits `rift://node/rust/<path>@<start>-<end>#<witness>` into its parts.
 fn parse_node_address(address: &str) -> Result<NodeAddress, ReadError> {
-    let malformed = || ReadError::invalid("node", "not a witnessed rift node address");
+    let malformed = || ReadFault::invalid("node", "not a witnessed rift node address");
     let remainder = address
         .strip_prefix("rift://node/rust/")
         .ok_or_else(malformed)?;
@@ -402,8 +403,9 @@ fn parse_node_address(address: &str) -> Result<NodeAddress, ReadError> {
         return Err(malformed());
     }
     let path = decoded(encoded_path).ok_or_else(malformed)?;
-    let path = CoreProjectPath::new(path)
-        .map_err(|error| ReadError::invalid("node", error.violation().label()))?;
+    let path = CoreProjectPath::new(path).map_err(|error| {
+        ReadFault::invalid("node", rift_core::fault_label(&error.fault().violation()))
+    })?;
     Ok(NodeAddress {
         path,
         range: ByteRange { start, end },

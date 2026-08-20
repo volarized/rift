@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use rift_core::{ErrorDescriptor, ErrorName, ErrorRegistry};
+use rift_core::{ErrorCode, ErrorDescriptor, ErrorName};
 use serde_json::json;
 
 use crate::RiftMcp;
@@ -151,12 +151,14 @@ impl ExportError {
     pub fn descriptor(&self) -> ErrorDescriptor {
         match self {
             Self::UnknownFlag { .. } | Self::ExtraArgument { .. } => {
-                ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+                ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
             }
             Self::CheckUnreadable { .. } | Self::WriteFailed { .. } => {
-                ErrorRegistry::descriptor(ErrorName::StorageFailure)
+                ErrorName::Wire(ErrorCode::StorageFailure).descriptor()
             }
-            Self::CheckMismatch { .. } => ErrorRegistry::descriptor(ErrorName::ArtifactStale),
+            Self::CheckMismatch { .. } => {
+                ErrorName::Cli(rift_core::CliCode::ArtifactStale).descriptor()
+            }
         }
     }
 }
