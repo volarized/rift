@@ -5,7 +5,7 @@ mod composition;
 pub use composition::{
     CacheError, CacheUpdate, CacheViolation, Component, CompositionBuilder, CompositionEditor,
     CompositionError, CompositionErrorKind, CompositionScope, Flow, FlowCardinality, JoinCoverage,
-    JoinItem, KeyJoinPolicy, KeyedFlow, MissingSide, PerKeyCache, ProviderComposition,
+    JoinItem, JoinSides, KeyJoinPolicy, KeyedFlow, MissingSide, PerKeyCache, ProviderComposition,
     StageDescriptor, StagePath, join_keyed,
 };
 

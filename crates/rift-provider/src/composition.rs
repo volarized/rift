@@ -927,28 +927,45 @@ pub struct JoinCoverage<K, L, R> {
     pub missing: Vec<(K, MissingSide)>,
 }
 
+/// Both keyed inputs of one join, named by side.
+#[derive(Debug)]
+pub struct JoinSides<'a, K, L, R> {
+    /// Left keyed input.
+    pub left: &'a BTreeMap<K, L>,
+    /// Right keyed input.
+    pub right: &'a BTreeMap<K, R>,
+}
+
+impl<K, L, R> Copy for JoinSides<'_, K, L, R> {}
+
+impl<K, L, R> Clone for JoinSides<'_, K, L, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 /// Aligns keyed values without silently dropping missing-item coverage.
 #[must_use]
 pub fn join_keyed<K, L, R>(
     policy: KeyJoinPolicy,
-    left: &BTreeMap<K, L>,
-    right: &BTreeMap<K, R>,
+    sides: JoinSides<'_, K, L, R>,
 ) -> JoinCoverage<K, L, R>
 where
     K: Clone + Ord,
     L: Clone,
     R: Clone,
 {
-    let keys = left
+    let keys = sides
+        .left
         .keys()
-        .chain(right.keys())
+        .chain(sides.right.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut items = BTreeMap::new();
     let mut missing = Vec::new();
     for key in keys {
-        let left_value = left.get(&key).cloned();
-        let right_value = right.get(&key).cloned();
+        let left_value = sides.left.get(&key).cloned();
+        let right_value = sides.right.get(&key).cloned();
         if left_value.is_none() {
             missing.push((key.clone(), MissingSide::Left));
         }
@@ -1206,7 +1223,13 @@ mod tests {
             (KeyJoinPolicy::Left, vec![1, 2]),
             (KeyJoinPolicy::Union, vec![1, 2, 3]),
         ] {
-            let joined = join_keyed(policy, &left, &right);
+            let joined = join_keyed(
+                policy,
+                JoinSides {
+                    left: &left,
+                    right: &right,
+                },
+            );
             assert_eq!(
                 joined.items.keys().copied().collect::<Vec<_>>(),
                 expected_keys
