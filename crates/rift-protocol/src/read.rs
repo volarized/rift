@@ -39,17 +39,17 @@ pub struct CoChange {
 
 /// State tag carried by a complete coverage claim.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CoverageCompleteState {
     /// Wire value `complete`.
-    #[serde(rename = "complete")]
     Complete,
 }
 
 /// State tag carried by a partial coverage claim.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CoveragePartialState {
     /// Wire value `partial`.
-    #[serde(rename = "partial")]
     Partial,
 }
 
@@ -106,33 +106,28 @@ pub enum Coverage {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum CoverageReach {
     /// Wire value `request`.
-    #[serde(rename = "request")]
     Request,
     /// Wire value `project`.
-    #[serde(rename = "project")]
     Project,
     /// Wire value `dependencies`.
-    #[serde(rename = "dependencies")]
     Dependencies,
     /// Wire value `all`.
-    #[serde(rename = "all")]
     All,
 }
 
 /// What a completeness statement covers — everything the request asked for, one file, or a
 /// standing scope the answer holds over.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum CoverageScope {
-    #[serde(rename = "reach")]
     /// A standing scope identified by its name.
     Reach {
         /// How far the claim reaches.
         reach: CoverageReach,
     },
-    #[serde(rename = "unit")]
     /// One file. The claim holds for that path and says nothing about any other.
     Unit {
         /// The file the claim is about.
@@ -145,12 +140,11 @@ pub enum CoverageScope {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum CoverageStateState {
     /// Wire value `unsupported`.
-    #[serde(rename = "unsupported")]
     Unsupported,
     /// Wire value `not_applicable`.
-    #[serde(rename = "not_applicable")]
     NotApplicable,
 }
 
@@ -236,15 +230,13 @@ pub struct DiagnosticContext {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticContextSource {
     /// Wire value `provider`.
-    #[serde(rename = "provider")]
     Provider,
     /// Wire value `hook`.
-    #[serde(rename = "hook")]
     Hook,
     /// Wire value `apply`.
-    #[serde(rename = "apply")]
     Apply,
 }
 
@@ -253,15 +245,13 @@ pub enum DiagnosticContextSource {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticContinuation {
     /// Wire value `repairable`.
-    #[serde(rename = "repairable")]
     Repairable,
     /// Wire value `unrepairable`.
-    #[serde(rename = "unrepairable")]
     Unrepairable,
     /// Wire value `unknown`.
-    #[serde(rename = "unknown")]
     Unknown,
 }
 
@@ -282,12 +272,11 @@ pub struct DiagnosticRelated {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticReliability {
     /// Wire value `reliable`.
-    #[serde(rename = "reliable")]
     Reliable,
     /// Wire value `recovered`.
-    #[serde(rename = "recovered")]
     Recovered,
 }
 
@@ -296,12 +285,11 @@ pub enum DiagnosticReliability {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticTag {
     /// Wire value `deprecated`.
-    #[serde(rename = "deprecated")]
     Deprecated,
     /// Wire value `unnecessary`.
-    #[serde(rename = "unnecessary")]
     Unnecessary,
 }
 
@@ -328,12 +316,11 @@ pub struct Documentation {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DocumentationFormat {
     /// Wire value `plain`.
-    #[serde(rename = "plain")]
     Plain,
     /// Wire value `markdown`.
-    #[serde(rename = "markdown")]
     Markdown,
 }
 
@@ -393,24 +380,19 @@ pub struct Extensions(pub BTreeMap<ExtensionKey, ExtensionValue>);
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum FactFamily {
     /// Wire value `symbols`.
-    #[serde(rename = "symbols")]
     Symbols,
     /// Wire value `nodes`.
-    #[serde(rename = "nodes")]
     Nodes,
     /// Wire value `relationships`.
-    #[serde(rename = "relationships")]
     Relationships,
     /// Wire value `types`.
-    #[serde(rename = "types")]
     Types,
     /// Wire value `diagnostics`.
-    #[serde(rename = "diagnostics")]
     Diagnostics,
     /// Wire value `history`.
-    #[serde(rename = "history")]
     History,
 }
 
@@ -441,39 +423,29 @@ pub struct FieldFilter {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum FieldFilterOp {
     /// Wire value `eq`.
-    #[serde(rename = "eq")]
     Eq,
     /// Wire value `ne`.
-    #[serde(rename = "ne")]
     Ne,
     /// Wire value `in`.
-    #[serde(rename = "in")]
     In,
     /// Wire value `contains`.
-    #[serde(rename = "contains")]
     Contains,
     /// Wire value `prefix`.
-    #[serde(rename = "prefix")]
     Prefix,
     /// Wire value `regex`.
-    #[serde(rename = "regex")]
     Regex,
     /// Wire value `gt`.
-    #[serde(rename = "gt")]
     Gt,
     /// Wire value `gte`.
-    #[serde(rename = "gte")]
     Gte,
     /// Wire value `lt`.
-    #[serde(rename = "lt")]
     Lt,
     /// Wire value `lte`.
-    #[serde(rename = "lte")]
     Lte,
     /// Wire value `exists`.
-    #[serde(rename = "exists")]
     Exists,
 }
 
@@ -501,9 +473,8 @@ pub struct File {
 
 /// The bytes of a regular file or the target of a symbolic link.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum FileContent {
-    #[serde(rename = "regular")]
     /// A physical or generated file with bytes in it. Every node and symbol with readable
     /// source comes from this kind.
     Regular {
@@ -513,7 +484,6 @@ pub enum FileContent {
         /// Whether the file is executable.
         executable: bool,
     },
-    #[serde(rename = "symlink")]
     /// A symbolic link whose target is carried as canonical base64.
     Symlink {
         /// Canonical padded base64 of the raw target bytes. Rift does not follow the
@@ -543,39 +513,33 @@ pub struct FileId(
 
 /// A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum Filter {
-    #[serde(rename = "field")]
     /// A test on one field of the entity.
     Field {
         /// The field and the comparison.
         field: FieldFilter,
     },
-    #[serde(rename = "relation")]
     /// A test on the edges the entity has.
     Relation {
         /// The edges to look for, and what they must reach.
         relation: Box<RelationFilter>,
     },
-    #[serde(rename = "all")]
     /// Conjunction: every member has to hold.
     All {
         /// The filters that must all hold.
         all: Vec<Filter>,
     },
-    #[serde(rename = "any")]
     /// Disjunction: at least one member has to hold.
     Any {
         /// The filters, of which one is enough.
         any: Vec<Filter>,
     },
-    #[serde(rename = "not")]
     /// Negation of what it holds.
     Not {
         /// The filter being negated.
         not: Box<Filter>,
     },
-    #[serde(rename = "element")]
     /// A test on one entry of a list the entity holds.
     Element {
         /// The list to walk, and what one of its entries has to satisfy.
@@ -587,12 +551,11 @@ pub enum Filter {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum Freshness {
     /// Wire value `current`.
-    #[serde(rename = "current")]
     Current,
     /// Wire value `stale`.
-    #[serde(rename = "stale")]
     Stale,
 }
 
@@ -705,12 +668,11 @@ pub struct GraphHop {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum HopDirection {
     /// Wire value `outgoing`.
-    #[serde(rename = "outgoing")]
     Outgoing,
     /// Wire value `incoming`.
-    #[serde(rename = "incoming")]
     Incoming,
 }
 
@@ -762,24 +724,19 @@ pub struct LanguageRegion {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum MatchedField {
     /// Wire value `name`.
-    #[serde(rename = "name")]
     Name,
     /// Wire value `signature`.
-    #[serde(rename = "signature")]
     Signature,
     /// Wire value `documentation`.
-    #[serde(rename = "documentation")]
     Documentation,
     /// Wire value `content`.
-    #[serde(rename = "content")]
     Content,
     /// Wire value `path`.
-    #[serde(rename = "path")]
     Path,
     /// Wire value `relationship`.
-    #[serde(rename = "relationship")]
     Relationship,
 }
 
@@ -824,60 +781,43 @@ pub struct Node {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum NodeFacet {
     /// Wire value `declaration`.
-    #[serde(rename = "declaration")]
     Declaration,
     /// Wire value `definition`.
-    #[serde(rename = "definition")]
     Definition,
     /// Wire value `body`.
-    #[serde(rename = "body")]
     Body,
     /// Wire value `block`.
-    #[serde(rename = "block")]
     Block,
     /// Wire value `statement`.
-    #[serde(rename = "statement")]
     Statement,
     /// Wire value `expression`.
-    #[serde(rename = "expression")]
     Expression,
     /// Wire value `type_expression`.
-    #[serde(rename = "type_expression")]
     TypeExpression,
     /// Wire value `import`.
-    #[serde(rename = "import")]
     Import,
     /// Wire value `export`.
-    #[serde(rename = "export")]
     Export,
     /// Wire value `parameter`.
-    #[serde(rename = "parameter")]
     Parameter,
     /// Wire value `argument`.
-    #[serde(rename = "argument")]
     Argument,
     /// Wire value `annotation`.
-    #[serde(rename = "annotation")]
     Annotation,
     /// Wire value `comment`.
-    #[serde(rename = "comment")]
     Comment,
     /// Wire value `identifier`.
-    #[serde(rename = "identifier")]
     Identifier,
     /// Wire value `literal`.
-    #[serde(rename = "literal")]
     Literal,
     /// Wire value `pattern`.
-    #[serde(rename = "pattern")]
     Pattern,
     /// Wire value `generated`.
-    #[serde(rename = "generated")]
     Generated,
     /// Wire value `test`.
-    #[serde(rename = "test")]
     Test,
 }
 
@@ -1083,27 +1023,21 @@ pub struct ReadSnapshot {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RegionRole {
     /// Wire value `selection`.
-    #[serde(rename = "selection")]
     Selection,
     /// Wire value `name`.
-    #[serde(rename = "name")]
     Name,
     /// Wire value `header`.
-    #[serde(rename = "header")]
     Header,
     /// Wire value `body`.
-    #[serde(rename = "body")]
     Body,
     /// Wire value `content`.
-    #[serde(rename = "content")]
     Content,
     /// Wire value `documentation`.
-    #[serde(rename = "documentation")]
     Documentation,
     /// Wire value `enclosing`.
-    #[serde(rename = "enclosing")]
     Enclosing,
 }
 
@@ -1145,15 +1079,13 @@ pub struct RelationFilter {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RelationFilterDirection {
     /// Wire value `outgoing`.
-    #[serde(rename = "outgoing")]
     Outgoing,
     /// Wire value `incoming`.
-    #[serde(rename = "incoming")]
     Incoming,
     /// Wire value `either`.
-    #[serde(rename = "either")]
     Either,
 }
 
@@ -1161,12 +1093,11 @@ pub enum RelationFilterDirection {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RelationFilterQuantifier {
     /// Wire value `exists`.
-    #[serde(rename = "exists")]
     Exists,
     /// Wire value `not_exists`.
-    #[serde(rename = "not_exists")]
     NotExists,
 }
 
@@ -1206,15 +1137,13 @@ pub struct Relationship {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RelationshipDerivation {
     /// Wire value `resolution`.
-    #[serde(rename = "resolution")]
     Resolution,
     /// Wire value `syntax`.
-    #[serde(rename = "syntax")]
     Syntax,
     /// Wire value `heuristic`.
-    #[serde(rename = "heuristic")]
     Heuristic,
 }
 
@@ -1223,93 +1152,65 @@ pub enum RelationshipDerivation {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum RelationshipFacet {
     /// Wire value `contains`.
-    #[serde(rename = "contains")]
     Contains,
     /// Wire value `declares`.
-    #[serde(rename = "declares")]
     Declares,
     /// Wire value `augments`.
-    #[serde(rename = "augments")]
     Augments,
     /// Wire value `references`.
-    #[serde(rename = "references")]
     References,
     /// Wire value `calls`.
-    #[serde(rename = "calls")]
     Calls,
     /// Wire value `constructs`.
-    #[serde(rename = "constructs")]
     Constructs,
     /// Wire value `reads`.
-    #[serde(rename = "reads")]
     Reads,
     /// Wire value `writes`.
-    #[serde(rename = "writes")]
     Writes,
     /// Wire value `imports`.
-    #[serde(rename = "imports")]
     Imports,
     /// Wire value `exports`.
-    #[serde(rename = "exports")]
     Exports,
     /// Wire value `extends`.
-    #[serde(rename = "extends")]
     Extends,
     /// Wire value `implements`.
-    #[serde(rename = "implements")]
     Implements,
     /// Wire value `has_type`.
-    #[serde(rename = "has_type")]
     HasType,
     /// Wire value `overrides`.
-    #[serde(rename = "overrides")]
     Overrides,
     /// Wire value `aliases`.
-    #[serde(rename = "aliases")]
     Aliases,
     /// Wire value `generates`.
-    #[serde(rename = "generates")]
     Generates,
     /// Wire value `depends_on`.
-    #[serde(rename = "depends_on")]
     DependsOn,
     /// Wire value `annotated_by`.
-    #[serde(rename = "annotated_by")]
     AnnotatedBy,
     /// Wire value `throws`.
-    #[serde(rename = "throws")]
     Throws,
     /// Wire value `catches`.
-    #[serde(rename = "catches")]
     Catches,
     /// Wire value `bounded_by`.
-    #[serde(rename = "bounded_by")]
     BoundedBy,
     /// Wire value `instantiates`.
-    #[serde(rename = "instantiates")]
     Instantiates,
     /// Wire value `specializes`.
-    #[serde(rename = "specializes")]
     Specializes,
     /// Wire value `overloads`.
-    #[serde(rename = "overloads")]
     Overloads,
     /// Wire value `mixes_in`.
-    #[serde(rename = "mixes_in")]
     MixesIn,
     /// Wire value `embeds`.
-    #[serde(rename = "embeds")]
     Embeds,
     /// Wire value `tests`.
-    #[serde(rename = "tests")]
     Tests,
     /// Wire value `configures`.
-    #[serde(rename = "configures")]
     Configures,
     /// Wire value `binds`.
-    #[serde(rename = "binds")]
     Binds,
 }
 
@@ -1319,15 +1220,13 @@ pub enum RelationshipFacet {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum ResultOrder {
     /// Wire value `relevance`.
-    #[serde(rename = "relevance")]
     Relevance,
     /// Wire value `path`.
-    #[serde(rename = "path")]
     Path,
     /// Wire value `identity`.
-    #[serde(rename = "identity")]
     Identity,
 }
 
@@ -1384,22 +1283,19 @@ pub struct SearchHit {
 
 /// What a search hit is. Tagged, so the payload correlation survives code generation.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "target", deny_unknown_fields)]
+#[serde(tag = "target", deny_unknown_fields, rename_all = "snake_case")]
 pub enum SearchHitTarget {
-    #[serde(rename = "symbol")]
     /// A symbol hit: the declaration a provider resolved.
     Symbol {
         /// The declaration that matched.
         symbol: Symbol,
     },
-    #[serde(rename = "node")]
     /// A node hit: one place in a syntax tree, without its enclosing symbol record.
     Node {
         /// The syntax-tree node that matched, and the symbol written at it where there is
         /// one.
         node: Node,
     },
-    #[serde(rename = "file")]
     /// A file hit: one entry of the tree, whether or not any provider reads it.
     File {
         /// The tree entry that matched: what it holds, and which languages read it.
@@ -1412,18 +1308,15 @@ pub enum SearchHitTarget {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SearchInclude {
     /// Wire value `source`.
-    #[serde(rename = "source")]
     Source,
     /// Wire value `signature`.
-    #[serde(rename = "signature")]
     Signature,
     /// Wire value `relationships`.
-    #[serde(rename = "relationships")]
     Relationships,
     /// Wire value `diagnostics`.
-    #[serde(rename = "diagnostics")]
     Diagnostics,
 }
 
@@ -1432,18 +1325,15 @@ pub enum SearchInclude {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SearchIntent {
     /// Wire value `trace`.
-    #[serde(rename = "trace")]
     Trace,
     /// Wire value `find_tests`.
-    #[serde(rename = "find_tests")]
     FindTests,
     /// Wire value `edit_ripple`.
-    #[serde(rename = "edit_ripple")]
     EditRipple,
     /// Wire value `review_context`.
-    #[serde(rename = "review_context")]
     ReviewContext,
 }
 
@@ -1522,18 +1412,15 @@ fn default_search_params_scope() -> SearchScope {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SearchParamsTarget {
     /// Wire value `symbol`.
-    #[serde(rename = "symbol")]
     Symbol,
     /// Wire value `node`.
-    #[serde(rename = "node")]
     Node,
     /// Wire value `file`.
-    #[serde(rename = "file")]
     File,
     /// Wire value `all`.
-    #[serde(rename = "all")]
     All,
 }
 
@@ -1559,15 +1446,13 @@ pub struct SearchResult {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SearchScope {
     /// Wire value `project`.
-    #[serde(rename = "project")]
     Project,
     /// Wire value `dependencies`.
-    #[serde(rename = "dependencies")]
     Dependencies,
     /// Wire value `all`.
-    #[serde(rename = "all")]
     All,
 }
 
@@ -1622,18 +1507,15 @@ pub struct SemanticCoverage(pub BTreeMap<FactFamily, Coverage>);
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum Severity {
     /// Wire value `error`.
-    #[serde(rename = "error")]
     Error,
     /// Wire value `warning`.
-    #[serde(rename = "warning")]
     Warning,
     /// Wire value `info`.
-    #[serde(rename = "info")]
     Info,
     /// Wire value `hint`.
-    #[serde(rename = "hint")]
     Hint,
 }
 
@@ -1699,24 +1581,21 @@ pub struct SourceExcerpt {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// Wire value `authored`.
-    #[serde(rename = "authored")]
     Authored,
     /// Wire value `generated`.
-    #[serde(rename = "generated")]
     Generated,
     /// Wire value `synthetic`.
-    #[serde(rename = "synthetic")]
     Synthetic,
 }
 
 /// Where source belongs. Package ownership is separate from whether source was authored or
 /// generated.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum SourceLocation {
-    #[serde(rename = "project")]
     /// Source owned by the current workspace.
     Project {
         /// Local package that owns the source, or null when no package manifest assigns
@@ -1724,16 +1603,13 @@ pub enum SourceLocation {
         #[serde(default)]
         package: Option<PackageIdentity>,
     },
-    #[serde(rename = "dependency")]
     /// Source owned by one resolved dependency.
     Dependency {
         /// Resolved dependency that owns the source.
         package: PackageIdentity,
     },
-    #[serde(rename = "stdlib")]
     /// Source installed with the language toolchain.
     Stdlib {},
-    #[serde(rename = "external")]
     /// Source outside the project, dependency graph, and standard library.
     External {},
 }
@@ -1828,96 +1704,67 @@ pub struct Symbol {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SymbolFacet {
     /// Wire value `namespace`.
-    #[serde(rename = "namespace")]
     Namespace,
     /// Wire value `module`.
-    #[serde(rename = "module")]
     Module,
     /// Wire value `type`.
-    #[serde(rename = "type")]
     Type,
     /// Wire value `value`.
-    #[serde(rename = "value")]
     Value,
     /// Wire value `callable`.
-    #[serde(rename = "callable")]
     Callable,
     /// Wire value `member`.
-    #[serde(rename = "member")]
     Member,
     /// Wire value `member_container`.
-    #[serde(rename = "member_container")]
     MemberContainer,
     /// Wire value `parameter`.
-    #[serde(rename = "parameter")]
     Parameter,
     /// Wire value `type_parameter`.
-    #[serde(rename = "type_parameter")]
     TypeParameter,
     /// Wire value `constructible`.
-    #[serde(rename = "constructible")]
     Constructible,
     /// Wire value `extensible`.
-    #[serde(rename = "extensible")]
     Extensible,
     /// Wire value `implementable`.
-    #[serde(rename = "implementable")]
     Implementable,
     /// Wire value `macro`.
-    #[serde(rename = "macro")]
     Macro,
     /// Wire value `test`.
-    #[serde(rename = "test")]
     Test,
     /// Wire value `annotation`.
-    #[serde(rename = "annotation")]
     Annotation,
     /// Wire value `extension`.
-    #[serde(rename = "extension")]
     Extension,
     /// Wire value `variant`.
-    #[serde(rename = "variant")]
     Variant,
     /// Wire value `enumeration`.
-    #[serde(rename = "enumeration")]
     Enumeration,
     /// Wire value `alias`.
-    #[serde(rename = "alias")]
     Alias,
     /// Wire value `property`.
-    #[serde(rename = "property")]
     Property,
     /// Wire value `abstract`.
-    #[serde(rename = "abstract")]
     Abstract,
     /// Wire value `constructor`.
-    #[serde(rename = "constructor")]
     Constructor,
     /// Wire value `static`.
-    #[serde(rename = "static")]
     Static,
     /// Wire value `mutable`.
-    #[serde(rename = "mutable")]
     Mutable,
     /// Wire value `public`.
-    #[serde(rename = "public")]
     Public,
     /// Wire value `deprecated`.
-    #[serde(rename = "deprecated")]
     Deprecated,
     /// Wire value `entrypoint`.
-    #[serde(rename = "entrypoint")]
     Entrypoint,
     /// Wire value `operator`.
-    #[serde(rename = "operator")]
     Operator,
     /// Wire value `async`.
-    #[serde(rename = "async")]
     Async,
     /// Wire value `generator`.
-    #[serde(rename = "generator")]
     Generator,
 }
 
@@ -1994,32 +1841,27 @@ pub struct SymbolVersion {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum SymbolVersionKind {
     /// Wire value `introduced`.
-    #[serde(rename = "introduced")]
     Introduced,
     /// Wire value `body_changed`.
-    #[serde(rename = "body_changed")]
     BodyChanged,
     /// Wire value `signature_changed`.
-    #[serde(rename = "signature_changed")]
     SignatureChanged,
     /// Wire value `moved`.
-    #[serde(rename = "moved")]
     Moved,
     /// Wire value `removed`.
-    #[serde(rename = "removed")]
     Removed,
     /// Wire value `decorators_changed`.
-    #[serde(rename = "decorators_changed")]
     DecoratorsChanged,
 }
 
 /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
 /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
 /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
-/// another, so that `end` is never below `start` is asserted by the conformance tests
-/// instead.
+/// another, so that `end` is never below `start` is asserted by the surface
+/// validation tests instead.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextRange {
@@ -2036,15 +1878,13 @@ pub struct TextRange {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum TraversalDirection {
     /// Wire value `outgoing`.
-    #[serde(rename = "outgoing")]
     Outgoing,
     /// Wire value `incoming`.
-    #[serde(rename = "incoming")]
     Incoming,
     /// Wire value `both`.
-    #[serde(rename = "both")]
     Both,
 }
 
@@ -2065,15 +1905,13 @@ pub struct TypeBinding {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum TypeBindingOrigin {
     /// Wire value `declared`.
-    #[serde(rename = "declared")]
     Declared,
     /// Wire value `inferred`.
-    #[serde(rename = "inferred")]
     Inferred,
     /// Wire value `expected`.
-    #[serde(rename = "expected")]
     Expected,
 }
 
@@ -2081,42 +1919,31 @@ pub enum TypeBindingOrigin {
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum TypeBindingRole {
     /// Wire value `receiver`.
-    #[serde(rename = "receiver")]
     Receiver,
     /// Wire value `parameter`.
-    #[serde(rename = "parameter")]
     Parameter,
     /// Wire value `return`.
-    #[serde(rename = "return")]
     Return,
     /// Wire value `field`.
-    #[serde(rename = "field")]
     Field,
     /// Wire value `bound`.
-    #[serde(rename = "bound")]
     Bound,
     /// Wire value `element`.
-    #[serde(rename = "element")]
     Element,
     /// Wire value `key`.
-    #[serde(rename = "key")]
     Key,
     /// Wire value `error`.
-    #[serde(rename = "error")]
     Error,
     /// Wire value `underlying`.
-    #[serde(rename = "underlying")]
     Underlying,
     /// Wire value `yielded`.
-    #[serde(rename = "yielded")]
     Yielded,
     /// Wire value `awaited`.
-    #[serde(rename = "awaited")]
     Awaited,
     /// Wire value `discriminant`.
-    #[serde(rename = "discriminant")]
     Discriminant,
 }
 

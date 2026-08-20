@@ -1,58 +1,20 @@
-//! Contract between the workspace error registry and the wire error surface.
-//!
-//! The registry in `rift-core` owns every stable code; the `ErrorCode` enum
-//! in `rift-protocol` owns what the wire admits. The MCP layer is where the
-//! two meet, so this suite holds them to one set of codes.
+//! The served wire errors, validated against the advertised `ErrorData`
+//! schema through a live client. Registry-wire agreement needs no test here:
+//! the registry composes the wire `ErrorCode` enum directly, so the two
+//! cannot name different code sets.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 
-use rift_core::ErrorRegistry;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
-use rift_protocol::error::{ErrorCode, ErrorData};
+use rift_protocol::error::ErrorData;
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use schemars::schema_for;
 use serde_json::json;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-
-#[test]
-fn every_wire_code_has_a_registry_entry_and_cli_codes_stay_off_the_wire() {
-    let registry: BTreeSet<&str> = ErrorRegistry::entries()
-        .iter()
-        .map(|descriptor| descriptor.code())
-        .collect();
-    let schema = serde_json::to_value(schema_for!(ErrorCode)).expect("ErrorCode schema serializes");
-    let wire: BTreeSet<String> = schema["oneOf"]
-        .as_array()
-        .expect("ErrorCode schema must list its values under oneOf")
-        .iter()
-        .map(|value| {
-            value["const"]
-                .as_str()
-                .expect("wire codes are strings")
-                .to_owned()
-        })
-        .collect();
-    for code in &wire {
-        assert!(
-            registry.contains(code.as_str()),
-            "wire code {code} has no registry entry; add it to the registry \
-             in the same change that puts it on the wire"
-        );
-    }
-    for code in registry {
-        assert!(
-            wire.contains(code) || code.starts_with("update_") || code == "artifact_stale",
-            "registry code {code} is neither on the wire nor in the CLI-only \
-             namespace (`update_*`, `artifact_stale`); put it on the wire or \
-             name its surface"
-        );
-    }
-}
 
 #[tokio::test]
 async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResult {

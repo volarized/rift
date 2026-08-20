@@ -3,10 +3,10 @@
 mod composition;
 
 pub use composition::{
-    CacheError, CacheUpdate, CacheViolation, Component, CompositionBuilder, CompositionEditor,
-    CompositionError, CompositionErrorKind, CompositionScope, Flow, FlowCardinality, JoinCoverage,
-    JoinItem, JoinSides, KeyJoinPolicy, KeyedFlow, MissingSide, PerKeyCache, ProviderComposition,
-    StageDescriptor, StagePath, join_keyed,
+    CacheError, CacheFault, CacheUpdate, CacheViolation, Component, CompositionBuilder,
+    CompositionEditor, CompositionError, CompositionFault, CompositionScope, Flow, FlowCardinality,
+    JoinCoverage, JoinItem, JoinSides, KeyJoinPolicy, KeyedFlow, MissingSide, PerKeyCache,
+    ProviderComposition, StageDescriptor, StagePath, join_keyed,
 };
 
 /// Compile-time marker for provider-layer ownership.

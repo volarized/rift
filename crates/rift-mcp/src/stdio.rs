@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::Path;
 
-use rift_core::{ErrorDescriptor, ErrorName, ErrorRegistry};
+use rift_core::{ErrorCode, ErrorDescriptor, ErrorName};
 use rift_index::WorkspaceIndexLimits;
 use rift_server::ReadError;
 use rmcp::service::{QuitReason, ServerInitializeError};
@@ -56,9 +56,9 @@ impl StdioServeError {
     pub fn descriptor(&self) -> ErrorDescriptor {
         match self {
             Self::Read(source) => source.descriptor(),
-            Self::Initialize(_) => ErrorRegistry::descriptor(ErrorName::TemporarilyUnavailable),
+            Self::Initialize(_) => ErrorName::Wire(ErrorCode::TemporarilyUnavailable).descriptor(),
             Self::Task(_) | Self::UnexpectedQuit => {
-                ErrorRegistry::descriptor(ErrorName::InternalError)
+                ErrorName::Wire(ErrorCode::InternalError).descriptor()
             }
         }
     }
