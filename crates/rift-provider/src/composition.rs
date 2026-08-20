@@ -576,20 +576,7 @@ impl CompositionEditor {
                 new_path,
             )));
         }
-        for node in &mut self.nodes {
-            for input in &mut node.inputs {
-                if *input == index {
-                    *input = index + 1;
-                } else if *input > index {
-                    *input += 1;
-                }
-            }
-        }
-        if self.output == index {
-            self.output = index + 1;
-        } else if self.output > index {
-            self.output += 1;
-        }
+        self.remap_stage_references(|stage| if stage >= index { stage + 1 } else { stage });
         self.nodes.insert(
             index + 1,
             StageNode {
@@ -639,16 +626,7 @@ impl CompositionEditor {
             )));
         }
         self.nodes.remove(index);
-        for node in &mut self.nodes {
-            for input in &mut node.inputs {
-                if *input > index {
-                    *input -= 1;
-                }
-            }
-        }
-        if self.output > index {
-            self.output -= 1;
-        }
+        self.remap_stage_references(|stage| if stage > index { stage - 1 } else { stage });
         Ok(())
     }
 
@@ -665,6 +643,17 @@ impl CompositionEditor {
             .ok_or_else(|| {
                 CompositionError::new(CompositionErrorKind::StageNotFound(StagePath(path.into())))
             })
+    }
+
+    // Every stage index lives in node inputs and the output selector; one remap
+    // keeps both consistent when insertion or removal shifts positions.
+    fn remap_stage_references(&mut self, remap: impl Fn(usize) -> usize) {
+        for node in &mut self.nodes {
+            for input in &mut node.inputs {
+                *input = remap(*input);
+            }
+        }
+        self.output = remap(self.output);
     }
 }
 
