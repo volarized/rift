@@ -24,27 +24,25 @@ Windows PowerShell:
 irm https://volar.sh/rift/install.ps1 | iex
 ```
 
-Each installer resolves the latest release, selects a native x86-64 or Arm64 archive, and verifies
-its SHA-256 checksum before installing `rift` for the current user. Set `RIFT_VERSION` to a release
-tag to install that release explicitly.
+The installer downloads the latest verified release for your platform and installs it for the
+current user. To install a specific version, set the `RIFT_VERSION` environment variable to its
+release tag.
 
 ## MCP configuration
 
-An MCP client launches `rift mcp` in the folder containing the codebase. This repository includes
-the following `.mcp.json` configuration:
+An MCP client launches `rift mcp` in the folder containing the codebase. Register it in the
+client's MCP configuration — for Claude Code, `.mcp.json` in the project root:
 
 ```json
 {
   "mcpServers": {
     "rift": {
-      "command": "cargo",
-      "args": ["run", "--quiet", "--", "mcp"]
+      "command": "rift",
+      "args": ["mcp"]
     }
   }
 }
 ```
-
-Use `"command": "rift"` and `"args": ["mcp"]` after installing the release binary.
 
 ## Rust index
 
@@ -66,8 +64,8 @@ The MCP server advertises these read tools:
 rift update
 ```
 
-The command downloads latest checksummed native release into a temporary staging directory,
-validates its version, then replaces current executable. Unix uses a same-folder atomic rename;
+The command downloads the latest checksummed native release into a temporary staging directory,
+validates its version, then replaces the current executable. Unix uses a same-folder atomic rename;
 Windows keeps a rollback binary until replacement starts.
 
 ## CLI
