@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::path::Path;
 
+use data_encoding::BASE32_NOPAD;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_core::ProjectPath as CoreProjectPath;
+use rift_core::constants::{
+    RUST_READ_PROVIDER_ID, SEARCH_RESULTS_DEFAULT, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS,
+};
 use rift_index::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits,
@@ -18,9 +23,6 @@ use rift_protocol::read::{
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
-
-const SEARCH_LIMIT_DEFAULT: usize = 20;
-const PROVIDER: &str = "rift.rust.read";
 
 /// Stable read-service failure classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +202,7 @@ impl ReadService {
                 "search query is empty",
             ));
         }
-        let limit = usize::try_from(params.limit.unwrap_or(SEARCH_LIMIT_DEFAULT as u64))
+        let limit = usize::try_from(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))
             .map_err(|_| ReadError::new(ReadErrorKind::Invalid, "result limit is invalid"))?;
         let mut results = Vec::new();
         if matches!(
@@ -432,7 +434,10 @@ fn file_id(file: &IndexedFile) -> FileId {
 
 fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
     let digest = Sha256::digest(file.path().as_str().as_bytes());
-    SourceUnitId(format!("rift://source/src_{}", base32_130(&digest)))
+    SourceUnitId(format!(
+        "rift://source/src_{}",
+        digest_prefix_base32(&digest)
+    ))
 }
 
 fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
@@ -477,46 +482,53 @@ fn workspace_digest(index: &WorkspaceIndex) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn base32_130(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut output = String::with_capacity(26);
-    let mut accumulator = 0_u32;
-    let mut bits = 0_u8;
-    for byte in bytes.iter().copied() {
-        accumulator = (accumulator << 8) | u32::from(byte);
-        bits += 8;
-        while bits >= 5 && output.len() < 26 {
-            bits -= 5;
-            output.push(char::from(ALPHABET[((accumulator >> bits) & 31) as usize]));
-        }
-        if output.len() == 26 {
-            break;
-        }
-    }
-    output
+/// Renders the leading `SOURCE_UNIT_DIGEST_CHARS` base32 characters of one digest.
+///
+/// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with
+/// `O`, `I`, `B`, and `g`; source-unit identities use its lowercase form.
+fn digest_prefix_base32(bytes: &[u8]) -> String {
+    let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
+    encoded.truncate(SOURCE_UNIT_DIGEST_CHARS);
+    encoded
 }
 
+/// ASCII bytes percent-encoded inside `rift://` path segments.
+///
+/// The kept characters are the RFC 3986 path set; every other byte,
+/// including each byte of multi-byte UTF-8 sequences, is `%XX`-escaped.
+const PATH_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b';')
+    .remove(b'=')
+    .remove(b':')
+    .remove(b'@')
+    .remove(b'/')
+    .remove(b'-');
+
 fn encode_path(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"._~!$&'()*+,;=:@/-".contains(&byte) {
-            output.push(char::from(byte));
-        } else {
-            write!(output, "%{byte:02X}").expect("writing to String cannot fail");
-        }
-    }
-    output
+    utf8_percent_encode(value, PATH_ESCAPE_SET).to_string()
 }
 
 fn complete_coverage() -> Coverage {
-    let revision = Digest("0".repeat(64));
+    let revision = Digest("0".repeat(SHA256_HEX_LENGTH));
     Coverage::Complete {
         state: CoverageCompleteState::Complete,
         scope: CoverageScope::Reach {
             reach: CoverageReach::Request,
         },
         origins: vec![ProviderOrigin {
-            provider: ProviderId(PROVIDER.to_owned()),
+            provider: ProviderId(RUST_READ_PROVIDER_ID.to_owned()),
             revision: revision.clone(),
             tree_revision: revision.clone(),
             freshness: Freshness::Current,
