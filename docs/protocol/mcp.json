@@ -2539,7 +2539,7 @@
           },
           "TextRange": {
             "additionalProperties": false,
-            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the conformance tests\ninstead.",
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
             "properties": {
               "end": {
                 "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
@@ -4086,7 +4086,7 @@
           },
           "TextRange": {
             "additionalProperties": false,
-            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the conformance tests\ninstead.",
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
             "properties": {
               "end": {
                 "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
