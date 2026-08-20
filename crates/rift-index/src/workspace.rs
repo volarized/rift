@@ -418,7 +418,9 @@ fn composition() -> Result<ProviderComposition, WorkspaceIndexError> {
 fn component<Input: 'static, Output: 'static>(
     id: &str,
 ) -> Result<Component<Input, Output>, WorkspaceIndexError> {
-    Ok(Component::new(ProviderId::new(id).map_err(composition_error)?))
+    Ok(Component::new(
+        ProviderId::new(id).map_err(composition_error)?,
+    ))
 }
 
 fn composition_error(
@@ -441,7 +443,7 @@ fn discover(
             ));
         }
         let mut entries = fs::read_dir(&directory)
-            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+            .and_then(Iterator::collect::<Result<Vec<_>, _>>)
             .map_err(|error| {
                 WorkspaceIndexError::caused_by(
                     WorkspaceIndexViolation::Filesystem,
@@ -833,8 +835,14 @@ mod tests {
         let strict_parser =
             RustSyntaxProvider::new(RustSyntaxLimits::new(1, 1, 1).expect("positive bounds"));
         let source_path = directory.path().join("src/lib.rs");
-        let syntax_error = read_file(directory.path(), &source_path, &strict_parser, limits, &mut bytes)
-            .expect_err("syntax byte bound");
+        let syntax_error = read_file(
+            directory.path(),
+            &source_path,
+            &strict_parser,
+            limits,
+            &mut bytes,
+        )
+        .expect_err("syntax byte bound");
         assert_eq!(syntax_error.violation(), WorkspaceIndexViolation::Syntax);
         assert_eq!(syntax_error.path(), Some(source_path.as_path()));
         assert!(std::error::Error::source(&syntax_error).is_some());
