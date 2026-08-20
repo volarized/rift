@@ -117,6 +117,124 @@ pub enum RustSymbolKind {
     Macro,
 }
 
+/// Tree-sitter grammar node kind interpreted by this crate.
+///
+/// Vocabulary comes from the `node-types.json` of the pinned
+/// tree-sitter-rust 0.24.2 grammar. The grammar defines many more kinds;
+/// only the ones this crate reads are listed, so conversion from an
+/// arbitrary kind string is fallible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustGrammarNodeKind {
+    /// `const_item` declaration.
+    ConstItem,
+    /// `enum_item` declaration.
+    EnumItem,
+    /// `function_item` declaration.
+    FunctionItem,
+    /// `impl_item` block.
+    ImplItem,
+    /// `macro_definition` declaration.
+    MacroDefinition,
+    /// `mod_item` declaration.
+    ModItem,
+    /// `static_item` declaration.
+    StaticItem,
+    /// `struct_item` declaration.
+    StructItem,
+    /// `trait_item` declaration.
+    TraitItem,
+    /// `type_item` declaration.
+    TypeItem,
+    /// `visibility_modifier` marker on one declaration.
+    VisibilityModifier,
+}
+
+impl RustGrammarNodeKind {
+    /// Every interpreted kind, ordered by grammar spelling.
+    pub const ALL: [Self; 11] = [
+        Self::ConstItem,
+        Self::EnumItem,
+        Self::FunctionItem,
+        Self::ImplItem,
+        Self::MacroDefinition,
+        Self::ModItem,
+        Self::StaticItem,
+        Self::StructItem,
+        Self::TraitItem,
+        Self::TypeItem,
+        Self::VisibilityModifier,
+    ];
+
+    /// Returns grammar spelling from tree-sitter-rust `node-types.json`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConstItem => "const_item",
+            Self::EnumItem => "enum_item",
+            Self::FunctionItem => "function_item",
+            Self::ImplItem => "impl_item",
+            Self::MacroDefinition => "macro_definition",
+            Self::ModItem => "mod_item",
+            Self::StaticItem => "static_item",
+            Self::StructItem => "struct_item",
+            Self::TraitItem => "trait_item",
+            Self::TypeItem => "type_item",
+            Self::VisibilityModifier => "visibility_modifier",
+        }
+    }
+
+    /// Classifies grammar kinds the tree walk does not interpret as `None`.
+    fn from_kind(kind: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == kind)
+    }
+
+    const fn symbol_kind(self) -> Option<RustSymbolKind> {
+        match self {
+            Self::FunctionItem => Some(RustSymbolKind::Function),
+            Self::StructItem => Some(RustSymbolKind::Struct),
+            Self::EnumItem => Some(RustSymbolKind::Enum),
+            Self::TraitItem => Some(RustSymbolKind::Trait),
+            Self::TypeItem => Some(RustSymbolKind::TypeAlias),
+            Self::ConstItem => Some(RustSymbolKind::Constant),
+            Self::StaticItem => Some(RustSymbolKind::Static),
+            Self::ModItem => Some(RustSymbolKind::Module),
+            Self::MacroDefinition => Some(RustSymbolKind::Macro),
+            Self::ImplItem | Self::VisibilityModifier => None,
+        }
+    }
+}
+
+impl std::str::FromStr for RustGrammarNodeKind {
+    type Err = RustSyntaxError;
+
+    fn from_str(kind: &str) -> Result<Self, Self::Err> {
+        Self::from_kind(kind).ok_or_else(|| {
+            RustSyntaxError::new(RustSyntaxErrorKind::UnknownNodeKind { kind: kind.into() })
+        })
+    }
+}
+
+/// Grammar field name this crate reads, from tree-sitter-rust 0.24.2
+/// `node-types.json`.
+#[derive(Debug, Clone, Copy)]
+enum RustGrammarField {
+    /// `name` field on declaration items.
+    Name,
+    /// `type` field on `impl_item`.
+    Type,
+}
+
+impl RustGrammarField {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Type => "type",
+        }
+    }
+}
+
 /// Authored visibility of one Rust declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustVisibility {
@@ -126,6 +244,22 @@ pub enum RustVisibility {
     Public,
     /// Declaration uses exact restricted visibility spelling such as `pub(crate)`.
     Restricted(String),
+}
+
+impl RustVisibility {
+    /// Classifies authored `visibility_modifier` text from tree-sitter-rust grammar.
+    ///
+    /// Bare `pub` is [`RustVisibility::Public`]; any other authored spelling
+    /// such as `pub(crate)` or `pub(in path)` stays verbatim in
+    /// [`RustVisibility::Restricted`]. Declarations without a modifier never
+    /// reach this conversion and stay [`RustVisibility::Private`].
+    #[must_use]
+    pub fn from_authored(text: &str) -> Self {
+        match text {
+            "pub" => Self::Public,
+            restricted => Self::Restricted(restricted.into()),
+        }
+    }
 }
 
 /// One named Rust declaration.
@@ -306,6 +440,8 @@ pub enum RustSyntaxViolation {
     InvalidQuery,
     /// Query produced more captures than admitted.
     TooManyCaptures,
+    /// Node kind is outside interpreted grammar vocabulary.
+    UnknownNodeKind,
 }
 
 /// Configurable Rust syntax bound named in diagnostics.
@@ -379,6 +515,9 @@ enum RustSyntaxErrorKind {
     TooManyCaptures {
         captures_max: usize,
     },
+    UnknownNodeKind {
+        kind: String,
+    },
 }
 
 /// Opaque Rust syntax failure.
@@ -432,6 +571,7 @@ impl RustSyntaxError {
             RustSyntaxErrorKind::PositionOverflow { .. } => RustSyntaxViolation::PositionOverflow,
             RustSyntaxErrorKind::InvalidQuery { .. } => RustSyntaxViolation::InvalidQuery,
             RustSyntaxErrorKind::TooManyCaptures { .. } => RustSyntaxViolation::TooManyCaptures,
+            RustSyntaxErrorKind::UnknownNodeKind { .. } => RustSyntaxViolation::UnknownNodeKind,
         }
     }
 }
@@ -526,6 +666,19 @@ impl fmt::Display for RustSyntaxError {
                 formatter,
                 "Rust syntax query exceeds capture limit of {captures_max} passed to RustQuery::captures; raise captures_max or narrow the query",
             ),
+            RustSyntaxErrorKind::UnknownNodeKind { kind } => {
+                write!(
+                    formatter,
+                    "Rust node kind \"{kind}\" is outside the vocabulary interpreted by rift-syntax; expected one of the pinned tree-sitter-rust grammar kinds: ",
+                )?;
+                for (index, known) in RustGrammarNodeKind::ALL.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    formatter.write_str(known.as_str())?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -674,43 +827,31 @@ impl Default for RustSyntaxProvider {
 }
 
 fn declaration_name(node: Node<'_>, text: &str) -> Option<(String, RustSymbolKind)> {
-    let kind = match node.kind() {
-        "function_item" => RustSymbolKind::Function,
-        "struct_item" => RustSymbolKind::Struct,
-        "enum_item" => RustSymbolKind::Enum,
-        "trait_item" => RustSymbolKind::Trait,
-        "type_item" => RustSymbolKind::TypeAlias,
-        "const_item" => RustSymbolKind::Constant,
-        "static_item" => RustSymbolKind::Static,
-        "mod_item" => RustSymbolKind::Module,
-        "macro_definition" => RustSymbolKind::Macro,
-        _ => return None,
-    };
-    let name = node.child_by_field_name("name")?;
+    let kind = RustGrammarNodeKind::from_kind(node.kind())?.symbol_kind()?;
+    let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
     text.get(name.byte_range())
         .map(|value| (value.into(), kind))
 }
 
 fn declaration_visibility(node: Node<'_>, text: &str) -> RustVisibility {
-    let visibility = (0..node.named_child_count())
+    (0..node.named_child_count())
         .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == "visibility_modifier")
-        .and_then(|child| text.get(child.byte_range()));
-    match visibility {
-        None => RustVisibility::Private,
-        Some("pub") => RustVisibility::Public,
-        Some(authored) => RustVisibility::Restricted(authored.into()),
-    }
+        .find(|child| child.kind() == RustGrammarNodeKind::VisibilityModifier.as_str())
+        .and_then(|child| text.get(child.byte_range()))
+        .map_or(RustVisibility::Private, RustVisibility::from_authored)
 }
 
 fn container_name(node: Node<'_>, text: &str) -> Option<String> {
-    match node.kind() {
-        "mod_item" | "struct_item" | "enum_item" | "trait_item" => {
-            let name = node.child_by_field_name("name")?;
+    match RustGrammarNodeKind::from_kind(node.kind())? {
+        RustGrammarNodeKind::ModItem
+        | RustGrammarNodeKind::StructItem
+        | RustGrammarNodeKind::EnumItem
+        | RustGrammarNodeKind::TraitItem => {
+            let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
             text.get(name.byte_range()).map(Into::into)
         }
-        "impl_item" => {
-            let item = node.child_by_field_name("type")?;
+        RustGrammarNodeKind::ImplItem => {
+            let item = node.child_by_field_name(RustGrammarField::Type.as_str())?;
             text.get(item.byte_range())
                 .map(|value| value.split_whitespace().collect::<String>())
         }
