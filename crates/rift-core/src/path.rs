@@ -6,7 +6,7 @@ use crate::constants::{
     PROJECT_PATH_BYTES_MAX, RIFT_STATE_DIRECTORY, RIFT_STATE_DIRECTORY_PREFIX,
     SOURCE_PATH_BYTES_MAX,
 };
-use crate::{ErrorDescriptor, ErrorName, ErrorRegistry};
+use crate::{ErrorContext, ErrorDescriptor, ErrorName, ErrorRegistry, render_failure};
 
 /// Path vocabulary being validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +15,17 @@ pub enum PathKind {
     Project,
     /// Location-relative source-catalog path.
     Source,
+}
+
+impl PathKind {
+    /// Returns short lowercase phrase naming the path vocabulary.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project path",
+            Self::Source => "source path",
+        }
+    }
 }
 
 /// Reason a path is outside its domain.
@@ -40,6 +51,24 @@ pub enum PathViolation {
     RiftState,
 }
 
+impl PathViolation {
+    /// Returns short lowercase phrase naming the violated rule.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::TooLong => "longer than the byte bound",
+            Self::Absolute => "absolute",
+            Self::DotSegment => "contains a dot segment",
+            Self::EmptySegment => "contains an empty segment",
+            Self::Backslash => "contains a backslash separator",
+            Self::ControlCharacter => "contains a control character",
+            Self::NonCanonicalUnicode => "not Unicode NFC",
+            Self::RiftState => "addresses rift state under `.rift`",
+        }
+    }
+}
+
 /// Invalid project or source path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathError {
@@ -63,13 +92,22 @@ impl PathError {
     /// Returns canonical registry metadata.
     #[must_use]
     pub const fn descriptor(self) -> ErrorDescriptor {
-        ErrorRegistry::descriptor(ErrorName::InvalidConfiguration)
+        ErrorRegistry::descriptor(ErrorName::UnsupportedPath)
+    }
+
+    /// Returns ordered typed context.
+    #[must_use]
+    pub fn context(self) -> Vec<ErrorContext> {
+        vec![
+            ErrorContext::new("path_kind", self.kind.label()),
+            ErrorContext::new("violation", self.violation.label()),
+        ]
     }
 }
 
 impl fmt::Display for PathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.descriptor().explanation())
+        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
     }
 }
 
@@ -269,6 +307,60 @@ mod tests {
     #[test]
     fn path_error_uses_registry_explanation() {
         let error = ProjectPath::new("../outside").expect_err("dot segment is invalid");
-        assert_eq!(error.to_string(), error.descriptor().explanation());
+        assert_eq!(
+            error.to_string(),
+            "the path cannot be addressed by this workspace: \
+             path_kind project path, violation contains a dot segment; \
+             use a workspace-relative path with `/` separators and no `.` or `..` components"
+        );
+    }
+
+    #[test]
+    fn path_violation_labels_are_non_empty_lowercase() {
+        let violations = [
+            PathViolation::Empty,
+            PathViolation::TooLong,
+            PathViolation::Absolute,
+            PathViolation::DotSegment,
+            PathViolation::EmptySegment,
+            PathViolation::Backslash,
+            PathViolation::ControlCharacter,
+            PathViolation::NonCanonicalUnicode,
+            PathViolation::RiftState,
+        ];
+        for violation in violations {
+            let label = violation.label();
+            assert!(!label.is_empty(), "violation={violation:?}");
+            assert!(
+                label.chars().next().is_some_and(char::is_lowercase),
+                "label must start lowercase so it reads inside a rendered \
+                 failure line: violation={violation:?}, label={label}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_kind_labels_name_each_vocabulary() {
+        assert_eq!(PathKind::Project.label(), "project path");
+        assert_eq!(PathKind::Source.label(), "source path");
+    }
+
+    #[test]
+    fn path_error_display_covers_project_and_source_kinds() {
+        let project_error = ProjectPath::new("../outside").expect_err("dot segment is invalid");
+        assert_eq!(
+            project_error.to_string(),
+            "the path cannot be addressed by this workspace: \
+             path_kind project path, violation contains a dot segment; \
+             use a workspace-relative path with `/` separators and no `.` or `..` components"
+        );
+
+        let source_error = SourcePath::new("").expect_err("empty source path is invalid");
+        assert_eq!(
+            source_error.to_string(),
+            "the path cannot be addressed by this workspace: \
+             path_kind source path, violation empty; \
+             use a workspace-relative path with `/` separators and no `.` or `..` components"
+        );
     }
 }

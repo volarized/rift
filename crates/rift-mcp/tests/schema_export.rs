@@ -98,12 +98,55 @@ fn parse_arguments_rejects_unknown_flag() {
     let error =
         schema::parse_arguments(["--bogus".to_owned()]).expect_err("unknown flag must fail");
     let message = error.to_string();
+    assert_eq!(error.descriptor().code(), "invalid_request");
     let ExportError::UnknownFlag { argument } = error else {
         panic!("expected UnknownFlag, got {error:?}");
     };
     assert_eq!(argument, "--bogus");
     assert!(message.contains("--bogus"));
     assert!(message.contains("usage: rift-schema-export"));
+}
+
+#[test]
+fn descriptor_codes_match_registry_per_variant() {
+    let extra = schema::parse_arguments(["first".to_owned(), "second".to_owned()])
+        .expect_err("second directory must fail");
+    assert_eq!(extra.descriptor().code(), "invalid_request");
+}
+
+#[test]
+fn check_unreadable_descriptor_is_storage_failure() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let check_request =
+        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
+    let error = schema::run(&check_request).expect_err("missing document must fail check");
+    assert_eq!(error.descriptor().code(), "storage_failure");
+    Ok(())
+}
+
+#[test]
+fn write_failed_descriptor_is_storage_failure() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let blocked = directory.path().join("blocked");
+    fs::write(&blocked, "not a directory")?;
+    let request = schema::parse_arguments([blocked.join("nested").display().to_string()])?;
+    let error = schema::run(&request).expect_err("writing under a file must fail");
+    assert_eq!(error.descriptor().code(), "storage_failure");
+    Ok(())
+}
+
+#[test]
+fn check_mismatch_descriptor_is_artifact_stale() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
+    schema::run(&write_request)?;
+    fs::write(directory.path().join("mcp.json"), "{}")?;
+
+    let check_request =
+        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
+    let error = schema::run(&check_request).expect_err("stale document must fail check");
+    assert_eq!(error.descriptor().code(), "artifact_stale");
+    Ok(())
 }
 
 #[test]

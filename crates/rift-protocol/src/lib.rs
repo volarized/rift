@@ -6,4 +6,6 @@
 //! into the docs, so the served surface and the documented surface cannot
 //! drift apart.
 
+pub mod error;
 pub mod read;
+pub mod schema;

@@ -13,6 +13,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use rift_core::{ErrorDescriptor, ErrorName, ErrorRegistry};
 use serde_json::json;
 
 use crate::RiftMcp;
@@ -140,6 +141,22 @@ impl Error for ExportError {
             Self::UnknownFlag { .. } | Self::ExtraArgument { .. } | Self::CheckMismatch { .. } => {
                 None
             }
+        }
+    }
+}
+
+impl ExportError {
+    /// Returns canonical registry metadata.
+    #[must_use]
+    pub fn descriptor(&self) -> ErrorDescriptor {
+        match self {
+            Self::UnknownFlag { .. } | Self::ExtraArgument { .. } => {
+                ErrorRegistry::descriptor(ErrorName::InvalidRequest)
+            }
+            Self::CheckUnreadable { .. } | Self::WriteFailed { .. } => {
+                ErrorRegistry::descriptor(ErrorName::StorageFailure)
+            }
+            Self::CheckMismatch { .. } => ErrorRegistry::descriptor(ErrorName::ArtifactStale),
         }
     }
 }

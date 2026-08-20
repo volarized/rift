@@ -47,7 +47,10 @@ async fn main() -> ExitCode {
         }
         Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("rift: {error}");
+            eprintln!(
+                "rift: error[{code}]: {error}",
+                code = error.descriptor().code()
+            );
             ExitCode::FAILURE
         }
     }
@@ -57,6 +60,16 @@ async fn main() -> ExitCode {
 enum CliError {
     Mcp(rift_mcp::StdioServeError),
     Update(update::UpdateError),
+}
+
+impl CliError {
+    /// Returns canonical registry metadata from the wrapped failure.
+    fn descriptor(&self) -> rift_core::ErrorDescriptor {
+        match self {
+            Self::Mcp(error) => error.descriptor(),
+            Self::Update(error) => error.descriptor(),
+        }
+    }
 }
 
 impl fmt::Display for CliError {

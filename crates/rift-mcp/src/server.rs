@@ -1,11 +1,21 @@
 use std::path::Path;
 
+use rift_core::{ErrorName, RetryDirective};
 use rift_index::WorkspaceIndexLimits;
+use rift_protocol::error as wire;
 use rift_protocol::read::{GetSymbolParams, GetSymbolResult, SearchParams, SearchResult};
-use rift_server::{ReadError, ReadErrorKind, ReadService};
+use rift_server::{ReadError, ReadService};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
+
+/// JSON-RPC error code every Rift operating failure travels under. The
+/// machine-readable classification is the [`wire::ErrorData`] in `data`.
+const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
+
+/// Most `causes` entries one wire error carries, matching the advertised
+/// schema bound.
+const ERROR_CAUSES_MAX: usize = 8;
 
 /// Read-only Rust workspace MCP server.
 #[derive(Debug)]
@@ -36,7 +46,10 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
-        self.reads.get_symbol(&params).map(Json).map_err(tool_error)
+        self.reads
+            .get_symbol(&params)
+            .map(Json)
+            .map_err(|error| tool_error(&error))
     }
 
     /// Searches indexed Rust declarations and source lines by lexical `query`. Use
@@ -46,7 +59,10 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        self.reads.search(&params).map(Json).map_err(tool_error)
+        self.reads
+            .search(&params)
+            .map(Json)
+            .map_err(|error| tool_error(&error))
     }
 }
 
@@ -59,16 +75,89 @@ impl ServerHandler for RiftMcp {
     }
 }
 
-fn tool_error(error: ReadError) -> ErrorData {
-    let kind = error.kind();
+/// Maps a read failure to the JSON-RPC error object the design documents:
+/// code `-32000`, the rendered failure line as `message`, and the typed
+/// [`wire::ErrorData`] as `data`.
+fn tool_error(error: &ReadError) -> ErrorData {
     let message = error.to_string();
-    drop(error);
-    match kind {
-        ReadErrorKind::Index => ErrorData::internal_error(message, None),
-        ReadErrorKind::Unsupported | ReadErrorKind::Invalid | ReadErrorKind::NotFound => {
-            ErrorData::invalid_params(message, None)
-        }
+    let data = serde_json::to_value(wire_error(error, wire::ErrorPhase::Read)).ok();
+    ErrorData::new(RIFT_ERROR_CODE, message, data)
+}
+
+/// Builds the wire error payload for one read failure.
+fn wire_error(error: &ReadError, phase: wire::ErrorPhase) -> wire::ErrorData {
+    let descriptor = error.descriptor();
+    wire::ErrorData {
+        code: wire_code(descriptor.name()),
+        message: error.to_string(),
+        retry: wire_retry(descriptor.retry()),
+        phase,
+        diagnostics: Vec::new(),
+        limit: None,
+        causes: wire_causes(error),
     }
+}
+
+/// Maps a registry identity to its wire code. CLI-only identities never
+/// reach this boundary; they classify as `internal_error` if one ever does.
+fn wire_code(name: ErrorName) -> wire::ErrorCode {
+    match name {
+        ErrorName::InvalidRequest => wire::ErrorCode::InvalidRequest,
+        ErrorName::PermissionDenied => wire::ErrorCode::PermissionDenied,
+        ErrorName::ResourceNotFound => wire::ErrorCode::ResourceNotFound,
+        ErrorName::ContentUnavailable => wire::ErrorCode::ContentUnavailable,
+        ErrorName::CursorInvalid => wire::ErrorCode::CursorInvalid,
+        ErrorName::CursorExpired => wire::ErrorCode::CursorExpired,
+        ErrorName::Cancelled => wire::ErrorCode::Cancelled,
+        ErrorName::LimitExceeded => wire::ErrorCode::LimitExceeded,
+        ErrorName::StorageFailure => wire::ErrorCode::StorageFailure,
+        ErrorName::UnsupportedPath => wire::ErrorCode::UnsupportedPath,
+        ErrorName::TemporarilyUnavailable => wire::ErrorCode::TemporarilyUnavailable,
+        ErrorName::ConfigurationInvalid => wire::ErrorCode::ConfigurationInvalid,
+        ErrorName::CapabilityUnavailable => wire::ErrorCode::CapabilityUnavailable,
+        ErrorName::InternalError
+        | ErrorName::UpdateBinaryInvalid
+        | ErrorName::UpdateReleaseInvalid
+        | ErrorName::UpdateDownloadFailed
+        | ErrorName::UpdateStagingFailed
+        | ErrorName::UpdateChecksumMismatch
+        | ErrorName::UpdateArchiveInvalid
+        | ErrorName::UpdatePublishFailed
+        | ErrorName::UpdateRollbackFailed
+        | ErrorName::ArtifactStale => wire::ErrorCode::InternalError,
+    }
+}
+
+/// Maps registry retry guidance to the wire directive.
+fn wire_retry(retry: RetryDirective) -> wire::RetryDirective {
+    match retry {
+        RetryDirective::Never => wire::RetryDirective::Never,
+        RetryDirective::SameRequest => wire::RetryDirective::SameRequest,
+        RetryDirective::OperatorAction => wire::RetryDirective::OperatorAction,
+    }
+}
+
+/// Walks the failure's source chain into bounded `causes` entries, outermost
+/// first. Each level inherits the outer classification, which the read error
+/// already resolved through the concrete failure it wraps.
+fn wire_causes(error: &ReadError) -> Vec<wire::ErrorCause> {
+    let descriptor = error.descriptor();
+    let code = wire_code(descriptor.name());
+    let retry = wire_retry(descriptor.retry());
+    let mut causes = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if causes.len() == ERROR_CAUSES_MAX {
+            break;
+        }
+        causes.push(wire::ErrorCause {
+            code,
+            message: current.to_string(),
+            retry,
+        });
+        source = current.source();
+    }
+    causes
 }
 
 #[cfg(test)]
@@ -207,8 +296,12 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn client_rejects_empty_search_query_with_invalid_params() -> TestResult {
+    /// Calls one tool expecting a Rift wire error and returns the JSON-RPC
+    /// error object.
+    async fn failing_call(
+        arguments_value: &serde_json::Value,
+        tool: &'static str,
+    ) -> TestResult<rmcp::ErrorData> {
         let (_directory, server) = fixture()?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
@@ -219,53 +312,46 @@ mod tests {
             service.waiting().await.expect("server must stop cleanly");
         });
         let client = ().serve(client_transport).await?;
-
         let error = client
-            .call_tool(
-                CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": ""}))?),
-            )
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments(arguments_value)?))
             .await
-            .expect_err("empty search query must be rejected");
+            .expect_err("the request must be rejected");
+        client.cancel().await?;
+        server_task.await?;
         let ServiceError::McpError(data) = error else {
             panic!("expected protocol-level McpError, got {error:?}");
         };
-        assert_eq!(data.code, ErrorCode::INVALID_PARAMS);
-        assert_eq!(data.message.as_ref(), "search query is empty");
+        Ok(data)
+    }
 
-        client.cancel().await?;
-        server_task.await?;
+    #[tokio::test]
+    async fn client_rejects_empty_search_query_with_typed_wire_error() -> TestResult {
+        let data = failing_call(&json!({"query": ""}), "search").await?;
+        assert_eq!(data.code, ErrorCode(-32000));
+        assert_eq!(
+            data.message.as_ref(),
+            "the request does not match the documented form: field query, \
+             violation empty; correct the reported field and resend the request"
+        );
+        let wire = data.data.ok_or("wire error data must be present")?;
+        assert_eq!(wire["code"], json!("invalid_request"));
+        assert_eq!(wire["retry"], json!("never"));
+        assert_eq!(wire["phase"], json!("read"));
+        assert_eq!(wire["causes"], json!([]));
         Ok(())
     }
 
     #[tokio::test]
-    async fn client_rejects_zero_result_limit_with_internal_error() -> TestResult {
-        let (_directory, server) = fixture()?;
-        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
-        let server_task = tokio::spawn(async move {
-            let service = server
-                .serve(server_transport)
-                .await
-                .expect("server must initialize");
-            service.waiting().await.expect("server must stop cleanly");
-        });
-        let client = ().serve(client_transport).await?;
-
-        let error = client
-            .call_tool(
-                CallToolRequestParams::new("get_symbol")
-                    .with_arguments(arguments(&json!({"name": "beacon", "limit": 0}))?),
-            )
-            .await
-            .expect_err("zero result limit must be rejected");
-        let ServiceError::McpError(data) = error else {
-            panic!("expected protocol-level McpError, got {error:?}");
-        };
-        assert_eq!(data.code, ErrorCode::INTERNAL_ERROR);
-        assert_eq!(data.message.as_ref(), "workspace indexing failed");
-
-        client.cancel().await?;
-        server_task.await?;
+    async fn client_rejects_zero_result_limit_as_invalid_request() -> TestResult {
+        let data = failing_call(&json!({"name": "beacon", "limit": 0}), "get_symbol").await?;
+        assert_eq!(data.code, ErrorCode(-32000));
+        assert_eq!(
+            data.message.as_ref(),
+            "the request does not match the documented form: field limit, \
+             violation zero; correct the reported field and resend the request"
+        );
+        let wire = data.data.ok_or("wire error data must be present")?;
+        assert_eq!(wire["code"], json!("invalid_request"));
         Ok(())
     }
 }

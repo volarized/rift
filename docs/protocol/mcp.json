@@ -831,7 +831,10 @@
             "properties": {
               "default": {
                 "description": "The default value as written in the source. Null where there is none.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -839,7 +842,10 @@
               },
               "name": {
                 "description": "What the parameter is called. Null where the language allows an unnamed one, as a\npositional parameter in a function type.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "node": {
                 "anyOf": [
@@ -1043,7 +1049,10 @@
                 "properties": {
                   "default": {
                     "description": "The default value as written in the source. Null where there is none.",
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "extensions": {
                     "$ref": "#/$defs/Extensions",
@@ -1051,7 +1060,10 @@
                   },
                   "name": {
                     "description": "What the parameter is called. Null where the language allows an unnamed one, as a\npositional parameter in a function type.",
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "node": {
                     "anyOf": [
@@ -1089,7 +1101,10 @@
                   "default",
                   "extensions"
                 ],
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "returns": {
                 "description": "What the call yields. An array because a language may return several values, and\nbecause a declared and an inferred return are separate bindings.",
@@ -1369,7 +1384,10 @@
               },
               "visibility": {
                 "description": "How widely the symbol is visible, in the language's own terms — `public`, `private`,\n`pub(crate)`. Null where the language has no such concept.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -1841,7 +1859,10 @@
                 "maxLength": 8192,
                 "minLength": 17,
                 "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "source": {
                 "description": "The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.",
@@ -1876,7 +1897,10 @@
             "maxLength": 4096,
             "minLength": 1,
             "pattern": "^[A-Za-z0-9_-]+$",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "snapshot": {
             "$ref": "#/$defs/ReadSnapshot",
@@ -3039,7 +3063,10 @@
             "properties": {
               "code": {
                 "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
@@ -3073,7 +3100,10 @@
                 "required": [
                   "name"
                 ],
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "message": {
                 "description": "What the provider said, in its own words.",
@@ -3112,7 +3142,10 @@
                   "unit",
                   "range"
                 ],
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "tags": {
                 "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
@@ -3144,7 +3177,10 @@
                 "description": "One-based column within that line, counted in UTF-8 bytes. Null for the same reason\nas `line`.",
                 "format": "uint64",
                 "minimum": 0,
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "diagnostic": {
                 "$ref": "#/$defs/Diagnostic",
@@ -3167,13 +3203,19 @@
                   "span",
                   "text"
                 ],
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "line": {
                 "description": "One-based line the finding starts on. Null where the diagnostic has no span — a\nwhole-project error has nowhere to point.",
                 "format": "uint64",
                 "minimum": 0,
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "source": {
                 "$ref": "#/$defs/DiagnosticContextSource",
@@ -3872,7 +3914,10 @@
             "properties": {
               "default": {
                 "description": "The default value as written in the source. Null where there is none.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -3880,7 +3925,10 @@
               },
               "name": {
                 "description": "What the parameter is called. Null where the language allows an unnamed one, as a\npositional parameter in a function type.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "node": {
                 "anyOf": [
@@ -4550,7 +4598,10 @@
                 "properties": {
                   "default": {
                     "description": "The default value as written in the source. Null where there is none.",
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "extensions": {
                     "$ref": "#/$defs/Extensions",
@@ -4558,7 +4609,10 @@
                   },
                   "name": {
                     "description": "What the parameter is called. Null where the language allows an unnamed one, as a\npositional parameter in a function type.",
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "node": {
                     "anyOf": [
@@ -4596,7 +4650,10 @@
                   "default",
                   "extensions"
                 ],
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "returns": {
                 "description": "What the call yields. An array because a language may return several values, and\nbecause a declared and an inferred return are separate bindings.",
@@ -4895,7 +4952,10 @@
               },
               "visibility": {
                 "description": "How widely the symbol is visible, in the language's own terms — `public`, `private`,\n`pub(crate)`. Null where the language has no such concept.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -5266,7 +5326,10 @@
                 "maxLength": 8192,
                 "minLength": 17,
                 "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "source": {
                 "description": "The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.",
@@ -5294,7 +5357,10 @@
             "maxLength": 4096,
             "minLength": 1,
             "pattern": "^[A-Za-z0-9_-]+$",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "results": {
             "description": "The hits on this page, in the order the request asked for.",
