@@ -441,14 +441,7 @@ fn discover(
             ));
         }
         let mut entries = fs::read_dir(&directory)
-            .map_err(|error| {
-                WorkspaceIndexError::caused_by(
-                    WorkspaceIndexViolation::Filesystem,
-                    Some(&directory),
-                    error,
-                )
-            })?
-            .collect::<Result<Vec<_>, _>>()
+            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
             .map_err(|error| {
                 WorkspaceIndexError::caused_by(
                     WorkspaceIndexViolation::Filesystem,
