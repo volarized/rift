@@ -18,10 +18,9 @@ fn starts_with_lowercase(value: &str) -> bool {
 }
 
 fn tail_uses_owned_alphabet(value: &str, punctuation: &[u8]) -> bool {
-    value
-        .bytes()
-        .skip(1)
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || punctuation.contains(&byte))
+    value.bytes().skip(1).all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || punctuation.contains(&byte)
+    })
 }
 
 #[cfg(test)]

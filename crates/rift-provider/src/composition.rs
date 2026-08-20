@@ -225,9 +225,10 @@ impl CompositionError {
         Self { kind }
     }
 
-    rift_core::property! {
-        /// Returns stable failure classification and context.
-        pub const fn kind(&self) -> &CompositionErrorKind = &self.kind;
+    /// Returns stable failure classification and context.
+    #[must_use]
+    pub const fn kind(&self) -> &CompositionErrorKind {
+        &self.kind
     }
 
     /// Returns stage path attached to failure when present.
