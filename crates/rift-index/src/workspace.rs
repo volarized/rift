@@ -400,17 +400,10 @@ fn composition() -> Result<ProviderComposition, WorkspaceIndexError> {
     let index = Component::<RustFacts, ReadIndex>::new(
         ProviderId::new("memory-index").map_err(composition_error)?,
     );
-    let files = builder
-        .source("project", &source)
-        .map_err(composition_error)?;
-    let facts = builder
-        .then(files, "syntax", &syntax)
-        .map_err(composition_error)?;
-    let reads = builder
-        .then(facts, "index", &index)
-        .map_err(composition_error)?;
-    builder.output(reads).map_err(composition_error)?;
-    builder.build().map_err(composition_error)
+    let files = builder.source("project", &source);
+    let facts = builder.then(files, "syntax", &syntax);
+    let reads = builder.then(facts, "index", &index);
+    builder.output(reads).build().map_err(composition_error)
 }
 
 fn composition_error(source: impl IntoCompositionSource) -> WorkspaceIndexError {
