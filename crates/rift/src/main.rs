@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Serve read-only Rust workspace context over stdio MCP.
+    /// Serve Rust workspace reads and edits over stdio MCP.
     Mcp,
     /// Replace current Rift binary with latest official release.
     Update,

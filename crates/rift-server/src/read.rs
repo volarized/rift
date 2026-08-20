@@ -30,7 +30,7 @@ use sha2::{Digest as _, Sha256};
 pub enum ReadErrorKind {
     /// Workspace could not be indexed.
     Index,
-    /// Request uses functionality not served by v0.0.2.
+    /// Request uses functionality this release does not serve.
     Unsupported,
     /// Request is invalid for direct workspace reads.
     Invalid,
