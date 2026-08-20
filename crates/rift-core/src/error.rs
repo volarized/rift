@@ -1,10 +1,11 @@
-//! Rift's error registry: one identity vocabulary, one rendering rule.
+//! Rift's error registry: the full set of errors that can happen across the
+//! MCP and CLI surfaces.
 //!
-//! The wire half of the vocabulary is [`rift_protocol::error::ErrorCode`];
-//! this module adds the CLI-only half, the canonical explanation and action
-//! for every identity, and the generic [`Error`] carrier every crate renders
-//! failures through. Code strings are owned by serde on the code enums, so
-//! the registry and the wire cannot drift.
+//! The wire piece is [`rift_protocol::error::ErrorCode`]; this module adds
+//! the CLI-only piece, the canonical explanation and action for every
+//! identity, and the generic [`Error`] carrier every crate renders failures
+//! through. Code strings are owned by serde on the code enums, so the
+//! registry and the wire cannot drift.
 
 use std::fmt;
 
@@ -290,12 +291,12 @@ impl ErrorContext {
     }
 }
 
-/// Renders one failure line: explanation, named context, then the action.
+/// Prepares a detailed failure message from the error and its context.
 ///
-/// Every surface that shows an operating failure to a person prints this
-/// form, so a message always says what failed, with which values, and what
-/// to do next: `explanation: key value, key value; action`. The wire carries
-/// the same facts as typed JSON in `ErrorData`; this line is for humans.
+/// The message always outlines what failed, which values caused the failure,
+/// and the recommended next step, in one form every surface prints:
+/// `explanation: key value, key value; action`. This render is the
+/// human-readable form; the same information travels as JSON in `ErrorData`.
 #[must_use]
 pub fn render_failure(descriptor: ErrorDescriptor, context: &[ErrorContext]) -> String {
     let evidence = context
