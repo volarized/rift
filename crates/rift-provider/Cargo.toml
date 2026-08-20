@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 rift-core.workspace = true
+serde.workspace = true
