@@ -1,8 +1,8 @@
 //! Wire models for the read-only Rift MCP tools.
 //!
 //! Every type here is a wire contract: serde attributes define exactly what
-//! the server accepts and returns, and the schemas exported by
-//! [`crate::schema::schema_document`] are generated from these definitions.
+//! the server accepts and returns, and the MCP server derives its advertised
+//! request and response schemas from these definitions.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -14,6 +14,150 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer)
+}
+
+/// Cross-field rules the derive attributes cannot express, attached to models
+/// with `#[schemars(transform = constraint::...)]`.
+///
+/// Each function appends one composition clause to its model's schema. The
+/// clauses are authored as structured [`serde_json::json!`] values so every
+/// rule reads as indented data with one field per line.
+pub mod constraint {
+    use schemars::Schema;
+    use serde_json::{Value, json};
+
+    /// Appends `clause` to the `keyword` array of `schema`, creating the array
+    /// on first use so several rules can target the same keyword.
+    fn append(schema: &mut Schema, keyword: &str, clause: Value) {
+        let clauses = schema
+            .ensure_object()
+            .entry(keyword)
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::Array(values) = clauses {
+            values.push(clause);
+        }
+    }
+
+    /// A symlink [`File`](super::File) carries no language facts: languages and
+    /// regions stay empty and `semantic` stays false.
+    pub fn symlink_carries_no_language_facts(schema: &mut Schema) {
+        append(
+            schema,
+            "allOf",
+            json!({
+                "if": {
+                    "properties": {
+                        "content": { "properties": { "kind": { "const": "symlink" } } }
+                    }
+                },
+                "then": {
+                    "properties": {
+                        "languages": { "maxItems": 0 },
+                        "regions": { "maxItems": 0 },
+                        "semantic": { "const": false }
+                    }
+                }
+            }),
+        );
+    }
+
+    /// A [`RelationFilter`](super::RelationFilter) names what it matches by:
+    /// an exact `kind` in one language's vocabulary, or a portable `facet`.
+    pub fn relation_filter_names_kind_or_facet(schema: &mut Schema) {
+        append(
+            schema,
+            "anyOf",
+            json!({
+                "description": "Matching by exact kind, in one language's vocabulary.",
+                "required": ["kind"]
+            }),
+        );
+        append(
+            schema,
+            "anyOf",
+            json!({
+                "description": "Matching by portable facet, which reaches every served language.",
+                "required": ["facet"]
+            }),
+        );
+    }
+
+    /// A [`SearchHit`](super::SearchHit) carries `span` and `line` together or
+    /// not at all, and node and file hits always carry both.
+    pub fn search_hit_pairs_span_with_line(schema: &mut Schema) {
+        append(
+            schema,
+            "allOf",
+            json!({
+                "oneOf": [
+                    { "required": ["span", "line"] },
+                    { "not": { "anyOf": [ { "required": ["span"] }, { "required": ["line"] } ] } }
+                ]
+            }),
+        );
+        append(
+            schema,
+            "allOf",
+            json!({
+                "if": {
+                    "properties": {
+                        "hit": { "properties": { "target": { "enum": ["node", "file"] } } }
+                    }
+                },
+                "then": { "required": ["span", "line"] }
+            }),
+        );
+    }
+
+    /// [`SearchParams`](super::SearchParams) with a `traversal` keep `target`
+    /// at `symbol` or `all`, and `paths` only narrow project-scoped searches.
+    pub fn search_traversal_and_paths_stay_in_scope(schema: &mut Schema) {
+        append(
+            schema,
+            "allOf",
+            json!({
+                "if": { "required": ["traversal"] },
+                "then": { "properties": { "target": { "enum": ["symbol", "all"] } } }
+            }),
+        );
+        append(
+            schema,
+            "allOf",
+            json!({
+                "if": { "required": ["paths"] },
+                "then": { "properties": { "scope": { "const": "project" } } }
+            }),
+        );
+    }
+
+    /// [`SearchParams`](super::SearchParams) ask for something: a text `query`,
+    /// a provider `filter`, or a bounded relationship `traversal`.
+    pub fn search_names_query_filter_or_traversal(schema: &mut Schema) {
+        append(
+            schema,
+            "anyOf",
+            json!({
+                "description": "Satisfied by a text query, with or without a filter alongside it.",
+                "required": ["query"]
+            }),
+        );
+        append(
+            schema,
+            "anyOf",
+            json!({
+                "description": "Satisfied by a filter alone, for a search with no text to match.",
+                "required": ["filter"]
+            }),
+        );
+        append(
+            schema,
+            "anyOf",
+            json!({
+                "description": "Satisfied by a bounded relationship traversal.",
+                "required": ["traversal"]
+            }),
+        );
+    }
 }
 
 /// Empirical coupling between two symbols: how often revisions that touched one touched the
@@ -479,7 +623,7 @@ pub enum FieldFilterOp {
 /// One file and the languages that read it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(extend("allOf" = [{"if":{"properties":{"content":{"properties":{"kind":{"const":"symlink"}}}}},"then":{"properties":{"languages":{"maxItems":0},"regions":{"maxItems":0},"semantic":{"const":false}}}}]))]
+#[schemars(transform = constraint::symlink_carries_no_language_facts)]
 pub struct File {
     /// Project-relative source identity and the URI from which this record and its bytes
     /// are read.
@@ -1109,7 +1253,7 @@ pub enum RegionRole {
 /// A predicate over an exact advertised relationship kind or portable facet.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(extend("anyOf" = [{"description":"Matching by exact kind, in one language's vocabulary.","required":["kind"]},{"description":"Matching by portable facet, which reaches every served language.","required":["facet"]}]))]
+#[schemars(transform = constraint::relation_filter_names_kind_or_facet)]
 pub struct RelationFilter {
     /// Exact relationship kinds a provider emits. Any listed kind matches.
     #[serde(default)]
@@ -1342,7 +1486,7 @@ pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] 
 /// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(extend("allOf" = [{"oneOf":[{"required":["span","line"]},{"not":{"anyOf":[{"required":["span"]},{"required":["line"]}]}}]},{"if":{"properties":{"hit":{"properties":{"target":{"enum":["node","file"]}}}}},"then":{"required":["span","line"]}}]))]
+#[schemars(transform = constraint::search_hit_pairs_span_with_line)]
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file — whichever `target` allowed.
     pub hit: SearchHitTarget,
@@ -1451,8 +1595,8 @@ pub enum SearchIntent {
 /// narrows project-only searches.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(extend("allOf" = [{"if":{"required":["traversal"]},"then":{"properties":{"target":{"enum":["symbol","all"]}}}},{"if":{"required":["paths"]},"then":{"properties":{"scope":{"const":"project"}}}}]))]
-#[schemars(extend("anyOf" = [{"description":"Satisfied by a text query, with or without a filter alongside it.","required":["query"]},{"description":"Satisfied by a filter alone, for a search with no text to match.","required":["filter"]},{"description":"Satisfied by a bounded relationship traversal.","required":["traversal"]}]))]
+#[schemars(transform = constraint::search_traversal_and_paths_stay_in_scope)]
+#[schemars(transform = constraint::search_names_query_filter_or_traversal)]
 pub struct SearchParams {
     /// Which entity kinds may be returned — a kind selector, never the text to search for;
     /// that is `query`. Omitted, every kind may match. Type data is attached to the Symbol

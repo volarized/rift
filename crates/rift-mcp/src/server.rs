@@ -14,7 +14,7 @@ pub struct RiftMcp {
     tool_router: ToolRouter<Self>,
 }
 
-#[tool_router(router = tool_router)]
+#[tool_router(router = tool_router, vis = "pub(crate)")]
 impl RiftMcp {
     /// Builds server from one immutable direct-workspace snapshot.
     ///
@@ -28,12 +28,10 @@ impl RiftMcp {
         })
     }
 
-    #[tool(
-        name = "get_symbol",
-        description = "Finds Rust declarations and their source by exact symbol name. Each hit \
-            carries the declaration and its source excerpt; `include_body: false` omits both. \
-            Use `search` when the name is not exactly known."
-    )]
+    /// Finds Rust declarations and their source by exact symbol name. Each hit
+    /// carries the declaration and its source excerpt; `include_body: false` omits
+    /// both. Use `search` when the name is not exactly known.
+    #[tool]
     fn get_symbol(
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
@@ -41,11 +39,9 @@ impl RiftMcp {
         self.reads.get_symbol(&params).map(Json).map_err(tool_error)
     }
 
-    #[tool(
-        name = "search",
-        description = "Searches indexed Rust declarations and source lines by lexical `query`. \
-            Use `get_symbol` when the declaration name is known."
-    )]
+    /// Searches indexed Rust declarations and source lines by lexical `query`. Use
+    /// `get_symbol` when the declaration name is known.
+    #[tool]
     fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -81,7 +77,7 @@ mod tests {
     use std::fs;
 
     use rift_index::WorkspaceIndexLimits;
-    use rift_protocol::contracts::TOOL_CONTRACTS;
+    use rift_server::ReadErrorKind;
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
@@ -105,6 +101,16 @@ mod tests {
             .as_object()
             .cloned()
             .ok_or_else(|| "tool arguments must be an object".into())
+    }
+
+    #[test]
+    fn build_propagates_workspace_index_failure() {
+        let error = RiftMcp::build(
+            std::path::Path::new("not-a-real-rift-workspace"),
+            WorkspaceIndexLimits::default(),
+        )
+        .expect_err("missing root must fail");
+        assert_eq!(error.kind(), ReadErrorKind::Index);
     }
 
     #[tokio::test]
@@ -169,7 +175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_sees_contract_tool_descriptions() -> TestResult {
+    async fn exported_schema_document_matches_served_tools() -> TestResult {
         let (_directory, server) = fixture()?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
@@ -180,19 +186,20 @@ mod tests {
             service.waiting().await.expect("server must stop cleanly");
         });
         let client = ().serve(client_transport).await?;
-        let tools = client.list_all_tools().await?;
+        let mut advertised = client.list_all_tools().await?;
+        advertised.sort_by(|left, right| left.name.cmp(&right.name));
 
-        for contract in TOOL_CONTRACTS {
-            let tool = tools
-                .iter()
-                .find(|tool| tool.name.as_ref() == contract.name)
-                .ok_or_else(|| format!("tool {} must be advertised", contract.name))?;
-            assert_eq!(
-                tool.description.as_deref(),
-                Some(contract.description),
-                "advertised description must match the protocol contract for {}",
-                contract.name,
-            );
+        let document: serde_json::Value = serde_json::from_str(&crate::schema::schema_document())?;
+        let exported = document["tools"]
+            .as_array()
+            .ok_or("exported document must carry a tools array")?;
+
+        assert_eq!(exported.len(), advertised.len());
+        for (entry, tool) in exported.iter().zip(&advertised) {
+            assert_eq!(entry["name"], json!(tool.name));
+            assert_eq!(entry["description"], json!(tool.description));
+            assert_eq!(entry["input_schema"], json!(tool.input_schema));
+            assert_eq!(entry["output_schema"], json!(tool.output_schema));
         }
 
         client.cancel().await?;

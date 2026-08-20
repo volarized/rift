@@ -96,10 +96,10 @@ def main() -> int:
         if "bin" in target["kind"]
     )
     # rift is the only released binary; rift-schema-export is the repo-internal
-    # generator that writes docs/protocol from the Rust protocol models.
-    if binaries != ["rift-protocol:rift-schema-export", "rift:rift"]:
+    # generator that writes the served tool surface into docs/protocol.
+    if binaries != ["rift-mcp:rift-schema-export", "rift:rift"]:
         raise RuntimeError(
-            "expected exactly rift:rift and rift-protocol:rift-schema-export "
+            "expected exactly rift:rift and rift-mcp:rift-schema-export "
             f"binary targets, got {binaries}"
         )
     return 0

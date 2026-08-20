@@ -1,5 +1,0 @@
-{
-  "title": "Draft",
-  "root": true,
-  "pages": ["index", "architecture", "configuration", "protocol", "changelog", "deprecated"]
-}

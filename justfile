@@ -4,10 +4,10 @@ format:
     cargo fmt --all --check
 
 generate:
-    cargo run -q -p rift-protocol --bin rift-schema-export -- docs/protocol
+    cargo run -q -p rift-mcp --bin rift-schema-export -- docs/protocol
 
 generate-check:
-    cargo run -q -p rift-protocol --bin rift-schema-export -- --check docs/protocol
+    cargo run -q -p rift-mcp --bin rift-schema-export -- --check docs/protocol
 
 check:
     cargo check --workspace --all-targets --all-features
