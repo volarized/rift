@@ -54,9 +54,10 @@ replaces current executable.
 
 ## Protocol development
 
-The protocol models are Rust types in `crates/rift-protocol/src`, and the docs site renders the
-JSON Schema document exported from them into `docs/protocol`. Regenerate and verify the export
-with:
+The protocol models are Rust types in `crates/rift-protocol/src`, and the MCP server in
+`crates/rift-mcp` serves tools built from them. The document in `docs/protocol` is the served
+tool surface — names, descriptions, and JSON Schemas serialized from the same tool router the
+server runs. Regenerate and verify the export with:
 
 ```sh
 just generate
