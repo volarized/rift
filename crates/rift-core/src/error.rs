@@ -590,5 +590,15 @@ mod tests {
         let error = Error::from(SourcedFault(std::io::Error::other("disk gone")));
         let source = std::error::Error::source(&error).expect("source must be exposed");
         assert_eq!(source.to_string(), "disk gone");
+        assert_eq!(error.descriptor().name.code(), "storage_failure");
+    }
+
+    #[test]
+    fn kind_without_an_underlying_failure_exposes_no_source() {
+        let error = Error::from(ProbeFault::Unreadable);
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "a fault that wraps nothing must expose no source"
+        );
     }
 }
