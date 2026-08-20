@@ -251,23 +251,36 @@ impl WireFailure for ReadError {
 
     fn wire_causes(&self) -> Vec<wire::ErrorCause> {
         let descriptor = self.descriptor();
-        let code = wire_code(descriptor.name());
-        let retry = descriptor.retry();
-        let mut causes = Vec::new();
-        let mut source = std::error::Error::source(self);
-        while let Some(current) = source {
-            if causes.len() == ERROR_CAUSES_MAX {
-                break;
-            }
-            causes.push(wire::ErrorCause {
-                code,
-                message: current.to_string(),
-                retry,
-            });
-            source = current.source();
-        }
-        causes
+        bounded_causes(
+            wire_code(descriptor.name()),
+            descriptor.retry(),
+            std::error::Error::source(self),
+        )
     }
+}
+
+/// Walks one source chain into bounded `causes` entries, outermost first.
+/// Every level inherits the classification and retry guidance passed in,
+/// which the failure already resolved through the concrete fault it wraps.
+fn bounded_causes(
+    code: wire::ErrorCode,
+    retry: wire::RetryDirective,
+    outermost: Option<&(dyn std::error::Error + 'static)>,
+) -> Vec<wire::ErrorCause> {
+    let mut causes = Vec::new();
+    let mut source = outermost;
+    while let Some(current) = source {
+        if causes.len() == ERROR_CAUSES_MAX {
+            break;
+        }
+        causes.push(wire::ErrorCause {
+            code,
+            message: current.to_string(),
+            retry,
+        });
+        source = current.source();
+    }
+    causes
 }
 
 /// The wire code for one registry identity. The registry composes the wire
@@ -624,6 +637,50 @@ pub fn beacon() -> u64 {
         assert_eq!(
             super::wire_code(ErrorName::Cli(CliCode::ArtifactStale)),
             wire::ErrorCode::InternalError
+        );
+    }
+
+    #[derive(Debug)]
+    struct Link {
+        depth: usize,
+        inner: Option<Box<Link>>,
+    }
+
+    impl std::fmt::Display for Link {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "link {}", self.depth)
+        }
+    }
+
+    impl Error for Link {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.inner
+                .as_deref()
+                .map(|link| link as &(dyn Error + 'static))
+        }
+    }
+
+    #[test]
+    fn cause_walk_stops_at_the_declared_bound() {
+        let mut chained = Link {
+            depth: 0,
+            inner: None,
+        };
+        for depth in 1..=super::ERROR_CAUSES_MAX + 2 {
+            chained = Link {
+                depth,
+                inner: Some(Box::new(chained)),
+            };
+        }
+        let causes = super::bounded_causes(
+            wire::ErrorCode::StorageFailure,
+            wire::RetryDirective::Never,
+            Some(&chained),
+        );
+        assert_eq!(
+            causes.len(),
+            super::ERROR_CAUSES_MAX,
+            "a chain deeper than the bound must truncate at the bound"
         );
     }
 
