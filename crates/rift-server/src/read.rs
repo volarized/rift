@@ -7,11 +7,11 @@ use rift_index::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits,
 };
-use rift_protocol::generated::read::{
+use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
     FactFamily, File, FileContent, FileId, Freshness, GetSymbolHit, GetSymbolParams,
     GetSymbolResult, IndexSnapshot, Language, MatchedField, Node, NodeFacet, NodeId, NodesParams,
-    NodesResult, ProviderId, ProviderProvenance, ReadSnapshot, SearchHit, SearchHitTarget,
+    NodesResult, ProviderId, ProviderOrigin, ReadSnapshot, SearchHit, SearchHitTarget,
     SearchParams, SearchParamsTarget, SearchResult, SearchScope, SemanticCoverage, SourceExcerpt,
     SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId,
     SymbolOrigin, TextRange,
@@ -515,7 +515,7 @@ fn complete_coverage() -> Coverage {
         scope: CoverageScope::Reach {
             reach: CoverageReach::Request,
         },
-        provenance: vec![ProviderProvenance {
+        origins: vec![ProviderOrigin {
             provider: ProviderId(PROVIDER.to_owned()),
             revision: revision.clone(),
             tree_revision: revision.clone(),
@@ -627,7 +627,7 @@ mod tests {
     use std::fs;
 
     use rift_index::SymbolMatchRank;
-    use rift_protocol::generated::read::{
+    use rift_protocol::read::{
         GetSymbolParams, NodesParams, ProjectPath, ProjectionId, SearchParams,
     };
     use serde_json::{Value, json};
