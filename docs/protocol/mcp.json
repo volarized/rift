@@ -48,17 +48,17 @@
             "oneOf": [
               {
                 "const": "project",
-                "description": "Wire value `project`.",
+                "description": "Only source the workspace owns.",
                 "type": "string"
               },
               {
                 "const": "dependencies",
-                "description": "Wire value `dependencies`.",
+                "description": "Only source of resolved dependencies.",
                 "type": "string"
               },
               {
                 "const": "all",
-                "description": "Wire value `all`.",
+                "description": "Project, dependency, and standard-library source alike.",
                 "type": "string"
               }
             ]
@@ -288,7 +288,7 @@
             "oneOf": [
               {
                 "const": "complete",
-                "description": "Wire value `complete`.",
+                "description": "Everything in scope is present.",
                 "type": "string"
               }
             ]
@@ -298,7 +298,7 @@
             "oneOf": [
               {
                 "const": "partial",
-                "description": "Wire value `partial`.",
+                "description": "Some of what is in scope is missing.",
                 "type": "string"
               }
             ]
@@ -308,22 +308,22 @@
             "oneOf": [
               {
                 "const": "request",
-                "description": "Wire value `request`.",
+                "description": "Only what this request touched.",
                 "type": "string"
               },
               {
                 "const": "project",
-                "description": "Wire value `project`.",
+                "description": "Every visible file of the workspace.",
                 "type": "string"
               },
               {
                 "const": "dependencies",
-                "description": "Wire value `dependencies`.",
+                "description": "The workspace's resolved dependencies.",
                 "type": "string"
               },
               {
                 "const": "all",
-                "description": "Wire value `all`.",
+                "description": "The workspace, its dependencies, and the standard library together.",
                 "type": "string"
               }
             ]
@@ -352,7 +352,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One file. The claim holds for that path and says nothing about any other.",
+                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
                 "properties": {
                   "kind": {
                     "const": "unit",
@@ -376,12 +376,12 @@
             "oneOf": [
               {
                 "const": "unsupported",
-                "description": "Wire value `unsupported`.",
+                "description": "No provider produces this family for the language.",
                 "type": "string"
               },
               {
                 "const": "not_applicable",
-                "description": "Wire value `not_applicable`.",
+                "description": "The family has no meaning for this language.",
                 "type": "string"
               }
             ]
@@ -415,12 +415,12 @@
             "oneOf": [
               {
                 "const": "plain",
-                "description": "Wire value `plain`.",
+                "description": "Plain text with no markup to render.",
                 "type": "string"
               },
               {
                 "const": "markdown",
-                "description": "Wire value `markdown`.",
+                "description": "Markdown as authored in the source.",
                 "type": "string"
               }
             ]
@@ -472,12 +472,12 @@
             "oneOf": [
               {
                 "const": "current",
-                "description": "Wire value `current`.",
+                "description": "The derived state covers the answer's captured revisions.",
                 "type": "string"
               },
               {
                 "const": "stale",
-                "description": "Wire value `stale`.",
+                "description": "The derived state lags behind the answer's captured revisions.",
                 "type": "string"
               }
             ]
@@ -682,92 +682,92 @@
             "oneOf": [
               {
                 "const": "declaration",
-                "description": "Wire value `declaration`.",
+                "description": "Introduces a name.",
                 "type": "string"
               },
               {
                 "const": "definition",
-                "description": "Wire value `definition`.",
+                "description": "Supplies the implementation behind a declared name.",
                 "type": "string"
               },
               {
                 "const": "body",
-                "description": "Wire value `body`.",
+                "description": "The implementation part of a declaration.",
                 "type": "string"
               },
               {
                 "const": "block",
-                "description": "Wire value `block`.",
+                "description": "A delimited group of statements.",
                 "type": "string"
               },
               {
                 "const": "statement",
-                "description": "Wire value `statement`.",
+                "description": "One executable step.",
                 "type": "string"
               },
               {
                 "const": "expression",
-                "description": "Wire value `expression`.",
+                "description": "Computes a value.",
                 "type": "string"
               },
               {
                 "const": "type_expression",
-                "description": "Wire value `type_expression`.",
+                "description": "Spells a type.",
                 "type": "string"
               },
               {
                 "const": "import",
-                "description": "Wire value `import`.",
+                "description": "Brings an external name into scope.",
                 "type": "string"
               },
               {
                 "const": "export",
-                "description": "Wire value `export`.",
+                "description": "Exposes a name outside its unit.",
                 "type": "string"
               },
               {
                 "const": "parameter",
-                "description": "Wire value `parameter`.",
+                "description": "A declared input of a callable.",
                 "type": "string"
               },
               {
                 "const": "argument",
-                "description": "Wire value `argument`.",
+                "description": "A value passed at a call site.",
                 "type": "string"
               },
               {
                 "const": "annotation",
-                "description": "Wire value `annotation`.",
+                "description": "A decorator or attribute qualifying a construct.",
                 "type": "string"
               },
               {
                 "const": "comment",
-                "description": "Wire value `comment`.",
+                "description": "Commentary the language ignores.",
                 "type": "string"
               },
               {
                 "const": "identifier",
-                "description": "Wire value `identifier`.",
+                "description": "A name as written in the source.",
                 "type": "string"
               },
               {
                 "const": "literal",
-                "description": "Wire value `literal`.",
+                "description": "A value written out directly.",
                 "type": "string"
               },
               {
                 "const": "pattern",
-                "description": "Wire value `pattern`.",
+                "description": "A destructuring or match pattern.",
                 "type": "string"
               },
               {
                 "const": "generated",
-                "description": "Wire value `generated`.",
+                "description": "Produced by a tool rather than authored.",
                 "type": "string"
               },
               {
                 "const": "test",
-                "description": "Wire value `test`.",
+                "description": "Belongs to test code.",
                 "type": "string"
               }
             ]
@@ -966,37 +966,37 @@
             "oneOf": [
               {
                 "const": "selection",
-                "description": "Wire value `selection`.",
+                "description": "The stretch that best identifies the node when presented.",
                 "type": "string"
               },
               {
                 "const": "name",
-                "description": "Wire value `name`.",
+                "description": "The name being declared.",
                 "type": "string"
               },
               {
                 "const": "header",
-                "description": "Wire value `header`.",
+                "description": "The declaration up to where the body starts.",
                 "type": "string"
               },
               {
                 "const": "body",
-                "description": "Wire value `body`.",
+                "description": "The implementation, without documentation or header.",
                 "type": "string"
               },
               {
                 "const": "content",
-                "description": "Wire value `content`.",
+                "description": "The interior of the node without its delimiters.",
                 "type": "string"
               },
               {
                 "const": "documentation",
-                "description": "Wire value `documentation`.",
+                "description": "The doc comment attached to the declaration.",
                 "type": "string"
               },
               {
                 "const": "enclosing",
-                "description": "Wire value `enclosing`.",
+                "description": "The full extent including what surrounds the node proper.",
                 "type": "string"
               }
             ]
@@ -1185,17 +1185,17 @@
             "oneOf": [
               {
                 "const": "authored",
-                "description": "Wire value `authored`.",
+                "description": "A person wrote it.",
                 "type": "string"
               },
               {
                 "const": "generated",
-                "description": "Wire value `generated`.",
+                "description": "A tool produced it from other source.",
                 "type": "string"
               },
               {
                 "const": "synthetic",
-                "description": "Wire value `synthetic`.",
+                "description": "The provider minted it without any source text.",
                 "type": "string"
               }
             ]
@@ -1412,152 +1412,152 @@
             "oneOf": [
               {
                 "const": "namespace",
-                "description": "Wire value `namespace`.",
+                "description": "A named scope that groups declarations.",
                 "type": "string"
               },
               {
                 "const": "module",
-                "description": "Wire value `module`.",
+                "description": "A compilation or import unit.",
                 "type": "string"
               },
               {
                 "const": "type",
-                "description": "Wire value `type`.",
+                "description": "Names a type.",
                 "type": "string"
               },
               {
                 "const": "value",
-                "description": "Wire value `value`.",
+                "description": "Holds a runtime value.",
                 "type": "string"
               },
               {
                 "const": "callable",
-                "description": "Wire value `callable`.",
+                "description": "Can be invoked.",
                 "type": "string"
               },
               {
                 "const": "member",
-                "description": "Wire value `member`.",
+                "description": "Belongs to a containing type.",
                 "type": "string"
               },
               {
                 "const": "member_container",
-                "description": "Wire value `member_container`.",
+                "description": "Owns members of its own.",
                 "type": "string"
               },
               {
                 "const": "parameter",
-                "description": "Wire value `parameter`.",
+                "description": "A declared input of a callable.",
                 "type": "string"
               },
               {
                 "const": "type_parameter",
-                "description": "Wire value `type_parameter`.",
+                "description": "A generic parameter a declaration abstracts over.",
                 "type": "string"
               },
               {
                 "const": "constructible",
-                "description": "Wire value `constructible`.",
+                "description": "Instances of it can be created.",
                 "type": "string"
               },
               {
                 "const": "extensible",
-                "description": "Wire value `extensible`.",
+                "description": "Other types can inherit from it.",
                 "type": "string"
               },
               {
                 "const": "implementable",
-                "description": "Wire value `implementable`.",
+                "description": "Other types can fulfil it.",
                 "type": "string"
               },
               {
                 "const": "macro",
-                "description": "Wire value `macro`.",
+                "description": "Expands at compile time.",
                 "type": "string"
               },
               {
                 "const": "test",
-                "description": "Wire value `test`.",
+                "description": "Exercises other code as a test.",
                 "type": "string"
               },
               {
                 "const": "annotation",
-                "description": "Wire value `annotation`.",
+                "description": "Decorates other declarations.",
                 "type": "string"
               },
               {
                 "const": "extension",
-                "description": "Wire value `extension`.",
+                "description": "Adds members to a type declared elsewhere.",
                 "type": "string"
               },
               {
                 "const": "variant",
-                "description": "Wire value `variant`.",
+                "description": "One case of an enumeration.",
                 "type": "string"
               },
               {
                 "const": "enumeration",
-                "description": "Wire value `enumeration`.",
+                "description": "A closed set of variants.",
                 "type": "string"
               },
               {
                 "const": "alias",
-                "description": "Wire value `alias`.",
+                "description": "Another name for an existing symbol.",
                 "type": "string"
               },
               {
                 "const": "property",
-                "description": "Wire value `property`.",
+                "description": "A member accessed like a field but backed by code.",
                 "type": "string"
               },
               {
                 "const": "abstract",
-                "description": "Wire value `abstract`.",
+                "description": "Declared without a complete implementation.",
                 "type": "string"
               },
               {
                 "const": "constructor",
-                "description": "Wire value `constructor`.",
+                "description": "Creates instances of its container.",
                 "type": "string"
               },
               {
                 "const": "static",
-                "description": "Wire value `static`.",
+                "description": "Belongs to the type rather than an instance.",
                 "type": "string"
               },
               {
                 "const": "mutable",
-                "description": "Wire value `mutable`.",
+                "description": "Its value can change after initialization.",
                 "type": "string"
               },
               {
                 "const": "public",
-                "description": "Wire value `public`.",
+                "description": "Visible outside its declaring scope.",
                 "type": "string"
               },
               {
                 "const": "deprecated",
-                "description": "Wire value `deprecated`.",
+                "description": "Marked as discouraged for new use.",
                 "type": "string"
               },
               {
                 "const": "entrypoint",
-                "description": "Wire value `entrypoint`.",
+                "description": "Where execution starts.",
                 "type": "string"
               },
               {
                 "const": "operator",
-                "description": "Wire value `operator`.",
+                "description": "Invoked through operator syntax.",
                 "type": "string"
               },
               {
                 "const": "async",
-                "description": "Wire value `async`.",
+                "description": "Runs asynchronously.",
                 "type": "string"
               },
               {
                 "const": "generator",
-                "description": "Wire value `generator`.",
+                "description": "Yields a sequence of values over time.",
                 "type": "string"
               }
             ]
@@ -1678,32 +1678,32 @@
             "oneOf": [
               {
                 "const": "introduced",
-                "description": "Wire value `introduced`.",
+                "description": "The revision brought the symbol into existence.",
                 "type": "string"
               },
               {
                 "const": "body_changed",
-                "description": "Wire value `body_changed`.",
+                "description": "The revision changed the implementation without touching the signature.",
                 "type": "string"
               },
               {
                 "const": "signature_changed",
-                "description": "Wire value `signature_changed`.",
+                "description": "The revision changed the declared interface.",
                 "type": "string"
               },
               {
                 "const": "moved",
-                "description": "Wire value `moved`.",
+                "description": "The revision relocated the declaration to another path.",
                 "type": "string"
               },
               {
                 "const": "removed",
-                "description": "Wire value `removed`.",
+                "description": "The revision deleted the declaration.",
                 "type": "string"
               },
               {
                 "const": "decorators_changed",
-                "description": "Wire value `decorators_changed`.",
+                "description": "The revision changed the annotations on the declaration.",
                 "type": "string"
               }
             ]
@@ -1762,17 +1762,17 @@
             "oneOf": [
               {
                 "const": "declared",
-                "description": "Wire value `declared`.",
+                "description": "Written in the source by the author.",
                 "type": "string"
               },
               {
                 "const": "inferred",
-                "description": "Wire value `inferred`.",
+                "description": "Worked out by the provider from usage.",
                 "type": "string"
               },
               {
                 "const": "expected",
-                "description": "Wire value `expected`.",
+                "description": "Required by the surrounding context.",
                 "type": "string"
               }
             ]
@@ -1782,62 +1782,62 @@
             "oneOf": [
               {
                 "const": "receiver",
-                "description": "Wire value `receiver`.",
+                "description": "The type of the implicit first parameter.",
                 "type": "string"
               },
               {
                 "const": "parameter",
-                "description": "Wire value `parameter`.",
+                "description": "The type a parameter accepts.",
                 "type": "string"
               },
               {
                 "const": "return",
-                "description": "Wire value `return`.",
+                "description": "The type a call yields.",
                 "type": "string"
               },
               {
                 "const": "field",
-                "description": "Wire value `field`.",
+                "description": "The type a field holds.",
                 "type": "string"
               },
               {
                 "const": "bound",
-                "description": "Wire value `bound`.",
+                "description": "A constraint on a type parameter.",
                 "type": "string"
               },
               {
                 "const": "element",
-                "description": "Wire value `element`.",
+                "description": "The type of a collection's entries.",
                 "type": "string"
               },
               {
                 "const": "key",
-                "description": "Wire value `key`.",
+                "description": "The type a map is indexed by.",
                 "type": "string"
               },
               {
                 "const": "error",
-                "description": "Wire value `error`.",
+                "description": "The type of the failure a fallible result carries.",
                 "type": "string"
               },
               {
                 "const": "underlying",
-                "description": "Wire value `underlying`.",
+                "description": "The type an alias or wrapper stands for.",
                 "type": "string"
               },
               {
                 "const": "yielded",
-                "description": "Wire value `yielded`.",
+                "description": "The type a generator produces per step.",
                 "type": "string"
               },
               {
                 "const": "awaited",
-                "description": "Wire value `awaited`.",
+                "description": "The type awaiting the value resolves to.",
                 "type": "string"
               },
               {
                 "const": "discriminant",
-                "description": "Wire value `discriminant`.",
+                "description": "The type that tags which variant a value holds.",
                 "type": "string"
               }
             ]
@@ -2788,7 +2788,7 @@
             "oneOf": [
               {
                 "const": "complete",
-                "description": "Wire value `complete`.",
+                "description": "Everything in scope is present.",
                 "type": "string"
               }
             ]
@@ -2798,7 +2798,7 @@
             "oneOf": [
               {
                 "const": "partial",
-                "description": "Wire value `partial`.",
+                "description": "Some of what is in scope is missing.",
                 "type": "string"
               }
             ]
@@ -2808,22 +2808,22 @@
             "oneOf": [
               {
                 "const": "request",
-                "description": "Wire value `request`.",
+                "description": "Only what this request touched.",
                 "type": "string"
               },
               {
                 "const": "project",
-                "description": "Wire value `project`.",
+                "description": "Every visible file of the workspace.",
                 "type": "string"
               },
               {
                 "const": "dependencies",
-                "description": "Wire value `dependencies`.",
+                "description": "The workspace's resolved dependencies.",
                 "type": "string"
               },
               {
                 "const": "all",
-                "description": "Wire value `all`.",
+                "description": "The workspace, its dependencies, and the standard library together.",
                 "type": "string"
               }
             ]
@@ -2852,7 +2852,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One file. The claim holds for that path and says nothing about any other.",
+                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
                 "properties": {
                   "kind": {
                     "const": "unit",
@@ -2876,12 +2876,12 @@
             "oneOf": [
               {
                 "const": "unsupported",
-                "description": "Wire value `unsupported`.",
+                "description": "No provider produces this family for the language.",
                 "type": "string"
               },
               {
                 "const": "not_applicable",
-                "description": "Wire value `not_applicable`.",
+                "description": "The family has no meaning for this language.",
                 "type": "string"
               }
             ]
@@ -2938,12 +2938,12 @@
             "oneOf": [
               {
                 "const": "current",
-                "description": "Wire value `current`.",
+                "description": "The derived state covers the answer's captured revisions.",
                 "type": "string"
               },
               {
                 "const": "stale",
-                "description": "Wire value `stale`.",
+                "description": "The derived state lags behind the answer's captured revisions.",
                 "type": "string"
               }
             ]
@@ -3087,92 +3087,92 @@
             "oneOf": [
               {
                 "const": "declaration",
-                "description": "Wire value `declaration`.",
+                "description": "Introduces a name.",
                 "type": "string"
               },
               {
                 "const": "definition",
-                "description": "Wire value `definition`.",
+                "description": "Supplies the implementation behind a declared name.",
                 "type": "string"
               },
               {
                 "const": "body",
-                "description": "Wire value `body`.",
+                "description": "The implementation part of a declaration.",
                 "type": "string"
               },
               {
                 "const": "block",
-                "description": "Wire value `block`.",
+                "description": "A delimited group of statements.",
                 "type": "string"
               },
               {
                 "const": "statement",
-                "description": "Wire value `statement`.",
+                "description": "One executable step.",
                 "type": "string"
               },
               {
                 "const": "expression",
-                "description": "Wire value `expression`.",
+                "description": "Computes a value.",
                 "type": "string"
               },
               {
                 "const": "type_expression",
-                "description": "Wire value `type_expression`.",
+                "description": "Spells a type.",
                 "type": "string"
               },
               {
                 "const": "import",
-                "description": "Wire value `import`.",
+                "description": "Brings an external name into scope.",
                 "type": "string"
               },
               {
                 "const": "export",
-                "description": "Wire value `export`.",
+                "description": "Exposes a name outside its unit.",
                 "type": "string"
               },
               {
                 "const": "parameter",
-                "description": "Wire value `parameter`.",
+                "description": "A declared input of a callable.",
                 "type": "string"
               },
               {
                 "const": "argument",
-                "description": "Wire value `argument`.",
+                "description": "A value passed at a call site.",
                 "type": "string"
               },
               {
                 "const": "annotation",
-                "description": "Wire value `annotation`.",
+                "description": "A decorator or attribute qualifying a construct.",
                 "type": "string"
               },
               {
                 "const": "comment",
-                "description": "Wire value `comment`.",
+                "description": "Commentary the language ignores.",
                 "type": "string"
               },
               {
                 "const": "identifier",
-                "description": "Wire value `identifier`.",
+                "description": "A name as written in the source.",
                 "type": "string"
               },
               {
                 "const": "literal",
-                "description": "Wire value `literal`.",
+                "description": "A value written out directly.",
                 "type": "string"
               },
               {
                 "const": "pattern",
-                "description": "Wire value `pattern`.",
+                "description": "A destructuring or match pattern.",
                 "type": "string"
               },
               {
                 "const": "generated",
-                "description": "Wire value `generated`.",
+                "description": "Produced by a tool rather than authored.",
                 "type": "string"
               },
               {
                 "const": "test",
-                "description": "Wire value `test`.",
+                "description": "Belongs to test code.",
                 "type": "string"
               }
             ]
@@ -3278,37 +3278,37 @@
             "oneOf": [
               {
                 "const": "selection",
-                "description": "Wire value `selection`.",
+                "description": "The stretch that best identifies the node when presented.",
                 "type": "string"
               },
               {
                 "const": "name",
-                "description": "Wire value `name`.",
+                "description": "The name being declared.",
                 "type": "string"
               },
               {
                 "const": "header",
-                "description": "Wire value `header`.",
+                "description": "The declaration up to where the body starts.",
                 "type": "string"
               },
               {
                 "const": "body",
-                "description": "Wire value `body`.",
+                "description": "The implementation, without documentation or header.",
                 "type": "string"
               },
               {
                 "const": "content",
-                "description": "Wire value `content`.",
+                "description": "The interior of the node without its delimiters.",
                 "type": "string"
               },
               {
                 "const": "documentation",
-                "description": "Wire value `documentation`.",
+                "description": "The doc comment attached to the declaration.",
                 "type": "string"
               },
               {
                 "const": "enclosing",
-                "description": "Wire value `enclosing`.",
+                "description": "The full extent including what surrounds the node proper.",
                 "type": "string"
               }
             ]
@@ -4238,57 +4238,57 @@
             "oneOf": [
               {
                 "const": "eq",
-                "description": "Wire value `eq`.",
+                "description": "The field equals the value.",
                 "type": "string"
               },
               {
                 "const": "ne",
-                "description": "Wire value `ne`.",
+                "description": "The field differs from the value.",
                 "type": "string"
               },
               {
                 "const": "in",
-                "description": "Wire value `in`.",
+                "description": "The field equals one of the listed values.",
                 "type": "string"
               },
               {
                 "const": "contains",
-                "description": "Wire value `contains`.",
+                "description": "The array field holds the value as an entry.",
                 "type": "string"
               },
               {
                 "const": "prefix",
-                "description": "Wire value `prefix`.",
+                "description": "The field starts with the value.",
                 "type": "string"
               },
               {
                 "const": "regex",
-                "description": "Wire value `regex`.",
+                "description": "The field matches the value as a regular expression.",
                 "type": "string"
               },
               {
                 "const": "gt",
-                "description": "Wire value `gt`.",
+                "description": "The field is greater than the value.",
                 "type": "string"
               },
               {
                 "const": "gte",
-                "description": "Wire value `gte`.",
+                "description": "The field is greater than or equal to the value.",
                 "type": "string"
               },
               {
                 "const": "lt",
-                "description": "Wire value `lt`.",
+                "description": "The field is less than the value.",
                 "type": "string"
               },
               {
                 "const": "lte",
-                "description": "Wire value `lte`.",
+                "description": "The field is less than or equal to the value.",
                 "type": "string"
               },
               {
                 "const": "exists",
-                "description": "Wire value `exists`.",
+                "description": "The field is present, whatever its value.",
                 "type": "string"
               }
             ]
@@ -4553,17 +4553,17 @@
             "oneOf": [
               {
                 "const": "outgoing",
-                "description": "Wire value `outgoing`.",
+                "description": "The edge starts at the entity being filtered.",
                 "type": "string"
               },
               {
                 "const": "incoming",
-                "description": "Wire value `incoming`.",
+                "description": "The edge points at the entity being filtered.",
                 "type": "string"
               },
               {
                 "const": "either",
-                "description": "Wire value `either`.",
+                "description": "The edge runs either way.",
                 "type": "string"
               }
             ]
@@ -4573,12 +4573,12 @@
             "oneOf": [
               {
                 "const": "exists",
-                "description": "Wire value `exists`.",
+                "description": "At least one such edge must exist.",
                 "type": "string"
               },
               {
                 "const": "not_exists",
-                "description": "Wire value `not_exists`.",
+                "description": "No such edge may exist.",
                 "type": "string"
               }
             ]
@@ -4588,147 +4588,147 @@
             "oneOf": [
               {
                 "const": "contains",
-                "description": "Wire value `contains`.",
+                "description": "The source contains the target within its scope.",
                 "type": "string"
               },
               {
                 "const": "declares",
-                "description": "Wire value `declares`.",
+                "description": "The source declares the target.",
                 "type": "string"
               },
               {
                 "const": "augments",
-                "description": "Wire value `augments`.",
+                "description": "The source adds to a declaration made elsewhere.",
                 "type": "string"
               },
               {
                 "const": "references",
-                "description": "Wire value `references`.",
+                "description": "The source mentions the target.",
                 "type": "string"
               },
               {
                 "const": "calls",
-                "description": "Wire value `calls`.",
+                "description": "The source invokes the target.",
                 "type": "string"
               },
               {
                 "const": "constructs",
-                "description": "Wire value `constructs`.",
+                "description": "The source creates an instance of the target.",
                 "type": "string"
               },
               {
                 "const": "reads",
-                "description": "Wire value `reads`.",
+                "description": "The source reads the target's value.",
                 "type": "string"
               },
               {
                 "const": "writes",
-                "description": "Wire value `writes`.",
+                "description": "The source assigns to the target.",
                 "type": "string"
               },
               {
                 "const": "imports",
-                "description": "Wire value `imports`.",
+                "description": "The source brings the target into scope.",
                 "type": "string"
               },
               {
                 "const": "exports",
-                "description": "Wire value `exports`.",
+                "description": "The source exposes the target outside its unit.",
                 "type": "string"
               },
               {
                 "const": "extends",
-                "description": "Wire value `extends`.",
+                "description": "The source inherits from the target.",
                 "type": "string"
               },
               {
                 "const": "implements",
-                "description": "Wire value `implements`.",
+                "description": "The source fulfils the target's interface.",
                 "type": "string"
               },
               {
                 "const": "has_type",
-                "description": "Wire value `has_type`.",
+                "description": "The source is typed by the target.",
                 "type": "string"
               },
               {
                 "const": "overrides",
-                "description": "Wire value `overrides`.",
+                "description": "The source replaces the target inherited from a supertype.",
                 "type": "string"
               },
               {
                 "const": "aliases",
-                "description": "Wire value `aliases`.",
+                "description": "The source is another name for the target.",
                 "type": "string"
               },
               {
                 "const": "generates",
-                "description": "Wire value `generates`.",
+                "description": "The source produces the target as generated code.",
                 "type": "string"
               },
               {
                 "const": "depends_on",
-                "description": "Wire value `depends_on`.",
+                "description": "The source requires the target to build or run.",
                 "type": "string"
               },
               {
                 "const": "annotated_by",
-                "description": "Wire value `annotated_by`.",
+                "description": "The source carries the target as an annotation.",
                 "type": "string"
               },
               {
                 "const": "throws",
-                "description": "Wire value `throws`.",
+                "description": "The source can raise the target.",
                 "type": "string"
               },
               {
                 "const": "catches",
-                "description": "Wire value `catches`.",
+                "description": "The source handles the target when raised.",
                 "type": "string"
               },
               {
                 "const": "bounded_by",
-                "description": "Wire value `bounded_by`.",
+                "description": "The source's type parameter is constrained by the target.",
                 "type": "string"
               },
               {
                 "const": "instantiates",
-                "description": "Wire value `instantiates`.",
+                "description": "The source applies concrete arguments to the generic target.",
                 "type": "string"
               },
               {
                 "const": "specializes",
-                "description": "Wire value `specializes`.",
+                "description": "The source is a specialization of the generic target.",
                 "type": "string"
               },
               {
                 "const": "overloads",
-                "description": "Wire value `overloads`.",
+                "description": "The source and target are separately dispatched forms of one name.",
                 "type": "string"
               },
               {
                 "const": "mixes_in",
-                "description": "Wire value `mixes_in`.",
+                "description": "The source incorporates the target as a mixin.",
                 "type": "string"
               },
               {
                 "const": "embeds",
-                "description": "Wire value `embeds`.",
+                "description": "The source embeds the target within its own definition.",
                 "type": "string"
               },
               {
                 "const": "tests",
-                "description": "Wire value `tests`.",
+                "description": "The source exercises the target as a test.",
                 "type": "string"
               },
               {
                 "const": "configures",
-                "description": "Wire value `configures`.",
+                "description": "The source supplies configuration for the target.",
                 "type": "string"
               },
               {
                 "const": "binds",
-                "description": "Wire value `binds`.",
+                "description": "The source binds a name or value to the target.",
                 "type": "string"
               }
             ]
@@ -4738,17 +4738,17 @@
             "oneOf": [
               {
                 "const": "relevance",
-                "description": "Wire value `relevance`.",
+                "description": "Best score first, with identity breaking ties.",
                 "type": "string"
               },
               {
                 "const": "path",
-                "description": "Wire value `path`.",
+                "description": "Project path order, with identity breaking ties.",
                 "type": "string"
               },
               {
                 "const": "identity",
-                "description": "Wire value `identity`.",
+                "description": "The result's own identity alone.",
                 "type": "string"
               }
             ]
@@ -4758,22 +4758,22 @@
             "oneOf": [
               {
                 "const": "source",
-                "description": "Wire value `source`.",
+                "description": "The source around each hit, with its span.",
                 "type": "string"
               },
               {
                 "const": "signature",
-                "description": "Wire value `signature`.",
+                "description": "Rendered signatures for symbol hits.",
                 "type": "string"
               },
               {
                 "const": "relationships",
-                "description": "Wire value `relationships`.",
+                "description": "Edges from each hit.",
                 "type": "string"
               },
               {
                 "const": "diagnostics",
-                "description": "Wire value `diagnostics`.",
+                "description": "Provider findings at each hit.",
                 "type": "string"
               }
             ]
@@ -4783,22 +4783,22 @@
             "oneOf": [
               {
                 "const": "trace",
-                "description": "Wire value `trace`.",
+                "description": "Follows execution outward from the seed.",
                 "type": "string"
               },
               {
                 "const": "find_tests",
-                "description": "Wire value `find_tests`.",
+                "description": "Finds the tests that exercise the seed.",
                 "type": "string"
               },
               {
                 "const": "edit_ripple",
-                "description": "Wire value `edit_ripple`.",
+                "description": "Estimates what an edit to the seed would disturb.",
                 "type": "string"
               },
               {
                 "const": "review_context",
-                "description": "Wire value `review_context`.",
+                "description": "Gathers what a reviewer of the seed should see.",
                 "type": "string"
               }
             ]
@@ -4808,22 +4808,22 @@
             "oneOf": [
               {
                 "const": "symbol",
-                "description": "Wire value `symbol`.",
+                "description": "Only declarations may match.",
                 "type": "string"
               },
               {
                 "const": "node",
-                "description": "Wire value `node`.",
+                "description": "Only syntax-tree nodes may match.",
                 "type": "string"
               },
               {
                 "const": "file",
-                "description": "Wire value `file`.",
+                "description": "Only tree entries may match.",
                 "type": "string"
               },
               {
                 "const": "all",
-                "description": "Wire value `all`.",
+                "description": "Any entity kind may match.",
                 "type": "string"
               }
             ]
@@ -4833,17 +4833,17 @@
             "oneOf": [
               {
                 "const": "project",
-                "description": "Wire value `project`.",
+                "description": "Only source the workspace owns.",
                 "type": "string"
               },
               {
                 "const": "dependencies",
-                "description": "Wire value `dependencies`.",
+                "description": "Only source of resolved dependencies.",
                 "type": "string"
               },
               {
                 "const": "all",
-                "description": "Wire value `all`.",
+                "description": "Project, dependency, and standard-library source alike.",
                 "type": "string"
               }
             ]
@@ -4919,17 +4919,17 @@
             "oneOf": [
               {
                 "const": "outgoing",
-                "description": "Wire value `outgoing`.",
+                "description": "Walks edges leaving each visited symbol.",
                 "type": "string"
               },
               {
                 "const": "incoming",
-                "description": "Wire value `incoming`.",
+                "description": "Walks edges arriving at each visited symbol.",
                 "type": "string"
               },
               {
                 "const": "both",
-                "description": "Wire value `both`.",
+                "description": "Walks edges in both directions.",
                 "type": "string"
               }
             ]
@@ -5214,7 +5214,7 @@
             "oneOf": [
               {
                 "const": "complete",
-                "description": "Wire value `complete`.",
+                "description": "Everything in scope is present.",
                 "type": "string"
               }
             ]
@@ -5224,7 +5224,7 @@
             "oneOf": [
               {
                 "const": "partial",
-                "description": "Wire value `partial`.",
+                "description": "Some of what is in scope is missing.",
                 "type": "string"
               }
             ]
@@ -5234,22 +5234,22 @@
             "oneOf": [
               {
                 "const": "request",
-                "description": "Wire value `request`.",
+                "description": "Only what this request touched.",
                 "type": "string"
               },
               {
                 "const": "project",
-                "description": "Wire value `project`.",
+                "description": "Every visible file of the workspace.",
                 "type": "string"
               },
               {
                 "const": "dependencies",
-                "description": "Wire value `dependencies`.",
+                "description": "The workspace's resolved dependencies.",
                 "type": "string"
               },
               {
                 "const": "all",
-                "description": "Wire value `all`.",
+                "description": "The workspace, its dependencies, and the standard library together.",
                 "type": "string"
               }
             ]
@@ -5278,7 +5278,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One file. The claim holds for that path and says nothing about any other.",
+                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
                 "properties": {
                   "kind": {
                     "const": "unit",
@@ -5302,12 +5302,12 @@
             "oneOf": [
               {
                 "const": "unsupported",
-                "description": "Wire value `unsupported`.",
+                "description": "No provider produces this family for the language.",
                 "type": "string"
               },
               {
                 "const": "not_applicable",
-                "description": "Wire value `not_applicable`.",
+                "description": "The family has no meaning for this language.",
                 "type": "string"
               }
             ]
@@ -5491,17 +5491,17 @@
             "oneOf": [
               {
                 "const": "provider",
-                "description": "Wire value `provider`.",
+                "description": "A language provider emitted the finding.",
                 "type": "string"
               },
               {
                 "const": "hook",
-                "description": "Wire value `hook`.",
+                "description": "A configured hook emitted the finding.",
                 "type": "string"
               },
               {
                 "const": "apply",
-                "description": "Wire value `apply`.",
+                "description": "Applying a change request emitted the finding.",
                 "type": "string"
               }
             ]
@@ -5511,17 +5511,17 @@
             "oneOf": [
               {
                 "const": "repairable",
-                "description": "Wire value `repairable`.",
+                "description": "The producer recovered and later facts remain reliable.",
                 "type": "string"
               },
               {
                 "const": "unrepairable",
-                "description": "Wire value `unrepairable`.",
+                "description": "The producer could not recover, so later facts are suspect.",
                 "type": "string"
               },
               {
                 "const": "unknown",
-                "description": "Wire value `unknown`.",
+                "description": "The producer does not say whether it recovered.",
                 "type": "string"
               }
             ]
@@ -5551,12 +5551,12 @@
             "oneOf": [
               {
                 "const": "reliable",
-                "description": "Wire value `reliable`.",
+                "description": "The surrounding facts came off a clean parse.",
                 "type": "string"
               },
               {
                 "const": "recovered",
-                "description": "Wire value `recovered`.",
+                "description": "The parser recovered nearby, so surrounding facts may be off.",
                 "type": "string"
               }
             ]
@@ -5566,12 +5566,12 @@
             "oneOf": [
               {
                 "const": "deprecated",
-                "description": "Wire value `deprecated`.",
+                "description": "The code the finding points at is deprecated.",
                 "type": "string"
               },
               {
                 "const": "unnecessary",
-                "description": "Wire value `unnecessary`.",
+                "description": "The code the finding points at is unused or has no effect.",
                 "type": "string"
               }
             ]
@@ -5605,12 +5605,12 @@
             "oneOf": [
               {
                 "const": "plain",
-                "description": "Wire value `plain`.",
+                "description": "Plain text with no markup to render.",
                 "type": "string"
               },
               {
                 "const": "markdown",
-                "description": "Wire value `markdown`.",
+                "description": "Markdown as authored in the source.",
                 "type": "string"
               }
             ]
@@ -5783,12 +5783,12 @@
             "oneOf": [
               {
                 "const": "current",
-                "description": "Wire value `current`.",
+                "description": "The derived state covers the answer's captured revisions.",
                 "type": "string"
               },
               {
                 "const": "stale",
-                "description": "Wire value `stale`.",
+                "description": "The derived state lags behind the answer's captured revisions.",
                 "type": "string"
               }
             ]
@@ -5817,12 +5817,12 @@
             "oneOf": [
               {
                 "const": "outgoing",
-                "description": "Wire value `outgoing`.",
+                "description": "The walk followed the edge from source to target.",
                 "type": "string"
               },
               {
                 "const": "incoming",
-                "description": "Wire value `incoming`.",
+                "description": "The walk followed the edge against its direction, from target to source.",
                 "type": "string"
               }
             ]
@@ -5906,32 +5906,32 @@
             "oneOf": [
               {
                 "const": "name",
-                "description": "Wire value `name`.",
+                "description": "The declaration's name matched.",
                 "type": "string"
               },
               {
                 "const": "signature",
-                "description": "Wire value `signature`.",
+                "description": "A rendered signature matched.",
                 "type": "string"
               },
               {
                 "const": "documentation",
-                "description": "Wire value `documentation`.",
+                "description": "An attached doc comment matched.",
                 "type": "string"
               },
               {
                 "const": "content",
-                "description": "Wire value `content`.",
+                "description": "The file's contents matched.",
                 "type": "string"
               },
               {
                 "const": "path",
-                "description": "Wire value `path`.",
+                "description": "The project-relative path matched.",
                 "type": "string"
               },
               {
                 "const": "relationship",
-                "description": "Wire value `relationship`.",
+                "description": "A relationship traversal reached the hit.",
                 "type": "string"
               }
             ]
@@ -6020,92 +6020,92 @@
             "oneOf": [
               {
                 "const": "declaration",
-                "description": "Wire value `declaration`.",
+                "description": "Introduces a name.",
                 "type": "string"
               },
               {
                 "const": "definition",
-                "description": "Wire value `definition`.",
+                "description": "Supplies the implementation behind a declared name.",
                 "type": "string"
               },
               {
                 "const": "body",
-                "description": "Wire value `body`.",
+                "description": "The implementation part of a declaration.",
                 "type": "string"
               },
               {
                 "const": "block",
-                "description": "Wire value `block`.",
+                "description": "A delimited group of statements.",
                 "type": "string"
               },
               {
                 "const": "statement",
-                "description": "Wire value `statement`.",
+                "description": "One executable step.",
                 "type": "string"
               },
               {
                 "const": "expression",
-                "description": "Wire value `expression`.",
+                "description": "Computes a value.",
                 "type": "string"
               },
               {
                 "const": "type_expression",
-                "description": "Wire value `type_expression`.",
+                "description": "Spells a type.",
                 "type": "string"
               },
               {
                 "const": "import",
-                "description": "Wire value `import`.",
+                "description": "Brings an external name into scope.",
                 "type": "string"
               },
               {
                 "const": "export",
-                "description": "Wire value `export`.",
+                "description": "Exposes a name outside its unit.",
                 "type": "string"
               },
               {
                 "const": "parameter",
-                "description": "Wire value `parameter`.",
+                "description": "A declared input of a callable.",
                 "type": "string"
               },
               {
                 "const": "argument",
-                "description": "Wire value `argument`.",
+                "description": "A value passed at a call site.",
                 "type": "string"
               },
               {
                 "const": "annotation",
-                "description": "Wire value `annotation`.",
+                "description": "A decorator or attribute qualifying a construct.",
                 "type": "string"
               },
               {
                 "const": "comment",
-                "description": "Wire value `comment`.",
+                "description": "Commentary the language ignores.",
                 "type": "string"
               },
               {
                 "const": "identifier",
-                "description": "Wire value `identifier`.",
+                "description": "A name as written in the source.",
                 "type": "string"
               },
               {
                 "const": "literal",
-                "description": "Wire value `literal`.",
+                "description": "A value written out directly.",
                 "type": "string"
               },
               {
                 "const": "pattern",
-                "description": "Wire value `pattern`.",
+                "description": "A destructuring or match pattern.",
                 "type": "string"
               },
               {
                 "const": "generated",
-                "description": "Wire value `generated`.",
+                "description": "Produced by a tool rather than authored.",
                 "type": "string"
               },
               {
                 "const": "test",
-                "description": "Wire value `test`.",
+                "description": "Belongs to test code.",
                 "type": "string"
               }
             ]
@@ -6298,37 +6298,37 @@
             "oneOf": [
               {
                 "const": "selection",
-                "description": "Wire value `selection`.",
+                "description": "The stretch that best identifies the node when presented.",
                 "type": "string"
               },
               {
                 "const": "name",
-                "description": "Wire value `name`.",
+                "description": "The name being declared.",
                 "type": "string"
               },
               {
                 "const": "header",
-                "description": "Wire value `header`.",
+                "description": "The declaration up to where the body starts.",
                 "type": "string"
               },
               {
                 "const": "body",
-                "description": "Wire value `body`.",
+                "description": "The implementation, without documentation or header.",
                 "type": "string"
               },
               {
                 "const": "content",
-                "description": "Wire value `content`.",
+                "description": "The interior of the node without its delimiters.",
                 "type": "string"
               },
               {
                 "const": "documentation",
-                "description": "Wire value `documentation`.",
+                "description": "The doc comment attached to the declaration.",
                 "type": "string"
               },
               {
                 "const": "enclosing",
-                "description": "Wire value `enclosing`.",
+                "description": "The full extent including what surrounds the node proper.",
                 "type": "string"
               }
             ]
@@ -6400,17 +6400,17 @@
             "oneOf": [
               {
                 "const": "resolution",
-                "description": "Wire value `resolution`.",
+                "description": "The provider resolved the edge semantically, so a consumer may act on it directly.",
                 "type": "string"
               },
               {
                 "const": "syntax",
-                "description": "Wire value `syntax`.",
+                "description": "The edge was read from syntax alone, without semantic resolution.",
                 "type": "string"
               },
               {
                 "const": "heuristic",
-                "description": "Wire value `heuristic`.",
+                "description": "The edge is a guess, qualified by `confidence`.",
                 "type": "string"
               }
             ]
@@ -6420,147 +6420,147 @@
             "oneOf": [
               {
                 "const": "contains",
-                "description": "Wire value `contains`.",
+                "description": "The source contains the target within its scope.",
                 "type": "string"
               },
               {
                 "const": "declares",
-                "description": "Wire value `declares`.",
+                "description": "The source declares the target.",
                 "type": "string"
               },
               {
                 "const": "augments",
-                "description": "Wire value `augments`.",
+                "description": "The source adds to a declaration made elsewhere.",
                 "type": "string"
               },
               {
                 "const": "references",
-                "description": "Wire value `references`.",
+                "description": "The source mentions the target.",
                 "type": "string"
               },
               {
                 "const": "calls",
-                "description": "Wire value `calls`.",
+                "description": "The source invokes the target.",
                 "type": "string"
               },
               {
                 "const": "constructs",
-                "description": "Wire value `constructs`.",
+                "description": "The source creates an instance of the target.",
                 "type": "string"
               },
               {
                 "const": "reads",
-                "description": "Wire value `reads`.",
+                "description": "The source reads the target's value.",
                 "type": "string"
               },
               {
                 "const": "writes",
-                "description": "Wire value `writes`.",
+                "description": "The source assigns to the target.",
                 "type": "string"
               },
               {
                 "const": "imports",
-                "description": "Wire value `imports`.",
+                "description": "The source brings the target into scope.",
                 "type": "string"
               },
               {
                 "const": "exports",
-                "description": "Wire value `exports`.",
+                "description": "The source exposes the target outside its unit.",
                 "type": "string"
               },
               {
                 "const": "extends",
-                "description": "Wire value `extends`.",
+                "description": "The source inherits from the target.",
                 "type": "string"
               },
               {
                 "const": "implements",
-                "description": "Wire value `implements`.",
+                "description": "The source fulfils the target's interface.",
                 "type": "string"
               },
               {
                 "const": "has_type",
-                "description": "Wire value `has_type`.",
+                "description": "The source is typed by the target.",
                 "type": "string"
               },
               {
                 "const": "overrides",
-                "description": "Wire value `overrides`.",
+                "description": "The source replaces the target inherited from a supertype.",
                 "type": "string"
               },
               {
                 "const": "aliases",
-                "description": "Wire value `aliases`.",
+                "description": "The source is another name for the target.",
                 "type": "string"
               },
               {
                 "const": "generates",
-                "description": "Wire value `generates`.",
+                "description": "The source produces the target as generated code.",
                 "type": "string"
               },
               {
                 "const": "depends_on",
-                "description": "Wire value `depends_on`.",
+                "description": "The source requires the target to build or run.",
                 "type": "string"
               },
               {
                 "const": "annotated_by",
-                "description": "Wire value `annotated_by`.",
+                "description": "The source carries the target as an annotation.",
                 "type": "string"
               },
               {
                 "const": "throws",
-                "description": "Wire value `throws`.",
+                "description": "The source can raise the target.",
                 "type": "string"
               },
               {
                 "const": "catches",
-                "description": "Wire value `catches`.",
+                "description": "The source handles the target when raised.",
                 "type": "string"
               },
               {
                 "const": "bounded_by",
-                "description": "Wire value `bounded_by`.",
+                "description": "The source's type parameter is constrained by the target.",
                 "type": "string"
               },
               {
                 "const": "instantiates",
-                "description": "Wire value `instantiates`.",
+                "description": "The source applies concrete arguments to the generic target.",
                 "type": "string"
               },
               {
                 "const": "specializes",
-                "description": "Wire value `specializes`.",
+                "description": "The source is a specialization of the generic target.",
                 "type": "string"
               },
               {
                 "const": "overloads",
-                "description": "Wire value `overloads`.",
+                "description": "The source and target are separately dispatched forms of one name.",
                 "type": "string"
               },
               {
                 "const": "mixes_in",
-                "description": "Wire value `mixes_in`.",
+                "description": "The source incorporates the target as a mixin.",
                 "type": "string"
               },
               {
                 "const": "embeds",
-                "description": "Wire value `embeds`.",
+                "description": "The source embeds the target within its own definition.",
                 "type": "string"
               },
               {
                 "const": "tests",
-                "description": "Wire value `tests`.",
+                "description": "The source exercises the target as a test.",
                 "type": "string"
               },
               {
                 "const": "configures",
-                "description": "Wire value `configures`.",
+                "description": "The source supplies configuration for the target.",
                 "type": "string"
               },
               {
                 "const": "binds",
-                "description": "Wire value `binds`.",
+                "description": "The source binds a name or value to the target.",
                 "type": "string"
               }
             ]
@@ -6790,22 +6790,22 @@
             "oneOf": [
               {
                 "const": "error",
-                "description": "Wire value `error`.",
+                "description": "The provider judges the code wrong.",
                 "type": "string"
               },
               {
                 "const": "warning",
-                "description": "Wire value `warning`.",
+                "description": "Suspect but not necessarily wrong.",
                 "type": "string"
               },
               {
                 "const": "info",
-                "description": "Wire value `info`.",
+                "description": "Informational, with nothing to fix.",
                 "type": "string"
               },
               {
                 "const": "hint",
-                "description": "Wire value `hint`.",
+                "description": "A gentle suggestion a consumer may hide.",
                 "type": "string"
               }
             ]
@@ -6989,17 +6989,17 @@
             "oneOf": [
               {
                 "const": "authored",
-                "description": "Wire value `authored`.",
+                "description": "A person wrote it.",
                 "type": "string"
               },
               {
                 "const": "generated",
-                "description": "Wire value `generated`.",
+                "description": "A tool produced it from other source.",
                 "type": "string"
               },
               {
                 "const": "synthetic",
-                "description": "Wire value `synthetic`.",
+                "description": "The provider minted it without any source text.",
                 "type": "string"
               }
             ]
@@ -7235,152 +7235,152 @@
             "oneOf": [
               {
                 "const": "namespace",
-                "description": "Wire value `namespace`.",
+                "description": "A named scope that groups declarations.",
                 "type": "string"
               },
               {
                 "const": "module",
-                "description": "Wire value `module`.",
+                "description": "A compilation or import unit.",
                 "type": "string"
               },
               {
                 "const": "type",
-                "description": "Wire value `type`.",
+                "description": "Names a type.",
                 "type": "string"
               },
               {
                 "const": "value",
-                "description": "Wire value `value`.",
+                "description": "Holds a runtime value.",
                 "type": "string"
               },
               {
                 "const": "callable",
-                "description": "Wire value `callable`.",
+                "description": "Can be invoked.",
                 "type": "string"
               },
               {
                 "const": "member",
-                "description": "Wire value `member`.",
+                "description": "Belongs to a containing type.",
                 "type": "string"
               },
               {
                 "const": "member_container",
-                "description": "Wire value `member_container`.",
+                "description": "Owns members of its own.",
                 "type": "string"
               },
               {
                 "const": "parameter",
-                "description": "Wire value `parameter`.",
+                "description": "A declared input of a callable.",
                 "type": "string"
               },
               {
                 "const": "type_parameter",
-                "description": "Wire value `type_parameter`.",
+                "description": "A generic parameter a declaration abstracts over.",
                 "type": "string"
               },
               {
                 "const": "constructible",
-                "description": "Wire value `constructible`.",
+                "description": "Instances of it can be created.",
                 "type": "string"
               },
               {
                 "const": "extensible",
-                "description": "Wire value `extensible`.",
+                "description": "Other types can inherit from it.",
                 "type": "string"
               },
               {
                 "const": "implementable",
-                "description": "Wire value `implementable`.",
+                "description": "Other types can fulfil it.",
                 "type": "string"
               },
               {
                 "const": "macro",
-                "description": "Wire value `macro`.",
+                "description": "Expands at compile time.",
                 "type": "string"
               },
               {
                 "const": "test",
-                "description": "Wire value `test`.",
+                "description": "Exercises other code as a test.",
                 "type": "string"
               },
               {
                 "const": "annotation",
-                "description": "Wire value `annotation`.",
+                "description": "Decorates other declarations.",
                 "type": "string"
               },
               {
                 "const": "extension",
-                "description": "Wire value `extension`.",
+                "description": "Adds members to a type declared elsewhere.",
                 "type": "string"
               },
               {
                 "const": "variant",
-                "description": "Wire value `variant`.",
+                "description": "One case of an enumeration.",
                 "type": "string"
               },
               {
                 "const": "enumeration",
-                "description": "Wire value `enumeration`.",
+                "description": "A closed set of variants.",
                 "type": "string"
               },
               {
                 "const": "alias",
-                "description": "Wire value `alias`.",
+                "description": "Another name for an existing symbol.",
                 "type": "string"
               },
               {
                 "const": "property",
-                "description": "Wire value `property`.",
+                "description": "A member accessed like a field but backed by code.",
                 "type": "string"
               },
               {
                 "const": "abstract",
-                "description": "Wire value `abstract`.",
+                "description": "Declared without a complete implementation.",
                 "type": "string"
               },
               {
                 "const": "constructor",
-                "description": "Wire value `constructor`.",
+                "description": "Creates instances of its container.",
                 "type": "string"
               },
               {
                 "const": "static",
-                "description": "Wire value `static`.",
+                "description": "Belongs to the type rather than an instance.",
                 "type": "string"
               },
               {
                 "const": "mutable",
-                "description": "Wire value `mutable`.",
+                "description": "Its value can change after initialization.",
                 "type": "string"
               },
               {
                 "const": "public",
-                "description": "Wire value `public`.",
+                "description": "Visible outside its declaring scope.",
                 "type": "string"
               },
               {
                 "const": "deprecated",
-                "description": "Wire value `deprecated`.",
+                "description": "Marked as discouraged for new use.",
                 "type": "string"
               },
               {
                 "const": "entrypoint",
-                "description": "Wire value `entrypoint`.",
+                "description": "Where execution starts.",
                 "type": "string"
               },
               {
                 "const": "operator",
-                "description": "Wire value `operator`.",
+                "description": "Invoked through operator syntax.",
                 "type": "string"
               },
               {
                 "const": "async",
-                "description": "Wire value `async`.",
+                "description": "Runs asynchronously.",
                 "type": "string"
               },
               {
                 "const": "generator",
-                "description": "Wire value `generator`.",
+                "description": "Yields a sequence of values over time.",
                 "type": "string"
               }
             ]
@@ -7484,17 +7484,17 @@
             "oneOf": [
               {
                 "const": "declared",
-                "description": "Wire value `declared`.",
+                "description": "Written in the source by the author.",
                 "type": "string"
               },
               {
                 "const": "inferred",
-                "description": "Wire value `inferred`.",
+                "description": "Worked out by the provider from usage.",
                 "type": "string"
               },
               {
                 "const": "expected",
-                "description": "Wire value `expected`.",
+                "description": "Required by the surrounding context.",
                 "type": "string"
               }
             ]
@@ -7504,62 +7504,62 @@
             "oneOf": [
               {
                 "const": "receiver",
-                "description": "Wire value `receiver`.",
+                "description": "The type of the implicit first parameter.",
                 "type": "string"
               },
               {
                 "const": "parameter",
-                "description": "Wire value `parameter`.",
+                "description": "The type a parameter accepts.",
                 "type": "string"
               },
               {
                 "const": "return",
-                "description": "Wire value `return`.",
+                "description": "The type a call yields.",
                 "type": "string"
               },
               {
                 "const": "field",
-                "description": "Wire value `field`.",
+                "description": "The type a field holds.",
                 "type": "string"
               },
               {
                 "const": "bound",
-                "description": "Wire value `bound`.",
+                "description": "A constraint on a type parameter.",
                 "type": "string"
               },
               {
                 "const": "element",
-                "description": "Wire value `element`.",
+                "description": "The type of a collection's entries.",
                 "type": "string"
               },
               {
                 "const": "key",
-                "description": "Wire value `key`.",
+                "description": "The type a map is indexed by.",
                 "type": "string"
               },
               {
                 "const": "error",
-                "description": "Wire value `error`.",
+                "description": "The type of the failure a fallible result carries.",
                 "type": "string"
               },
               {
                 "const": "underlying",
-                "description": "Wire value `underlying`.",
+                "description": "The type an alias or wrapper stands for.",
                 "type": "string"
               },
               {
                 "const": "yielded",
-                "description": "Wire value `yielded`.",
+                "description": "The type a generator produces per step.",
                 "type": "string"
               },
               {
                 "const": "awaited",
-                "description": "Wire value `awaited`.",
+                "description": "The type awaiting the value resolves to.",
                 "type": "string"
               },
               {
                 "const": "discriminant",
-                "description": "Wire value `discriminant`.",
+                "description": "The type that tags which variant a value holds.",
                 "type": "string"
               }
             ]

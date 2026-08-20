@@ -1,12 +1,10 @@
-//! Validation gate for the served MCP surface.
-//!
-//! Every advertised tool has request coverage in the corpus below, every
-//! corpus request satisfies the tool's advertised input schema, and every
-//! structured result validates against the tool's advertised output schema.
-//! Both `next_cursor` arms are proven against the schema a client enforces:
-//! the `null` arm from live results, the present arm by revalidating a page
-//! with a cursor spliced in. The walk also follows any cursor a result
-//! returns, so live pagination joins the gate as soon as a read mints one.
+//! Validates and verifies the behaviour of every advertised tool on the MCP
+//! surface: each corpus request against the tool's advertised input schema,
+//! each structured result against its advertised output schema, and every
+//! sub-variant a result can take — the `next_cursor` string and `null` arms,
+//! cohesive cursor walkthroughs across pages, and so on. The walk follows any
+//! cursor a result returns, so live pagination joins the gate as soon as a
+//! read mints one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -24,9 +22,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// Most cursor pages one corpus request may walk before the gate fails.
 const FOLLOWED_PAGES_MAX: usize = 16;
 
-/// One request per advertised tool behavior worth proving: a single exact
-/// hit, a paginated prefix listing, a body-free lookup, and node listings
-/// at a declaration's first byte and inside its body.
+/// Sample validation corpus with various scenarios: one request per
+/// advertised tool behavior worth proving.
 fn corpus() -> Vec<(&'static str, Value)> {
     vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
