@@ -30,12 +30,14 @@ use sha2::{Digest as _, Sha256};
 pub enum ReadErrorKind {
     /// Workspace could not be indexed.
     Index,
-    /// Request uses functionality not served by v0.0.2.
+    /// Request uses functionality this release does not serve.
     Unsupported,
     /// Request is invalid for direct workspace reads.
     Invalid,
     /// Requested source does not exist.
     NotFound,
+    /// Workspace files could not be read or written.
+    Storage,
 }
 
 /// Opaque read-service failure.
@@ -55,14 +57,14 @@ impl ReadError {
         }
     }
 
-    fn unsupported(capability: &'static str) -> Self {
+    pub(crate) fn unsupported(capability: &'static str) -> Self {
         Self::new(
             ReadErrorKind::Unsupported,
             vec![ErrorContext::new("capability", capability)],
         )
     }
 
-    fn invalid(field: &'static str, violation: impl Into<String>) -> Self {
+    pub(crate) fn invalid(field: &'static str, violation: impl Into<String>) -> Self {
         Self::new(
             ReadErrorKind::Invalid,
             vec![
@@ -72,10 +74,25 @@ impl ReadError {
         )
     }
 
-    fn not_found(path: impl Into<String>) -> Self {
+    pub(crate) fn not_found(path: impl Into<String>) -> Self {
         Self::new(
             ReadErrorKind::NotFound,
             vec![ErrorContext::new("path", path)],
+        )
+    }
+
+    pub(crate) fn storage(
+        path: impl Into<String>,
+        operation: &'static str,
+        io: &std::io::Error,
+    ) -> Self {
+        Self::new(
+            ReadErrorKind::Storage,
+            vec![
+                ErrorContext::new("path", path),
+                ErrorContext::new("operation", operation),
+                ErrorContext::new("io", io.to_string()),
+            ],
         )
     }
 
@@ -110,6 +127,7 @@ impl ReadError {
             }
             ReadErrorKind::Invalid => ErrorRegistry::descriptor(ErrorName::InvalidRequest),
             ReadErrorKind::NotFound => ErrorRegistry::descriptor(ErrorName::ResourceNotFound),
+            ReadErrorKind::Storage => ErrorRegistry::descriptor(ErrorName::StorageFailure),
         }
     }
 
@@ -159,6 +177,11 @@ impl ReadService {
             source_revision: Digest(digest),
         };
         Ok(Self { index, snapshot })
+    }
+
+    /// Returns the immutable workspace index this snapshot serves.
+    pub(crate) const fn index(&self) -> &WorkspaceIndex {
+        &self.index
     }
 
     /// Reads Rust syntax nodes covering one UTF-8 byte position.
@@ -343,7 +366,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
         .find(|node| node.range == matched.symbol.range);
     node.map_or_else(
         || Node {
-            id: NodeId(node_address(matched.file, "item", matched.symbol.range)),
+            id: NodeId(node_address(matched.file, matched.symbol.range)),
             symbol: Some(symbol_id(matched.file, matched.symbol)),
             unit: file_id(matched.file),
             language: rust_language(),
@@ -458,7 +481,7 @@ fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
     }
 }
 
-fn source_span(file: &IndexedFile, range: ByteRange) -> SourceUnitSpan {
+pub(crate) fn source_span(file: &IndexedFile, range: ByteRange) -> SourceUnitSpan {
     SourceUnitSpan {
         unit: source_unit_id(file),
         range: text_range(range),
@@ -479,11 +502,11 @@ fn rust_language() -> Language {
     }
 }
 
-fn file_id(file: &IndexedFile) -> FileId {
+pub(crate) fn file_id(file: &IndexedFile) -> FileId {
     FileId(format!("rift://file/{}", encode_path(file.path().as_str())))
 }
 
-fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
+pub(crate) fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
     let digest = Sha256::digest(file.path().as_str().as_bytes());
     SourceUnitId(format!(
         "rift://source/src_{}",
@@ -500,25 +523,33 @@ fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
 }
 
 fn node_id(file: &IndexedFile, node: &RustNode) -> NodeId {
-    NodeId(node_address(file, &node.kind, node.range))
+    NodeId(node_address(file, node.range))
 }
 
-fn node_address(file: &IndexedFile, kind: &str, range: ByteRange) -> String {
-    let fingerprint = Sha256::digest(format!(
-        "{}:{kind}:{}:{}",
-        file.path(),
-        range.start,
-        range.end
-    ));
+fn node_address(file: &IndexedFile, range: ByteRange) -> String {
     format!(
-        "rift://node/rust/{}@{}-{}#{:02x}{:02x}{:02x}{:02x}",
+        "rift://node/rust/{}@{}-{}#{}",
         encode_path(file.path().as_str()),
         range.start,
         range.end,
-        fingerprint[0],
-        fingerprint[1],
-        fingerprint[2],
-        fingerprint[3]
+        node_witness(file.source(), range)
+    )
+}
+
+/// The witness a node address carries: the first eight lowercase hex
+/// characters of the SHA-256 of the node's source bytes. Recomputing it is
+/// how resolution proves the bytes behind an address have not drifted.
+pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
+    let start = usize::try_from(range.start)
+        .unwrap_or(source.len())
+        .min(source.len());
+    let end = usize::try_from(range.end)
+        .unwrap_or(source.len())
+        .min(source.len());
+    let fingerprint = Sha256::digest(source.get(start..end).unwrap_or_default().as_bytes());
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        fingerprint[0], fingerprint[1], fingerprint[2], fingerprint[3]
     )
 }
 
@@ -537,7 +568,7 @@ fn workspace_digest(index: &WorkspaceIndex) -> String {
 ///
 /// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with
 /// `O`, `I`, `B`, and `g`; source-unit identities use its lowercase form.
-fn digest_prefix_base32(bytes: &[u8]) -> String {
+pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
     let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
     encoded.truncate(SOURCE_UNIT_DIGEST_CHARS);
     encoded
@@ -567,7 +598,7 @@ const PATH_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'-');
 
-fn encode_path(value: &str) -> String {
+pub(crate) fn encode_path(value: &str) -> String {
     utf8_percent_encode(value, PATH_ESCAPE_SET).to_string()
 }
 

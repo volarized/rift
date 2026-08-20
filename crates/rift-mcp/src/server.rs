@@ -1,12 +1,16 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use rift_core::{ErrorName, RetryDirective};
 use rift_index::WorkspaceIndexLimits;
+use rift_protocol::change::{
+    ChangeResult, InsertSymbolParams, PatchParams, ReplaceNodeParams, ReplaceSymbolParams,
+};
 use rift_protocol::error as wire;
 use rift_protocol::read::{
     GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
 };
-use rift_server::{ReadError, ReadService};
+use rift_server::{ChangeService, ReadError, ReadService};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
@@ -19,23 +23,30 @@ const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
 /// schema bound.
 const ERROR_CAUSES_MAX: usize = 8;
 
-/// Read-only Rust workspace MCP server.
+/// Rust workspace MCP server: reads serve an immutable snapshot, changes
+/// write the workspace and swap in a fresh snapshot.
 #[derive(Debug)]
 pub struct RiftMcp {
-    reads: ReadService,
+    root: PathBuf,
+    limits: WorkspaceIndexLimits,
+    reads: RwLock<ReadService>,
+    changes: ChangeService,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl RiftMcp {
-    /// Builds server from one immutable direct-workspace snapshot.
+    /// Builds server from one direct-workspace snapshot.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] when workspace cannot be indexed within bounds.
     pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
         Ok(Self {
-            reads: ReadService::build(root, limits)?,
+            root: root.to_path_buf(),
+            limits,
+            reads: RwLock::new(ReadService::build(root, limits)?),
+            changes: ChangeService::new(root),
             tool_router: Self::tool_router(),
         })
     }
@@ -48,7 +59,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
-        self.reads
+        self.snapshot()
             .get_symbol(&params)
             .map(Json)
             .map_err(|error| tool_error(&error))
@@ -61,7 +72,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        self.reads
+        self.snapshot()
             .search(&params)
             .map(Json)
             .map_err(|error| tool_error(&error))
@@ -75,10 +86,112 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ErrorData> {
-        self.reads
+        self.snapshot()
             .nodes(params)
             .map(Json)
             .map_err(|error| tool_error(&error))
+    }
+
+    /// Replaces one declaration addressed by symbol. The parser derives the
+    /// span, so the caller supplies no offsets; a refusal names the failed
+    /// precondition and leaves the workspace untouched.
+    #[tool]
+    fn replace_symbol(
+        &self,
+        Parameters(params): Parameters<ReplaceSymbolParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        self.change(|reads, changes| changes.replace_symbol(reads, &params))
+    }
+
+    /// Inserts a new declaration before or after an existing one, addressed
+    /// by its anchor symbol. A refusal names the failed precondition and
+    /// leaves the workspace untouched.
+    #[tool]
+    fn insert_symbol(
+        &self,
+        Parameters(params): Parameters<InsertSymbolParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        self.change(|reads, changes| changes.insert_symbol(reads, &params))
+    }
+
+    /// Replaces one syntax node through a witnessed address from `nodes`.
+    /// The server recomputes the witness before writing and refuses when the
+    /// bytes drifted, so a stale address never splices into moved code.
+    #[tool]
+    fn replace_node(
+        &self,
+        Parameters(params): Parameters<ReplaceNodeParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        self.change(|reads, changes| changes.replace_node(reads, &params))
+    }
+
+    /// Applies unified-diff hunks to workspace files atomically. Hunk
+    /// context guards the change: a context mismatch refuses with an unmet
+    /// precondition and the tree stays untouched.
+    #[tool]
+    fn patch(
+        &self,
+        Parameters(params): Parameters<PatchParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        self.change(|reads, changes| changes.patch(reads, &params))
+    }
+
+    /// Takes the current read snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Recovers a poisoned lock instead of panicking: the snapshot is
+    /// replaced whole, so a poisoned guard still holds a coherent value.
+    fn snapshot(&self) -> std::sync::RwLockReadGuard<'_, ReadService> {
+        self.reads
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Runs one change against the current snapshot and, when it lands,
+    /// swaps in a snapshot of the changed workspace.
+    ///
+    /// A rebuild failure after a landed change rides the result as a
+    /// diagnostic rather than failing the call: the write happened, and the
+    /// caller must not be told otherwise.
+    fn change(
+        &self,
+        operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        let mut result = operation(&self.snapshot(), &self.changes)
+            .map_err(|error| tool_error_in(&error, wire::ErrorPhase::Change))?;
+        if let ChangeResult::Applied { summary } = &mut result {
+            match ReadService::build(&self.root, self.limits) {
+                Ok(rebuilt) => {
+                    *self
+                        .reads
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = rebuilt;
+                }
+                Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
+            }
+        }
+        Ok(Json(result))
+    }
+}
+
+/// The finding an applied change carries when the follow-up snapshot could
+/// not be rebuilt: reads keep serving the pre-change snapshot until one can.
+fn stale_snapshot_diagnostic(error: &ReadError) -> rift_protocol::read::Diagnostic {
+    rift_protocol::read::Diagnostic {
+        severity: rift_protocol::read::Severity::Warning,
+        code: None,
+        message: format!(
+            "the change landed, and the read snapshot could not refresh; \
+             reads serve the pre-change tree until the workspace indexes again: {error}"
+        ),
+        span: None,
+        related: Vec::new(),
+        tags: Vec::new(),
+        reliability: rift_protocol::read::DiagnosticReliability::Reliable,
+        continuation: rift_protocol::read::DiagnosticContinuation::Unknown,
+        extensions: rift_protocol::read::Extensions(std::collections::BTreeMap::new()),
+        language: None,
     }
 }
 
@@ -88,8 +201,10 @@ impl ServerHandler for RiftMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Read the current workspace: get_symbol and search find declarations, \
-                 nodes lists witnessed syntax nodes at a byte position.",
+                "Read and edit the current workspace: get_symbol and search find \
+                 declarations, nodes lists witnessed syntax nodes at a byte position, \
+                 and replace_symbol, insert_symbol, replace_node, and patch change \
+                 code atomically behind verified preconditions.",
             )
     }
 }
@@ -98,8 +213,13 @@ impl ServerHandler for RiftMcp {
 /// code `-32000`, the rendered failure line as `message`, and the typed
 /// [`wire::ErrorData`] as `data`.
 fn tool_error(error: &ReadError) -> ErrorData {
+    tool_error_in(error, wire::ErrorPhase::Read)
+}
+
+/// Maps one failure to the wire error object, naming the phase it stopped in.
+fn tool_error_in(error: &ReadError, phase: wire::ErrorPhase) -> ErrorData {
     let message = error.to_string();
-    let data = serde_json::to_value(wire_error(error, wire::ErrorPhase::Read)).ok();
+    let data = serde_json::to_value(wire_error(error, phase)).ok();
     ErrorData::new(RIFT_ERROR_CODE, message, data)
 }
 
@@ -240,7 +360,15 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
-            ["get_symbol", "nodes", "search"]
+            [
+                "get_symbol",
+                "insert_symbol",
+                "nodes",
+                "patch",
+                "replace_node",
+                "replace_symbol",
+                "search"
+            ]
         );
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
 
@@ -336,6 +464,55 @@ mod tests {
             assert_eq!(entry["input_schema"], json!(tool.input_schema));
             assert_eq!(entry["output_schema"], json!(tool.output_schema));
         }
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_change_lands_and_reads_serve_the_new_snapshot() -> TestResult {
+        let (_directory, server) = fixture()?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+
+        let change = client
+            .call_tool(
+                CallToolRequestParams::new("replace_symbol").with_arguments(arguments(&json!({
+                    "symbol": "rift://symbol/rust/lib.rs/beacon",
+                    "body": "pub fn beacon() -> u8 {\n    7\n}"
+                }))?),
+            )
+            .await?;
+        let structured = change
+            .structured_content
+            .ok_or("replace_symbol must return structured content")?;
+        assert_eq!(structured["status"], json!("applied"));
+        assert_eq!(structured["summary"]["paths"], json!(["lib.rs"]));
+
+        let symbol = client
+            .call_tool(
+                CallToolRequestParams::new("get_symbol")
+                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            )
+            .await?;
+        let structured = symbol
+            .structured_content
+            .ok_or("get_symbol must return structured content")?;
+        let excerpt = structured["hits"][0]["source"]["text"]
+            .as_str()
+            .ok_or("hit must carry source text")?;
+        assert!(
+            excerpt.contains("-> u8"),
+            "reads after an applied change must serve the new snapshot: {excerpt}"
+        );
 
         client.cancel().await?;
         server_task.await?;

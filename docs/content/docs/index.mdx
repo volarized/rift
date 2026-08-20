@@ -3,12 +3,12 @@ title: Rift
 description: Install Rift, connect its MCP server, and read Rust workspaces.
 ---
 
-<VersionBadge version="v0.0.2" />
+<VersionBadge version="v0.0.4" />
 
 Rift is an agentic development toolkit for reading, discovering, and editing codebases.
 
 Rift gives [MCP](https://modelcontextprotocol.io/specification/2026-07-28) agents structured reads
-over Rust code in the current folder.
+and precise, precondition-guarded edits over Rust code in the current folder.
 
 ## Install
 
@@ -53,10 +53,31 @@ the source-to-syntax-to-index pipeline.
 The scanner skips symlinks and the `.git`, `.rift`, and `target` directories. It writes no index or
 projection state to the codebase.
 
-The MCP server advertises these read tools:
+The MCP server advertises three read tools:
 
 - `search` finds declarations and matching source lines.
 - `get_symbol` returns declarations with source excerpts when the name is known.
+- `nodes` lists the syntax nodes covering one byte position, outermost first. Each node id ends
+  in a witness — a hash of the node's source bytes — which is what a later `replace_node`
+  verifies before writing.
+
+## Changes
+
+Four tools edit the workspace. Each resolves its address against the served snapshot, proves its
+preconditions against the bytes on disk, and only then writes — atomically, behind one
+application lock, so two concurrent changes collide as a clean refusal rather than as
+interleaved bytes:
+
+- `replace_symbol` rewrites one declaration addressed by symbol; the parser derives the span.
+- `insert_symbol` lands a new declaration before or after its anchor.
+- `replace_node` replaces one syntax node through a witnessed address from `nodes`; a stale
+  witness refuses with the expected and observed values.
+- `patch` applies unified-diff hunks, several files in one change; a context mismatch refuses
+  and the tree stays untouched.
+
+A change that cannot land returns a refusal naming the failed precondition, and the tree is
+untouched. An applied change re-parses what it touched and reports parser findings on the
+result. Every failure carries a stable error code and a suggested action.
 
 ## Update
 
@@ -76,7 +97,7 @@ agentic development toolkit
 Usage: rift [COMMAND]
 
 Commands:
-  mcp     Serve read-only Rust workspace context over stdio MCP
+  mcp     Serve Rust workspace reads and edits over stdio MCP
   update  Replace current Rift binary with latest official release
   help    Print this message or the help of the given subcommand(s)
 

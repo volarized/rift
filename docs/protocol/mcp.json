@@ -1917,6 +1917,714 @@
       }
     },
     {
+      "description": "Inserts a new declaration before or after an existing one, addressed\nby its anchor symbol. A refusal names the failed precondition and\nleaves the workspace untouched.",
+      "input_schema": {
+        "$defs": {
+          "InsertPosition": {
+            "description": "Which side of the anchor receives the new declaration.",
+            "oneOf": [
+              {
+                "const": "before",
+                "description": "Wire value `before`.",
+                "type": "string"
+              },
+              {
+                "const": "after",
+                "description": "Wire value `after`.",
+                "type": "string"
+              }
+            ]
+          },
+          "SymbolId": {
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "anchor": {
+            "$ref": "#/$defs/SymbolId",
+            "description": "The existing declaration the new one lands beside."
+          },
+          "body": {
+            "description": "The new declaration's source.",
+            "maxLength": 1048576,
+            "type": "string"
+          },
+          "position": {
+            "$ref": "#/$defs/InsertPosition",
+            "description": "Which side of the anchor receives the new declaration."
+          }
+        },
+        "required": [
+          "anchor",
+          "position",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "insert_symbol",
+      "output_schema": {
+        "$defs": {
+          "ChangeId": {
+            "description": "Identity of one applied change, minted when the change lands.",
+            "maxLength": 30,
+            "minLength": 30,
+            "pattern": "^chg_[a-z2-7]{26}$",
+            "type": "string"
+          },
+          "ChangeSummary": {
+            "additionalProperties": false,
+            "description": "One applied change, with everything Rift learned while resolving it.",
+            "properties": {
+              "diagnostics": {
+                "description": "Resolution findings in source order.",
+                "items": {
+                  "$ref": "#/$defs/Diagnostic"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "edits": {
+                "description": "Concrete edits in canonical file-and-range order.",
+                "items": {
+                  "$ref": "#/$defs/Edit"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "id": {
+                "$ref": "#/$defs/ChangeId",
+                "description": "Identity of this applied change."
+              },
+              "paths": {
+                "description": "Paths whose entries differ because of this change, sorted bytewise.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 256,
+                "type": "array"
+              }
+            },
+            "required": [
+              "id",
+              "paths",
+              "edits",
+              "diagnostics"
+            ],
+            "type": "object"
+          },
+          "Diagnostic": {
+            "additionalProperties": false,
+            "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
+            "properties": {
+              "code": {
+                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "$ref": "#/$defs/DiagnosticContinuation",
+                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+              },
+              "extensions": {
+                "$ref": "#/$defs/Extensions",
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+              },
+              "language": {
+                "additionalProperties": false,
+                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
+                "properties": {
+                  "dialect": {
+                    "default": null,
+                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9._-]*$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "name": {
+                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9._-]*$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "message": {
+                "description": "What the provider said, in its own words.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "related": {
+                "description": "Other places the provider pointed at while explaining this one.",
+                "items": {
+                  "$ref": "#/$defs/DiagnosticRelated"
+                },
+                "type": "array"
+              },
+              "reliability": {
+                "$ref": "#/$defs/DiagnosticReliability",
+                "description": "Whether the facts around this finding came off a clean parse."
+              },
+              "severity": {
+                "$ref": "#/$defs/Severity",
+                "description": "How much it matters."
+              },
+              "span": {
+                "additionalProperties": false,
+                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
+                "properties": {
+                  "range": {
+                    "$ref": "#/$defs/TextRange",
+                    "description": "The bytes, as offsets into that file."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "Which file the offsets are into."
+                  }
+                },
+                "required": [
+                  "unit",
+                  "range"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "tags": {
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "items": {
+                  "$ref": "#/$defs/DiagnosticTag"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "severity",
+              "code",
+              "message",
+              "span",
+              "related",
+              "tags",
+              "reliability",
+              "continuation",
+              "extensions",
+              "language"
+            ],
+            "type": "object"
+          },
+          "DiagnosticContinuation": {
+            "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing.",
+            "oneOf": [
+              {
+                "const": "repairable",
+                "description": "Wire value `repairable`.",
+                "type": "string"
+              },
+              {
+                "const": "unrepairable",
+                "description": "Wire value `unrepairable`.",
+                "type": "string"
+              },
+              {
+                "const": "unknown",
+                "description": "Wire value `unknown`.",
+                "type": "string"
+              }
+            ]
+          },
+          "DiagnosticRelated": {
+            "additionalProperties": false,
+            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "properties": {
+              "message": {
+                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "span": {
+                "$ref": "#/$defs/SourceSpan",
+                "description": "Where to look."
+              }
+            },
+            "required": [
+              "message",
+              "span"
+            ],
+            "type": "object"
+          },
+          "DiagnosticReliability": {
+            "description": "Whether the facts around this finding came off a clean parse.",
+            "oneOf": [
+              {
+                "const": "reliable",
+                "description": "Wire value `reliable`.",
+                "type": "string"
+              },
+              {
+                "const": "recovered",
+                "description": "Wire value `recovered`.",
+                "type": "string"
+              }
+            ]
+          },
+          "DiagnosticTag": {
+            "description": "Presentation tags for the finding. A consumer can render them as strikethrough or grey\ntext.",
+            "oneOf": [
+              {
+                "const": "deprecated",
+                "description": "Wire value `deprecated`.",
+                "type": "string"
+              },
+              {
+                "const": "unnecessary",
+                "description": "Wire value `unnecessary`.",
+                "type": "string"
+              }
+            ]
+          },
+          "Edit": {
+            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "One byte range of one file and what replaces it.",
+                "properties": {
+                  "kind": {
+                    "const": "replace",
+                    "type": "string"
+                  },
+                  "span": {
+                    "$ref": "#/$defs/SourceSpan",
+                    "description": "The file, and the byte range being replaced."
+                  },
+                  "text": {
+                    "description": "What the range becomes. Empty deletes it.",
+                    "maxLength": 1048576,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "span",
+                  "text"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ExtensionValue": {
+            "additionalProperties": false,
+            "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
+            "properties": {
+              "data": {
+                "description": "The value itself, shaped by whatever that key and version advertise. Rift carries it\nand never interprets it."
+              },
+              "version": {
+                "description": "Which version of the key's advertised schema shaped `data`. A consumer skips a value\nwhose version it does not implement.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "data"
+            ],
+            "type": "object"
+          },
+          "Extensions": {
+            "additionalProperties": false,
+            "description": "Facts a provider carries that the model has no field for, under a reverse-domain key.\nKeys and values use RFC 8785 canonical JSON. Consumers skip entries they do not\nimplement.",
+            "patternProperties": {
+              "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$": {
+                "$ref": "#/$defs/ExtensionValue"
+              }
+            },
+            "type": "object"
+          },
+          "FileId": {
+            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+            "maxLength": 8192,
+            "minLength": 13,
+            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "NodeId": {
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "maxLength": 8192,
+            "minLength": 27,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "type": "string"
+          },
+          "OperationPrecondition": {
+            "additionalProperties": false,
+            "description": "One executable condition checked while resolving an operation.",
+            "properties": {
+              "addresses": {
+                "description": "Existing semantic or source subjects involved in the condition.",
+                "items": {
+                  "$ref": "#/$defs/PreconditionAddress"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "expected": {
+                "$ref": "#/$defs/PreconditionValue",
+                "description": "Required value for this check."
+              },
+              "kind": {
+                "$ref": "#/$defs/OperationPreconditionKind",
+                "description": "The condition that was checked."
+              },
+              "observed": {
+                "$ref": "#/$defs/PreconditionValue",
+                "description": "Value found while checking the condition."
+              },
+              "paths": {
+                "description": "Project paths involved in the condition, including destinations that do not yet\nexist.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "status": {
+                "$ref": "#/$defs/OperationPreconditionStatus",
+                "description": "Whether the condition held."
+              }
+            },
+            "required": [
+              "kind",
+              "status",
+              "addresses",
+              "paths",
+              "expected",
+              "observed"
+            ],
+            "type": "object"
+          },
+          "OperationPreconditionKind": {
+            "description": "Condition being checked.",
+            "oneOf": [
+              {
+                "const": "target_exists",
+                "description": "Wire value `target_exists`.",
+                "type": "string"
+              },
+              {
+                "const": "source_unchanged",
+                "description": "Wire value `source_unchanged`.",
+                "type": "string"
+              }
+            ]
+          },
+          "OperationPreconditionStatus": {
+            "description": "Result of this check.",
+            "oneOf": [
+              {
+                "const": "satisfied",
+                "description": "Wire value `satisfied`.",
+                "type": "string"
+              },
+              {
+                "const": "failed",
+                "description": "Wire value `failed`.",
+                "type": "string"
+              }
+            ]
+          },
+          "PreconditionAddress": {
+            "description": "Existing semantic or source subject a precondition addresses.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A declaration, addressed by its symbol.",
+                "properties": {
+                  "kind": {
+                    "const": "symbol",
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "$ref": "#/$defs/SymbolId",
+                    "description": "The symbol addressed."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "symbol"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A syntax node, addressed by its witnessed identity.",
+                "properties": {
+                  "kind": {
+                    "const": "node",
+                    "type": "string"
+                  },
+                  "node": {
+                    "$ref": "#/$defs/NodeId",
+                    "description": "The node addressed."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "node"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "PreconditionValue": {
+            "description": "A typed value compared by an operation precondition.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Boolean property such as target existence or writability.",
+                "properties": {
+                  "kind": {
+                    "const": "boolean",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Non-negative count such as remaining usages.",
+                "properties": {
+                  "kind": {
+                    "const": "count",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Language or policy value whose spelling is itself significant.",
+                "properties": {
+                  "kind": {
+                    "const": "text",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "maxLength": 1000,
+            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "type": "string"
+          },
+          "RefusalReason": {
+            "description": "Why resolution produced no edits at all. `ErrorData` carries transport and\ninfrastructure failures.",
+            "oneOf": [
+              {
+                "const": "unsupported",
+                "description": "Nothing serves this operation for the language it reaches.",
+                "type": "string"
+              },
+              {
+                "const": "unmet_precondition",
+                "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
+                "type": "string"
+              },
+              {
+                "const": "ambiguous_target",
+                "description": "The address resolves to several targets. Narrow it and ask again.",
+                "type": "string"
+              }
+            ]
+          },
+          "Severity": {
+            "description": "How much a `Diagnostic` matters, in the provider's own judgement. Providers map their\ntoolchain's own levels onto these four, so a caller can drop everything below `warning`\nwithout knowing which language produced it.",
+            "oneOf": [
+              {
+                "const": "error",
+                "description": "Wire value `error`.",
+                "type": "string"
+              },
+              {
+                "const": "warning",
+                "description": "Wire value `warning`.",
+                "type": "string"
+              },
+              {
+                "const": "info",
+                "description": "Wire value `info`.",
+                "type": "string"
+              },
+              {
+                "const": "hint",
+                "description": "Wire value `hint`.",
+                "type": "string"
+              }
+            ]
+          },
+          "SourceSpan": {
+            "additionalProperties": false,
+            "description": "A byte range of one file.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "The bytes, as offsets into that file."
+              },
+              "unit": {
+                "$ref": "#/$defs/FileId",
+                "description": "Which file the offsets are into."
+              }
+            },
+            "required": [
+              "unit",
+              "range"
+            ],
+            "type": "object"
+          },
+          "SymbolId": {
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "TextRange": {
+            "additionalProperties": false,
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the conformance tests\ninstead.",
+            "properties": {
+              "end": {
+                "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "description": "First byte of the range, counted from the start of the file.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start",
+              "end"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "The operation resolved to edits and Rift wrote them into the targeted tree.",
+            "properties": {
+              "status": {
+                "const": "applied",
+                "type": "string"
+              },
+              "summary": {
+                "$ref": "#/$defs/ChangeSummary",
+                "description": "The applied change and its evidence."
+              }
+            },
+            "required": [
+              "status",
+              "summary"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Resolution produced no edits, so the targeted tree is untouched.",
+            "properties": {
+              "diagnostics": {
+                "description": "Evidence that explains the refusal.",
+                "items": {
+                  "$ref": "#/$defs/Diagnostic"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "preconditions": {
+                "description": "Conditions checked before refusal, including at least one failed entry for\n`unmet_precondition`.",
+                "items": {
+                  "$ref": "#/$defs/OperationPrecondition"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "reason": {
+                "$ref": "#/$defs/RefusalReason",
+                "description": "The condition the caller can act on."
+              },
+              "status": {
+                "const": "refused",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "reason",
+              "preconditions",
+              "diagnostics"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    {
       "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift.",
       "input_schema": {
         "$defs": {
@@ -2721,6 +3429,2161 @@
           "snapshot"
         ],
         "type": "object"
+      }
+    },
+    {
+      "description": "Applies unified-diff hunks to workspace files atomically. Hunk\ncontext guards the change: a context mismatch refuses with an unmet\nprecondition and the tree stays untouched.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "patch": {
+            "description": "A unified diff. Hunk context guards the change, and a context mismatch refuses\nwith an unmet precondition.",
+            "maxLength": 4194304,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "patch"
+        ],
+        "type": "object"
+      },
+      "name": "patch",
+      "output_schema": {
+        "$defs": {
+          "ChangeId": {
+            "description": "Identity of one applied change, minted when the change lands.",
+            "maxLength": 30,
+            "minLength": 30,
+            "pattern": "^chg_[a-z2-7]{26}$",
+            "type": "string"
+          },
+          "ChangeSummary": {
+            "additionalProperties": false,
+            "description": "One applied change, with everything Rift learned while resolving it.",
+            "properties": {
+              "diagnostics": {
+                "description": "Resolution findings in source order.",
+                "items": {
+                  "$ref": "#/$defs/Diagnostic"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "edits": {
+                "description": "Concrete edits in canonical file-and-range order.",
+                "items": {
+                  "$ref": "#/$defs/Edit"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "id": {
+                "$ref": "#/$defs/ChangeId",
+                "description": "Identity of this applied change."
+              },
+              "paths": {
+                "description": "Paths whose entries differ because of this change, sorted bytewise.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 256,
+                "type": "array"
+              }
+            },
+            "required": [
+              "id",
+              "paths",
+              "edits",
+              "diagnostics"
+            ],
+            "type": "object"
+          },
+          "Diagnostic": {
+            "additionalProperties": false,
+            "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
+            "properties": {
+              "code": {
+                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "$ref": "#/$defs/DiagnosticContinuation",
+                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+              },
+              "extensions": {
+                "$ref": "#/$defs/Extensions",
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+              },
+              "language": {
+                "additionalProperties": false,
+                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
+                "properties": {
+                  "dialect": {
+                    "default": null,
+                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9._-]*$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "name": {
+                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9._-]*$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "message": {
+                "description": "What the provider said, in its own words.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "related": {
+                "description": "Other places the provider pointed at while explaining this one.",
+                "items": {
+                  "$ref": "#/$defs/DiagnosticRelated"
+                },
+                "type": "array"
+              },
+              "reliability": {
+                "$ref": "#/$defs/DiagnosticReliability",
+                "description": "Whether the facts around this finding came off a clean parse."
+              },
+              "severity": {
+                "$ref": "#/$defs/Severity",
+                "description": "How much it matters."
+              },
+              "span": {
+                "additionalProperties": false,
+                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
+                "properties": {
+                  "range": {
+                    "$ref": "#/$defs/TextRange",
+                    "description": "The bytes, as offsets into that file."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "Which file the offsets are into."
+                  }
+                },
+                "required": [
+                  "unit",
+                  "range"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "tags": {
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "items": {
+                  "$ref": "#/$defs/DiagnosticTag"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "severity",
+              "code",
+              "message",
+              "span",
+              "related",
+              "tags",
+              "reliability",
+              "continuation",
+              "extensions",
+              "language"
+            ],
+            "type": "object"
+          },
+          "DiagnosticContinuation": {
+            "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing.",
+            "oneOf": [
+              {
+                "const": "repairable",
+                "description": "Wire value `repairable`.",
+                "type": "string"
+              },
+              {
+                "const": "unrepairable",
+                "description": "Wire value `unrepairable`.",
+                "type": "string"
+              },
+              {
+                "const": "unknown",
+                "description": "Wire value `unknown`.",
+                "type": "string"
+              }
+            ]
+          },
+          "DiagnosticRelated": {
+            "additionalProperties": false,
+            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "properties": {
+              "message": {
+                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "span": {
+                "$ref": "#/$defs/SourceSpan",
+                "description": "Where to look."
+              }
+            },
+            "required": [
+              "message",
+              "span"
+            ],
+            "type": "object"
+          },
+          "DiagnosticReliability": {
+            "description": "Whether the facts around this finding came off a clean parse.",
+            "oneOf": [
+              {
+                "const": "reliable",
+                "description": "Wire value `reliable`.",
+                "type": "string"
+              },
+              {
+                "const": "recovered",
+                "description": "Wire value `recovered`.",
+                "type": "string"
+              }
+            ]
+          },
+          "DiagnosticTag": {
+            "description": "Presentation tags for the finding. A consumer can render them as strikethrough or grey\ntext.",
+            "oneOf": [
+              {
+                "const": "deprecated",
+                "description": "Wire value `deprecated`.",
+                "type": "string"
+              },
+              {
+                "const": "unnecessary",
+                "description": "Wire value `unnecessary`.",
+                "type": "string"
+              }
+            ]
+          },
+          "Edit": {
+            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "One byte range of one file and what replaces it.",
+                "properties": {
+                  "kind": {
+                    "const": "replace",
+                    "type": "string"
+                  },
+                  "span": {
+                    "$ref": "#/$defs/SourceSpan",
+                    "description": "The file, and the byte range being replaced."
+                  },
+                  "text": {
+                    "description": "What the range becomes. Empty deletes it.",
+                    "maxLength": 1048576,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "span",
+                  "text"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ExtensionValue": {
+            "additionalProperties": false,
+            "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
+            "properties": {
+              "data": {
+                "description": "The value itself, shaped by whatever that key and version advertise. Rift carries it\nand never interprets it."
+              },
+              "version": {
+                "description": "Which version of the key's advertised schema shaped `data`. A consumer skips a value\nwhose version it does not implement.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "data"
+            ],
+            "type": "object"
+          },
+          "Extensions": {
+            "additionalProperties": false,
+            "description": "Facts a provider carries that the model has no field for, under a reverse-domain key.\nKeys and values use RFC 8785 canonical JSON. Consumers skip entries they do not\nimplement.",
+            "patternProperties": {
+              "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$": {
+                "$ref": "#/$defs/ExtensionValue"
+              }
+            },
+            "type": "object"
+          },
+          "FileId": {
+            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+            "maxLength": 8192,
+            "minLength": 13,
+            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "NodeId": {
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "maxLength": 8192,
+            "minLength": 27,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "type": "string"
+          },
+          "OperationPrecondition": {
+            "additionalProperties": false,
+            "description": "One executable condition checked while resolving an operation.",
+            "properties": {
+              "addresses": {
+                "description": "Existing semantic or source subjects involved in the condition.",
+                "items": {
+                  "$ref": "#/$defs/PreconditionAddress"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "expected": {
+                "$ref": "#/$defs/PreconditionValue",
+                "description": "Required value for this check."
+              },
+              "kind": {
+                "$ref": "#/$defs/OperationPreconditionKind",
+                "description": "The condition that was checked."
+              },
+              "observed": {
+                "$ref": "#/$defs/PreconditionValue",
+                "description": "Value found while checking the condition."
+              },
+              "paths": {
+                "description": "Project paths involved in the condition, including destinations that do not yet\nexist.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "status": {
+                "$ref": "#/$defs/OperationPreconditionStatus",
+                "description": "Whether the condition held."
+              }
+            },
+            "required": [
+              "kind",
+              "status",
+              "addresses",
+              "paths",
+              "expected",
+              "observed"
+            ],
+            "type": "object"
+          },
+          "OperationPreconditionKind": {
+            "description": "Condition being checked.",
+            "oneOf": [
+              {
+                "const": "target_exists",
+                "description": "Wire value `target_exists`.",
+                "type": "string"
+              },
+              {
+                "const": "source_unchanged",
+                "description": "Wire value `source_unchanged`.",
+                "type": "string"
+              }
+            ]
+          },
+          "OperationPreconditionStatus": {
+            "description": "Result of this check.",
+            "oneOf": [
+              {
+                "const": "satisfied",
+                "description": "Wire value `satisfied`.",
+                "type": "string"
+              },
+              {
+                "const": "failed",
+                "description": "Wire value `failed`.",
+                "type": "string"
+              }
+            ]
+          },
+          "PreconditionAddress": {
+            "description": "Existing semantic or source subject a precondition addresses.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A declaration, addressed by its symbol.",
+                "properties": {
+                  "kind": {
+                    "const": "symbol",
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "$ref": "#/$defs/SymbolId",
+                    "description": "The symbol addressed."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "symbol"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A syntax node, addressed by its witnessed identity.",
+                "properties": {
+                  "kind": {
+                    "const": "node",
+                    "type": "string"
+                  },
+                  "node": {
+                    "$ref": "#/$defs/NodeId",
+                    "description": "The node addressed."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "node"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "PreconditionValue": {
+            "description": "A typed value compared by an operation precondition.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Boolean property such as target existence or writability.",
+                "properties": {
+                  "kind": {
+                    "const": "boolean",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Non-negative count such as remaining usages.",
+                "properties": {
+                  "kind": {
+                    "const": "count",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Language or policy value whose spelling is itself significant.",
+                "properties": {
+                  "kind": {
+                    "const": "text",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "maxLength": 1000,
+            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "type": "string"
+          },
+          "RefusalReason": {
+            "description": "Why resolution produced no edits at all. `ErrorData` carries transport and\ninfrastructure failures.",
+            "oneOf": [
+              {
+                "const": "unsupported",
+                "description": "Nothing serves this operation for the language it reaches.",
+                "type": "string"
+              },
+              {
+                "const": "unmet_precondition",
+                "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
+                "type": "string"
+              },
+              {
+                "const": "ambiguous_target",
+                "description": "The address resolves to several targets. Narrow it and ask again.",
+                "type": "string"
+              }
+            ]
+          },
+          "Severity": {
+            "description": "How much a `Diagnostic` matters, in the provider's own judgement. Providers map their\ntoolchain's own levels onto these four, so a caller can drop everything below `warning`\nwithout knowing which language produced it.",
+            "oneOf": [
+              {
+                "const": "error",
+                "description": "Wire value `error`.",
+                "type": "string"
+              },
+              {
+                "const": "warning",
+                "description": "Wire value `warning`.",
+                "type": "string"
+              },
+              {
+                "const": "info",
+                "description": "Wire value `info`.",
+                "type": "string"
+              },
+              {
+                "const": "hint",
+                "description": "Wire value `hint`.",
+                "type": "string"
+              }
+            ]
+          },
+          "SourceSpan": {
+            "additionalProperties": false,
+            "description": "A byte range of one file.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "The bytes, as offsets into that file."
+              },
+              "unit": {
+                "$ref": "#/$defs/FileId",
+                "description": "Which file the offsets are into."
+              }
+            },
+            "required": [
+              "unit",
+              "range"
+            ],
+            "type": "object"
+          },
+          "SymbolId": {
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "TextRange": {
+            "additionalProperties": false,
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the conformance tests\ninstead.",
+            "properties": {
+              "end": {
+                "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "description": "First byte of the range, counted from the start of the file.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start",
+              "end"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "The operation resolved to edits and Rift wrote them into the targeted tree.",
+            "properties": {
+              "status": {
+                "const": "applied",
+                "type": "string"
+              },
+              "summary": {
+                "$ref": "#/$defs/ChangeSummary",
+                "description": "The applied change and its evidence."
+              }
+            },
+            "required": [
+              "status",
+              "summary"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Resolution produced no edits, so the targeted tree is untouched.",
+            "properties": {
+              "diagnostics": {
+                "description": "Evidence that explains the refusal.",
+                "items": {
+                  "$ref": "#/$defs/Diagnostic"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "preconditions": {
+                "description": "Conditions checked before refusal, including at least one failed entry for\n`unmet_precondition`.",
+                "items": {
+                  "$ref": "#/$defs/OperationPrecondition"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "reason": {
+                "$ref": "#/$defs/RefusalReason",
+                "description": "The condition the caller can act on."
+              },
+              "status": {
+                "const": "refused",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "reason",
+              "preconditions",
+              "diagnostics"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    {
+      "description": "Replaces one syntax node through a witnessed address from `nodes`.\nThe server recomputes the witness before writing and refuses when the\nbytes drifted, so a stale address never splices into moved code.",
+      "input_schema": {
+        "$defs": {
+          "NodeId": {
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "maxLength": 8192,
+            "minLength": 27,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "type": "string"
+          },
+          "RegionRole": {
+            "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
+            "oneOf": [
+              {
+                "const": "selection",
+                "description": "Wire value `selection`.",
+                "type": "string"
+              },
+              {
+                "const": "name",
+                "description": "Wire value `name`.",
+                "type": "string"
+              },
+              {
+                "const": "header",
+                "description": "Wire value `header`.",
+                "type": "string"
+              },
+              {
+                "const": "body",
+                "description": "Wire value `body`.",
+                "type": "string"
+              },
+              {
+                "const": "content",
+                "description": "Wire value `content`.",
+                "type": "string"
+              },
+              {
+                "const": "documentation",
+                "description": "Wire value `documentation`.",
+                "type": "string"
+              },
+              {
+                "const": "enclosing",
+                "description": "Wire value `enclosing`.",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "The replacement source.",
+            "maxLength": 1048576,
+            "type": "string"
+          },
+          "node": {
+            "$ref": "#/$defs/NodeId",
+            "description": "The node to replace, witness included."
+          },
+          "region": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RegionRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Which named part of the node to replace. Null — the only value this release\nserves — replaces the node whole; a named region fails as\n`capability_unavailable`."
+          }
+        },
+        "required": [
+          "node",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "replace_node",
+      "output_schema": {
+        "$defs": {
+          "ChangeId": {
+            "description": "Identity of one applied change, minted when the change lands.",
+            "maxLength": 30,
+            "minLength": 30,
+            "pattern": "^chg_[a-z2-7]{26}$",
+            "type": "string"
+          },
+          "ChangeSummary": {
+            "additionalProperties": false,
+            "description": "One applied change, with everything Rift learned while resolving it.",
+            "properties": {
+              "diagnostics": {
+                "description": "Resolution findings in source order.",
+                "items": {
+                  "$ref": "#/$defs/Diagnostic"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "edits": {
+                "description": "Concrete edits in canonical file-and-range order.",
+                "items": {
+                  "$ref": "#/$defs/Edit"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "id": {
+                "$ref": "#/$defs/ChangeId",
+                "description": "Identity of this applied change."
+              },
+              "paths": {
+                "description": "Paths whose entries differ because of this change, sorted bytewise.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 256,
+                "type": "array"
+              }
+            },
+            "required": [
+              "id",
+              "paths",
+              "edits",
+              "diagnostics"
+            ],
+            "type": "object"
+          },
+          "Diagnostic": {
+            "additionalProperties": false,
+            "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
+            "properties": {
+              "code": {
+                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "$ref": "#/$defs/DiagnosticContinuation",
+                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+              },
+              "extensions": {
+                "$ref": "#/$defs/Extensions",
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+              },
+              "language": {
+                "additionalProperties": false,
+                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
+                "properties": {
+                  "dialect": {
+                    "default": null,
+                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9._-]*$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "name": {
+                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9._-]*$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "message": {
+                "description": "What the provider said, in its own words.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "related": {
+                "description": "Other places the provider pointed at while explaining this one.",
+                "items": {
+                  "$ref": "#/$defs/DiagnosticRelated"
+                },
+                "type": "array"
+              },
+              "reliability": {
+                "$ref": "#/$defs/DiagnosticReliability",
+                "description": "Whether the facts around this finding came off a clean parse."
+              },
+              "severity": {
+                "$ref": "#/$defs/Severity",
+                "description": "How much it matters."
+              },
+              "span": {
+                "additionalProperties": false,
+                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
+                "properties": {
+                  "range": {
+                    "$ref": "#/$defs/TextRange",
+                    "description": "The bytes, as offsets into that file."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "Which file the offsets are into."
+                  }
+                },
+                "required": [
+                  "unit",
+                  "range"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "tags": {
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "items": {
+                  "$ref": "#/$defs/DiagnosticTag"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "severity",
+              "code",
+              "message",
+              "span",
+              "related",
+              "tags",
+              "reliability",
+              "continuation",
+              "extensions",
+              "language"
+            ],
+            "type": "object"
+          },
+          "DiagnosticContinuation": {
+            "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing.",
+            "oneOf": [
+              {
+                "const": "repairable",
+                "description": "Wire value `repairable`.",
+                "type": "string"
+              },
+              {
+                "const": "unrepairable",
+                "description": "Wire value `unrepairable`.",
+                "type": "string"
+              },
+              {
+                "const": "unknown",
+                "description": "Wire value `unknown`.",
+                "type": "string"
+              }
+            ]
+          },
+          "DiagnosticRelated": {
+            "additionalProperties": false,
+            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "properties": {
+              "message": {
+                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "span": {
+                "$ref": "#/$defs/SourceSpan",
+                "description": "Where to look."
+              }
+            },
+            "required": [
+              "message",
+              "span"
+            ],
+            "type": "object"
+          },
+          "DiagnosticReliability": {
+            "description": "Whether the facts around this finding came off a clean parse.",
+            "oneOf": [
+              {
+                "const": "reliable",
+                "description": "Wire value `reliable`.",
+                "type": "string"
+              },
+              {
+                "const": "recovered",
+                "description": "Wire value `recovered`.",
+                "type": "string"
+              }
+            ]
+          },
+          "DiagnosticTag": {
+            "description": "Presentation tags for the finding. A consumer can render them as strikethrough or grey\ntext.",
+            "oneOf": [
+              {
+                "const": "deprecated",
+                "description": "Wire value `deprecated`.",
+                "type": "string"
+              },
+              {
+                "const": "unnecessary",
+                "description": "Wire value `unnecessary`.",
+                "type": "string"
+              }
+            ]
+          },
+          "Edit": {
+            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "One byte range of one file and what replaces it.",
+                "properties": {
+                  "kind": {
+                    "const": "replace",
+                    "type": "string"
+                  },
+                  "span": {
+                    "$ref": "#/$defs/SourceSpan",
+                    "description": "The file, and the byte range being replaced."
+                  },
+                  "text": {
+                    "description": "What the range becomes. Empty deletes it.",
+                    "maxLength": 1048576,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "span",
+                  "text"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ExtensionValue": {
+            "additionalProperties": false,
+            "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
+            "properties": {
+              "data": {
+                "description": "The value itself, shaped by whatever that key and version advertise. Rift carries it\nand never interprets it."
+              },
+              "version": {
+                "description": "Which version of the key's advertised schema shaped `data`. A consumer skips a value\nwhose version it does not implement.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "data"
+            ],
+            "type": "object"
+          },
+          "Extensions": {
+            "additionalProperties": false,
+            "description": "Facts a provider carries that the model has no field for, under a reverse-domain key.\nKeys and values use RFC 8785 canonical JSON. Consumers skip entries they do not\nimplement.",
+            "patternProperties": {
+              "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$": {
+                "$ref": "#/$defs/ExtensionValue"
+              }
+            },
+            "type": "object"
+          },
+          "FileId": {
+            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+            "maxLength": 8192,
+            "minLength": 13,
+            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "NodeId": {
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "maxLength": 8192,
+            "minLength": 27,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "type": "string"
+          },
+          "OperationPrecondition": {
+            "additionalProperties": false,
+            "description": "One executable condition checked while resolving an operation.",
+            "properties": {
+              "addresses": {
+                "description": "Existing semantic or source subjects involved in the condition.",
+                "items": {
+                  "$ref": "#/$defs/PreconditionAddress"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "expected": {
+                "$ref": "#/$defs/PreconditionValue",
+                "description": "Required value for this check."
+              },
+              "kind": {
+                "$ref": "#/$defs/OperationPreconditionKind",
+                "description": "The condition that was checked."
+              },
+              "observed": {
+                "$ref": "#/$defs/PreconditionValue",
+                "description": "Value found while checking the condition."
+              },
+              "paths": {
+                "description": "Project paths involved in the condition, including destinations that do not yet\nexist.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "status": {
+                "$ref": "#/$defs/OperationPreconditionStatus",
+                "description": "Whether the condition held."
+              }
+            },
+            "required": [
+              "kind",
+              "status",
+              "addresses",
+              "paths",
+              "expected",
+              "observed"
+            ],
+            "type": "object"
+          },
+          "OperationPreconditionKind": {
+            "description": "Condition being checked.",
+            "oneOf": [
+              {
+                "const": "target_exists",
+                "description": "Wire value `target_exists`.",
+                "type": "string"
+              },
+              {
+                "const": "source_unchanged",
+                "description": "Wire value `source_unchanged`.",
+                "type": "string"
+              }
+            ]
+          },
+          "OperationPreconditionStatus": {
+            "description": "Result of this check.",
+            "oneOf": [
+              {
+                "const": "satisfied",
+                "description": "Wire value `satisfied`.",
+                "type": "string"
+              },
+              {
+                "const": "failed",
+                "description": "Wire value `failed`.",
+                "type": "string"
+              }
+            ]
+          },
+          "PreconditionAddress": {
+            "description": "Existing semantic or source subject a precondition addresses.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A declaration, addressed by its symbol.",
+                "properties": {
+                  "kind": {
+                    "const": "symbol",
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "$ref": "#/$defs/SymbolId",
+                    "description": "The symbol addressed."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "symbol"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A syntax node, addressed by its witnessed identity.",
+                "properties": {
+                  "kind": {
+                    "const": "node",
+                    "type": "string"
+                  },
+                  "node": {
+                    "$ref": "#/$defs/NodeId",
+                    "description": "The node addressed."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "node"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "PreconditionValue": {
+            "description": "A typed value compared by an operation precondition.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Boolean property such as target existence or writability.",
+                "properties": {
+                  "kind": {
+                    "const": "boolean",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Non-negative count such as remaining usages.",
+                "properties": {
+                  "kind": {
+                    "const": "count",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Language or policy value whose spelling is itself significant.",
+                "properties": {
+                  "kind": {
+                    "const": "text",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "maxLength": 1000,
+            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "type": "string"
+          },
+          "RefusalReason": {
+            "description": "Why resolution produced no edits at all. `ErrorData` carries transport and\ninfrastructure failures.",
+            "oneOf": [
+              {
+                "const": "unsupported",
+                "description": "Nothing serves this operation for the language it reaches.",
+                "type": "string"
+              },
+              {
+                "const": "unmet_precondition",
+                "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
+                "type": "string"
+              },
+              {
+                "const": "ambiguous_target",
+                "description": "The address resolves to several targets. Narrow it and ask again.",
+                "type": "string"
+              }
+            ]
+          },
+          "Severity": {
+            "description": "How much a `Diagnostic` matters, in the provider's own judgement. Providers map their\ntoolchain's own levels onto these four, so a caller can drop everything below `warning`\nwithout knowing which language produced it.",
+            "oneOf": [
+              {
+                "const": "error",
+                "description": "Wire value `error`.",
+                "type": "string"
+              },
+              {
+                "const": "warning",
+                "description": "Wire value `warning`.",
+                "type": "string"
+              },
+              {
+                "const": "info",
+                "description": "Wire value `info`.",
+                "type": "string"
+              },
+              {
+                "const": "hint",
+                "description": "Wire value `hint`.",
+                "type": "string"
+              }
+            ]
+          },
+          "SourceSpan": {
+            "additionalProperties": false,
+            "description": "A byte range of one file.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "The bytes, as offsets into that file."
+              },
+              "unit": {
+                "$ref": "#/$defs/FileId",
+                "description": "Which file the offsets are into."
+              }
+            },
+            "required": [
+              "unit",
+              "range"
+            ],
+            "type": "object"
+          },
+          "SymbolId": {
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "TextRange": {
+            "additionalProperties": false,
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the conformance tests\ninstead.",
+            "properties": {
+              "end": {
+                "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "description": "First byte of the range, counted from the start of the file.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start",
+              "end"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "The operation resolved to edits and Rift wrote them into the targeted tree.",
+            "properties": {
+              "status": {
+                "const": "applied",
+                "type": "string"
+              },
+              "summary": {
+                "$ref": "#/$defs/ChangeSummary",
+                "description": "The applied change and its evidence."
+              }
+            },
+            "required": [
+              "status",
+              "summary"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Resolution produced no edits, so the targeted tree is untouched.",
+            "properties": {
+              "diagnostics": {
+                "description": "Evidence that explains the refusal.",
+                "items": {
+                  "$ref": "#/$defs/Diagnostic"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "preconditions": {
+                "description": "Conditions checked before refusal, including at least one failed entry for\n`unmet_precondition`.",
+                "items": {
+                  "$ref": "#/$defs/OperationPrecondition"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "reason": {
+                "$ref": "#/$defs/RefusalReason",
+                "description": "The condition the caller can act on."
+              },
+              "status": {
+                "const": "refused",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "reason",
+              "preconditions",
+              "diagnostics"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    {
+      "description": "Replaces one declaration addressed by symbol. The parser derives the\nspan, so the caller supplies no offsets; a refusal names the failed\nprecondition and leaves the workspace untouched.",
+      "input_schema": {
+        "$defs": {
+          "RegionRole": {
+            "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
+            "oneOf": [
+              {
+                "const": "selection",
+                "description": "Wire value `selection`.",
+                "type": "string"
+              },
+              {
+                "const": "name",
+                "description": "Wire value `name`.",
+                "type": "string"
+              },
+              {
+                "const": "header",
+                "description": "Wire value `header`.",
+                "type": "string"
+              },
+              {
+                "const": "body",
+                "description": "Wire value `body`.",
+                "type": "string"
+              },
+              {
+                "const": "content",
+                "description": "Wire value `content`.",
+                "type": "string"
+              },
+              {
+                "const": "documentation",
+                "description": "Wire value `documentation`.",
+                "type": "string"
+              },
+              {
+                "const": "enclosing",
+                "description": "Wire value `enclosing`.",
+                "type": "string"
+              }
+            ]
+          },
+          "SymbolId": {
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "The replacement source.",
+            "maxLength": 1048576,
+            "type": "string"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RegionRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Which part of the declaration to replace. Null — the only value this release\nserves — replaces the whole declaration; a named region fails as\n`capability_unavailable`."
+          },
+          "symbol": {
+            "$ref": "#/$defs/SymbolId",
+            "description": "The declaration to replace."
+          }
+        },
+        "required": [
+          "symbol",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "replace_symbol",
+      "output_schema": {
+        "$defs": {
+          "ChangeId": {
+            "description": "Identity of one applied change, minted when the change lands.",
+            "maxLength": 30,
+            "minLength": 30,
+            "pattern": "^chg_[a-z2-7]{26}$",
+            "type": "string"
+          },
+          "ChangeSummary": {
+            "additionalProperties": false,
+            "description": "One applied change, with everything Rift learned while resolving it.",
+            "properties": {
+              "diagnostics": {
+                "description": "Resolution findings in source order.",
+                "items": {
+                  "$ref": "#/$defs/Diagnostic"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "edits": {
+                "description": "Concrete edits in canonical file-and-range order.",
+                "items": {
+                  "$ref": "#/$defs/Edit"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "id": {
+                "$ref": "#/$defs/ChangeId",
+                "description": "Identity of this applied change."
+              },
+              "paths": {
+                "description": "Paths whose entries differ because of this change, sorted bytewise.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 256,
+                "type": "array"
+              }
+            },
+            "required": [
+              "id",
+              "paths",
+              "edits",
+              "diagnostics"
+            ],
+            "type": "object"
+          },
+          "Diagnostic": {
+            "additionalProperties": false,
+            "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
+            "properties": {
+              "code": {
+                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "$ref": "#/$defs/DiagnosticContinuation",
+                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+              },
+              "extensions": {
+                "$ref": "#/$defs/Extensions",
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+              },
+              "language": {
+                "additionalProperties": false,
+                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
+                "properties": {
+                  "dialect": {
+                    "default": null,
+                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9._-]*$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "name": {
+                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9._-]*$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "message": {
+                "description": "What the provider said, in its own words.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "related": {
+                "description": "Other places the provider pointed at while explaining this one.",
+                "items": {
+                  "$ref": "#/$defs/DiagnosticRelated"
+                },
+                "type": "array"
+              },
+              "reliability": {
+                "$ref": "#/$defs/DiagnosticReliability",
+                "description": "Whether the facts around this finding came off a clean parse."
+              },
+              "severity": {
+                "$ref": "#/$defs/Severity",
+                "description": "How much it matters."
+              },
+              "span": {
+                "additionalProperties": false,
+                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
+                "properties": {
+                  "range": {
+                    "$ref": "#/$defs/TextRange",
+                    "description": "The bytes, as offsets into that file."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "Which file the offsets are into."
+                  }
+                },
+                "required": [
+                  "unit",
+                  "range"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "tags": {
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "items": {
+                  "$ref": "#/$defs/DiagnosticTag"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "severity",
+              "code",
+              "message",
+              "span",
+              "related",
+              "tags",
+              "reliability",
+              "continuation",
+              "extensions",
+              "language"
+            ],
+            "type": "object"
+          },
+          "DiagnosticContinuation": {
+            "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing.",
+            "oneOf": [
+              {
+                "const": "repairable",
+                "description": "Wire value `repairable`.",
+                "type": "string"
+              },
+              {
+                "const": "unrepairable",
+                "description": "Wire value `unrepairable`.",
+                "type": "string"
+              },
+              {
+                "const": "unknown",
+                "description": "Wire value `unknown`.",
+                "type": "string"
+              }
+            ]
+          },
+          "DiagnosticRelated": {
+            "additionalProperties": false,
+            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "properties": {
+              "message": {
+                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "span": {
+                "$ref": "#/$defs/SourceSpan",
+                "description": "Where to look."
+              }
+            },
+            "required": [
+              "message",
+              "span"
+            ],
+            "type": "object"
+          },
+          "DiagnosticReliability": {
+            "description": "Whether the facts around this finding came off a clean parse.",
+            "oneOf": [
+              {
+                "const": "reliable",
+                "description": "Wire value `reliable`.",
+                "type": "string"
+              },
+              {
+                "const": "recovered",
+                "description": "Wire value `recovered`.",
+                "type": "string"
+              }
+            ]
+          },
+          "DiagnosticTag": {
+            "description": "Presentation tags for the finding. A consumer can render them as strikethrough or grey\ntext.",
+            "oneOf": [
+              {
+                "const": "deprecated",
+                "description": "Wire value `deprecated`.",
+                "type": "string"
+              },
+              {
+                "const": "unnecessary",
+                "description": "Wire value `unnecessary`.",
+                "type": "string"
+              }
+            ]
+          },
+          "Edit": {
+            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "One byte range of one file and what replaces it.",
+                "properties": {
+                  "kind": {
+                    "const": "replace",
+                    "type": "string"
+                  },
+                  "span": {
+                    "$ref": "#/$defs/SourceSpan",
+                    "description": "The file, and the byte range being replaced."
+                  },
+                  "text": {
+                    "description": "What the range becomes. Empty deletes it.",
+                    "maxLength": 1048576,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "span",
+                  "text"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ExtensionValue": {
+            "additionalProperties": false,
+            "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
+            "properties": {
+              "data": {
+                "description": "The value itself, shaped by whatever that key and version advertise. Rift carries it\nand never interprets it."
+              },
+              "version": {
+                "description": "Which version of the key's advertised schema shaped `data`. A consumer skips a value\nwhose version it does not implement.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "data"
+            ],
+            "type": "object"
+          },
+          "Extensions": {
+            "additionalProperties": false,
+            "description": "Facts a provider carries that the model has no field for, under a reverse-domain key.\nKeys and values use RFC 8785 canonical JSON. Consumers skip entries they do not\nimplement.",
+            "patternProperties": {
+              "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$": {
+                "$ref": "#/$defs/ExtensionValue"
+              }
+            },
+            "type": "object"
+          },
+          "FileId": {
+            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+            "maxLength": 8192,
+            "minLength": 13,
+            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "NodeId": {
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "maxLength": 8192,
+            "minLength": 27,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "type": "string"
+          },
+          "OperationPrecondition": {
+            "additionalProperties": false,
+            "description": "One executable condition checked while resolving an operation.",
+            "properties": {
+              "addresses": {
+                "description": "Existing semantic or source subjects involved in the condition.",
+                "items": {
+                  "$ref": "#/$defs/PreconditionAddress"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "expected": {
+                "$ref": "#/$defs/PreconditionValue",
+                "description": "Required value for this check."
+              },
+              "kind": {
+                "$ref": "#/$defs/OperationPreconditionKind",
+                "description": "The condition that was checked."
+              },
+              "observed": {
+                "$ref": "#/$defs/PreconditionValue",
+                "description": "Value found while checking the condition."
+              },
+              "paths": {
+                "description": "Project paths involved in the condition, including destinations that do not yet\nexist.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "status": {
+                "$ref": "#/$defs/OperationPreconditionStatus",
+                "description": "Whether the condition held."
+              }
+            },
+            "required": [
+              "kind",
+              "status",
+              "addresses",
+              "paths",
+              "expected",
+              "observed"
+            ],
+            "type": "object"
+          },
+          "OperationPreconditionKind": {
+            "description": "Condition being checked.",
+            "oneOf": [
+              {
+                "const": "target_exists",
+                "description": "Wire value `target_exists`.",
+                "type": "string"
+              },
+              {
+                "const": "source_unchanged",
+                "description": "Wire value `source_unchanged`.",
+                "type": "string"
+              }
+            ]
+          },
+          "OperationPreconditionStatus": {
+            "description": "Result of this check.",
+            "oneOf": [
+              {
+                "const": "satisfied",
+                "description": "Wire value `satisfied`.",
+                "type": "string"
+              },
+              {
+                "const": "failed",
+                "description": "Wire value `failed`.",
+                "type": "string"
+              }
+            ]
+          },
+          "PreconditionAddress": {
+            "description": "Existing semantic or source subject a precondition addresses.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A declaration, addressed by its symbol.",
+                "properties": {
+                  "kind": {
+                    "const": "symbol",
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "$ref": "#/$defs/SymbolId",
+                    "description": "The symbol addressed."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "symbol"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A syntax node, addressed by its witnessed identity.",
+                "properties": {
+                  "kind": {
+                    "const": "node",
+                    "type": "string"
+                  },
+                  "node": {
+                    "$ref": "#/$defs/NodeId",
+                    "description": "The node addressed."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "node"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "PreconditionValue": {
+            "description": "A typed value compared by an operation precondition.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Boolean property such as target existence or writability.",
+                "properties": {
+                  "kind": {
+                    "const": "boolean",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Non-negative count such as remaining usages.",
+                "properties": {
+                  "kind": {
+                    "const": "count",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Language or policy value whose spelling is itself significant.",
+                "properties": {
+                  "kind": {
+                    "const": "text",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The value.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "maxLength": 1000,
+            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "type": "string"
+          },
+          "RefusalReason": {
+            "description": "Why resolution produced no edits at all. `ErrorData` carries transport and\ninfrastructure failures.",
+            "oneOf": [
+              {
+                "const": "unsupported",
+                "description": "Nothing serves this operation for the language it reaches.",
+                "type": "string"
+              },
+              {
+                "const": "unmet_precondition",
+                "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
+                "type": "string"
+              },
+              {
+                "const": "ambiguous_target",
+                "description": "The address resolves to several targets. Narrow it and ask again.",
+                "type": "string"
+              }
+            ]
+          },
+          "Severity": {
+            "description": "How much a `Diagnostic` matters, in the provider's own judgement. Providers map their\ntoolchain's own levels onto these four, so a caller can drop everything below `warning`\nwithout knowing which language produced it.",
+            "oneOf": [
+              {
+                "const": "error",
+                "description": "Wire value `error`.",
+                "type": "string"
+              },
+              {
+                "const": "warning",
+                "description": "Wire value `warning`.",
+                "type": "string"
+              },
+              {
+                "const": "info",
+                "description": "Wire value `info`.",
+                "type": "string"
+              },
+              {
+                "const": "hint",
+                "description": "Wire value `hint`.",
+                "type": "string"
+              }
+            ]
+          },
+          "SourceSpan": {
+            "additionalProperties": false,
+            "description": "A byte range of one file.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "The bytes, as offsets into that file."
+              },
+              "unit": {
+                "$ref": "#/$defs/FileId",
+                "description": "Which file the offsets are into."
+              }
+            },
+            "required": [
+              "unit",
+              "range"
+            ],
+            "type": "object"
+          },
+          "SymbolId": {
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "TextRange": {
+            "additionalProperties": false,
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the conformance tests\ninstead.",
+            "properties": {
+              "end": {
+                "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "description": "First byte of the range, counted from the start of the file.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start",
+              "end"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "The operation resolved to edits and Rift wrote them into the targeted tree.",
+            "properties": {
+              "status": {
+                "const": "applied",
+                "type": "string"
+              },
+              "summary": {
+                "$ref": "#/$defs/ChangeSummary",
+                "description": "The applied change and its evidence."
+              }
+            },
+            "required": [
+              "status",
+              "summary"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Resolution produced no edits, so the targeted tree is untouched.",
+            "properties": {
+              "diagnostics": {
+                "description": "Evidence that explains the refusal.",
+                "items": {
+                  "$ref": "#/$defs/Diagnostic"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              "preconditions": {
+                "description": "Conditions checked before refusal, including at least one failed entry for\n`unmet_precondition`.",
+                "items": {
+                  "$ref": "#/$defs/OperationPrecondition"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "reason": {
+                "$ref": "#/$defs/RefusalReason",
+                "description": "The condition the caller can act on."
+              },
+              "status": {
+                "const": "refused",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "reason",
+              "preconditions",
+              "diagnostics"
+            ],
+            "type": "object"
+          }
+        ]
       }
     },
     {

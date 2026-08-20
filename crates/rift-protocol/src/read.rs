@@ -1,4 +1,4 @@
-//! Wire models for the read-only Rift MCP tools.
+//! Wire models for the Rift MCP read tools.
 //!
 //! Every type here is a wire contract: serde attributes define exactly what
 //! the server accepts and returns, and the MCP server derives its advertised
