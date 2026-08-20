@@ -71,12 +71,18 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 mod tests {
     use std::error::Error as _;
 
-    use super::{Cli, CliCommand, CliError, cli_command};
+    use super::{Cli, CliCommand, CliError, cli_command, run};
     use clap::Parser;
 
     #[test]
     fn empty_invocation_remains_valid() {
         assert!(Cli::try_parse_from(["rift"]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_command_runs_successfully() {
+        let cli = Cli { command: None };
+        assert!(run(cli).await.is_ok());
     }
 
     #[test]
