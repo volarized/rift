@@ -1,8 +1,15 @@
 //! Bounded, checksummed self-update for official Rift releases.
 
+use rift_core::constants::{
+    CHECKSUM_ENTRY_COUNT_MAX, CHECKSUM_MANIFEST_BYTES_MAX, HTTPS_SCHEME, REDIRECT_HOPS_MAX,
+    RELEASE_API_URL, RELEASE_ARCHIVE_BYTES_MAX, RELEASE_ARCHIVE_MEMBER_COUNT,
+    RELEASE_BINARY_BYTES_MAX, RELEASE_DOCUMENT_BYTES_MAX, RELEASE_DOWNLOAD_BASE_URL,
+    RELEASE_DOWNLOAD_TIMEOUT, RELEASE_METADATA_BYTES_MAX, SHA256_HEX_LENGTH,
+};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::fs;
@@ -10,18 +17,38 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
-const RELEASE_API_URL: &str = "https://api.github.com/repos/volarized/rift/releases/latest";
-const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/volarized/rift/releases/download";
-const RELEASE_METADATA_BYTES_MAX: u64 = 1024 * 1024;
-const CHECKSUM_MANIFEST_BYTES_MAX: u64 = 16 * 1024;
-const RELEASE_ARCHIVE_BYTES_MAX: u64 = 128 * 1024 * 1024;
-const RELEASE_BINARY_BYTES_MAX: u64 = 128 * 1024 * 1024;
-const RELEASE_DOCUMENT_BYTES_MAX: u64 = 4 * 1024 * 1024;
-const RELEASE_MEMBER_COUNT: usize = 3;
-const CHECKSUM_ENTRY_COUNT_MAX: usize = 16;
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
+/// File name for the staged latest-release metadata response.
+const RELEASE_METADATA_FILE_NAME: &str = "latest.json";
+/// User agent identifying the Rift updater to GitHub.
+const UPDATE_USER_AGENT: &str = "rift-updater";
+/// Accept header value requesting GitHub's JSON release representation.
+const GITHUB_JSON_ACCEPT: &str = "application/vnd.github+json";
+/// Two-space separator of the `sha256sum` text-mode manifest format.
+const SHA256SUM_SEPARATOR: &str = "  ";
+/// Bytes read per iteration while hashing one release file.
+const CHECKSUM_READ_BUFFER_BYTES: usize = 16 * 1024;
+/// Guidance shown when the staged binary cannot replace the current one.
+const PUBLISH_FAILURE_GUIDANCE: &str =
+    "Rift update could not be published: ensure the Rift install directory is writable and retry";
+
+/// Sibling file name staging the incoming Windows binary.
+#[cfg(windows)]
+const WINDOWS_UPDATE_PREPARED_NAME: &str = ".rift-update-new.exe";
+/// Sibling file name holding the replaced Windows binary until cleanup.
+#[cfg(windows)]
+const WINDOWS_UPDATE_BACKUP_NAME: &str = ".rift-update-old.exe";
+/// Hidden subcommand run on the new binary to delete the replaced one.
+///
+/// Must match the hidden `__CleanupUpdate` subcommand name in `main.rs`.
+#[cfg(windows)]
+const CLEANUP_SUBCOMMAND: &str = "__cleanup-update";
+/// Maximum removal attempts for one replaced Windows binary.
+#[cfg(windows)]
+const CLEANUP_RETRY_COUNT_MAX: u32 = 40;
+/// Delay between replaced-binary removal attempts.
+#[cfg(windows)]
+const CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const RELEASE_TARGET: &str = "aarch64-apple-darwin";
@@ -80,24 +107,24 @@ impl fmt::Display for UpdateOutcome {
 /// Opaque updater failure.
 #[derive(Debug)]
 pub(super) struct UpdateError {
-    message: &'static str,
+    message: Cow<'static, str>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl UpdateError {
-    fn new(message: &'static str) -> Self {
+    fn new(message: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            message,
+            message: message.into(),
             source: None,
         }
     }
 
     fn caused_by(
-        message: &'static str,
+        message: impl Into<Cow<'static, str>>,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         Self {
-            message,
+            message: message.into(),
             source: Some(Box::new(source)),
         }
     }
@@ -105,7 +132,7 @@ impl UpdateError {
 
 impl fmt::Display for UpdateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -149,7 +176,7 @@ impl ReleaseArtifact {
         format!("{}/{}", self.root, Self::binary_name())
     }
 
-    fn members(&self) -> [String; RELEASE_MEMBER_COUNT] {
+    fn members(&self) -> [String; RELEASE_ARCHIVE_MEMBER_COUNT] {
         [
             self.binary_member(),
             format!("{}/README.md", self.root),
@@ -158,7 +185,7 @@ impl ReleaseArtifact {
     }
 
     fn download_url(&self, name: &str) -> String {
-        format!("{RELEASE_DOWNLOAD_BASE}/v{}/{name}", self.version)
+        format!("{RELEASE_DOWNLOAD_BASE_URL}/v{}/{name}", self.version)
     }
 }
 
@@ -184,9 +211,18 @@ struct GitHubReleaseSource<T> {
 struct AtomicPublisher;
 
 pub(super) fn update() -> Result<UpdateOutcome, UpdateError> {
-    let current = std::env::current_exe()
-        .map_err(|error| UpdateError::caused_by("current Rift executable is unavailable", error))?;
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(version_error)?;
+    let current = std::env::current_exe().map_err(|error| {
+        UpdateError::caused_by(
+            "current Rift executable could not be located: reinstall Rift if the binary was moved or deleted",
+            error,
+        )
+    })?;
+    let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|error| {
+        UpdateError::caused_by(
+            "installed Rift version is invalid: reinstall Rift from an official release",
+            error,
+        )
+    })?;
     update_with(
         &GitHubReleaseSource {
             transport: ReqwestTransport::new()?,
@@ -204,14 +240,17 @@ fn update_with(
     current_version: Version,
 ) -> Result<UpdateOutcome, UpdateError> {
     let staging = tempfile::tempdir().map_err(|error| {
-        UpdateError::caused_by("update staging directory could not be created", error)
+        UpdateError::caused_by(
+            "update staging directory could not be created: ensure the system temporary directory is writable and has free space",
+            error,
+        )
     })?;
     let latest_version = source.latest_version(staging.path())?;
     match latest_version.cmp(&current_version) {
         Ordering::Equal => Ok(UpdateOutcome::Current(current_version)),
-        Ordering::Less => Err(UpdateError::new(
-            "latest release is older than current Rift",
-        )),
+        Ordering::Less => Err(UpdateError::new(format!(
+            "latest release v{latest_version} is older than current Rift v{current_version}: no update is available; current binary is newer than any published release"
+        ))),
         Ordering::Greater => {
             let candidate = source.stage(staging.path(), latest_version.clone())?;
             let cleanup_pending = publisher.publish(current_path, &candidate)?;
@@ -227,7 +266,9 @@ fn update_with(
 impl ReqwestTransport {
     fn new() -> Result<Self, UpdateError> {
         let redirects = reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || attempt.url().scheme() != "https" {
+            if attempt.previous().len() >= REDIRECT_HOPS_MAX
+                || attempt.url().scheme() != HTTPS_SCHEME
+            {
                 attempt.stop()
             } else {
                 attempt.follow()
@@ -235,9 +276,9 @@ impl ReqwestTransport {
         });
         let client = reqwest::blocking::Client::builder()
             .redirect(redirects)
-            .timeout(DOWNLOAD_TIMEOUT)
+            .timeout(RELEASE_DOWNLOAD_TIMEOUT)
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
-            .user_agent("rift-updater")
+            .user_agent(UPDATE_USER_AGENT)
             .build()
             .map_err(download_error)?;
         Ok(Self { client })
@@ -249,7 +290,7 @@ impl DownloadTransport for ReqwestTransport {
         let mut response = self
             .client
             .get(url)
-            .header("Accept", "application/vnd.github+json")
+            .header(reqwest::header::ACCEPT, GITHUB_JSON_ACCEPT)
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(download_error)?;
@@ -257,13 +298,16 @@ impl DownloadTransport for ReqwestTransport {
             .content_length()
             .is_some_and(|length| length > bytes_max)
         {
-            return Err(download_too_large());
+            return Err(download_too_large(bytes_max));
         }
         let mut output = fs::File::create(destination).map_err(download_error)?;
-        let copied = io::copy(&mut response.by_ref().take(bytes_max + 1), &mut output)
-            .map_err(download_error)?;
+        let copied = io::copy(
+            &mut response.by_ref().take(bytes_max_with_sentinel(bytes_max)),
+            &mut output,
+        )
+        .map_err(download_error)?;
         if copied == 0 || copied > bytes_max {
-            return Err(download_too_large());
+            return Err(download_too_large(bytes_max));
         }
         output.sync_all().map_err(download_error)?;
         Ok(())
@@ -272,7 +316,7 @@ impl DownloadTransport for ReqwestTransport {
 
 impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
     fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError> {
-        let metadata_path = directory.join("latest.json");
+        let metadata_path = directory.join(RELEASE_METADATA_FILE_NAME);
         self.transport
             .download(RELEASE_API_URL, &metadata_path, RELEASE_METADATA_BYTES_MAX)?;
         let bytes = fs::read(metadata_path).map_err(release_error)?;
@@ -302,28 +346,39 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
 fn parse_release_tag(tag: &str) -> Result<Version, UpdateError> {
     let value = tag
         .strip_prefix('v')
-        .ok_or_else(|| UpdateError::new("release version is invalid"))?;
-    let version = Version::parse(value).map_err(version_error)?;
+        .ok_or_else(|| UpdateError::new(release_tag_invalid(tag)))?;
+    let version = Version::parse(value)
+        .map_err(|error| UpdateError::caused_by(release_tag_invalid(tag), error))?;
     if !version.pre.is_empty() || !version.build.is_empty() {
-        return Err(UpdateError::new("release version is invalid"));
+        return Err(UpdateError::new(format!(
+            "release tag `{tag}` is a pre-release or build: only stable releases of the form `vMAJOR.MINOR.PATCH` are supported"
+        )));
     }
     Ok(version)
 }
 
-fn version_error(error: semver::Error) -> UpdateError {
-    UpdateError::caused_by("release version is invalid", error)
+fn release_tag_invalid(tag: &str) -> String {
+    format!(
+        "release tag `{tag}` is invalid: expected the form `vMAJOR.MINOR.PATCH`, such as `v0.0.2`"
+    )
 }
 
 #[cfg(test)]
 pub(super) fn error_for_test() -> UpdateError {
-    version_error(Version::parse("invalid").expect_err("fixture must be invalid"))
+    parse_release_tag("vinvalid").expect_err("fixture tag must be invalid")
 }
 
 fn require_bounded_file(path: &Path, bytes_max: u64) -> Result<u64, UpdateError> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| UpdateError::caused_by("release file is unavailable", error))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        UpdateError::caused_by(
+            "downloaded release file is unavailable: retry `rift update`",
+            error,
+        )
+    })?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > bytes_max {
-        return Err(UpdateError::new("release file has invalid type or size"));
+        return Err(UpdateError::new(format!(
+            "release file is not a regular file between 1 and {bytes_max} bytes: retry `rift update`; if this persists the release assets may be malformed"
+        )));
     }
     Ok(metadata.len())
 }
@@ -336,8 +391,11 @@ fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Resul
         if index >= CHECKSUM_ENTRY_COUNT_MAX {
             return Err(checksum_invalid());
         }
-        let (digest, name) = line.split_once("  ").ok_or_else(checksum_invalid)?;
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let (digest, name) = line
+            .split_once(SHA256SUM_SEPARATOR)
+            .ok_or_else(checksum_invalid)?;
+        if digest.len() != SHA256_HEX_LENGTH || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
             return Err(checksum_invalid());
         }
         if name == archive_name && expected.replace(digest).is_some() {
@@ -347,7 +405,9 @@ fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Resul
     let expected = expected.ok_or_else(checksum_invalid)?;
     let actual = sha256(archive)?;
     if !actual.eq_ignore_ascii_case(expected) {
-        return Err(UpdateError::new("release archive checksum mismatch"));
+        return Err(UpdateError::new(
+            "release archive checksum does not match its manifest entry: retry `rift update`; if this persists the download may be corrupted or tampered with",
+        ));
     }
     Ok(())
 }
@@ -356,7 +416,7 @@ fn sha256(path: &Path) -> Result<String, UpdateError> {
     require_bounded_file(path, RELEASE_ARCHIVE_BYTES_MAX)?;
     let mut file = fs::File::open(path).map_err(checksum_error)?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = [0_u8; CHECKSUM_READ_BUFFER_BYTES];
     loop {
         let count = file.read(&mut buffer).map_err(checksum_error)?;
         if count == 0 {
@@ -368,23 +428,41 @@ fn sha256(path: &Path) -> Result<String, UpdateError> {
 }
 
 fn checksum_invalid() -> UpdateError {
-    UpdateError::new("release checksum manifest is invalid")
+    UpdateError::new(
+        "release checksum manifest is invalid: expected `sha256sum`-format lines naming the release archive exactly once; retry `rift update`",
+    )
 }
 
 fn checksum_error(error: io::Error) -> UpdateError {
-    UpdateError::caused_by("release checksum could not be verified", error)
+    UpdateError::caused_by(
+        "release checksum could not be verified: retry `rift update`",
+        error,
+    )
 }
 
 fn release_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
-    UpdateError::caused_by("latest Rift release is invalid", error)
+    UpdateError::caused_by(
+        "latest release metadata is invalid: retry `rift update` or check https://github.com/volarized/rift/releases",
+        error,
+    )
 }
 
 fn download_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
-    UpdateError::caused_by("release download failed", error)
+    UpdateError::caused_by(
+        "release download failed: check network access to github.com and retry `rift update`",
+        error,
+    )
 }
 
-fn download_too_large() -> UpdateError {
-    UpdateError::new("release download has invalid size")
+fn download_too_large(bytes_max: u64) -> UpdateError {
+    UpdateError::new(format!(
+        "release download was empty or exceeded {bytes_max} bytes: retry `rift update`; if this persists the release assets may be malformed"
+    ))
+}
+
+/// Read limit admitting one sentinel byte past `bytes_max` to detect oversized payloads.
+const fn bytes_max_with_sentinel(bytes_max: u64) -> u64 {
+    bytes_max.saturating_add(1)
 }
 
 fn copy_bounded(
@@ -392,9 +470,15 @@ fn copy_bounded(
     destination: &mut impl Write,
     bytes_max: u64,
 ) -> Result<(), UpdateError> {
-    let copied = io::copy(&mut source.take(bytes_max + 1), destination).map_err(archive_error)?;
+    let copied = io::copy(
+        &mut source.take(bytes_max_with_sentinel(bytes_max)),
+        destination,
+    )
+    .map_err(archive_error)?;
     if copied == 0 || copied > bytes_max {
-        return Err(UpdateError::new("release archive member has invalid size"));
+        return Err(UpdateError::new(format!(
+            "release archive member is empty or exceeds {bytes_max} bytes: retry `rift update`; if this persists the release may be malformed"
+        )));
     }
     Ok(())
 }
@@ -403,8 +487,8 @@ fn extract_member(
     entry: &mut impl Read,
     path: &Path,
     size: u64,
-    expected: &[String; RELEASE_MEMBER_COUNT],
-    seen: &mut [bool; RELEASE_MEMBER_COUNT],
+    expected: &[String; RELEASE_ARCHIVE_MEMBER_COUNT],
+    seen: &mut [bool; RELEASE_ARCHIVE_MEMBER_COUNT],
     candidate: &Path,
 ) -> Result<(), UpdateError> {
     let position = expected
@@ -428,10 +512,10 @@ fn extract_member(
 }
 
 fn finish_extraction(
-    seen: [bool; RELEASE_MEMBER_COUNT],
+    seen: [bool; RELEASE_ARCHIVE_MEMBER_COUNT],
     candidate: PathBuf,
 ) -> Result<PathBuf, UpdateError> {
-    if seen != [true; RELEASE_MEMBER_COUNT] {
+    if seen != [true; RELEASE_ARCHIVE_MEMBER_COUNT] {
         return Err(archive_invalid());
     }
     validate_candidate(&candidate)?;
@@ -448,11 +532,11 @@ fn extract_candidate(
     let decoder = flate2::read::GzDecoder::new(raw);
     let mut archive = tar::Archive::new(decoder);
     let expected = artifact.members();
-    let mut seen = [false; RELEASE_MEMBER_COUNT];
+    let mut seen = [false; RELEASE_ARCHIVE_MEMBER_COUNT];
     let candidate = directory.join(ReleaseArtifact::binary_name());
     let entries = archive.entries().map_err(archive_error)?;
     for (index, entry) in entries.enumerate() {
-        if index >= RELEASE_MEMBER_COUNT {
+        if index >= RELEASE_ARCHIVE_MEMBER_COUNT {
             return Err(archive_invalid());
         }
         let mut entry = entry.map_err(archive_error)?;
@@ -474,13 +558,13 @@ fn extract_candidate(
 ) -> Result<PathBuf, UpdateError> {
     let raw = fs::File::open(archive_path).map_err(archive_error)?;
     let mut archive = zip::ZipArchive::new(raw).map_err(archive_error)?;
-    if archive.len() != RELEASE_MEMBER_COUNT {
+    if archive.len() != RELEASE_ARCHIVE_MEMBER_COUNT {
         return Err(archive_invalid());
     }
     let expected = artifact.members();
-    let mut seen = [false; RELEASE_MEMBER_COUNT];
+    let mut seen = [false; RELEASE_ARCHIVE_MEMBER_COUNT];
     let candidate = directory.join(ReleaseArtifact::binary_name());
-    for index in 0..RELEASE_MEMBER_COUNT {
+    for index in 0..RELEASE_ARCHIVE_MEMBER_COUNT {
         let mut entry = archive.by_index(index).map_err(archive_error)?;
         if !entry.is_file() {
             return Err(archive_invalid());
@@ -506,11 +590,16 @@ const fn member_bytes_max(position: usize) -> u64 {
 }
 
 fn archive_invalid() -> UpdateError {
-    UpdateError::new("release archive contents are invalid")
+    UpdateError::new(
+        "release archive contents are invalid: expected exactly one binary, README.md, and LICENSE.md member; retry `rift update`",
+    )
 }
 
 fn archive_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
-    UpdateError::caused_by("release archive could not be extracted", error)
+    UpdateError::caused_by(
+        "release archive could not be extracted: retry `rift update`; if this persists the download may be corrupted",
+        error,
+    )
 }
 
 impl Publisher for AtomicPublisher {
@@ -521,9 +610,11 @@ impl Publisher for AtomicPublisher {
 
 #[cfg(unix)]
 fn publish_candidate(current: &Path, candidate: &Path) -> Result<bool, UpdateError> {
-    let parent = current
-        .parent()
-        .ok_or_else(|| UpdateError::new("current executable has no parent"))?;
+    let parent = current.parent().ok_or_else(|| {
+        UpdateError::new(
+            "current executable has no parent directory: install Rift in a regular directory before updating",
+        )
+    })?;
     let mut prepared = tempfile::NamedTempFile::new_in(parent).map_err(publish_error)?;
     let mut source = fs::File::open(candidate).map_err(publish_error)?;
     copy_bounded(
@@ -531,7 +622,7 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<bool, UpdateErr
         prepared.as_file_mut(),
         RELEASE_BINARY_BYTES_MAX,
     )
-    .map_err(|error| UpdateError::caused_by("Rift update could not be published", error))?;
+    .map_err(|error| UpdateError::caused_by(PUBLISH_FAILURE_GUIDANCE, error))?;
     let permissions = fs::metadata(current).map_err(publish_error)?.permissions();
     prepared
         .as_file()
@@ -546,10 +637,12 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<bool, UpdateErr
 
 #[cfg(windows)]
 fn publish_candidate(current: &Path, candidate: &Path) -> Result<bool, UpdateError> {
-    let prepared = sibling(current, ".rift-update-new.exe")?;
-    let backup = sibling(current, ".rift-update-old.exe")?;
+    let prepared = sibling(current, WINDOWS_UPDATE_PREPARED_NAME)?;
+    let backup = sibling(current, WINDOWS_UPDATE_BACKUP_NAME)?;
     if backup.exists() {
-        return Err(UpdateError::new("another Rift update is pending cleanup"));
+        return Err(UpdateError::new(format!(
+            "another Rift update is pending cleanup: retry after the previous Rift process exits, or delete `{WINDOWS_UPDATE_BACKUP_NAME}` beside the Rift binary"
+        )));
     }
     if prepared.exists() {
         fs::remove_file(&prepared).map_err(publish_error)?;
@@ -563,13 +656,13 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<bool, UpdateErr
         return match fs::rename(&backup, current) {
             Ok(()) => Err(publish_error(publish)),
             Err(rollback) => Err(UpdateError::caused_by(
-                "Rift update publish and rollback failed",
+                "Rift update publish and rollback both failed: reinstall Rift from an official release",
                 RollbackError { publish, rollback },
             )),
         };
     }
     let scheduled = Command::new(current)
-        .args(["__cleanup-update", &std::process::id().to_string()])
+        .args([CLEANUP_SUBCOMMAND, &std::process::id().to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -580,14 +673,15 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<bool, UpdateErr
 
 #[cfg(windows)]
 fn sibling(current: &Path, name: &str) -> Result<PathBuf, UpdateError> {
-    current
-        .parent()
-        .map(|parent| parent.join(name))
-        .ok_or_else(|| UpdateError::new("current executable has no parent"))
+    current.parent().map(|parent| parent.join(name)).ok_or_else(|| {
+        UpdateError::new(
+            "current executable has no parent directory: install Rift in a regular directory before updating",
+        )
+    })
 }
 
 fn publish_error(error: io::Error) -> UpdateError {
-    UpdateError::caused_by("Rift update could not be published", error)
+    UpdateError::caused_by(PUBLISH_FAILURE_GUIDANCE, error)
 }
 
 #[cfg(windows)]
@@ -614,12 +708,12 @@ impl std::error::Error for RollbackError {}
 #[cfg(windows)]
 pub(super) fn cleanup_replaced_binary() -> Result<(), UpdateError> {
     let current = std::env::current_exe().map_err(publish_error)?;
-    let backup = sibling(&current, ".rift-update-old.exe")?;
-    for _ in 0..40 {
+    let backup = sibling(&current, WINDOWS_UPDATE_BACKUP_NAME)?;
+    for _ in 0..CLEANUP_RETRY_COUNT_MAX {
         match fs::remove_file(&backup) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => std::thread::sleep(CLEANUP_RETRY_DELAY),
         }
     }
     fs::remove_file(backup).map_err(publish_error)
@@ -729,7 +823,7 @@ mod tests {
             } else {
                 assert_eq!(
                     result.expect_err("downgrade must fail").to_string(),
-                    "latest release is older than current Rift"
+                    "latest release v0.0.1 is older than current Rift v0.0.2: no update is available; current binary is newer than any published release"
                 );
             }
             assert_eq!(source.stage_calls.get(), 0);
@@ -801,7 +895,7 @@ mod tests {
         ] {
             assert!(error.source().is_some());
         }
-        for error in [super::download_too_large(), super::archive_invalid()] {
+        for error in [super::download_too_large(1), super::archive_invalid()] {
             assert!(error.source().is_none());
         }
         for mut bytes in [b"".as_slice(), b"ab".as_slice()] {

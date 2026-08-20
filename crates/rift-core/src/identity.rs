@@ -189,9 +189,10 @@ impl SourceUnitIdError {
         Self { kind }
     }
 
-    crate::property! {
-        /// Returns source-unit identity failure classification.
-        pub const fn kind(self) -> SourceUnitIdErrorKind = self.kind;
+    /// Returns source-unit identity failure classification.
+    #[must_use]
+    pub const fn kind(self) -> SourceUnitIdErrorKind {
+        self.kind
     }
 
     /// Returns canonical registry metadata.
