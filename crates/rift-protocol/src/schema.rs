@@ -47,6 +47,11 @@ macro_rules! property {
     }};
 }
 
+/// The Rift extension keyword stating an admitted range schema validation
+/// cannot compare itself: the bounds of a string-spelled `ByteSize` or
+/// `Duration` key.
+const RIFT_RANGE: &str = "rift:range";
+
 /// The serde tag property of [`FileContent`](crate::read::FileContent),
 /// pinned by [`tests::tagged_union_tags_exist_in_generated_schemas`].
 const FILE_CONTENT_TAG: &str = "kind";
@@ -234,6 +239,63 @@ fn nullable_without_type(object: &mut Map<String, Value>) {
         object.insert(keyword::DESCRIPTION.to_owned(), description);
     }
     object.insert(keyword::ANY_OF.to_owned(), json!([inner, null_arm]));
+}
+
+/// A `rift:range` value: the smallest and largest admitted spelling, both
+/// serialized by the value type itself.
+fn range<T: Serialize>(min: &T, max: &T) -> Value {
+    json!({ "min": wire(min), "max": wire(max) })
+}
+
+/// Adds `annotation` under `key` on one named property of `schema`, for
+/// extension keywords that ride a property's own clause.
+fn annotate_property(schema: &mut Schema, name: &str, key: &str, annotation: Value) {
+    let property = schema
+        .ensure_object()
+        .get_mut(keyword::PROPERTIES)
+        .and_then(|properties| properties.get_mut(name))
+        .and_then(Value::as_object_mut);
+    if let Some(property) = property {
+        property.insert(key.to_owned(), annotation);
+    }
+}
+
+/// An [`ExecutionConfiguration`](crate::configuration::ExecutionConfiguration)
+/// states each `ByteSize` and `Duration` ceiling as `rift:range` on its key:
+/// schema validation alone cannot compare `"16kb"` against a ceiling, so
+/// the server enforces the bound at load and the schema carries it for
+/// readers.
+pub fn declare_execution_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ByteSize, Duration, EXECUTION_CODE_BYTES_MAX, EXECUTION_OUTPUT_BYTES_MAX,
+        EXECUTION_TIMEOUT_MS_MAX, ExecutionConfiguration,
+    };
+    let ranges = [
+        (
+            property!(ExecutionConfiguration, max_code),
+            range(
+                &ByteSize::from_bytes(1),
+                &ByteSize::from_bytes(EXECUTION_CODE_BYTES_MAX),
+            ),
+        ),
+        (
+            property!(ExecutionConfiguration, max_timeout),
+            range(
+                &Duration::from_millis(1),
+                &Duration::from_millis(EXECUTION_TIMEOUT_MS_MAX),
+            ),
+        ),
+        (
+            property!(ExecutionConfiguration, max_output),
+            range(
+                &ByteSize::from_bytes(0),
+                &ByteSize::from_bytes(EXECUTION_OUTPUT_BYTES_MAX),
+            ),
+        ),
+    ];
+    for (name, admitted) in ranges {
+        annotate_property(schema, name, RIFT_RANGE, admitted);
+    }
 }
 
 /// An [`ErrorData`](crate::error::ErrorData) carries `limit` only when
@@ -523,11 +585,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn execution_configuration_schema_states_ranges_on_each_bounded_key() {
+        let schema =
+            serde_json::to_value(schema_for!(crate::configuration::ExecutionConfiguration))
+                .expect("schema");
+        let cases = [
+            ("max_code", json!({ "min": "1b", "max": "32kb" })),
+            ("max_timeout", json!({ "min": "1ms", "max": "1d" })),
+            ("max_output", json!({ "min": "0b", "max": "16kb" })),
+        ];
+        for (name, admitted) in cases {
+            assert_eq!(
+                schema["properties"][name][RIFT_RANGE], admitted,
+                "{name} must state its admitted range"
+            );
+        }
+    }
+
     /// The `property!` macro proves a field exists on the struct; this test
     /// proves serde serves it under the same name, closing the rename gap.
     #[test]
     fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 4] = [
+        let cases: [(&str, Value, &[&str]); 5] = [
+            (
+                "ExecutionConfiguration",
+                serde_json::to_value(schema_for!(crate::configuration::ExecutionConfiguration))
+                    .expect("schema"),
+                &["max_code", "max_timeout", "max_output"],
+            ),
             (
                 "File",
                 serde_json::to_value(schema_for!(File)).expect("schema"),

@@ -1,0 +1,444 @@
+{
+  "$defs": {
+    "ByteSize": {
+      "description": "A byte size: an integer magnitude with a required unit suffix `b`, `kb`, `mb`, `gb`, or `tb`; units are binary, so `1kb` is 1024 bytes.",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:b|kb|mb|gb|tb)$",
+      "type": "string"
+    },
+    "ChangedPaths": {
+      "description": "Whether the changed project paths ride the hook's command line.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "The command runs exactly as configured.",
+          "type": "string"
+        },
+        {
+          "const": "append",
+          "description": "The changed project paths follow the configured `arguments`, in byte\norder, for a tool that takes files.",
+          "type": "string"
+        }
+      ]
+    },
+    "CommandHook": {
+      "additionalProperties": false,
+      "description": "One `[[hooks]]` block: an executable Rift starts directly — no shell —\ninside the changed tree each time a change applies. Every key is\nrequired; the schema carries no defaults.",
+      "properties": {
+        "arguments": {
+          "description": "The program's literal arguments, in order. May be empty.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "changed_paths": {
+          "$ref": "#/$defs/ChangedPaths",
+          "description": "Whether the changed project paths are appended after `arguments` in\nbyte order."
+        },
+        "determinism": {
+          "$ref": "#/$defs/Determinism",
+          "description": "Whether an identical tree and environment are expected to reproduce\nthe result."
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment values added on top of the environment the server\ninherited.",
+          "type": "object"
+        },
+        "guarantees": {
+          "description": "What a passing run establishes. Each entry becomes evidence on the\nchange the hook checked.",
+          "items": {
+            "$ref": "#/$defs/HookGuarantee"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "id": {
+          "description": "Label for this hook's results, unique within the list.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/HookKind",
+          "description": "What the hook is: a test suite, a linter, a build, or something else."
+        },
+        "output_limit_bytes": {
+          "description": "Bytes of each output stream Rift keeps, 256 to 4096. The full size\nis still reported.",
+          "format": "uint64",
+          "maximum": 4096,
+          "minimum": 256,
+          "type": "integer"
+        },
+        "program": {
+          "description": "The executable Rift starts. An absolute path is refused; a bare name\nresolves through `PATH`, a relative one below `working_directory`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Milliseconds before Rift kills the process, 1 to 3600000.",
+          "format": "uint64",
+          "maximum": 3600000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/HookType",
+          "description": "How the hook runs; `command` is the only type."
+        },
+        "working_directory": {
+          "$ref": "#/$defs/ProjectPath",
+          "description": "Directory the process starts in, relative to the changed tree's\nroot. Empty selects the root."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "kind",
+        "program",
+        "arguments",
+        "changed_paths",
+        "working_directory",
+        "environment",
+        "timeout_ms",
+        "output_limit_bytes",
+        "guarantees",
+        "determinism"
+      ],
+      "type": "object"
+    },
+    "CoverageReach": {
+      "description": "How far the claim reaches.",
+      "oneOf": [
+        {
+          "const": "request",
+          "description": "Only what this request touched.",
+          "type": "string"
+        },
+        {
+          "const": "project",
+          "description": "Every visible file of the workspace.",
+          "type": "string"
+        },
+        {
+          "const": "dependencies",
+          "description": "The workspace's resolved dependencies.",
+          "type": "string"
+        },
+        {
+          "const": "all",
+          "description": "The workspace, its dependencies, and the standard library together.",
+          "type": "string"
+        }
+      ]
+    },
+    "CoverageScope": {
+      "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A standing scope identified by its name.",
+          "properties": {
+            "kind": {
+              "const": "reach",
+              "type": "string"
+            },
+            "reach": {
+              "$ref": "#/$defs/CoverageReach",
+              "description": "How far the claim reaches."
+            }
+          },
+          "required": [
+            "kind",
+            "reach"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
+          "properties": {
+            "kind": {
+              "const": "unit",
+              "type": "string"
+            },
+            "unit": {
+              "$ref": "#/$defs/FileId",
+              "description": "The file the claim is about."
+            }
+          },
+          "required": [
+            "kind",
+            "unit"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Determinism": {
+      "description": "Whether an identical tree and environment are expected to reproduce a\nhook's result.",
+      "oneOf": [
+        {
+          "const": "deterministic",
+          "description": "The same tree and environment give the same answer.",
+          "type": "string"
+        },
+        {
+          "const": "best_effort",
+          "description": "The result may vary between identical runs.",
+          "type": "string"
+        }
+      ]
+    },
+    "Duration": {
+      "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
+      "type": "string"
+    },
+    "ExecutionConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[execution]` table. `execute` stays off until `allow` names the\nlanguages caller-provided code may run as.",
+      "properties": {
+        "allow": {
+          "default": [],
+          "description": "Language selectors enabled for `execute`: a language name, or\n`name:dialect` to pin a dialect. Empty keeps execution off.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "max_code": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16kb",
+          "description": "Bytes one submitted block may hold, 1b to 32kb.",
+          "rift:range": {
+            "max": "32kb",
+            "min": "1b"
+          }
+        },
+        "max_concurrent": {
+          "default": 2,
+          "description": "Evaluations running at once across the whole workspace.",
+          "format": "uint64",
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_output": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "8kb",
+          "description": "Bytes each captured stream keeps, up to 16kb.",
+          "rift:range": {
+            "max": "16kb",
+            "min": "0b"
+          }
+        },
+        "max_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "Wall-clock bound per evaluation, 1ms to 1d.",
+          "rift:range": {
+            "max": "1d",
+            "min": "1ms"
+          }
+        }
+      },
+      "type": "object"
+    },
+    "FileId": {
+      "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+      "maxLength": 8192,
+      "minLength": 13,
+      "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+      "type": "string"
+    },
+    "GuaranteeKind": {
+      "description": "A property a verifier can establish about an applied change.",
+      "oneOf": [
+        {
+          "const": "syntax_validated",
+          "description": "The changed source parses.",
+          "type": "string"
+        },
+        {
+          "const": "bindings_preserved",
+          "description": "Names still resolve to what they resolved to before the change.",
+          "type": "string"
+        },
+        {
+          "const": "references_updated",
+          "description": "References to the changed declarations were updated with them.",
+          "type": "string"
+        },
+        {
+          "const": "behavior_checked",
+          "description": "The change's behavior was exercised, such as by a test suite.",
+          "type": "string"
+        }
+      ]
+    },
+    "HistoryConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[providers.history]` table. The history provider's cost scales with\nhow far back it walks, so its depth is the budget worth setting.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether the history provider runs at all.",
+          "type": "boolean"
+        },
+        "max_revisions": {
+          "default": 500,
+          "description": "Revisions the walk covers from the current head, newest first.",
+          "format": "uint64",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "HookGuarantee": {
+      "additionalProperties": false,
+      "description": "What a passing run of one hook establishes about the change it checked.",
+      "properties": {
+        "detail": {
+          "description": "The exact property the hook checks, and the limits on reading a pass.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/GuaranteeKind",
+          "description": "Which property a pass establishes."
+        },
+        "scope": {
+          "$ref": "#/$defs/CoverageScope",
+          "description": "What the check covers."
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "HookKind": {
+      "description": "What a hook is, as workspace configuration presents it.",
+      "oneOf": [
+        {
+          "const": "test",
+          "description": "A test suite.",
+          "type": "string"
+        },
+        {
+          "const": "lint",
+          "description": "A linter.",
+          "type": "string"
+        },
+        {
+          "const": "build",
+          "description": "A build.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A hook none of the other kinds describe.",
+          "type": "string"
+        }
+      ]
+    },
+    "HookType": {
+      "description": "How a hook runs; `command` — an executable started directly, without a\nshell — is the only type.",
+      "oneOf": [
+        {
+          "const": "command",
+          "description": "An executable Rift starts directly inside the changed tree.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectPath": {
+      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+      "maxLength": 1000,
+      "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+      "type": "string"
+    },
+    "ProvidersConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[providers]` table: the built-in providers run without\nconfiguration, and this table bounds or disables them.",
+      "properties": {
+        "history": {
+          "$ref": "#/$defs/HistoryConfiguration",
+          "default": {
+            "enabled": true,
+            "max_revisions": 500
+          },
+          "description": "The history provider's budget."
+        }
+      },
+      "type": "object"
+    },
+    "SearchConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[search]` table. Search runs on a lexical index with nothing to\nconfigure; `embedding` names the model that adds dense ranking on top.",
+      "properties": {
+        "embedding": {
+          "description": "The embedding model identifier. Vectors are stored per model, so\nchanging the value rebuilds the dense index; absent keeps search\nlexical.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The whole `rift.toml`. Every table is optional and defaults to the\nbehavior documented on it; any key outside these definitions refuses the\nfile as `configuration_invalid`.",
+  "properties": {
+    "execution": {
+      "$ref": "#/$defs/ExecutionConfiguration",
+      "default": {
+        "allow": [],
+        "max_code": "16kb",
+        "max_concurrent": 2,
+        "max_output": "8kb",
+        "max_timeout": "30s"
+      },
+      "description": "Enablement and limits for caller-provided code."
+    },
+    "hooks": {
+      "default": [],
+      "description": "Hooks run in the changed tree, in list order, each time a change\napplies.",
+      "items": {
+        "$ref": "#/$defs/CommandHook"
+      },
+      "maxItems": 32,
+      "type": "array"
+    },
+    "providers": {
+      "$ref": "#/$defs/ProvidersConfiguration",
+      "default": {
+        "history": {
+          "enabled": true,
+          "max_revisions": 500
+        }
+      },
+      "description": "Bounds and switches for the built-in providers."
+    },
+    "search": {
+      "$ref": "#/$defs/SearchConfiguration",
+      "default": {},
+      "description": "The embedding model that adds dense ranking to lexical search."
+    }
+  },
+  "title": "WorkspaceConfiguration",
+  "type": "object"
+}

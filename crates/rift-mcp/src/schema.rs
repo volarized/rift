@@ -3,9 +3,11 @@
 //! [`schema_document`] serializes the same tool router [`RiftMcp`] runs, so
 //! the exported document and the served surface come from one definition:
 //! tool names and descriptions from the `#[tool]` methods, request and
-//! response schemas derived from the `rift_protocol` wire models. The
-//! `rift-schema-export` binary writes the document into the docs; the rest of
-//! this module is the binary's logic, kept here so it is testable.
+//! response schemas derived from the `rift_protocol` wire models.
+//! [`configuration_schema_document`] derives the `rift.toml` schema from the
+//! same crate's configuration model. The `rift-schema-export` binary writes
+//! both documents into the docs; the rest of this module is the binary's
+//! logic, kept here so it is testable.
 
 use std::error::Error;
 use std::fmt;
@@ -22,11 +24,17 @@ use crate::RiftMcp;
 const DOCUMENT_DESCRIPTION: &str =
     "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.";
 
-/// Directory the schema document lands in when no argument names one.
-const OUTPUT_DIR_DEFAULT: &str = "docs/protocol";
+/// Directory the export lands in when no argument names one; each document
+/// carries its own path below it.
+const OUTPUT_DIR_DEFAULT: &str = "docs";
 
-/// File name of the exported schema document inside the output directory.
-const SCHEMA_FILE_NAME: &str = "mcp.json";
+/// Path of the exported tool-surface document below the output directory.
+const SCHEMA_DOCUMENT_PATH: &str = "protocol/mcp.json";
+
+/// Path of the exported `rift.toml` schema below the output directory. It
+/// lands in the docs site's static files, so readers fetch it from the
+/// site's own origin rather than the repository host.
+const CONFIGURATION_SCHEMA_PATH: &str = "public/rift.schema.json";
 
 /// Usage line appended to argument errors.
 const USAGE: &str = "usage: rift-schema-export [--check] [OUTPUT_DIR]";
@@ -60,6 +68,24 @@ pub fn schema_document() -> String {
         "description": DOCUMENT_DESCRIPTION,
         "tools": tools,
     });
+    let mut rendered = format!("{document:#}");
+    rendered.push('\n');
+    rendered
+}
+
+/// Renders the JSON Schema of `rift.toml`, derived from
+/// [`WorkspaceConfiguration`](rift_protocol::configuration::WorkspaceConfiguration),
+/// so an editor can validate the file and refuse unknown keys before the
+/// server does.
+///
+/// Output is pretty-printed, ends with a trailing newline, and is
+/// byte-identical across calls because `serde_json` stores objects as sorted
+/// maps.
+#[must_use]
+pub fn configuration_schema_document() -> String {
+    let schema = schemars::schema_for!(rift_protocol::configuration::WorkspaceConfiguration);
+    let document = serde_json::to_value(&schema)
+        .unwrap_or_else(|error| unreachable!("schemas serialize to JSON values: {error}"));
     let mut rendered = format!("{document:#}");
     rendered.push('\n');
     rendered
@@ -200,38 +226,54 @@ where
     })
 }
 
-/// Writes the schema document, or with `--check` proves the committed copy
-/// matches the served surface.
+/// Writes both schema documents, or with `--check` proves the committed
+/// copies match what the server derives.
 ///
 /// # Errors
 ///
-/// Returns [`ExportError`] when the document cannot be read, differs, or
+/// Returns [`ExportError`] when a document cannot be read, differs, or
 /// cannot be written.
 pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
-    let document = schema_document();
-    let document_path = request.output_dir.join(SCHEMA_FILE_NAME);
+    let documents = [
+        (SCHEMA_DOCUMENT_PATH, schema_document()),
+        (CONFIGURATION_SCHEMA_PATH, configuration_schema_document()),
+    ];
     if request.check {
-        let committed =
-            fs::read_to_string(&document_path).map_err(|source| ExportError::CheckUnreadable {
-                path: document_path.clone(),
-                source,
-            })?;
-        if committed != document {
-            return Err(ExportError::CheckMismatch {
-                path: document_path,
-            });
+        for (relative_path, document) in &documents {
+            check_document(&request.output_dir.join(relative_path), document)?;
         }
-        println!("{} is up to date", document_path.display());
         return Ok(());
     }
-    fs::create_dir_all(&request.output_dir).map_err(|source| ExportError::WriteFailed {
-        path: request.output_dir.clone(),
-        source,
-    })?;
-    fs::write(&document_path, document).map_err(|source| ExportError::WriteFailed {
-        path: document_path.clone(),
-        source,
-    })?;
-    println!("wrote {}", document_path.display());
+    for (relative_path, document) in &documents {
+        let document_path = request.output_dir.join(relative_path);
+        let parent = document_path
+            .parent()
+            .unwrap_or(request.output_dir.as_path());
+        fs::create_dir_all(parent).map_err(|source| ExportError::WriteFailed {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        fs::write(&document_path, document).map_err(|source| ExportError::WriteFailed {
+            path: document_path.clone(),
+            source,
+        })?;
+        println!("wrote {}", document_path.display());
+    }
+    Ok(())
+}
+
+/// Proves one committed document matches its derived content.
+fn check_document(document_path: &std::path::Path, document: &str) -> Result<(), ExportError> {
+    let committed =
+        fs::read_to_string(document_path).map_err(|source| ExportError::CheckUnreadable {
+            path: document_path.to_path_buf(),
+            source,
+        })?;
+    if committed != *document {
+        return Err(ExportError::CheckMismatch {
+            path: document_path.to_path_buf(),
+        });
+    }
+    println!("{} is up to date", document_path.display());
     Ok(())
 }

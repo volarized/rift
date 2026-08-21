@@ -1,16 +1,25 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::time::SystemTime;
 
-use rift_core::ErrorName;
+use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
+use rift_core::{ErrorName, Fault};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::change::{
-    ChangeResult, InsertSymbolParams, PatchParams, ReplaceNodeParams, ReplaceSymbolParams,
+    ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
+    ReplaceNodeParams, ReplaceSymbolParams,
 };
+use rift_protocol::configuration::{CommandHook, WorkspaceConfiguration};
 use rift_protocol::error as wire;
 use rift_protocol::read::{
-    GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
+    DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams,
+    SearchResult,
 };
-use rift_server::{ChangeService, ReadError, ReadService};
+use rift_server::{
+    ChangeService, ConfigurationError, HookRun, HookStatus, ReadError, ReadService,
+    load_configuration, run_hooks,
+};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
@@ -33,7 +42,48 @@ pub struct RiftMcp {
     limits: WorkspaceIndexLimits,
     reads: RwLock<ReadService>,
     changes: ChangeService,
+    configuration: RwLock<ConfigurationState>,
     tool_router: ToolRouter<Self>,
+}
+
+/// The last admission of the workspace's `rift.toml`, kept with the file
+/// state it was read from so an edited file is re-admitted on the next
+/// request and an unchanged one is not re-parsed per call.
+#[derive(Debug)]
+struct ConfigurationState {
+    admitted: Result<WorkspaceConfiguration, ConfigurationError>,
+    fingerprint: Option<ConfigurationFingerprint>,
+}
+
+impl ConfigurationState {
+    /// Admits the workspace's current `rift.toml`.
+    fn admit(root: &Path) -> Self {
+        Self {
+            admitted: load_configuration(root),
+            fingerprint: configuration_fingerprint(root),
+        }
+    }
+
+    /// The admission's outcome as one request sees it: the configuration to
+    /// serve under, or the typed refusal naming what to fix.
+    fn admitted(&self, phase: wire::ErrorPhase) -> Result<WorkspaceConfiguration, ErrorData> {
+        match &self.admitted {
+            Ok(configuration) => Ok(configuration.clone()),
+            Err(error) => Err(error.tool_error(phase)),
+        }
+    }
+}
+
+/// The file state one admission was read from. Size rides modification
+/// time because same-second edits are common at a shell; an edit that
+/// preserves both is not re-admitted until either moves.
+type ConfigurationFingerprint = (SystemTime, u64);
+
+/// The current `rift.toml` file state, or null when the file is absent or
+/// unreadable — either way the next admission decides what that means.
+fn configuration_fingerprint(root: &Path) -> Option<ConfigurationFingerprint> {
+    let metadata = std::fs::metadata(root.join(WORKSPACE_CONFIGURATION_FILE)).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
@@ -49,6 +99,7 @@ impl RiftMcp {
             limits,
             reads: RwLock::new(ReadService::build(root, limits)?),
             changes: ChangeService::new(root),
+            configuration: RwLock::new(ConfigurationState::admit(root)),
             tool_router: Self::tool_router(),
         })
     }
@@ -61,10 +112,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
-        self.snapshot()
-            .get_symbol(&params)
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+        self.read(|reads| reads.get_symbol(&params))
     }
 
     /// Searches indexed Rust declarations and source lines by lexical `query`. Use
@@ -74,10 +122,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        self.snapshot()
-            .search(&params)
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+        self.read(|reads| reads.search(&params))
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
@@ -88,10 +133,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ErrorData> {
-        self.snapshot()
-            .nodes(params)
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+        self.read(|reads| reads.nodes(params))
     }
 
     /// Replaces one declaration addressed by symbol. The parser derives the
@@ -150,19 +192,68 @@ impl RiftMcp {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Runs one change against the current snapshot and, when it lands,
-    /// swaps in a snapshot of the changed workspace.
+    /// Runs one read against the current snapshot, behind the admission
+    /// gate every request passes.
+    fn read<Answer>(
+        &self,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError>,
+    ) -> Result<Json<Answer>, ErrorData> {
+        self.admitted_configuration(wire::ErrorPhase::Read)?;
+        operation(&self.snapshot())
+            .map(Json)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// The admitted workspace configuration, re-admitting `rift.toml` when
+    /// the file changed since the last request. While the file is invalid,
+    /// every request fails as `configuration_invalid` until it is fixed.
     ///
-    /// A rebuild failure after a landed change rides the result as a
+    /// # Panics
+    ///
+    /// Recovers a poisoned lock instead of panicking: the admission is
+    /// replaced whole, so a poisoned guard still holds a coherent value.
+    fn admitted_configuration(
+        &self,
+        phase: wire::ErrorPhase,
+    ) -> Result<WorkspaceConfiguration, ErrorData> {
+        let current = configuration_fingerprint(&self.root);
+        let state = self
+            .configuration
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.fingerprint == current {
+            return state.admitted(phase);
+        }
+        drop(state);
+        let mut state = self
+            .configuration
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.fingerprint != current {
+            *state = ConfigurationState::admit(&self.root);
+        }
+        state.admitted(phase)
+    }
+
+    /// Runs one change against the current snapshot and, when it lands,
+    /// runs the workspace's hooks in the changed tree and swaps in a
+    /// snapshot of the changed workspace.
+    ///
+    /// Hooks observe an already-applied change: their verdicts ride the
+    /// result and never roll the change back. The snapshot is rebuilt after
+    /// they ran, so reads also serve whatever a hook wrote into the tree. A
+    /// rebuild failure after a landed change rides the result as a
     /// diagnostic rather than failing the call: the write happened, and the
     /// caller must not be told otherwise.
     fn change(
         &self,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
+        let configuration = self.admitted_configuration(wire::ErrorPhase::Change)?;
         let mut result = operation(&self.snapshot(), &self.changes)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
         if let ChangeResult::Applied { summary } = &mut result {
+            self.attach_hook_verdicts(&configuration.hooks, summary);
             match ReadService::build(&self.root, self.limits) {
                 Ok(rebuilt) => {
                     *self
@@ -175,6 +266,90 @@ impl RiftMcp {
         }
         Ok(Json(result))
     }
+
+    /// Runs the configured hooks over one applied change and attaches what
+    /// they established: a passing hook's configured guarantees become
+    /// evidence, and every other outcome becomes an error finding.
+    fn attach_hook_verdicts(&self, hooks: &[CommandHook], summary: &mut ChangeSummary) {
+        if hooks.is_empty() {
+            return;
+        }
+        let runs = run_hooks(hooks, &self.root, &summary.paths);
+        for (hook, run) in hooks.iter().zip(&runs) {
+            if run.status == HookStatus::Passed {
+                summary
+                    .guarantees
+                    .extend(hook.guarantees.iter().map(|guarantee| GuaranteeEvidence {
+                        kind: guarantee.kind,
+                        scope: guarantee.scope.clone(),
+                        hook: hook.id.clone(),
+                        detail: guarantee.detail.clone(),
+                    }));
+            } else {
+                summary.diagnostics.push(hook_failure_diagnostic(hook, run));
+            }
+        }
+    }
+}
+
+/// Bytes of each captured hook stream a failure finding quotes. The finding
+/// also states the full sizes, so a truncated quote stays distinguishable
+/// from a short log.
+const HOOK_FINDING_STREAM_BYTES_MAX: usize = 1_024;
+
+/// The finding an applied change carries for one hook that did not pass:
+/// what ended the run, then each non-empty stream's size and bounded quote.
+fn hook_failure_diagnostic(hook: &CommandHook, run: &HookRun) -> rift_protocol::read::Diagnostic {
+    let account = match &run.status {
+        HookStatus::Passed => unreachable!(
+            "a passing hook contributes guarantees, not findings: hook={:?}",
+            hook.id
+        ),
+        HookStatus::Failed => match run.exit_code {
+            Some(code) => format!("exited {code}"),
+            None => "exited nonzero".to_owned(),
+        },
+        HookStatus::TimedOut => format!("killed after {}ms", hook.timeout_ms),
+        HookStatus::Error(message) => message.clone(),
+    };
+    let mut message = format!("hook {} did not pass: {account}", hook.id);
+    for (stream_name, stream) in [("stdout", &run.stdout), ("stderr", &run.stderr)] {
+        if stream.total_bytes == 0 {
+            continue;
+        }
+        let quoted = bounded_prefix(&stream.text, HOOK_FINDING_STREAM_BYTES_MAX);
+        let _ = write!(
+            message,
+            "; {stream_name} ({} of {} bytes): {quoted}",
+            quoted.len(),
+            stream.total_bytes,
+        );
+    }
+    rift_protocol::read::Diagnostic {
+        severity: rift_protocol::read::Severity::Error,
+        code: Some(DiagnosticCode::HookFailed.code()),
+        message,
+        span: None,
+        related: Vec::new(),
+        tags: Vec::new(),
+        reliability: rift_protocol::read::DiagnosticReliability::Reliable,
+        continuation: rift_protocol::read::DiagnosticContinuation::Unknown,
+        extensions: rift_protocol::read::Extensions(std::collections::BTreeMap::new()),
+        language: None,
+    }
+}
+
+/// The longest prefix of `text` within `bytes_max` that ends on a character
+/// boundary. The walk back is bounded by UTF-8 itself: at most three steps.
+fn bounded_prefix(text: &str, bytes_max: usize) -> &str {
+    if text.len() <= bytes_max {
+        return text;
+    }
+    let mut end = bytes_max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The finding an applied change carries when the follow-up snapshot could
@@ -182,7 +357,7 @@ impl RiftMcp {
 fn stale_snapshot_diagnostic(error: &ReadError) -> rift_protocol::read::Diagnostic {
     rift_protocol::read::Diagnostic {
         severity: rift_protocol::read::Severity::Warning,
-        code: None,
+        code: Some(DiagnosticCode::SnapshotStale.code()),
         message: format!(
             "the change landed, and the read snapshot could not refresh; \
              reads serve the pre-change tree until the workspace indexes again: {error}"
@@ -229,7 +404,7 @@ trait WireFailure {
     fn wire_causes(&self) -> Vec<wire::ErrorCause>;
 }
 
-impl WireFailure for ReadError {
+impl<K: Fault> WireFailure for rift_core::Error<K> {
     fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData {
         let message = self.to_string();
         let data = serde_json::to_value(self.wire_error(phase)).ok();
@@ -681,6 +856,108 @@ pub fn beacon() -> u64 {
             causes.len(),
             super::ERROR_CAUSES_MAX,
             "a chain deeper than the bound must truncate at the bound"
+        );
+    }
+
+    fn probe_hook() -> rift_protocol::configuration::CommandHook {
+        use rift_protocol::configuration::{ChangedPaths, Determinism, HookKind, HookType};
+        rift_protocol::configuration::CommandHook {
+            r#type: HookType::Command,
+            id: "tests".to_owned(),
+            kind: HookKind::Test,
+            program: "cargo".to_owned(),
+            arguments: vec!["test".to_owned()],
+            changed_paths: ChangedPaths::None,
+            working_directory: rift_protocol::read::ProjectPath(String::new()),
+            environment: std::collections::BTreeMap::new(),
+            timeout_ms: 120_000,
+            output_limit_bytes: 4_096,
+            guarantees: Vec::new(),
+            determinism: Determinism::Deterministic,
+        }
+    }
+
+    fn silent_run(status: rift_server::HookStatus, exit_code: Option<i32>) -> rift_server::HookRun {
+        rift_server::HookRun {
+            id: "tests".to_owned(),
+            status,
+            exit_code,
+            stdout: rift_server::CapturedStream::default(),
+            stderr: rift_server::CapturedStream::default(),
+        }
+    }
+
+    #[test]
+    fn failed_hook_finding_quotes_exit_code_and_nonempty_streams() {
+        use rift_server::{CapturedStream, HookStatus};
+        let mut run = silent_run(HookStatus::Failed, Some(1));
+        run.stdout = CapturedStream {
+            text: "boom".to_owned(),
+            captured_bytes: 4,
+            total_bytes: 4,
+            truncated: false,
+        };
+        let finding = super::hook_failure_diagnostic(&probe_hook(), &run);
+        assert_eq!(finding.severity, rift_protocol::read::Severity::Error);
+        assert_eq!(finding.code.as_deref(), Some("rift.hook.failed"));
+        assert!(
+            finding.message.contains("exited 1")
+                && finding.message.contains("stdout (4 of 4 bytes): boom")
+                && !finding.message.contains("stderr"),
+            "{}",
+            finding.message
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a passing hook contributes guarantees, not findings")]
+    fn passing_hook_finding_is_a_programmer_error() {
+        let run = silent_run(rift_server::HookStatus::Passed, Some(0));
+        let _ = super::hook_failure_diagnostic(&probe_hook(), &run);
+    }
+
+    #[test]
+    fn hook_finding_accounts_for_every_non_passing_outcome() {
+        use rift_server::HookStatus;
+        let cases = [
+            (HookStatus::Failed, None, "exited nonzero"),
+            (HookStatus::TimedOut, None, "killed after 120000ms"),
+            (
+                HookStatus::Error("failed to launch: missing".to_owned()),
+                None,
+                "failed to launch: missing",
+            ),
+        ];
+        for (status, exit_code, expected) in cases {
+            let finding =
+                super::hook_failure_diagnostic(&probe_hook(), &silent_run(status, exit_code));
+            assert!(
+                finding.message.contains(expected),
+                "{expected} missing from {}",
+                finding.message
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_prefix_cuts_on_character_boundaries() {
+        assert_eq!(super::bounded_prefix("short", 16), "short");
+        assert_eq!(super::bounded_prefix("ééé", 3), "é");
+        assert_eq!(super::bounded_prefix("ééé", 4), "éé");
+    }
+
+    #[test]
+    fn stale_snapshot_finding_carries_its_code_and_the_render() {
+        let error = rift_server::ReadError::from(ReadFault::Unsupported {
+            capability: "probe",
+        });
+        let finding = super::stale_snapshot_diagnostic(&error);
+        assert_eq!(finding.code.as_deref(), Some("rift.snapshot.stale"));
+        assert_eq!(finding.severity, rift_protocol::read::Severity::Warning);
+        assert!(
+            finding.message.contains("the change landed"),
+            "{}",
+            finding.message
         );
     }
 

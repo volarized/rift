@@ -34,6 +34,8 @@ pub const SOURCE_PATH_BYTES_MAX: usize = 4_096;
 pub const RIFT_STATE_DIRECTORY: &str = ".rift";
 /// Prefix of every path below Rift-owned workspace state.
 pub const RIFT_STATE_DIRECTORY_PREFIX: &str = ".rift/";
+/// Workspace configuration file, read from the workspace root.
+pub const WORKSPACE_CONFIGURATION_FILE: &str = "rift.toml";
 /// Maximum ASCII bytes in one provider-composition stage name.
 pub const STAGE_NAME_BYTES_MAX: usize = 64;
 /// Punctuation accepted in provider-composition stage names.

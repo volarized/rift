@@ -1982,7 +1982,7 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order.",
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -1995,6 +1995,14 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "type": "array"
+              },
+              "guarantees": {
+                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "items": {
+                  "$ref": "#/$defs/GuaranteeEvidence"
+                },
+                "maxItems": 512,
                 "type": "array"
               },
               "id": {
@@ -2014,9 +2022,78 @@
               "id",
               "paths",
               "edits",
-              "diagnostics"
+              "diagnostics",
+              "guarantees"
             ],
             "type": "object"
+          },
+          "CoverageReach": {
+            "description": "How far the claim reaches.",
+            "oneOf": [
+              {
+                "const": "request",
+                "description": "Only what this request touched.",
+                "type": "string"
+              },
+              {
+                "const": "project",
+                "description": "Every visible file of the workspace.",
+                "type": "string"
+              },
+              {
+                "const": "dependencies",
+                "description": "The workspace's resolved dependencies.",
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "description": "The workspace, its dependencies, and the standard library together.",
+                "type": "string"
+              }
+            ]
+          },
+          "CoverageScope": {
+            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A standing scope identified by its name.",
+                "properties": {
+                  "kind": {
+                    "const": "reach",
+                    "type": "string"
+                  },
+                  "reach": {
+                    "$ref": "#/$defs/CoverageReach",
+                    "description": "How far the claim reaches."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "reach"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
+                "properties": {
+                  "kind": {
+                    "const": "unit",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file the claim is about."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
           },
           "Diagnostic": {
             "additionalProperties": false,
@@ -2266,6 +2343,64 @@
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
+          },
+          "GuaranteeEvidence": {
+            "additionalProperties": false,
+            "description": "A property a passing hook established about one applied change. The\nserver mints one entry per configured guarantee of each hook that\npassed, so a green run carries what it actually proved rather than an\nunexplained tick.",
+            "properties": {
+              "detail": {
+                "description": "The exact property checked and the limits on reading a pass, from\nthe hook's configuration.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "hook": {
+                "description": "The configured hook whose passing run established the property.",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "$ref": "#/$defs/GuaranteeKind",
+                "description": "Which property is established."
+              },
+              "scope": {
+                "$ref": "#/$defs/CoverageScope",
+                "description": "What the check covered."
+              }
+            },
+            "required": [
+              "kind",
+              "scope",
+              "hook",
+              "detail"
+            ],
+            "type": "object"
+          },
+          "GuaranteeKind": {
+            "description": "A property a verifier can establish about an applied change.",
+            "oneOf": [
+              {
+                "const": "syntax_validated",
+                "description": "The changed source parses.",
+                "type": "string"
+              },
+              {
+                "const": "bindings_preserved",
+                "description": "Names still resolve to what they resolved to before the change.",
+                "type": "string"
+              },
+              {
+                "const": "references_updated",
+                "description": "References to the changed declarations were updated with them.",
+                "type": "string"
+              },
+              {
+                "const": "behavior_checked",
+                "description": "The change's behavior was exercised, such as by a test suite.",
+                "type": "string"
+              }
+            ]
           },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
@@ -3464,7 +3599,7 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order.",
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -3477,6 +3612,14 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "type": "array"
+              },
+              "guarantees": {
+                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "items": {
+                  "$ref": "#/$defs/GuaranteeEvidence"
+                },
+                "maxItems": 512,
                 "type": "array"
               },
               "id": {
@@ -3496,9 +3639,78 @@
               "id",
               "paths",
               "edits",
-              "diagnostics"
+              "diagnostics",
+              "guarantees"
             ],
             "type": "object"
+          },
+          "CoverageReach": {
+            "description": "How far the claim reaches.",
+            "oneOf": [
+              {
+                "const": "request",
+                "description": "Only what this request touched.",
+                "type": "string"
+              },
+              {
+                "const": "project",
+                "description": "Every visible file of the workspace.",
+                "type": "string"
+              },
+              {
+                "const": "dependencies",
+                "description": "The workspace's resolved dependencies.",
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "description": "The workspace, its dependencies, and the standard library together.",
+                "type": "string"
+              }
+            ]
+          },
+          "CoverageScope": {
+            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A standing scope identified by its name.",
+                "properties": {
+                  "kind": {
+                    "const": "reach",
+                    "type": "string"
+                  },
+                  "reach": {
+                    "$ref": "#/$defs/CoverageReach",
+                    "description": "How far the claim reaches."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "reach"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
+                "properties": {
+                  "kind": {
+                    "const": "unit",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file the claim is about."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
           },
           "Diagnostic": {
             "additionalProperties": false,
@@ -3748,6 +3960,64 @@
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
+          },
+          "GuaranteeEvidence": {
+            "additionalProperties": false,
+            "description": "A property a passing hook established about one applied change. The\nserver mints one entry per configured guarantee of each hook that\npassed, so a green run carries what it actually proved rather than an\nunexplained tick.",
+            "properties": {
+              "detail": {
+                "description": "The exact property checked and the limits on reading a pass, from\nthe hook's configuration.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "hook": {
+                "description": "The configured hook whose passing run established the property.",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "$ref": "#/$defs/GuaranteeKind",
+                "description": "Which property is established."
+              },
+              "scope": {
+                "$ref": "#/$defs/CoverageScope",
+                "description": "What the check covered."
+              }
+            },
+            "required": [
+              "kind",
+              "scope",
+              "hook",
+              "detail"
+            ],
+            "type": "object"
+          },
+          "GuaranteeKind": {
+            "description": "A property a verifier can establish about an applied change.",
+            "oneOf": [
+              {
+                "const": "syntax_validated",
+                "description": "The changed source parses.",
+                "type": "string"
+              },
+              {
+                "const": "bindings_preserved",
+                "description": "Names still resolve to what they resolved to before the change.",
+                "type": "string"
+              },
+              {
+                "const": "references_updated",
+                "description": "References to the changed declarations were updated with them.",
+                "type": "string"
+              },
+              {
+                "const": "behavior_checked",
+                "description": "The change's behavior was exercised, such as by a test suite.",
+                "type": "string"
+              }
+            ]
           },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
@@ -4204,7 +4474,7 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order.",
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -4217,6 +4487,14 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "type": "array"
+              },
+              "guarantees": {
+                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "items": {
+                  "$ref": "#/$defs/GuaranteeEvidence"
+                },
+                "maxItems": 512,
                 "type": "array"
               },
               "id": {
@@ -4236,9 +4514,78 @@
               "id",
               "paths",
               "edits",
-              "diagnostics"
+              "diagnostics",
+              "guarantees"
             ],
             "type": "object"
+          },
+          "CoverageReach": {
+            "description": "How far the claim reaches.",
+            "oneOf": [
+              {
+                "const": "request",
+                "description": "Only what this request touched.",
+                "type": "string"
+              },
+              {
+                "const": "project",
+                "description": "Every visible file of the workspace.",
+                "type": "string"
+              },
+              {
+                "const": "dependencies",
+                "description": "The workspace's resolved dependencies.",
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "description": "The workspace, its dependencies, and the standard library together.",
+                "type": "string"
+              }
+            ]
+          },
+          "CoverageScope": {
+            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A standing scope identified by its name.",
+                "properties": {
+                  "kind": {
+                    "const": "reach",
+                    "type": "string"
+                  },
+                  "reach": {
+                    "$ref": "#/$defs/CoverageReach",
+                    "description": "How far the claim reaches."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "reach"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
+                "properties": {
+                  "kind": {
+                    "const": "unit",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file the claim is about."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
           },
           "Diagnostic": {
             "additionalProperties": false,
@@ -4488,6 +4835,64 @@
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
+          },
+          "GuaranteeEvidence": {
+            "additionalProperties": false,
+            "description": "A property a passing hook established about one applied change. The\nserver mints one entry per configured guarantee of each hook that\npassed, so a green run carries what it actually proved rather than an\nunexplained tick.",
+            "properties": {
+              "detail": {
+                "description": "The exact property checked and the limits on reading a pass, from\nthe hook's configuration.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "hook": {
+                "description": "The configured hook whose passing run established the property.",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "$ref": "#/$defs/GuaranteeKind",
+                "description": "Which property is established."
+              },
+              "scope": {
+                "$ref": "#/$defs/CoverageScope",
+                "description": "What the check covered."
+              }
+            },
+            "required": [
+              "kind",
+              "scope",
+              "hook",
+              "detail"
+            ],
+            "type": "object"
+          },
+          "GuaranteeKind": {
+            "description": "A property a verifier can establish about an applied change.",
+            "oneOf": [
+              {
+                "const": "syntax_validated",
+                "description": "The changed source parses.",
+                "type": "string"
+              },
+              {
+                "const": "bindings_preserved",
+                "description": "Names still resolve to what they resolved to before the change.",
+                "type": "string"
+              },
+              {
+                "const": "references_updated",
+                "description": "References to the changed declarations were updated with them.",
+                "type": "string"
+              },
+              {
+                "const": "behavior_checked",
+                "description": "The change's behavior was exercised, such as by a test suite.",
+                "type": "string"
+              }
+            ]
           },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
@@ -4944,7 +5349,7 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order.",
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -4957,6 +5362,14 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "type": "array"
+              },
+              "guarantees": {
+                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "items": {
+                  "$ref": "#/$defs/GuaranteeEvidence"
+                },
+                "maxItems": 512,
                 "type": "array"
               },
               "id": {
@@ -4976,9 +5389,78 @@
               "id",
               "paths",
               "edits",
-              "diagnostics"
+              "diagnostics",
+              "guarantees"
             ],
             "type": "object"
+          },
+          "CoverageReach": {
+            "description": "How far the claim reaches.",
+            "oneOf": [
+              {
+                "const": "request",
+                "description": "Only what this request touched.",
+                "type": "string"
+              },
+              {
+                "const": "project",
+                "description": "Every visible file of the workspace.",
+                "type": "string"
+              },
+              {
+                "const": "dependencies",
+                "description": "The workspace's resolved dependencies.",
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "description": "The workspace, its dependencies, and the standard library together.",
+                "type": "string"
+              }
+            ]
+          },
+          "CoverageScope": {
+            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A standing scope identified by its name.",
+                "properties": {
+                  "kind": {
+                    "const": "reach",
+                    "type": "string"
+                  },
+                  "reach": {
+                    "$ref": "#/$defs/CoverageReach",
+                    "description": "How far the claim reaches."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "reach"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
+                "properties": {
+                  "kind": {
+                    "const": "unit",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file the claim is about."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
           },
           "Diagnostic": {
             "additionalProperties": false,
@@ -5228,6 +5710,64 @@
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
+          },
+          "GuaranteeEvidence": {
+            "additionalProperties": false,
+            "description": "A property a passing hook established about one applied change. The\nserver mints one entry per configured guarantee of each hook that\npassed, so a green run carries what it actually proved rather than an\nunexplained tick.",
+            "properties": {
+              "detail": {
+                "description": "The exact property checked and the limits on reading a pass, from\nthe hook's configuration.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "hook": {
+                "description": "The configured hook whose passing run established the property.",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "$ref": "#/$defs/GuaranteeKind",
+                "description": "Which property is established."
+              },
+              "scope": {
+                "$ref": "#/$defs/CoverageScope",
+                "description": "What the check covered."
+              }
+            },
+            "required": [
+              "kind",
+              "scope",
+              "hook",
+              "detail"
+            ],
+            "type": "object"
+          },
+          "GuaranteeKind": {
+            "description": "A property a verifier can establish about an applied change.",
+            "oneOf": [
+              {
+                "const": "syntax_validated",
+                "description": "The changed source parses.",
+                "type": "string"
+              },
+              {
+                "const": "bindings_preserved",
+                "description": "Names still resolve to what they resolved to before the change.",
+                "type": "string"
+              },
+              {
+                "const": "references_updated",
+                "description": "References to the changed declarations were updated with them.",
+                "type": "string"
+              },
+              {
+                "const": "behavior_checked",
+                "description": "The change's behavior was exercised, such as by a test suite.",
+                "type": "string"
+              }
+            ]
           },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
