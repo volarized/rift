@@ -8,12 +8,13 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 /// The spelling a [`ByteSize`] value must match.
-const BYTE_SIZE_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:B|KiB|MiB|GiB|TiB)$";
+const BYTE_SIZE_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:b|kb|mb|gb|tb)$";
 /// The spelling a [`Duration`] value must match.
 const DURATION_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$";
 
-/// A byte size: an integer magnitude with a required binary-unit suffix
-/// `B`, `KiB`, `MiB`, `GiB`, or `TiB`.
+/// A byte size: an integer magnitude with a required unit suffix `b`, `kb`,
+/// `mb`, `gb`, or `tb`. Units are binary: `1kb` is 1024 bytes, and every
+/// larger unit scales by 1024 again.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ByteSize(u64);
@@ -31,8 +32,8 @@ impl ByteSize {
         self.0
     }
 
-    /// Parses the file spelling: digits, then one of `B`, `KiB`, `MiB`,
-    /// `GiB`, or `TiB`.
+    /// Parses the file spelling: digits, then one of `b`, `kb`, `mb`, `gb`,
+    /// or `tb`.
     ///
     /// # Errors
     ///
@@ -41,11 +42,11 @@ impl ByteSize {
     pub fn parse(text: &str) -> Result<Self, UnitParseError> {
         let (magnitude, unit) = split_magnitude(text, ByteSize::EXPECTED)?;
         let scale: u64 = match unit {
-            "B" => 1,
-            "KiB" => 1 << 10,
-            "MiB" => 1 << 20,
-            "GiB" => 1 << 30,
-            "TiB" => 1 << 40,
+            "b" => 1,
+            "kb" => 1 << 10,
+            "mb" => 1 << 20,
+            "gb" => 1 << 30,
+            "tb" => 1 << 40,
             _ => return Err(UnitParseError::new(text, ByteSize::EXPECTED)),
         };
         let bytes = magnitude
@@ -56,7 +57,7 @@ impl ByteSize {
 
     /// The documented form, named in every parse failure.
     const EXPECTED: &'static str =
-        "an integer magnitude followed by B, KiB, MiB, GiB, or TiB, such as `16KiB`";
+        "an integer magnitude followed by b, kb, mb, gb, or tb (binary units), such as `16kb`";
 }
 
 impl TryFrom<String> for ByteSize {
@@ -70,17 +71,17 @@ impl TryFrom<String> for ByteSize {
 impl From<ByteSize> for String {
     fn from(size: ByteSize) -> Self {
         let units = [
-            (1_u64 << 40, "TiB"),
-            (1 << 30, "GiB"),
-            (1 << 20, "MiB"),
-            (1 << 10, "KiB"),
+            (1_u64 << 40, "tb"),
+            (1 << 30, "gb"),
+            (1 << 20, "mb"),
+            (1 << 10, "kb"),
         ];
         for (scale, suffix) in units {
             if size.0 != 0 && size.0.is_multiple_of(scale) {
                 return format!("{}{suffix}", size.0 / scale);
             }
         }
-        format!("{}B", size.0)
+        format!("{}b", size.0)
     }
 }
 
@@ -93,8 +94,9 @@ impl JsonSchema for ByteSize {
         json_schema!({
             "type": "string",
             "pattern": BYTE_SIZE_PATTERN,
-            "description": "A byte size: an integer magnitude with a required \
-                            binary-unit suffix `B`, `KiB`, `MiB`, `GiB`, or `TiB`."
+            "description": "A byte size: an integer magnitude with a required unit \
+                            suffix `b`, `kb`, `mb`, `gb`, or `tb`; units are binary, \
+                            so `1kb` is 1024 bytes."
         })
     }
 }
@@ -200,6 +202,18 @@ impl UnitParseError {
             expected,
         }
     }
+
+    /// The value that failed to parse, as the file spelled it.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.text
+    }
+
+    /// The documented form the value must match.
+    #[must_use]
+    pub const fn expected(&self) -> &'static str {
+        self.expected
+    }
 }
 
 impl std::fmt::Display for UnitParseError {
@@ -242,12 +256,12 @@ mod tests {
     #[test]
     fn test_byte_size_parses_every_documented_unit() {
         let cases = [
-            ("0B", 0),
-            ("1B", 1),
-            ("16KiB", 16 << 10),
-            ("3MiB", 3 << 20),
-            ("2GiB", 2 << 30),
-            ("1TiB", 1 << 40),
+            ("0b", 0),
+            ("1b", 1),
+            ("16kb", 16 << 10),
+            ("3mb", 3 << 20),
+            ("2gb", 2 << 30),
+            ("1tb", 1 << 40),
         ];
         for (text, bytes) in cases {
             assert_eq!(
@@ -261,7 +275,7 @@ mod tests {
     #[test]
     fn test_byte_size_refuses_malformed_spellings() {
         for text in [
-            "", "16", "KiB", "016KiB", "16kib", "16 KiB", "-1B", "1.5KiB",
+            "", "16", "kb", "016kb", "16KB", "16KiB", "16kib", "16 kb", "-1b", "1.5kb",
         ] {
             assert!(ByteSize::parse(text).is_err(), "{text:?} must be refused");
         }
@@ -269,17 +283,26 @@ mod tests {
 
     #[test]
     fn test_byte_size_refuses_overflow() {
-        assert!(ByteSize::parse("99999999999TiB").is_err());
-        assert!(ByteSize::parse("999999999999999999999B").is_err());
+        assert!(ByteSize::parse("99999999999tb").is_err());
+        assert!(ByteSize::parse("999999999999999999999b").is_err());
+    }
+
+    #[test]
+    fn test_base_unit_accessors_return_the_scaled_magnitude() {
+        assert_eq!(ByteSize::parse("2kb").expect("spelling").bytes(), 2 << 10);
+        assert_eq!(
+            Duration::parse("2m").expect("spelling").milliseconds(),
+            120_000
+        );
     }
 
     #[test]
     fn test_byte_size_renders_largest_exact_unit() {
         let cases = [
-            (0, "0B"),
-            (1, "1B"),
-            (16 << 10, "16KiB"),
-            ((16 << 10) + 1, "16385B"),
+            (0, "0b"),
+            (1, "1b"),
+            (16 << 10, "16kb"),
+            ((16 << 10) + 1, "16385b"),
         ];
         for (bytes, text) in cases {
             assert_eq!(String::from(ByteSize::from_bytes(bytes)), text);
@@ -331,11 +354,30 @@ mod tests {
 
     #[test]
     fn test_unit_parse_error_names_the_expected_form() {
-        let error = ByteSize::parse("16kb").expect_err("lowercase unit must be refused");
+        let error = ByteSize::parse("16KiB").expect_err("an uppercase unit must be refused");
         let message = error.to_string();
         assert!(
-            message.contains("16kb") && message.contains("16KiB"),
+            message.contains("16KiB") && message.contains("16kb"),
             "the failure must show the value and the documented form: {message}"
+        );
+        assert_eq!(error.value(), "16KiB");
+        assert_eq!(error.expected(), ByteSize::EXPECTED);
+    }
+
+    #[test]
+    fn test_values_round_trip_through_serde_in_canonical_spelling() {
+        let size: ByteSize = serde_json::from_value(json!("16kb")).expect("spelling must admit");
+        assert_eq!(serde_json::to_value(size).expect("render"), json!("16kb"));
+        let duration: Duration = serde_json::from_value(json!("90s")).expect("spelling must admit");
+        assert_eq!(
+            serde_json::to_value(duration).expect("render"),
+            json!("90s")
+        );
+        let refused = serde_json::from_value::<ByteSize>(json!("16KiB"))
+            .expect_err("the serde boundary must refuse what parse refuses");
+        assert!(
+            refused.to_string().contains("16kb"),
+            "the serde failure must carry the documented form: {refused}"
         );
     }
 
