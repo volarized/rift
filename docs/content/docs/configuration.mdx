@@ -20,6 +20,34 @@ Treat `rift.toml` as executable workspace configuration. Hooks named by a reposi
 Rift applies a change, using the server's OS permissions, so inspect the file before enabling the
 workspace.
 
+## Source
+
+<VersionBadge version="v0.0.6" />
+
+`source` controls which files below the workspace root the index and reads consider visible.
+`include` and `exclude` take exact project-relative paths or globs, matched the same way
+[`search`](/docs/protocol/mcp#tool-search)'s `paths` selector matches them:
+
+```toml
+[source]
+include = []
+exclude = []
+respect_gitignore = true
+```
+
+Empty `include` admits every file `exclude` and `.gitignore` leave standing; a match in `exclude`
+drops a file even when `include` also matches it. `respect_gitignore`, on by default, applies the
+workspace's own `.gitignore` files, root and nested — global and parent-directory ignore sources
+are never read.
+
+`.git`, `.rift`, and `target` stay invisible under every `source` setting. This hard floor sits
+below `include`, `exclude`, and `.gitignore`, so nothing in the file can reach past it.
+
+`source` shapes what the index walks: a file it excludes stops reaching `search` and
+[`get_symbol`](/docs/protocol/mcp#tool-get_symbol) results. A single `search` request can still
+reach one such file on demand, through the request-side `force_include` override on `search`'s
+`paths` selector.
+
 ## Execution
 
 <VersionBadge version="planned" />
