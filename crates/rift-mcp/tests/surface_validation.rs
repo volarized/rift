@@ -28,7 +28,7 @@ const FOLLOWED_PAGES_MAX: usize = 16;
 /// Sample validation corpus with various scenarios: one request per
 /// advertised tool behavior worth proving.
 fn corpus() -> Vec<(&'static str, Value)> {
-    vec![
+    let mut requests = vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
         ("get_symbol", json!({ "name": "beacon", "limit": 1 })),
         (
@@ -114,6 +114,73 @@ fn corpus() -> Vec<(&'static str, Value)> {
                 "body": "pub fn beacon_three( {"
             }),
         ),
+    ];
+    requests.extend(insert_symbol_file_target_corpus());
+    requests
+}
+
+/// `insert_symbol` file-target requests: an append to an existing file, a
+/// created file with nested parent directories, and a missing-target refusal.
+fn insert_symbol_file_target_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "insert_symbol",
+            json!({
+                "file": "lib.rs",
+                "position": "after",
+                "body": "pub fn beacon_extra() {}"
+            }),
+        ),
+        (
+            "insert_symbol",
+            json!({
+                "file": "docs/notes.md",
+                "position": "before",
+                "create_missing": true,
+                "body": "# Notes"
+            }),
+        ),
+        (
+            "insert_symbol",
+            json!({
+                "file": "docs/missing.md",
+                "position": "after",
+                "body": "# Missing"
+            }),
+        ),
+    ]
+}
+
+/// `insert_symbol` requests that must fail the advertised input schema before
+/// any tool ever resolves them: each proves one refused target-shape rule.
+fn invalid_insert_symbol_corpus() -> Vec<Value> {
+    vec![
+        json!({
+            "anchor": "rift://symbol/rust/lib.rs/beacon_one",
+            "file": "notes/extra.md",
+            "position": "after",
+            "body": "x"
+        }),
+        json!({
+            "position": "after",
+            "body": "x"
+        }),
+        json!({
+            "anchor": "rift://symbol/rust/lib.rs/beacon_one",
+            "position": "after",
+            "body": "x",
+            "create_missing": true
+        }),
+        json!({
+            "file": ".rift/x.rs",
+            "position": "after",
+            "body": "x"
+        }),
+        json!({
+            "file": "../escape.rs",
+            "position": "after",
+            "body": "x"
+        }),
     ]
 }
 
@@ -280,6 +347,71 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
             "the corpus must prove the {reason} refusal arm; proven: {refusal_reasons:?}"
         );
     }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_symbol_schema_rejects_invalid_target_combinations() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+    let (input_validator, _) = &validators["insert_symbol"];
+    for request in invalid_insert_symbol_corpus() {
+        assert!(
+            input_validator.iter_errors(&request).next().is_some(),
+            "insert_symbol request must fail its advertised schema: {request:#}"
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A file `insert_symbol` creates lands in the rebuilt snapshot, so a later
+/// read sees the symbol it declares.
+#[tokio::test]
+async fn insert_symbol_file_target_creation_is_visible_to_a_later_read() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+
+    let created = client
+        .call_tool(
+            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
+                "file": "extra.rs",
+                "position": "after",
+                "create_missing": true,
+                "body": "pub fn beacon_extra_read() {}"
+            }))?),
+        )
+        .await?;
+    let created = created
+        .structured_content
+        .ok_or("insert_symbol must return structured content")?;
+    assert_eq!(
+        created["status"],
+        json!("applied"),
+        "a missing file target with create_missing must land: {created:#}"
+    );
+
+    let found = client
+        .call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({ "name": "beacon_extra_read" }))?),
+        )
+        .await?;
+    let found = found
+        .structured_content
+        .ok_or("get_symbol must return structured content")?;
+    let hits = found["hits"]
+        .as_array()
+        .ok_or("get_symbol must return hits")?;
+    assert!(
+        !hits.is_empty(),
+        "a file insert_symbol just created must be visible to a later read: {found:#}"
+    );
 
     client.cancel().await?;
     server_task.await?;

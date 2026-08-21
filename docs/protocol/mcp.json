@@ -1917,11 +1917,11 @@
       }
     },
     {
-      "description": "Inserts a new declaration before or after an existing one, addressed\nby its anchor symbol. A refusal names the failed precondition and\nleaves the workspace untouched.",
+      "description": "Inserts a new declaration beside an anchor symbol, or content at a file\ntarget. A file target lands the body verbatim at the file's start or\nend, creating it first when `create_missing` is set and it is missing.\nA refusal names the failed precondition and leaves the workspace\nuntouched.",
       "input_schema": {
         "$defs": {
           "InsertPosition": {
-            "description": "Which side of the anchor receives the new declaration.",
+            "description": "Which side of the anchor or file target receives the new content.",
             "oneOf": [
               {
                 "const": "before",
@@ -1935,6 +1935,12 @@
               }
             ]
           },
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "maxLength": 1000,
+            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "type": "string"
+          },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
             "maxLength": 8192,
@@ -1945,23 +1951,76 @@
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "required": [
+                  "anchor"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              }
+            ]
+          },
+          {
+            "not": {
+              "properties": {
+                "create_missing": {
+                  "const": true
+                }
+              },
+              "required": [
+                "anchor",
+                "create_missing"
+              ]
+            }
+          }
+        ],
         "properties": {
           "anchor": {
-            "$ref": "#/$defs/SymbolId",
+            "anyOf": [
+              {
+                "$ref": "#/$defs/SymbolId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
             "description": "The existing declaration the new one lands beside."
           },
           "body": {
-            "description": "The new declaration's source.",
+            "description": "The new content: a declaration beside `anchor`, or a file target's whole body.",
             "maxLength": 1048576,
             "type": "string"
           },
+          "create_missing": {
+            "default": false,
+            "description": "Creates a missing `file` target instead of refusing. Invalid together with\n`anchor`.",
+            "type": "boolean"
+          },
+          "file": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProjectPath"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The file the content lands in, created first when `create_missing` is set and\nit does not exist."
+          },
           "position": {
             "$ref": "#/$defs/InsertPosition",
-            "description": "Which side of the anchor receives the new declaration."
+            "description": "Which side of the anchor or file target receives the new content."
           }
         },
         "required": [
-          "anchor",
           "position",
           "body"
         ],

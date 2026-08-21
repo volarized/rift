@@ -69,7 +69,8 @@ application lock, so two concurrent changes collide as a clean refusal rather th
 interleaved bytes:
 
 - `replace_symbol` rewrites one declaration addressed by symbol; the parser derives the span.
-- `insert_symbol` lands a new declaration before or after its anchor.
+- `insert_symbol` lands a new declaration before or after its anchor, or content at a file
+  target; `create_missing` creates a missing file target first.
 - `replace_node` replaces one syntax node through a witnessed address from `nodes`; a stale
   witness refuses with the expected and observed values.
 - `patch` applies unified-diff hunks, several files in one change; a context mismatch refuses

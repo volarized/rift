@@ -13,9 +13,9 @@ use std::sync::Mutex;
 use percent_encoding::percent_decode_str;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_protocol::change::{
-    ChangeId, ChangeResult, ChangeSummary, Edit, InsertPosition, OperationPrecondition,
-    OperationPreconditionKind, OperationPreconditionStatus, PatchParams, PreconditionAddress,
-    PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
+    ChangeId, ChangeResult, ChangeSummary, Edit, InsertPosition, InsertSymbolParams,
+    OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus, PatchParams,
+    PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::read::{
     Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Severity,
@@ -95,21 +95,57 @@ impl ChangeService {
         self.conclude(reads, resolution)
     }
 
-    /// Inserts a new declaration beside the anchor symbol.
+    /// Inserts a new declaration beside the anchor symbol, or content at a file
+    /// target.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for a malformed address or a filesystem failure;
-    /// a resolvable request that cannot land returns a refused
-    /// [`ChangeResult`] instead.
+    /// Returns [`ReadError`] for a malformed address, a request naming both or
+    /// neither of `anchor` and `file`, `create_missing` set with `anchor`, or a
+    /// filesystem failure; a resolvable request that cannot land returns a
+    /// refused [`ChangeResult`] instead.
     pub fn insert_symbol(
         &self,
         reads: &ReadService,
-        params: &rift_protocol::change::InsertSymbolParams,
+        params: &InsertSymbolParams,
     ) -> Result<ChangeResult, ReadError> {
-        let (path, qualified_name) = parse_symbol_address(&params.anchor.0)?;
-        let body = params.body.clone();
-        let position = params.position;
+        match (params.anchor.as_ref(), params.file.as_ref()) {
+            (Some(_), Some(_)) => Err(ReadFault::invalid(
+                "file",
+                "insert_symbol accepts exactly one of anchor or file, not both",
+            )),
+            (None, None) => Err(ReadFault::invalid(
+                "anchor",
+                "insert_symbol requires exactly one of anchor or file",
+            )),
+            (Some(_), None) if params.create_missing => Err(ReadFault::invalid(
+                "create_missing",
+                "cannot be set with an anchor target; an anchor always addresses \
+                 an existing file",
+            )),
+            (Some(anchor), None) => {
+                self.insert_beside_anchor(reads, &anchor.0, params.position, &params.body)
+            }
+            (None, Some(file)) => self.insert_at_file(
+                reads,
+                file,
+                params.position,
+                &params.body,
+                params.create_missing,
+            ),
+        }
+    }
+
+    /// Inserts a new declaration beside the anchor symbol.
+    fn insert_beside_anchor(
+        &self,
+        reads: &ReadService,
+        anchor: &str,
+        position: InsertPosition,
+        body: &str,
+    ) -> Result<ChangeResult, ReadError> {
+        let (path, qualified_name) = parse_symbol_address(anchor)?;
+        let body = body.to_owned();
         let resolution = self.resolve_symbol_spans(reads, &path, &qualified_name, |range| {
             let (at, text) = match position {
                 InsertPosition::Before => (range.start, format!("{body}\n\n")),
@@ -122,6 +158,59 @@ impl ChangeService {
             }
         })?;
         self.conclude(reads, resolution)
+    }
+
+    /// Inserts content at a file target: the start of the file for `before`, the
+    /// end for `after`, one blank line from what was already there. A missing
+    /// file is created, parent directories included, only when `create_missing`
+    /// is set; otherwise resolution refuses, naming the missing target. The body
+    /// lands verbatim — no parser involvement — so any project-relative path is
+    /// a legal target.
+    fn insert_at_file(
+        &self,
+        reads: &ReadService,
+        file: &rift_protocol::read::ProjectPath,
+        position: InsertPosition,
+        body: &str,
+        create_missing: bool,
+    ) -> Result<ChangeResult, ReadError> {
+        let path = CoreProjectPath::new(file.0.as_str()).map_err(|error| {
+            ReadFault::invalid("file", rift_core::fault_label(&error.fault().violation()))
+        })?;
+        let absolute = self.root.join(path.as_str());
+        let existing = match fs::read_to_string(&absolute) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(ReadFault::storage(path.as_str(), "read", &error)),
+        };
+        let rewrite = match existing {
+            Some(content) => FileRewrite {
+                previous_len: content.len() as u64,
+                next_source: spliced_at_file_edge(&content, position, body),
+                kind: RewriteKind::Modify,
+                path,
+            },
+            None if create_missing => FileRewrite {
+                path,
+                kind: RewriteKind::Create,
+                previous_len: 0,
+                next_source: body.to_owned(),
+            },
+            None => {
+                return Ok(ChangeResult::refused(
+                    RefusalReason::UnmetPrecondition,
+                    vec![OperationPrecondition::new(
+                        OperationPreconditionKind::TargetExists,
+                        OperationPreconditionStatus::Failed,
+                        Vec::new(),
+                        vec![path.as_str().to_owned()],
+                        PreconditionValue::Boolean { value: true },
+                        PreconditionValue::Boolean { value: false },
+                    )],
+                ));
+            }
+        };
+        self.apply_rewrites(reads, &[rewrite])
     }
 
     /// Replaces one syntax node through a witnessed address.
@@ -534,6 +623,15 @@ fn discard_staged<'a>(staged_paths: impl IntoIterator<Item = &'a PathBuf>) {
     }
 }
 
+/// Splices new content at a file boundary, matching the anchor-insert spacing
+/// policy: one blank line separates the new content from what was already there.
+fn spliced_at_file_edge(existing: &str, position: InsertPosition, body: &str) -> String {
+    match position {
+        InsertPosition::Before => format!("{body}\n\n{existing}"),
+        InsertPosition::After => format!("{existing}\n\n{body}"),
+    }
+}
+
 /// A parsed witnessed node address.
 #[derive(Debug)]
 struct NodeAddress {
@@ -821,9 +919,11 @@ mod tests {
         let result = changes.insert_symbol(
             &reads,
             &InsertSymbolParams {
-                anchor: symbol("beacon"),
+                anchor: Some(symbol("beacon")),
+                file: None,
                 position: InsertPosition::Before,
                 body: "/// Docs.\npub fn early() {}".to_owned(),
+                create_missing: false,
             },
         )?;
         applied_summary(result);
@@ -837,9 +937,11 @@ mod tests {
         let result = changes.insert_symbol(
             &reads,
             &InsertSymbolParams {
-                anchor: symbol("beacon"),
+                anchor: Some(symbol("beacon")),
+                file: None,
                 position: InsertPosition::After,
                 body: "pub fn late() {}".to_owned(),
+                create_missing: false,
             },
         )?;
         applied_summary(result);
@@ -848,6 +950,205 @@ mod tests {
             written,
             "/// Docs.\npub fn early() {}\n\npub fn beacon() {}\n\npub fn late() {}\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_file_target_lands_at_the_requested_edge() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("lib.rs".to_owned())),
+                position: InsertPosition::Before,
+                body: "//! Module docs.".to_owned(),
+                create_missing: false,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "//! Module docs.\n\npub fn beacon() {}\n");
+
+        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("lib.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "pub fn tail() {}".to_owned(),
+                create_missing: false,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written,
+            "//! Module docs.\n\npub fn beacon() {}\n\n\npub fn tail() {}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_creates_missing_file_with_nested_parent_directories() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("notes/todo/plan.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "// plan".to_owned(),
+                create_missing: true,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("notes/todo/plan.rs"))?;
+        assert_eq!(
+            written, "// plan",
+            "a created file's body lands exactly, with no anchor-insert spacing added"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_refuses_a_missing_file_without_create_missing() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("missing.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "pub fn late() {}".to_owned(),
+                create_missing: false,
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a missing file target without create_missing must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        assert_eq!(
+            preconditions[0].paths,
+            vec![ProjectPath("missing.rs".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_create_missing_on_an_existing_file_just_inserts() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("lib.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "pub fn late() {}".to_owned(),
+                create_missing: true,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "pub fn beacon() {}\n\n\npub fn late() {}");
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_file_target_accepts_a_non_rust_extension() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("notes/TODO.md".to_owned())),
+                position: InsertPosition::Before,
+                body: "- write docs".to_owned(),
+                create_missing: true,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("notes/TODO.md"))?;
+        assert_eq!(written, "- write docs");
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_rejects_invalid_target_combinations() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let both = changes
+            .insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: Some(symbol("beacon")),
+                    file: Some(ProjectPath("lib.rs".to_owned())),
+                    position: InsertPosition::After,
+                    body: "pub fn late() {}".to_owned(),
+                    create_missing: false,
+                },
+            )
+            .expect_err("both anchor and file must be rejected");
+        assert_eq!(both.descriptor().code(), "invalid_request");
+
+        let neither = changes
+            .insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: None,
+                    file: None,
+                    position: InsertPosition::After,
+                    body: "pub fn late() {}".to_owned(),
+                    create_missing: false,
+                },
+            )
+            .expect_err("a request naming neither target must be rejected");
+        assert_eq!(neither.descriptor().code(), "invalid_request");
+
+        let create_missing_with_anchor = changes
+            .insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: Some(symbol("beacon")),
+                    file: None,
+                    position: InsertPosition::After,
+                    body: "pub fn late() {}".to_owned(),
+                    create_missing: true,
+                },
+            )
+            .expect_err("create_missing with an anchor target must be rejected");
+        assert_eq!(
+            create_missing_with_anchor.descriptor().code(),
+            "invalid_request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_file_target_rejects_rift_state_paths() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let error = changes
+            .insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: None,
+                    file: Some(ProjectPath(".rift/x.rs".to_owned())),
+                    position: InsertPosition::After,
+                    body: "x".to_owned(),
+                    create_missing: true,
+                },
+            )
+            .expect_err("a .rift-state file target must be rejected");
+        assert_eq!(error.descriptor().code(), "invalid_request");
         Ok(())
     }
 
@@ -921,128 +1222,6 @@ mod tests {
             !summary.diagnostics.is_empty(),
             "a body that breaks the parse must say so on the result"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_applies_hunks_and_reports_the_rewrite() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\npub fn steady() {}\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1,2 +1,2 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            " pub fn steady() {}",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.clone(),
-            },
-        )?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(written, "pub fn beacon() -> u8 { 7 }\npub fn steady() {}\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_drifted_context_and_touches_nothing() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1 +1 @@",
-            "-pub fn vanished() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.clone(),
-            },
-        )?;
-        let ChangeResult::Refused {
-            reason,
-            preconditions,
-            ..
-        } = result
-        else {
-            panic!("drifted hunk context must refuse");
-        };
-        assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        assert_eq!(
-            preconditions[0].kind,
-            OperationPreconditionKind::SourceUnchanged
-        );
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() {}\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_rewrites_several_files_in_one_change() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("aid.rs"), "pub fn aid() {}\n")?;
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
-        let changes = ChangeService::new(directory.path());
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1 +1 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            "--- a/aid.rs",
-            "+++ b/aid.rs",
-            "@@ -1 +1 @@",
-            "-pub fn aid() {}",
-            "+pub fn aid() -> u8 { 9 }",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.clone(),
-            },
-        )?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.paths.len(), 2);
-        assert_eq!(summary.edits.len(), 2);
-        assert!(fs::read_to_string(directory.path().join("lib.rs"))?.contains("-> u8"));
-        assert!(fs::read_to_string(directory.path().join("aid.rs"))?.contains("-> u8"));
-        Ok(())
-    }
-
-    #[test]
-    fn patch_rejects_malformed_and_escaping_input() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let no_header = changes
-            .patch(
-                &reads,
-                &rift_protocol::change::PatchParams {
-                    patch: "not a diff".to_owned(),
-                },
-            )
-            .expect_err("headerless input must error");
-        assert_eq!(no_header.descriptor().code(), "invalid_request");
-        let escaping = changes
-            .patch(
-                &reads,
-                &rift_protocol::change::PatchParams {
-                    patch: "--- a/../escape.rs\n+++ b/../escape.rs\n@@ -1 +1 @@\n-x\n+y\n"
-                        .to_owned(),
-                },
-            )
-            .expect_err("dot segments must error");
-        assert_eq!(escaping.descriptor().code(), "invalid_request");
         Ok(())
     }
 
@@ -1131,9 +1310,11 @@ mod tests {
         let result = changes.insert_symbol(
             &reads,
             &InsertSymbolParams {
-                anchor: symbol("vanished"),
+                anchor: Some(symbol("vanished")),
+                file: None,
                 position: InsertPosition::After,
                 body: "pub fn late() {}".to_owned(),
+                create_missing: false,
             },
         )?;
         let ChangeResult::Refused {
@@ -1283,197 +1464,6 @@ mod tests {
         assert_eq!(
             preconditions[0].paths,
             vec![ProjectPath("ghost.rs".to_owned())]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_rejects_more_files_than_the_bound() -> TestResult {
-        use std::fmt::Write as _;
-
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let mut patch = String::new();
-        for index in 0..=crate::patch::PATCH_FILES_MAX {
-            let _ = writeln!(
-                patch,
-                "--- a/f{index}.rs\n+++ b/f{index}.rs\n@@ -1 +1 @@\n-x\n+y"
-            );
-        }
-        let error = changes
-            .patch(&reads, &rift_protocol::change::PatchParams { patch })
-            .expect_err("a diff past the file bound must error");
-        assert_eq!(error.descriptor().code(), "invalid_request");
-        assert!(
-            error.to_string().contains(&format!(
-                "more than {} files",
-                crate::patch::PATCH_FILES_MAX
-            )),
-            "message must name the bound: {error}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_file_rename_as_unsupported() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/other.rs",
-            "@@ -1 +1 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
-        let ChangeResult::Refused { reason, .. } = result else {
-            panic!("file rename must refuse this release");
-        };
-        assert_eq!(reason, RefusalReason::Unsupported);
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() {}\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_a_path_the_index_does_not_serve() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = "--- a/ghost.rs\n+++ b/ghost.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.to_owned(),
-            },
-        )?;
-        let ChangeResult::Refused {
-            reason,
-            preconditions,
-            ..
-        } = result
-        else {
-            panic!("a patch for an unindexed path must refuse");
-        };
-        assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        assert_eq!(
-            preconditions[0].kind,
-            OperationPreconditionKind::TargetExists
-        );
-        assert_eq!(
-            preconditions[0].paths,
-            vec![ProjectPath("ghost.rs".to_owned())]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_when_disk_drifted_from_snapshot() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() { }\n")?;
-        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.to_owned(),
-            },
-        )?;
-        let ChangeResult::Refused {
-            reason,
-            preconditions,
-            ..
-        } = result
-        else {
-            panic!("a drifted file under a patch must refuse before writing");
-        };
-        assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        assert_eq!(
-            preconditions[0].kind,
-            OperationPreconditionKind::SourceUnchanged
-        );
-        assert_ne!(preconditions[0].expected, preconditions[0].observed);
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() { }\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_with_crlf_endings_applies_and_preserves_them() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\r\npub fn steady() {}\r\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1,2 +1,2 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            " pub fn steady() {}",
-            "",
-        ]
-        .join("\r\n");
-        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(
-            written, "pub fn beacon() -> u8 { 7 }\r\npub fn steady() {}\r\n",
-            "CRLF endings must survive the rewrite byte-for-byte"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_with_lf_context_refuses_a_crlf_source() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\r\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1 +1 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
-        let ChangeResult::Refused { reason, .. } = result else {
-            panic!("an ending mismatch must refuse as context drift, not rewrite endings");
-        };
-        assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() {}\r\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_without_a_trailing_newline_applies() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }";
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.to_owned(),
-            },
-        )?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(written, "pub fn beacon() -> u8 { 7 }");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_with_backslash_paths_names_the_expected_form() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = "--- \"a\\\\lib.rs\"\n+++ \"b\\\\lib.rs\"\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
-        let error = changes
-            .patch(
-                &reads,
-                &rift_protocol::change::PatchParams {
-                    patch: patch.to_owned(),
-                },
-            )
-            .expect_err("backslash separators must fail as an invalid path");
-        assert_eq!(error.descriptor().code(), "invalid_request");
-        assert!(
-            error.to_string().contains("forward-slash"),
-            "message must name the expected form: {error}"
         );
         Ok(())
     }

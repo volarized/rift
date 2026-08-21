@@ -147,9 +147,11 @@ impl RiftMcp {
         self.change(|reads, changes| changes.replace_symbol(reads, &params))
     }
 
-    /// Inserts a new declaration before or after an existing one, addressed
-    /// by its anchor symbol. A refusal names the failed precondition and
-    /// leaves the workspace untouched.
+    /// Inserts a new declaration beside an anchor symbol, or content at a file
+    /// target. A file target lands the body verbatim at the file's start or
+    /// end, creating it first when `create_missing` is set and it is missing.
+    /// A refusal names the failed precondition and leaves the workspace
+    /// untouched.
     #[tool]
     fn insert_symbol(
         &self,

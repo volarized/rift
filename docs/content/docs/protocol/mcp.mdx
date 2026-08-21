@@ -283,7 +283,13 @@ v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json
 authoritative served shape.
 
 `insert_symbol` inserts a new declaration before or after an existing one, addressed by its
-anchor symbol. The parser derives the anchor's span, so the caller supplies no offsets.
+anchor symbol, or content at a file target addressed by `file`. The parser derives the
+anchor's span, so the caller supplies no offsets. A file target skips the parser: the body
+lands verbatim at the file's start or end.
+
+`create_missing` creates a missing file target first, parent directories included; without
+it, resolution refuses and names the missing target. `create_missing` is invalid together
+with `anchor`, which always addresses an existing file.
 
 ### replace_node [#tool-replace_node]
 

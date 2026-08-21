@@ -1030,4 +1030,316 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn patch_applies_hunks_and_reports_the_rewrite() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\npub fn steady() {}\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/lib.rs",
+            "@@ -1,2 +1,2 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            " pub fn steady() {}",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.clone(),
+            },
+        )?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "pub fn beacon() -> u8 { 7 }\npub fn steady() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_drifted_context_and_touches_nothing() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/lib.rs",
+            "@@ -1 +1 @@",
+            "-pub fn vanished() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.clone(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("drifted hunk context must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_rewrites_several_files_in_one_change() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("aid.rs"), "pub fn aid() {}\n")?;
+        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let changes = ChangeService::new(directory.path());
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/lib.rs",
+            "@@ -1 +1 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            "--- a/aid.rs",
+            "+++ b/aid.rs",
+            "@@ -1 +1 @@",
+            "-pub fn aid() {}",
+            "+pub fn aid() -> u8 { 9 }",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.clone(),
+            },
+        )?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths.len(), 2);
+        assert_eq!(summary.edits.len(), 2);
+        assert!(fs::read_to_string(directory.path().join("lib.rs"))?.contains("-> u8"));
+        assert!(fs::read_to_string(directory.path().join("aid.rs"))?.contains("-> u8"));
+        Ok(())
+    }
+
+    #[test]
+    fn patch_rejects_malformed_and_escaping_input() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let no_header = changes
+            .patch(
+                &reads,
+                &PatchParams {
+                    patch: "not a diff".to_owned(),
+                },
+            )
+            .expect_err("headerless input must error");
+        assert_eq!(no_header.descriptor().code(), "invalid_request");
+        let escaping = changes
+            .patch(
+                &reads,
+                &PatchParams {
+                    patch: "--- a/../escape.rs\n+++ b/../escape.rs\n@@ -1 +1 @@\n-x\n+y\n"
+                        .to_owned(),
+                },
+            )
+            .expect_err("dot segments must error");
+        assert_eq!(escaping.descriptor().code(), "invalid_request");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_rejects_more_files_than_the_bound() -> TestResult {
+        use std::fmt::Write as _;
+
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let mut patch = String::new();
+        for index in 0..=super::PATCH_FILES_MAX {
+            let _ = writeln!(
+                patch,
+                "--- a/f{index}.rs\n+++ b/f{index}.rs\n@@ -1 +1 @@\n-x\n+y"
+            );
+        }
+        let error = changes
+            .patch(&reads, &PatchParams { patch })
+            .expect_err("a diff past the file bound must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("more than {} files", super::PATCH_FILES_MAX)),
+            "message must name the bound: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_file_rename_as_unsupported() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/other.rs",
+            "@@ -1 +1 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused { reason, .. } = result else {
+            panic!("file rename must refuse this release");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_a_path_the_index_does_not_serve() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = "--- a/ghost.rs\n+++ b/ghost.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.to_owned(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a patch for an unindexed path must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        assert_eq!(
+            preconditions[0].paths,
+            vec![ProjectPath("ghost.rs".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_when_disk_drifted_from_snapshot() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() { }\n")?;
+        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.to_owned(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a drifted file under a patch must refuse before writing");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        assert_ne!(preconditions[0].expected, preconditions[0].observed);
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() { }\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_with_crlf_endings_applies_and_preserves_them() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\r\npub fn steady() {}\r\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/lib.rs",
+            "@@ -1,2 +1,2 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            " pub fn steady() {}",
+            "",
+        ]
+        .join("\r\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written, "pub fn beacon() -> u8 { 7 }\r\npub fn steady() {}\r\n",
+            "CRLF endings must survive the rewrite byte-for-byte"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_with_lf_context_refuses_a_crlf_source() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\r\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/lib.rs",
+            "@@ -1 +1 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused { reason, .. } = result else {
+            panic!("an ending mismatch must refuse as context drift, not rewrite endings");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() {}\r\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_without_a_trailing_newline_applies() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }";
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.to_owned(),
+            },
+        )?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "pub fn beacon() -> u8 { 7 }");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_with_backslash_paths_names_the_expected_form() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = "--- \"a\\\\lib.rs\"\n+++ \"b\\\\lib.rs\"\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
+        let error = changes
+            .patch(
+                &reads,
+                &PatchParams {
+                    patch: patch.to_owned(),
+                },
+            )
+            .expect_err("backslash separators must fail as an invalid path");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("forward-slash"),
+            "message must name the expected form: {error}"
+        );
+        Ok(())
+    }
 }

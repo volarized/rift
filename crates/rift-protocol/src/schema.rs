@@ -450,6 +450,29 @@ pub fn require_query_filter_or_traversal(schema: &mut Schema) {
     );
 }
 
+/// [`InsertSymbolParams`](crate::change::InsertSymbolParams) addresses exactly one
+/// target, and `create_missing` combines only with `file`.
+pub fn insert_symbol_addresses_one_target(schema: &mut Schema) {
+    use crate::change::InsertSymbolParams;
+    let anchor = property!(InsertSymbolParams, anchor);
+    let file = property!(InsertSymbolParams, file);
+    let create_missing = property!(InsertSymbolParams, create_missing);
+    append(
+        schema,
+        Composition::All,
+        one_of(vec![requires(&[anchor]), requires(&[file])]),
+    );
+    let anchor_and_create_missing = [anchor, create_missing];
+    append(
+        schema,
+        Composition::All,
+        not(merged(vec![
+            requires(&anchor_and_create_missing),
+            properties(vec![(create_missing, constant(&true))]),
+        ])),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,16 +626,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn insert_symbol_addresses_one_target_states_exclusive_composition() {
+        let mut schema = schema_from(json!({}));
+        insert_symbol_addresses_one_target(&mut schema);
+        assert_eq!(
+            schema.as_value(),
+            &json!({
+                "allOf": [
+                    {
+                        "oneOf": [
+                            { "required": ["anchor"] },
+                            { "required": ["file"] }
+                        ]
+                    },
+                    {
+                        "not": {
+                            "required": ["anchor", "create_missing"],
+                            "properties": { "create_missing": { "const": true } }
+                        }
+                    }
+                ]
+            })
+        );
+    }
+
     /// The `property!` macro proves a field exists on the struct; this test
     /// proves serde serves it under the same name, closing the rename gap.
     #[test]
     fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 5] = [
+        let cases: [(&str, Value, &[&str]); 6] = [
             (
                 "ExecutionConfiguration",
                 serde_json::to_value(schema_for!(crate::configuration::ExecutionConfiguration))
                     .expect("schema"),
                 &["max_code", "max_timeout", "max_output"],
+            ),
+            (
+                "InsertSymbolParams",
+                serde_json::to_value(schema_for!(crate::change::InsertSymbolParams))
+                    .expect("schema"),
+                &["anchor", "file", "position", "body", "create_missing"],
             ),
             (
                 "File",
