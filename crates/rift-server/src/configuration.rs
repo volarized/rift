@@ -203,6 +203,25 @@ embedding = "potion-retrieval-32M"
         assert_eq!(hook.determinism, Determinism::Deterministic);
     }
 
+    /// The repository's own `rift.toml`, exercised so the committed file admits cleanly
+    /// under the exact model this module validates against.
+    #[test]
+    fn test_repository_rift_toml_admits_cleanly() {
+        let raw = include_str!("../../../rift.toml");
+        let configuration =
+            admit_configuration(raw).expect("the repository's rift.toml must admit cleanly");
+        assert!(configuration.source.include.is_empty());
+        assert!(configuration.source.exclude.is_empty());
+        assert!(configuration.source.respect_gitignore);
+        assert_eq!(configuration.hooks.len(), 2);
+        assert_eq!(configuration.hooks[0].id, "format");
+        assert_eq!(configuration.hooks[0].program, "just");
+        assert_eq!(configuration.hooks[0].arguments, ["format"]);
+        assert_eq!(configuration.hooks[1].id, "check");
+        assert_eq!(configuration.hooks[1].program, "just");
+        assert_eq!(configuration.hooks[1].arguments, ["check"]);
+    }
+
     #[test]
     fn test_unknown_key_is_refused_as_malformed() {
         let error = admit_configuration("[execution]\nmax_codes = \"16kb\"\n")

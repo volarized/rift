@@ -1,0 +1,38 @@
+#:schema https://volar.sh/rift/rift.schema.json
+
+[source]
+include = []
+exclude = []
+respect_gitignore = true
+
+[[hooks]]
+type = "command"
+id = "format"
+kind = "lint"
+program = "just"
+arguments = ["format"]
+changed_paths = "none"
+working_directory = ""
+environment = {}
+timeout_ms = 120000
+output_limit_bytes = 4096
+guarantees = [
+  { kind = "syntax_validated", scope = { kind = "reach", reach = "project" }, detail = "cargo fmt --all --check passes" },
+]
+determinism = "deterministic"
+
+[[hooks]]
+type = "command"
+id = "check"
+kind = "build"
+program = "just"
+arguments = ["check"]
+changed_paths = "none"
+working_directory = ""
+environment = {}
+timeout_ms = 600000
+output_limit_bytes = 4096
+guarantees = [
+  { kind = "syntax_validated", scope = { kind = "reach", reach = "project" }, detail = "cargo check and the architecture gate pass" },
+]
+determinism = "deterministic"
