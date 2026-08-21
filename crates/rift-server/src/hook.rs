@@ -2,9 +2,10 @@
 //!
 //! Each hook is an executable started directly — no shell — inside the
 //! changed tree, its streams captured up to the configured prefix, its
-//! wall-clock bounded by `timeout_ms`. Hooks observe an already-applied
-//! change: a failing hook rides the result as evidence and never rolls the
-//! change back.
+//! wall-clock bounded by `timeout_ms`. A command starts from the environment
+//! the server inherited, with the hook's `environment` entries laid on top.
+//! Hooks observe an already-applied change: a failing hook rides the result
+//! as evidence and never rolls the change back.
 
 use std::io::Read;
 use std::path::Path;
@@ -20,6 +21,11 @@ const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Bytes read from a hook stream per read call.
 const STREAM_READ_BYTES: usize = 8 << 10;
+
+/// Bytes of one hook stream the runner counts before it stops reading. A
+/// hook that produces more blocks on its full pipe until `timeout_ms` kills
+/// it, and the reported total stays at this ceiling.
+const STREAM_TOTAL_BYTES_MAX: u64 = 64 << 20;
 
 /// What one configured hook's run produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,7 +64,7 @@ pub struct CapturedStream {
     pub text: String,
     /// Bytes of the prefix actually captured.
     pub captured_bytes: u64,
-    /// Bytes the stream produced in total.
+    /// Bytes the stream produced, counted up to the runner's drain ceiling.
     pub total_bytes: u64,
     /// Whether the capture stopped short of the full stream.
     pub truncated: bool,
@@ -195,19 +201,20 @@ fn join_drain(handle: Option<std::thread::JoinHandle<CapturedStream>>) -> Captur
         .unwrap_or_default()
 }
 
-/// Reads one stream to end-of-file, keeping the first `capture_bytes` and
-/// counting all. The loop is bounded by the stream itself: it ends when the
-/// hook's process exits or closes the pipe, which `wait_bounded` forces by
-/// the configured timeout.
+/// Reads one stream until end-of-file or the drain ceiling, keeping the
+/// first `capture_bytes` and counting the rest. The loop is bounded by
+/// [`STREAM_TOTAL_BYTES_MAX`]: each read returns at least one byte, so it
+/// iterates at most that many times before end-of-file, an error, or the
+/// ceiling stops it.
 fn drain(mut stream: impl Read, capture_bytes: usize) -> CapturedStream {
     let mut kept: Vec<u8> = Vec::with_capacity(capture_bytes.min(STREAM_READ_BYTES));
     let mut total_bytes: u64 = 0;
     let mut buffer = [0_u8; STREAM_READ_BYTES];
-    loop {
+    while total_bytes < STREAM_TOTAL_BYTES_MAX {
         match stream.read(&mut buffer) {
             Ok(0) | Err(_) => break,
             Ok(read_bytes) => {
-                total_bytes += read_bytes as u64;
+                total_bytes = STREAM_TOTAL_BYTES_MAX.min(total_bytes + read_bytes as u64);
                 if kept.len() < capture_bytes {
                     let taken = read_bytes.min(capture_bytes - kept.len());
                     kept.extend_from_slice(&buffer[..taken]);
@@ -360,6 +367,76 @@ mod tests {
         assert!(
             matches!(&runs[0].status, HookStatus::Error(message) if message.contains("program"))
         );
+    }
+
+    #[test]
+    fn test_hook_inherits_the_server_environment() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runs = run_hooks(&[hook("printenv", &["PATH"])], directory.path(), &[]);
+        assert_eq!(runs[0].status, HookStatus::Passed);
+        assert!(
+            !runs[0].stdout.text.trim().is_empty(),
+            "the child must see the server's PATH"
+        );
+    }
+
+    #[test]
+    fn test_configured_environment_wins_over_the_inherited_value() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut overlaid = hook("printenv", &["HOME"]);
+        overlaid
+            .environment
+            .insert("HOME".to_owned(), "/rift/overlay".to_owned());
+        let runs = run_hooks(&[overlaid], directory.path(), &[]);
+        assert_eq!(runs[0].stdout.text, "/rift/overlay\n");
+    }
+
+    /// A stream that never ends, for proving the drain ceiling.
+    struct EndlessStream;
+
+    impl Read for EndlessStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            buffer.fill(b'x');
+            Ok(buffer.len())
+        }
+    }
+
+    #[test]
+    fn test_drain_stops_counting_at_the_stream_ceiling() {
+        let captured = drain(EndlessStream, 16);
+        assert_eq!(captured.total_bytes, STREAM_TOTAL_BYTES_MAX);
+        assert_eq!(captured.captured_bytes, 16);
+        assert!(captured.truncated);
+    }
+
+    /// A stream that fails on its first read.
+    struct FailingStream;
+
+    impl Read for FailingStream {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stream torn down"))
+        }
+    }
+
+    #[test]
+    fn test_drain_reports_an_erroring_stream_as_empty() {
+        let captured = drain(FailingStream, 16);
+        assert_eq!(captured, CapturedStream::default());
+    }
+
+    /// A stream whose reader thread panics, for proving the join fallback.
+    struct PanickingStream;
+
+    impl Read for PanickingStream {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("reader died mid-stream");
+        }
+    }
+
+    #[test]
+    fn test_panicked_reader_reports_an_empty_capture() {
+        let captured = join_drain(drain_thread(Some(PanickingStream), 16));
+        assert_eq!(captured, CapturedStream::default());
     }
 
     #[test]
