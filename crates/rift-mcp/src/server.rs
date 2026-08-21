@@ -57,6 +57,15 @@ impl ConfigurationState {
             fingerprint: configuration_fingerprint(root),
         }
     }
+
+    /// The admission's outcome as one request sees it: the configuration to
+    /// serve under, or the typed refusal naming what to fix.
+    fn admitted(&self, phase: wire::ErrorPhase) -> Result<WorkspaceConfiguration, ErrorData> {
+        match &self.admitted {
+            Ok(configuration) => Ok(configuration.clone()),
+            Err(error) => Err(error.tool_error(phase)),
+        }
+    }
 }
 
 /// The file state one admission was read from. Size rides modification
@@ -97,11 +106,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
-        self.admitted_configuration(wire::ErrorPhase::Read)?;
-        self.snapshot()
-            .get_symbol(&params)
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+        self.read(|reads| reads.get_symbol(&params))
     }
 
     /// Searches indexed Rust declarations and source lines by lexical `query`. Use
@@ -111,11 +116,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        self.admitted_configuration(wire::ErrorPhase::Read)?;
-        self.snapshot()
-            .search(&params)
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+        self.read(|reads| reads.search(&params))
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
@@ -126,11 +127,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ErrorData> {
-        self.admitted_configuration(wire::ErrorPhase::Read)?;
-        self.snapshot()
-            .nodes(params)
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+        self.read(|reads| reads.nodes(params))
     }
 
     /// Replaces one declaration addressed by symbol. The parser derives the
@@ -189,6 +186,18 @@ impl RiftMcp {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Runs one read against the current snapshot, behind the admission
+    /// gate every request passes.
+    fn read<Answer>(
+        &self,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError>,
+    ) -> Result<Json<Answer>, ErrorData> {
+        self.admitted_configuration(wire::ErrorPhase::Read)?;
+        operation(&self.snapshot())
+            .map(Json)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
     /// The admitted workspace configuration, re-admitting `rift.toml` when
     /// the file changed since the last request. While the file is invalid,
     /// every request fails as `configuration_invalid` until it is fixed.
@@ -202,15 +211,14 @@ impl RiftMcp {
         phase: wire::ErrorPhase,
     ) -> Result<WorkspaceConfiguration, ErrorData> {
         let current = configuration_fingerprint(&self.root);
-        {
-            let state = self
-                .configuration
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.fingerprint == current {
-                return admitted(&state, phase);
-            }
+        let state = self
+            .configuration
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.fingerprint == current {
+            return state.admitted(phase);
         }
+        drop(state);
         let mut state = self
             .configuration
             .write()
@@ -218,7 +226,7 @@ impl RiftMcp {
         if state.fingerprint != current {
             *state = ConfigurationState::admit(&self.root);
         }
-        admitted(&state, phase)
+        state.admitted(phase)
     }
 
     /// Runs one change against the current snapshot and, when it lands,
@@ -246,18 +254,6 @@ impl RiftMcp {
             }
         }
         Ok(Json(result))
-    }
-}
-
-/// The admission's outcome as one request sees it: the configuration to
-/// serve under, or the typed refusal naming what to fix.
-fn admitted(
-    state: &ConfigurationState,
-    phase: wire::ErrorPhase,
-) -> Result<WorkspaceConfiguration, ErrorData> {
-    match &state.admitted {
-        Ok(configuration) => Ok(configuration.clone()),
-        Err(error) => Err(error.tool_error(phase)),
     }
 }
 
