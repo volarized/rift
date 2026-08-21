@@ -5,9 +5,9 @@
 //! implements the registry trait over them, giving every configuration
 //! refusal the registry's identity, explanation, and rendering.
 
-use rift_protocol::configuration::UnitParseError;
+use rift_protocol::configuration::{ConfigurationViolation, UnitParseError};
 
-use crate::error::{ErrorContext, ErrorName, Fault};
+use crate::error::{ErrorContext, ErrorName, Fault, fault_label};
 use rift_protocol::error::ErrorCode;
 
 impl Fault for UnitParseError {
@@ -20,6 +20,22 @@ impl Fault for UnitParseError {
             ErrorContext::new("value", self.value()),
             ErrorContext::new("expected", self.expected()),
         ]
+    }
+}
+
+impl Fault for ConfigurationViolation {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        let mut context = vec![ErrorContext::new("violation", fault_label(self))];
+        context.extend(
+            self.evidence()
+                .into_iter()
+                .map(|(key, value)| ErrorContext::new(key, value)),
+        );
+        context
     }
 }
 
@@ -44,6 +60,27 @@ mod tests {
                 && message.contains("16kb")
                 && message.contains("correct the reported configuration field"),
             "the render must carry explanation, evidence, and action: {message}"
+        );
+    }
+
+    #[test]
+    fn test_configuration_violation_renders_through_the_registry() {
+        let violation = ConfigurationViolation::HookExecutableAbsolute {
+            id: "tests".to_owned(),
+            program: "/bin/cargo".to_owned(),
+        };
+        let error = Error::from(violation);
+        assert_eq!(
+            error.name(),
+            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("violation hook_executable_absolute")
+                && message.contains("id tests")
+                && message.contains("program /bin/cargo")
+                && message.contains("correct the reported configuration field"),
+            "the render must carry the serde label, the evidence, and the action: {message}"
         );
     }
 
