@@ -1,6 +1,8 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ignore::{DirEntry, WalkBuilder};
 use rift_core::constants::{
     READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, WORKSPACE_BYTES_MAX_DEFAULT,
     WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
@@ -8,13 +10,15 @@ use rift_core::constants::{
 };
 use rift_core::{
     CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
-    fault_label,
+    SourceVisibility, fault_label,
 };
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{
     RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxError, RustSyntaxProvider,
 };
 use serde::Serialize;
+
+use crate::glob::PathMatcher;
 
 #[derive(Debug)]
 struct WorkspaceFiles;
@@ -117,6 +121,8 @@ pub enum WorkspaceIndexViolation {
     Composition,
     /// Requested result bound exceeds configured maximum.
     ResultLimit,
+    /// A `source.include` or `source.exclude` entry is not a valid glob.
+    SourcePatternInvalid,
 }
 
 /// One workspace indexing failure: its violation, the offending path when
@@ -149,7 +155,8 @@ impl Fault for WorkspaceIndexFault {
         match self.violation {
             WorkspaceIndexViolation::ZeroLimit
             | WorkspaceIndexViolation::InvalidRoot
-            | WorkspaceIndexViolation::Composition => {
+            | WorkspaceIndexViolation::Composition
+            | WorkspaceIndexViolation::SourcePatternInvalid => {
                 ErrorName::Wire(ErrorCode::ConfigurationInvalid)
             }
             WorkspaceIndexViolation::TooDeep
@@ -207,7 +214,7 @@ fn index_error_at(violation: WorkspaceIndexViolation, path: &Path) -> WorkspaceI
     })
 }
 
-fn index_error_caused_by(
+pub(crate) fn index_error_caused_by(
     violation: WorkspaceIndexViolation,
     path: Option<&Path>,
     source: impl std::error::Error + Send + Sync + 'static,
@@ -281,17 +288,25 @@ pub struct WorkspaceIndex {
 }
 
 impl WorkspaceIndex {
-    /// Scans current Rust files directly from workspace root.
+    /// Scans current Rust files directly from workspace root, applying
+    /// `visibility`'s `.gitignore` and `[source]` include/exclude policy on
+    /// top of the hard floor.
     ///
-    /// Symlinks and Rift state are never followed or indexed.
+    /// Symlinks, `.git`, `.rift`, and `target` are never followed or
+    /// indexed, whatever `visibility` says.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for invalid root, I/O, syntax, or exceeded bound.
-    pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, WorkspaceIndexError> {
+    /// Returns [`WorkspaceIndexError`] for invalid root, I/O, syntax, an invalid
+    /// `[source]` pattern, or an exceeded bound.
+    pub fn build(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+    ) -> Result<Self, WorkspaceIndexError> {
         let root = canonical_root(root)?;
         let composition = composition()?;
-        let paths = discover(&root, limits)?;
+        let paths = discover(&root, limits, visibility)?;
         let parser = RustSyntaxProvider::default();
         let mut workspace_bytes = 0_usize;
         let mut files = Vec::with_capacity(paths.len());
@@ -325,6 +340,12 @@ impl WorkspaceIndex {
         &self.composition
     }
 
+    /// Returns the maximum result count accepted per query against this index.
+    #[must_use]
+    pub const fn results_max(&self) -> usize {
+        self.limits.results_max()
+    }
+
     /// Finds declarations by exact, suffix, or substring name.
     ///
     /// # Errors
@@ -336,26 +357,7 @@ impl WorkspaceIndex {
         limit: usize,
     ) -> Result<Vec<SymbolMatch<'_>>, WorkspaceIndexError> {
         self.validate_result_limit(limit)?;
-        let query = query.to_lowercase();
-        let mut matches = self
-            .files
-            .iter()
-            .flat_map(|file| {
-                file.syntax()
-                    .symbols()
-                    .iter()
-                    .map(move |symbol| (file, symbol))
-            })
-            .filter(|(_, symbol)| symbol.qualified_name.to_lowercase().contains(&query))
-            .map(|(file, symbol)| SymbolMatch {
-                file,
-                symbol,
-                rank: symbol_rank(symbol, &query),
-            })
-            .collect::<Vec<_>>();
-        matches.sort_by_key(|matched| (matched.rank, matched.symbol.qualified_name.as_str()));
-        matches.truncate(limit);
-        Ok(matches)
+        Ok(symbol_matches(&self.files, query, limit))
     }
 
     /// Finds lexical source lines containing query.
@@ -369,19 +371,7 @@ impl WorkspaceIndex {
         limit: usize,
     ) -> Result<Vec<(&IndexedFile, usize, String)>, WorkspaceIndexError> {
         self.validate_result_limit(limit)?;
-        let query = query.to_lowercase();
-        let mut matches = Vec::new();
-        for file in &self.files {
-            for (line_index, line) in file.source().lines().enumerate() {
-                if line.to_lowercase().contains(&query) {
-                    matches.push((file, line_index + 1, line.into()));
-                    if matches.len() == limit {
-                        return Ok(matches);
-                    }
-                }
-            }
-        }
-        Ok(matches)
+        Ok(source_line_matches(&self.files, query, limit))
     }
 
     /// Returns file by canonical project path.
@@ -396,12 +386,133 @@ impl WorkspaceIndex {
         self.file(path).map(|file| file.syntax().nodes_at(position))
     }
 
+    /// Walks the workspace on demand for `.rs` files matching `force_include`'s globs that are
+    /// not already indexed, ignoring `[source]` policy and `.gitignore` — only the hard floor
+    /// (`.git`, `.rift`, `target`, symlinks) stays unreachable. Each match is parsed with the
+    /// same syntax provider and per-file byte bound as the index, and the walk stops as soon
+    /// as it would exceed `files_max`.
+    ///
+    /// Work is bounded by the same directory-depth limit as the index and by `files_max`
+    /// matches; a `files_max`-plus-one-th match refuses rather than truncating silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for an invalid glob, an unreadable path, invalid UTF-8
+    /// source, a syntax failure, or a file exceeding this index's per-file or aggregate byte
+    /// bound, or `files_max` matches.
+    pub fn force_include_files(
+        &self,
+        force_include: &[String],
+        files_max: usize,
+    ) -> Result<Vec<IndexedFile>, WorkspaceIndexError> {
+        if force_include.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matcher = PathMatcher::build(&self.root, force_include, &[])?;
+        let parser = RustSyntaxProvider::default();
+        let mut extra_bytes = 0_usize;
+        let mut files = Vec::new();
+        let walker = walk_without_gitignore(&self.root, self.limits.directory_depth_max);
+        for entry in walker.build() {
+            let entry = entry.map_err(|error| walk_error(&self.root, error))?;
+            let file_type = entry.file_type();
+            if file_type.is_some_and(|file_type| file_type.is_dir()) {
+                if entry.depth() > self.limits.directory_depth_max {
+                    return Err(index_error_at(
+                        WorkspaceIndexViolation::TooDeep,
+                        entry.path(),
+                    ));
+                }
+                continue;
+            }
+            if !file_type.is_some_and(|file_type| file_type.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            if !matcher.admits(path) {
+                continue;
+            }
+            let relative = path.strip_prefix(&self.root).map_err(|error| {
+                index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
+            })?;
+            let project_path = relative_path(relative)?;
+            if self.file(&project_path).is_some() {
+                continue;
+            }
+            if files.len() >= files_max {
+                return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+            }
+            files.push(read_file(
+                &self.root,
+                path,
+                &parser,
+                self.limits,
+                &mut extra_bytes,
+            )?);
+        }
+        Ok(files)
+    }
+
     fn validate_result_limit(&self, limit: usize) -> Result<(), WorkspaceIndexError> {
         if limit == 0 || limit > self.limits.results_max {
             return Err(index_error(WorkspaceIndexViolation::ResultLimit));
         }
         Ok(())
     }
+}
+
+/// Declaration matches for `query` across `files`, ranked qualified-exact first, then
+/// name-exact, qualified-suffix, and substring. Shared so an on-demand file set (search's
+/// `force_include`) scores identically to the index.
+pub fn symbol_matches<'a>(
+    files: impl IntoIterator<Item = &'a IndexedFile>,
+    query: &str,
+    limit: usize,
+) -> Vec<SymbolMatch<'a>> {
+    let query = query.to_lowercase();
+    let mut matches = files
+        .into_iter()
+        .flat_map(|file| {
+            file.syntax()
+                .symbols()
+                .iter()
+                .map(move |symbol| (file, symbol))
+        })
+        .filter(|(_, symbol)| symbol.qualified_name.to_lowercase().contains(&query))
+        .map(|(file, symbol)| SymbolMatch {
+            file,
+            symbol,
+            rank: symbol_rank(symbol, &query),
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|matched| (matched.rank, matched.symbol.qualified_name.as_str()));
+    matches.truncate(limit);
+    matches
+}
+
+/// Lexical source-line matches for `query` across `files`. Shared the same way as
+/// [`symbol_matches`].
+pub fn source_line_matches<'a>(
+    files: impl IntoIterator<Item = &'a IndexedFile>,
+    query: &str,
+    limit: usize,
+) -> Vec<(&'a IndexedFile, usize, String)> {
+    let query = query.to_lowercase();
+    let mut matches = Vec::new();
+    for file in files {
+        for (line_index, line) in file.source().lines().enumerate() {
+            if line.to_lowercase().contains(&query) {
+                matches.push((file, line_index + 1, line.into()));
+                if matches.len() == limit {
+                    return matches;
+                }
+            }
+        }
+    }
+    matches
 }
 
 fn positive_bound(bound: usize) -> Result<(), WorkspaceIndexError> {
@@ -450,60 +561,112 @@ fn composition_error(
     index_error_caused_by(WorkspaceIndexViolation::Composition, None, source)
 }
 
+/// Rust source paths visible below `root`: the hard floor (`.git`, `.rift`,
+/// `target`, symlinks) is always applied, `visibility.respect_gitignore()`
+/// then layers the workspace's own `.gitignore` chain, and
+/// `visibility.include()`/`.exclude()` narrow or drop candidate files.
+///
+/// Directories are walked in file-name order so a bound violation is
+/// reported deterministically; the returned files are sorted by path.
 fn discover(
     root: &Path,
     limits: WorkspaceIndexLimits,
+    visibility: &SourceVisibility,
 ) -> Result<Vec<PathBuf>, WorkspaceIndexError> {
-    let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    let matcher = PathMatcher::build(root, visibility.include(), visibility.exclude())?;
+    let mut walker = base_walker(root, limits.directory_depth_max);
+    walker.git_ignore(visibility.respect_gitignore());
     let mut files = Vec::new();
-    while let Some((directory, depth)) = pending.pop() {
-        if depth > limits.directory_depth_max {
-            return Err(index_error_at(WorkspaceIndexViolation::TooDeep, &directory));
+    for entry in walker.build() {
+        let entry = entry.map_err(|error| walk_error(root, error))?;
+        let file_type = entry.file_type();
+        if file_type.is_some_and(|file_type| file_type.is_dir()) {
+            if entry.depth() > limits.directory_depth_max {
+                return Err(index_error_at(
+                    WorkspaceIndexViolation::TooDeep,
+                    entry.path(),
+                ));
+            }
+            continue;
         }
-        let mut entries = fs::read_dir(&directory)
-            .and_then(Iterator::collect::<Result<Vec<_>, _>>)
-            .map_err(|error| {
-                index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(&directory), error)
-            })?;
-        entries.sort_by_key(fs::DirEntry::file_name);
-        for entry in entries.into_iter().rev() {
-            discover_entry(&entry, depth, &mut pending, &mut files, limits)?;
+        if !file_type.is_some_and(|file_type| file_type.is_file()) {
+            continue;
         }
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        if !matcher.admits(path) {
+            continue;
+        }
+        if files.len() >= limits.files_max {
+            return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+        }
+        files.push(path.to_path_buf());
     }
     files.sort();
     Ok(files)
 }
 
-fn discover_entry(
-    entry: &fs::DirEntry,
-    depth: usize,
-    pending: &mut Vec<(PathBuf, usize)>,
-    files: &mut Vec<PathBuf>,
-    limits: WorkspaceIndexLimits,
-) -> Result<(), WorkspaceIndexError> {
-    let path = entry.path();
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(&path), error)
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        if !is_ignored_directory(&entry.file_name()) {
-            pending.push((path, depth + 1));
-        }
-    } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
-        if files.len() >= limits.files_max {
-            return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, &path));
-        }
-        files.push(path);
-    }
-    Ok(())
+/// One depth-bounded, hard-floor-filtered walk builder rooted at `root`, shared by the
+/// `[source]`-scoped scan and `force_include`'s on-demand walk. The caller still chooses whether
+/// `.gitignore` applies.
+fn base_walker(root: &Path, directory_depth_max: usize) -> WalkBuilder {
+    let mut walker = WalkBuilder::new(root);
+    walker
+        .standard_filters(false)
+        .require_git(false)
+        .follow_links(false)
+        .max_depth(Some(directory_depth_max.saturating_add(1)))
+        .sort_by_file_name(OsStr::cmp)
+        .filter_entry(hard_floor_admits);
+    walker
 }
 
-fn is_ignored_directory(name: &std::ffi::OsStr) -> bool {
+/// The walk `force_include` uses to reach files the ordinary scan excludes: the hard floor still
+/// applies, but `.gitignore` and `[source]` policy do not.
+fn walk_without_gitignore(root: &Path, directory_depth_max: usize) -> WalkBuilder {
+    let mut walker = base_walker(root, directory_depth_max);
+    walker.git_ignore(false);
+    walker
+}
+
+/// The hard floor every workspace applies before `.gitignore` or
+/// `[source]` are consulted: `.git`, `.rift`, and `target` are never
+/// descended into, and a symlink is never followed or indexed.
+fn hard_floor_admits(entry: &DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    if entry.path_is_symlink() {
+        return false;
+    }
+    let is_dir = entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir());
+    !(is_dir && is_ignored_directory(entry.file_name()))
+}
+
+fn is_ignored_directory(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
+}
+
+/// The path one `ignore` walk failure names, when its cause names one.
+fn walk_source_path(error: &ignore::Error) -> Option<PathBuf> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path.clone()),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            walk_source_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child.clone()),
+        _ => None,
+    }
+}
+
+fn walk_error(root: &Path, error: ignore::Error) -> WorkspaceIndexError {
+    let path = walk_source_path(&error).unwrap_or_else(|| root.to_path_buf());
+    index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(&path), error)
 }
 
 fn read_file(
@@ -597,8 +760,12 @@ mod tests {
     #[test]
     fn test_index_builds_composed_direct_workspace_reads() {
         let directory = fixture();
-        let index = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
-            .expect("workspace index");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("workspace index");
         assert_eq!(index.files().len(), 1);
         assert_eq!(index.composition().steps().len(), 3);
         let symbols = index.symbols("update", 5).expect("bounded symbol read");
@@ -623,10 +790,254 @@ mod tests {
         fs::create_dir(directory.path().join(".rift")).expect("state directory");
         fs::write(directory.path().join(".rift/hidden.rs"), "fn hidden() {}")
             .expect("state source");
-        let index = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
-            .expect("workspace index");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("workspace index");
         assert!(index.symbols("escaped", 5).expect("symbol read").is_empty());
         assert!(index.symbols("hidden", 5).expect("symbol read").is_empty());
+    }
+
+    fn build_index(
+        directory: &tempfile::TempDir,
+        visibility: &SourceVisibility,
+    ) -> Result<WorkspaceIndex, WorkspaceIndexError> {
+        WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            visibility,
+        )
+    }
+
+    fn has_symbol(index: &WorkspaceIndex, name: &str) -> bool {
+        !index
+            .symbols(name, 5)
+            .expect("bounded symbol read")
+            .is_empty()
+    }
+
+    #[test]
+    fn test_force_include_reaches_gitignored_file_and_skips_already_indexed() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join(".gitignore"), "hidden.rs\n").expect("root gitignore");
+        fs::write(directory.path().join("lib.rs"), "pub fn kept() {}\n").expect("kept source");
+        fs::write(directory.path().join("hidden.rs"), "pub fn phantom() {}\n")
+            .expect("hidden source");
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        assert!(has_symbol(&index, "kept"));
+        assert!(!has_symbol(&index, "phantom"));
+
+        let extra = index
+            .force_include_files(&["hidden.rs".to_owned()], 10)
+            .expect("force_include walk");
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].path().as_str(), "hidden.rs");
+        assert!(
+            extra[0]
+                .syntax()
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == "phantom")
+        );
+
+        let indexed_only = index
+            .force_include_files(&["lib.rs".to_owned()], 10)
+            .expect("force_include of an already-indexed file");
+        assert!(
+            indexed_only.is_empty(),
+            "force_include of an indexed file must not duplicate it"
+        );
+    }
+
+    #[test]
+    fn test_force_include_respects_hard_floor_and_bound() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(
+            directory.path().join(".gitignore"),
+            "a.rs\nb.rs\nfloor.rs\n",
+        )
+        .expect("root gitignore");
+        fs::create_dir_all(directory.path().join(".git")).expect("git directory");
+        fs::write(
+            directory.path().join(".git/floor.rs"),
+            "pub fn floor() {}\n",
+        )
+        .expect("floor source");
+        fs::write(directory.path().join("a.rs"), "pub fn a() {}\n").expect("a source");
+        fs::write(directory.path().join("b.rs"), "pub fn b() {}\n").expect("b source");
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+
+        let floor_reach = index
+            .force_include_files(&[".git/**".to_owned()], 10)
+            .expect("force_include walk");
+        assert!(
+            floor_reach.is_empty(),
+            "the hard floor must stay unreachable via force_include"
+        );
+
+        let bound_error = index
+            .force_include_files(&["*.rs".to_owned()], 1)
+            .expect_err("two matches must refuse a one-file bound");
+        assert_eq!(
+            bound_error.fault().violation(),
+            WorkspaceIndexViolation::TooManyFiles
+        );
+    }
+
+    #[test]
+    fn test_force_include_reports_too_deep_like_the_ordinary_scan() {
+        // `outer/` is gitignored, so the ordinary scan never walks deep enough to see `inner/`
+        // and `WorkspaceIndex::build` succeeds under a depth bound of 1. `force_include`
+        // ignores `.gitignore`, so its own walk reaches `inner/` and must report the same
+        // `TooDeep` bound the ordinary scan would have, rather than silently stopping short.
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join(".gitignore"), "outer/\n").expect("root gitignore");
+        fs::write(directory.path().join("kept.rs"), "pub fn kept() {}\n").expect("kept source");
+        fs::create_dir_all(directory.path().join("outer/inner")).expect("nested directories");
+        fs::write(
+            directory.path().join("outer/inner/deep.rs"),
+            "pub fn deep() {}\n",
+        )
+        .expect("nested source");
+        let limits = WorkspaceIndexLimits::new(5, 1_000, 2_000, 1, 5).expect("positive limits");
+        let shallow = WorkspaceIndex::build(directory.path(), limits, &SourceVisibility::default())
+            .expect("index bounded to depth 1, with the deep directory hidden by .gitignore");
+        let error = shallow
+            .force_include_files(&["outer/**".to_owned()], 10)
+            .expect_err("a directory past the depth bound must refuse");
+        assert_eq!(error.fault().violation(), WorkspaceIndexViolation::TooDeep);
+    }
+
+    #[test]
+    fn test_force_include_invalid_glob_refuses() {
+        let directory = fixture();
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        let error = index
+            .force_include_files(&["[".to_owned()], 10)
+            .expect_err("an unclosed character class must be refused");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
+    }
+
+    #[test]
+    fn test_gitignore_chain_hides_matching_files_including_nested() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("src/generated")).expect("fixture directories");
+        fs::write(directory.path().join("src/lib.rs"), "pub fn kept() {}\n").expect("kept source");
+        fs::write(
+            directory.path().join("src/generated/gen.rs"),
+            "pub fn generated() {}\n",
+        )
+        .expect("generated source");
+        fs::write(directory.path().join("src/generated/.gitignore"), "*.rs\n")
+            .expect("nested gitignore");
+
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        assert!(has_symbol(&index, "kept"));
+        assert!(!has_symbol(&index, "generated"));
+    }
+
+    #[test]
+    fn test_respect_gitignore_toggle_admits_or_hides_matching_files() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("vendor")).expect("fixture directories");
+        fs::write(directory.path().join(".gitignore"), "vendor/\n").expect("root gitignore");
+        fs::write(
+            directory.path().join("vendor/dep.rs"),
+            "pub fn vendored() {}\n",
+        )
+        .expect("vendored source");
+
+        let respecting = build_index(&directory, &SourceVisibility::default()).expect("index");
+        assert!(!has_symbol(&respecting, "vendored"));
+
+        let ignoring = SourceVisibility::new(Vec::new(), Vec::new(), false);
+        let index = build_index(&directory, &ignoring).expect("index");
+        assert!(has_symbol(&index, "vendored"));
+    }
+
+    #[test]
+    fn test_include_narrows_visibility_to_matching_files() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("src")).expect("fixture directories");
+        fs::write(directory.path().join("src/lib.rs"), "pub fn kept() {}\n").expect("kept source");
+        fs::write(directory.path().join("other.rs"), "pub fn other() {}\n").expect("other source");
+
+        let visibility = SourceVisibility::new(vec!["src/**".to_owned()], Vec::new(), true);
+        let index = build_index(&directory, &visibility).expect("index");
+        assert_eq!(index.files().len(), 1);
+        assert!(has_symbol(&index, "kept"));
+        assert!(!has_symbol(&index, "other"));
+    }
+
+    #[test]
+    fn test_exclude_drops_matching_files_even_when_included() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("src/generated")).expect("fixture directories");
+        fs::write(directory.path().join("src/lib.rs"), "pub fn kept() {}\n").expect("kept source");
+        fs::write(
+            directory.path().join("src/generated/gen.rs"),
+            "pub fn generated() {}\n",
+        )
+        .expect("generated source");
+
+        let visibility = SourceVisibility::new(
+            vec!["src/**".to_owned()],
+            vec!["src/generated/**".to_owned()],
+            true,
+        );
+        let index = build_index(&directory, &visibility).expect("index");
+        assert!(has_symbol(&index, "kept"));
+        assert!(!has_symbol(&index, "generated"));
+    }
+
+    #[test]
+    fn test_hard_floor_hides_git_rift_and_target_regardless_of_config() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        for name in [".git", ".rift", "target"] {
+            fs::create_dir_all(directory.path().join(name)).expect("floor directory");
+            fs::write(
+                directory.path().join(name).join("floor.rs"),
+                "pub fn floor() {}\n",
+            )
+            .expect("floor source");
+        }
+
+        // respect_gitignore is off and the hard-floor directories are force-listed in
+        // include: the floor must still win.
+        let visibility = SourceVisibility::new(
+            vec![
+                ".git/**".to_owned(),
+                ".rift/**".to_owned(),
+                "target/**".to_owned(),
+            ],
+            Vec::new(),
+            false,
+        );
+        let index = build_index(&directory, &visibility).expect("index");
+        assert!(!has_symbol(&index, "floor"));
+        assert!(index.files().is_empty());
+    }
+
+    #[test]
+    fn test_dotfiles_stay_visible() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join(".hidden.rs"), "pub fn dotfile() {}\n")
+            .expect("dotfile source");
+        fs::create_dir_all(directory.path().join(".config")).expect("dot directory");
+        fs::write(
+            directory.path().join(".config/mod.rs"),
+            "pub fn dotdir() {}\n",
+        )
+        .expect("dotdir source");
+
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        assert!(has_symbol(&index, "dotfile"));
+        assert!(has_symbol(&index, "dotdir"));
     }
 
     #[test]
@@ -635,6 +1046,7 @@ mod tests {
         let file_error = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::new(2, 4, 100, 4, 5).expect("positive limits"),
+            &SourceVisibility::default(),
         )
         .expect_err("file byte bound");
         assert_eq!(
@@ -642,8 +1054,12 @@ mod tests {
             WorkspaceIndexViolation::FileTooLarge
         );
 
-        let index = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
-            .expect("workspace index");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("workspace index");
         assert_eq!(
             index
                 .symbols("Rift", index.limits.results_max() + 1)
@@ -673,8 +1089,12 @@ mod tests {
         );
 
         let missing = PathBuf::from("missing-rift-workspace");
-        let missing_error = WorkspaceIndex::build(&missing, WorkspaceIndexLimits::default())
-            .expect_err("missing root");
+        let missing_error = WorkspaceIndex::build(
+            &missing,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect_err("missing root");
         assert_eq!(
             missing_error.fault().violation(),
             WorkspaceIndexViolation::InvalidRoot
@@ -685,10 +1105,14 @@ mod tests {
         let directory = fixture();
         let file_root = directory.path().join("src/lib.rs");
         assert_eq!(
-            WorkspaceIndex::build(&file_root, WorkspaceIndexLimits::default())
-                .expect_err("file root")
-                .fault()
-                .violation(),
+            WorkspaceIndex::build(
+                &file_root,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+            )
+            .expect_err("file root")
+            .fault()
+            .violation(),
             WorkspaceIndexViolation::InvalidRoot,
         );
 
@@ -697,6 +1121,7 @@ mod tests {
             WorkspaceIndex::build(
                 directory.path(),
                 WorkspaceIndexLimits::new(1, 1_000, 2_000, 4, 5).expect("limits"),
+                &SourceVisibility::default(),
             )
             .expect_err("file count bound")
             .fault()
@@ -707,6 +1132,7 @@ mod tests {
             WorkspaceIndex::build(
                 directory.path(),
                 WorkspaceIndexLimits::new(5, 1_000, 8, 4, 5).expect("limits"),
+                &SourceVisibility::default(),
             )
             .expect_err("workspace byte bound")
             .fault()
@@ -721,6 +1147,7 @@ mod tests {
             WorkspaceIndex::build(
                 directory.path(),
                 WorkspaceIndexLimits::new(5, 1_000, 2_000, 1, 5).expect("limits"),
+                &SourceVisibility::default(),
             )
             .expect_err("depth bound")
             .fault()
@@ -732,8 +1159,12 @@ mod tests {
     #[test]
     fn test_index_queries_cover_rank_and_early_limit_paths() {
         let directory = fixture();
-        let index = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
-            .expect("workspace index");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("workspace index");
         assert_eq!(
             index.root(),
             fs::canonicalize(directory.path()).expect("root")
@@ -835,6 +1266,11 @@ mod tests {
                  resize the request below the named limit, or raise that limit \
                  in the workspace configuration",
             ),
+            (
+                WorkspaceIndexViolation::SourcePatternInvalid,
+                "the workspace configuration failed validation: violation source_pattern_invalid; \
+                 correct the reported configuration field, then retry",
+            ),
         ];
         for (violation, message) in cases {
             assert_eq!(index_error(violation).to_string(), message);
@@ -916,8 +1352,12 @@ mod tests {
         let locked = root.join("locked");
         fs::create_dir(&locked).expect("locked directory");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("remove read");
-        let unreadable = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
-            .expect_err("unreadable directory");
+        let unreadable = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect_err("unreadable directory");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
         assert_eq!(
             unreadable.fault().violation(),
@@ -930,8 +1370,12 @@ mod tests {
         fs::write(unsearchable.join("entry.rs"), "fn entry() {}").expect("entry source");
         fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o444))
             .expect("remove search");
-        let stat_error = WorkspaceIndex::build(directory.path(), WorkspaceIndexLimits::default())
-            .expect_err("unsearchable directory");
+        let stat_error = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect_err("unsearchable directory");
         fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755))
             .expect("restore search");
         assert_eq!(
@@ -972,7 +1416,7 @@ mod tests {
 
         fs::write(directory.path().join("src/invalid.rs"), [0xff]).expect("invalid UTF-8");
         assert_eq!(
-            WorkspaceIndex::build(directory.path(), limits)
+            WorkspaceIndex::build(directory.path(), limits, &SourceVisibility::default())
                 .expect_err("invalid source")
                 .fault()
                 .violation(),

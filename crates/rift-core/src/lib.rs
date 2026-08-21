@@ -10,6 +10,7 @@ mod path;
 
 pub mod constants;
 
+pub use configuration::SourceVisibility;
 pub use error::{
     CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, RetryDirective,
     RiftError, fault_label, render_failure,

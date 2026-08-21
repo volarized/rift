@@ -5,6 +5,7 @@ mod configuration;
 mod hook;
 mod patch;
 mod read;
+mod search;
 
 pub use change::ChangeService;
 pub use configuration::{ConfigurationError, ConfigurationFault, load_configuration};

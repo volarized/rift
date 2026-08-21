@@ -4,7 +4,7 @@ use std::sync::RwLock;
 use std::time::SystemTime;
 
 use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
-use rift_core::{ErrorName, Fault};
+use rift_core::{ErrorName, Fault, SourceVisibility};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
@@ -72,6 +72,15 @@ impl ConfigurationState {
             Err(error) => Err(error.tool_error(phase)),
         }
     }
+
+    /// The `[source]` policy from the last admission, or the default policy
+    /// while `rift.toml` is invalid.
+    fn source_visibility(&self) -> SourceVisibility {
+        self.admitted.as_ref().map_or_else(
+            |_| SourceVisibility::default(),
+            |configuration| SourceVisibility::from(&configuration.source),
+        )
+    }
 }
 
 /// The file state one admission was read from. Size rides modification
@@ -88,18 +97,24 @@ fn configuration_fingerprint(root: &Path) -> Option<ConfigurationFingerprint> {
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl RiftMcp {
-    /// Builds server from one direct-workspace snapshot.
+    /// Builds server from one direct-workspace snapshot, applying the
+    /// admitted `rift.toml`'s `[source]` policy to the initial index. While
+    /// `rift.toml` is invalid, the initial index still builds under the
+    /// default policy; every request then fails as `configuration_invalid`
+    /// until the file is fixed.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] when workspace cannot be indexed within bounds.
     pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
+        let configuration = ConfigurationState::admit(root);
+        let visibility = configuration.source_visibility();
         Ok(Self {
             root: root.to_path_buf(),
             limits,
-            reads: RwLock::new(ReadService::build(root, limits)?),
+            reads: RwLock::new(ReadService::build(root, limits, &visibility)?),
             changes: ChangeService::new(root),
-            configuration: RwLock::new(ConfigurationState::admit(root)),
+            configuration: RwLock::new(configuration),
             tool_router: Self::tool_router(),
         })
     }
@@ -243,10 +258,11 @@ impl RiftMcp {
     ///
     /// Hooks observe an already-applied change: their verdicts ride the
     /// result and never roll the change back. The snapshot is rebuilt after
-    /// they ran, so reads also serve whatever a hook wrote into the tree. A
-    /// rebuild failure after a landed change rides the result as a
-    /// diagnostic rather than failing the call: the write happened, and the
-    /// caller must not be told otherwise.
+    /// they ran, so reads also serve whatever a hook wrote into the tree,
+    /// under the `[source]` policy this call already admitted. A rebuild
+    /// failure after a landed change rides the result as a diagnostic
+    /// rather than failing the call: the write happened, and the caller
+    /// must not be told otherwise.
     fn change(
         &self,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
@@ -256,7 +272,8 @@ impl RiftMcp {
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
         if let ChangeResult::Applied { summary } = &mut result {
             self.attach_hook_verdicts(&configuration.hooks, summary);
-            match ReadService::build(&self.root, self.limits) {
+            let visibility = SourceVisibility::from(&configuration.source);
+            match ReadService::build(&self.root, self.limits, &visibility) {
                 Ok(rebuilt) => {
                     *self
                         .reads
@@ -475,7 +492,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use rift_core::{CliCode, ErrorName};
+    use rift_core::{CliCode, ErrorName, SourceVisibility};
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::error as wire;
     use rift_server::{ReadFault, ReadService};
@@ -968,6 +985,7 @@ pub fn beacon() -> u64 {
         let error = ReadService::build(
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
         )
         .expect_err("missing root must fail");
         let causes = error.wire_causes();
