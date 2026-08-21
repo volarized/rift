@@ -910,6 +910,13 @@ pub fn beacon() -> u64 {
     }
 
     #[test]
+    #[should_panic(expected = "a passing hook contributes guarantees, not findings")]
+    fn passing_hook_finding_is_a_programmer_error() {
+        let run = silent_run(rift_server::HookStatus::Passed, Some(0));
+        let _ = super::hook_failure_diagnostic(&probe_hook(), &run);
+    }
+
+    #[test]
     fn hook_finding_accounts_for_every_non_passing_outcome() {
         use rift_server::HookStatus;
         let cases = [
