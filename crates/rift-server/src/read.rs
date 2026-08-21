@@ -511,11 +511,17 @@ fn semantic_coverage(family: FactFamily) -> SemanticCoverage {
     SemanticCoverage(BTreeMap::from([(family, complete_coverage())]))
 }
 
+/// Finds the symbol a witnessed syntax node belongs to.
+///
+/// A node's range matches a symbol's declaration range (the whole
+/// declaration, including attached docs and attributes) for most nodes, but
+/// the item node itself only spans its own bytes, so it matches on
+/// `item_range` instead.
 fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&RustSymbol> {
     file.syntax()
         .symbols()
         .iter()
-        .find(|symbol| symbol.range == range)
+        .find(|symbol| symbol.range == range || symbol.item_range == range)
 }
 
 fn node_facets(node: &RustNode) -> Vec<NodeFacet> {
@@ -598,6 +604,20 @@ mod tests {
             "pub struct Beacon;\nimpl Beacon { pub fn signal(&self) {} }\n",
         )?;
         fs::write(directory.path().join("README.md"), "Beacon docs")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
+        Ok((directory, service))
+    }
+
+    const DOCUMENTED_SOURCE: &str = "/// A beacon.\n#[derive(Debug)]\npub struct Beacon;\n";
+
+    fn documented_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), DOCUMENTED_SOURCE)?;
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -846,5 +866,78 @@ pub fn compute() -> i32 {
         assert_eq!(keys, ["path", "operation", "io"]);
         assert_eq!(context[0].value(), "src/lib.rs");
         assert_eq!(context[2].value(), "sealed");
+    }
+
+    #[test]
+    fn nodes_backlink_documented_item_to_its_symbol() -> TestResult {
+        let (_directory, service) = documented_fixture()?;
+        let position = DOCUMENTED_SOURCE
+            .find("Beacon")
+            .ok_or("fixture must contain the struct name")? as u64;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position,
+            projection: None,
+        })?;
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        let item = nodes
+            .iter()
+            .find(|node| node["kind"] == "rust.struct_item")
+            .ok_or("fixture must witness the struct_item node")?;
+        assert!(
+            item["symbol"]
+                .as_str()
+                .is_some_and(|id| id.contains("/Beacon")),
+            "documented struct item must backlink to its symbol, got {:?}",
+            item["symbol"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_backlink_undocumented_item_to_its_symbol() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let position = "pub struct ".len() as u64;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position,
+            projection: None,
+        })?;
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        let item = nodes
+            .iter()
+            .find(|node| node["kind"] == "rust.struct_item")
+            .ok_or("fixture must witness the struct_item node")?;
+        assert!(
+            item["symbol"]
+                .as_str()
+                .is_some_and(|id| id.contains("/Beacon")),
+            "undocumented struct item must still backlink to its symbol"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_report_no_symbol_backlink_for_non_symbol_node() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let position = "pub struct Beacon;\n".len() as u64;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position,
+            projection: None,
+        })?;
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        let impl_node = nodes
+            .iter()
+            .find(|node| node["kind"] == "rust.impl_item")
+            .ok_or("fixture must witness the impl_item node")?;
+        assert!(
+            impl_node["symbol"].is_null(),
+            "impl_item is not itself a declared symbol"
+        );
+        Ok(())
     }
 }

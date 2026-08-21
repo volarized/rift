@@ -151,9 +151,10 @@ impl RiftMcp {
         self.read(|reads| reads.nodes(params))
     }
 
-    /// Replaces one declaration addressed by symbol. The parser derives the
-    /// span, so the caller supplies no offsets; a refusal names the failed
-    /// precondition and leaves the workspace untouched.
+    /// Replaces one declaration addressed by symbol. The whole declaration
+    /// includes its attached outer attributes and doc comments. The parser
+    /// derives the span, so the caller supplies no offsets; a refusal
+    /// names the failed precondition and leaves the workspace untouched.
     #[tool]
     fn replace_symbol(
         &self,
@@ -163,10 +164,11 @@ impl RiftMcp {
     }
 
     /// Inserts a new declaration beside an anchor symbol, or content at a file
-    /// target. A file target lands the body verbatim at the file's start or
-    /// end, creating it first when `create_missing` is set and it is missing.
-    /// A refusal names the failed precondition and leaves the workspace
-    /// untouched.
+    /// target. Anchored insertions land beside the anchor's whole declaration,
+    /// its attached outer attributes and doc comments included. A file target
+    /// lands the body verbatim at the file's start or end, creating it first
+    /// when `create_missing` is set and it is missing. A refusal names the
+    /// failed precondition and leaves the workspace untouched.
     #[tool]
     fn insert_symbol(
         &self,

@@ -264,7 +264,8 @@ impl ChangeResult {
 }
 
 /// Replaces one declaration addressed by symbol. The parser derives the span, so the
-/// caller supplies no offsets.
+/// caller supplies no offsets. The whole declaration includes attached outer attributes
+/// and doc comments.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceSymbolParams {
@@ -281,7 +282,8 @@ pub struct ReplaceSymbolParams {
 }
 
 /// Inserts a new declaration beside an anchor symbol, or content at a file target.
-/// The request carries exactly one of `anchor` or `file`.
+/// The request carries exactly one of `anchor` or `file`; an anchored insertion lands
+/// beside the whole declaration, attached outer attributes and doc comments included.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::insert_symbol_addresses_one_target)]
