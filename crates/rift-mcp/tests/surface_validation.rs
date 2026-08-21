@@ -37,6 +37,18 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("search", json!({ "query": "beacon" })),
         ("search", json!({ "query": "beacon", "limit": 1 })),
+        (
+            "search",
+            json!({ "query": "beacon", "paths": { "include": ["lib.rs"] } }),
+        ),
+        (
+            "search",
+            json!({
+                "query": "phantom",
+                "target": "symbol",
+                "paths": { "force_include": ["hidden.rs"] }
+            }),
+        ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
         (
@@ -146,6 +158,13 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("lib.rs"),
         "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n\
          #[cfg(unix)]\npub fn dual() {}\n#[cfg(windows)]\npub fn dual() {}\n",
+    )?;
+    // Gitignored, so a plain search never reaches it; `paths.force_include` is the only way
+    // in, proving that arm of the surface end to end.
+    fs::write(directory.path().join(".gitignore"), "hidden.rs\n")?;
+    fs::write(
+        directory.path().join("hidden.rs"),
+        "pub fn phantom_signal() {}\n",
     )?;
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);

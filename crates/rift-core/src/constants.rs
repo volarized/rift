@@ -54,6 +54,8 @@ pub const READ_RESULTS_MAX_DEFAULT: usize = 1_000;
 pub const WORKSPACE_IGNORED_DIRECTORIES: &[&str] = &[".git", ".rift", "target"];
 /// Default maximum results returned by one search call.
 pub const SEARCH_RESULTS_DEFAULT: usize = 20;
+/// Maximum files one search's `paths.force_include` may pull into the index on demand.
+pub const FORCE_INCLUDE_FILES_MAX: usize = 256;
 /// Canonical identity of the built-in Rust read provider.
 pub const RUST_READ_PROVIDER_ID: &str = "rift.rust.read";
 /// Hexadecimal characters in one SHA-256 digest.

@@ -6380,27 +6380,33 @@
           },
           "PathSelector": {
             "additionalProperties": false,
-            "description": "Which files a query runs over, as two lists of globs matched against the project-relative\npath. `include: [\"src/**\"]` selects the source tree; `exclude: [\"src/generated/**\"]` then\nremoves generated output.",
+            "description": "Which files a query runs over, as three lists of globs matched against the project-relative\npath. The same glob engine backs the workspace's `[source]` policy. `include: [\"src/**\"]`\nselects the source tree; `exclude: [\"src/generated/**\"]` then removes generated output.",
             "properties": {
               "exclude": {
+                "default": [],
                 "description": "Globs that drop a path `include` already matched.",
                 "items": {
                   "$ref": "#/$defs/PathPattern"
                 },
                 "type": "array"
               },
+              "force_include": {
+                "default": [],
+                "description": "Globs reaching files the workspace's `[source]` policy or `.gitignore` excluded from\nthe index. Matches are bounded per request, and the server refuses the search when the\nbound is crossed rather than truncating it silently.",
+                "items": {
+                  "$ref": "#/$defs/PathPattern"
+                },
+                "type": "array"
+              },
               "include": {
-                "description": "Globs a path has to match to be searched at all.",
+                "default": [],
+                "description": "Globs a path has to match to be searched at all. Empty admits every visible file.",
                 "items": {
                   "$ref": "#/$defs/PathPattern"
                 },
                 "type": "array"
               }
             },
-            "required": [
-              "include",
-              "exclude"
-            ],
             "type": "object"
           },
           "ProjectionId": {
