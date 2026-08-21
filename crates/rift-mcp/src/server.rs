@@ -13,7 +13,8 @@ use rift_protocol::change::{
 use rift_protocol::configuration::{CommandHook, WorkspaceConfiguration};
 use rift_protocol::error as wire;
 use rift_protocol::read::{
-    GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
+    DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams,
+    SearchResult,
 };
 use rift_server::{
     ChangeService, ConfigurationError, HookRun, HookStatus, ReadError, ReadService,
@@ -296,9 +297,6 @@ impl RiftMcp {
 /// from a short log.
 const HOOK_FINDING_STREAM_BYTES_MAX: usize = 1_024;
 
-/// The stable finding code every hook that did not pass is reported under.
-const HOOK_FAILED_CODE: &str = "rift.hook.failed";
-
 /// The finding an applied change carries for one hook that did not pass:
 /// what ended the run, then each non-empty stream's size and bounded quote.
 fn hook_failure_diagnostic(hook: &CommandHook, run: &HookRun) -> rift_protocol::read::Diagnostic {
@@ -329,7 +327,7 @@ fn hook_failure_diagnostic(hook: &CommandHook, run: &HookRun) -> rift_protocol::
     }
     rift_protocol::read::Diagnostic {
         severity: rift_protocol::read::Severity::Error,
-        code: Some(HOOK_FAILED_CODE.to_owned()),
+        code: Some(DiagnosticCode::HookFailed.code()),
         message,
         span: None,
         related: Vec::new(),
@@ -359,7 +357,7 @@ fn bounded_prefix(text: &str, bytes_max: usize) -> &str {
 fn stale_snapshot_diagnostic(error: &ReadError) -> rift_protocol::read::Diagnostic {
     rift_protocol::read::Diagnostic {
         severity: rift_protocol::read::Severity::Warning,
-        code: None,
+        code: Some(DiagnosticCode::SnapshotStale.code()),
         message: format!(
             "the change landed, and the read snapshot could not refresh; \
              reads serve the pre-change tree until the workspace indexes again: {error}"
@@ -858,6 +856,101 @@ pub fn beacon() -> u64 {
             causes.len(),
             super::ERROR_CAUSES_MAX,
             "a chain deeper than the bound must truncate at the bound"
+        );
+    }
+
+    fn probe_hook() -> rift_protocol::configuration::CommandHook {
+        use rift_protocol::configuration::{ChangedPaths, Determinism, HookKind, HookType};
+        rift_protocol::configuration::CommandHook {
+            r#type: HookType::Command,
+            id: "tests".to_owned(),
+            kind: HookKind::Test,
+            program: "cargo".to_owned(),
+            arguments: vec!["test".to_owned()],
+            changed_paths: ChangedPaths::None,
+            working_directory: rift_protocol::read::ProjectPath(String::new()),
+            environment: std::collections::BTreeMap::new(),
+            timeout_ms: 120_000,
+            output_limit_bytes: 4_096,
+            guarantees: Vec::new(),
+            determinism: Determinism::Deterministic,
+        }
+    }
+
+    fn silent_run(status: rift_server::HookStatus, exit_code: Option<i32>) -> rift_server::HookRun {
+        rift_server::HookRun {
+            id: "tests".to_owned(),
+            status,
+            exit_code,
+            stdout: rift_server::CapturedStream::default(),
+            stderr: rift_server::CapturedStream::default(),
+        }
+    }
+
+    #[test]
+    fn failed_hook_finding_quotes_exit_code_and_nonempty_streams() {
+        use rift_server::{CapturedStream, HookStatus};
+        let mut run = silent_run(HookStatus::Failed, Some(1));
+        run.stdout = CapturedStream {
+            text: "boom".to_owned(),
+            captured_bytes: 4,
+            total_bytes: 4,
+            truncated: false,
+        };
+        let finding = super::hook_failure_diagnostic(&probe_hook(), &run);
+        assert_eq!(finding.severity, rift_protocol::read::Severity::Error);
+        assert_eq!(finding.code.as_deref(), Some("rift.hook.failed"));
+        assert!(
+            finding.message.contains("exited 1")
+                && finding.message.contains("stdout (4 of 4 bytes): boom")
+                && !finding.message.contains("stderr"),
+            "{}",
+            finding.message
+        );
+    }
+
+    #[test]
+    fn hook_finding_accounts_for_every_non_passing_outcome() {
+        use rift_server::HookStatus;
+        let cases = [
+            (HookStatus::Failed, None, "exited nonzero"),
+            (HookStatus::TimedOut, None, "killed after 120000ms"),
+            (
+                HookStatus::Error("failed to launch: missing".to_owned()),
+                None,
+                "failed to launch: missing",
+            ),
+        ];
+        for (status, exit_code, expected) in cases {
+            let finding =
+                super::hook_failure_diagnostic(&probe_hook(), &silent_run(status, exit_code));
+            assert!(
+                finding.message.contains(expected),
+                "{expected} missing from {}",
+                finding.message
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_prefix_cuts_on_character_boundaries() {
+        assert_eq!(super::bounded_prefix("short", 16), "short");
+        assert_eq!(super::bounded_prefix("ééé", 3), "é");
+        assert_eq!(super::bounded_prefix("ééé", 4), "éé");
+    }
+
+    #[test]
+    fn stale_snapshot_finding_carries_its_code_and_the_render() {
+        let error = rift_server::ReadError::from(ReadFault::Unsupported {
+            capability: "probe",
+        });
+        let finding = super::stale_snapshot_diagnostic(&error);
+        assert_eq!(finding.code.as_deref(), Some("rift.snapshot.stale"));
+        assert_eq!(finding.severity, rift_protocol::read::Severity::Warning);
+        assert!(
+            finding.message.contains("the change landed"),
+            "{}",
+            finding.message
         );
     }
 
