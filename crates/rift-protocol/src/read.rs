@@ -200,6 +200,35 @@ pub struct Diagnostic {
     pub language: Option<Language>,
 }
 
+/// A code Rift stamps on a diagnostic it authors itself, as `Diagnostic.code`. Provider
+/// diagnostics keep their tools' own codes; these name the findings the server raises about a
+/// change it applied. The code strings are owned by serde, the same way error codes are.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum DiagnosticCode {
+    /// A configured hook did not pass over an applied change.
+    #[serde(rename = "rift.hook.failed")]
+    HookFailed,
+    /// The read snapshot could not refresh after an applied change; reads serve the pre-change
+    /// tree until the workspace indexes again.
+    #[serde(rename = "rift.snapshot.stale")]
+    SnapshotStale,
+}
+
+impl DiagnosticCode {
+    /// The stable code string, read back through serialization so it cannot drift from the
+    /// serde spelling.
+    #[must_use]
+    pub fn code(self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(code)) => code,
+            other => unreachable!(
+                "diagnostic codes are unit variants and must serialize to plain strings, \
+                 got {other:?}"
+            ),
+        }
+    }
+}
+
 /// One `Diagnostic` as an MCP answer carries it: the fact its emitter minted, plus what Rift
 /// can add on top — where it lands in a line and column, and the source around it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -1964,4 +1993,15 @@ pub struct TypeExpression {
     pub resolved: Option<SymbolId>,
     /// Type facts the model has no field for, namespaced by the provider that emitted them.
     pub extensions: Extensions,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DiagnosticCode;
+
+    #[test]
+    fn test_diagnostic_codes_serialize_to_their_documented_spellings() {
+        assert_eq!(DiagnosticCode::HookFailed.code(), "rift.hook.failed");
+        assert_eq!(DiagnosticCode::SnapshotStale.code(), "rift.snapshot.stale");
+    }
 }
