@@ -271,8 +271,12 @@ pub struct RustSymbol {
     pub kind: RustSymbolKind,
     /// Authored declaration visibility.
     pub visibility: RustVisibility,
-    /// Complete declaration byte range.
+    /// Complete declaration byte range, extended over attached outer
+    /// attributes and outer doc comments.
     pub range: ByteRange,
+    /// The item node's own byte range, excluding any attached outer
+    /// attributes and doc comments. Equal to `range` when nothing attaches.
+    pub item_range: ByteRange,
 }
 
 /// One bounded match produced by a Rift-owned Rust query.
@@ -763,6 +767,7 @@ impl RustSyntaxProvider {
                     kind: *kind,
                     visibility: declaration_visibility(node, text),
                     range: symbol_range(node, text, range)?,
+                    item_range: range,
                 });
             }
             let child_qualification = container_name(node, text).map_or_else(

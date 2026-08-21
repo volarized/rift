@@ -100,6 +100,12 @@ mod tests {
         &text[start..end]
     }
 
+    fn item_span_text<'a>(text: &'a str, symbol: &RustSymbol) -> &'a str {
+        let start = usize::try_from(symbol.item_range.start).expect("fixture span fits usize");
+        let end = usize::try_from(symbol.item_range.end).expect("fixture span fits usize");
+        &text[start..end]
+    }
+
     #[test]
     fn struct_span_includes_leading_doc_and_derive() {
         let text = "/// A beacon.\n#[derive(Debug)]\npub struct Beacon;\n";
@@ -168,6 +174,22 @@ mod tests {
             symbols[0].range.start,
             u64::try_from(expected_start).expect("fits u64")
         );
+    }
+
+    #[test]
+    fn item_range_excludes_attached_doc_and_attribute() {
+        let text = "/// A beacon.\n#[derive(Debug)]\npub struct Beacon;\n";
+        let symbols = symbols(text);
+        assert_eq!(item_span_text(text, &symbols[0]), "pub struct Beacon;");
+        assert_ne!(symbols[0].range.start, symbols[0].item_range.start);
+        assert_eq!(symbols[0].range.end, symbols[0].item_range.end);
+    }
+
+    #[test]
+    fn item_range_equals_range_with_nothing_attached() {
+        let text = "pub struct Beacon;\n";
+        let symbols = symbols(text);
+        assert_eq!(symbols[0].range, symbols[0].item_range);
     }
 
     #[test]
