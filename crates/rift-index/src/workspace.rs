@@ -800,6 +800,28 @@ mod tests {
         assert!(index.symbols("hidden", 5).expect("symbol read").is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_skips_entries_that_are_neither_file_nor_directory() {
+        let directory = fixture();
+        let status = std::process::Command::new("mkfifo")
+            .arg(directory.path().join("src/pipe.rs"))
+            .status()
+            .expect("mkfifo must run");
+        assert!(status.success(), "mkfifo must create the named pipe");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("workspace index");
+        assert_eq!(
+            index.files().len(),
+            1,
+            "a named pipe is neither a directory nor a regular file and must be skipped"
+        );
+    }
+
     fn build_index(
         directory: &tempfile::TempDir,
         visibility: &SourceVisibility,
@@ -911,6 +933,35 @@ mod tests {
     }
 
     #[test]
+    fn test_force_include_of_empty_list_returns_no_files() {
+        let directory = fixture();
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        let extra = index
+            .force_include_files(&[], 10)
+            .expect("an empty force_include list must not walk for matches");
+        assert!(extra.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_force_include_skips_entries_that_are_neither_file_nor_directory() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let status = std::process::Command::new("mkfifo")
+            .arg(directory.path().join("pipe.rs"))
+            .status()
+            .expect("mkfifo must run");
+        assert!(status.success(), "mkfifo must create the named pipe");
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        let extra = index
+            .force_include_files(&["*.rs".to_owned()], 10)
+            .expect("force_include walk");
+        assert!(
+            extra.is_empty(),
+            "a named pipe is neither a directory nor a regular file and must be skipped"
+        );
+    }
+
+    #[test]
     fn test_force_include_invalid_glob_refuses() {
         let directory = fixture();
         let index = build_index(&directory, &SourceVisibility::default()).expect("index");
@@ -993,6 +1044,32 @@ mod tests {
         let index = build_index(&directory, &visibility).expect("index");
         assert!(has_symbol(&index, "kept"));
         assert!(!has_symbol(&index, "generated"));
+    }
+
+    #[test]
+    fn test_invalid_include_glob_reports_source_pattern_invalid() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join("lib.rs"), "pub fn kept() {}\n").expect("kept source");
+
+        let visibility = SourceVisibility::new(vec!["[".to_owned()], Vec::new(), true);
+        let error = build_index(&directory, &visibility).expect_err("unclosed glob class");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
+    }
+
+    #[test]
+    fn test_invalid_exclude_glob_reports_source_pattern_invalid() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join("lib.rs"), "pub fn kept() {}\n").expect("kept source");
+
+        let visibility = SourceVisibility::new(Vec::new(), vec!["[".to_owned()], true);
+        let error = build_index(&directory, &visibility).expect_err("unclosed glob class");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
     }
 
     #[test]
