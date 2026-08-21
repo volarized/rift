@@ -5,3 +5,7 @@
 /rift/install.ps1
   Content-Type: text/plain; charset=utf-8
   X-Content-Type-Options: nosniff
+
+/rift/rift.schema.json
+  Content-Type: application/json; charset=utf-8
+  X-Content-Type-Options: nosniff
