@@ -31,6 +31,11 @@ pub(super) fn declaration_start(node: Node<'_>, text: &str) -> usize {
         if !is_attached(previous) {
             break;
         }
+        // tree-sitter guarantees every sibling's byte range indexes validly
+        // into the exact text it was parsed from, so these two `None` arms
+        // guard a caller contract (text must be that same source), not a
+        // reachable parse outcome; no legitimate or malformed source drives
+        // `text.get` to fail here.
         let Some(previous_text) = text.get(previous.byte_range()) else {
             break;
         };
@@ -78,6 +83,7 @@ mod tests {
     use rift_core::ProjectPath;
 
     use super::super::{RustSource, RustSymbol, RustSyntaxProvider};
+    use super::gap_permits_attachment;
 
     fn path() -> ProjectPath {
         ProjectPath::new("src/lib.rs").expect("valid fixture path")
@@ -199,5 +205,10 @@ mod tests {
         assert_eq!(symbols.len(), 2);
         assert!(symbols[0].range.end <= symbols[1].range.start);
         assert_eq!(span_text(text, &symbols[1]), "/// Doc B.\nstruct B;");
+    }
+
+    #[test]
+    fn gap_with_non_whitespace_content_does_not_permit_attachment() {
+        assert!(!gap_permits_attachment("/// doc\n", "x"));
     }
 }

@@ -1101,6 +1101,33 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn insert_symbol_file_target_surfaces_read_storage_failure() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let target = directory.path().join("lib.rs");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000))?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("lib.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "pub fn late() {}".to_owned(),
+                create_missing: false,
+            },
+        );
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))?;
+        let error = result.expect_err("an unreadable existing file must fail to insert");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation read"),
+            "failure must name the read operation: {error}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn insert_symbol_create_missing_on_an_existing_file_just_inserts() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;

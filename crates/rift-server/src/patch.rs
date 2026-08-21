@@ -599,8 +599,8 @@ mod tests {
     use rift_protocol::read::ProjectPath;
 
     use super::{
-        FileRewrite, PatchTarget, RewriteKind, apply_segment, find_hunk_position,
-        resolve_patch_target,
+        FileRewrite, PATCH_MISMATCH_DETAIL_BYTES_MAX, PatchTarget, RewriteKind, apply_segment,
+        find_hunk_position, resolve_patch_target, truncate_detail,
     };
     use crate::change::ChangeService;
     use crate::read::ReadService;
@@ -718,6 +718,22 @@ mod tests {
     }
 
     #[test]
+    fn apply_segment_skips_a_position_a_prior_hunk_already_patched_even_on_a_tie() -> TestResult {
+        // "a" appears at both line 1 and line 3; the first hunk patches line
+        // 1 to "MARK". The second hunk's anchor sits equidistant from the
+        // now-patched line 1 and the untouched line 3 — the backward
+        // position is tried first per the tie-break rule, but it must be
+        // rejected for being already patched, landing on line 3 instead.
+        let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+MARK\n@@ -2 +2 @@\n-a\n+ZULU\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let result = apply_segment("a\nz\na\n", &parsed)
+            .map_err(|_| "the untouched occurrence must still be found")?;
+        assert_eq!(result, "MARK\nz\nZULU\n");
+        Ok(())
+    }
+
+    #[test]
     fn resolve_patch_target_creates_from_dev_null_original() -> TestResult {
         let diff = "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n";
         let segments = hunks(diff)?;
@@ -747,6 +763,21 @@ mod tests {
             .ok_or("a rename must refuse")?;
         let ChangeResult::Refused { reason, .. } = refusal else {
             return Err("a rename refusal must carry the refused shape".into());
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_patch_target_refuses_when_both_sides_are_dev_null() -> TestResult {
+        let diff = "--- /dev/null\n+++ /dev/null\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let refusal = resolve_patch_target(&parsed)?
+            .err()
+            .ok_or("a dev-null pair on both sides must refuse")?;
+        let ChangeResult::Refused { reason, .. } = refusal else {
+            return Err("a dev-null pair refusal must carry the refused shape".into());
         };
         assert_eq!(reason, RefusalReason::Unsupported);
         Ok(())
@@ -810,6 +841,33 @@ mod tests {
             "message must name the file and the specific hunk: {error}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn named_parse_error_falls_back_to_the_file_when_no_isolated_hunk_fails() -> TestResult {
+        // Each hunk is internally consistent on its own; only their declared
+        // ranges run backward, an error that exists between hunks and never
+        // surfaces from re-parsing either hunk alone.
+        let diff = "--- a/f\n+++ b/f\n\
+             @@ -5 +5 @@\n-five\n+FIVE\n\
+             @@ -1 +1 @@\n-one\n+ONE\n";
+        let error = super::parse_segment(diff, 4)
+            .err()
+            .ok_or("out-of-order hunk ranges must fail to parse")?;
+        assert!(
+            error.to_string().contains("file 4:"),
+            "no isolated hunk fails, so the message must name the file alone: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_detail_backs_off_a_boundary_that_would_split_a_multi_byte_character() {
+        let prefix_len = PATCH_MISMATCH_DETAIL_BYTES_MAX - 1;
+        let value = format!("{}é{}", "a".repeat(prefix_len), "b".repeat(10));
+        let truncated = truncate_detail(value);
+        assert_eq!(truncated.len(), prefix_len);
+        assert_eq!(truncated, "a".repeat(prefix_len));
     }
 
     #[test]
@@ -930,6 +988,50 @@ mod tests {
     }
 
     #[test]
+    fn patch_creation_reports_a_stat_failure_when_a_parent_segment_is_a_file() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("blocked"), "not a directory\n")?;
+        let patch = [
+            "--- /dev/null",
+            "+++ b/blocked/inner.rs",
+            "@@ -0,0 +1 @@",
+            "+pub fn inner() {}",
+            "",
+        ]
+        .join("\n");
+        let error = changes
+            .patch(&reads, &PatchParams { patch })
+            .expect_err("a non-directory parent segment must surface a stat failure");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation stat"),
+            "failure must name the stat operation: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_creation_when_the_hunk_carries_context() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = [
+            "--- /dev/null",
+            "+++ b/new.rs",
+            "@@ -1 +1,2 @@",
+            " existing",
+            "+two",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused { reason, .. } = result else {
+            panic!("a context line cannot exist in an empty starting file");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert!(!directory.path().join("new.rs").exists());
+        Ok(())
+    }
+
+    #[test]
     fn patch_deletes_a_file_on_full_match() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\npub fn steady() {}\n")?;
         let patch = [
@@ -975,6 +1077,101 @@ mod tests {
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(untouched, "pub fn beacon() {}\npub fn steady() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_deletion_of_a_path_the_index_does_not_serve() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = [
+            "--- a/missing.rs",
+            "+++ /dev/null",
+            "@@ -1 +0,0 @@",
+            "-pub fn gone() {}",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("deleting a path the index does not serve must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_deletion_when_disk_drifted_from_the_index() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() { changed }\n",
+        )?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ /dev/null",
+            "@@ -1 +0,0 @@",
+            "-pub fn beacon() {}",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("deletion must refuse when the disk has drifted from the indexed source");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() { changed }\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_deletion_when_the_hunk_context_never_matches() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ /dev/null",
+            "@@ -1 +0,0 @@",
+            "-pub fn vanished() {}",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a deletion hunk whose context never matches must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        let PreconditionValue::Text { value } = &preconditions[0].expected else {
+            panic!("a context mismatch reports the expected hunk text");
+        };
+        assert!(
+            value.contains("vanished"),
+            "expected side must name the unmatched hunk content: {value}"
+        );
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, "pub fn beacon() {}\n");
         Ok(())
     }
 
