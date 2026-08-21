@@ -60,7 +60,8 @@ impl ConfigurationState {
 }
 
 /// The file state one admission was read from. Size rides modification
-/// time because same-second edits are common at a shell.
+/// time because same-second edits are common at a shell; an edit that
+/// preserves both is not re-admitted until either moves.
 type ConfigurationFingerprint = (SystemTime, u64);
 
 /// The current `rift.toml` file state, or null when the file is absent or
