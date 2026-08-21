@@ -1107,12 +1107,18 @@ mod tests {
         for (break_bound, expected_field) in cases {
             let mut configuration = WorkspaceConfiguration::default();
             break_bound(&mut configuration.execution);
-            match configuration.validate() {
-                Err(ConfigurationViolation::LimitOutOfRange { field, .. }) => {
-                    assert_eq!(field, expected_field);
-                }
-                other => panic!("{expected_field} must be refused, got {other:?}"),
-            }
+            let violation = configuration
+                .validate()
+                .expect_err("the broken bound must refuse the configuration");
+            let named_field = violation
+                .evidence()
+                .first()
+                .map(|(key, value)| (*key, value.clone()));
+            assert_eq!(
+                named_field,
+                Some(("field", (*expected_field).to_owned())),
+                "unexpected violation {violation:?}"
+            );
         }
     }
 
@@ -1147,12 +1153,14 @@ mod tests {
         assert_eq!(configuration.validate(), Ok(()));
         for selector in ["", "Python", "sql:", ":postgresql", "sql:Post", "a b"] {
             configuration.execution.allow = vec![selector.to_owned()];
-            assert!(
-                matches!(
-                    configuration.validate(),
-                    Err(ConfigurationViolation::LanguageSelectorInvalid { .. })
-                ),
-                "{selector:?} must be refused"
+            let violation = configuration
+                .validate()
+                .expect_err("the selector must refuse the configuration");
+            let evidence_key = violation.evidence().first().map(|(key, _)| *key);
+            assert_eq!(
+                evidence_key,
+                Some("selector"),
+                "{selector:?} gave {violation:?}"
             );
         }
     }
@@ -1172,8 +1180,12 @@ mod tests {
     /// One way to break a hook bound, and the check its refusal must pass.
     type HookBoundCase = (fn(&mut CommandHook), fn(&ConfigurationViolation) -> bool);
 
-    /// Proves each broken hook is refused with the expected violation.
+    /// Proves each broken hook is refused with the expected violation, and
+    /// that the matcher rejects an unrelated one.
     fn assert_hooks_refused<const CASES: usize>(break_and_expect: [HookBoundCase; CASES]) {
+        let unrelated = ConfigurationViolation::HookIdDuplicate {
+            id: "unrelated".to_owned(),
+        };
         for (break_bound, expected) in break_and_expect {
             let mut broken = hook();
             break_bound(&mut broken);
@@ -1185,6 +1197,10 @@ mod tests {
                 .validate()
                 .expect_err("the broken hook must be refused");
             assert!(expected(&violation), "unexpected violation {violation:?}");
+            assert!(
+                !expected(&unrelated),
+                "the matcher must reject an unrelated violation"
+            );
         }
     }
 
