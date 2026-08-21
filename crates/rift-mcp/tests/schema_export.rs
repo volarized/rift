@@ -22,14 +22,13 @@ fn run_without_arguments_writes_default_output_directory() -> TestResult {
 
     let written = fs::read_to_string(directory.path().join("docs/protocol/mcp.json"))?;
     assert_eq!(written, schema::schema_document());
-    let configuration =
-        fs::read_to_string(directory.path().join("docs/protocol/rift.schema.json"))?;
+    let configuration = fs::read_to_string(directory.path().join("docs/public/rift.schema.json"))?;
     assert_eq!(configuration, schema::configuration_schema_document());
 
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.starts_with("wrote "));
     assert!(stdout.contains("docs/protocol/mcp.json"));
-    assert!(stdout.contains("docs/protocol/rift.schema.json"));
+    assert!(stdout.contains("docs/public/rift.schema.json"));
     Ok(())
 }
 
@@ -38,7 +37,7 @@ fn check_fails_when_configuration_schema_is_stale() -> TestResult {
     let directory = tempfile::tempdir()?;
     let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
     schema::run(&write_request)?;
-    fs::write(directory.path().join("rift.schema.json"), "{}")?;
+    fs::write(directory.path().join("public/rift.schema.json"), "{}")?;
 
     let check_request =
         schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
@@ -93,7 +92,7 @@ fn run_with_explicit_directory_writes_document_there() -> TestResult {
     let request = schema::parse_arguments([directory.path().display().to_string()])?;
     schema::run(&request)?;
 
-    let written = fs::read_to_string(directory.path().join("mcp.json"))?;
+    let written = fs::read_to_string(directory.path().join("protocol/mcp.json"))?;
     assert_eq!(written, schema::schema_document());
     Ok(())
 }
@@ -115,7 +114,7 @@ fn check_fails_when_document_is_stale() -> TestResult {
     let directory = tempfile::tempdir()?;
     let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
     schema::run(&write_request)?;
-    fs::write(directory.path().join("mcp.json"), "{}")?;
+    fs::write(directory.path().join("protocol/mcp.json"), "{}")?;
 
     let check_request =
         schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
@@ -183,7 +182,7 @@ fn check_mismatch_descriptor_is_artifact_stale() -> TestResult {
     let directory = tempfile::tempdir()?;
     let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
     schema::run(&write_request)?;
-    fs::write(directory.path().join("mcp.json"), "{}")?;
+    fs::write(directory.path().join("protocol/mcp.json"), "{}")?;
 
     let check_request =
         schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
@@ -208,7 +207,11 @@ fn parse_arguments_rejects_second_output_directory() {
 #[test]
 fn check_error_messages_name_path_and_regenerate_command() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let document_path = directory.path().join("mcp.json").display().to_string();
+    let document_path = directory
+        .path()
+        .join("protocol/mcp.json")
+        .display()
+        .to_string();
     let check_request =
         schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
 
@@ -218,7 +221,7 @@ fn check_error_messages_name_path_and_regenerate_command() -> TestResult {
 
     let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
     schema::run(&write_request)?;
-    fs::write(directory.path().join("mcp.json"), "{}")?;
+    fs::write(directory.path().join("protocol/mcp.json"), "{}")?;
     let mismatch = schema::run(&check_request).expect_err("stale document must fail check");
     assert!(mismatch.to_string().contains(&document_path));
     assert!(mismatch.to_string().contains(REGENERATE_COMMAND));
@@ -242,7 +245,7 @@ fn write_failed_names_path_and_usage() -> TestResult {
 #[test]
 fn write_failed_when_document_path_is_a_directory() -> TestResult {
     let directory = tempfile::tempdir()?;
-    fs::create_dir(directory.path().join("mcp.json"))?;
+    fs::create_dir_all(directory.path().join("protocol/mcp.json"))?;
     let request = schema::parse_arguments([directory.path().display().to_string()])?;
 
     let error = schema::run(&request).expect_err("writing over a directory must fail");
