@@ -90,10 +90,10 @@ mod tests {
         let context = fault.context();
         let keys: Vec<&str> = context.iter().map(ErrorContext::key).collect();
         assert_eq!(keys, ["value", "expected"]);
+        let expected = context[1].value();
         assert!(
-            context[1].value().contains("30s"),
-            "the expected form must show a duration example: {}",
-            context[1].value()
+            expected.contains("30s"),
+            "the expected form must name 30s: {expected}"
         );
     }
 }
