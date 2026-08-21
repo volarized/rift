@@ -140,18 +140,23 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
     let stdout = join_drain(stdout_drain);
     let stderr = join_drain(stderr_drain);
 
-    let (status, exit_code) = match exit {
-        _ if timed_out => (HookStatus::TimedOut, None),
-        Ok(exit) if exit.success() => (HookStatus::Passed, exit.code()),
-        Ok(exit) => (HookStatus::Failed, exit.code()),
-        Err(io) => (HookStatus::Error(format!("waiting on hook: {io}")), None),
-    };
+    let (status, exit_code) = conclude(exit, timed_out);
     HookRun {
         id: hook.id.clone(),
         status,
         exit_code,
         stdout,
         stderr,
+    }
+}
+
+/// The run's verdict from how the wait ended.
+fn conclude(exit: std::io::Result<ExitStatus>, timed_out: bool) -> (HookStatus, Option<i32>) {
+    match exit {
+        _ if timed_out => (HookStatus::TimedOut, None),
+        Ok(exit) if exit.success() => (HookStatus::Passed, exit.code()),
+        Ok(exit) => (HookStatus::Failed, exit.code()),
+        Err(io) => (HookStatus::Error(format!("waiting on hook: {io}")), None),
     }
 }
 
@@ -256,6 +261,14 @@ mod tests {
         }
     }
 
+    /// The message of an error status, empty for any other.
+    fn error_text(status: &HookStatus) -> &str {
+        match status {
+            HookStatus::Error(message) => message,
+            _ => "",
+        }
+    }
+
     fn paths(raw: &[&str]) -> Vec<ProjectPath> {
         raw.iter()
             .map(|path| ProjectPath((*path).to_owned()))
@@ -295,10 +308,10 @@ mod tests {
         let runs = run_hooks(&[slow], directory.path(), &[]);
         assert_eq!(runs[0].status, HookStatus::TimedOut);
         assert_eq!(runs[0].exit_code, None);
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the kill must not wait out the sleep: {:?}",
-            started.elapsed()
+            elapsed < Duration::from_secs(5),
+            "the kill must not wait out the sleep: {elapsed:?}"
         );
     }
 
@@ -326,11 +339,8 @@ mod tests {
             .environment
             .insert("RIFT_HOOK_PROBE".to_owned(), "42".to_owned());
         let runs = run_hooks(&[in_sub, with_environment], directory.path(), &[]);
-        assert!(
-            runs[0].stdout.text.trim_end().ends_with("/sub"),
-            "{}",
-            runs[0].stdout.text
-        );
+        let stdout = runs[0].stdout.text.trim_end();
+        assert!(stdout.ends_with("/sub"), "{stdout}");
         assert_eq!(runs[1].stdout.text, "42\n");
     }
 
@@ -342,31 +352,24 @@ mod tests {
             directory.path(),
             &[],
         );
-        assert!(
-            matches!(&runs[0].status, HookStatus::Error(message) if message.contains("launch")),
-            "{:?}",
-            runs[0].status
-        );
+        let status = &runs[0].status;
+        assert!(error_text(status).contains("launch"), "{status:?}");
     }
 
     #[test]
     fn test_absolute_program_is_refused_before_spawning() {
         let directory = tempfile::tempdir().expect("tempdir");
         let runs = run_hooks(&[hook("/bin/echo", &["hi"])], directory.path(), &[]);
-        assert!(
-            matches!(&runs[0].status, HookStatus::Error(message) if message.contains("absolute")),
-            "{:?}",
-            runs[0].status
-        );
+        let status = &runs[0].status;
+        assert!(error_text(status).contains("absolute"), "{status:?}");
     }
 
     #[test]
     fn test_empty_program_is_an_error() {
         let directory = tempfile::tempdir().expect("tempdir");
         let runs = run_hooks(&[hook("", &[])], directory.path(), &[]);
-        assert!(
-            matches!(&runs[0].status, HookStatus::Error(message) if message.contains("program"))
-        );
+        let status = &runs[0].status;
+        assert!(error_text(status).contains("program"), "{status:?}");
     }
 
     #[test]
@@ -437,6 +440,20 @@ mod tests {
     fn test_panicked_reader_reports_an_empty_capture() {
         let captured = join_drain(drain_thread(Some(PanickingStream), 16));
         assert_eq!(captured, CapturedStream::default());
+    }
+
+    #[test]
+    fn test_conclude_maps_every_wait_outcome() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let success = ExitStatus::from_raw(0);
+        let failure = ExitStatus::from_raw(2 << 8);
+        assert_eq!(conclude(Ok(success), false), (HookStatus::Passed, Some(0)));
+        assert_eq!(conclude(Ok(failure), false), (HookStatus::Failed, Some(2)));
+        assert_eq!(conclude(Ok(success), true), (HookStatus::TimedOut, None));
+        let (status, exit_code) = conclude(Err(std::io::Error::other("wait torn down")), false);
+        assert_eq!(exit_code, None);
+        assert_eq!(error_text(&status), "waiting on hook: wait torn down");
+        assert_eq!(error_text(&HookStatus::Passed), "");
     }
 
     #[test]
