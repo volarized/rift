@@ -1,3 +1,5 @@
+mod attachment;
+
 use rift_core::ProjectPath;
 use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
@@ -760,7 +762,7 @@ impl RustSyntaxProvider {
                     qualified_name: qualify(&qualification, name),
                     kind: *kind,
                     visibility: declaration_visibility(node, text),
-                    range,
+                    range: symbol_range(node, text, range)?,
                 });
             }
             let child_qualification = container_name(node, text).map_or_else(
@@ -821,6 +823,22 @@ fn declaration_name(node: Node<'_>, text: &str) -> Option<(String, RustSymbolKin
     let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
     text.get(name.byte_range())
         .map(|value| (value.into(), kind))
+}
+
+/// A declaration's span, extended over its attached outer attributes and
+/// outer doc comments so the whole declaration — not just the item node —
+/// is what `replace_symbol` and `insert_symbol` act on.
+fn symbol_range(
+    node: Node<'_>,
+    text: &str,
+    item_range: ByteRange,
+) -> Result<ByteRange, RustSyntaxError> {
+    let start = attachment::declaration_start(node, text);
+    let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
+    Ok(ByteRange {
+        start,
+        end: item_range.end,
+    })
 }
 
 fn declaration_visibility(node: Node<'_>, text: &str) -> RustVisibility {

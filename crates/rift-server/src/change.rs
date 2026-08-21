@@ -971,6 +971,54 @@ mod tests {
     }
 
     #[test]
+    fn insert_symbol_before_a_documented_anchor_lands_above_its_doc_comment() -> TestResult {
+        let (directory, reads, changes) =
+            fixture("/// Beacon docs.\n#[derive(Debug)]\npub struct Beacon;\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: symbol("Beacon"),
+                position: InsertPosition::Before,
+                body: "pub struct Early;".to_owned(),
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written,
+            "pub struct Early;\n\n/// Beacon docs.\n#[derive(Debug)]\npub struct Beacon;\n",
+            "the insertion must land above the doc comment, not between it and the struct"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_symbol_on_a_documented_declaration_leaves_no_orphaned_doc_or_attribute() -> TestResult
+    {
+        let (directory, reads, changes) =
+            fixture("/// Old docs.\n#[derive(Debug)]\npub struct Beacon;\n")?;
+        let result = changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("Beacon"),
+                region: None,
+                body: "/// New docs.\npub struct Beacon {\n    pub signal: u8,\n}".to_owned(),
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written,
+            "/// New docs.\npub struct Beacon {\n    pub signal: u8,\n}\n"
+        );
+        assert!(
+            !written.contains("Old docs") && !written.contains("derive"),
+            "the old doc comment and attribute must not survive the replacement: {written}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn replace_node_verifies_its_witness_both_ways() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         let listing = reads.nodes(NodesParams {

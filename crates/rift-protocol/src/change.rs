@@ -263,7 +263,8 @@ impl ChangeResult {
 }
 
 /// Replaces one declaration addressed by symbol. The parser derives the span, so the
-/// caller supplies no offsets.
+/// caller supplies no offsets. The whole declaration includes attached outer attributes
+/// and doc comments.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceSymbolParams {
@@ -280,6 +281,7 @@ pub struct ReplaceSymbolParams {
 }
 
 /// Inserts a new declaration beside an existing one, addressed by its anchor symbol.
+/// The whole declaration includes attached outer attributes and doc comments.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InsertSymbolParams {

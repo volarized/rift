@@ -1917,7 +1917,7 @@
       }
     },
     {
-      "description": "Inserts a new declaration before or after an existing one, addressed\nby its anchor symbol. A refusal names the failed precondition and\nleaves the workspace untouched.",
+      "description": "Inserts a new declaration before or after an existing one, addressed\nby its anchor symbol. Before and after land beside the anchor's\nwhole declaration, its attached outer attributes and doc comments\nincluded. A refusal names the failed precondition and leaves the\nworkspace untouched.",
       "input_schema": {
         "$defs": {
           "InsertPosition": {
@@ -5252,7 +5252,7 @@
       }
     },
     {
-      "description": "Replaces one declaration addressed by symbol. The parser derives the\nspan, so the caller supplies no offsets; a refusal names the failed\nprecondition and leaves the workspace untouched.",
+      "description": "Replaces one declaration addressed by symbol. The whole declaration\nincludes its attached outer attributes and doc comments. The parser\nderives the span, so the caller supplies no offsets; a refusal\nnames the failed precondition and leaves the workspace untouched.",
       "input_schema": {
         "$defs": {
           "RegionRole": {

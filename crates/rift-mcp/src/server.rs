@@ -136,9 +136,10 @@ impl RiftMcp {
         self.read(|reads| reads.nodes(params))
     }
 
-    /// Replaces one declaration addressed by symbol. The parser derives the
-    /// span, so the caller supplies no offsets; a refusal names the failed
-    /// precondition and leaves the workspace untouched.
+    /// Replaces one declaration addressed by symbol. The whole declaration
+    /// includes its attached outer attributes and doc comments. The parser
+    /// derives the span, so the caller supplies no offsets; a refusal
+    /// names the failed precondition and leaves the workspace untouched.
     #[tool]
     fn replace_symbol(
         &self,
@@ -148,8 +149,10 @@ impl RiftMcp {
     }
 
     /// Inserts a new declaration before or after an existing one, addressed
-    /// by its anchor symbol. A refusal names the failed precondition and
-    /// leaves the workspace untouched.
+    /// by its anchor symbol. Before and after land beside the anchor's
+    /// whole declaration, its attached outer attributes and doc comments
+    /// included. A refusal names the failed precondition and leaves the
+    /// workspace untouched.
     #[tool]
     fn insert_symbol(
         &self,
