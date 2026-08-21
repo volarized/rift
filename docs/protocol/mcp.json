@@ -3567,13 +3567,13 @@
       }
     },
     {
-      "description": "Applies unified-diff hunks to workspace files atomically. Hunk\ncontext guards the change: a context mismatch refuses with an unmet\nprecondition and the tree stays untouched.",
+      "description": "Applies unified-diff hunks to workspace files atomically. Hunk\ncontext guards the change; header line numbers are hints, as with\n`git apply`. A `/dev/null` header creates or deletes the file.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
         "properties": {
           "patch": {
-            "description": "A unified diff. Hunk context guards the change, and a context mismatch refuses\nwith an unmet precondition.",
+            "description": "A unified diff. Hunk context guards the change; header line numbers are hints,\nas with `git apply`. `/dev/null` headers create or delete files.",
             "maxLength": 4194304,
             "minLength": 1,
             "type": "string"

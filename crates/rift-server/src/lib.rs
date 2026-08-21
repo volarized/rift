@@ -3,6 +3,7 @@
 mod change;
 mod configuration;
 mod hook;
+mod patch;
 mod read;
 
 pub use change::ChangeService;

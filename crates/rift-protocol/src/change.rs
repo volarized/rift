@@ -313,8 +313,8 @@ pub struct ReplaceNodeParams {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatchParams {
-    /// A unified diff. Hunk context guards the change, and a context mismatch refuses
-    /// with an unmet precondition.
+    /// A unified diff. Hunk context guards the change; header line numbers are hints,
+    /// as with `git apply`. `/dev/null` headers create or delete files.
     #[schemars(length(min = 1, max = 4_194_304))]
     pub patch: String,
 }

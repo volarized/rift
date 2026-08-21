@@ -10,7 +10,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use diffy::Patch;
 use percent_encoding::percent_decode_str;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_protocol::change::{
@@ -19,22 +18,17 @@ use rift_protocol::change::{
     PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::read::{
-    Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, Severity, SourceSpan,
-    TextRange,
+    Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Severity,
+    SourceSpan, TextRange,
 };
 use rift_syntax::{ByteRange, RustSource, RustSyntaxLimits, RustSyntaxProvider};
 use sha2::{Digest as _, Sha256};
 
-use crate::read::{ReadError, ReadFault, ReadService, file_id, node_witness};
+use crate::patch::{self, FileRewrite, RewriteKind};
+use crate::read::{ReadError, ReadFault, ReadService, encode_path, file_id, node_witness};
 
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
-
-/// Most files one unified diff may address.
-const PATCH_FILES_MAX: usize = 64;
-
-/// Longest hunk-mismatch detail one precondition value carries.
-const PATCH_MISMATCH_DETAIL_BYTES_MAX: usize = 256;
 
 /// Byte length of the hashed material a change identity keeps: 16 bytes
 /// encode to the 26 base32 characters the `chg_` pattern requires.
@@ -194,98 +188,58 @@ impl ChangeService {
 
     /// Applies unified-diff hunks to workspace files atomically.
     ///
+    /// Hunk context locates each hunk; header line numbers are hints, as
+    /// with `git apply`. A `/dev/null` header creates or deletes the file.
+    ///
     /// # Errors
     ///
     /// Returns [`ReadError`] for a diff that does not parse, addresses an
-    /// illegal path, or fails at the filesystem; hunk-context drift and
-    /// file-level changes this release does not serve return a refused
-    /// [`ChangeResult`] instead.
+    /// illegal path, or fails at the filesystem; hunk-context that cannot
+    /// be located, and a rename or copy, which this release does not
+    /// serve, return a refused [`ChangeResult`] instead.
     pub fn patch(
         &self,
         reads: &ReadService,
         params: &PatchParams,
     ) -> Result<ChangeResult, ReadError> {
-        let segments = split_file_segments(&params.patch)?;
+        let segments = patch::split_file_segments(&params.patch)?;
         let mut rewrites: Vec<FileRewrite> = Vec::with_capacity(segments.len());
-        for segment in &segments {
-            let parsed = Patch::from_str(segment)
-                .map_err(|error| ReadFault::invalid("patch", error.to_string()))?;
-            let path = match patched_project_path(&parsed)? {
-                Ok(path) => path,
+        for (index, segment) in segments.iter().enumerate() {
+            match patch::resolve_segment(&self.root, reads, segment, index + 1)? {
+                Ok(rewrite) => rewrites.push(rewrite),
                 Err(refusal) => return Ok(refusal),
-            };
-            let Some(file) = reads.index().file(&path) else {
-                return Ok(ChangeResult::refused(
-                    RefusalReason::UnmetPrecondition,
-                    vec![OperationPrecondition::new(
-                        OperationPreconditionKind::TargetExists,
-                        OperationPreconditionStatus::Failed,
-                        Vec::new(),
-                        vec![path.as_str().to_owned()],
-                        PreconditionValue::Boolean { value: true },
-                        PreconditionValue::Boolean { value: false },
-                    )],
-                ));
-            };
-            if let Resolution::Refused {
-                reason,
-                preconditions,
-            } = self.verified_against_disk(
-                reads,
-                &path,
-                ChangePlan {
-                    path: path.clone(),
-                    range: ByteRange { start: 0, end: 0 },
-                    text: String::new(),
-                },
-            )? {
-                return Ok(ChangeResult::refused(reason, preconditions));
-            }
-            match diffy::apply(file.source(), &parsed) {
-                Ok(next_source) => rewrites.push(FileRewrite {
-                    path,
-                    previous_len: file.source().len() as u64,
-                    next_source,
-                }),
-                Err(error) => {
-                    let mut detail = error.to_string();
-                    detail.truncate(PATCH_MISMATCH_DETAIL_BYTES_MAX);
-                    return Ok(ChangeResult::refused(
-                        RefusalReason::UnmetPrecondition,
-                        vec![OperationPrecondition::new(
-                            OperationPreconditionKind::SourceUnchanged,
-                            OperationPreconditionStatus::Failed,
-                            Vec::new(),
-                            vec![path.as_str().to_owned()],
-                            PreconditionValue::Text {
-                                value: "every hunk context matches".to_owned(),
-                            },
-                            PreconditionValue::Text { value: detail },
-                        )],
-                    ));
-                }
             }
         }
         self.apply_rewrites(reads, &rewrites)
     }
 
-    /// Restores the files a partial publish already renamed, rewriting each
-    /// from its indexed source. Rollback is best-effort inside the failure
-    /// path: a file whose index entry cannot serve its source stays as
-    /// published, and the storage error the caller returns names the file
-    /// that stopped the publish.
+    /// Restores the files a partial publish already changed: a modified or
+    /// deleted file gets its indexed source back, and a created file is
+    /// removed. Rollback is best-effort inside the failure path: a file
+    /// whose index entry cannot serve its source stays as published, and
+    /// the storage error the caller returns names the file that stopped
+    /// the publish.
     fn roll_back_published(&self, reads: &ReadService, published: &[&FileRewrite]) {
         for landed in published {
-            if let Some(file) = reads.index().file(&landed.path) {
-                let _ = fs::write(self.root.join(landed.path.as_str()), file.source());
+            let absolute = self.root.join(landed.path.as_str());
+            match landed.kind {
+                RewriteKind::Create => {
+                    let _ = fs::remove_file(&absolute);
+                }
+                RewriteKind::Modify | RewriteKind::Delete => {
+                    if let Some(file) = reads.index().file(&landed.path) {
+                        let _ = fs::write(&absolute, file.source());
+                    }
+                }
             }
         }
     }
 
     /// Stages and publishes whole-file rewrites, all or none.
     ///
-    /// Every stage lands before the first rename; a failed rename restores
-    /// the files already renamed from their indexed source.
+    /// Every stage lands before the first publish; a failed publish
+    /// restores every file already published, from its indexed source or,
+    /// for a file this batch created, by removing it.
     fn apply_rewrites(
         &self,
         reads: &ReadService,
@@ -295,25 +249,45 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut staged_paths = Vec::with_capacity(rewrites.len());
+        let mut staged: Vec<Option<PathBuf>> = Vec::with_capacity(rewrites.len());
         for rewrite in rewrites {
-            let staged = self
-                .root
-                .join(rewrite.path.as_str())
-                .with_extension("rift-staged");
-            if let Err(error) = fs::write(&staged, &rewrite.next_source) {
-                discard_staged(&staged_paths);
-                let _ = fs::remove_file(&staged);
+            if rewrite.kind == RewriteKind::Delete {
+                staged.push(None);
+                continue;
+            }
+            let absolute = self.root.join(rewrite.path.as_str());
+            if rewrite.kind == RewriteKind::Create
+                && let Some(parent) = absolute.parent()
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                discard_staged(staged.iter().flatten());
+                return Err(ReadFault::storage(
+                    rewrite.path.as_str(),
+                    "create_dir",
+                    &error,
+                ));
+            }
+            let staged_path = absolute.with_extension("rift-staged");
+            if let Err(error) = fs::write(&staged_path, &rewrite.next_source) {
+                discard_staged(staged.iter().flatten());
+                let _ = fs::remove_file(&staged_path);
                 return Err(ReadFault::storage(rewrite.path.as_str(), "stage", &error));
             }
-            staged_paths.push(staged);
+            staged.push(Some(staged_path));
         }
         let mut published: Vec<&FileRewrite> = Vec::with_capacity(rewrites.len());
-        for (rewrite, staged) in rewrites.iter().zip(&staged_paths) {
+        for (rewrite, staged_path) in rewrites.iter().zip(&staged) {
             let absolute = self.root.join(rewrite.path.as_str());
-            if let Err(error) = fs::rename(staged, &absolute) {
+            let outcome = match (rewrite.kind, staged_path) {
+                (RewriteKind::Delete, _) => fs::remove_file(&absolute),
+                (_, Some(staged_path)) => fs::rename(staged_path, &absolute),
+                (_, None) => Err(std::io::Error::other(
+                    "staged rewrite is missing its staged file",
+                )),
+            };
+            if let Err(error) = outcome {
                 self.roll_back_published(reads, &published);
-                discard_staged(&staged_paths);
+                discard_staged(staged.iter().flatten());
                 return Err(ReadFault::storage(rewrite.path.as_str(), "publish", &error));
             }
             published.push(rewrite);
@@ -331,24 +305,31 @@ impl ChangeService {
             paths.push(rift_protocol::read::ProjectPath(
                 rewrite.path.as_str().to_owned(),
             ));
-            if let Some(file) = reads.index().file(&rewrite.path) {
-                edits.push(Edit::Replace {
-                    span: SourceSpan {
-                        unit: file_id(file),
-                        range: TextRange {
-                            start: 0,
-                            end: rewrite.previous_len,
-                        },
+            let unit = match reads.index().file(&rewrite.path) {
+                Some(file) => file_id(file),
+                None => FileId(format!(
+                    "rift://file/{}",
+                    encode_path(rewrite.path.as_str())
+                )),
+            };
+            edits.push(Edit::Replace {
+                span: SourceSpan {
+                    unit: unit.clone(),
+                    range: TextRange {
+                        start: 0,
+                        end: rewrite.previous_len,
                     },
-                    text: rewrite.next_source.clone(),
-                });
+                },
+                text: rewrite.next_source.clone(),
+            });
+            if rewrite.kind != RewriteKind::Delete {
+                diagnostics.extend(reparse_diagnostics(
+                    unit,
+                    &rewrite.path,
+                    &rewrite.next_source,
+                ));
+                diagnostics.truncate(CHANGE_DIAGNOSTICS_MAX);
             }
-            diagnostics.extend(reparse_diagnostics(
-                reads,
-                &rewrite.path,
-                &rewrite.next_source,
-            ));
-            diagnostics.truncate(CHANGE_DIAGNOSTICS_MAX);
         }
         let digest = identity.finalize();
         Ok(ChangeResult::Applied {
@@ -521,9 +502,10 @@ impl ChangeService {
         }
         drop(guard);
 
+        let unit = file_id(file);
         let edit = Edit::Replace {
             span: SourceSpan {
-                unit: file_id(file),
+                unit: unit.clone(),
                 range: TextRange {
                     start: plan.range.start,
                     end: plan.range.end,
@@ -538,114 +520,18 @@ impl ChangeService {
                     plan.path.as_str().to_owned(),
                 )],
                 edits: vec![edit],
-                diagnostics: reparse_diagnostics(reads, &plan.path, &next_source),
+                diagnostics: reparse_diagnostics(unit, &plan.path, &next_source),
                 guarantees: Vec::new(),
             },
         })
     }
 }
 
-/// One whole-file rewrite a patch resolved to.
-#[derive(Debug)]
-struct FileRewrite {
-    path: CoreProjectPath,
-    previous_len: u64,
-    next_source: String,
-}
-
 /// Removes every staged sidecar file, ignoring entries already gone.
-fn discard_staged(staged_paths: &[PathBuf]) {
+fn discard_staged<'a>(staged_paths: impl IntoIterator<Item = &'a PathBuf>) {
     for staged in staged_paths {
         let _ = fs::remove_file(staged);
     }
-}
-
-/// Splits one unified diff into its per-file segments. Only a header line
-/// opens a segment: hunk body lines never start with `---` at column zero,
-/// because context lines carry a leading space and removals a single `-`.
-///
-/// Hunk body bytes pass through untouched — a CRLF patch keeps its `\r`
-/// so its context matches a CRLF source, and an ending mismatch surfaces
-/// as hunk-context drift, never a silent rewrite. Only structural lines
-/// shed a CRLF ending, because the diff parser rejects `\r` in headers.
-fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
-    let mut segments: Vec<String> = Vec::new();
-    let mut segment_line = 0_usize;
-    for line in patch.split_inclusive('\n') {
-        if line.starts_with("--- ") {
-            if segments.len() == PATCH_FILES_MAX {
-                return Err(ReadFault::invalid(
-                    "patch",
-                    format!("addresses more than {PATCH_FILES_MAX} files"),
-                ));
-            }
-            segments.push(String::new());
-            segment_line = 0;
-        }
-        if let Some(segment) = segments.last_mut() {
-            let structural = segment_line == 0
-                || (segment_line == 1 && line.starts_with("+++ "))
-                || line.starts_with("@@");
-            push_segment_line(segment, line, structural);
-            segment_line += 1;
-        }
-    }
-    if segments.is_empty() {
-        return Err(ReadFault::invalid("patch", "carries no `---` file header"));
-    }
-    Ok(segments)
-}
-
-/// Appends one diff line to its segment. A structural line — the `---` and
-/// `+++` file headers and `@@` hunk headers — sheds a CRLF ending, because
-/// the diff parser rejects `\r` there; body lines keep their exact bytes so
-/// hunk content matches the stored source byte-for-byte.
-fn push_segment_line(segment: &mut String, line: &str, structural: bool) {
-    match (structural, line.strip_suffix("\r\n")) {
-        (true, Some(stripped)) => {
-            segment.push_str(stripped);
-            segment.push('\n');
-        }
-        _ => segment.push_str(line),
-    }
-}
-
-/// Resolves the project path one parsed segment addresses, or the refusal
-/// for file-level changes this release does not serve.
-///
-/// Patch paths are wire values, not OS paths: forward-slash relative on
-/// every platform, with git's literal `a/`, `b/`, and `/dev/null`
-/// conventions, which git emits unchanged on Windows and macOS alike.
-fn patched_project_path(
-    parsed: &Patch<'_, str>,
-) -> Result<Result<CoreProjectPath, ChangeResult>, ReadError> {
-    let original = parsed.original().unwrap_or_default();
-    let modified = parsed.modified().unwrap_or_default();
-    if original.contains('\\') || modified.contains('\\') {
-        return Err(ReadFault::invalid(
-            "patch",
-            "path uses backslash separators; project paths are forward-slash \
-             relative on every platform, such as `src/lib.rs`",
-        ));
-    }
-    if original == "/dev/null" || modified == "/dev/null" {
-        return Ok(Err(ChangeResult::refused(
-            RefusalReason::Unsupported,
-            Vec::new(),
-        )));
-    }
-    let original = original.strip_prefix("a/").unwrap_or(original);
-    let modified = modified.strip_prefix("b/").unwrap_or(modified);
-    if original != modified {
-        return Ok(Err(ChangeResult::refused(
-            RefusalReason::Unsupported,
-            Vec::new(),
-        )));
-    }
-    let path = CoreProjectPath::new(original).map_err(|error| {
-        ReadFault::invalid("patch", rift_core::fault_label(&error.fault().violation()))
-    })?;
-    Ok(Ok(path))
 }
 
 /// A parsed witnessed node address.
@@ -709,7 +595,7 @@ fn decoded(encoded: &str) -> Option<String> {
 }
 
 /// First eight hex characters of the SHA-256 of one source text.
-fn digest_hex8(source: &str) -> String {
+pub(crate) fn digest_hex8(source: &str) -> String {
     let digest = Sha256::digest(source.as_bytes());
     format!(
         "{:02x}{:02x}{:02x}{:02x}",
@@ -730,19 +616,14 @@ fn change_id(path: &str, next_source: &str) -> ChangeId {
 ///
 /// A change that breaks the syntax still lands — the tree is the caller's —
 /// but the result says so instead of leaving the discovery to the next read.
-fn reparse_diagnostics(
-    reads: &ReadService,
-    path: &CoreProjectPath,
-    source: &str,
-) -> Vec<Diagnostic> {
-    let Some(file) = reads.index().file(path) else {
-        return Vec::new();
-    };
+/// `unit` names the changed file even when it has no prior index entry, as
+/// for a file a patch just created.
+fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Vec<Diagnostic> {
     let provider = RustSyntaxProvider::new(RustSyntaxLimits::default());
     let parsed = provider.analyze(RustSource { path, text: source });
     match parsed {
         Err(error) => vec![change_diagnostic(
-            file_id(file),
+            unit,
             format!("the changed file no longer parses within bounds: {error}"),
             None,
         )],
@@ -753,7 +634,7 @@ fn reparse_diagnostics(
             .take(CHANGE_DIAGNOSTICS_MAX)
             .map(|node| {
                 change_diagnostic(
-                    file_id(file),
+                    unit.clone(),
                     "the parser marked this region erroneous after the change".to_owned(),
                     Some(node.range),
                 )
@@ -1106,30 +987,6 @@ mod tests {
     }
 
     #[test]
-    fn patch_refuses_file_creation_as_unsupported() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = [
-            "--- /dev/null",
-            "+++ b/new.rs",
-            "@@ -0,0 +1 @@",
-            "+pub fn fresh() {}",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.clone(),
-            },
-        )?;
-        let ChangeResult::Refused { reason, .. } = result else {
-            panic!("file creation must refuse this release");
-        };
-        assert_eq!(reason, RefusalReason::Unsupported);
-        Ok(())
-    }
-
-    #[test]
     fn patch_rewrites_several_files_in_one_change() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
@@ -1436,7 +1293,7 @@ mod tests {
 
         let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         let mut patch = String::new();
-        for index in 0..=super::PATCH_FILES_MAX {
+        for index in 0..=crate::patch::PATCH_FILES_MAX {
             let _ = writeln!(
                 patch,
                 "--- a/f{index}.rs\n+++ b/f{index}.rs\n@@ -1 +1 @@\n-x\n+y"
@@ -1447,9 +1304,10 @@ mod tests {
             .expect_err("a diff past the file bound must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
         assert!(
-            error
-                .to_string()
-                .contains(&format!("more than {} files", super::PATCH_FILES_MAX)),
+            error.to_string().contains(&format!(
+                "more than {} files",
+                crate::patch::PATCH_FILES_MAX
+            )),
             "message must name the bound: {error}"
         );
         Ok(())

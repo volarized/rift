@@ -170,8 +170,8 @@ impl RiftMcp {
     }
 
     /// Applies unified-diff hunks to workspace files atomically. Hunk
-    /// context guards the change: a context mismatch refuses with an unmet
-    /// precondition and the tree stays untouched.
+    /// context guards the change; header line numbers are hints, as with
+    /// `git apply`. A `/dev/null` header creates or deletes the file.
     #[tool]
     fn patch(
         &self,

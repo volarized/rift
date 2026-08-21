@@ -87,6 +87,20 @@ fn corpus() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            "patch",
+            json!({
+                // The header claims line 1; the unique match actually sits
+                // at line 5, proving header line numbers are hints only.
+                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon_three() {}\n+pub fn beacon_three() -> u8 { 3 }\n"
+            }),
+        ),
+        (
+            "patch",
+            json!({
+                "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
+            }),
+        ),
+        (
             "replace_symbol",
             json!({
                 "symbol": "rift://symbol/rust/lib.rs/dual",
