@@ -591,6 +591,7 @@ mod tests {
     use std::fs;
 
     use diffy::Patch;
+    use rift_core::SourceVisibility;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
         ChangeResult, ChangeSummary, OperationPreconditionKind, PatchParams, PreconditionValue,
@@ -615,7 +616,11 @@ mod tests {
     fn fixture(source: &str) -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), source)?;
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         let changes = ChangeService::new(directory.path());
         Ok((directory, reads, changes))
     }
@@ -1003,7 +1008,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(directory.path().join("aid.rs"), "pub fn aid() {}\n")?;
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         let changes = ChangeService::new(directory.path());
         let patch = [
             "--- a/lib.rs",
