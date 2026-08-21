@@ -361,6 +361,11 @@
         }
       ]
     },
+    "PathPattern": {
+      "description": "Project-relative glob using *, ?, **, and character classes.",
+      "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$",
+      "type": "string"
+    },
     "ProjectPath": {
       "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
       "maxLength": 1000,
@@ -394,6 +399,36 @@
             "string",
             "null"
           ]
+        }
+      },
+      "type": "object"
+    },
+    "SourceConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[source]` table: which files below the workspace root the index and reads consider\nvisible. `.git`, `.rift`, and `target` stay invisible whatever this table says.",
+      "properties": {
+        "exclude": {
+          "default": [],
+          "description": "Exact file paths or globs dropped from visibility, in [`PathPattern`] syntax. A match\nhere is dropped even when `include` also matches it.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 512,
+          "type": "array"
+        },
+        "include": {
+          "default": [],
+          "description": "Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.\nEmpty admits every file `exclude` and `.gitignore` leave standing.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 512,
+          "type": "array"
+        },
+        "respect_gitignore": {
+          "default": true,
+          "description": "Whether the workspace's own `.gitignore` files, root and nested, hide the paths they\nmatch. Global and parent-directory gitignore sources are never read.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -437,6 +472,15 @@
       "$ref": "#/$defs/SearchConfiguration",
       "default": {},
       "description": "The embedding model that adds dense ranking to lexical search."
+    },
+    "source": {
+      "$ref": "#/$defs/SourceConfiguration",
+      "default": {
+        "exclude": [],
+        "include": [],
+        "respect_gitignore": true
+      },
+      "description": "Which files below the workspace root the index and reads consider visible."
     }
   },
   "title": "WorkspaceConfiguration",

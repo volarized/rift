@@ -7,7 +7,7 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{
     RUST_READ_PROVIDER_ID, SEARCH_RESULTS_DEFAULT, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS,
 };
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
 use rift_index::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits,
@@ -150,13 +150,19 @@ pub struct ReadService {
 }
 
 impl ReadService {
-    /// Builds one in-memory snapshot from real workspace files.
+    /// Builds one in-memory snapshot from real workspace files, applying
+    /// `visibility`'s `.gitignore` and `[source]` policy on top of the hard
+    /// floor.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] when root cannot be indexed within bounds.
-    pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let index = WorkspaceIndex::build(root, limits).map_err(ReadFault::index)?;
+    pub fn build(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+    ) -> Result<Self, ReadError> {
+        let index = WorkspaceIndex::build(root, limits, visibility).map_err(ReadFault::index)?;
         let digest = workspace_digest(&index);
         let snapshot = ReadSnapshot {
             tree_revision: Digest(digest.clone()),
@@ -713,6 +719,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
+    use rift_core::SourceVisibility;
     use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
     use rift_index::SymbolMatchRank;
     use rift_protocol::read::{
@@ -733,7 +740,11 @@ mod tests {
             "pub struct Beacon;\nimpl Beacon { pub fn signal(&self) {} }\n",
         )?;
         fs::write(directory.path().join("README.md"), "Beacon docs")?;
-        let service = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         Ok((directory, service))
     }
 
@@ -775,7 +786,11 @@ pub fn compute() -> i32 {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), RICH_SOURCE)?;
-        let service = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         Ok((directory, service))
     }
 
@@ -928,6 +943,7 @@ pub fn compute() -> i32 {
         let error = ReadService::build(
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
         )
         .expect_err("missing root must fail");
 

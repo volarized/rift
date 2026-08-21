@@ -795,6 +795,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
+    use rift_core::SourceVisibility;
     use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
@@ -813,7 +814,11 @@ mod tests {
     fn fixture(source: &str) -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), source)?;
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         let changes = ChangeService::new(directory.path());
         Ok((directory, reads, changes))
     }
@@ -952,7 +957,11 @@ mod tests {
             "/// Docs.\npub fn early() {}\n\npub fn beacon() {}\n"
         );
 
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         let result = changes.insert_symbol(
             &reads,
             &InsertSymbolParams {
@@ -1134,7 +1143,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(directory.path().join("aid.rs"), "pub fn aid() {}\n")?;
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         let changes = ChangeService::new(directory.path());
         let patch = [
             "--- a/lib.rs",

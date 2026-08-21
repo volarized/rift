@@ -11,3 +11,4 @@ pub mod configuration;
 pub mod error;
 pub mod read;
 pub mod schema;
+pub mod source;
