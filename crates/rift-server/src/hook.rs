@@ -155,7 +155,13 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> (std::io::Result<ExitSt
         match child.try_wait() {
             Ok(Some(exit)) => return (Ok(exit), false),
             Ok(None) => {}
-            Err(io) => return (Err(io), false),
+            Err(io) => {
+                // The child's state is unknown, and an unobservable child must
+                // not outlive its bound: kill it before reporting the failure.
+                let _ = child.kill();
+                let _ = child.wait();
+                return (Err(io), false);
+            }
         }
         let Some(remaining) = deadline
             .checked_duration_since(Instant::now())
