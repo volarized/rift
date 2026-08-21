@@ -611,7 +611,7 @@ mod tests {
 
     use rift_core::SourceVisibility;
     use rift_protocol::read::{
-        GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId,
+        Digest, GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, ReadSnapshot,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -789,6 +789,22 @@ pub fn compute() -> i32 {
         assert_eq!(origin["tree_revision"], snapshot_tree);
         assert_eq!(origin["source_revision"], snapshot_source);
         assert_ne!(origin["tree_revision"], json!("00000000"));
+        Ok(())
+    }
+
+    /// `complete_coverage` falls back to `tree_revision` when the read consulted no index,
+    /// instead of unwrapping the absent `IndexSnapshot`.
+    #[test]
+    fn complete_coverage_falls_back_to_tree_revision_without_an_index_snapshot() -> TestResult {
+        let snapshot = ReadSnapshot {
+            tree_revision: Digest("deadbeef".to_owned()),
+            index: None,
+            source_revision: Digest("cafef00d".to_owned()),
+        };
+        let value = serde_json::to_value(super::complete_coverage(&snapshot))?;
+        assert_eq!(value["origins"][0]["revision"], json!("deadbeef"));
+        assert_eq!(value["origins"][0]["tree_revision"], json!("deadbeef"));
+        assert_eq!(value["origins"][0]["source_revision"], json!("cafef00d"));
         Ok(())
     }
 
