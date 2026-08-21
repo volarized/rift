@@ -135,8 +135,9 @@ A hook runs the tree it checks — `cargo test` compiles the very change it's ch
 a configured hook executes the agent's change each time one applies.
 
 Every key in the block is required — the schema carries no defaults, so a missing `environment`
-fails the file with `configuration_invalid`. The list holds at most 32 hooks. Two keys carry
-bounds: `timeout_ms`, when Rift kills the process, takes 1 to 3600000, and
+fails the file with `configuration_invalid`. The list holds at most 32 hooks.
+
+Two keys carry bounds: `timeout_ms`, when Rift kills the process, takes 1 to 3600000, and
 `output_limit_bytes`, how much of each stream Rift keeps, takes 256 to 4096. The full size is
 still reported, so you can tell a truncated log from a short one.
 
