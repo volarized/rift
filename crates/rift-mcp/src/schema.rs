@@ -24,16 +24,17 @@ use crate::RiftMcp;
 const DOCUMENT_DESCRIPTION: &str =
     "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.";
 
-/// Directory the schema documents land in when no argument names one.
-const OUTPUT_DIR_DEFAULT: &str = "docs/protocol";
+/// Directory the export lands in when no argument names one; each document
+/// carries its own path below it.
+const OUTPUT_DIR_DEFAULT: &str = "docs";
 
-/// File name of the exported tool-surface document inside the output
-/// directory.
-const SCHEMA_FILE_NAME: &str = "mcp.json";
+/// Path of the exported tool-surface document below the output directory.
+const SCHEMA_DOCUMENT_PATH: &str = "protocol/mcp.json";
 
-/// File name of the exported `rift.toml` schema inside the output
-/// directory.
-const CONFIGURATION_SCHEMA_FILE_NAME: &str = "rift.schema.json";
+/// Path of the exported `rift.toml` schema below the output directory. It
+/// lands in the docs site's static files, so readers fetch it from the
+/// site's own origin rather than the repository host.
+const CONFIGURATION_SCHEMA_PATH: &str = "public/rift.schema.json";
 
 /// Usage line appended to argument errors.
 const USAGE: &str = "usage: rift-schema-export [--check] [OUTPUT_DIR]";
@@ -234,24 +235,24 @@ where
 /// cannot be written.
 pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
     let documents = [
-        (SCHEMA_FILE_NAME, schema_document()),
-        (
-            CONFIGURATION_SCHEMA_FILE_NAME,
-            configuration_schema_document(),
-        ),
+        (SCHEMA_DOCUMENT_PATH, schema_document()),
+        (CONFIGURATION_SCHEMA_PATH, configuration_schema_document()),
     ];
     if request.check {
-        for (file_name, document) in &documents {
-            check_document(&request.output_dir.join(file_name), document)?;
+        for (relative_path, document) in &documents {
+            check_document(&request.output_dir.join(relative_path), document)?;
         }
         return Ok(());
     }
-    fs::create_dir_all(&request.output_dir).map_err(|source| ExportError::WriteFailed {
-        path: request.output_dir.clone(),
-        source,
-    })?;
-    for (file_name, document) in &documents {
-        let document_path = request.output_dir.join(file_name);
+    for (relative_path, document) in &documents {
+        let document_path = request.output_dir.join(relative_path);
+        let parent = document_path
+            .parent()
+            .unwrap_or(request.output_dir.as_path());
+        fs::create_dir_all(parent).map_err(|source| ExportError::WriteFailed {
+            path: parent.to_path_buf(),
+            source,
+        })?;
         fs::write(&document_path, document).map_err(|source| ExportError::WriteFailed {
             path: document_path.clone(),
             source,

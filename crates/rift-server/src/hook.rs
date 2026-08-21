@@ -90,11 +90,14 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
         stdout: CapturedStream::default(),
         stderr: CapturedStream::default(),
     };
-    let Some((program, literal_arguments)) = hook.argv.split_first() else {
-        return error("empty argv".to_owned());
-    };
-    if Path::new(program).is_absolute() {
-        return error(format!("absolute executable path refused: {program}"));
+    if hook.program.is_empty() {
+        return error("empty program".to_owned());
+    }
+    if Path::new(&hook.program).is_absolute() {
+        return error(format!(
+            "absolute executable path refused: {}",
+            hook.program
+        ));
     }
 
     let working_directory = if hook.working_directory.0.is_empty() {
@@ -102,8 +105,8 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
     } else {
         tree_root.join(&hook.working_directory.0)
     };
-    let mut command = Command::new(program);
-    command.args(literal_arguments);
+    let mut command = Command::new(&hook.program);
+    command.args(&hook.arguments);
     if hook.changed_paths == ChangedPaths::Append {
         command.args(ordered_paths);
     }
@@ -226,12 +229,16 @@ mod tests {
     use rift_protocol::configuration::{Determinism, HookKind, HookType};
     use std::collections::BTreeMap;
 
-    fn hook(argv: &[&str]) -> CommandHook {
+    fn hook(program: &str, arguments: &[&str]) -> CommandHook {
         CommandHook {
             r#type: HookType::Command,
             id: "probe".to_owned(),
             kind: HookKind::Other,
-            argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+            program: program.to_owned(),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
             changed_paths: ChangedPaths::None,
             working_directory: ProjectPath(String::new()),
             environment: BTreeMap::new(),
@@ -251,7 +258,7 @@ mod tests {
     #[test]
     fn test_passing_hook_appends_changed_paths_byte_ordered() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut echo = hook(&["echo", "hello"]);
+        let mut echo = hook("echo", &["hello"]);
         echo.changed_paths = ChangedPaths::Append;
         let changed = paths(&["pkg/b.rs", "a.rs", "pkg/a.rs"]);
         let runs = run_hooks(&[echo], directory.path(), &changed);
@@ -267,7 +274,7 @@ mod tests {
     #[test]
     fn test_nonzero_exit_fails_with_its_code() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(&[hook(&["false"])], directory.path(), &[]);
+        let runs = run_hooks(&[hook("false", &[])], directory.path(), &[]);
         assert_eq!(runs[0].status, HookStatus::Failed);
         assert_eq!(runs[0].exit_code, Some(1));
     }
@@ -275,7 +282,7 @@ mod tests {
     #[test]
     fn test_timeout_kills_the_hook_without_waiting_it_out() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut slow = hook(&["sleep", "10"]);
+        let mut slow = hook("sleep", &["10"]);
         slow.timeout_ms = 200;
         let started = Instant::now();
         let runs = run_hooks(&[slow], directory.path(), &[]);
@@ -291,7 +298,7 @@ mod tests {
     #[test]
     fn test_output_is_capped_and_full_size_reported() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut noisy = hook(&["seq", "1", "5000"]);
+        let mut noisy = hook("seq", &["1", "5000"]);
         noisy.output_limit_bytes = 256;
         let runs = run_hooks(&[noisy], directory.path(), &[]);
         let stdout = &runs[0].stdout;
@@ -305,9 +312,9 @@ mod tests {
     fn test_working_directory_and_environment_shape_the_process() {
         let directory = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(directory.path().join("sub")).expect("create sub");
-        let mut in_sub = hook(&["pwd"]);
+        let mut in_sub = hook("pwd", &[]);
         in_sub.working_directory = ProjectPath("sub".to_owned());
-        let mut with_environment = hook(&["printenv", "RIFT_HOOK_PROBE"]);
+        let mut with_environment = hook("printenv", &["RIFT_HOOK_PROBE"]);
         with_environment
             .environment
             .insert("RIFT_HOOK_PROBE".to_owned(), "42".to_owned());
@@ -324,7 +331,7 @@ mod tests {
     fn test_missing_program_is_an_error_not_a_panic() {
         let directory = tempfile::tempdir().expect("tempdir");
         let runs = run_hooks(
-            &[hook(&["rift-test-binary-that-does-not-exist"])],
+            &[hook("rift-test-binary-that-does-not-exist", &[])],
             directory.path(),
             &[],
         );
@@ -338,7 +345,7 @@ mod tests {
     #[test]
     fn test_absolute_program_is_refused_before_spawning() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(&[hook(&["/bin/echo", "hi"])], directory.path(), &[]);
+        let runs = run_hooks(&[hook("/bin/echo", &["hi"])], directory.path(), &[]);
         assert!(
             matches!(&runs[0].status, HookStatus::Error(message) if message.contains("absolute")),
             "{:?}",
@@ -347,18 +354,20 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_argv_is_an_error() {
+    fn test_empty_program_is_an_error() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(&[hook(&[])], directory.path(), &[]);
-        assert!(matches!(&runs[0].status, HookStatus::Error(message) if message.contains("argv")));
+        let runs = run_hooks(&[hook("", &[])], directory.path(), &[]);
+        assert!(
+            matches!(&runs[0].status, HookStatus::Error(message) if message.contains("program"))
+        );
     }
 
     #[test]
     fn test_hooks_run_in_list_order() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut first = hook(&["echo", "first"]);
+        let mut first = hook("echo", &["first"]);
         first.id = "first".to_owned();
-        let mut second = hook(&["echo", "second"]);
+        let mut second = hook("echo", &["second"]);
         second.id = "second".to_owned();
         let runs = run_hooks(&[first, second], directory.path(), &[]);
         assert_eq!(runs[0].id, "first");

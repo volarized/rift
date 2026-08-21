@@ -20,12 +20,18 @@ pub const EXECUTION_TIMEOUT_MS_MAX: u64 = 86_400_000;
 pub const EXECUTION_OUTPUT_BYTES_MAX: u64 = 16 << 10;
 /// Evaluations admitted concurrently across the workspace, at most.
 pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
+/// Entries `execution.allow` may hold, at most.
+pub const EXECUTION_ALLOW_ITEMS_MAX: usize = 64;
 /// Revisions the history provider may walk from the current head, at most.
 pub const HISTORY_REVISIONS_MAX: u64 = 100_000;
+/// Bytes `search.embedding` may hold, at most.
+pub const EMBEDDING_MODEL_BYTES_MAX: usize = 128;
 /// Configured hooks one workspace may declare, at most.
 pub const HOOKS_MAX: usize = 32;
-/// Entries one hook's `argv` may hold, at most.
-pub const HOOK_ARGV_ITEMS_MAX: usize = 64;
+/// Bytes one hook's `id` may hold, at most.
+pub const HOOK_ID_BYTES_MAX: usize = 64;
+/// Entries one hook's `arguments` may hold, at most.
+pub const HOOK_ARGUMENTS_MAX: usize = 64;
 /// Entries one hook's `environment` may hold, at most.
 pub const HOOK_ENVIRONMENT_ENTRIES_MAX: usize = 64;
 /// Milliseconds one hook may run before Rift kills it, at most: one hour.
@@ -34,14 +40,19 @@ pub const HOOK_TIMEOUT_MS_MAX: u64 = 3_600_000;
 pub const HOOK_OUTPUT_BYTES_MIN: u64 = 256;
 /// Bytes of each hook stream Rift keeps, at most.
 pub const HOOK_OUTPUT_BYTES_MAX: u64 = 4_096;
+/// Guarantees one hook may declare, at most.
+pub const HOOK_GUARANTEES_MAX: usize = 16;
+/// Bytes one guarantee's `detail` may hold, at most.
+pub const HOOK_GUARANTEE_DETAIL_BYTES_MAX: usize = 1_024;
 
 /// The spelling a [`ByteSize`] value must match.
-const BYTE_SIZE_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:B|KiB|MiB|GiB|TiB)$";
+const BYTE_SIZE_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:b|kb|mb|gb|tb)$";
 /// The spelling a [`Duration`] value must match.
 const DURATION_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$";
 
-/// A byte size: an integer magnitude with a required binary-unit suffix
-/// `B`, `KiB`, `MiB`, `GiB`, or `TiB`.
+/// A byte size: an integer magnitude with a required unit suffix `b`, `kb`,
+/// `mb`, `gb`, or `tb`. Units are binary: `1kb` is 1024 bytes, and every
+/// larger unit scales by 1024 again.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ByteSize(u64);
@@ -59,8 +70,8 @@ impl ByteSize {
         self.0
     }
 
-    /// Parses the file spelling: digits, then one of `B`, `KiB`, `MiB`,
-    /// `GiB`, or `TiB`.
+    /// Parses the file spelling: digits, then one of `b`, `kb`, `mb`, `gb`,
+    /// or `tb`.
     ///
     /// # Errors
     ///
@@ -69,11 +80,11 @@ impl ByteSize {
     pub fn parse(text: &str) -> Result<Self, UnitParseError> {
         let (magnitude, unit) = split_magnitude(text, ByteSize::EXPECTED)?;
         let scale: u64 = match unit {
-            "B" => 1,
-            "KiB" => 1 << 10,
-            "MiB" => 1 << 20,
-            "GiB" => 1 << 30,
-            "TiB" => 1 << 40,
+            "b" => 1,
+            "kb" => 1 << 10,
+            "mb" => 1 << 20,
+            "gb" => 1 << 30,
+            "tb" => 1 << 40,
             _ => return Err(UnitParseError::new(text, ByteSize::EXPECTED)),
         };
         let bytes = magnitude
@@ -84,7 +95,7 @@ impl ByteSize {
 
     /// The documented form, named in every parse failure.
     const EXPECTED: &'static str =
-        "an integer magnitude followed by B, KiB, MiB, GiB, or TiB, such as `16KiB`";
+        "an integer magnitude followed by b, kb, mb, gb, or tb (binary units), such as `16kb`";
 }
 
 impl TryFrom<String> for ByteSize {
@@ -98,17 +109,17 @@ impl TryFrom<String> for ByteSize {
 impl From<ByteSize> for String {
     fn from(size: ByteSize) -> Self {
         let units = [
-            (1_u64 << 40, "TiB"),
-            (1 << 30, "GiB"),
-            (1 << 20, "MiB"),
-            (1 << 10, "KiB"),
+            (1_u64 << 40, "tb"),
+            (1 << 30, "gb"),
+            (1 << 20, "mb"),
+            (1 << 10, "kb"),
         ];
         for (scale, suffix) in units {
             if size.0 != 0 && size.0.is_multiple_of(scale) {
                 return format!("{}{suffix}", size.0 / scale);
             }
         }
-        format!("{}B", size.0)
+        format!("{}b", size.0)
     }
 }
 
@@ -121,8 +132,9 @@ impl JsonSchema for ByteSize {
         json_schema!({
             "type": "string",
             "pattern": BYTE_SIZE_PATTERN,
-            "description": "A byte size: an integer magnitude with a required \
-                            binary-unit suffix `B`, `KiB`, `MiB`, `GiB`, or `TiB`."
+            "description": "A byte size: an integer magnitude with a required unit \
+                            suffix `b`, `kb`, `mb`, `gb`, or `tb`; units are binary, \
+                            so `1kb` is 1024 bytes."
         })
     }
 }
@@ -227,6 +239,18 @@ impl UnitParseError {
             text: text.to_owned(),
             expected,
         }
+    }
+
+    /// The value that failed to parse, as the file spelled it.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.text
+    }
+
+    /// The documented form the value must match.
+    #[must_use]
+    pub const fn expected(&self) -> &'static str {
+        self.expected
     }
 }
 
@@ -355,11 +379,11 @@ pub struct ExecutionConfiguration {
     /// `name:dialect` to pin a dialect. Empty keeps execution off.
     #[schemars(length(max = 64))]
     pub allow: Vec<String>,
-    /// Bytes one submitted block may hold, 1B to 32KiB.
+    /// Bytes one submitted block may hold, 1b to 32kb.
     pub max_code: ByteSize,
     /// Wall-clock bound per evaluation, 1ms to 1d.
     pub max_timeout: Duration,
-    /// Bytes each captured stream keeps, up to 16KiB.
+    /// Bytes each captured stream keeps, up to 16kb.
     pub max_output: ByteSize,
     /// Evaluations running at once across the whole workspace.
     #[schemars(range(min = 1, max = 64))]
@@ -379,38 +403,41 @@ impl Default for ExecutionConfiguration {
 }
 
 impl ExecutionConfiguration {
+    /// The table's bounds in key order, then the selector rule.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        out_of_range(
-            "execution.max_code",
-            self.max_code.bytes(),
-            1,
-            EXECUTION_CODE_BYTES_MAX,
-        )
-        .or_else(|| {
-            out_of_range(
+        let limits = [
+            (
+                "execution.allow",
+                self.allow.len() as u64,
+                0,
+                EXECUTION_ALLOW_ITEMS_MAX as u64,
+            ),
+            (
+                "execution.max_code",
+                self.max_code.bytes(),
+                1,
+                EXECUTION_CODE_BYTES_MAX,
+            ),
+            (
                 "execution.max_timeout",
                 self.max_timeout.milliseconds(),
                 1,
                 EXECUTION_TIMEOUT_MS_MAX,
-            )
-        })
-        .or_else(|| {
-            out_of_range(
+            ),
+            (
                 "execution.max_output",
                 self.max_output.bytes(),
                 0,
                 EXECUTION_OUTPUT_BYTES_MAX,
-            )
-        })
-        .or_else(|| {
-            out_of_range(
+            ),
+            (
                 "execution.max_concurrent",
                 self.max_concurrent,
                 1,
                 EXECUTION_CONCURRENT_MAX,
-            )
-        })
-        .or_else(|| {
+            ),
+        ];
+        first_out_of_range(limits).or_else(|| {
             self.allow
                 .iter()
                 .find(|selector| !is_language_selector(selector))
@@ -435,17 +462,22 @@ pub struct SearchConfiguration {
 }
 
 impl SearchConfiguration {
+    /// The model-identifier rules, one named clause each.
     fn violation(&self) -> Option<ConfigurationViolation> {
         let embedding = self.embedding.as_deref()?;
-        let valid = !embedding.is_empty()
-            && embedding.len() <= 128
-            && embedding.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
-            });
+        let nonempty = !embedding.is_empty();
+        let within_length = embedding.len() <= EMBEDDING_MODEL_BYTES_MAX;
+        let charset_admitted = embedding.chars().all(is_model_identifier_character);
+        let valid = nonempty && within_length && charset_admitted;
         (!valid).then(|| ConfigurationViolation::EmbeddingModelInvalid {
             value: embedding.to_owned(),
         })
     }
+}
+
+/// Whether `character` may appear in an embedding model identifier.
+fn is_model_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
 }
 
 /// One `[[hooks]]` block: an executable Rift starts directly — no shell —
@@ -461,13 +493,15 @@ pub struct CommandHook {
     pub id: String,
     /// What the hook is: a test suite, a linter, a build, or something else.
     pub kind: HookKind,
-    /// The executable followed by its literal arguments. An absolute
-    /// executable path is refused; a bare name resolves through `PATH`, a
-    /// relative one below `working_directory`.
-    #[schemars(length(min = 1, max = 64))]
-    pub argv: Vec<String>,
-    /// Whether the changed project paths are appended to `argv` in byte
-    /// order.
+    /// The executable Rift starts. An absolute path is refused; a bare name
+    /// resolves through `PATH`, a relative one below `working_directory`.
+    #[schemars(length(min = 1))]
+    pub program: String,
+    /// The program's literal arguments, in order. May be empty.
+    #[schemars(length(max = 64))]
+    pub arguments: Vec<String>,
+    /// Whether the changed project paths are appended after `arguments` in
+    /// byte order.
     pub changed_paths: ChangedPaths,
     /// Directory the process starts in, relative to the changed tree's
     /// root. Empty selects the root.
@@ -518,15 +552,15 @@ pub enum HookKind {
     Other,
 }
 
-/// Whether the changed project paths ride the hook's `argv`.
+/// Whether the changed project paths ride the hook's command line.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ChangedPaths {
-    /// `argv` runs exactly as configured.
+    /// The command runs exactly as configured.
     None,
-    /// The changed project paths follow the configured `argv`, in byte
+    /// The changed project paths follow the configured `arguments`, in byte
     /// order, for a tool that takes files.
     Append,
 }
@@ -610,8 +644,8 @@ pub enum ConfigurationViolation {
         /// The rejected id.
         id: String,
     },
-    /// A hook declares no executable to run.
-    HookArgvEmpty {
+    /// A hook's `program` is empty, so there is nothing to run.
+    HookProgramEmpty {
         /// The hook missing its executable.
         id: String,
     },
@@ -655,7 +689,7 @@ impl ConfigurationViolation {
             Self::HookIdDuplicate { id } | Self::HookIdInvalid { id } => {
                 vec![("id", id.clone())]
             }
-            Self::HookArgvEmpty { id } => vec![("id", id.clone())],
+            Self::HookProgramEmpty { id } => vec![("id", id.clone())],
             Self::HookExecutableAbsolute { id, program } => {
                 vec![("id", id.clone()), ("program", program.clone())]
             }
@@ -679,6 +713,16 @@ fn out_of_range(
         min,
         max,
     })
+}
+
+/// The first table row whose value sits outside its range, rows in key
+/// order.
+fn first_out_of_range<const ROWS: usize>(
+    limits: [(&'static str, u64, u64, u64); ROWS],
+) -> Option<ConfigurationViolation> {
+    limits
+        .into_iter()
+        .find_map(|(field, value, min, max)| out_of_range(field, value, min, max))
 }
 
 /// Whether `selector` is a language name or `name:dialect`, both in the
@@ -725,71 +769,105 @@ fn hooks_violation(hooks: &[CommandHook]) -> Option<ConfigurationViolation> {
     None
 }
 
-/// The first bound one hook breaks, keys in declaration order.
+/// The first bound one hook breaks, rules in key order.
 fn hook_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    if !is_hook_id(&hook.id) {
-        return Some(ConfigurationViolation::HookIdInvalid {
+    identity_violation(hook)
+        .or_else(|| command_violation(hook))
+        .or_else(|| environment_violation(hook))
+        .or_else(|| guarantee_violation(hook))
+        .or_else(|| hook_bounds_violation(hook))
+}
+
+/// The `id` rule: the label every result of this hook carries.
+fn identity_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
+    (!is_hook_id(&hook.id)).then(|| ConfigurationViolation::HookIdInvalid {
+        id: hook.id.clone(),
+    })
+}
+
+/// The rules on what the hook runs: a present, non-absolute program.
+fn command_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
+    if hook.program.is_empty() {
+        return Some(ConfigurationViolation::HookProgramEmpty {
             id: hook.id.clone(),
         });
     }
-    match hook.argv.split_first() {
-        None => {
-            return Some(ConfigurationViolation::HookArgvEmpty {
-                id: hook.id.clone(),
-            });
-        }
-        Some((program, _)) if is_absolute_program(program) => {
-            return Some(ConfigurationViolation::HookExecutableAbsolute {
-                id: hook.id.clone(),
-                program: program.clone(),
-            });
-        }
-        Some(_) => {}
-    }
-    if hook.argv.len() > HOOK_ARGV_ITEMS_MAX {
-        return out_of_range(
-            "hooks.argv",
-            hook.argv.len() as u64,
-            1,
-            HOOK_ARGV_ITEMS_MAX as u64,
-        );
-    }
-    if hook.environment.len() > HOOK_ENVIRONMENT_ENTRIES_MAX {
-        return out_of_range(
-            "hooks.environment",
-            hook.environment.len() as u64,
-            0,
-            HOOK_ENVIRONMENT_ENTRIES_MAX as u64,
-        );
-    }
-    if let Some(key) = hook
+    is_absolute_program(&hook.program).then(|| ConfigurationViolation::HookExecutableAbsolute {
+        id: hook.id.clone(),
+        program: hook.program.clone(),
+    })
+}
+
+/// The rule on every `environment` entry's key.
+fn environment_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
+    let key = hook
         .environment
         .keys()
-        .find(|key| key.is_empty() || key.contains('=') || key.contains('\0'))
-    {
-        return Some(ConfigurationViolation::HookEnvironmentKeyInvalid {
-            id: hook.id.clone(),
-            key: key.clone(),
-        });
-    }
-    out_of_range("hooks.timeout_ms", hook.timeout_ms, 1, HOOK_TIMEOUT_MS_MAX).or_else(|| {
+        .find(|key| !is_environment_key(key))?;
+    Some(ConfigurationViolation::HookEnvironmentKeyInvalid {
+        id: hook.id.clone(),
+        key: key.clone(),
+    })
+}
+
+/// The `detail` length rule on every declared guarantee.
+fn guarantee_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
+    hook.guarantees.iter().find_map(|guarantee| {
         out_of_range(
-            "hooks.output_limit_bytes",
-            hook.output_limit_bytes,
-            HOOK_OUTPUT_BYTES_MIN,
-            HOOK_OUTPUT_BYTES_MAX,
+            "hooks.guarantees.detail",
+            guarantee.detail.len() as u64,
+            1,
+            HOOK_GUARANTEE_DETAIL_BYTES_MAX as u64,
         )
     })
 }
 
-/// Whether `id` labels a hook: nonempty, at most 64 bytes, characters from
-/// `A-Z a-z 0-9 . _ -`.
+/// The numeric bounds one hook carries, as a table in key order.
+fn hook_bounds_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
+    let limits = [
+        (
+            "hooks.arguments",
+            hook.arguments.len() as u64,
+            0,
+            HOOK_ARGUMENTS_MAX as u64,
+        ),
+        (
+            "hooks.environment",
+            hook.environment.len() as u64,
+            0,
+            HOOK_ENVIRONMENT_ENTRIES_MAX as u64,
+        ),
+        ("hooks.timeout_ms", hook.timeout_ms, 1, HOOK_TIMEOUT_MS_MAX),
+        (
+            "hooks.output_limit_bytes",
+            hook.output_limit_bytes,
+            HOOK_OUTPUT_BYTES_MIN,
+            HOOK_OUTPUT_BYTES_MAX,
+        ),
+        (
+            "hooks.guarantees",
+            hook.guarantees.len() as u64,
+            0,
+            HOOK_GUARANTEES_MAX as u64,
+        ),
+    ];
+    first_out_of_range(limits)
+}
+
+/// Whether `id` labels a hook: nonempty, at most
+/// [`HOOK_ID_BYTES_MAX`] bytes, characters from `A-Z a-z 0-9 . _ -`.
 fn is_hook_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= 64
+        && id.len() <= HOOK_ID_BYTES_MAX
         && id.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
         })
+}
+
+/// Whether `key` can name an environment entry: nonempty, without `=` or a
+/// NUL byte.
+fn is_environment_key(key: &str) -> bool {
+    !key.is_empty() && !key.contains('=') && !key.contains('\0')
 }
 
 /// Whether `program` is an absolute path on any platform the workspace can
@@ -812,7 +890,8 @@ mod tests {
             r#type: HookType::Command,
             id: "tests".to_owned(),
             kind: HookKind::Test,
-            argv: vec!["cargo".to_owned(), "test".to_owned()],
+            program: "cargo".to_owned(),
+            arguments: vec!["test".to_owned()],
             changed_paths: ChangedPaths::None,
             working_directory: ProjectPath(String::new()),
             environment: BTreeMap::new(),
@@ -826,12 +905,12 @@ mod tests {
     #[test]
     fn test_byte_size_parses_every_documented_unit() {
         let cases = [
-            ("0B", 0),
-            ("1B", 1),
-            ("16KiB", 16 << 10),
-            ("3MiB", 3 << 20),
-            ("2GiB", 2 << 30),
-            ("1TiB", 1 << 40),
+            ("0b", 0),
+            ("1b", 1),
+            ("16kb", 16 << 10),
+            ("3mb", 3 << 20),
+            ("2gb", 2 << 30),
+            ("1tb", 1 << 40),
         ];
         for (text, bytes) in cases {
             assert_eq!(
@@ -845,7 +924,7 @@ mod tests {
     #[test]
     fn test_byte_size_refuses_malformed_spellings() {
         for text in [
-            "", "16", "KiB", "016KiB", "16kib", "16 KiB", "-1B", "1.5KiB",
+            "", "16", "kb", "016kb", "16KB", "16KiB", "16kib", "16 kb", "-1b", "1.5kb",
         ] {
             assert!(ByteSize::parse(text).is_err(), "{text:?} must be refused");
         }
@@ -853,17 +932,26 @@ mod tests {
 
     #[test]
     fn test_byte_size_refuses_overflow() {
-        assert!(ByteSize::parse("99999999999TiB").is_err());
-        assert!(ByteSize::parse("999999999999999999999B").is_err());
+        assert!(ByteSize::parse("99999999999tb").is_err());
+        assert!(ByteSize::parse("999999999999999999999b").is_err());
+    }
+
+    #[test]
+    fn test_base_unit_accessors_return_the_scaled_magnitude() {
+        assert_eq!(ByteSize::parse("2kb").expect("spelling").bytes(), 2 << 10);
+        assert_eq!(
+            Duration::parse("2m").expect("spelling").milliseconds(),
+            120_000
+        );
     }
 
     #[test]
     fn test_byte_size_renders_largest_exact_unit() {
         let cases = [
-            (0, "0B"),
-            (1, "1B"),
-            (16 << 10, "16KiB"),
-            ((16 << 10) + 1, "16385B"),
+            (0, "0b"),
+            (1, "1b"),
+            (16 << 10, "16kb"),
+            ((16 << 10) + 1, "16385b"),
         ];
         for (bytes, text) in cases {
             assert_eq!(String::from(ByteSize::from_bytes(bytes)), text);
@@ -915,11 +1003,30 @@ mod tests {
 
     #[test]
     fn test_unit_parse_error_names_the_expected_form() {
-        let error = ByteSize::parse("16kb").expect_err("lowercase unit must be refused");
+        let error = ByteSize::parse("16KiB").expect_err("an uppercase unit must be refused");
         let message = error.to_string();
         assert!(
-            message.contains("16kb") && message.contains("16KiB"),
+            message.contains("16KiB") && message.contains("16kb"),
             "the failure must show the value and the documented form: {message}"
+        );
+        assert_eq!(error.value(), "16KiB");
+        assert_eq!(error.expected(), ByteSize::EXPECTED);
+    }
+
+    #[test]
+    fn test_values_round_trip_through_serde_in_canonical_spelling() {
+        let size: ByteSize = serde_json::from_value(json!("16kb")).expect("spelling must admit");
+        assert_eq!(serde_json::to_value(size).expect("render"), json!("16kb"));
+        let duration: Duration = serde_json::from_value(json!("90s")).expect("spelling must admit");
+        assert_eq!(
+            serde_json::to_value(duration).expect("render"),
+            json!("90s")
+        );
+        let refused = serde_json::from_value::<ByteSize>(json!("16KiB"))
+            .expect_err("the serde boundary must refuse what parse refuses");
+        assert!(
+            refused.to_string().contains("16kb"),
+            "the serde failure must carry the documented form: {refused}"
         );
     }
 
@@ -1066,19 +1173,35 @@ mod tests {
     /// One way to break a hook bound, and the check its refusal must pass.
     type HookBoundCase = (fn(&mut CommandHook), fn(&ConfigurationViolation) -> bool);
 
+    /// Proves each broken hook is refused with the expected violation.
+    fn assert_hooks_refused<const CASES: usize>(break_and_expect: [HookBoundCase; CASES]) {
+        for (break_bound, expected) in break_and_expect {
+            let mut broken = hook();
+            break_bound(&mut broken);
+            let configuration = WorkspaceConfiguration {
+                hooks: vec![broken],
+                ..WorkspaceConfiguration::default()
+            };
+            let violation = configuration
+                .validate()
+                .expect_err("the broken hook must be refused");
+            assert!(expected(&violation), "unexpected violation {violation:?}");
+        }
+    }
+
     #[test]
-    fn test_hook_bounds_are_enforced_in_declaration_order() {
-        let break_and_expect: [HookBoundCase; 6] = [
+    fn test_hook_command_rules_are_enforced() {
+        let break_and_expect: [HookBoundCase; 4] = [
             (
                 |hook| hook.id = "spaced id".to_owned(),
                 |violation| matches!(violation, ConfigurationViolation::HookIdInvalid { .. }),
             ),
             (
-                |hook| hook.argv = Vec::new(),
-                |violation| matches!(violation, ConfigurationViolation::HookArgvEmpty { .. }),
+                |hook| hook.program = String::new(),
+                |violation| matches!(violation, ConfigurationViolation::HookProgramEmpty { .. }),
             ),
             (
-                |hook| hook.argv = vec!["/bin/echo".to_owned()],
+                |hook| hook.program = "/bin/echo".to_owned(),
                 |violation| {
                     matches!(
                         violation,
@@ -1087,11 +1210,73 @@ mod tests {
                 },
             ),
             (
-                |hook| hook.argv = vec!["C:\\tools\\echo.exe".to_owned()],
+                |hook| hook.program = "C:\\tools\\echo.exe".to_owned(),
                 |violation| {
                     matches!(
                         violation,
                         ConfigurationViolation::HookExecutableAbsolute { .. }
+                    )
+                },
+            ),
+        ];
+        assert_hooks_refused(break_and_expect);
+    }
+
+    #[test]
+    fn test_hook_bounds_are_enforced() {
+        let break_and_expect: [HookBoundCase; 5] = [
+            (
+                |hook| hook.arguments = vec![String::new(); HOOK_ARGUMENTS_MAX + 1],
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "hooks.arguments",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |hook| {
+                    hook.guarantees = vec![
+                        HookGuarantee {
+                            kind: GuaranteeKind::BehaviorChecked,
+                            scope: CoverageScope::Reach {
+                                reach: crate::read::CoverageReach::Project,
+                            },
+                            detail: "the suite ran".to_owned(),
+                        };
+                        HOOK_GUARANTEES_MAX + 1
+                    ];
+                },
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "hooks.guarantees",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |hook| {
+                    hook.guarantees = vec![HookGuarantee {
+                        kind: GuaranteeKind::BehaviorChecked,
+                        scope: CoverageScope::Reach {
+                            reach: crate::read::CoverageReach::Project,
+                        },
+                        detail: String::new(),
+                    }];
+                },
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "hooks.guarantees.detail",
+                            ..
+                        }
                     )
                 },
             ),
@@ -1120,18 +1305,7 @@ mod tests {
                 },
             ),
         ];
-        for (break_bound, expected) in break_and_expect {
-            let mut broken = hook();
-            break_bound(&mut broken);
-            let configuration = WorkspaceConfiguration {
-                hooks: vec![broken],
-                ..WorkspaceConfiguration::default()
-            };
-            let violation = configuration
-                .validate()
-                .expect_err("the broken hook must be refused");
-            assert!(expected(&violation), "unexpected violation {violation:?}");
-        }
+        assert_hooks_refused(break_and_expect);
     }
 
     #[test]
@@ -1181,6 +1355,73 @@ mod tests {
     }
 
     #[test]
+    fn test_every_violation_variant_carries_its_evidence() {
+        let id = || "tests".to_owned();
+        let cases = [
+            (
+                ConfigurationViolation::LanguageSelectorInvalid {
+                    selector: "Python".to_owned(),
+                },
+                vec![("selector", "Python".to_owned())],
+            ),
+            (
+                ConfigurationViolation::EmbeddingModelInvalid {
+                    value: "spaced out".to_owned(),
+                },
+                vec![("value", "spaced out".to_owned())],
+            ),
+            (
+                ConfigurationViolation::HookIdDuplicate { id: id() },
+                vec![("id", id())],
+            ),
+            (
+                ConfigurationViolation::HookIdInvalid { id: id() },
+                vec![("id", id())],
+            ),
+            (
+                ConfigurationViolation::HookProgramEmpty { id: id() },
+                vec![("id", id())],
+            ),
+            (
+                ConfigurationViolation::HookExecutableAbsolute {
+                    id: id(),
+                    program: "/bin/echo".to_owned(),
+                },
+                vec![("id", id()), ("program", "/bin/echo".to_owned())],
+            ),
+            (
+                ConfigurationViolation::HookEnvironmentKeyInvalid {
+                    id: id(),
+                    key: "BAD=KEY".to_owned(),
+                },
+                vec![("id", id()), ("key", "BAD=KEY".to_owned())],
+            ),
+        ];
+        for (violation, expected) in cases {
+            assert_eq!(violation.evidence(), expected, "{violation:?}");
+        }
+    }
+
+    #[test]
+    fn test_hook_count_above_the_cap_is_refused() {
+        let hooks = (0..=HOOKS_MAX)
+            .map(|index| {
+                let mut numbered = hook();
+                numbered.id = format!("hook-{index}");
+                numbered
+            })
+            .collect();
+        let configuration = WorkspaceConfiguration {
+            hooks,
+            ..WorkspaceConfiguration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange { field: "hooks", .. })
+        ));
+    }
+
+    #[test]
     fn test_hook_round_trips_through_json_with_exact_wire_names() {
         let value = serde_json::to_value(hook()).expect("serialize");
         assert_eq!(value["type"], json!("command"));
@@ -1198,5 +1439,99 @@ mod tests {
         let duration = serde_json::to_value(schemars::schema_for!(Duration)).expect("schema");
         assert_eq!(duration["type"], json!("string"));
         assert_eq!(duration["pattern"], json!(DURATION_PATTERN));
+    }
+
+    /// Attribute arguments take only literals, so the schema attributes
+    /// restate the bound constants; this pins each advertised bound to the
+    /// constant `validate` enforces.
+    #[test]
+    fn test_schema_attribute_bounds_equal_the_enforced_constants() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let definitions = &schema["$defs"];
+        let execution = &definitions["ExecutionConfiguration"]["properties"];
+        let history = &definitions["HistoryConfiguration"]["properties"];
+        let search = &definitions["SearchConfiguration"]["properties"];
+        let hook = &definitions["CommandHook"]["properties"];
+        let guarantee = &definitions["HookGuarantee"]["properties"];
+        let cases = [
+            (
+                "hooks max",
+                &schema["properties"]["hooks"]["maxItems"],
+                json!(HOOKS_MAX),
+            ),
+            (
+                "allow max",
+                &execution["allow"]["maxItems"],
+                json!(EXECUTION_ALLOW_ITEMS_MAX),
+            ),
+            (
+                "concurrent min",
+                &execution["max_concurrent"]["minimum"],
+                json!(1),
+            ),
+            (
+                "concurrent max",
+                &execution["max_concurrent"]["maximum"],
+                json!(EXECUTION_CONCURRENT_MAX),
+            ),
+            (
+                "revisions min",
+                &history["max_revisions"]["minimum"],
+                json!(1),
+            ),
+            (
+                "revisions max",
+                &history["max_revisions"]["maximum"],
+                json!(HISTORY_REVISIONS_MAX),
+            ),
+            ("embedding min", &search["embedding"]["minLength"], json!(1)),
+            (
+                "embedding max",
+                &search["embedding"]["maxLength"],
+                json!(EMBEDDING_MODEL_BYTES_MAX),
+            ),
+            ("id min", &hook["id"]["minLength"], json!(1)),
+            ("id max", &hook["id"]["maxLength"], json!(HOOK_ID_BYTES_MAX)),
+            ("program min", &hook["program"]["minLength"], json!(1)),
+            (
+                "arguments max",
+                &hook["arguments"]["maxItems"],
+                json!(HOOK_ARGUMENTS_MAX),
+            ),
+            ("timeout min", &hook["timeout_ms"]["minimum"], json!(1)),
+            (
+                "timeout max",
+                &hook["timeout_ms"]["maximum"],
+                json!(HOOK_TIMEOUT_MS_MAX),
+            ),
+            (
+                "output min",
+                &hook["output_limit_bytes"]["minimum"],
+                json!(HOOK_OUTPUT_BYTES_MIN),
+            ),
+            (
+                "output max",
+                &hook["output_limit_bytes"]["maximum"],
+                json!(HOOK_OUTPUT_BYTES_MAX),
+            ),
+            (
+                "guarantees max",
+                &hook["guarantees"]["maxItems"],
+                json!(HOOK_GUARANTEES_MAX),
+            ),
+            ("detail min", &guarantee["detail"]["minLength"], json!(1)),
+            (
+                "detail max",
+                &guarantee["detail"]["maxLength"],
+                json!(HOOK_GUARANTEE_DETAIL_BYTES_MAX),
+            ),
+        ];
+        for (name, advertised, enforced) in cases {
+            assert_eq!(
+                advertised, &enforced,
+                "the schema's {name} bound must equal the enforced constant"
+            );
+        }
     }
 }

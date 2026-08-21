@@ -262,7 +262,7 @@ fn annotate_property(schema: &mut Schema, name: &str, key: &str, annotation: Val
 
 /// An [`ExecutionConfiguration`](crate::configuration::ExecutionConfiguration)
 /// states each `ByteSize` and `Duration` ceiling as `rift:range` on its key:
-/// schema validation alone cannot compare `"16KiB"` against a ceiling, so
+/// schema validation alone cannot compare `"16kb"` against a ceiling, so
 /// the server enforces the bound at load and the schema carries it for
 /// readers.
 pub fn declare_execution_ranges(schema: &mut Schema) {
@@ -591,9 +591,9 @@ mod tests {
             serde_json::to_value(schema_for!(crate::configuration::ExecutionConfiguration))
                 .expect("schema");
         let cases = [
-            ("max_code", json!({ "min": "1B", "max": "32KiB" })),
+            ("max_code", json!({ "min": "1b", "max": "32kb" })),
             ("max_timeout", json!({ "min": "1ms", "max": "1d" })),
-            ("max_output", json!({ "min": "0B", "max": "16KiB" })),
+            ("max_output", json!({ "min": "0b", "max": "16kb" })),
         ];
         for (name, admitted) in cases {
             assert_eq!(

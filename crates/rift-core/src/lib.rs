@@ -1,5 +1,6 @@
 //! Pure domain vocabulary and correctness primitives for Rift.
 
+mod configuration;
 mod error;
 mod identity;
 mod limits;

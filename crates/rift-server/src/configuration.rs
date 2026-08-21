@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
+use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
 
 /// Bytes a `rift.toml` may hold, at most. The file states bounded tables
@@ -67,12 +67,7 @@ impl Fault for ConfigurationFault {
             Self::Malformed { detail } => {
                 context.push(ErrorContext::new("detail", detail.clone()));
             }
-            Self::Invalid(violation) => {
-                context.push(ErrorContext::new("violation", fault_label(violation)));
-                for (key, value) in violation.evidence() {
-                    context.push(ErrorContext::new(key, value));
-                }
-            }
+            Self::Invalid(violation) => context.extend(violation.context()),
         }
         context
     }
@@ -139,7 +134,8 @@ mod tests {
 type = "command"
 id = "tests"
 kind = "test"
-argv = ["cargo", "test"]
+program = "cargo"
+arguments = ["test"]
 changed_paths = "none"
 working_directory = ""
 environment = {}
@@ -172,9 +168,9 @@ determinism = "deterministic"
             r#"
 [execution]
 allow = ["python"]
-max_code = "16KiB"
+max_code = "16kb"
 max_timeout = "30s"
-max_output = "8KiB"
+max_output = "8kb"
 max_concurrent = 2
 
 [providers.history]
@@ -201,14 +197,15 @@ embedding = "potion-retrieval-32M"
         let hook = &configuration.hooks[0];
         assert_eq!(hook.id, "tests");
         assert_eq!(hook.kind, HookKind::Test);
-        assert_eq!(hook.argv, ["cargo", "test"]);
+        assert_eq!(hook.program, "cargo");
+        assert_eq!(hook.arguments, ["test"]);
         assert_eq!(hook.changed_paths, ChangedPaths::None);
         assert_eq!(hook.determinism, Determinism::Deterministic);
     }
 
     #[test]
     fn test_unknown_key_is_refused_as_malformed() {
-        let error = admit_configuration("[execution]\nmax_codes = \"16KiB\"\n")
+        let error = admit_configuration("[execution]\nmax_codes = \"16kb\"\n")
             .expect_err("an unknown key must refuse the file");
         assert!(matches!(
             error.fault(),
@@ -260,8 +257,7 @@ embedding = "potion-retrieval-32M"
 
     #[test]
     fn test_absolute_hook_executable_is_refused() {
-        let broken =
-            DOCUMENTED_HOOK.replace("argv = [\"cargo\", \"test\"]", "argv = [\"/bin/cargo\"]");
+        let broken = DOCUMENTED_HOOK.replace("program = \"cargo\"", "program = \"/bin/cargo\"");
         let error = admit_configuration(&broken)
             .expect_err("an absolute executable path must refuse the file");
         assert!(
@@ -279,6 +275,11 @@ embedding = "potion-retrieval-32M"
             error.fault(),
             ConfigurationFault::Oversized { .. }
         ));
+        let message = error.to_string();
+        assert!(
+            message.contains("bytes") && message.contains("bytes_max 262144"),
+            "the refusal must name the size and the admitted maximum: {message}"
+        );
     }
 
     #[test]
@@ -289,5 +290,10 @@ embedding = "potion-retrieval-32M"
         let error = load_configuration(directory.path())
             .expect_err("a directory in the file's place must fail to read");
         assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
+        let message = error.to_string();
+        assert!(
+            message.contains("path ") && message.contains("io "),
+            "the refusal must carry the path and the I/O account: {message}"
+        );
     }
 }
