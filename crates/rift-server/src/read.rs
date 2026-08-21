@@ -4,7 +4,7 @@ use std::path::Path;
 use data_encoding::BASE32_NOPAD;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_core::ProjectPath as CoreProjectPath;
-use rift_core::constants::{RUST_READ_PROVIDER_ID, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS};
+use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_PROVIDER_ID};
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
 use rift_index::{
     IndexedFile, SymbolMatch, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
@@ -12,9 +12,10 @@ use rift_index::{
 use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
     FactFamily, FileId, Freshness, GetSymbolHit, GetSymbolParams, GetSymbolResult, IndexSnapshot,
-    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProviderId, ProviderOrigin,
-    ReadSnapshot, SearchScope, SemanticCoverage, SourceExcerpt, SourceKind, SourceLocation,
-    SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProjectPath, ProviderId,
+    ProviderOrigin, ReadSnapshot, SearchScope, SemanticCoverage, SourceExcerpt, SourceKind,
+    SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
+    TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -158,16 +159,16 @@ impl ReadService {
         visibility: &SourceVisibility,
     ) -> Result<Self, ReadError> {
         let index = WorkspaceIndex::build(root, limits, visibility).map_err(ReadFault::index)?;
-        let digest = workspace_digest(&index);
+        let revision = wire_digest(&workspace_digest(&index));
         let snapshot = ReadSnapshot {
-            tree_revision: Digest(digest.clone()),
+            tree_revision: revision.clone(),
             index: Some(IndexSnapshot {
-                revision: Digest(digest.clone()),
-                tree_revision: Digest(digest.clone()),
+                revision: revision.clone(),
+                tree_revision: revision.clone(),
                 freshness: Freshness::Current,
-                source_revision: Digest(digest.clone()),
+                source_revision: revision.clone(),
             }),
-            source_revision: Digest(digest),
+            source_revision: revision,
         };
         Ok(Self { index, snapshot })
     }
@@ -215,7 +216,7 @@ impl ReadService {
         Ok(NodesResult {
             nodes,
             source,
-            coverage: semantic_coverage(FactFamily::Nodes),
+            coverage: semantic_coverage(FactFamily::Nodes, &self.snapshot),
             snapshot: self.snapshot.clone(),
         })
     }
@@ -252,7 +253,7 @@ impl ReadService {
             .collect();
         Ok(GetSymbolResult {
             hits,
-            coverage: complete_coverage(),
+            coverage: complete_coverage(&self.snapshot),
             next_cursor: None,
             snapshot: self.snapshot.clone(),
         })
@@ -394,12 +395,18 @@ pub(crate) fn file_id(file: &IndexedFile) -> FileId {
     FileId(format!("rift://file/{}", encode_path(file.path().as_str())))
 }
 
+/// Mints the project resolver's source-unit identity: the resolver name, then the
+/// project-relative path as the resolver's own canonical unit key.
 pub(crate) fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
-    let digest = Sha256::digest(file.path().as_str().as_bytes());
     SourceUnitId(format!(
-        "rift://source/src_{}",
-        digest_prefix_base32(&digest)
+        "rift://source/project/{}",
+        encode_path(file.path().as_str())
     ))
+}
+
+/// Project-relative path of one indexed file, as the wire model carries it.
+pub(crate) fn project_path(file: &IndexedFile) -> ProjectPath {
+    ProjectPath(file.path().as_str().to_owned())
 }
 
 fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
@@ -435,13 +442,9 @@ fn workspace_digest(index: &WorkspaceIndex) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Renders the leading `SOURCE_UNIT_DIGEST_CHARS` base32 characters of one digest.
-///
-/// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with
-/// `O`, `I`, `B`, and `g`; source-unit identities use its lowercase form.
-/// The witness a node address carries: the first eight lowercase hex
-/// characters of the SHA-256 of the node's source bytes. Recomputing it is
-/// how resolution proves the bytes behind an address have not drifted.
+/// The witness a node address carries: the first eight lowercase hex characters of the
+/// SHA-256 of the node's source bytes. Recomputing it is how resolution proves the bytes
+/// behind an address have not drifted.
 pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
     let start = usize::try_from(range.start)
         .unwrap_or(source.len())
@@ -449,16 +452,32 @@ pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
     let end = usize::try_from(range.end)
         .unwrap_or(source.len())
         .min(source.len());
-    let fingerprint = Sha256::digest(source.get(start..end).unwrap_or_default().as_bytes());
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        fingerprint[0], fingerprint[1], fingerprint[2], fingerprint[3]
-    )
+    digest_hex8(source.get(start..end).unwrap_or_default())
 }
 
+/// First `DIGEST_WIRE_CHARS` lowercase hex characters of the SHA-256 of `source` — the sole
+/// wire constructor for a witness or a `Digest`. A 64-character digest reaching the wire is a
+/// defect this stays the single choke point against.
+pub(crate) fn digest_hex8(source: &str) -> String {
+    let fingerprint = Sha256::digest(source.as_bytes());
+    format!("{fingerprint:x}")[..DIGEST_WIRE_CHARS].to_owned()
+}
+
+/// Truncates an already-hashed full-length hex digest to its wire form. `full` keeps
+/// collision resistance for internal identity computation; only the truncated form crosses
+/// the wire boundary.
+fn wire_digest(full: &str) -> Digest {
+    Digest(full[..DIGEST_WIRE_CHARS].to_owned())
+}
+
+/// Renders the leading `OPAQUE_ID_DIGEST_CHARS` base32 characters of one digest, minting an
+/// opaque `chg_`-style identity.
+///
+/// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with `O`, `I`, `B`, and
+/// `g`; opaque identities use its lowercase form.
 pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
     let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
-    encoded.truncate(SOURCE_UNIT_DIGEST_CHARS);
+    encoded.truncate(OPAQUE_ID_DIGEST_CHARS);
     encoded
 }
 
@@ -490,8 +509,13 @@ pub(crate) fn encode_path(value: &str) -> String {
     utf8_percent_encode(value, PATH_ESCAPE_SET).to_string()
 }
 
-pub(crate) fn complete_coverage() -> Coverage {
-    let revision = Digest("0".repeat(SHA256_HEX_LENGTH));
+/// Complete coverage for a request served in full from `snapshot`, carrying the real
+/// revisions the answer used — never a fabricated digest.
+pub(crate) fn complete_coverage(snapshot: &ReadSnapshot) -> Coverage {
+    let revision = snapshot.index.as_ref().map_or_else(
+        || snapshot.tree_revision.clone(),
+        |index| index.revision.clone(),
+    );
     Coverage::Complete {
         state: CoverageCompleteState::Complete,
         scope: CoverageScope::Reach {
@@ -499,16 +523,16 @@ pub(crate) fn complete_coverage() -> Coverage {
         },
         origins: vec![ProviderOrigin {
             provider: ProviderId(RUST_READ_PROVIDER_ID.to_owned()),
-            revision: revision.clone(),
-            tree_revision: revision.clone(),
+            revision,
+            tree_revision: snapshot.tree_revision.clone(),
             freshness: Freshness::Current,
-            source_revision: revision,
+            source_revision: snapshot.source_revision.clone(),
         }],
     }
 }
 
-fn semantic_coverage(family: FactFamily) -> SemanticCoverage {
-    SemanticCoverage(BTreeMap::from([(family, complete_coverage())]))
+fn semantic_coverage(family: FactFamily, snapshot: &ReadSnapshot) -> SemanticCoverage {
+    SemanticCoverage(BTreeMap::from([(family, complete_coverage(snapshot))]))
 }
 
 /// Finds the symbol a witnessed syntax node belongs to.
@@ -705,8 +729,23 @@ pub fn compute() -> i32 {
         );
         assert_eq!(
             value["snapshot"]["tree_revision"].as_str().map(str::len),
-            Some(64)
+            Some(8)
         );
+        Ok(())
+    }
+
+    /// The wire `Digest` truncates to eight characters, but the internal identity computation
+    /// it truncates from keeps its full sixty-four-character SHA-256, unchanged from before
+    /// this release: freshness and any future identity comparison still work off the strong
+    /// hash, not the short wire witness.
+    #[test]
+    fn workspace_digest_keeps_its_full_hash_before_wire_truncation() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let full = super::workspace_digest(service.index());
+        assert_eq!(full.len(), 64);
+        let wire = &service.snapshot().tree_revision.0;
+        assert_eq!(wire.len(), 8);
+        assert!(full.starts_with(wire.as_str()));
         Ok(())
     }
 
@@ -729,7 +768,27 @@ pub fn compute() -> i32 {
                 .is_some_and(|id| id.contains("/Beacon"))
         );
         assert_eq!(value["hits"][0]["source"]["text"], "pub struct Beacon;");
+        assert_eq!(
+            value["hits"][0]["symbol"]["origin"]["unit"],
+            json!("rift://source/project/src/lib.rs")
+        );
         assert_eq!(value["next_cursor"], Value::Null);
+        Ok(())
+    }
+
+    /// `complete_coverage` fills its `ProviderOrigin` from the snapshot the answer actually
+    /// used; a fabricated all-zero digest here would be a defect.
+    #[test]
+    fn get_symbol_coverage_origins_carry_the_snapshots_real_revisions() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let snapshot_tree = value["snapshot"]["tree_revision"].clone();
+        let snapshot_source = value["snapshot"]["source_revision"].clone();
+        let origin = &value["coverage"]["origins"][0];
+        assert_eq!(origin["tree_revision"], snapshot_tree);
+        assert_eq!(origin["source_revision"], snapshot_source);
+        assert_ne!(origin["tree_revision"], json!("00000000"));
         Ok(())
     }
 

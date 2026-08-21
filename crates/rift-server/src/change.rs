@@ -25,7 +25,9 @@ use rift_syntax::{ByteRange, RustSource, RustSyntaxLimits, RustSyntaxProvider};
 use sha2::{Digest as _, Sha256};
 
 use crate::patch::{self, FileRewrite, RewriteKind};
-use crate::read::{ReadError, ReadFault, ReadService, encode_path, file_id, node_witness};
+use crate::read::{
+    ReadError, ReadFault, ReadService, digest_hex8, encode_path, file_id, node_witness,
+};
 
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
@@ -690,15 +692,6 @@ fn decoded(encoded: &str) -> Option<String> {
         .decode_utf8()
         .ok()
         .map(std::borrow::Cow::into_owned)
-}
-
-/// First eight hex characters of the SHA-256 of one source text.
-pub(crate) fn digest_hex8(source: &str) -> String {
-    let digest = Sha256::digest(source.as_bytes());
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3]
-    )
 }
 
 /// Mints the identity of one landed change from its path and result bytes.

@@ -387,8 +387,8 @@
             ]
           },
           "Digest": {
-            "description": "SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes\nthe algorithm so every consumer produces the same identity for the same bytes.",
-            "pattern": "^[0-9a-f]{64}$",
+            "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+            "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
           "Documentation": {
@@ -1279,8 +1279,10 @@
             ]
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog. Rift derives it from the\nresolver identity and that resolver's canonical unit key, so the same installed source\nkeeps its identity across catalog revisions.",
-            "pattern": "^rift://source/src_[a-z2-7]{26}$",
+            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding — for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
             "type": "string"
           },
           "SourceUnitSpan": {
@@ -3081,8 +3083,8 @@
             ]
           },
           "Digest": {
-            "description": "SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes\nthe algorithm so every consumer produces the same identity for the same bytes.",
-            "pattern": "^[0-9a-f]{64}$",
+            "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+            "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
           "ExactKind": {
@@ -3534,8 +3536,10 @@
             "type": "object"
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog. Rift derives it from the\nresolver identity and that resolver's canonical unit key, so the same installed source\nkeeps its identity across catalog revisions.",
-            "pattern": "^rift://source/src_[a-z2-7]{26}$",
+            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding — for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
             "type": "string"
           },
           "SourceUnitSpan": {
@@ -6778,7 +6782,7 @@
             "oneOf": [
               {
                 "const": "source",
-                "description": "The source around each hit, with its span.",
+                "description": "The source text around each hit.",
                 "type": "string"
               },
               {
@@ -7597,8 +7601,8 @@
             ]
           },
           "Digest": {
-            "description": "SHA-256 of the value being identified, lowercase hex, 64 characters. The contract fixes\nthe algorithm so every consumer produces the same identity for the same bytes.",
-            "pattern": "^[0-9a-f]{64}$",
+            "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+            "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
           "Documentation": {
@@ -8243,6 +8247,12 @@
             ],
             "type": "object"
           },
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "maxLength": 1000,
+            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "type": "string"
+          },
           "ProviderId": {
             "description": "Stable identity of one provider implementation. The identity remains unchanged across\nprovider restarts and fact revisions, so callers can compare origins from separate\nanswers.",
             "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
@@ -8652,7 +8662,7 @@
               },
               "distance": {
                 "default": null,
-                "description": "Number of edges in `path`. It is present exactly when `path` is present and equals\nits length.",
+                "description": "Number of edges in `traversal_path`. It is present exactly when `traversal_path` is\npresent and equals its length.",
                 "format": "uint64",
                 "maximum": 2,
                 "minimum": 1,
@@ -8683,17 +8693,16 @@
                 "type": "array"
               },
               "path": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProjectPath"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
                 "default": null,
-                "description": "Shortest relationship path from `traversal.seed` to this hit. Present whenever the\ntraversal reached the hit, including a hit also matched lexically.",
-                "items": {
-                  "$ref": "#/$defs/GraphHop"
-                },
-                "maxItems": 2,
-                "minItems": 1,
-                "type": [
-                  "array",
-                  "null"
-                ]
+                "description": "Project-relative path of the hit, where the location is a project path. Null for a\nhit whose only location is a dependency or standard-library source unit."
               },
               "relationships": {
                 "default": null,
@@ -8712,16 +8721,12 @@
                 "type": "number"
               },
               "source": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SourceExcerpt"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
                 "default": null,
-                "description": "The source around the hit, requested with `include: [\"source\"]`. Carries its span,\nso the caller can act on what it read without searching for it again."
+                "description": "The source text around the hit, requested with `include: [\"source\"]`. Covers the\nhit's `span`; a caller that needs the range already has it there.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "span": {
                 "anyOf": [
@@ -8734,6 +8739,19 @@
                 ],
                 "default": null,
                 "description": "Where the hit is written in the source catalog. Null for a symbol whose source is\nunavailable or synthetic."
+              },
+              "traversal_path": {
+                "default": null,
+                "description": "Shortest relationship path from `traversal.seed` to this hit. Present whenever the\ntraversal reached the hit, including a hit also matched lexically.",
+                "items": {
+                  "$ref": "#/$defs/GraphHop"
+                },
+                "maxItems": 2,
+                "minItems": 1,
+                "type": [
+                  "array",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -8985,25 +9003,6 @@
             ],
             "type": "object"
           },
-          "SourceExcerpt": {
-            "additionalProperties": false,
-            "description": "A copy of source from the catalog. The unit may belong to the project, a dependency, or\nthe standard library; the excerpt preserves bytes as they were when the answer was\nproduced.",
-            "properties": {
-              "span": {
-                "$ref": "#/$defs/SourceUnitSpan",
-                "description": "The source unit and byte range the text was taken from."
-              },
-              "text": {
-                "description": "The source bytes returned by the request.",
-                "type": "string"
-              }
-            },
-            "required": [
-              "span",
-              "text"
-            ],
-            "type": "object"
-          },
           "SourceKind": {
             "description": "How source or a declaration came to exist.",
             "oneOf": [
@@ -9122,8 +9121,10 @@
             "type": "object"
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog. Rift derives it from the\nresolver identity and that resolver's canonical unit key, so the same installed source\nkeeps its identity across catalog revisions.",
-            "pattern": "^rift://source/src_[a-z2-7]{26}$",
+            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding — for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
             "type": "string"
           },
           "SourceUnitSpan": {

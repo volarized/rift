@@ -20,8 +20,7 @@ use rift_protocol::change::{
     PreconditionValue, RefusalReason,
 };
 
-use crate::change::digest_hex8;
-use crate::read::{ReadError, ReadFault, ReadService};
+use crate::read::{ReadError, ReadFault, ReadService, digest_hex8};
 
 /// Most files one unified diff may address.
 pub(crate) const PATCH_FILES_MAX: usize = 64;

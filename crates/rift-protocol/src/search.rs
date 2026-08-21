@@ -4,8 +4,8 @@
 //! paths keep resolving.
 
 use crate::read::{
-    Coverage, Cursor, DiagnosticContext, File, Node, ProjectionId, ReadSnapshot, Relationship,
-    RelationshipFacet, SearchScope, SourceExcerpt, SourceUnitSpan, Symbol, SymbolId,
+    Coverage, Cursor, DiagnosticContext, File, Node, ProjectPath, ProjectionId, ReadSnapshot,
+    Relationship, RelationshipFacet, SearchScope, SourceUnitSpan, Symbol, SymbolId,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -279,10 +279,10 @@ pub struct SearchHit {
     /// Edges from this hit, requested with `include: ["relationships"]`.
     #[serde(default)]
     pub relationships: Option<Vec<Relationship>>,
-    /// The source around the hit, requested with `include: ["source"]`. Carries its span,
-    /// so the caller can act on what it read without searching for it again.
+    /// The source text around the hit, requested with `include: ["source"]`. Covers the
+    /// hit's `span`; a caller that needs the range already has it there.
     #[serde(default)]
-    pub source: Option<SourceExcerpt>,
+    pub source: Option<String>,
     /// What providers reported here, requested with `include: ["diagnostics"]`.
     #[serde(default)]
     pub diagnostics: Option<Vec<DiagnosticContext>>,
@@ -294,13 +294,17 @@ pub struct SearchHit {
     #[serde(default)]
     #[schemars(range(min = 1_u64))]
     pub line: Option<u64>,
+    /// Project-relative path of the hit, where the location is a project path. Null for a
+    /// hit whose only location is a dependency or standard-library source unit.
+    #[serde(default)]
+    pub path: Option<ProjectPath>,
     /// Shortest relationship path from `traversal.seed` to this hit. Present whenever the
     /// traversal reached the hit, including a hit also matched lexically.
     #[serde(default)]
     #[schemars(length(min = 1, max = 2))]
-    pub path: Option<Vec<GraphHop>>,
-    /// Number of edges in `path`. It is present exactly when `path` is present and equals
-    /// its length.
+    pub traversal_path: Option<Vec<GraphHop>>,
+    /// Number of edges in `traversal_path`. It is present exactly when `traversal_path` is
+    /// present and equals its length.
     #[serde(default)]
     #[schemars(range(min = 1_u64, max = 2_u64))]
     pub distance: Option<u64>,
@@ -335,7 +339,7 @@ pub enum SearchHitTarget {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SearchInclude {
-    /// The source around each hit, with its span.
+    /// The source text around each hit.
     Source,
     /// Rendered signatures for symbol hits.
     Signature,

@@ -214,6 +214,79 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     );
 }
 
+/// Whether every byte of `text` is a lowercase hex digit.
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Walks `value`, refusing a bare 64-character lowercase-hex string anywhere on the wire: the
+/// only digest form the wire now carries is the eight-character witness.
+fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
+    match value {
+        Value::String(text) => assert!(
+            !(text.len() == 64 && is_lowercase_hex(text)),
+            "{context} must not carry a bare 64-character digest, only the 8-character wire \
+             form: {text}"
+        ),
+        Value::Array(items) => {
+            for item in items {
+                assert_no_bare_sha256_digest(item, context);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                assert_no_bare_sha256_digest(item, context);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Proves one tool result carries no oversized digest and no non-project source-unit
+/// resolver, and that every `search` hit names its project-relative path.
+fn assert_wire_hygiene(name: &str, structured: &Value) {
+    let context = format!("{name} result");
+    assert_no_bare_sha256_digest(structured, &context);
+    assert_source_unit_ids_use_project_resolver(structured, &context);
+    if name == "search"
+        && let Some(results) = structured["results"].as_array()
+    {
+        for hit in results {
+            assert!(
+                !hit["path"].is_null(),
+                "a search hit's path must not be null: {hit:#}"
+            );
+        }
+    }
+}
+
+/// Walks `value`, proving every `rift://source/` identity uses the project resolver: the
+/// only source resolver this release serves.
+fn assert_source_unit_ids_use_project_resolver(value: &Value, context: &str) {
+    match value {
+        Value::String(text) => {
+            if let Some(rest) = text.strip_prefix("rift://source/") {
+                assert!(
+                    rest.starts_with("project/"),
+                    "{context} source-unit id must use the project resolver: {text}"
+                );
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_source_unit_ids_use_project_resolver(item, context);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                assert_source_unit_ids_use_project_resolver(item, context);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 /// Builds the shared fixture workspace and serves it to one client.
 async fn served_fixture() -> TestResult<(
     tempfile::TempDir,
@@ -309,6 +382,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 .structured_content
                 .ok_or_else(|| format!("{name} must return structured content"))?;
             assert_validates(output_validator, &structured, &format!("{name} result"));
+            assert_wire_hygiene(name, &structured);
             match structured["status"].as_str() {
                 Some("applied") => {
                     applied_changes += 1;

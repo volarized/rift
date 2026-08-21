@@ -8,13 +8,13 @@ use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT};
 use rift_index::{PathMatcher, SymbolMatch, SymbolMatchRank, WorkspaceIndex};
 use rift_protocol::read::{
     File, FileContent, MatchedField, PathPattern, PathSelector, SearchHit, SearchHitTarget,
-    SearchParams, SearchParamsTarget, SearchResult, SourceExcerpt,
+    SearchParams, SearchParamsTarget, SearchResult,
 };
 use rift_syntax::ByteRange;
 
 use crate::read::{
     ReadError, ReadFault, ReadService, admitted_limit, complete_coverage, excerpt, file_id,
-    rust_language, source_span, validate_common, wire_symbol,
+    project_path, rust_language, source_span, validate_common, wire_symbol,
 };
 
 impl ReadService {
@@ -72,9 +72,10 @@ impl ReadService {
             )?;
         }
         results.truncate(limit);
+        let snapshot = self.snapshot().clone();
         Ok(SearchResult {
-            snapshot: self.snapshot().clone(),
-            coverage: complete_coverage(),
+            coverage: complete_coverage(&snapshot),
+            snapshot,
             results,
             next_cursor: None,
         })
@@ -222,14 +223,15 @@ fn symbol_search_hit(matched: SymbolMatch<'_>) -> SearchHit {
         score,
         matched_by: vec![MatchedField::Name],
         relationships: None,
-        source: Some(excerpt(matched.file, matched.symbol.range)),
+        source: Some(excerpt(matched.file, matched.symbol.range).text),
         diagnostics: None,
         span: Some(source_span(matched.file, matched.symbol.range)),
         line: Some(line_number(
             matched.file.source(),
             matched.symbol.range.start,
         )),
-        path: None,
+        path: Some(project_path(matched.file)),
+        traversal_path: None,
         distance: None,
     }
 }
@@ -254,14 +256,12 @@ fn file_search_hit(file: &rift_index::IndexedFile, line: usize, text: String) ->
         score: 1.0,
         matched_by: vec![MatchedField::Content],
         relationships: None,
-        source: Some(SourceExcerpt {
-            span: source_span(file, range),
-            text,
-        }),
+        source: Some(text),
         diagnostics: None,
         span: Some(source_span(file, range)),
         line: Some(u64::try_from(line).unwrap_or(u64::MAX)),
-        path: None,
+        path: Some(project_path(file)),
+        traversal_path: None,
         distance: None,
     }
 }
@@ -441,8 +441,82 @@ pub fn compute() -> i32 {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0]["hit"]["target"], "symbol");
         assert_eq!(results[0]["score"], 1.0);
+        assert_eq!(results[0]["path"], json!("src/lib.rs"));
         assert_eq!(results[2]["hit"]["target"], "file");
         assert_eq!(results[2]["line"], 1);
+        assert!(
+            results[2]["path"]
+                .as_str()
+                .is_some_and(|path| !path.is_empty()),
+            "the file hit must carry a non-empty project-relative path: {:#?}",
+            results[2]
+        );
+        Ok(())
+    }
+
+    /// A symbol hit's `path` used to render `null`, with the project-relative location
+    /// reachable only by parsing the symbol's own id.
+    #[test]
+    fn search_hits_carry_project_relative_path_for_nested_files() -> TestResult {
+        let (_directory, service) = multi_file_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "target": "symbol",
+            "limit": 10
+        }))?;
+        let value = serde_json::to_value(service.search(&params)?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert!(!results.is_empty());
+        assert!(
+            results
+                .iter()
+                .all(|hit| hit["path"].as_str().is_some_and(|path| !path.is_empty())),
+            "every symbol hit must carry a non-empty project-relative path: {results:#?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|hit| hit["path"] == json!("src/nested/deep.rs")),
+            "the nested file's hit must carry its nested project-relative path: {results:#?}"
+        );
+        Ok(())
+    }
+
+    /// The excerpt used to duplicate the hit's own `span` inside `source`; it now carries
+    /// text only, and the span a caller needs is the one already on the hit.
+    #[test]
+    fn search_hit_source_excerpt_is_text_only_with_no_duplicate_span() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "Beacon",
+            "target": "symbol",
+            "include": ["source"],
+            "limit": 1
+        }))?;
+        let value = serde_json::to_value(service.search(&params)?)?;
+        let hit = &value["results"][0];
+        assert!(
+            hit["source"].is_string(),
+            "excerpt must serialize as a bare string, not an object carrying a span: {hit}"
+        );
+        assert_eq!(hit["source"], json!("pub struct Beacon;"));
+        assert_eq!(hit["span"]["range"]["start"], 0);
+        Ok(())
+    }
+
+    /// `complete_coverage` used to fill every origin revision with an all-zero digest; the
+    /// search answer now carries the snapshot's real revisions.
+    #[test]
+    fn search_result_origins_carry_the_snapshots_real_revisions() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon"}))?;
+        let value = serde_json::to_value(service.search(&params)?)?;
+        let snapshot_tree = value["snapshot"]["tree_revision"].clone();
+        let snapshot_source = value["snapshot"]["source_revision"].clone();
+        let origin = &value["coverage"]["origins"][0];
+        assert_eq!(origin["tree_revision"], snapshot_tree);
+        assert_eq!(origin["source_revision"], snapshot_source);
+        assert_ne!(origin["tree_revision"], json!("00000000"));
         Ok(())
     }
 
@@ -552,7 +626,7 @@ pub fn compute() -> i32 {
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 1);
         assert!(results[0]["line"].as_u64().is_some_and(|line| line > 1));
-        assert_eq!(results[0]["source"]["text"], "    // lookout marker");
+        assert_eq!(results[0]["source"], "    // lookout marker");
         Ok(())
     }
 
