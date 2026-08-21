@@ -5,7 +5,7 @@ title: Configuration
 <VersionBadge version="v0.0.5" />
 
 Rift reads `rift.toml` from the workspace root. The generated
-[`rift.schema.json`](https://github.com/volarized/rift/blob/main/docs/protocol/rift.schema.json)
+[`rift.schema.json`](https://volar.sh/rift/rift.schema.json)
 defines the file and rejects any key it doesn't know, so a typo fails at load rather than being
 silently ignored. Edits take effect for later requests once validation passes; while the file is
 invalid, requests fail with `configuration_invalid` until you fix it.
@@ -13,7 +13,7 @@ invalid, requests fail with `configuration_invalid` until you fix it.
 An editor that supports TOML schema directives can load the generated schema:
 
 ```toml
-#:schema https://raw.githubusercontent.com/volarized/rift/main/docs/protocol/rift.schema.json
+#:schema https://volar.sh/rift/rift.schema.json
 ```
 
 Treat `rift.toml` as executable workspace configuration. Hooks named by a repository run after
@@ -32,26 +32,27 @@ until you name the languages it's allowed for. A selector is a language name, or
 ```toml
 [execution]
 allow = ["python"]
-max_code = "16KiB"
+max_code = "16kb"
 max_timeout = "30s"
-max_output = "8KiB"
+max_output = "8kb"
 max_concurrent = 2
 ```
 
 Every key below `allow` is shown at its default:
 
-- `max_code` bounds one submitted block, 1B to 32KiB
+- `max_code` bounds one submitted block, 1b to 32kb
 - `max_timeout` bounds one evaluation, 1ms to 1d — the evaluation only: refreshing the
   execution copy is extra, and a refresh that outruns the same bound fails the call with
   `deadline_exceeded`
-- `max_output` bounds each captured stream separately, up to 16KiB, so a program that floods
+- `max_output` bounds each captured stream separately, up to 16kb, so a program that floods
   stdout gets a prefix and a byte count rather than a hung request
 - `max_concurrent` caps evaluations running at once across the whole workspace, 1 to 64
 
 The schema states each range as `rift:range` on the key, and the server enforces it at load —
-schema validation alone can't compare `"16KiB"` against a ceiling.
+schema validation alone can't compare `"16kb"` against a ceiling.
 
-Durations take `ms`, `s`, `m`, `h`, or `d`; byte sizes take `B`, `KiB`, `MiB`, `GiB`, or `TiB`.
+Durations take `ms`, `s`, `m`, `h`, or `d`; byte sizes take `b`, `kb`, `mb`, `gb`, or
+`tb` — binary units, so `1kb` is 1024 bytes.
 
 A runtime has to serve the language as well. Listing a language under `allow` does nothing when
 no runtime serves it. The [`rift://workspace`](/docs/protocol/mcp#resource-workspace)
@@ -111,7 +112,8 @@ shell — is the only type:
 type = "command"
 id = "tests"
 kind = "test"
-argv = ["cargo", "test"]
+program = "cargo"
+arguments = ["test"]
 changed_paths = "none"
 working_directory = ""
 environment = {}
@@ -124,12 +126,13 @@ determinism = "deterministic"
 The keys that shape how the command runs:
 
 - `id` — unique within the list, labels the result
-- `argv` — refuses an absolute executable path; a bare name resolves through the `PATH` of the
+- `program` — refuses an absolute path; a bare name resolves through the `PATH` of the
   environment the command runs with — the server's, with `environment` applied on top — and a
   relative one below `working_directory`, which is itself relative to the workspace root; its
   empty value selects the root
-- `changed_paths` — `"append"` adds the changed project paths to `argv` in byte order, for a
-  linter that takes files; `"none"` leaves `argv` alone
+- `arguments` — the program's literal arguments, in order; may be empty
+- `changed_paths` — `"append"` adds the changed project paths after `arguments` in byte order,
+  for a linter that takes files; `"none"` leaves the command alone
 
 A hook runs the tree it checks — `cargo test` compiles the very change it's checking — so
 a configured hook executes the agent's change each time one applies.
