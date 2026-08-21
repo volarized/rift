@@ -4,22 +4,17 @@ use std::path::Path;
 use data_encoding::BASE32_NOPAD;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_core::ProjectPath as CoreProjectPath;
-use rift_core::constants::{
-    RUST_READ_PROVIDER_ID, SEARCH_RESULTS_DEFAULT, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS,
-};
+use rift_core::constants::{RUST_READ_PROVIDER_ID, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS};
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
 use rift_index::{
-    IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
-    WorkspaceIndexLimits,
+    IndexedFile, SymbolMatch, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
 };
 use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
-    FactFamily, File, FileContent, FileId, Freshness, GetSymbolHit, GetSymbolParams,
-    GetSymbolResult, IndexSnapshot, Language, MatchedField, Node, NodeFacet, NodeId, NodesParams,
-    NodesResult, ProviderId, ProviderOrigin, ReadSnapshot, SearchHit, SearchHitTarget,
-    SearchParams, SearchParamsTarget, SearchResult, SearchScope, SemanticCoverage, SourceExcerpt,
-    SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TextRange,
+    FactFamily, FileId, Freshness, GetSymbolHit, GetSymbolParams, GetSymbolResult, IndexSnapshot,
+    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProviderId, ProviderOrigin,
+    ReadSnapshot, SearchScope, SemanticCoverage, SourceExcerpt, SourceKind, SourceLocation,
+    SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -134,7 +129,7 @@ impl ReadFault {
         })
     }
 
-    fn index(source: WorkspaceIndexError) -> ReadError {
+    pub(crate) fn index(source: WorkspaceIndexError) -> ReadError {
         Error::new(Self::Index(source))
     }
 }
@@ -180,6 +175,11 @@ impl ReadService {
     /// Returns the immutable workspace index this snapshot serves.
     pub(crate) const fn index(&self) -> &WorkspaceIndex {
         &self.index
+    }
+
+    /// Returns the tree and index revisions captured for this snapshot.
+    pub(crate) const fn snapshot(&self) -> &ReadSnapshot {
+        &self.snapshot
     }
 
     /// Reads Rust syntax nodes covering one UTF-8 byte position.
@@ -257,58 +257,11 @@ impl ReadService {
             snapshot: self.snapshot.clone(),
         })
     }
-
-    /// Searches Rust declarations and source lines.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] for deferred filters, traversal, cursors, projections, or scopes.
-    pub fn search(&self, params: &SearchParams) -> Result<SearchResult, ReadError> {
-        validate_search(params)?;
-        let query = params
-            .query
-            .as_deref()
-            .ok_or_else(|| ReadFault::invalid("query", "missing"))?;
-        if query.is_empty() {
-            return Err(ReadFault::invalid("query", "empty"));
-        }
-        let limit = admitted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
-        let mut results = Vec::new();
-        if matches!(
-            params.target,
-            SearchParamsTarget::All | SearchParamsTarget::Symbol
-        ) {
-            for matched in self.index.symbols(query, limit).map_err(ReadFault::index)? {
-                results.push(symbol_search_hit(matched));
-            }
-        }
-        if results.len() < limit
-            && matches!(
-                params.target,
-                SearchParamsTarget::All | SearchParamsTarget::File
-            )
-        {
-            for (file, line, text) in self
-                .index
-                .source_matches(query, limit - results.len())
-                .map_err(ReadFault::index)?
-            {
-                results.push(file_search_hit(file, line, text));
-            }
-        }
-        results.truncate(limit);
-        Ok(SearchResult {
-            snapshot: self.snapshot.clone(),
-            coverage: complete_coverage(),
-            results,
-            next_cursor: None,
-        })
-    }
 }
 
 /// Admits a caller-supplied result limit: positive, and inside this
 /// platform's addressable range.
-fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
+pub(crate) fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
     if requested == 0 {
         return Err(ReadFault::invalid("limit", "zero"));
     }
@@ -316,27 +269,16 @@ fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
         .map_err(|_| ReadFault::invalid("limit", format!("{requested} exceeds this platform")))
 }
 
-fn validate_common(cursor: bool, projection: bool, scope: SearchScope) -> Result<(), ReadError> {
+pub(crate) fn validate_common(
+    cursor: bool,
+    projection: bool,
+    scope: SearchScope,
+) -> Result<(), ReadError> {
     if cursor || projection {
         return Err(ReadFault::unsupported("cursor and projection reads"));
     }
     if scope == SearchScope::Dependencies {
         return Err(ReadFault::unsupported("dependency reads"));
-    }
-    Ok(())
-}
-
-fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
-    validate_common(
-        params.cursor.is_some(),
-        params.projection.is_some(),
-        params.scope,
-    )?;
-    if params.filter.is_some() || params.paths.is_some() || params.traversal.is_some() {
-        return Err(ReadFault::unsupported("filtered and traversal search"));
-    }
-    if params.target == SearchParamsTarget::Node {
-        return Err(ReadFault::unsupported("node search"));
     }
     Ok(())
 }
@@ -380,7 +322,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
     )
 }
 
-fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
+pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
     let symbol = matched.symbol;
     Symbol {
         id: symbol_id(matched.file, symbol),
@@ -413,60 +355,7 @@ fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
     }
 }
 
-fn symbol_search_hit(matched: SymbolMatch<'_>) -> SearchHit {
-    let score = symbol_match_score(matched.rank);
-    SearchHit {
-        hit: SearchHitTarget::Symbol {
-            symbol: wire_symbol(matched),
-        },
-        score,
-        matched_by: vec![MatchedField::Name],
-        relationships: None,
-        source: Some(excerpt(matched.file, matched.symbol.range)),
-        diagnostics: None,
-        span: Some(source_span(matched.file, matched.symbol.range)),
-        line: Some(line_number(
-            matched.file.source(),
-            matched.symbol.range.start,
-        )),
-        path: None,
-        distance: None,
-    }
-}
-
-fn file_search_hit(file: &IndexedFile, line: usize, text: String) -> SearchHit {
-    let start = line_start(file.source(), line);
-    let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
-    let range = ByteRange { start, end };
-    SearchHit {
-        hit: SearchHitTarget::File {
-            file: File {
-                id: file_id(file),
-                content: FileContent::Regular {
-                    size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
-                    executable: false,
-                },
-                languages: vec![rust_language()],
-                regions: Vec::new(),
-                semantic: true,
-            },
-        },
-        score: 1.0,
-        matched_by: vec![MatchedField::Content],
-        relationships: None,
-        source: Some(SourceExcerpt {
-            span: source_span(file, range),
-            text,
-        }),
-        diagnostics: None,
-        span: Some(source_span(file, range)),
-        line: Some(u64::try_from(line).unwrap_or(u64::MAX)),
-        path: None,
-        distance: None,
-    }
-}
-
-fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
+pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
     let start = usize::try_from(range.start)
         .unwrap_or(file.source().len())
         .min(file.source().len());
@@ -494,7 +383,7 @@ fn text_range(range: ByteRange) -> TextRange {
     }
 }
 
-fn rust_language() -> Language {
+pub(crate) fn rust_language() -> Language {
     Language {
         name: "rust".to_owned(),
         dialect: None,
@@ -601,7 +490,7 @@ pub(crate) fn encode_path(value: &str) -> String {
     utf8_percent_encode(value, PATH_ESCAPE_SET).to_string()
 }
 
-fn complete_coverage() -> Coverage {
+pub(crate) fn complete_coverage() -> Coverage {
     let revision = Digest("0".repeat(SHA256_HEX_LENGTH));
     Coverage::Complete {
         state: CoverageCompleteState::Complete,
@@ -685,50 +574,19 @@ fn authored_visibility(visibility: &RustVisibility) -> String {
     }
 }
 
-const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
-    match rank {
-        SymbolMatchRank::QualifiedExact => 1.0,
-        SymbolMatchRank::NameExact => 0.9,
-        SymbolMatchRank::QualifiedSuffix => 0.8,
-        SymbolMatchRank::Substring => 0.7,
-    }
-}
-
-fn line_number(source: &str, position: u64) -> u64 {
-    let end = usize::try_from(position)
-        .unwrap_or(source.len())
-        .min(source.len());
-    u64::try_from(source[..end].match_indices('\n').count() + 1).unwrap_or(u64::MAX)
-}
-
-fn line_start(source: &str, line: usize) -> u64 {
-    let mut current = 1_usize;
-    for (index, byte) in source.bytes().enumerate() {
-        if current == line {
-            return u64::try_from(index).unwrap_or(u64::MAX);
-        }
-        if byte == b'\n' {
-            current += 1;
-        }
-    }
-    u64::try_from(source.len()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
     use std::fs;
 
     use rift_core::SourceVisibility;
-    use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
-    use rift_index::SymbolMatchRank;
     use rift_protocol::read::{
-        GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, SearchParams,
+        GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{ReadFault, ReadService, WorkspaceIndexLimits, symbol_match_score};
+    use super::{ReadFault, ReadService, WorkspaceIndexLimits};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -856,35 +714,6 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_combines_symbol_and_source_matches_with_limit() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "limit": 3
-        }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0]["hit"]["target"], "symbol");
-        assert_eq!(results[0]["score"], 1.0);
-        assert_eq!(results[2]["hit"]["target"], "file");
-        assert_eq!(results[2]["line"], 1);
-        Ok(())
-    }
-
-    #[test]
-    fn symbol_scores_preserve_semantic_rank() {
-        let scores = [
-            symbol_match_score(SymbolMatchRank::QualifiedExact),
-            symbol_match_score(SymbolMatchRank::NameExact),
-            symbol_match_score(SymbolMatchRank::QualifiedSuffix),
-            symbol_match_score(SymbolMatchRank::Substring),
-        ];
-        assert!(scores.windows(2).all(|pair| pair[0] > pair[1]));
-    }
-
-    #[test]
     fn unsupported_projection_and_history_are_rejected() -> TestResult {
         let (_directory, service) = fixture()?;
         let projection =
@@ -912,20 +741,8 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn unsupported_filter_and_missing_source_are_distinct() -> TestResult {
+    fn nodes_missing_source_is_not_found() -> TestResult {
         let (_directory, service) = fixture()?;
-        let search: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "filter": {"kind": "field", "field": {"field": "name", "op": "eq", "value": "Beacon"}}
-        }))?;
-        assert!(matches!(
-            service
-                .search(&search)
-                .expect_err("filter must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-
         let missing = service.nodes(NodesParams {
             path: ProjectPath("src/missing.rs".to_owned()),
             position: 0,
@@ -982,105 +799,6 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_rejects_cursor_and_node_target() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let cursor: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "cursor": "page-two"}))?;
-        assert!(matches!(
-            service
-                .search(&cursor)
-                .expect_err("cursor reads must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-
-        let node_target: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "target": "node"}))?;
-        assert!(matches!(
-            service
-                .search(&node_target)
-                .expect_err("node target must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn search_requires_query_and_rejects_zero_limit() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let missing_query: SearchParams = serde_json::from_value(json!({}))?;
-        assert!(matches!(
-            service
-                .search(&missing_query)
-                .expect_err("missing query must fail")
-                .fault(),
-            ReadFault::Invalid { .. }
-        ));
-
-        let zero_limit: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
-        let error = service
-            .search(&zero_limit)
-            .expect_err("zero limit must fail");
-        assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
-        assert_eq!(
-            error.to_string(),
-            "the request does not match the documented form: field limit, \
-             violation zero; correct the reported field and resend the request"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn search_target_file_propagates_oversized_result_limit() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "target": "file",
-            "limit": READ_RESULTS_MAX_DEFAULT as u64 + 1
-        }))?;
-        assert!(matches!(
-            service
-                .search(&params)
-                .expect_err("oversized file-target limit must fail")
-                .fault(),
-            ReadFault::Index(_)
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn search_target_symbol_excludes_file_hits() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "target": "symbol",
-            "limit": 5
-        }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|hit| hit["hit"]["target"] == "symbol"));
-        Ok(())
-    }
-
-    #[test]
-    fn search_reports_multi_line_file_match_position() -> TestResult {
-        let (_directory, service) = rich_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "lookout marker",
-            "target": "file"
-        }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert_eq!(results.len(), 1);
-        assert!(results[0]["line"].as_u64().is_some_and(|line| line > 1));
-        assert_eq!(results[0]["source"]["text"], "    // lookout marker");
-        Ok(())
-    }
-
-    #[test]
     fn nodes_facets_identify_expression_statement_and_comment() -> TestResult {
         let (_directory, service) = rich_fixture()?;
 
@@ -1128,45 +846,5 @@ pub fn compute() -> i32 {
         assert_eq!(keys, ["path", "operation", "io"]);
         assert_eq!(context[0].value(), "src/lib.rs");
         assert_eq!(context[2].value(), "sealed");
-    }
-
-    #[test]
-    fn search_resolves_every_rust_symbol_kind_and_visibility() -> TestResult {
-        let (_directory, service) = rich_fixture()?;
-        let cases = [
-            ("Level", "rust.enum", None),
-            ("Speaks", "rust.trait", None),
-            ("Alias", "rust.type_alias", None),
-            ("MAX", "rust.constant", None),
-            ("NAME", "rust.static", None),
-            ("inner", "rust.module", None),
-            ("noop", "rust.macro", None),
-            ("Hidden", "rust.struct", Some("private")),
-            ("scoped", "rust.function", Some("pub(crate)")),
-        ];
-        for (name, kind, visibility) in cases {
-            let params: SearchParams = serde_json::from_value(json!({
-                "query": name,
-                "target": "symbol",
-                "limit": 1
-            }))?;
-            let value = serde_json::to_value(service.search(&params)?)?;
-            let hit = &value["results"][0]["hit"]["symbol"];
-            assert_eq!(hit["kind"], kind, "unexpected kind for {name}");
-            if let Some(expected_visibility) = visibility {
-                assert_eq!(
-                    hit["visibility"], expected_visibility,
-                    "unexpected visibility for {name}"
-                );
-                assert!(
-                    !hit["facets"]
-                        .as_array()
-                        .ok_or("facets must be array")?
-                        .contains(&json!("public")),
-                    "{name} must not carry public facet"
-                );
-            }
-        }
-        Ok(())
     }
 }
