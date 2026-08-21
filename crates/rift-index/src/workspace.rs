@@ -933,6 +933,35 @@ mod tests {
     }
 
     #[test]
+    fn test_force_include_of_empty_list_returns_no_files() {
+        let directory = fixture();
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        let extra = index
+            .force_include_files(&[], 10)
+            .expect("an empty force_include list must not walk for matches");
+        assert!(extra.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_force_include_skips_entries_that_are_neither_file_nor_directory() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let status = std::process::Command::new("mkfifo")
+            .arg(directory.path().join("pipe.rs"))
+            .status()
+            .expect("mkfifo must run");
+        assert!(status.success(), "mkfifo must create the named pipe");
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        let extra = index
+            .force_include_files(&["*.rs".to_owned()], 10)
+            .expect("force_include walk");
+        assert!(
+            extra.is_empty(),
+            "a named pipe is neither a directory nor a regular file and must be skipped"
+        );
+    }
+
+    #[test]
     fn test_force_include_invalid_glob_refuses() {
         let directory = fixture();
         let index = build_index(&directory, &SourceVisibility::default()).expect("index");

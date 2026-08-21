@@ -307,7 +307,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{ReadFault, ReadService, SymbolMatchRank, symbol_match_score};
+    use super::{ReadFault, ReadService, SymbolMatchRank, line_start, symbol_match_score};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -458,6 +458,15 @@ pub fn compute() -> i32 {
     }
 
     #[test]
+    fn line_start_beyond_source_line_count_returns_source_length() {
+        let source = "one\ntwo\nthree\n";
+        assert_eq!(
+            line_start(source, 100),
+            u64::try_from(source.len()).expect("small fixture length fits u64")
+        );
+    }
+
+    #[test]
     fn search_rejects_cursor_and_node_target() -> TestResult {
         let (_directory, service) = fixture()?;
         let cursor: SearchParams =
@@ -483,13 +492,22 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_requires_query_and_rejects_zero_limit() -> TestResult {
+    fn search_requires_query_rejects_empty_query_and_zero_limit() -> TestResult {
         let (_directory, service) = fixture()?;
         let missing_query: SearchParams = serde_json::from_value(json!({}))?;
         assert!(matches!(
             service
                 .search(&missing_query)
                 .expect_err("missing query must fail")
+                .fault(),
+            ReadFault::Invalid { .. }
+        ));
+
+        let empty_query: SearchParams = serde_json::from_value(json!({"query": ""}))?;
+        assert!(matches!(
+            service
+                .search(&empty_query)
+                .expect_err("empty query must fail")
                 .fault(),
             ReadFault::Invalid { .. }
         ));
