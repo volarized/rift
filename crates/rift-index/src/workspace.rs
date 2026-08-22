@@ -1723,4 +1723,54 @@ mod tests {
             WorkspaceIndexViolation::WorkspaceTooLarge,
         );
     }
+
+    #[test]
+    fn test_fingerprint_paths_preserves_bound_and_path_failures() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let limits = WorkspaceIndexLimits::new(5, 8, 10, 4, 5).expect("limits");
+
+        let missing = root.join("missing.rs");
+        let error = fingerprint_paths(&root, &[missing], limits).expect_err("missing source");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+
+        let oversized = root.join("oversized.rs");
+        fs::write(&oversized, b"123456789").expect("oversized source");
+        let error = fingerprint_paths(&root, &[oversized], limits).expect_err("file bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::FileTooLarge
+        );
+
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        fs::write(&first, b"123456").expect("first source");
+        fs::write(&second, b"123456").expect("second source");
+        let error =
+            fingerprint_paths(&root, &[first, second], limits).expect_err("workspace bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+
+        let outside = tempfile::NamedTempFile::new().expect("outside source");
+        fs::write(outside.path(), b"fn x(){}").expect("outside bytes");
+        let error = fingerprint_paths(&root, &[outside.path().to_path_buf()], limits)
+            .expect_err("outside path");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::InvalidPath
+        );
+
+        let invalid = root.join("invalid.rs");
+        fs::write(&invalid, [0xff]).expect("invalid source");
+        let error = fingerprint_paths(&root, &[invalid], limits).expect_err("invalid UTF-8");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::InvalidSource
+        );
+    }
 }
