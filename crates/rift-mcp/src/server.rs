@@ -1324,6 +1324,29 @@ mod tests {
         Ok(())
     }
 
+    /// Calls one tool, retrying the refusals the server advertises as
+    /// `retry: same_request`: a concurrent write may move the index between
+    /// snapshot and admission, and the wire contract answers with a bounded
+    /// retry rather than a failure.
+    async fn call_until_admitted(
+        peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
+        params: CallToolRequestParams,
+    ) -> TestResult<rmcp::model::CallToolResult> {
+        const ADMISSION_ATTEMPTS_MAX: usize = 8;
+        for _attempt in 0..ADMISSION_ATTEMPTS_MAX {
+            match peer.call_tool(params.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(ServiceError::McpError(error))
+                    if error
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err("the server kept refusing a retryable change".into())
+    }
+
     #[tokio::test]
     async fn concurrent_inserts_publish_from_serialized_fresh_snapshots() -> TestResult {
         let (directory, server) = fixture().await?;
@@ -1338,14 +1361,16 @@ mod tests {
         let client = ().serve(client_transport).await?;
         let first_client = client.peer().clone();
         let second_client = client.peer().clone();
-        let first = first_client.call_tool(
+        let first = call_until_admitted(
+            &first_client,
             CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
                 "anchor": "rift://symbol/rust/lib.rs/beacon",
                 "position": "after",
                 "body": "pub fn first_insert() {}"
             }))?),
         );
-        let second = second_client.call_tool(
+        let second = call_until_admitted(
+            &second_client,
             CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
                 "anchor": "rift://symbol/rust/lib.rs/beacon",
                 "position": "after",
