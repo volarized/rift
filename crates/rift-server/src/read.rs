@@ -58,6 +58,13 @@ pub enum ReadFault {
         /// The rendered I/O failure.
         io: String,
     },
+    /// Tokio could not run or join one bounded blocking operation.
+    Task {
+        /// Operation submitted to the blocking executor.
+        operation: &'static str,
+        /// Runtime failure account.
+        detail: String,
+    },
 }
 
 impl Fault for ReadFault {
@@ -69,6 +76,7 @@ impl Fault for ReadFault {
             Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
             Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
+            Self::Task { .. } => ErrorName::Wire(ErrorCode::InternalError),
         }
     }
 
@@ -93,6 +101,10 @@ impl Fault for ReadFault {
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("io", io.clone()),
             ],
+            Self::Task { operation, detail } => vec![
+                ErrorContext::new("operation", *operation),
+                ErrorContext::new("detail", detail.clone()),
+            ],
         }
     }
 
@@ -103,7 +115,8 @@ impl Fault for ReadFault {
             Self::Unsupported { .. }
             | Self::Invalid { .. }
             | Self::NotFound { .. }
-            | Self::Storage { .. } => None,
+            | Self::Storage { .. }
+            | Self::Task { .. } => None,
         }
     }
 }
@@ -142,6 +155,14 @@ impl ReadFault {
 
     pub(crate) fn history(source: HistoryError) -> ReadError {
         Error::new(Self::History(source))
+    }
+
+    /// Classifies a Tokio blocking-executor failure.
+    pub fn task(operation: &'static str, detail: impl Into<String>) -> ReadError {
+        Error::new(Self::Task {
+            operation,
+            detail: detail.into(),
+        })
     }
 }
 
@@ -1026,6 +1047,17 @@ pub fn compute() -> i32 {
         assert_eq!(keys, ["path", "operation", "io"]);
         assert_eq!(context[0].value(), "src/lib.rs");
         assert_eq!(context[2].value(), "sealed");
+    }
+
+    #[test]
+    fn task_fault_is_internal_and_names_the_blocking_operation() {
+        let error = ReadFault::task("initial index build", "worker panicked");
+        assert_eq!(error.descriptor().code(), "internal_error");
+        let context = error.context();
+        assert_eq!(context[0].key(), "operation");
+        assert_eq!(context[0].value(), "initial index build");
+        assert_eq!(context[1].key(), "detail");
+        assert_eq!(context[1].value(), "worker panicked");
     }
 
     #[test]

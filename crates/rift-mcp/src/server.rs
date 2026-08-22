@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
@@ -23,6 +23,7 @@ use rift_server::{
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
+use tokio::sync::{RwLock, Semaphore};
 
 /// JSON-RPC error code every Rift operating failure travels under: the
 /// first code of the server-defined range (-32000 to -32099), which rmcp
@@ -34,24 +35,60 @@ const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
 /// schema bound.
 const ERROR_CAUSES_MAX: usize = 8;
 
+/// Blocking filesystem and syntax operations admitted across MCP servers.
+const BLOCKING_OPERATIONS_MAX: usize = 4;
+
+/// Workspace blocking operations admitted process-wide.
+fn blocking_operations() -> &'static Arc<Semaphore> {
+    static OPERATIONS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    OPERATIONS.get_or_init(|| Arc::new(Semaphore::new(BLOCKING_OPERATIONS_MAX)))
+}
+
+/// Runs one blocking operation under process-wide bounded admission.
+async fn bounded_blocking<Output>(
+    operation: &'static str,
+    work: impl FnOnce() -> Result<Output, ReadError> + Send + 'static,
+) -> Result<Output, ReadError>
+where
+    Output: Send + 'static,
+{
+    let permit = Arc::clone(blocking_operations())
+        .acquire_owned()
+        .await
+        .map_err(|error| ReadFault::task(operation, error.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|error| ReadFault::task(operation, error.to_string()))?
+}
+
 /// Rust workspace MCP server: reads serve an immutable snapshot, changes
 /// write the workspace and swap in a fresh snapshot.
 #[derive(Debug)]
 pub struct RiftMcp {
     root: PathBuf,
     limits: WorkspaceIndexLimits,
-    reads: RwLock<ReadService>,
-    changes: ChangeService,
-    configuration: RwLock<ConfigurationState>,
+    published: Arc<RwLock<Arc<PublishedWorkspace>>>,
+    changes: Arc<ChangeService>,
+    change_lane: Arc<Mutex<()>>,
     tool_router: ToolRouter<Self>,
+}
+
+/// Read index and configuration policy published as one immutable value.
+#[derive(Debug)]
+struct PublishedWorkspace {
+    reads: Arc<ReadService>,
+    configuration: ConfigurationState,
 }
 
 /// The last admission of the workspace's `rift.toml`, kept with the file
 /// state it was read from so an edited file is re-admitted on the next
 /// request and an unchanged one is not re-parsed per call.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ConfigurationState {
-    admitted: Result<WorkspaceConfiguration, ConfigurationError>,
+    admitted: Result<WorkspaceConfiguration, Arc<ConfigurationError>>,
     fingerprint: Option<ConfigurationFingerprint>,
 }
 
@@ -59,7 +96,7 @@ impl ConfigurationState {
     /// Admits the workspace's current `rift.toml`.
     fn admit(root: &Path) -> Self {
         Self {
-            admitted: load_configuration(root),
+            admitted: load_configuration(root).map_err(Arc::new),
             fingerprint: configuration_fingerprint(root),
         }
     }
@@ -106,15 +143,30 @@ impl RiftMcp {
     /// # Errors
     ///
     /// Returns [`ReadError`] when workspace cannot be indexed within bounds.
-    pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let configuration = ConfigurationState::admit(root);
-        let visibility = configuration.source_visibility();
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future discards construction. An admitted blocking scan
+    /// finishes in the bounded executor before releasing its capacity permit.
+    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
+        let root = root.to_path_buf();
+        let build_root = root.clone();
+        let published = bounded_blocking("initial index build", move || {
+            let configuration = ConfigurationState::admit(&build_root);
+            let visibility = configuration.source_visibility();
+            let reads = ReadService::build(&build_root, limits, &visibility)?;
+            Ok(Arc::new(PublishedWorkspace {
+                reads: Arc::new(reads),
+                configuration,
+            }))
+        })
+        .await?;
         Ok(Self {
-            root: root.to_path_buf(),
+            root: root.clone(),
             limits,
-            reads: RwLock::new(ReadService::build(root, limits, &visibility)?),
-            changes: ChangeService::new(root),
-            configuration: RwLock::new(configuration),
+            published: Arc::new(RwLock::new(published)),
+            changes: Arc::new(ChangeService::new(&root)),
+            change_lane: Arc::new(Mutex::new(())),
             tool_router: Self::tool_router(),
         })
     }
@@ -124,24 +176,25 @@ impl RiftMcp {
     /// both. `rev` serves the lookup from a version-control revision instead of
     /// the current tree. Use `search` when the name is not exactly known.
     #[tool]
-    fn get_symbol(
+    async fn get_symbol(
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
         let rev = params.rev.clone();
-        self.read_at(rev.as_ref(), |reads| reads.get_symbol(&params))
+        self.read_at(rev, move |reads| reads.get_symbol(&params))
+            .await
     }
 
     /// Searches indexed Rust declarations and source lines by lexical `query`.
     /// `rev` searches a version-control revision instead of the current tree.
     /// Use `get_symbol` when the declaration name is known.
     #[tool]
-    fn search(
+    async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let rev = params.rev.clone();
-        self.read_at(rev.as_ref(), |reads| reads.search(&params))
+        self.read_at(rev, move |reads| reads.search(&params)).await
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
@@ -150,12 +203,12 @@ impl RiftMcp {
     /// lists the nodes as of a version-control revision instead of the
     /// current tree.
     #[tool]
-    fn nodes(
+    async fn nodes(
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ErrorData> {
         let rev = params.rev.clone();
-        self.read_at(rev.as_ref(), |reads| reads.nodes(params))
+        self.read_at(rev, move |reads| reads.nodes(params)).await
     }
 
     /// Replaces one declaration addressed by symbol. The whole declaration
@@ -163,11 +216,12 @@ impl RiftMcp {
     /// derives the span, so the caller supplies no offsets; a refusal
     /// names the failed precondition and leaves the workspace untouched.
     #[tool]
-    fn replace_symbol(
+    async fn replace_symbol(
         &self,
         Parameters(params): Parameters<ReplaceSymbolParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(|reads, changes| changes.replace_symbol(reads, &params))
+        self.change(move |reads, changes| changes.replace_symbol(reads, &params))
+            .await
     }
 
     /// Inserts a new declaration beside an anchor symbol, or content at a file
@@ -177,45 +231,36 @@ impl RiftMcp {
     /// when `create_missing` is set and it is missing. A refusal names the
     /// failed precondition and leaves the workspace untouched.
     #[tool]
-    fn insert_symbol(
+    async fn insert_symbol(
         &self,
         Parameters(params): Parameters<InsertSymbolParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(|reads, changes| changes.insert_symbol(reads, &params))
+        self.change(move |reads, changes| changes.insert_symbol(reads, &params))
+            .await
     }
 
     /// Replaces one syntax node through a witnessed address from `nodes`.
     /// The server recomputes the witness before writing and refuses when the
     /// bytes drifted, so a stale address never splices into moved code.
     #[tool]
-    fn replace_node(
+    async fn replace_node(
         &self,
         Parameters(params): Parameters<ReplaceNodeParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(|reads, changes| changes.replace_node(reads, &params))
+        self.change(move |reads, changes| changes.replace_node(reads, &params))
+            .await
     }
 
     /// Applies unified-diff hunks to workspace files atomically. Hunk
     /// context guards the change; header line numbers are hints, as with
     /// `git apply`. A `/dev/null` header creates or deletes the file.
     #[tool]
-    fn patch(
+    async fn patch(
         &self,
         Parameters(params): Parameters<PatchParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(|reads, changes| changes.patch(reads, &params))
-    }
-
-    /// Takes the current read snapshot.
-    ///
-    /// # Panics
-    ///
-    /// Recovers a poisoned lock instead of panicking: the snapshot is
-    /// replaced whole, so a poisoned guard still holds a coherent value.
-    fn snapshot(&self) -> std::sync::RwLockReadGuard<'_, ReadService> {
-        self.reads
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.change(move |reads, changes| changes.patch(reads, &params))
+            .await
     }
 
     /// Runs one read against the tree the request names — the current
@@ -225,15 +270,23 @@ impl RiftMcp {
     /// A revision snapshot is built per request from the workspace's git
     /// objects, under the same `[source]` policy and bounds as the current
     /// one; `[providers.history] enabled = false` refuses it.
-    fn read_at<Answer>(
+    async fn read_at<Answer>(
         &self,
-        rev: Option<&rift_protocol::read::RevisionId>,
-        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError>,
-    ) -> Result<Json<Answer>, ErrorData> {
-        let configuration = self.admitted_configuration(wire::ErrorPhase::Read)?;
+        rev: Option<rift_protocol::read::RevisionId>,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+    ) -> Result<Json<Answer>, ErrorData>
+    where
+        Answer: Send + 'static,
+    {
+        let published = self.published_workspace(wire::ErrorPhase::Read).await?;
+        let configuration = published.configuration.admitted(wire::ErrorPhase::Read)?;
         let read_error = |error: ReadError| error.tool_error(wire::ErrorPhase::Read);
         let Some(rev) = rev else {
-            return operation(&self.snapshot()).map(Json).map_err(read_error);
+            let reads = Arc::clone(&published.reads);
+            return bounded_blocking("current workspace read", move || operation(&reads))
+                .await
+                .map(Json)
+                .map_err(read_error);
         };
         if !configuration.providers.history.enabled {
             return Err(read_error(ReadError::from(ReadFault::Unsupported {
@@ -241,40 +294,72 @@ impl RiftMcp {
             })));
         }
         let visibility = SourceVisibility::from(&configuration.source);
-        let reads = ReadService::at_revision(&self.root, rev, self.limits, &visibility)
-            .map_err(read_error)?;
-        operation(&reads).map(Json).map_err(read_error)
+        let root = self.root.clone();
+        let limits = self.limits;
+        bounded_blocking("revision workspace read", move || {
+            let reads = ReadService::at_revision(&root, &rev, limits, &visibility)?;
+            operation(&reads)
+        })
+        .await
+        .map(Json)
+        .map_err(read_error)
     }
 
-    /// The admitted workspace configuration, re-admitting `rift.toml` when
-    /// the file changed since the last request. While the file is invalid,
-    /// every request fails as `configuration_invalid` until it is fixed.
-    ///
-    /// # Panics
-    ///
-    /// Recovers a poisoned lock instead of panicking: the admission is
-    /// replaced whole, so a poisoned guard still holds a coherent value.
-    fn admitted_configuration(
+    /// Returns one atomically published index and configuration policy.
+    async fn published_workspace(
         &self,
         phase: wire::ErrorPhase,
-    ) -> Result<WorkspaceConfiguration, ErrorData> {
-        let current = configuration_fingerprint(&self.root);
-        let state = self
-            .configuration
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.fingerprint == current {
-            return state.admitted(phase);
+    ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
+        let root = self.root.clone();
+        let fingerprint = bounded_blocking("configuration fingerprint", move || {
+            Ok(configuration_fingerprint(&root))
+        })
+        .await
+        .map_err(|error| error.tool_error(phase))?;
+        let guard = self.published.read().await;
+        let published = Arc::clone(&guard);
+        drop(guard);
+        if published.configuration.fingerprint == fingerprint {
+            published.configuration.admitted(phase)?;
+            return Ok(published);
         }
-        drop(state);
-        let mut state = self
-            .configuration
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.fingerprint != current {
-            *state = ConfigurationState::admit(&self.root);
-        }
-        state.admitted(phase)
+        self.refresh_configuration(phase).await
+    }
+
+    /// Rebuilds index and configuration together after `rift.toml` changes.
+    async fn refresh_configuration(
+        &self,
+        phase: wire::ErrorPhase,
+    ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
+        let root = self.root.clone();
+        let limits = self.limits;
+        let published = Arc::clone(&self.published);
+        let change_lane = Arc::clone(&self.change_lane);
+        let refreshed = bounded_blocking("configuration index rebuild", move || {
+            let lane = change_lane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = Arc::clone(&published.blocking_read());
+            let fingerprint = configuration_fingerprint(&root);
+            if current.configuration.fingerprint == fingerprint {
+                drop(lane);
+                return Ok(current);
+            }
+            let configuration = ConfigurationState::admit(&root);
+            let visibility = configuration.source_visibility();
+            let reads = Arc::new(ReadService::build(&root, limits, &visibility)?);
+            let next = Arc::new(PublishedWorkspace {
+                reads,
+                configuration,
+            });
+            *published.blocking_write() = Arc::clone(&next);
+            drop(lane);
+            Ok(next)
+        })
+        .await
+        .map_err(|error| error.tool_error(phase))?;
+        refreshed.configuration.admitted(phase)?;
+        Ok(refreshed)
     }
 
     /// Runs one change against the current snapshot and, when it lands,
@@ -288,37 +373,64 @@ impl RiftMcp {
     /// failure after a landed change rides the result as a diagnostic
     /// rather than failing the call: the write happened, and the caller
     /// must not be told otherwise.
-    fn change(
+    ///
+    /// Dropping this future after blocking work starts does not cancel that
+    /// work. The serialized operation finishes through snapshot publication
+    /// before releasing its lane.
+    async fn change(
         &self,
-        operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
+        operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>
+        + Send
+        + 'static,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        let configuration = self.admitted_configuration(wire::ErrorPhase::Change)?;
-        let mut result = operation(&self.snapshot(), &self.changes)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        if let ChangeResult::Applied { summary } = &mut result {
-            self.attach_hook_verdicts(&configuration.hooks, summary);
-            let visibility = SourceVisibility::from(&configuration.source);
-            match ReadService::build(&self.root, self.limits, &visibility) {
-                Ok(rebuilt) => {
-                    *self
-                        .reads
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = rebuilt;
+        self.published_workspace(wire::ErrorPhase::Change).await?;
+        let root = self.root.clone();
+        let limits = self.limits;
+        let published = Arc::clone(&self.published);
+        let changes = Arc::clone(&self.changes);
+        let change_lane = Arc::clone(&self.change_lane);
+        bounded_blocking("workspace change", move || {
+            let lane = change_lane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = Arc::clone(&published.blocking_read());
+            let configuration = match current.configuration.admitted(wire::ErrorPhase::Change) {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    drop(lane);
+                    return Ok(Err(error));
                 }
-                Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
+            };
+            let mut result = operation(&current.reads, &changes)?;
+            if let ChangeResult::Applied { summary } = &mut result {
+                Self::attach_hook_verdicts(&root, &configuration.hooks, summary);
+                let visibility = SourceVisibility::from(&configuration.source);
+                match ReadService::build(&root, limits, &visibility) {
+                    Ok(rebuilt) => {
+                        let next = Arc::new(PublishedWorkspace {
+                            reads: Arc::new(rebuilt),
+                            configuration: current.configuration.clone(),
+                        });
+                        *published.blocking_write() = next;
+                    }
+                    Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
+                }
             }
-        }
-        Ok(Json(result))
+            drop(lane);
+            Ok(Ok(Json(result)))
+        })
+        .await
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?
     }
 
     /// Runs the configured hooks over one applied change and attaches what
     /// they established: a passing hook's configured guarantees become
     /// evidence, and every other outcome becomes an error finding.
-    fn attach_hook_verdicts(&self, hooks: &[CommandHook], summary: &mut ChangeSummary) {
+    fn attach_hook_verdicts(root: &Path, hooks: &[CommandHook], summary: &mut ChangeSummary) {
         if hooks.is_empty() {
             return;
         }
-        let runs = run_hooks(hooks, &self.root, &summary.paths);
+        let runs = run_hooks(hooks, root, &summary.paths);
         for (hook, run) in hooks.iter().zip(&runs) {
             if run.status == HookStatus::Passed {
                 summary
@@ -532,10 +644,10 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
+    async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         Ok((directory, server))
     }
 
@@ -548,19 +660,20 @@ mod tests {
             .ok_or_else(|| "tool arguments must be an object".into())
     }
 
-    #[test]
-    fn build_propagates_workspace_index_failure() {
+    #[tokio::test]
+    async fn build_propagates_workspace_index_failure() {
         let error = RiftMcp::build(
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
         )
+        .await
         .expect_err("missing root must fail");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
     }
 
     #[tokio::test]
     async fn client_lists_and_calls_exact_read_only_surface() -> TestResult {
-        let (_directory, server) = fixture()?;
+        let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -656,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn exported_schema_document_matches_served_tools() -> TestResult {
-        let (_directory, server) = fixture()?;
+        let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -689,7 +802,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_change_lands_and_reads_serve_the_new_snapshot() -> TestResult {
-        let (_directory, server) = fixture()?;
+        let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -737,6 +850,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_inserts_publish_from_serialized_fresh_snapshots() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+        let first_client = client.peer().clone();
+        let second_client = client.peer().clone();
+        let first = first_client.call_tool(
+            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
+                "anchor": "rift://symbol/rust/lib.rs/beacon",
+                "position": "after",
+                "body": "pub fn first_insert() {}"
+            }))?),
+        );
+        let second = second_client.call_tool(
+            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
+                "anchor": "rift://symbol/rust/lib.rs/beacon",
+                "position": "after",
+                "body": "pub fn second_insert() {}"
+            }))?),
+        );
+        let (first, second) = tokio::join!(first, second);
+        for result in [first?, second?] {
+            let structured = result
+                .structured_content
+                .ok_or("insert_symbol must return structured content")?;
+            assert_eq!(structured["status"], json!("applied"));
+        }
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert!(
+            written.contains("first_insert"),
+            "first concurrent insert must survive: {written}"
+        );
+        assert!(
+            written.contains("second_insert"),
+            "second concurrent insert must survive: {written}"
+        );
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn applied_change_reports_failed_snapshot_rebuild_as_warning() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
@@ -746,7 +909,7 @@ mod tests {
         )?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight)?;
+        let server = RiftMcp::build(directory.path(), tight).await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -798,7 +961,7 @@ pub fn beacon() -> u64 {
         arguments_value: &serde_json::Value,
         tool: &'static str,
     ) -> TestResult<rmcp::ErrorData> {
-        let (_directory, server) = fixture()?;
+        let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
