@@ -1,7 +1,7 @@
 # Documentation site
 
 This directory contains the Fumadocs site for Rift. Hand-written pages live under
-`content/docs`; `protocol/mcp.json` carries the served MCP tool surface exported from the Rust
+`content/docs`; `docs/public/mcp.json` carries the served MCP tool surface exported from the Rust
 workspace.
 
 Install the JavaScript dependencies and start the development server:

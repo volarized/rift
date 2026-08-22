@@ -25,7 +25,8 @@ same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is 
 [`ChangeResult`](/docs/protocol/reference#ChangeResult) saying refused, never `isError` —
 while [`ErrorData`](/docs/protocol/reference#ErrorData) travels as the
 [JSON-RPC error](https://www.jsonrpc.org/specification#error_object)
-object's `data`, under code `-32000`.
+object's `data`, under code `-32000`. The exported schema at
+[`mcp.json`](https://volar.sh/rift/mcp.json) is the authoritative served shape.
 
 The server serializes change application per targeted tree: two concurrent changes against one
 tree apply one after the other, and the later one meets its preconditions against the earlier
@@ -58,9 +59,6 @@ filesystem tools.
 
 <VersionBadge version="v0.0.4" languages={["Rust"]} />
 
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
-
 `get_symbol` is the read to start from when the name is known. Its default `scope: "all"` searches
 project, dependency, standard-library, and external declarations. A hit includes source when its
 resolver supplied readable bytes; synthetic and source-less dependency declarations still carry
@@ -70,9 +68,6 @@ symbols and attaches their version-control timeline and co-change coupling.
 ### search [#tool-search]
 
 <VersionBadge version="v0.0.6" languages={["Rust"]} />
-
-v0.0.6 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
 
 `search` takes a lexical `query`, narrowed or extended by a `paths` selector. `include` and
 `exclude` glob the project-relative path — the same glob engine backs the workspace's
@@ -84,7 +79,7 @@ rather than searching a silently truncated set.
 
 The request shape also carries a `filter` over resolved provider facts and a bounded relationship
 `traversal`. The server does not implement either yet: a request naming one refuses with
-`capability_unavailable`. v0.0.6 serves `query` and `paths` alone.
+`capability_unavailable`. The server serves `query` and `paths` alone.
 
 Search defaults to `scope: "project"`. `scope: "dependencies"` searches resolved dependencies;
 `scope: "all"` also includes project, standard-library, and external declarations. A `paths`
@@ -191,7 +186,7 @@ A provider can return a declaration even when installed source is unavailable:
 }
 ```
 
-This request names a `traversal`, which v0.0.6 does not serve:
+This request names a `traversal`, which the server does not serve:
 
 ```json
 {
@@ -218,9 +213,6 @@ This request names a `traversal`, which v0.0.6 does not serve:
 ### nodes [#tool-nodes]
 
 <VersionBadge version="v0.0.4" languages={["Rust"]} />
-
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
 
 `nodes` lists the syntax regions covering one position, outermost first. Each identity carries
 the witness a later
@@ -265,9 +257,6 @@ first; a page requested after eviction or process restart returns `cursor_expire
 
 <VersionBadge version="v0.0.6" languages={["Rust"]} />
 
-v0.0.6 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
-
 `replace_symbol` replaces one whole declaration addressed by symbol. The parser derives its
 span, so the caller supplies no offsets.
 
@@ -279,9 +268,6 @@ matching rustdoc's own attachment rule.
 ### insert_symbol [#tool-insert_symbol]
 
 <VersionBadge version="v0.0.6" languages={["Rust"]} />
-
-v0.0.6 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
 
 `insert_symbol` inserts a new declaration before or after an existing one, addressed by its
 anchor symbol, or content at a file target addressed by `file`. The parser derives the anchor's
@@ -298,18 +284,12 @@ with `anchor`, which always addresses an existing file.
 
 <VersionBadge version="v0.0.4" languages={["Rust"]} />
 
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
-
 `replace_node` reaches below a declaration through a witnessed node address from
 [`nodes`](#tool-nodes).
 
 ### patch [#tool-patch]
 
 <VersionBadge version="v0.0.6" languages={["Rust"]} />
-
-v0.0.6 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
 
 `patch` applies a unified diff following [`git apply`](https://git-scm.com/docs/git-apply)
 semantics: a hunk's context and deleted lines locate it, and its `@@` header's line numbers are
