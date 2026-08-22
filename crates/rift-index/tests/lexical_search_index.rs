@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rift_core::ProjectPath;
+use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_index::{
     LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalSearchIndex, LexicalUnit,
     LexicalUnitKind,
@@ -566,5 +566,88 @@ async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_fa
     let error = outcome.expect_err("opening under a missing parent directory must refuse");
     assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
     assert_eq!(error.fault().path(), Some(path.as_path()));
+    Ok(())
+}
+
+/// Table shape mirroring `lexical_units` so a raw connection can create a
+/// conflicting table before the adapter ever opens the path: same table name,
+/// incompatible columns.
+#[derive(Debug, toasty::Model)]
+#[table = "lexical_units"]
+struct ConflictingUnitRecord {
+    #[key]
+    identity: String,
+}
+
+async fn open_conflicting_schema_probe(path: &Path) -> toasty::Result<Db> {
+    let mut builder = Db::builder();
+    builder
+        .models(toasty::models!(ConflictingUnitRecord))
+        .max_pool_size(1);
+    builder.build(Sqlite::open(path)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinct_from_build_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+
+    // Pre-create a `lexical_units` table with the wrong shape through a raw
+    // connection, bypassing the adapter's own migrations entirely. `open`'s
+    // own build step succeeds (the file and a connection are perfectly
+    // usable); only the later `MIGRATIONS.apply` call fails, since its
+    // `CREATE TABLE lexical_units` collides with the one already present.
+    let probe_database = open_conflicting_schema_probe(&path).await?;
+    let mut probe_connection = probe_database.connection().await?;
+    toasty::sql::statement("CREATE TABLE lexical_units(id INTEGER PRIMARY KEY)")
+        .exec(&mut probe_connection)
+        .await?;
+    drop(probe_connection);
+    drop(probe_database);
+
+    let outcome = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await;
+    let error =
+        outcome.expect_err("migration apply against a pre-existing conflicting table must refuse");
+    assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+    assert_eq!(error.fault().path(), Some(path.as_path()));
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.to_string().contains("lexical_units")),
+        "migration failure must preserve the underlying SQL conflict, not just a build failure"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_replace_all_against_readonly_directory_surfaces_storage_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+
+    // The pooled connection opened during `open` keeps its file descriptor
+    // writable regardless of later `chmod` calls on the database file
+    // itself (POSIX only checks permissions at `open`, not on each write).
+    // WAL activation on first use, however, must create fresh `-wal`/`-shm`
+    // files in the containing directory, so stripping directory write
+    // access is what forces a genuine SQLite write failure here.
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))?;
+    let outcome = index
+        .replace_all(&[text_unit("docs/a.md", "content")?], "revision-1")
+        .await;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+
+    let error =
+        outcome.expect_err("write against a read-only directory must surface a storage failure");
+    assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+    assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
+    assert!(
+        std::error::Error::source(&error).is_some(),
+        "storage_error must preserve the underlying toasty/SQLite cause"
+    );
     Ok(())
 }

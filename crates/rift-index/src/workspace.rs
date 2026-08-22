@@ -2731,4 +2731,76 @@ mod tests {
         assert_eq!(chunked[0].0.as_str(), "big.md");
         assert_eq!(chunked[0].1, 4);
     }
+
+    #[test]
+    fn test_read_text_file_of_directory_path_reports_filesystem_failure() {
+        let directory = fixture();
+        let mut workspace_bytes = 0_usize;
+        let error = read_text_file(
+            directory.path(),
+            &directory.path().join("src"),
+            WorkspaceIndexLimits::default(),
+            &mut workspace_bytes,
+        )
+        .expect_err("reading a directory's bytes as a file must fail");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+    }
+
+    #[test]
+    fn test_read_text_file_of_path_outside_root_reports_invalid_path() {
+        let directory = fixture();
+        let outside = tempfile::tempdir().expect("outside workspace");
+        let outside_file = outside.path().join("outside.md");
+        fs::write(&outside_file, "outside text").expect("outside fixture file");
+        let mut workspace_bytes = 0_usize;
+        let error = read_text_file(
+            directory.path(),
+            &outside_file,
+            WorkspaceIndexLimits::default(),
+            &mut workspace_bytes,
+        )
+        .expect_err("a path outside root must fail to strip its prefix");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::InvalidPath
+        );
+    }
+
+    #[test]
+    fn test_admitted_text_file_over_limit_without_overflow_reports_workspace_too_large() {
+        let limits = WorkspaceIndexLimits::new(5, 1_000, 10, 4, 5).expect("limits");
+        let mut workspace_bytes = 6_usize;
+        let project_path = ProjectPath::new("big.md").expect("fixture path");
+        let error = admitted_text_file(
+            project_path,
+            b"12345".to_vec(),
+            Path::new("big.md"),
+            limits,
+            &mut workspace_bytes,
+        )
+        .expect_err(
+            "6 already-counted bytes plus 5 more must cross a ten-byte bound without overflowing",
+        );
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a text file's lexical identity must be non-empty")]
+    fn test_push_text_lexical_units_of_root_path_panics_on_empty_identity() {
+        // `ProjectPath::new("")` is valid and names the workspace root, so a whole-file text
+        // unit for it builds its identity from that empty path, which `LexicalUnit::new`
+        // refuses: this invariant must never fire for a real discovered path.
+        let file = TextSourceFile {
+            path: ProjectPath::new("").expect("an empty project path names the workspace root"),
+            content: "hello".to_owned(),
+        };
+        let mut units = Vec::new();
+        push_text_lexical_units(&mut units, &file, 1_024);
+    }
 }

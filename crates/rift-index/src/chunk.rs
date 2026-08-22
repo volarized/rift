@@ -224,4 +224,26 @@ mod tests {
     fn test_text_chunks_zero_bound_panics() {
         let _ = text_chunks("anything", 0);
     }
+
+    #[test]
+    fn test_text_chunks_of_a_character_wider_than_the_bound_keeps_it_whole_and_byte_faithful() {
+        // '\u{1F600}' is 4 bytes in UTF-8; every bound below that width drives
+        // `char_boundary_at_or_before` down to zero, so it must fall back to the character's
+        // own width instead of producing an empty or invalid-UTF-8 piece.
+        let content = "\u{1F600}";
+        for chunk_bytes_max in 1..=3 {
+            let chunks = text_chunks(content, chunk_bytes_max);
+            assert_eq!(
+                contents(&chunks),
+                [content],
+                "chunk_bytes_max={chunk_bytes_max} must still yield the whole character as one piece"
+            );
+            assert_eq!(offsets(&chunks), [0]);
+            let rejoined: String = chunks.iter().map(TextChunk::content).collect();
+            assert_eq!(
+                rejoined, content,
+                "chunk_bytes_max={chunk_bytes_max} must reproduce the character byte-for-byte"
+            );
+        }
+    }
 }

@@ -2022,6 +2022,65 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
+    #[test]
+    fn applied_change_that_breaks_the_source_policy_rebuild_reports_stale_snapshot() -> TestResult {
+        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new();
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let root = directory.path().to_path_buf();
+        // `files_max=1` admits the workspace's single Rust source file for `ReadService::build`,
+        // which never counts `.gitignore` files. `WorkspaceSourcePolicy::build` re-walks for
+        // `.gitignore` files specifically and counts each one against that same bound, so a
+        // second `.gitignore` written by the change trips `TooManyFiles` there even though the
+        // read-side rebuild already succeeded.
+        let tight_limits = WorkspaceIndexLimits::new(1, 1_048_576, 10_485_760, 16, 5)
+            .expect("tight limits admit exactly one file");
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            tight_limits,
+            &published,
+            &validation,
+            &changes,
+            move |_, _| {
+                fs::create_dir_all(root.join("nested")).map_err(|error| {
+                    ReadFault::task("test gitignore directory", error.to_string())
+                })?;
+                fs::write(root.join(".gitignore"), "").map_err(|error| {
+                    ReadFault::task("test root gitignore write", error.to_string())
+                })?;
+                fs::write(root.join("nested/.gitignore"), "").map_err(|error| {
+                    ReadFault::task("test nested gitignore write", error.to_string())
+                })?;
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        paths: Vec::new(),
+                        edits: Vec::new(),
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
+            panic!("the applied change must survive a failed source-policy rebuild");
+        };
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(
+            summary.diagnostics[0].message.contains("too_many_files"),
+            "diagnostic must name the source-policy rebuild failure: {:?}",
+            summary.diagnostics[0]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reads_fail_fast_after_watcher_failure() -> TestResult {
         let (_directory, server) = fixture().await?;

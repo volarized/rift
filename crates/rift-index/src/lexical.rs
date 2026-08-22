@@ -937,10 +937,12 @@ impl LexicalSearchIndex {
 mod tests {
     use super::{
         LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation, LexicalSearchIndex,
-        LexicalUnit, LexicalUnitKind, UNIT_NAME_BYTES_MAX, identifier_expansion, lexical_error,
-        lexical_error_at, lexical_error_caused_by, match_expression, validate_lexical_batch,
+        LexicalUnit, LexicalUnitKind, UNIT_NAME_BYTES_MAX, checked_byte_length,
+        decode_lexical_match, identifier_expansion, lexical_error, lexical_error_at,
+        lexical_error_caused_by, match_expression, require_pragma_row, validate_lexical_batch,
     };
     use rift_core::{ErrorCode, ErrorName, ProjectPath};
+    use toasty::stmt::Value;
 
     #[test]
     fn test_lexical_unit_new_refuses_empty_identity() {
@@ -1184,6 +1186,56 @@ mod tests {
             identifier_expansion("caf\u{e9}Menu"),
             "caf\u{e9}Menu caf\u{e9} menu"
         );
+    }
+
+    #[test]
+    fn test_identifier_expansion_multi_word_already_lowercase_is_unchanged() {
+        assert_eq!(identifier_expansion("foo bar"), "foo bar");
+    }
+
+    #[test]
+    fn test_identifier_expansion_empty_string_is_unchanged() {
+        assert_eq!(identifier_expansion(""), "");
+    }
+
+    #[test]
+    fn test_require_pragma_row_mismatch_refuses_naming_observed_and_expected() {
+        let rows = [Value::record_from_vec(vec![Value::String(
+            "delete".to_owned(),
+        )])];
+        let expected = [Value::String("wal".to_owned())];
+        let error =
+            require_pragma_row(&rows, &expected).expect_err("mismatched pragma row must refuse");
+        assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+        let context = error.context();
+        let pragma = context
+            .iter()
+            .find(|entry| entry.key() == "pragma")
+            .map(rift_core::ErrorContext::value);
+        assert!(
+            pragma.is_some_and(|value| value.contains("unexpected pragma row")),
+            "pragma mismatch must name the observed and expected rows"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "content byte length must fit i64 once bounded by unit_bytes_max")]
+    fn test_checked_byte_length_usize_max_panics_on_i64_overflow() {
+        let _ = checked_byte_length(usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "lexical search row must be a record")]
+    fn test_decode_lexical_match_non_record_row_panics() {
+        let row = Value::String("not-a-record".to_owned());
+        let _ = decode_lexical_match(&row);
+    }
+
+    #[test]
+    #[should_panic(expected = "lexical search row must match its declared column types")]
+    fn test_decode_lexical_match_wrong_shaped_record_panics() {
+        let row = Value::record_from_vec(vec![Value::String("only-one-field".to_owned())]);
+        let _ = decode_lexical_match(&row);
     }
 
     #[test]
