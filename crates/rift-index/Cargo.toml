@@ -19,7 +19,10 @@ sha2.workspace = true
 rift-model.workspace = true
 rift-provider.workspace = true
 rift-syntax.workspace = true
+toasty.workspace = true
+toasty-driver-sqlite.workspace = true
 
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true
+tokio.workspace = true
