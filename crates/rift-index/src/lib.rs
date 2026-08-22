@@ -6,9 +6,9 @@ mod workspace;
 
 pub use glob::PathMatcher;
 pub use workspace::{
-    IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
-    WorkspaceIndexFault, WorkspaceIndexLimits, WorkspaceIndexViolation, source_line_matches,
-    symbol_matches,
+    IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceFingerprint, WorkspaceIndex,
+    WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits, WorkspaceIndexViolation,
+    WorkspaceSourcePolicy, source_line_matches, symbol_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

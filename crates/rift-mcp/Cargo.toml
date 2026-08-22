@@ -11,6 +11,7 @@ description = "Model Context Protocol transport for Rift"
 workspace = true
 
 [dependencies]
+notify.workspace = true
 rmcp.workspace = true
 rift-core.workspace = true
 rift-index.workspace = true
@@ -18,7 +19,9 @@ rift-protocol.workspace = true
 rift-server.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -27,3 +30,4 @@ rmcp = { workspace = true, features = ["client"] }
 jsonschema.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true

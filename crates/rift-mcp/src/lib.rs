@@ -1,8 +1,10 @@
 //! Model Context Protocol transport boundary.
 
+mod failure;
 pub mod schema;
 mod server;
 mod stdio;
+mod validation;
 
 pub use server::RiftMcp;
 pub use stdio::{StdioServeError, serve_stdio};

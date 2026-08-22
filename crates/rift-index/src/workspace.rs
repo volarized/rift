@@ -1,12 +1,14 @@
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ignore::{DirEntry, Walk, WalkBuilder};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::{DirEntry, Match, Walk, WalkBuilder};
 use rift_core::constants::{
     READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, WORKSPACE_BYTES_MAX_DEFAULT,
-    WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
-    WORKSPACE_IGNORED_DIRECTORIES,
+    WORKSPACE_CONFIGURATION_FILE, WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
+    WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
     CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
@@ -18,6 +20,7 @@ use rift_syntax::{
     SOURCE_FILE_EXTENSIONS,
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::glob::PathMatcher;
 
@@ -94,6 +97,11 @@ impl WorkspaceIndexLimits {
     /// Returns maximum directory depth an index reaches below the root.
     pub(crate) const fn directory_depth_max(self) -> usize {
         self.directory_depth_max
+    }
+
+    /// Returns maximum aggregate source bytes admitted per index.
+    pub(crate) const fn workspace_bytes_max(self) -> usize {
+        self.workspace_bytes_max
     }
 }
 
@@ -317,6 +325,143 @@ pub enum SymbolMatchRank {
     Substring,
 }
 
+/// Exact identity of visible workspace source paths and bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFingerprint([u8; 32]);
+
+/// Compiled source visibility used by filesystem event admission.
+#[derive(Debug)]
+pub struct WorkspaceSourcePolicy {
+    root: PathBuf,
+    watched_root: PathBuf,
+    matcher: PathMatcher,
+    gitignore: Option<Gitignore>,
+}
+
+/// Separates one path from its source bytes in workspace identity material.
+const FINGERPRINT_PATH_SEPARATOR: u8 = 0;
+/// Separates adjacent files in workspace identity material.
+const FINGERPRINT_FILE_SEPARATOR: u8 = 0xff;
+
+impl WorkspaceFingerprint {
+    /// Captures visible source paths and bytes without parsing syntax.
+    ///
+    /// Work is bounded by [`WorkspaceIndexLimits`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for discovery, read, encoding, or
+    /// configured-bound failures.
+    pub fn capture(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+    ) -> Result<Self, WorkspaceIndexError> {
+        let root = canonical_root(root)?;
+        let paths = discover(&root, limits, visibility)?;
+        fingerprint_paths(&root, &paths, limits)
+    }
+
+    fn from_files(files: &[IndexedFile]) -> Self {
+        let mut hasher = Sha256::new();
+        for file in files {
+            update_fingerprint(&mut hasher, file.path(), file.source().as_bytes());
+        }
+        Self(hasher.finalize().into())
+    }
+}
+
+impl WorkspaceSourcePolicy {
+    /// Compiles path policy from admitted configuration and `.gitignore` files.
+    ///
+    /// Work is bounded by [`WorkspaceIndexLimits`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid roots, patterns, ignore files,
+    /// or configured-bound failures.
+    pub fn build(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+    ) -> Result<Self, WorkspaceIndexError> {
+        let watched_root = root.to_path_buf();
+        let root = canonical_root(root)?;
+        let matcher = PathMatcher::build(&root, visibility.include(), visibility.exclude())?;
+        let gitignore = visibility
+            .respect_gitignore()
+            .then(|| build_gitignore(&root, limits))
+            .transpose()?;
+        Ok(Self {
+            root,
+            watched_root,
+            matcher,
+            gitignore,
+        })
+    }
+
+    /// Returns whether one Rust source path passes current workspace policy.
+    #[must_use]
+    pub fn admits(&self, path: &Path) -> bool {
+        let Some(path) = self.normalized_path(path) else {
+            return false;
+        };
+        let path = path.as_ref();
+        let source_file = has_source_extension(path);
+        let above_hard_floor = hard_floor_admits_path(&self.root, path);
+        if !source_file || !above_hard_floor {
+            return false;
+        }
+        let configuration_admits = self.matcher.admits(path);
+        let gitignore_admits = self.gitignore.as_ref().is_none_or(|gitignore| {
+            !matches!(
+                gitignore.matched_path_or_any_parents(path, false),
+                Match::Ignore(_)
+            )
+        });
+        configuration_admits && gitignore_admits
+    }
+
+    /// Returns whether one directory can contain visible Rust source.
+    #[must_use]
+    pub fn may_admit_descendant(&self, path: &Path) -> bool {
+        let Some(path) = self.normalized_path(path) else {
+            return false;
+        };
+        let path = path.as_ref();
+        let above_hard_floor = hard_floor_admits_path(&self.root, path);
+        if !above_hard_floor {
+            return false;
+        }
+        let configuration_admits = self.matcher.may_admit_descendant(path);
+        let gitignore_admits = self.gitignore.as_ref().is_none_or(|gitignore| {
+            !matches!(
+                gitignore.matched_path_or_any_parents(path, true),
+                Match::Ignore(_)
+            )
+        });
+        configuration_admits && gitignore_admits
+    }
+
+    /// Returns whether path identifies root workspace configuration file.
+    #[must_use]
+    pub fn is_workspace_configuration(&self, path: &Path) -> bool {
+        self.normalized_path(path)
+            .is_some_and(|path| path == self.root.join(WORKSPACE_CONFIGURATION_FILE))
+    }
+
+    /// Maps watched spelling onto canonical root without touching event path.
+    fn normalized_path<'a>(&self, path: &'a Path) -> Option<Cow<'a, Path>> {
+        if path.strip_prefix(&self.root).is_ok() {
+            return Some(Cow::Borrowed(path));
+        }
+        let relative = path.strip_prefix(&self.watched_root).ok().or_else(|| {
+            (!path.is_absolute() && !self.watched_root.is_absolute()).then_some(path)
+        })?;
+        Some(Cow::Owned(self.root.join(relative)))
+    }
+}
+
 /// Immutable current-workspace Rust read index.
 #[derive(Debug)]
 pub struct WorkspaceIndex {
@@ -324,6 +469,7 @@ pub struct WorkspaceIndex {
     files: Vec<IndexedFile>,
     composition: ProviderComposition,
     limits: WorkspaceIndexLimits,
+    fingerprint: WorkspaceFingerprint,
 }
 
 impl WorkspaceIndex {
@@ -353,11 +499,13 @@ impl WorkspaceIndex {
             let file = read_file(&root, &path, &parser, limits, &mut workspace_bytes)?;
             files.push(file);
         }
+        let fingerprint = WorkspaceFingerprint::from_files(&files);
         Ok(Self {
             root,
             files,
             composition,
             limits,
+            fingerprint,
         })
     }
 
@@ -370,11 +518,13 @@ impl WorkspaceIndex {
         composition: ProviderComposition,
         limits: WorkspaceIndexLimits,
     ) -> Self {
+        let fingerprint = WorkspaceFingerprint::from_files(&files);
         Self {
             root,
             files,
             composition,
             limits,
+            fingerprint,
         }
     }
 
@@ -394,6 +544,12 @@ impl WorkspaceIndex {
     #[must_use]
     pub const fn composition(&self) -> &ProviderComposition {
         &self.composition
+    }
+
+    /// Returns exact visible source identity captured by this index.
+    #[must_use]
+    pub const fn fingerprint(&self) -> &WorkspaceFingerprint {
+        &self.fingerprint
     }
 
     /// Returns the maximum result count accepted per query against this index.
@@ -667,6 +823,84 @@ fn discover(
     Ok(files)
 }
 
+/// Compiles bounded workspace `.gitignore` chain for direct event matching.
+fn build_gitignore(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+) -> Result<Gitignore, WorkspaceIndexError> {
+    let mut builder = GitignoreBuilder::new(root);
+    let mut ignore_files = 0_usize;
+    for entry in source_walk(root, limits.directory_depth_max, GitignorePolicy::Ignore) {
+        let entry = entry.map_err(|error| walk_error(root, error))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+            || path.file_name() != Some(OsStr::new(".gitignore"))
+        {
+            continue;
+        }
+        if ignore_files >= limits.files_max {
+            return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+        }
+        ignore_files += 1;
+        if let Some(error) = builder.add(path) {
+            return Err(index_error_caused_by(
+                WorkspaceIndexViolation::Filesystem,
+                Some(path),
+                error,
+            ));
+        }
+    }
+    builder.build().map_err(|error| {
+        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(root), error)
+    })
+}
+
+/// Hashes one already-discovered source set without parsing its syntax.
+fn fingerprint_paths(
+    root: &Path,
+    paths: &[PathBuf],
+    limits: WorkspaceIndexLimits,
+) -> Result<WorkspaceFingerprint, WorkspaceIndexError> {
+    let mut hasher = Sha256::new();
+    let mut workspace_bytes = 0_usize;
+    for path in paths {
+        let bytes = fs::read(path).map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        })?;
+        if bytes.len() > limits.file_bytes_max() {
+            return Err(index_error_at(WorkspaceIndexViolation::FileTooLarge, path));
+        }
+        workspace_bytes = workspace_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, path))?;
+        if workspace_bytes > limits.workspace_bytes_max() {
+            return Err(index_error_at(
+                WorkspaceIndexViolation::WorkspaceTooLarge,
+                path,
+            ));
+        }
+        let relative = path.strip_prefix(root).map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
+        })?;
+        let project_path = relative_path(relative)?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::InvalidSource, Some(path), error)
+        })?;
+        update_fingerprint(&mut hasher, &project_path, source.as_bytes());
+    }
+    Ok(WorkspaceFingerprint(hasher.finalize().into()))
+}
+
+/// Adds one unambiguous project-path/source pair to workspace identity.
+fn update_fingerprint(hasher: &mut Sha256, path: &ProjectPath, source: &[u8]) {
+    hasher.update(path.as_str().as_bytes());
+    hasher.update([FINGERPRINT_PATH_SEPARATOR]);
+    hasher.update(source);
+    hasher.update([FINGERPRINT_FILE_SEPARATOR]);
+}
+
 /// Whether a workspace walk also consults the workspace's own `.gitignore` chain, on top of the
 /// hard floor it always applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,6 +953,19 @@ fn hard_floor_admits(entry: &DirEntry) -> bool {
         .file_type()
         .is_some_and(|file_type| file_type.is_dir());
     !(is_dir && is_ignored_directory(entry.file_name()))
+}
+
+/// Applies the hard floor to one absolute event path.
+fn hard_floor_admits_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    !relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
+    })
 }
 
 /// Whether `path`'s extension is one some shipped syntax provider declares
@@ -879,6 +1126,40 @@ mod tests {
         assert_eq!(source[0].1, 1);
         let path = ProjectPath::new("src/lib.rs").expect("fixture path");
         assert!(!index.nodes(&path, 4).expect("indexed path").is_empty());
+    }
+
+    #[test]
+    fn test_workspace_source_policy_matches_configuration_gitignore_and_hard_floor() {
+        let directory = fixture();
+        let watched_root = directory.path().join(".");
+        fs::create_dir_all(directory.path().join("src/generated")).expect("generated directory");
+        fs::create_dir(directory.path().join("target")).expect("target directory");
+        fs::write(directory.path().join(".gitignore"), "src/ignored.rs\n").expect("ignore policy");
+        let visibility = SourceVisibility::new(
+            vec!["src/**".to_owned()],
+            vec!["src/generated/**".to_owned()],
+            true,
+        );
+        let policy = WorkspaceSourcePolicy::build(
+            &watched_root,
+            WorkspaceIndexLimits::default(),
+            &visibility,
+        )
+        .expect("source policy");
+
+        assert!(policy.admits(&directory.path().join("src/lib.rs")));
+        assert!(!policy.admits(&directory.path().join("src/ignored.rs")));
+        assert!(!policy.admits(&directory.path().join("src/generated/code.rs")));
+        assert!(!policy.admits(&directory.path().join("target/code.rs")));
+        assert!(!policy.admits(&directory.path().join("src/readme.md")));
+        assert!(!policy.admits(Path::new("outside.rs")));
+        assert!(policy.may_admit_descendant(&directory.path().join("src")));
+        assert!(!policy.may_admit_descendant(&directory.path().join("examples")));
+        assert!(!policy.may_admit_descendant(&directory.path().join("src/generated")));
+        assert!(!policy.may_admit_descendant(&directory.path().join("target")));
+        let canonical_root = fs::canonicalize(directory.path()).expect("canonical workspace");
+        assert!(policy.admits(&canonical_root.join("src/lib.rs")));
+        assert!(policy.may_admit_descendant(&canonical_root.join("src")));
     }
 
     #[cfg(unix)]
@@ -1623,6 +1904,112 @@ mod tests {
             .fault()
             .violation(),
             WorkspaceIndexViolation::WorkspaceTooLarge,
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_paths_preserves_bound_and_path_failures() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let limits = WorkspaceIndexLimits::new(5, 8, 10, 4, 5).expect("limits");
+
+        let missing = root.join("missing.rs");
+        let error = fingerprint_paths(&root, &[missing], limits).expect_err("missing source");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+
+        let oversized = root.join("oversized.rs");
+        fs::write(&oversized, b"123456789").expect("oversized source");
+        let error = fingerprint_paths(&root, &[oversized], limits).expect_err("file bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::FileTooLarge
+        );
+
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        fs::write(&first, b"123456").expect("first source");
+        fs::write(&second, b"123456").expect("second source");
+        let error =
+            fingerprint_paths(&root, &[first, second], limits).expect_err("workspace bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+
+        let outside = tempfile::NamedTempFile::new().expect("outside source");
+        fs::write(outside.path(), b"fn x(){}").expect("outside bytes");
+        let error = fingerprint_paths(&root, &[outside.path().to_path_buf()], limits)
+            .expect_err("outside path");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::InvalidPath
+        );
+
+        let invalid = root.join("invalid.rs");
+        fs::write(&invalid, [0xff]).expect("invalid source");
+        let error = fingerprint_paths(&root, &[invalid], limits).expect_err("invalid UTF-8");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::InvalidSource
+        );
+    }
+
+    #[test]
+    fn test_descendant_admission_refuses_paths_outside_root() {
+        let directory = fixture();
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("source policy");
+        assert!(!policy.may_admit_descendant(Path::new("/rift-elsewhere")));
+    }
+
+    #[test]
+    fn test_hard_floor_refuses_event_paths_outside_root() {
+        assert!(!hard_floor_admits_path(
+            Path::new("/rift-workspace"),
+            Path::new("/rift-elsewhere/lib.rs")
+        ));
+    }
+
+    #[test]
+    fn test_gitignore_files_beyond_the_file_bound_are_refused() {
+        let directory = fixture();
+        fs::write(directory.path().join(".gitignore"), "target\n").expect("root ignore");
+        fs::write(directory.path().join("src/.gitignore"), "generated\n").expect("nested ignore");
+        let tight = WorkspaceIndexLimits::new(1, 4_096, 65_536, 8, 10).expect("bounds");
+        let error =
+            WorkspaceSourcePolicy::build(directory.path(), tight, &SourceVisibility::default())
+                .expect_err("second ignore file must breach the file bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::TooManyFiles
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unreadable_gitignore_is_a_filesystem_refusal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = fixture();
+        let ignore = directory.path().join(".gitignore");
+        fs::write(&ignore, "target\n").expect("ignore fixture");
+        fs::set_permissions(&ignore, fs::Permissions::from_mode(0o000)).expect("revoke read");
+        let error = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect_err("unreadable ignore file must be refused");
+        fs::set_permissions(&ignore, fs::Permissions::from_mode(0o644)).expect("restore read");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
         );
     }
 }

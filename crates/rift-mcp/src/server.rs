@@ -1,53 +1,45 @@
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
-use rift_core::{ErrorName, Fault, SourceVisibility};
-use rift_index::WorkspaceIndexLimits;
+use rift_core::SourceVisibility;
+use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
     ReplaceNodeParams, ReplaceSymbolParams,
 };
-use rift_protocol::configuration::{
-    CommandHook, SERVER_BLOCKING_SLOTS_MAX, ServerConfiguration, WorkspaceConfiguration,
-};
+use rift_protocol::configuration::{CommandHook, SERVER_BLOCKING_SLOTS_MAX, ServerConfiguration};
 use rift_protocol::error as wire;
 use rift_protocol::read::{
-    DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams,
-    SearchResult,
+    GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
 };
-use rift_server::{
-    ChangeService, ConfigurationError, HookRun, HookStatus, ReadError, ReadFault, ReadService,
-    load_configuration, run_hooks,
-};
+use rift_server::{ChangeService, HookStatus, ReadError, ReadFault, ReadService, run_hooks};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
+use tracing::Instrument as _;
 
-/// JSON-RPC error code every Rift operating failure travels under: the
-/// first code of the server-defined range (-32000 to -32099), which rmcp
-/// exports no constant for — its constants name only MCP-defined codes. The
-/// machine-readable classification is the [`wire::ErrorData`] in `data`.
-const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
-
-/// Most `causes` entries one wire error carries, matching the advertised
-/// schema bound.
-const ERROR_CAUSES_MAX: usize = 8;
+use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
+use crate::validation::{
+    ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, INDEX_FRESHNESS_TIMEOUT, IndexState,
+    IndexSupervisor, IndexSupervisorContext, IndexValidation, PublishedWorkspace, RebuildOutcome,
+    configuration_fingerprint, initial_workspace, publish_rebuild, run_index_supervisor,
+    workspace_watcher,
+};
 
 /// Bounded Tokio admission for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
-struct BlockingExecutor {
-    operations: Arc<Semaphore>,
-    queue_timeout_ms: u64,
+pub(crate) struct BlockingExecutor {
+    pub(crate) operations: Arc<Semaphore>,
+    pub(crate) queue_timeout_ms: u64,
 }
 
 impl BlockingExecutor {
     /// Sizes the workspace's pool and queue wait from one admitted
     /// `[server]` table.
-    fn for_configuration(server: &ServerConfiguration) -> Self {
+    pub(crate) fn for_configuration(server: &ServerConfiguration) -> Self {
         // Admission bounds the value to 1..=SERVER_BLOCKING_SLOTS_MAX, so
         // the clamp only guards the usize conversion.
         let slots = usize::try_from(server.blocking_slots.min(SERVER_BLOCKING_SLOTS_MAX))
@@ -61,7 +53,7 @@ impl BlockingExecutor {
 
     /// Creates an isolated executor for deterministic capacity tests.
     #[cfg(test)]
-    fn isolated(operations_max: usize, queue_timeout_ms: u64) -> Self {
+    pub(crate) fn isolated(operations_max: usize, queue_timeout_ms: u64) -> Self {
         assert!(
             operations_max > 0,
             "blocking operation capacity must be positive: operations_max={operations_max}"
@@ -77,7 +69,7 @@ impl BlockingExecutor {
     }
 
     /// Runs one blocking operation after queued, bounded admission.
-    async fn run<Output>(
+    pub(crate) async fn run<Output>(
         &self,
         operation: &'static str,
         work: impl FnOnce() -> Result<Output, ReadError> + Send + 'static,
@@ -103,13 +95,13 @@ impl BlockingExecutor {
 
 /// Serializes workspace mutations and snapshot publication.
 #[derive(Debug, Default)]
-struct ChangeLane {
-    admission: Mutex<()>,
+pub(crate) struct ChangeLane {
+    admission: AsyncMutex<()>,
 }
 
 impl ChangeLane {
     /// Runs one operation after FIFO admission to the workspace lane.
-    fn run<Output>(&self, operation: impl FnOnce() -> Output) -> Output {
+    pub(crate) fn run<Output>(&self, operation: impl FnOnce() -> Output) -> Output {
         let guard = self.admission.blocking_lock();
         let output = operation();
         // Filesystem mutation and snapshot publication finish before release.
@@ -139,76 +131,18 @@ impl ChangeLane {
 pub struct RiftMcp {
     root: PathBuf,
     limits: WorkspaceIndexLimits,
-    published: Arc<RwLock<Arc<PublishedWorkspace>>>,
+    published: Arc<RwLock<IndexState>>,
+    validation: Arc<IndexValidation>,
     changes: Arc<ChangeService>,
     change_lane: Arc<ChangeLane>,
     blocking: BlockingExecutor,
     tool_router: ToolRouter<Self>,
 }
 
-/// Read index and configuration policy published as one immutable value.
-#[derive(Debug)]
-struct PublishedWorkspace {
-    reads: Arc<ReadService>,
-    configuration: ConfigurationState,
-}
-
-/// The last admission of the workspace's `rift.toml`, kept with the file
-/// state it was read from so an edited file is re-admitted on the next
-/// request and an unchanged one is not re-parsed per call.
-#[derive(Debug, Clone)]
-struct ConfigurationState {
-    admitted: Result<WorkspaceConfiguration, Arc<ConfigurationError>>,
-    fingerprint: Option<ConfigurationFingerprint>,
-}
-
-impl ConfigurationState {
-    /// Admits the workspace's current `rift.toml`.
-    fn admit(root: &Path) -> Self {
-        Self {
-            admitted: load_configuration(root).map_err(Arc::new),
-            fingerprint: configuration_fingerprint(root),
-        }
+impl Drop for RiftMcp {
+    fn drop(&mut self) {
+        self.validation.cancellation.cancel();
     }
-
-    /// The admission's outcome as one request sees it: the configuration to
-    /// serve under, or the typed refusal naming what to fix.
-    fn admitted(&self, phase: wire::ErrorPhase) -> Result<WorkspaceConfiguration, ErrorData> {
-        match &self.admitted {
-            Ok(configuration) => Ok(configuration.clone()),
-            Err(error) => Err(error.tool_error(phase)),
-        }
-    }
-
-    /// The `[server]` table from the last admission, or the default table
-    /// while `rift.toml` is invalid.
-    fn server_configuration(&self) -> ServerConfiguration {
-        self.admitted
-            .as_ref()
-            .map(|configuration| configuration.server.clone())
-            .unwrap_or_default()
-    }
-
-    /// The `[source]` policy from the last admission, or the default policy
-    /// while `rift.toml` is invalid.
-    fn source_visibility(&self) -> SourceVisibility {
-        self.admitted.as_ref().map_or_else(
-            |_| SourceVisibility::default(),
-            |configuration| SourceVisibility::from(&configuration.source),
-        )
-    }
-}
-
-/// The file state one admission was read from. Size rides modification
-/// time because same-second edits are common at a shell; an edit that
-/// preserves both is not re-admitted until either moves.
-type ConfigurationFingerprint = (SystemTime, u64);
-
-/// The current `rift.toml` file state, or null when the file is absent or
-/// unreadable — either way the next admission decides what that means.
-fn configuration_fingerprint(root: &Path) -> Option<ConfigurationFingerprint> {
-    let metadata = std::fs::metadata(root.join(WORKSPACE_CONFIGURATION_FILE)).ok()?;
-    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
@@ -231,31 +165,63 @@ impl RiftMcp {
     pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
         let root = root.to_path_buf();
         let admission_root = root.clone();
-        let configuration =
+        let startup_configuration =
             tokio::task::spawn_blocking(move || ConfigurationState::admit(&admission_root))
                 .await
                 .map_err(|error| ReadFault::task("configuration admission", error.to_string()))?;
-        let blocking = BlockingExecutor::for_configuration(&configuration.server_configuration());
-        let build_root = root.clone();
-        let published = blocking
-            .run("initial index build", move || {
-                let visibility = configuration.source_visibility();
-                let reads = ReadService::build(&build_root, limits, &visibility)?;
-                Ok(Arc::new(PublishedWorkspace {
-                    reads: Arc::new(reads),
-                    configuration,
-                }))
+        let blocking =
+            BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
+        let (validation, invalidations) = IndexValidation::new();
+        let watch_root = root.clone();
+        let watch_validation = Arc::clone(&validation);
+        let watcher = blocking
+            .run("workspace watch setup", move || {
+                workspace_watcher(&watch_root, &watch_validation)
             })
+            .instrument(tracing::info_span!(
+                "index.watch",
+                component = "index",
+                operation = "watch.setup"
+            ))
             .await?;
+        let published = initial_workspace(&root, limits, &validation, &blocking).await?;
+        let published = Arc::new(RwLock::new(IndexState {
+            current: published,
+            failure: None,
+        }));
+        let change_lane = Arc::new(ChangeLane::default());
+        let supervisor_task = tokio::spawn(run_index_supervisor(
+            watcher,
+            invalidations,
+            IndexSupervisorContext {
+                root: root.clone(),
+                limits,
+                published: Arc::clone(&published),
+                change_lane: Arc::clone(&change_lane),
+                validation: Arc::clone(&validation),
+                blocking: blocking.clone(),
+            },
+        ));
+        let mut task = validation.task.lock().await;
+        *task = Some(supervisor_task);
+        drop(task);
         Ok(Self {
             root: root.clone(),
             limits,
-            published: Arc::new(RwLock::new(published)),
+            published,
+            validation,
             changes: Arc::new(ChangeService::new(&root)),
-            change_lane: Arc::new(ChangeLane::default()),
+            change_lane,
             blocking,
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Returns owned supervisor shutdown access for transport adapters.
+    pub(crate) fn index_supervisor(&self) -> IndexSupervisor {
+        IndexSupervisor {
+            validation: Arc::clone(&self.validation),
+        }
     }
 
     /// Finds Rust declarations and their source by exact symbol name. Each hit
@@ -400,58 +366,95 @@ impl RiftMcp {
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
-        let root = self.root.clone();
-        let fingerprint = self
-            .blocking
-            .run("configuration fingerprint", move || {
-                Ok(configuration_fingerprint(&root))
-            })
-            .await
-            .map_err(|error| error.tool_error(phase))?;
-        let guard = self.published.read().await;
-        let published = Arc::clone(&guard);
-        // Refresh below awaits blocking capacity; no read guard may cross it.
-        drop(guard);
-        if published.configuration.fingerprint == fingerprint {
-            published.configuration.admitted(phase)?;
-            return Ok(published);
+        match tokio::time::timeout(INDEX_FRESHNESS_TIMEOUT, self.reconcile_workspace(phase)).await {
+            Ok(result) => result,
+            Err(_) => Err(ReadFault::unavailable(
+                "current workspace read",
+                "index freshness deadline elapsed",
+            )
+            .tool_error(phase)),
         }
-        self.refresh_configuration(phase).await
     }
 
-    /// Rebuilds index and configuration together after `rift.toml` changes.
-    async fn refresh_configuration(
+    /// Reconciles native observations with an exact request-time fingerprint.
+    async fn reconcile_workspace(
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
-        let root = self.root.clone();
-        let limits = self.limits;
-        let published = Arc::clone(&self.published);
-        let change_lane = Arc::clone(&self.change_lane);
-        let refreshed = self
-            .blocking
-            .run("configuration index rebuild", move || {
-                change_lane.run(|| {
-                    let current = Arc::clone(&published.blocking_read());
-                    let fingerprint = configuration_fingerprint(&root);
-                    if current.configuration.fingerprint == fingerprint {
-                        return Ok(current);
-                    }
-                    let configuration = ConfigurationState::admit(&root);
-                    let visibility = configuration.source_visibility();
-                    let reads = Arc::new(ReadService::build(&root, limits, &visibility)?);
-                    let next = Arc::new(PublishedWorkspace {
-                        reads,
-                        configuration,
-                    });
-                    *published.blocking_write() = Arc::clone(&next);
-                    Ok(next)
+        for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
+            let current = self.await_current_workspace(phase).await?;
+            let root = self.root.clone();
+            let limits = self.limits;
+            let visibility = current.configuration.source_visibility();
+            let capture = self
+                .blocking
+                .run("workspace fingerprint", move || {
+                    let fingerprint = WorkspaceFingerprint::capture(&root, limits, &visibility)
+                        .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+                    Ok((fingerprint, configuration_fingerprint(&root)))
                 })
-            })
-            .await
-            .map_err(|error| error.tool_error(phase))?;
-        refreshed.configuration.admitted(phase)?;
-        Ok(refreshed)
+                .instrument(tracing::debug_span!(
+                    "index.reconcile",
+                    component = "index",
+                    operation = "fingerprint.capture",
+                    epoch = current.epoch
+                ))
+                .await;
+            let (fingerprint, configuration_fingerprint) = match capture {
+                Ok(capture) => capture,
+                Err(error) => {
+                    let _ = self.validation.observe();
+                    return Err(error.tool_error(phase));
+                }
+            };
+            let configuration_matches =
+                current.configuration.fingerprint == configuration_fingerprint;
+            let epoch_matches = current.epoch == self.validation.observed_epoch();
+            if fingerprint == current.fingerprint && configuration_matches && epoch_matches {
+                current.configuration.admitted(phase)?;
+                return Ok(current);
+            }
+            self.validation
+                .observe()
+                .map_err(|error| error.tool_error(phase))?;
+        }
+        Err(ReadFault::unavailable(
+            "current workspace read",
+            "workspace changed across bounded reconciliation attempts",
+        )
+        .tool_error(phase))
+    }
+
+    /// Waits until published and observed epochs agree or latest build failed.
+    async fn await_current_workspace(
+        &self,
+        phase: wire::ErrorPhase,
+    ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
+        loop {
+            let changed = self.validation.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let observed_epoch = self.validation.observed_epoch();
+            let state = self.published.read().await;
+            let (current, failure) = state.snapshot();
+            drop(state);
+            if self.validation.watch_failed.load(Ordering::Acquire) {
+                return Err(ReadFault::unavailable(
+                    "current workspace read",
+                    "filesystem watcher failed",
+                )
+                .tool_error(phase));
+            }
+            if current.epoch == observed_epoch {
+                return Ok(current);
+            }
+            if let Some((failed_epoch, error)) = failure
+                && failed_epoch == observed_epoch
+            {
+                return Err(error.tool_error(phase));
+            }
+            changed.as_mut().await;
+        }
     }
 
     /// Runs one change against the current snapshot and, when it lands,
@@ -479,41 +482,98 @@ impl RiftMcp {
         let root = self.root.clone();
         let limits = self.limits;
         let published = Arc::clone(&self.published);
+        let validation = Arc::clone(&self.validation);
         let changes = Arc::clone(&self.changes);
         let change_lane = Arc::clone(&self.change_lane);
         self.blocking
             .run("workspace change", move || {
-                change_lane
-                    .run(|| Self::change_serialized(&root, limits, &published, &changes, operation))
+                change_lane.run(|| {
+                    Self::change_serialized(
+                        &root,
+                        limits,
+                        &published,
+                        &validation,
+                        &changes,
+                        operation,
+                    )
+                })
             })
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?
     }
 
-    /// Runs one already-serialized change through snapshot publication.
+    /// Runs one already-serialized change through validated publication.
     fn change_serialized(
         root: &Path,
         limits: WorkspaceIndexLimits,
-        published: &RwLock<Arc<PublishedWorkspace>>,
+        published: &RwLock<IndexState>,
+        validation: &IndexValidation,
         changes: &ChangeService,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
     ) -> Result<Result<Json<ChangeResult>, ErrorData>, ReadError> {
-        let current = Arc::clone(&published.blocking_read());
+        let state = published.blocking_read();
+        let (current, _) = state.snapshot();
+        drop(state);
+        if current.epoch != validation.observed_epoch() {
+            return Ok(Err(ReadFault::unavailable(
+                "workspace change",
+                "index changed before operation admission",
+            )
+            .tool_error(wire::ErrorPhase::Change)));
+        }
         let configuration = match current.configuration.admitted(wire::ErrorPhase::Change) {
             Ok(configuration) => configuration,
             Err(error) => return Ok(Err(error)),
         };
         let mut result = operation(&current.reads, changes)?;
         if let ChangeResult::Applied { summary } = &mut result {
+            let epoch = match validation.observe() {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                    return Ok(Ok(Json(result)));
+                }
+            };
             Self::attach_hook_verdicts(root, &configuration.hooks, summary);
             let visibility = SourceVisibility::from(&configuration.source);
             match ReadService::build(root, limits, &visibility) {
                 Ok(rebuilt) => {
+                    let fingerprint = rebuilt.workspace_fingerprint().clone();
+                    let source_policy =
+                        match WorkspaceSourcePolicy::build(root, limits, &visibility) {
+                            Ok(policy) => Arc::new(policy),
+                            Err(error) => {
+                                let error = ReadError::from(ReadFault::Index(error));
+                                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                                return Ok(Ok(Json(result)));
+                            }
+                        };
+                    if current.configuration.fingerprint != configuration_fingerprint(root) {
+                        let error = ReadFault::unavailable(
+                            "workspace change",
+                            "configuration changed during snapshot rebuild",
+                        );
+                        let _ = validation.observe();
+                        summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                        return Ok(Ok(Json(result)));
+                    }
                     let next = Arc::new(PublishedWorkspace {
                         reads: Arc::new(rebuilt),
                         configuration: current.configuration.clone(),
+                        fingerprint,
+                        source_policy,
+                        epoch,
                     });
-                    *published.blocking_write() = next;
+                    if publish_rebuild(published, validation, next) == RebuildOutcome::Published {
+                        tracing::info!(
+                            component = "index",
+                            operation = "index.publish",
+                            trigger = "rift_change",
+                            epoch,
+                            "index snapshot published"
+                        );
+                        validation.changed.notify_waiters();
+                    }
                 }
                 Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
             }
@@ -546,86 +606,6 @@ impl RiftMcp {
     }
 }
 
-/// Bytes of each captured hook stream a failure finding quotes. The finding
-/// also states the full sizes, so a truncated quote stays distinguishable
-/// from a short log.
-const HOOK_FINDING_STREAM_BYTES_MAX: usize = 1_024;
-
-/// The finding an applied change carries for one hook that did not pass:
-/// what ended the run, then each non-empty stream's size and bounded quote.
-fn hook_failure_diagnostic(hook: &CommandHook, run: &HookRun) -> rift_protocol::read::Diagnostic {
-    let account = match &run.status {
-        HookStatus::Passed => unreachable!(
-            "a passing hook contributes guarantees, not findings: hook={:?}",
-            hook.id
-        ),
-        HookStatus::Failed => match run.exit_code {
-            Some(code) => format!("exited {code}"),
-            None => "exited nonzero".to_owned(),
-        },
-        HookStatus::TimedOut => format!("killed after {}ms", hook.timeout_ms),
-        HookStatus::Error(message) => message.clone(),
-    };
-    let mut message = format!("hook {} did not pass: {account}", hook.id);
-    for (stream_name, stream) in [("stdout", &run.stdout), ("stderr", &run.stderr)] {
-        if stream.total_bytes == 0 {
-            continue;
-        }
-        let quoted = bounded_prefix(&stream.text, HOOK_FINDING_STREAM_BYTES_MAX);
-        let _ = write!(
-            message,
-            "; {stream_name} ({} of {} bytes): {quoted}",
-            quoted.len(),
-            stream.total_bytes,
-        );
-    }
-    rift_protocol::read::Diagnostic {
-        severity: rift_protocol::read::Severity::Error,
-        code: Some(DiagnosticCode::HookFailed.code()),
-        message,
-        span: None,
-        related: Vec::new(),
-        tags: Vec::new(),
-        reliability: rift_protocol::read::DiagnosticReliability::Reliable,
-        continuation: rift_protocol::read::DiagnosticContinuation::Unknown,
-        extensions: rift_protocol::read::Extensions(std::collections::BTreeMap::new()),
-        language: None,
-    }
-}
-
-/// The longest prefix of `text` within `bytes_max` that ends on a character
-/// boundary. The walk back is bounded by UTF-8 itself: at most three steps.
-fn bounded_prefix(text: &str, bytes_max: usize) -> &str {
-    if text.len() <= bytes_max {
-        return text;
-    }
-    let mut end = bytes_max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-/// The finding an applied change carries when the follow-up snapshot could
-/// not be rebuilt: reads keep serving the pre-change snapshot until one can.
-fn stale_snapshot_diagnostic(error: &ReadError) -> rift_protocol::read::Diagnostic {
-    rift_protocol::read::Diagnostic {
-        severity: rift_protocol::read::Severity::Warning,
-        code: Some(DiagnosticCode::SnapshotStale.code()),
-        message: format!(
-            "the change landed, and the read snapshot could not refresh; \
-             reads serve the pre-change tree until the workspace indexes again: {error}"
-        ),
-        span: None,
-        related: Vec::new(),
-        tags: Vec::new(),
-        reliability: rift_protocol::read::DiagnosticReliability::Reliable,
-        continuation: rift_protocol::read::DiagnosticContinuation::Unknown,
-        extensions: rift_protocol::read::Extensions(std::collections::BTreeMap::new()),
-        language: None,
-    }
-}
-
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
     fn get_info(&self) -> ServerInfo {
@@ -640,88 +620,6 @@ impl ServerHandler for RiftMcp {
     }
 }
 
-/// Boundary view of a read failure: the projection a tool handler serves as
-/// the JSON-RPC error object the design documents — code `-32000`, the
-/// rendered failure line as `message`, and the typed [`wire::ErrorData`] as
-/// `data`.
-trait WireFailure {
-    /// The JSON-RPC error object for this failure, naming the phase it
-    /// stopped in.
-    fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData;
-
-    /// The typed wire payload for this failure.
-    fn wire_error(&self, phase: wire::ErrorPhase) -> wire::ErrorData;
-
-    /// The failure's source chain as bounded `causes` entries, outermost
-    /// first. Each level inherits the outer classification, which the read
-    /// error already resolved through the concrete failure it wraps.
-    fn wire_causes(&self) -> Vec<wire::ErrorCause>;
-}
-
-impl<K: Fault> WireFailure for rift_core::Error<K> {
-    fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData {
-        let message = self.to_string();
-        let data = serde_json::to_value(self.wire_error(phase)).ok();
-        ErrorData::new(RIFT_ERROR_CODE, message, data)
-    }
-
-    fn wire_error(&self, phase: wire::ErrorPhase) -> wire::ErrorData {
-        let descriptor = self.descriptor();
-        wire::ErrorData {
-            code: wire_code(descriptor.name()),
-            message: self.to_string(),
-            retry: descriptor.retry(),
-            phase,
-            diagnostics: Vec::new(),
-            limit: None,
-            causes: self.wire_causes(),
-        }
-    }
-
-    fn wire_causes(&self) -> Vec<wire::ErrorCause> {
-        let descriptor = self.descriptor();
-        bounded_causes(
-            wire_code(descriptor.name()),
-            descriptor.retry(),
-            std::error::Error::source(self),
-        )
-    }
-}
-
-/// Walks one source chain into bounded `causes` entries, outermost first.
-/// Every level inherits the classification and retry guidance passed in,
-/// which the failure already resolved through the concrete fault it wraps.
-fn bounded_causes(
-    code: wire::ErrorCode,
-    retry: wire::RetryDirective,
-    outermost: Option<&(dyn std::error::Error + 'static)>,
-) -> Vec<wire::ErrorCause> {
-    let mut causes = Vec::new();
-    let mut source = outermost;
-    while let Some(current) = source {
-        if causes.len() == ERROR_CAUSES_MAX {
-            break;
-        }
-        causes.push(wire::ErrorCause {
-            code,
-            message: current.to_string(),
-            retry,
-        });
-        source = current.source();
-    }
-    causes
-}
-
-/// The wire code for one registry identity. The registry composes the wire
-/// enum, so this is a projection, not a mapping; a CLI-only identity never
-/// reaches this boundary, and classifies as `internal_error` if one does.
-fn wire_code(name: ErrorName) -> wire::ErrorCode {
-    match name {
-        ErrorName::Wire(code) => code,
-        ErrorName::Cli(_) => wire::ErrorCode::InternalError,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -730,18 +628,21 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use rift_core::{CliCode, ErrorName, SourceVisibility};
     use rift_index::WorkspaceIndexLimits;
-    use rift_protocol::error as wire;
-    use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault, ReadService};
 
-    use super::WireFailure;
+    use rift_protocol::read::GetSymbolResult;
+    use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault};
+
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
     use serde_json::json;
 
-    use super::{BlockingExecutor, ChangeLane, ConfigurationState, PublishedWorkspace, RiftMcp};
+    use super::{BlockingExecutor, ChangeLane, Parameters, RiftMcp};
+    use crate::validation::{
+        ConfigurationState, IndexState, IndexValidation, PublishedWorkspace, WorkspaceCandidate,
+        build_workspace_candidate, configuration_fingerprint, record_rebuild_failure,
+    };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -750,6 +651,15 @@ mod tests {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         Ok((directory, server))
+    }
+
+    async fn get_symbol(server: &RiftMcp, name: &str) -> Result<GetSymbolResult, rmcp::ErrorData> {
+        let params = serde_json::from_value(json!({"name": name}))
+            .expect("test symbol parameters must deserialize");
+        server
+            .get_symbol(Parameters(params))
+            .await
+            .map(|result| result.0)
     }
 
     fn arguments(
@@ -761,15 +671,159 @@ mod tests {
             .ok_or_else(|| "tool arguments must be an object".into())
     }
 
+    fn stable_candidate(root: &std::path::Path, epoch: u64) -> TestResult<Arc<PublishedWorkspace>> {
+        match build_workspace_candidate(root, WorkspaceIndexLimits::default(), epoch)? {
+            WorkspaceCandidate::Stable(candidate) => Ok(candidate),
+            WorkspaceCandidate::ConfigurationChanged => {
+                Err("fixture configuration must remain stable".into())
+            }
+        }
+    }
+
     #[tokio::test]
     async fn build_propagates_workspace_index_failure() {
-        let error = RiftMcp::build(
-            std::path::Path::new("not-a-real-rift-workspace"),
-            WorkspaceIndexLimits::default(),
-        )
-        .await
-        .expect_err("missing root must fail");
+        let directory = tempfile::tempdir().expect("fixture must exist");
+        fs::write(directory.path().join("invalid.rs"), [0xff])
+            .expect("invalid source fixture must write");
+        let error = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+            .await
+            .expect_err("invalid source must fail");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
+    }
+
+    #[tokio::test]
+    async fn external_create_modify_rename_and_delete_stay_current() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let created = directory.path().join("external.rs");
+        fs::write(&created, "pub fn external_created() {}\n")?;
+        let result = get_symbol(&server, "external_created")
+            .await
+            .map_err(|error| format!("external create must reconcile: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+
+        fs::write(&created, "pub fn external_modified() {}\n")?;
+        let result = get_symbol(&server, "external_modified")
+            .await
+            .map_err(|error| format!("external modify must reconcile: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+        assert!(
+            get_symbol(&server, "external_created")
+                .await?
+                .hits
+                .is_empty()
+        );
+
+        let renamed = directory.path().join("renamed.rs");
+        fs::rename(&created, &renamed)?;
+        let result = get_symbol(&server, "external_modified")
+            .await
+            .map_err(|error| format!("external rename must reconcile: {error:?}"))?;
+        let unit = result.hits[0]
+            .symbol
+            .origin
+            .unit
+            .as_ref()
+            .ok_or("renamed symbol must retain source unit")?;
+        assert!(unit.0.ends_with("/renamed.rs"));
+
+        fs::remove_file(renamed)?;
+        let result = get_symbol(&server, "external_modified")
+            .await
+            .map_err(|error| format!("external delete must reconcile: {error:?}"))?;
+        assert!(result.hits.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_burst_coalesces_without_losing_final_bytes() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let path = directory.path().join("burst.rs");
+        for sequence in 0..32 {
+            fs::write(&path, format!("pub fn burst_{sequence}() {{}}\n"))?;
+        }
+        let result = get_symbol(&server, "burst_31")
+            .await
+            .map_err(|error| format!("burst final state must reconcile: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+        assert!(get_symbol(&server, "burst_0").await?.hits.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_rebuild_failure_recovers_after_tree_is_valid() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lib.rs");
+        fs::write(&path, "pub fn beacon() {}\n")?;
+        let tight =
+            WorkspaceIndexLimits::new(4, 60, 60, 4, 100).map_err(|error| error.to_string())?;
+        let server = RiftMcp::build(directory.path(), tight).await?;
+
+        let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
+        fs::write(&path, oversized)?;
+        let error = get_symbol(&server, "oversized")
+            .await
+            .expect_err("oversized external edit must refuse a current answer");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some("limit_exceeded"));
+
+        fs::write(&path, "pub fn recovered() {}\n")?;
+        let mut recovered = false;
+        for _attempt in 0..100 {
+            if get_symbol(&server, "recovered")
+                .await
+                .is_ok_and(|result| result.hits.len() == 1)
+            {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(recovered, "valid external edit must recover failed rebuild");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ignore_policy_and_hard_floor_exclude_external_source() -> TestResult {
+        let (directory, server) = fixture().await?;
+        fs::write(
+            directory.path().join("policy.rs"),
+            "pub fn policy_hidden() {}\n",
+        )?;
+        assert_eq!(get_symbol(&server, "policy_hidden").await?.hits.len(), 1);
+
+        fs::write(directory.path().join(".gitignore"), "policy.rs\n")?;
+        assert!(get_symbol(&server, "policy_hidden").await?.hits.is_empty());
+        fs::remove_file(directory.path().join(".gitignore"))?;
+        assert_eq!(get_symbol(&server, "policy_hidden").await?.hits.len(), 1);
+
+        fs::create_dir(directory.path().join("target"))?;
+        fs::write(
+            directory.path().join("target/ignored.rs"),
+            "pub fn hard_floor_hidden() {}\n",
+        )?;
+        assert!(
+            get_symbol(&server, "hard_floor_hidden")
+                .await?
+                .hits
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_supervisor_shutdown_is_joined_and_idempotent() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let supervisor = server.index_supervisor();
+        drop(server);
+        assert!(supervisor.validation.cancellation.is_cancelled());
+        supervisor.shutdown().await?;
+        supervisor.shutdown().await?;
+        assert!(supervisor.validation.task.lock().await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -812,28 +866,6 @@ mod tests {
         assert_eq!(
             server.blocking.operations.available_permits() as u64,
             default_table.blocking_slots
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn refresh_reuses_publication_while_fingerprint_is_unchanged() -> TestResult {
-        let (directory, server) = fixture().await?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[providers.history]\nenabled = false\n",
-        )?;
-        let refreshed = server
-            .refresh_configuration(wire::ErrorPhase::Read)
-            .await
-            .map_err(|error| format!("changed file must be re-admitted: {error:?}"))?;
-        let reused = server
-            .refresh_configuration(wire::ErrorPhase::Read)
-            .await
-            .map_err(|error| format!("unchanged file must serve the current value: {error:?}"))?;
-        assert!(
-            Arc::ptr_eq(&refreshed, &reused),
-            "an unchanged fingerprint must return the published workspace, not rebuild it"
         );
         Ok(())
     }
@@ -1072,21 +1104,24 @@ mod tests {
     fn serialized_change_refuses_invalid_configuration_before_operation() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let reads = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-        )?;
+        let candidate = stable_candidate(directory.path(), 0)?;
         let configuration_error = rift_core::Error::new(ConfigurationFault::Malformed {
             detail: "test invalid configuration".to_owned(),
         });
-        let published = tokio::sync::RwLock::new(Arc::new(PublishedWorkspace {
-            reads: Arc::new(reads),
-            configuration: ConfigurationState {
-                admitted: Err(Arc::new(configuration_error)),
-                fingerprint: None,
-            },
-        }));
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: Arc::new(PublishedWorkspace {
+                reads: Arc::clone(&candidate.reads),
+                configuration: ConfigurationState {
+                    admitted: Err(Arc::new(configuration_error)),
+                    fingerprint: configuration_fingerprint(directory.path()),
+                },
+                fingerprint: candidate.fingerprint.clone(),
+                source_policy: Arc::clone(&candidate.source_policy),
+                epoch: 0,
+            }),
+            failure: None,
+        });
+        let (validation, _invalidations) = IndexValidation::new();
         let changes = ChangeService::new(directory.path());
         let operation_called = AtomicBool::new(false);
 
@@ -1094,6 +1129,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &published,
+            &validation,
             &changes,
             |_, _| {
                 operation_called.store(true, Ordering::SeqCst);
@@ -1288,6 +1324,29 @@ mod tests {
         Ok(())
     }
 
+    /// Calls one tool, retrying the refusals the server advertises as
+    /// `retry: same_request`: a concurrent write may move the index between
+    /// snapshot and admission, and the wire contract answers with a bounded
+    /// retry rather than a failure.
+    async fn call_until_admitted(
+        peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
+        params: CallToolRequestParams,
+    ) -> TestResult<rmcp::model::CallToolResult> {
+        const ADMISSION_ATTEMPTS_MAX: usize = 8;
+        for _attempt in 0..ADMISSION_ATTEMPTS_MAX {
+            match peer.call_tool(params.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(ServiceError::McpError(error))
+                    if error
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err("the server kept refusing a retryable change".into())
+    }
+
     #[tokio::test]
     async fn concurrent_inserts_publish_from_serialized_fresh_snapshots() -> TestResult {
         let (directory, server) = fixture().await?;
@@ -1302,14 +1361,16 @@ mod tests {
         let client = ().serve(client_transport).await?;
         let first_client = client.peer().clone();
         let second_client = client.peer().clone();
-        let first = first_client.call_tool(
+        let first = call_until_admitted(
+            &first_client,
             CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
                 "anchor": "rift://symbol/rust/lib.rs/beacon",
                 "position": "after",
                 "body": "pub fn first_insert() {}"
             }))?),
         );
-        let second = second_client.call_tool(
+        let second = call_until_admitted(
+            &second_client,
             CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
                 "anchor": "rift://symbol/rust/lib.rs/beacon",
                 "position": "after",
@@ -1341,11 +1402,7 @@ mod tests {
     #[tokio::test]
     async fn applied_change_reports_failed_snapshot_rebuild_as_warning() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(
-            directory.path().join("lib.rs"),
-            "pub fn beacon() {}
-",
-        )?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
         let server = RiftMcp::build(directory.path(), tight).await?;
@@ -1454,174 +1511,210 @@ pub fn beacon() -> u64 {
     }
 
     #[test]
-    fn cli_identity_projects_to_internal_error_on_the_wire() {
-        assert_eq!(
-            super::wire_code(ErrorName::Cli(CliCode::ArtifactStale)),
-            wire::ErrorCode::InternalError
-        );
-    }
-
-    #[derive(Debug)]
-    struct Link {
-        depth: usize,
-        inner: Option<Box<Link>>,
-    }
-
-    impl std::fmt::Display for Link {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "link {}", self.depth)
-        }
-    }
-
-    impl Error for Link {
-        fn source(&self) -> Option<&(dyn Error + 'static)> {
-            self.inner
-                .as_deref()
-                .map(|link| link as &(dyn Error + 'static))
-        }
-    }
-
-    #[test]
-    fn cause_walk_stops_at_the_declared_bound() {
-        let mut chained = Link {
-            depth: 0,
-            inner: None,
-        };
-        for depth in 1..=super::ERROR_CAUSES_MAX + 2 {
-            chained = Link {
-                depth,
-                inner: Some(Box::new(chained)),
-            };
-        }
-        let causes = super::bounded_causes(
-            wire::ErrorCode::StorageFailure,
-            wire::RetryDirective::Never,
-            Some(&chained),
-        );
-        assert_eq!(
-            causes.len(),
-            super::ERROR_CAUSES_MAX,
-            "a chain deeper than the bound must truncate at the bound"
-        );
-    }
-
-    fn probe_hook() -> rift_protocol::configuration::CommandHook {
-        use rift_protocol::configuration::{ChangedPaths, Determinism, HookKind, HookType};
-        rift_protocol::configuration::CommandHook {
-            r#type: HookType::Command,
-            id: "tests".to_owned(),
-            kind: HookKind::Test,
-            program: "cargo".to_owned(),
-            arguments: vec!["test".to_owned()],
-            changed_paths: ChangedPaths::None,
-            working_directory: rift_protocol::read::ProjectPath(String::new()),
-            environment: std::collections::BTreeMap::new(),
-            timeout_ms: 120_000,
-            output_limit_bytes: 4_096,
-            guarantees: Vec::new(),
-            determinism: Determinism::Deterministic,
-        }
-    }
-
-    fn silent_run(status: rift_server::HookStatus, exit_code: Option<i32>) -> rift_server::HookRun {
-        rift_server::HookRun {
-            id: "tests".to_owned(),
-            status,
-            exit_code,
-            stdout: rift_server::CapturedStream::default(),
-            stderr: rift_server::CapturedStream::default(),
-        }
-    }
-
-    #[test]
-    fn failed_hook_finding_quotes_exit_code_and_nonempty_streams() {
-        use rift_server::{CapturedStream, HookStatus};
-        let mut run = silent_run(HookStatus::Failed, Some(1));
-        run.stdout = CapturedStream {
-            text: "boom".to_owned(),
-            captured_bytes: 4,
-            total_bytes: 4,
-            truncated: false,
-        };
-        let finding = super::hook_failure_diagnostic(&probe_hook(), &run);
-        assert_eq!(finding.severity, rift_protocol::read::Severity::Error);
-        assert_eq!(finding.code.as_deref(), Some("rift.hook.failed"));
-        assert!(
-            finding.message.contains("exited 1")
-                && finding.message.contains("stdout (4 of 4 bytes): boom")
-                && !finding.message.contains("stderr"),
-            "{}",
-            finding.message
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "a passing hook contributes guarantees, not findings")]
-    fn passing_hook_finding_is_a_programmer_error() {
-        let run = silent_run(rift_server::HookStatus::Passed, Some(0));
-        let _ = super::hook_failure_diagnostic(&probe_hook(), &run);
-    }
-
-    #[test]
-    fn hook_finding_accounts_for_every_non_passing_outcome() {
-        use rift_server::HookStatus;
-        let cases = [
-            (HookStatus::Failed, None, "exited nonzero"),
-            (HookStatus::TimedOut, None, "killed after 120000ms"),
-            (
-                HookStatus::Error("failed to launch: missing".to_owned()),
-                None,
-                "failed to launch: missing",
-            ),
-        ];
-        for (status, exit_code, expected) in cases {
-            let finding =
-                super::hook_failure_diagnostic(&probe_hook(), &silent_run(status, exit_code));
-            assert!(
-                finding.message.contains(expected),
-                "{expected} missing from {}",
-                finding.message
-            );
-        }
-    }
-
-    #[test]
-    fn bounded_prefix_cuts_on_character_boundaries() {
-        assert_eq!(super::bounded_prefix("short", 16), "short");
-        assert_eq!(super::bounded_prefix("ééé", 3), "é");
-        assert_eq!(super::bounded_prefix("ééé", 4), "éé");
-    }
-
-    #[test]
-    fn stale_snapshot_finding_carries_its_code_and_the_render() {
-        let error = rift_server::ReadError::from(ReadFault::Unsupported {
-            capability: "probe",
+    fn serialized_change_refuses_when_index_already_moved() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new();
+        validation
+            .observe()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
         });
-        let finding = super::stale_snapshot_diagnostic(&error);
-        assert_eq!(finding.code.as_deref(), Some("rift.snapshot.stale"));
-        assert_eq!(finding.severity, rift_protocol::read::Severity::Warning);
+        let changes = ChangeService::new(directory.path());
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &validation,
+            &changes,
+            |_, _| panic!("a moved index must refuse before the operation runs"),
+        )?;
+        let Err(error) = outcome else {
+            panic!("a moved index must refuse the change");
+        };
         assert!(
-            finding.message.contains("the change landed"),
-            "{}",
-            finding.message
+            error
+                .message
+                .contains("index changed before operation admission"),
+            "unexpected refusal: {error:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn wire_causes_walk_the_source_chain_with_inherited_classification() {
-        let error = ReadService::build(
-            std::path::Path::new("not-a-real-rift-workspace"),
+    fn applied_change_reports_lost_observation_as_stale_snapshot() -> TestResult {
+        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, receiver) = IndexValidation::new();
+        drop(receiver);
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
             WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-        )
-        .expect_err("missing root must fail");
-        let causes = error.wire_causes();
-        assert!(!causes.is_empty(), "sourced failure must yield causes");
-        assert!(causes.len() <= super::ERROR_CAUSES_MAX);
-        let code = super::wire_code(error.descriptor().name());
-        for cause in &causes {
-            assert!(!cause.message.is_empty(), "cause message must be rendered");
-            assert_eq!(cause.code, code);
-        }
+            &published,
+            &validation,
+            &changes,
+            |_, _| {
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        paths: Vec::new(),
+                        edits: Vec::new(),
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+            panic!("the applied change must survive a lost observation");
+        };
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(
+            summary.diagnostics[0].message.contains("could not refresh"),
+            "diagnostic must explain the stale snapshot: {:?}",
+            summary.diagnostics[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applied_change_that_moves_configuration_reports_stale_snapshot() -> TestResult {
+        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new();
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let root = directory.path().to_path_buf();
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &validation,
+            &changes,
+            move |_, _| {
+                let moved = "[providers.history]\nenabled = false\n";
+                fs::write(root.join("rift.toml"), moved).map_err(|error| {
+                    ReadFault::task("test configuration write", error.to_string())
+                })?;
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        paths: Vec::new(),
+                        edits: Vec::new(),
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+            panic!("the applied change must survive a moved configuration");
+        };
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(
+            summary.diagnostics[0]
+                .message
+                .contains("configuration changed during snapshot rebuild"),
+            "diagnostic must name the moved configuration: {:?}",
+            summary.diagnostics[0]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_fail_fast_after_watcher_failure() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let _ = server.validation.observe_watch_failure();
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a failed watcher must refuse current reads");
+        assert!(
+            error.message.contains("filesystem watcher failed"),
+            "unexpected refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorded_rebuild_failure_serves_reads_the_typed_error() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let lane_guard = server.change_lane.admission.lock().await;
+        let epoch = server
+            .validation
+            .observe()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        let published = Arc::clone(&server.published);
+        let validation = Arc::clone(&server.validation);
+        let recorded = tokio::task::spawn_blocking(move || {
+            record_rebuild_failure(
+                &published,
+                &validation,
+                epoch,
+                ReadFault::unavailable("test rebuild", "injected failure"),
+            )
+        })
+        .await?;
+        assert!(
+            recorded,
+            "the failure must be recorded at the current epoch"
+        );
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a recorded rebuild failure must refuse current reads");
+        assert!(
+            error.message.contains("injected failure"),
+            "unexpected refusal: {error:?}"
+        );
+        drop(lane_guard);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reads_time_out_while_publication_is_stalled() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        // Advance the observed epoch without an invalidation signal, so no
+        // rebuild ever publishes a matching snapshot and the read must wait.
+        server
+            .validation
+            .observed_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a stalled publication must miss the freshness deadline");
+        assert!(
+            error.message.contains("index freshness deadline elapsed"),
+            "unexpected refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn traced_read_reconciles_under_an_active_subscriber() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_directory, server) = fixture().await?;
+        let result = get_symbol(&server, "beacon")
+            .await
+            .map_err(|error| format!("traced read must serve: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+        Ok(())
     }
 }
