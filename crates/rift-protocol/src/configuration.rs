@@ -668,6 +668,15 @@ pub enum ConfigurationViolation {
         /// The rejected key.
         key: String,
     },
+    /// A `source.include` or `source.exclude` entry breaks the forward-slash-only path-pattern
+    /// contract: it is empty, absolute, carries a backslash or control character, or a `.` or
+    /// `..` segment.
+    PathPatternInvalid {
+        /// The key's path in the file: `source.include` or `source.exclude`.
+        field: &'static str,
+        /// The rejected pattern.
+        pattern: String,
+    },
 }
 
 impl ConfigurationViolation {
@@ -699,6 +708,9 @@ impl ConfigurationViolation {
             }
             Self::HookEnvironmentKeyInvalid { id, key } => {
                 vec![("id", id.clone()), ("key", key.clone())]
+            }
+            Self::PathPatternInvalid { field, pattern } => {
+                vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
             }
         }
     }
@@ -1420,6 +1432,16 @@ mod tests {
                     key: "BAD=KEY".to_owned(),
                 },
                 vec![("id", id()), ("key", "BAD=KEY".to_owned())],
+            ),
+            (
+                ConfigurationViolation::PathPatternInvalid {
+                    field: "source.include",
+                    pattern: "src\\lib.rs".to_owned(),
+                },
+                vec![
+                    ("field", "source.include".to_owned()),
+                    ("pattern", "src\\lib.rs".to_owned()),
+                ],
             ),
         ];
         for (violation, expected) in cases {
