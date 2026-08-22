@@ -65,6 +65,13 @@ pub enum ReadFault {
         /// Runtime failure account.
         detail: String,
     },
+    /// A blocking operation waited past its configured queue bound.
+    CapacityTimeout {
+        /// Operation waiting for blocking capacity.
+        operation: &'static str,
+        /// Configured queue wait bound in milliseconds.
+        timeout_ms: u64,
+    },
 }
 
 impl Fault for ReadFault {
@@ -77,6 +84,7 @@ impl Fault for ReadFault {
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
             Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
             Self::Task { .. } => ErrorName::Wire(ErrorCode::InternalError),
+            Self::CapacityTimeout { .. } => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
         }
     }
 
@@ -105,6 +113,13 @@ impl Fault for ReadFault {
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("detail", detail.clone()),
             ],
+            Self::CapacityTimeout {
+                operation,
+                timeout_ms,
+            } => vec![
+                ErrorContext::new("operation", *operation),
+                ErrorContext::new("timeout_ms", timeout_ms.to_string()),
+            ],
         }
     }
 
@@ -116,7 +131,8 @@ impl Fault for ReadFault {
             | Self::Invalid { .. }
             | Self::NotFound { .. }
             | Self::Storage { .. }
-            | Self::Task { .. } => None,
+            | Self::Task { .. }
+            | Self::CapacityTimeout { .. } => None,
         }
     }
 }
@@ -162,6 +178,15 @@ impl ReadFault {
         Error::new(Self::Task {
             operation,
             detail: detail.into(),
+        })
+    }
+
+    /// Classifies exhausted wait for bounded blocking capacity.
+    #[must_use]
+    pub fn capacity_timeout(operation: &'static str, timeout_ms: u64) -> ReadError {
+        Error::new(Self::CapacityTimeout {
+            operation,
+            timeout_ms,
         })
     }
 }
