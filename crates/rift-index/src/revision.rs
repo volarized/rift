@@ -312,6 +312,32 @@ mod tests {
     }
 
     #[test]
+    fn test_at_revision_refuses_a_committed_path_the_project_contract_forbids() {
+        let directory = committed_workspace();
+        // A backslash is legal in a git tree entry and on unix filesystems,
+        // and `ProjectPath` refuses it on every platform; plumbing commits it
+        // without touching the host filesystem.
+        rift_history::fixture::commit_raw_path(
+            directory.path(),
+            b"bad\\path.rs",
+            "refs/heads/raw",
+        );
+        let (repository, _) = open_head(directory.path());
+        let raw = repository.resolve("raw").expect("raw branch resolves");
+        let error = WorkspaceIndex::at_revision(
+            &repository,
+            &raw,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect_err("a committed backslash path must refuse");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::InvalidPath
+        );
+    }
+
+    #[test]
     fn test_at_revision_refuses_a_non_utf8_committed_blob() {
         let directory = committed_workspace();
         fs::write(directory.path().join("evil.rs"), [0xff, 0xfe]).expect("binary blob");
