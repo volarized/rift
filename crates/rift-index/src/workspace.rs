@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use ignore::{DirEntry, WalkBuilder};
 use rift_core::constants::{
-    READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, WORKSPACE_BYTES_MAX_DEFAULT,
-    WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
-    WORKSPACE_IGNORED_DIRECTORIES,
+    READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, SOURCE_FILE_EXTENSIONS,
+    WORKSPACE_BYTES_MAX_DEFAULT, WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
+    WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
     CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
@@ -429,7 +429,7 @@ impl WorkspaceIndex {
                 continue;
             }
             let path = entry.path();
-            if path.extension().is_none_or(|extension| extension != "rs") {
+            if !has_source_extension(path) {
                 continue;
             }
             if !matcher.admits(path) {
@@ -593,7 +593,7 @@ fn discover(
             continue;
         }
         let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "rs") {
+        if !has_source_extension(path) {
             continue;
         }
         if !matcher.admits(path) {
@@ -650,6 +650,15 @@ fn hard_floor_admits(entry: &DirEntry) -> bool {
 fn is_ignored_directory(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
+}
+
+/// Whether `path`'s extension is one of [`SOURCE_FILE_EXTENSIONS`]: the single list every
+/// workspace walk consults, so a new grammar's extension joins the scan by extending that list
+/// alone.
+fn has_source_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| SOURCE_FILE_EXTENSIONS.contains(&extension))
 }
 
 /// The path one `ignore` walk failure names, when its cause names one.
