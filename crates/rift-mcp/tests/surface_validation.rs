@@ -51,6 +51,9 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
+        ("get_symbol", json!({ "name": "beacon_one", "rev": "main" })),
+        ("search", json!({ "query": "beacon", "rev": "main" })),
+        ("nodes", json!({ "path": "lib.rs", "position": 0, "rev": "main" })),
         (
             "replace_symbol",
             json!({
@@ -306,6 +309,11 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("hidden.rs"),
         "pub fn phantom_signal() {}\n",
     )?;
+    // A committed baseline, so the corpus can prove revision-addressed reads:
+    // `hidden.rs` stays gitignored and uncommitted, everything else lands in
+    // the fixture's one commit on `main`.
+    rift_history::fixture::init(directory.path());
+    rift_history::fixture::commit_all(directory.path(), "fixture baseline");
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -359,6 +367,8 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
 
     let mut null_cursor_pages = 0_usize;
     let mut present_cursor_pages = 0_usize;
+    let mut revision_snapshots = 0_usize;
+    let mut current_tree_snapshots = 0_usize;
     let mut applied_changes = 0_usize;
     let mut applied_with_findings = 0_usize;
     let mut refusal_reasons: BTreeSet<String> = BTreeSet::new();
@@ -383,6 +393,20 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 .ok_or_else(|| format!("{name} must return structured content"))?;
             assert_validates(output_validator, &structured, &format!("{name} result"));
             assert_wire_hygiene(name, &structured);
+            match &structured["snapshot"]["revision"] {
+                Value::String(commit) => {
+                    assert_eq!(
+                        commit.len(),
+                        40,
+                        "{name} snapshot revision must be the full commit id: {commit}"
+                    );
+                    revision_snapshots += 1;
+                }
+                Value::Null if structured.get("snapshot").is_some() => {
+                    current_tree_snapshots += 1;
+                }
+                _ => {}
+            }
             match structured["status"].as_str() {
                 Some("applied") => {
                     applied_changes += 1;
@@ -428,6 +452,11 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
         null_cursor_pages > 0 && present_cursor_pages > 0,
         "the corpus must prove both next_cursor arms against the schema: \
          null_cursor_pages={null_cursor_pages}, present_cursor_pages={present_cursor_pages}"
+    );
+    assert!(
+        revision_snapshots > 0 && current_tree_snapshots > 0,
+        "the corpus must prove both snapshot.revision arms against the schema: \
+         revision_snapshots={revision_snapshots}, current_tree_snapshots={current_tree_snapshots}"
     );
     assert!(
         applied_changes >= 3 && applied_with_findings >= 1,

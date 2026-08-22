@@ -17,7 +17,7 @@ use rift_protocol::read::{
     SearchResult,
 };
 use rift_server::{
-    ChangeService, ConfigurationError, HookRun, HookStatus, ReadError, ReadService,
+    ChangeService, ConfigurationError, HookRun, HookStatus, ReadError, ReadFault, ReadService,
     load_configuration, run_hooks,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -121,34 +121,41 @@ impl RiftMcp {
 
     /// Finds Rust declarations and their source by exact symbol name. Each hit
     /// carries the declaration and its source excerpt; `include_body: false` omits
-    /// both. Use `search` when the name is not exactly known.
+    /// both. `rev` serves the lookup from a version-control revision instead of
+    /// the current tree. Use `search` when the name is not exactly known.
     #[tool]
     fn get_symbol(
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
-        self.read(|reads| reads.get_symbol(&params))
+        let rev = params.rev.clone();
+        self.read_at(rev.as_ref(), |reads| reads.get_symbol(&params))
     }
 
-    /// Searches indexed Rust declarations and source lines by lexical `query`. Use
-    /// `get_symbol` when the declaration name is known.
+    /// Searches indexed Rust declarations and source lines by lexical `query`.
+    /// `rev` searches a version-control revision instead of the current tree.
+    /// Use `get_symbol` when the declaration name is known.
     #[tool]
     fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        self.read(|reads| reads.search(&params))
+        let rev = params.rev.clone();
+        self.read_at(rev.as_ref(), |reads| reads.search(&params))
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
     /// outermost first. Each identity carries a witness, so an address taken
-    /// from this listing refuses cleanly once the file's bytes drift.
+    /// from this listing refuses cleanly once the file's bytes drift. `rev`
+    /// lists the nodes as of a version-control revision instead of the
+    /// current tree.
     #[tool]
     fn nodes(
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ErrorData> {
-        self.read(|reads| reads.nodes(params))
+        let rev = params.rev.clone();
+        self.read_at(rev.as_ref(), |reads| reads.nodes(params))
     }
 
     /// Replaces one declaration addressed by symbol. The whole declaration
@@ -211,16 +218,32 @@ impl RiftMcp {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Runs one read against the current snapshot, behind the admission
-    /// gate every request passes.
-    fn read<Answer>(
+    /// Runs one read against the tree the request names — the current
+    /// snapshot, or a snapshot built at the request's version-control
+    /// revision — behind the admission gate every request passes.
+    ///
+    /// A revision snapshot is built per request from the workspace's git
+    /// objects, under the same `[source]` policy and bounds as the current
+    /// one; `[providers.history] enabled = false` refuses it.
+    fn read_at<Answer>(
         &self,
+        rev: Option<&rift_protocol::read::RevisionId>,
         operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError>,
     ) -> Result<Json<Answer>, ErrorData> {
-        self.admitted_configuration(wire::ErrorPhase::Read)?;
-        operation(&self.snapshot())
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+        let configuration = self.admitted_configuration(wire::ErrorPhase::Read)?;
+        let read_error = |error: ReadError| error.tool_error(wire::ErrorPhase::Read);
+        let Some(rev) = rev else {
+            return operation(&self.snapshot()).map(Json).map_err(read_error);
+        };
+        if !configuration.providers.history.enabled {
+            return Err(read_error(ReadError::from(ReadFault::Unsupported {
+                capability: "revision reads (providers.history disabled)",
+            })));
+        }
+        let visibility = SourceVisibility::from(&configuration.source);
+        let reads = ReadService::at_revision(&self.root, rev, self.limits, &visibility)
+            .map_err(read_error)?;
+        operation(&reads).map(Json).map_err(read_error)
     }
 
     /// The admitted workspace configuration, re-admitting `rift.toml` when

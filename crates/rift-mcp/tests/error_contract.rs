@@ -58,6 +58,20 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
             "get_symbol",
             json!({ "name": "beacon", "include_history": true }),
         ),
+        ("get_symbol", json!({ "name": "beacon", "rev": "main" })),
+        ("search", json!({ "query": "beacon", "rev": "main" })),
+        (
+            "nodes",
+            json!({ "path": "lib.rs", "position": 0, "rev": "HEAD~1" }),
+        ),
+        (
+            "get_symbol",
+            json!({
+                "name": "beacon",
+                "rev": "main",
+                "projection": "rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        ),
     ];
     for (tool, request) in failing_requests {
         let arguments = request
@@ -90,5 +104,80 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
 
     client.cancel().await?;
     server_task.await?;
+    Ok(())
+}
+
+/// One tool call expected to fail, returning its wire `ErrorData` payload.
+async fn failing_wire_error(
+    root: &std::path::Path,
+    tool: &'static str,
+    request: serde_json::Value,
+) -> TestResult<serde_json::Value> {
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())?;
+    let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+    let server_task = tokio::spawn(async move {
+        let service = server
+            .serve(server_transport)
+            .await
+            .expect("server must initialize");
+        service.waiting().await.expect("server must stop cleanly");
+    });
+    let client = ().serve(client_transport).await?;
+    let arguments = request
+        .as_object()
+        .cloned()
+        .ok_or("request must be an object")?;
+    let error = client
+        .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
+        .await
+        .expect_err("the request must be rejected");
+    client.cancel().await?;
+    server_task.await?;
+    let rmcp::ServiceError::McpError(data) = error else {
+        panic!("expected protocol-level McpError, got {error:?}");
+    };
+    Ok(data.data.ok_or("wire error data must be present")?)
+}
+
+#[tokio::test]
+async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    let wire = failing_wire_error(
+        directory.path(),
+        "get_symbol",
+        json!({ "name": "beacon", "rev": "main" }),
+    )
+    .await?;
+    assert_eq!(wire["code"], json!("capability_unavailable"));
+    assert_eq!(wire["retry"], json!("operator_action"));
+    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert!(
+        message.contains("requires a git repository — run `git init`, or omit `rev`"),
+        "the refusal must name the remedy: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn revision_read_with_history_disabled_is_refused() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        "[providers.history]\nenabled = false\n",
+    )?;
+    let wire = failing_wire_error(
+        directory.path(),
+        "get_symbol",
+        json!({ "name": "beacon", "rev": "main" }),
+    )
+    .await?;
+    assert_eq!(wire["code"], json!("capability_unavailable"));
+    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert!(
+        message.contains("providers.history disabled"),
+        "the refusal must name the disabling configuration: {message}"
+    );
     Ok(())
 }
