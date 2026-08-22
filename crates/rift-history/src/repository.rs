@@ -311,24 +311,31 @@ impl Repository {
     /// when the path lies outside the workspace, an error when its bytes
     /// inside the workspace are not UTF-8.
     fn workspace_relative(&self, filepath: &[u8]) -> Result<Option<String>, HistoryError> {
-        let relative = if self.prefix.is_empty() {
-            filepath
-        } else {
-            let Some(rest) = filepath
-                .strip_prefix(self.prefix.as_bytes())
-                .and_then(|rest| rest.strip_prefix(b"/"))
-            else {
-                return Ok(None);
-            };
-            rest
+        let Some(relative) = strip_workspace_prefix(filepath, self.prefix.as_bytes()) else {
+            return Ok(None);
         };
-        match std::str::from_utf8(relative) {
-            Ok(path) => Ok(Some(path.to_owned())),
-            Err(_) => Err(Error::new(HistoryFault::PathUnrepresentable {
-                path: String::from_utf8_lossy(filepath).into_owned(),
-            })),
-        }
+        utf8_path(relative, filepath).map(Some)
     }
+}
+
+/// The bytes of `filepath` below the workspace prefix, or `None` for a path
+/// outside the workspace. An empty prefix — the workspace at the repository
+/// root — keeps every path.
+fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if prefix.is_empty() {
+        return Some(filepath);
+    }
+    filepath.strip_prefix(prefix)?.strip_prefix(b"/")
+}
+
+/// One committed path's UTF-8 form. The refusal renders the full
+/// repository-relative spelling, so the reader sees the path git records.
+fn utf8_path(relative: &[u8], filepath: &[u8]) -> Result<String, HistoryError> {
+    std::str::from_utf8(relative).map(str::to_owned).map_err(|_| {
+        Error::new(HistoryFault::PathUnrepresentable {
+            path: String::from_utf8_lossy(filepath).into_owned(),
+        })
+    })
 }
 
 /// A [`gix::traverse::tree::Recorder`] behind an entry budget: every visited
@@ -670,5 +677,105 @@ mod tests {
             error.fault(),
             HistoryFault::RevisionUnknown { .. }
         ));
+    }
+
+    #[test]
+    fn test_every_fault_renders_its_registry_identity_and_evidence() {
+        let cases: Vec<(HistoryFault, &str, &str)> = vec![
+            (
+                HistoryFault::Unversioned {
+                    root: PathBuf::from("/workspace"),
+                },
+                "capability_unavailable",
+                "workspace",
+            ),
+            (
+                HistoryFault::RevisionUnknown {
+                    rev: "feature/absent".to_owned(),
+                },
+                "resource_not_found",
+                "rev",
+            ),
+            (
+                HistoryFault::RevisionNotCommit {
+                    rev: "main^{tree}".to_owned(),
+                    kind: "tree".to_owned(),
+                },
+                "resource_not_found",
+                "resolved_kind",
+            ),
+            (
+                HistoryFault::TreeTooLarge { entries_max: 4 },
+                "limit_exceeded",
+                "entries_max",
+            ),
+            (
+                HistoryFault::BlobTooLarge {
+                    path: "src/lib.rs".to_owned(),
+                    bytes_max: 4,
+                    size: 19,
+                },
+                "limit_exceeded",
+                "bytes_max",
+            ),
+            (
+                HistoryFault::PathUnrepresentable {
+                    path: "src/evil".to_owned(),
+                },
+                "unsupported_path",
+                "path",
+            ),
+            (
+                HistoryFault::Storage {
+                    operation: "read blob",
+                    detail: "object store gone".to_owned(),
+                },
+                "storage_failure",
+                "operation",
+            ),
+        ];
+        for (fault, code, evidence_key) in cases {
+            let error = HistoryError::from(fault);
+            assert_eq!(error.descriptor().code(), code, "{error}");
+            assert!(
+                error
+                    .context()
+                    .iter()
+                    .any(|entry| entry.key() == evidence_key),
+                "the {code} fault must carry {evidence_key} evidence: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tree_files_stops_descending_once_the_budget_is_spent() {
+        let directory = repository_fixture();
+        fs::create_dir_all(directory.path().join("src")).expect("directory");
+        fs::write(directory.path().join("src/extra.rs"), "pub fn extra() {}\n").expect("source");
+        commit_all(directory.path(), "grow below a directory");
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        // Budget 1: the root's first entry spends it, so the `src` subtree
+        // is refused before the walk ever descends into it.
+        let error = repository
+            .tree_files(&head, &admit_all, 1)
+            .expect_err("a subtree past the budget must refuse, not descend");
+        assert!(matches!(error.fault(), HistoryFault::TreeTooLarge { .. }));
+    }
+
+    #[test]
+    fn test_tree_files_refuses_a_non_utf8_committed_path() {
+        let directory = repository_fixture();
+        crate::fixture::commit_raw_path(directory.path(), b"evil-\xff.rs", "refs/heads/raw");
+        let repository = Repository::open(directory.path()).expect("repository");
+        let raw = repository.resolve("raw").expect("raw branch resolves");
+        let error = repository
+            .tree_files(&raw, &admit_all, REVISION_TREE_ENTRIES_MAX)
+            .expect_err("a committed non-UTF-8 path must refuse");
+        assert!(matches!(
+            error.fault(),
+            HistoryFault::PathUnrepresentable { .. }
+        ));
+        assert_eq!(error.descriptor().code(), "unsupported_path");
     }
 }
