@@ -316,7 +316,13 @@ export function buildScene(
   // means it reverses ranks for free and the author's declaration order is
   // lost. In a diagram that is not a free choice: `agent 1` has to come out
   // above `agent 2`. The classic median-and-transpose ordering keeps it.
-  layout(graph, { disableOptimalOrderHeuristic: true });
+  //
+  // `useDynamic: false` because dagre 3.x otherwise caches the previous layout
+  // in module state to stabilize incremental relayouts of one graph — and
+  // feeds it into the next layout's acyclic phase. Laying out a *different*
+  // graph next (three diagrams on one page) inherits that state, the rank
+  // phase silently no-ops, and `initOrder` crashes on rank `null`.
+  layout(graph, { disableOptimalOrderHeuristic: true, useDynamic: false });
 
   const plates: IsoPlate[] = [];
   const tiles: Tile[] = [];

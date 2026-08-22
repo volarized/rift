@@ -84,7 +84,20 @@ function lines(text: string | undefined): string[] {
     .filter((line) => line.length > 0);
 }
 
-export async function parseFlowchart(source: string): Promise<FlowGraph> {
+// Mermaid's parsers write into one database per diagram type, shared across
+// `parse` calls, and the database is only read back after an await. Sibling
+// Server Components parse concurrently, so without ordering one diagram's
+// read can observe another diagram's parse. This queue holds each
+// parse-and-read pair together, one diagram at a time.
+let parseTurn: Promise<unknown> = Promise.resolve();
+
+export function parseFlowchart(source: string): Promise<FlowGraph> {
+  const turn = parseTurn.then(() => parseFlowchartNow(source));
+  parseTurn = turn.catch(() => undefined);
+  return turn;
+}
+
+async function parseFlowchartNow(source: string): Promise<FlowGraph> {
   const { type, db } = await parse(source);
 
   // `flowchart` and `graph` both land on `flowchart-v2`. Anything else parsed
