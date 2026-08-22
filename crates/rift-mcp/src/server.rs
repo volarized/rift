@@ -2,14 +2,14 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock as SyncRwLock};
 use std::time::Duration;
 
-use notify::event::ModifyKind;
+use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use rift_core::constants::{WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES};
 use rift_core::{ErrorName, Fault, SourceVisibility};
-use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits};
+use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
     ReplaceNodeParams, ReplaceSymbolParams,
@@ -89,7 +89,7 @@ where
 pub struct RiftMcp {
     root: PathBuf,
     limits: WorkspaceIndexLimits,
-    published: Arc<RwLock<PublishedState>>,
+    published: Arc<RwLock<IndexState>>,
     coherence: Arc<IndexCoherence>,
     changes: Arc<ChangeService>,
     change_lane: Arc<Mutex<()>>,
@@ -108,14 +108,41 @@ struct PublishedWorkspace {
     reads: Arc<ReadService>,
     configuration: ConfigurationState,
     fingerprint: WorkspaceFingerprint,
+    source_policy: Arc<WorkspaceSourcePolicy>,
     epoch: u64,
 }
 
-/// Published workspace plus failure for the latest observed epoch.
+/// Published workspace plus failure for latest observed epoch.
 #[derive(Debug)]
-struct PublishedState {
+struct IndexState {
     current: Arc<PublishedWorkspace>,
     failure: Option<(u64, Arc<ReadError>)>,
+}
+
+impl IndexState {
+    /// Clones one coherent publication and its latest failure.
+    fn snapshot(&self) -> (Arc<PublishedWorkspace>, Option<(u64, Arc<ReadError>)>) {
+        (Arc::clone(&self.current), self.failure.clone())
+    }
+
+    /// Publishes candidate only while its observation remains current.
+    fn publish(&mut self, candidate: Arc<PublishedWorkspace>, observed_epoch: u64) -> bool {
+        if candidate.epoch != observed_epoch {
+            return false;
+        }
+        self.current = candidate;
+        self.failure = None;
+        true
+    }
+
+    /// Records failure only while its observation remains current.
+    fn record_failure(&mut self, epoch: u64, observed_epoch: u64, error: ReadError) -> bool {
+        if epoch != observed_epoch {
+            return false;
+        }
+        self.failure = Some((epoch, Arc::new(error)));
+        true
+    }
 }
 
 /// Filesystem observation and supervisor ownership shared with handlers.
@@ -125,6 +152,8 @@ struct IndexCoherence {
     watch_failed: Arc<AtomicBool>,
     invalidations: mpsc::Sender<()>,
     changed: Arc<Notify>,
+    publication_lane: Mutex<()>,
+    source_policy: SyncRwLock<Option<Arc<WorkspaceSourcePolicy>>>,
     cancellation: CancellationToken,
     task: AsyncMutex<Option<JoinHandle<()>>>,
 }
@@ -221,6 +250,8 @@ impl IndexCoherence {
                 watch_failed: Arc::new(AtomicBool::new(false)),
                 invalidations,
                 changed: Arc::new(Notify::new()),
+                publication_lane: Mutex::new(()),
+                source_policy: SyncRwLock::new(None),
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
             }),
@@ -230,6 +261,29 @@ impl IndexCoherence {
 
     /// Records one invalidation before coalescing its rebuild signal.
     fn observe(&self) -> Result<u64, ReadError> {
+        let publication = self
+            .publication_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = self.observe_locked();
+        drop(publication);
+        result
+    }
+
+    /// Marks watcher unhealthy and records invalidation in one critical section.
+    fn observe_watch_failure(&self) -> Result<u64, ReadError> {
+        let publication = self
+            .publication_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.watch_failed.store(true, Ordering::Release);
+        let result = self.observe_locked();
+        drop(publication);
+        result
+    }
+
+    /// Records one invalidation while caller owns publication lane.
+    fn observe_locked(&self) -> Result<u64, ReadError> {
         let previous = self
             .observed_epoch
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
@@ -256,6 +310,73 @@ impl IndexCoherence {
     /// Returns latest filesystem-event epoch.
     fn observed_epoch(&self) -> u64 {
         self.observed_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Installs event admission policy under publication linearization.
+    #[cfg(test)]
+    fn install_source_policy(&self, policy: Arc<WorkspaceSourcePolicy>) {
+        let publication = self
+            .publication_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.replace_source_policy_locked(policy);
+        drop(publication);
+    }
+
+    /// Replaces event admission policy while caller owns publication lane.
+    fn replace_source_policy_locked(&self, policy: Arc<WorkspaceSourcePolicy>) {
+        let mut current = self
+            .source_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Some(policy);
+    }
+
+    /// Filters and observes event within same publication critical section.
+    fn observe_event(&self, root: &Path, event: &Event) -> Result<Option<u64>, ReadError> {
+        let publication = self
+            .publication_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = if relevant_watch_event(root, self, event) {
+            self.observe_locked().map(Some)
+        } else {
+            Ok(None)
+        };
+        drop(publication);
+        result
+    }
+
+    /// Returns whether current policy admits one source event path.
+    fn source_path_is_relevant(&self, path: &Path) -> bool {
+        let current = self
+            .source_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.as_ref().is_none_or(|policy| policy.admits(path))
+    }
+
+    /// Returns whether current policy can admit source below one directory.
+    fn source_directory_is_relevant(&self, path: &Path) -> bool {
+        let current = self
+            .source_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current
+            .as_ref()
+            .is_none_or(|policy| policy.may_admit_descendant(path))
+    }
+
+    /// Returns whether path is current root workspace configuration.
+    fn workspace_configuration_is_relevant(&self, root: &Path, path: &Path) -> bool {
+        let current = self
+            .source_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.as_ref().map_or_else(
+            || path == root.join(WORKSPACE_CONFIGURATION_FILE),
+            |policy| policy.is_workspace_configuration(path),
+        )
     }
 }
 
@@ -299,32 +420,29 @@ fn workspace_watcher(
     root: &Path,
     coherence: &Arc<IndexCoherence>,
 ) -> Result<notify::RecommendedWatcher, ReadError> {
-    let watched_root = root.to_path_buf();
+    let watched_root = std::fs::canonicalize(root)
+        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     let event_root = watched_root.clone();
     let coherence = Arc::clone(coherence);
-    let mut watcher =
-        notify::recommended_watcher(move |result: notify::Result<Event>| match result {
-            Ok(event) if relevant_watch_event(&event_root, &event) => {
-                if coherence.observe().is_err() {
-                    tracing::error!(
-                        component = "index",
-                        operation = "watch.observe",
-                        "index watch failed"
-                    );
-                }
-            }
-            Ok(_) => {}
-            Err(_) => {
-                coherence.watch_failed.store(true, Ordering::Release);
-                let _ = coherence.observe();
-                tracing::warn!(
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+        if let Ok(event) = result {
+            if coherence.observe_event(&event_root, &event).is_err() {
+                tracing::error!(
                     component = "index",
-                    operation = "watch.receive",
-                    "index watch backend reported failure"
+                    operation = "watch.observe",
+                    "index watch failed"
                 );
             }
-        })
-        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+        } else {
+            let _ = coherence.observe_watch_failure();
+            tracing::warn!(
+                component = "index",
+                operation = "watch.receive",
+                "index watch backend reported failure"
+            );
+        }
+    })
+    .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     watcher
         .watch(&watched_root, RecursiveMode::Recursive)
         .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
@@ -332,7 +450,7 @@ fn workspace_watcher(
 }
 
 /// Whether one native event can change visible Rust source or its policy.
-fn relevant_watch_event(root: &Path, event: &Event) -> bool {
+fn relevant_watch_event(root: &Path, coherence: &IndexCoherence, event: &Event) -> bool {
     if matches!(event.kind, EventKind::Access(_)) {
         return false;
     }
@@ -340,7 +458,7 @@ fn relevant_watch_event(root: &Path, event: &Event) -> bool {
         .paths
         .iter()
         .filter(|path| hard_floor_admits_watch_path(root, path))
-        .any(|path| watch_kind_reaches_path(event.kind, path))
+        .any(|path| watch_kind_reaches_path(root, coherence, event.kind, path))
 }
 
 /// Rejects paths below Rift's hard-floor directories.
@@ -357,18 +475,33 @@ fn hard_floor_admits_watch_path(root: &Path, path: &Path) -> bool {
 }
 
 /// Applies event-kind filtering without trusting editor-specific event shapes.
-fn watch_kind_reaches_path(kind: EventKind, path: &Path) -> bool {
-    let policy_file = path
-        .file_name()
-        .is_some_and(|name| name == WORKSPACE_CONFIGURATION_FILE || name == ".gitignore");
-    let rust_source = path.extension().is_some_and(|extension| extension == "rs");
+fn watch_kind_reaches_path(
+    root: &Path,
+    coherence: &IndexCoherence,
+    kind: EventKind,
+    path: &Path,
+) -> bool {
+    let workspace_configuration = coherence.workspace_configuration_is_relevant(root, path);
+    let gitignore = path.file_name() == Some(std::ffi::OsStr::new(".gitignore"))
+        && path
+            .parent()
+            .is_some_and(|parent| coherence.source_directory_is_relevant(parent));
+    let policy_file = workspace_configuration || gitignore;
+    let source_file = coherence.source_path_is_relevant(path);
+    let directory_event = matches!(
+        kind,
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
+    ) && coherence.source_directory_is_relevant(path);
+    let possible_directory =
+        path.extension().is_none() && coherence.source_directory_is_relevant(path);
     match kind {
-        EventKind::Create(_)
-        | EventKind::Remove(_)
-        | EventKind::Modify(ModifyKind::Name(_))
-        | EventKind::Any
-        | EventKind::Other => true,
-        EventKind::Modify(_) => policy_file || rust_source,
+        EventKind::Create(_) | EventKind::Remove(_) => {
+            policy_file || source_file || directory_event
+        }
+        EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any | EventKind::Other => {
+            policy_file || source_file || possible_directory
+        }
+        EventKind::Modify(_) => policy_file || source_file,
         EventKind::Access(_) => false,
     }
 }
@@ -390,28 +523,27 @@ async fn initial_workspace(
             attempt
         );
         let built = bounded_blocking("initial index build", move || {
-            let configuration = ConfigurationState::admit(&build_root);
-            let visibility = configuration.source_visibility();
-            let reads = ReadService::build(&build_root, limits, &visibility)?;
-            let fingerprint = reads.workspace_fingerprint().clone();
-            if configuration.fingerprint != configuration_fingerprint(&build_root) {
-                return Ok(None);
-            }
-            Ok(Some(Arc::new(PublishedWorkspace {
-                reads: Arc::new(reads),
-                configuration,
-                fingerprint,
-                epoch,
-            })))
+            build_workspace_candidate(&build_root, limits, epoch)
         })
         .instrument(span)
         .await?;
-        let Some(built) = built else {
+        let WorkspaceCandidate::Stable(built) = built else {
             continue;
         };
         let stable_epoch = coherence.observed_epoch() == epoch;
         let watch_healthy = !coherence.watch_failed.load(Ordering::Acquire);
         if stable_epoch && watch_healthy {
+            let publication = coherence
+                .publication_lane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if coherence.observed_epoch() != epoch || coherence.watch_failed.load(Ordering::Acquire)
+            {
+                drop(publication);
+                continue;
+            }
+            coherence.replace_source_policy_locked(Arc::clone(&built.source_policy));
+            drop(publication);
             tracing::info!(
                 component = "index",
                 operation = "index.publish",
@@ -426,6 +558,37 @@ async fn initial_workspace(
         "initial index build",
         "workspace kept changing across bounded capture attempts",
     ))
+}
+
+/// Result of one bounded workspace candidate capture.
+enum WorkspaceCandidate {
+    /// Index, configuration, and source policy share one stable capture.
+    Stable(Arc<PublishedWorkspace>),
+    /// Configuration moved during capture.
+    ConfigurationChanged,
+}
+
+/// Builds one snapshot candidate and verifies configuration around its scan.
+fn build_workspace_candidate(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    epoch: u64,
+) -> Result<WorkspaceCandidate, ReadError> {
+    let configuration = ConfigurationState::admit(root);
+    let visibility = configuration.source_visibility();
+    let reads = ReadService::build(root, limits, &visibility)?;
+    let source_policy = WorkspaceSourcePolicy::build(root, limits, &visibility)
+        .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+    if configuration.fingerprint != configuration_fingerprint(root) {
+        return Ok(WorkspaceCandidate::ConfigurationChanged);
+    }
+    Ok(WorkspaceCandidate::Stable(Arc::new(PublishedWorkspace {
+        fingerprint: reads.workspace_fingerprint().clone(),
+        reads: Arc::new(reads),
+        configuration,
+        source_policy: Arc::new(source_policy),
+        epoch,
+    })))
 }
 
 /// Outcome of one background reconciliation attempt.
@@ -443,7 +606,7 @@ async fn run_index_supervisor(
     mut invalidations: mpsc::Receiver<()>,
     root: PathBuf,
     limits: WorkspaceIndexLimits,
-    published: Arc<RwLock<PublishedState>>,
+    published: Arc<RwLock<IndexState>>,
     change_lane: Arc<Mutex<()>>,
     coherence: Arc<IndexCoherence>,
 ) {
@@ -489,11 +652,20 @@ async fn run_index_supervisor(
                 error_code = error.descriptor().code(),
                 "index rebuild failed"
             );
-            let mut state = published.write().await;
-            if coherence.observed_epoch() == epoch {
-                state.failure = Some((epoch, Arc::new(error)));
+            let failed_state = Arc::clone(&published);
+            let failed_coherence = Arc::clone(&coherence);
+            let recorded = bounded_blocking("index failure publication", move || {
+                Ok(record_rebuild_failure(
+                    &failed_state,
+                    &failed_coherence,
+                    epoch,
+                    error,
+                ))
+            })
+            .await;
+            if recorded.is_err() {
+                let _ = coherence.observe_watch_failure();
             }
-            drop(state);
             coherence.changed.notify_waiters();
         }
     }
@@ -503,66 +675,126 @@ async fn run_index_supervisor(
 async fn rebuild_workspace(
     root: PathBuf,
     limits: WorkspaceIndexLimits,
-    published: Arc<RwLock<PublishedState>>,
+    published: Arc<RwLock<IndexState>>,
     change_lane: Arc<Mutex<()>>,
     coherence: Arc<IndexCoherence>,
     epoch: u64,
 ) -> Result<RebuildOutcome, ReadError> {
     bounded_blocking("filesystem index rebuild", move || {
-        let lane = change_lane
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if coherence.watch_failed.load(Ordering::Acquire) {
-            drop(lane);
-            return Err(ReadFault::unavailable(
-                "filesystem index rebuild",
-                "filesystem watcher failed",
-            ));
-        }
-        if coherence.observed_epoch() != epoch {
-            drop(lane);
-            return Ok(RebuildOutcome::Superseded);
-        }
-        let configuration = ConfigurationState::admit(&root);
-        let visibility = configuration.source_visibility();
-        let reads = ReadService::build(&root, limits, &visibility)?;
-        let fingerprint = reads.workspace_fingerprint().clone();
-        if configuration.fingerprint != configuration_fingerprint(&root) {
-            let _ = coherence.observe();
-            drop(lane);
-            return Ok(RebuildOutcome::Superseded);
-        }
-        if coherence.observed_epoch() != epoch {
-            drop(lane);
-            return Ok(RebuildOutcome::Superseded);
-        }
-        let next = Arc::new(PublishedWorkspace {
-            reads: Arc::new(reads),
-            configuration,
-            fingerprint,
-            epoch,
-        });
-        let mut state = published.blocking_write();
-        if coherence.observed_epoch() != epoch {
-            drop(state);
-            drop(lane);
-            return Ok(RebuildOutcome::Superseded);
-        }
-        state.current = next;
-        state.failure = None;
-        drop(state);
-        drop(lane);
-        tracing::info!(
-            component = "index",
-            operation = "index.publish",
-            trigger = "filesystem",
-            epoch,
-            "index snapshot published"
-        );
-        coherence.changed.notify_waiters();
-        Ok(RebuildOutcome::Published)
+        rebuild_workspace_blocking(&root, limits, &published, &change_lane, &coherence, epoch)
     })
     .await
+}
+
+/// Runs one serialized filesystem rebuild on blocking executor.
+fn rebuild_workspace_blocking(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    published: &RwLock<IndexState>,
+    change_lane: &Mutex<()>,
+    coherence: &IndexCoherence,
+    epoch: u64,
+) -> Result<RebuildOutcome, ReadError> {
+    let lane = change_lane
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !admit_rebuild(coherence, epoch)? {
+        drop(lane);
+        return Ok(RebuildOutcome::Superseded);
+    }
+    let candidate = build_workspace_candidate(root, limits, epoch)?;
+    let WorkspaceCandidate::Stable(candidate) = candidate else {
+        let _ = coherence.observe();
+        drop(lane);
+        return Ok(RebuildOutcome::Superseded);
+    };
+    let outcome = publish_rebuild(published, coherence, candidate);
+    drop(lane);
+    if outcome == RebuildOutcome::Published {
+        trace_publication(epoch);
+        coherence.changed.notify_waiters();
+    }
+    Ok(outcome)
+}
+
+/// Refuses rebuild when watcher failed or candidate epoch already moved.
+fn admit_rebuild(coherence: &IndexCoherence, epoch: u64) -> Result<bool, ReadError> {
+    if coherence.watch_failed.load(Ordering::Acquire) {
+        return Err(ReadFault::unavailable(
+            "filesystem index rebuild",
+            "filesystem watcher failed",
+        ));
+    }
+    Ok(coherence.observed_epoch() == epoch)
+}
+
+/// Atomically publishes candidate when observation still matches.
+fn publish_rebuild(
+    published: &RwLock<IndexState>,
+    coherence: &IndexCoherence,
+    candidate: Arc<PublishedWorkspace>,
+) -> RebuildOutcome {
+    publish_rebuild_after(published, coherence, candidate, || {})
+}
+
+/// Publishes under observation lane; hook enables deterministic overlap tests.
+fn publish_rebuild_after(
+    published: &RwLock<IndexState>,
+    coherence: &IndexCoherence,
+    candidate: Arc<PublishedWorkspace>,
+    after_state_lock: impl FnOnce(),
+) -> RebuildOutcome {
+    let publication = coherence
+        .publication_lane
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = published.blocking_write();
+    after_state_lock();
+    let observed_epoch = coherence.observed_epoch();
+    if candidate.epoch != observed_epoch {
+        drop(state);
+        drop(publication);
+        return RebuildOutcome::Superseded;
+    }
+    coherence.replace_source_policy_locked(Arc::clone(&candidate.source_policy));
+    let published = state.publish(candidate, observed_epoch);
+    drop(state);
+    drop(publication);
+    if published {
+        RebuildOutcome::Published
+    } else {
+        RebuildOutcome::Superseded
+    }
+}
+
+/// Records failure under same observation linearization as publication.
+fn record_rebuild_failure(
+    published: &RwLock<IndexState>,
+    coherence: &IndexCoherence,
+    epoch: u64,
+    error: ReadError,
+) -> bool {
+    let publication = coherence
+        .publication_lane
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let observed_epoch = coherence.observed_epoch();
+    let recorded = published
+        .blocking_write()
+        .record_failure(epoch, observed_epoch, error);
+    drop(publication);
+    recorded
+}
+
+/// Emits one path-free filesystem publication event.
+fn trace_publication(epoch: u64) {
+    tracing::info!(
+        component = "index",
+        operation = "index.publish",
+        trigger = "filesystem",
+        epoch,
+        "index snapshot published"
+    );
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
@@ -596,7 +828,7 @@ impl RiftMcp {
         ))
         .await?;
         let published = initial_workspace(&root, limits, &coherence).await?;
-        let published = Arc::new(RwLock::new(PublishedState {
+        let published = Arc::new(RwLock::new(IndexState {
             current: published,
             failure: None,
         }));
@@ -838,9 +1070,15 @@ impl RiftMcp {
             changed.as_mut().enable();
             let observed_epoch = self.coherence.observed_epoch();
             let state = self.published.read().await;
-            let current = Arc::clone(&state.current);
-            let failure = state.failure.clone();
+            let (current, failure) = state.snapshot();
             drop(state);
+            if self.coherence.watch_failed.load(Ordering::Acquire) {
+                return Err(ReadFault::unavailable(
+                    "current workspace read",
+                    "filesystem watcher failed",
+                )
+                .tool_error(phase));
+            }
             if current.epoch == observed_epoch {
                 return Ok(current);
             }
@@ -886,7 +1124,7 @@ impl RiftMcp {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = published.blocking_read();
-            let current = Arc::clone(&state.current);
+            let (current, _) = state.snapshot();
             drop(state);
             if current.epoch != coherence.observed_epoch() {
                 drop(lane);
@@ -918,6 +1156,16 @@ impl RiftMcp {
                 match ReadService::build(&root, limits, &visibility) {
                     Ok(rebuilt) => {
                         let fingerprint = rebuilt.workspace_fingerprint().clone();
+                        let source_policy =
+                            match WorkspaceSourcePolicy::build(&root, limits, &visibility) {
+                                Ok(policy) => Arc::new(policy),
+                                Err(error) => {
+                                    let error = ReadError::from(ReadFault::Index(error));
+                                    summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                                    drop(lane);
+                                    return Ok(Ok(Json(result)));
+                                }
+                            };
                         if current.configuration.fingerprint != configuration_fingerprint(&root) {
                             let error = ReadFault::unavailable(
                                 "workspace change",
@@ -932,22 +1180,19 @@ impl RiftMcp {
                             reads: Arc::new(rebuilt),
                             configuration: current.configuration.clone(),
                             fingerprint,
+                            source_policy,
                             epoch,
                         });
-                        if coherence.observed_epoch() == epoch {
-                            let mut state = published.blocking_write();
-                            if coherence.observed_epoch() == epoch {
-                                state.current = next;
-                                state.failure = None;
-                                tracing::info!(
-                                    component = "index",
-                                    operation = "index.publish",
-                                    trigger = "rift_change",
-                                    epoch,
-                                    "index snapshot published"
-                                );
-                            }
-                            drop(state);
+                        if publish_rebuild(&published, &coherence, next)
+                            == RebuildOutcome::Published
+                        {
+                            tracing::info!(
+                                component = "index",
+                                operation = "index.publish",
+                                trigger = "rift_change",
+                                epoch,
+                                "index snapshot published"
+                            );
                             coherence.changed.notify_waiters();
                         }
                     }
@@ -1166,10 +1411,14 @@ fn wire_code(name: ErrorName) -> wire::ErrorCode {
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier as ThreadBarrier};
     use std::time::Duration;
 
+    use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    use notify::{Event, EventKind};
     use rift_core::{CliCode, ErrorName, SourceVisibility};
-    use rift_index::WorkspaceIndexLimits;
+    use rift_index::{WorkspaceIndexLimits, WorkspaceSourcePolicy};
     use rift_protocol::error as wire;
     use rift_protocol::read::GetSymbolResult;
     use rift_server::{ReadFault, ReadService};
@@ -1179,8 +1428,13 @@ mod tests {
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
     use serde_json::json;
+    use tokio::sync::{Barrier as AsyncBarrier, RwLock};
 
-    use super::{Parameters, RiftMcp};
+    use super::{
+        ConfigurationFingerprint, ConfigurationState, IndexCoherence, IndexState, Parameters,
+        RebuildOutcome, RiftMcp, WorkspaceCandidate, build_workspace_candidate, publish_rebuild,
+        publish_rebuild_after, record_rebuild_failure, relevant_watch_event,
+    };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1209,6 +1463,18 @@ mod tests {
             .ok_or_else(|| "tool arguments must be an object".into())
     }
 
+    fn stable_candidate(
+        root: &std::path::Path,
+        epoch: u64,
+    ) -> TestResult<Arc<super::PublishedWorkspace>> {
+        match build_workspace_candidate(root, WorkspaceIndexLimits::default(), epoch)? {
+            WorkspaceCandidate::Stable(candidate) => Ok(candidate),
+            WorkspaceCandidate::ConfigurationChanged => {
+                Err("fixture configuration must remain stable".into())
+            }
+        }
+    }
+
     #[tokio::test]
     async fn build_propagates_workspace_index_failure() {
         let directory = tempfile::tempdir().expect("fixture must exist");
@@ -1218,6 +1484,397 @@ mod tests {
             .await
             .expect_err("invalid source must fail");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
+    }
+
+    #[test]
+    fn configuration_capture_covers_content_invalid_policy_and_oversize() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\nrespect_gitignore = false\n",
+        )?;
+        assert!(matches!(
+            super::configuration_fingerprint(directory.path()),
+            ConfigurationFingerprint::Content(_)
+        ));
+
+        fs::write(directory.path().join("rift.toml"), "invalid = true\n")?;
+        let invalid = ConfigurationState::admit(directory.path());
+        assert!(invalid.admitted.is_err());
+        assert_eq!(invalid.source_visibility(), SourceVisibility::default());
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            vec![
+                b'x';
+                usize::try_from(rift_server::CONFIGURATION_FILE_BYTES_MAX)
+                    .expect("configuration bound must fit usize")
+                    + 1
+            ],
+        )?;
+        assert!(matches!(
+            super::configuration_fingerprint(directory.path()),
+            ConfigurationFingerprint::Oversized(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_observations_are_monotonic_and_coalesce_one_signal() -> TestResult {
+        const OBSERVATIONS: usize = 32;
+        let (coherence, mut invalidations) = IndexCoherence::new();
+        let barrier = Arc::new(AsyncBarrier::new(OBSERVATIONS + 1));
+        let mut tasks = Vec::with_capacity(OBSERVATIONS);
+        for _ in 0..OBSERVATIONS {
+            let coherence = Arc::clone(&coherence);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                coherence.observe().map_err(|error| error.to_string())
+            }));
+        }
+        barrier.wait().await;
+        let mut epochs = Vec::with_capacity(OBSERVATIONS);
+        for task in tasks {
+            epochs.push(task.await??);
+        }
+        epochs.sort_unstable();
+        assert_eq!(epochs, (1..=OBSERVATIONS as u64).collect::<Vec<_>>());
+        assert_eq!(invalidations.try_recv(), Ok(()));
+        assert!(matches!(
+            invalidations.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn observation_refuses_closed_channel_and_exhausted_epoch() {
+        let (closed, receiver) = IndexCoherence::new();
+        drop(receiver);
+        assert!(closed.observe().is_err());
+        assert!(closed.watch_failed.load(Ordering::Acquire));
+
+        let (exhausted, _receiver) = IndexCoherence::new();
+        exhausted.observed_epoch.store(u64::MAX, Ordering::Release);
+        assert!(exhausted.observe().is_err());
+        assert!(exhausted.watch_failed.load(Ordering::Acquire));
+
+        let (failed, _receiver) = IndexCoherence::new();
+        assert_eq!(failed.observe_watch_failure().expect("failure epoch"), 1);
+        assert!(failed.watch_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn watcher_events_follow_source_policy_gitignore_and_hard_floor() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let watched_root = directory.path().join(".");
+        let event_root = directory.path().canonicalize()?;
+        fs::create_dir_all(directory.path().join("src/generated"))?;
+        fs::create_dir_all(directory.path().join("examples"))?;
+        fs::create_dir_all(directory.path().join("target"))?;
+        fs::write(directory.path().join(".gitignore"), "src/ignored.rs\n")?;
+        let visibility = SourceVisibility::new(
+            vec!["src/**".to_owned()],
+            vec!["src/generated/**".to_owned()],
+            true,
+        );
+        let policy = WorkspaceSourcePolicy::build(
+            &watched_root,
+            WorkspaceIndexLimits::default(),
+            &visibility,
+        )?;
+        let (coherence, _invalidations) = IndexCoherence::new();
+        coherence.install_source_policy(Arc::new(policy));
+        let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
+
+        assert!(relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Modify(ModifyKind::Any), "src/lib.rs")
+        ));
+        assert!(!relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Modify(ModifyKind::Any), "src/generated/code.rs")
+        ));
+        assert!(!relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Modify(ModifyKind::Any), "src/ignored.rs")
+        ));
+        assert!(relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Remove(RemoveKind::Folder), "src")
+        ));
+        assert!(!relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Create(CreateKind::Folder), "examples")
+        ));
+        assert!(!relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Remove(RemoveKind::Folder), "src/generated")
+        ));
+        assert!(relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Modify(ModifyKind::Any), ".gitignore")
+        ));
+        assert!(!relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Modify(ModifyKind::Any), "examples/.gitignore")
+        ));
+        assert!(!relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Modify(ModifyKind::Any), "src/rift.toml")
+        ));
+        assert!(!relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Modify(ModifyKind::Any), "target/.gitignore")
+        ));
+        assert!(relevant_watch_event(
+            &watched_root,
+            &coherence,
+            &event(EventKind::Modify(ModifyKind::Any), "rift.toml")
+        ));
+        Ok(())
+    }
+
+    fn assert_workspace_identity(
+        actual: &super::PublishedWorkspace,
+        expected: &super::PublishedWorkspace,
+    ) {
+        assert_eq!(actual.epoch, expected.epoch);
+        assert_eq!(actual.fingerprint, expected.fingerprint);
+        assert_eq!(
+            actual.configuration.fingerprint,
+            expected.configuration.fingerprint
+        );
+        assert_eq!(
+            actual.configuration.source_visibility().respect_gitignore(),
+            expected
+                .configuration
+                .source_visibility()
+                .respect_gitignore()
+        );
+        assert!(Arc::ptr_eq(&actual.source_policy, &expected.source_policy));
+    }
+
+    struct PublicationFixture {
+        _directory: tempfile::TempDir,
+        before: Arc<super::PublishedWorkspace>,
+        after: Arc<super::PublishedWorkspace>,
+        state: Arc<RwLock<IndexState>>,
+        coherence: Arc<IndexCoherence>,
+        _invalidations: tokio::sync::mpsc::Receiver<()>,
+    }
+
+    fn publication_fixture() -> TestResult<PublicationFixture> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\nrespect_gitignore = true\n",
+        )?;
+        let before = stable_candidate(directory.path(), 0)?;
+        let state = Arc::new(RwLock::new(IndexState {
+            current: Arc::clone(&before),
+            failure: None,
+        }));
+        let (coherence, invalidations) = IndexCoherence::new();
+        coherence.install_source_policy(Arc::clone(&before.source_policy));
+        fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\nrespect_gitignore = false\n",
+        )?;
+        let epoch = coherence.observe()?;
+        let after = stable_candidate(directory.path(), epoch)?;
+        Ok(PublicationFixture {
+            _directory: directory,
+            before,
+            after,
+            state,
+            coherence,
+            _invalidations: invalidations,
+        })
+    }
+
+    fn spawn_snapshot_readers(
+        state: &Arc<RwLock<IndexState>>,
+        expected: &Arc<super::PublishedWorkspace>,
+        readers_count: usize,
+    ) -> (Arc<ThreadBarrier>, Vec<std::thread::JoinHandle<()>>) {
+        let capture_barrier = Arc::new(ThreadBarrier::new(readers_count + 1));
+        let mut readers = Vec::with_capacity(readers_count);
+        for _ in 0..readers_count {
+            let state = Arc::clone(state);
+            let reader_barrier = Arc::clone(&capture_barrier);
+            let expected = Arc::clone(expected);
+            readers.push(std::thread::spawn(move || {
+                let state = state.blocking_read();
+                let (snapshot, failure) = state.snapshot();
+                drop(state);
+                reader_barrier.wait();
+                assert!(failure.is_none());
+                assert_workspace_identity(&snapshot, &expected);
+            }));
+        }
+        (capture_barrier, readers)
+    }
+
+    fn spawn_blocked_snapshot_readers(
+        state: &Arc<RwLock<IndexState>>,
+        expected: &Arc<super::PublishedWorkspace>,
+        readers_count: usize,
+    ) -> (Arc<ThreadBarrier>, Vec<std::thread::JoinHandle<()>>) {
+        let ready_barrier = Arc::new(ThreadBarrier::new(readers_count + 1));
+        let mut readers = Vec::with_capacity(readers_count);
+        for _ in 0..readers_count {
+            let state = Arc::clone(state);
+            let reader_barrier = Arc::clone(&ready_barrier);
+            let expected = Arc::clone(expected);
+            readers.push(std::thread::spawn(move || {
+                reader_barrier.wait();
+                let state = state.blocking_read();
+                let (snapshot, failure) = state.snapshot();
+                drop(state);
+                assert!(failure.is_none());
+                assert_workspace_identity(&snapshot, &expected);
+            }));
+        }
+        (ready_barrier, readers)
+    }
+
+    fn assert_published_fixture(fixture: &PublicationFixture) {
+        let state = fixture.state.blocking_read();
+        assert_workspace_identity(&state.current, &fixture.after);
+        drop(state);
+        let policy = fixture
+            .coherence
+            .source_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(Arc::ptr_eq(
+            policy.as_ref().expect("policy must be published"),
+            &fixture.after.source_policy
+        ));
+    }
+
+    #[test]
+    fn parallel_reads_span_atomic_publication_without_mixed_identity() -> TestResult {
+        const READERS: usize = 8;
+        let fixture = publication_fixture()?;
+        let (prepublication_captures, prepublication_readers) =
+            spawn_snapshot_readers(&fixture.state, &fixture.before, READERS);
+        prepublication_captures.wait();
+        let publication_locked = Arc::new(ThreadBarrier::new(2));
+        let publication_released = Arc::new(ThreadBarrier::new(2));
+        let publisher_state = Arc::clone(&fixture.state);
+        let publisher_coherence = Arc::clone(&fixture.coherence);
+        let published_candidate = Arc::clone(&fixture.after);
+        let locked = Arc::clone(&publication_locked);
+        let released = Arc::clone(&publication_released);
+        let publisher = std::thread::spawn(move || {
+            publish_rebuild_after(
+                &publisher_state,
+                &publisher_coherence,
+                published_candidate,
+                || {
+                    locked.wait();
+                    released.wait();
+                },
+            )
+        });
+        publication_locked.wait();
+
+        let (blocked_readers_ready, blocked_readers) =
+            spawn_blocked_snapshot_readers(&fixture.state, &fixture.after, READERS);
+        blocked_readers_ready.wait();
+        let observation_started = Arc::new(ThreadBarrier::new(2));
+        let observer_coherence = Arc::clone(&fixture.coherence);
+        let observer_started = Arc::clone(&observation_started);
+        let observer = std::thread::spawn(move || {
+            observer_started.wait();
+            observer_coherence.observe()
+        });
+        observation_started.wait();
+        publication_released.wait();
+        assert_eq!(
+            publisher.join().expect("publisher thread must not panic"),
+            RebuildOutcome::Published
+        );
+        assert_eq!(observer.join().expect("observer thread must not panic")?, 2);
+        for reader in prepublication_readers.into_iter().chain(blocked_readers) {
+            reader.join().expect("reader thread must not panic");
+        }
+        assert_published_fixture(&fixture);
+        assert_eq!(fixture.coherence.observed_epoch(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_state_updates_are_rejected_and_success_clears_failure() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let before = stable_candidate(directory.path(), 0)?;
+        fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
+        let after = stable_candidate(directory.path(), 1)?;
+        let mut state = IndexState {
+            current: Arc::clone(&before),
+            failure: None,
+        };
+
+        assert!(!state.publish(Arc::clone(&after), 2));
+        assert_workspace_identity(&state.current, &before);
+        assert!(!state.record_failure(1, 2, ReadFault::unavailable("test rebuild", "superseded")));
+        assert!(state.failure.is_none());
+        assert!(state.record_failure(1, 1, ReadFault::unavailable("test rebuild", "failed")));
+        assert!(state.failure.is_some());
+        assert!(state.publish(Arc::clone(&after), 1));
+        assert_workspace_identity(&state.current, &after);
+        assert!(state.failure.is_none());
+
+        let state = RwLock::new(IndexState {
+            current: Arc::clone(&before),
+            failure: None,
+        });
+        let (coherence, _invalidations) = IndexCoherence::new();
+        coherence.install_source_policy(Arc::clone(&before.source_policy));
+        assert_eq!(coherence.observe()?, 1);
+        assert_eq!(coherence.observe()?, 2);
+        assert_eq!(
+            publish_rebuild(&state, &coherence, Arc::clone(&after)),
+            RebuildOutcome::Superseded
+        );
+        let state_snapshot = state.blocking_read();
+        assert_workspace_identity(&state_snapshot.current, &before);
+        drop(state_snapshot);
+        let source_policy = coherence
+            .source_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(Arc::ptr_eq(
+            source_policy
+                .as_ref()
+                .expect("policy must remain installed"),
+            &before.source_policy
+        ));
+        drop(source_policy);
+        assert!(!record_rebuild_failure(
+            &state,
+            &coherence,
+            1,
+            ReadFault::unavailable("test rebuild", "superseded failure")
+        ));
+        assert!(state.blocking_read().failure.is_none());
+        Ok(())
     }
 
     #[tokio::test]
