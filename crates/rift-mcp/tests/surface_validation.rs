@@ -15,7 +15,7 @@ use std::fs;
 
 use jsonschema::Validator;
 use rift_index::WorkspaceIndexLimits;
-use rift_mcp::{RiftMcp, RiftMcpOptions};
+use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
@@ -325,12 +325,7 @@ async fn served_fixture() -> TestResult<(
     // the fixture's one commit on `main`.
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");
-    let server = RiftMcp::build(
-        directory.path(),
-        WorkspaceIndexLimits::default(),
-        RiftMcpOptions::default(),
-    )
-    .await?;
+    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server
@@ -671,12 +666,7 @@ guarantees = []
 determinism = "deterministic"
 "#,
     )?;
-    let server = RiftMcp::build(
-        directory.path(),
-        WorkspaceIndexLimits::default(),
-        RiftMcpOptions::default(),
-    )
-    .await?;
+    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server

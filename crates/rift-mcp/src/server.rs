@@ -1,9 +1,8 @@
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as SyncMutex, OnceLock, RwLock as SyncRwLock};
+use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::Duration;
 
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
@@ -15,7 +14,9 @@ use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
     ReplaceNodeParams, ReplaceSymbolParams,
 };
-use rift_protocol::configuration::{CommandHook, WorkspaceConfiguration};
+use rift_protocol::configuration::{
+    CommandHook, SERVER_BLOCKING_SLOTS_MAX, ServerConfiguration, WorkspaceConfiguration,
+};
 use rift_protocol::error as wire;
 use rift_protocol::read::{
     DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams,
@@ -44,9 +45,6 @@ const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
 /// schema bound.
 const ERROR_CAUSES_MAX: usize = 8;
 
-/// Blocking filesystem and syntax operations admitted across MCP servers.
-const BLOCKING_OPERATIONS_MAX: usize = 4;
-
 /// Filesystem events coalesced while one rebuild is pending.
 const INDEX_INVALIDATIONS_MAX: usize = 1;
 /// Delay collecting one bounded filesystem-event batch.
@@ -57,31 +55,6 @@ const INDEX_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(30);
 const INDEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Complete capture retries while the tree keeps moving.
 const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
-/// Milliseconds one operation may wait for blocking capacity.
-const BLOCKING_QUEUE_TIMEOUT_MS_DEFAULT: u64 = 30_000;
-
-/// Runtime policy for blocking MCP operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RiftMcpOptions {
-    blocking_queue_timeout_ms: u64,
-}
-
-impl RiftMcpOptions {
-    /// Sets maximum queue wait before a retryable capacity failure.
-    #[must_use]
-    pub fn with_blocking_queue_timeout_ms(mut self, timeout_ms: NonZeroU64) -> Self {
-        self.blocking_queue_timeout_ms = timeout_ms.get();
-        self
-    }
-}
-
-impl Default for RiftMcpOptions {
-    fn default() -> Self {
-        Self {
-            blocking_queue_timeout_ms: BLOCKING_QUEUE_TIMEOUT_MS_DEFAULT,
-        }
-    }
-}
 
 /// Bounded Tokio admission for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
@@ -91,11 +64,17 @@ struct BlockingExecutor {
 }
 
 impl BlockingExecutor {
-    /// Uses process-wide capacity with one server's queue-wait policy.
-    fn process_wide(options: RiftMcpOptions) -> Self {
+    /// Sizes the workspace's pool and queue wait from one admitted
+    /// `[server]` table.
+    fn for_configuration(server: &ServerConfiguration) -> Self {
+        // Admission bounds the value to 1..=SERVER_BLOCKING_SLOTS_MAX, so
+        // the clamp only guards the usize conversion.
+        let slots = usize::try_from(server.blocking_slots.min(SERVER_BLOCKING_SLOTS_MAX))
+            .unwrap_or(1)
+            .max(1);
         Self {
-            operations: Arc::clone(blocking_operations()),
-            queue_timeout_ms: options.blocking_queue_timeout_ms,
+            operations: Arc::new(Semaphore::new(slots)),
+            queue_timeout_ms: server.blocking_queue_timeout.milliseconds(),
         }
     }
 
@@ -139,12 +118,6 @@ impl BlockingExecutor {
         .await
         .map_err(|error| ReadFault::task(operation, error.to_string()))?
     }
-}
-
-/// Workspace blocking operations admitted process-wide.
-fn blocking_operations() -> &'static Arc<Semaphore> {
-    static OPERATIONS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    OPERATIONS.get_or_init(|| Arc::new(Semaphore::new(BLOCKING_OPERATIONS_MAX)))
 }
 
 /// Serializes workspace mutations and snapshot publication.
@@ -297,6 +270,15 @@ impl ConfigurationState {
             Ok(configuration) => Ok(configuration.clone()),
             Err(error) => Err(error.tool_error(phase)),
         }
+    }
+
+    /// The `[server]` table from the last admission, or the default table
+    /// while `rift.toml` is invalid.
+    fn server_configuration(&self) -> ServerConfiguration {
+        self.admitted
+            .as_ref()
+            .map(|configuration| configuration.server.clone())
+            .unwrap_or_default()
     }
 
     /// The `[source]` policy from the last admission, or the default policy
@@ -922,10 +904,11 @@ fn trace_publication(epoch: u64) {
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl RiftMcp {
     /// Builds server from one direct-workspace snapshot, applying the
-    /// admitted `rift.toml`'s `[source]` policy to the initial index. While
-    /// `rift.toml` is invalid, the initial index still builds under the
-    /// default policy; every request then fails as `configuration_invalid`
-    /// until the file is fixed.
+    /// admitted `rift.toml`'s `[source]` policy to the initial index and its
+    /// `[server]` table to the blocking pool. While `rift.toml` is invalid,
+    /// the initial index still builds under the default policies; every
+    /// request then fails as `configuration_invalid` until the file is
+    /// fixed.
     ///
     /// # Errors
     ///
@@ -935,13 +918,15 @@ impl RiftMcp {
     ///
     /// Dropping this future discards construction. An admitted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
-    pub async fn build(
-        root: &Path,
-        limits: WorkspaceIndexLimits,
-        options: RiftMcpOptions,
-    ) -> Result<Self, ReadError> {
+    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
         let root = root.to_path_buf();
-        let blocking = BlockingExecutor::process_wide(options);
+        let admission_root = root.clone();
+        let startup_configuration =
+            tokio::task::spawn_blocking(move || ConfigurationState::admit(&admission_root))
+                .await
+                .map_err(|error| ReadFault::task("configuration admission", error.to_string()))?;
+        let blocking =
+            BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
         let (coherence, invalidations) = IndexCoherence::new();
         let watch_root = root.clone();
         let watch_coherence = Arc::clone(&coherence);
@@ -1552,7 +1537,6 @@ fn wire_code(name: ErrorName) -> wire::ErrorCode {
 mod tests {
     use std::error::Error;
     use std::fs;
-    use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier as ThreadBarrier};
     use std::time::Duration;
@@ -1574,9 +1558,9 @@ mod tests {
 
     use super::{
         BlockingExecutor, ChangeLane, ConfigurationFingerprint, ConfigurationState, IndexCoherence,
-        IndexState, Parameters, PublishedWorkspace, RebuildOutcome, RiftMcp, RiftMcpOptions,
-        WorkspaceCandidate, build_workspace_candidate, publish_rebuild, publish_rebuild_after,
-        record_rebuild_failure, relevant_watch_event,
+        IndexState, Parameters, PublishedWorkspace, RebuildOutcome, RiftMcp, WorkspaceCandidate,
+        build_workspace_candidate, publish_rebuild, publish_rebuild_after, record_rebuild_failure,
+        relevant_watch_event,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1584,12 +1568,7 @@ mod tests {
     async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let server = RiftMcp::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            RiftMcpOptions::default(),
-        )
-        .await?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         Ok((directory, server))
     }
 
@@ -1628,13 +1607,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture must exist");
         fs::write(directory.path().join("invalid.rs"), [0xff])
             .expect("invalid source fixture must write");
-        let error = RiftMcp::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            RiftMcpOptions::default(),
-        )
-        .await
-        .expect_err("invalid source must fail");
+        let error = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+            .await
+            .expect_err("invalid source must fail");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
     }
 
@@ -2094,7 +2069,7 @@ mod tests {
         fs::write(&path, "pub fn beacon() {}\n")?;
         let tight =
             WorkspaceIndexLimits::new(4, 60, 60, 4, 100).map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight, RiftMcpOptions::default()).await?;
+        let server = RiftMcp::build(directory.path(), tight).await?;
 
         fs::write(
             &path,
@@ -2166,12 +2141,48 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mcp_options_configure_process_wide_queue_wait() {
-        let timeout_ms = NonZeroU64::new(1_250).expect("test timeout must be positive");
-        let options = RiftMcpOptions::default().with_blocking_queue_timeout_ms(timeout_ms);
-        let executor = BlockingExecutor::process_wide(options);
-        assert_eq!(executor.queue_timeout_ms, timeout_ms.get());
+    #[tokio::test]
+    async fn server_table_sizes_blocking_pool_and_queue_wait() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let configured = "[server]\nblocking_slots = 2\nblocking_queue_timeout = \"1250ms\"\n";
+        fs::write(directory.path().join("rift.toml"), configured)?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert_eq!(server.blocking.queue_timeout_ms, 1_250);
+        assert_eq!(server.blocking.operations.available_permits(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_server_table_keeps_default_blocking_policy() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let default_table = rift_protocol::configuration::ServerConfiguration::default();
+        assert_eq!(
+            server.blocking.queue_timeout_ms,
+            default_table.blocking_queue_timeout.milliseconds()
+        );
+        assert_eq!(
+            server.blocking.operations.available_permits() as u64,
+            default_table.blocking_slots
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_configuration_builds_default_blocking_policy() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[server]\nblocking_slots = 0\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let default_table = rift_protocol::configuration::ServerConfiguration::default();
+        assert_eq!(
+            server.blocking.operations.available_permits() as u64,
+            default_table.blocking_slots
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2688,7 +2699,7 @@ mod tests {
         )?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight, RiftMcpOptions::default()).await?;
+        let server = RiftMcp::build(directory.path(), tight).await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use rift_index::WorkspaceIndexLimits;
-use rift_mcp::{RiftMcp, RiftMcpOptions};
+use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
@@ -59,12 +59,7 @@ fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> 
 }
 
 async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let server = RiftMcp::build(
-        root,
-        WorkspaceIndexLimits::default(),
-        RiftMcpOptions::default(),
-    )
-    .await?;
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let service = server
