@@ -722,10 +722,30 @@ pub(crate) fn rebuild_workspace_serialized(
     validation: &IndexValidation,
     epoch: u64,
 ) -> Result<RebuildOutcome, ReadError> {
+    rebuild_workspace_serialized_with(
+        root,
+        limits,
+        published,
+        validation,
+        epoch,
+        build_workspace_candidate,
+    )
+}
+
+/// Runs one serialized rebuild over an injectable capture, so tests can
+/// force each superseded arm deterministically instead of racing the scan.
+pub(crate) fn rebuild_workspace_serialized_with(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    published: &RwLock<IndexState>,
+    validation: &IndexValidation,
+    epoch: u64,
+    capture: impl FnOnce(&Path, WorkspaceIndexLimits, u64) -> Result<WorkspaceCandidate, ReadError>,
+) -> Result<RebuildOutcome, ReadError> {
     if !admit_rebuild(validation, epoch)? {
         return Ok(RebuildOutcome::Superseded);
     }
-    let candidate = build_workspace_candidate(root, limits, epoch)?;
+    let candidate = capture(root, limits, epoch)?;
     let WorkspaceCandidate::Stable(candidate) = candidate else {
         let _ = validation.observe();
         return Ok(RebuildOutcome::Superseded);
@@ -1342,6 +1362,75 @@ mod tests {
             7,
         )?;
         assert_eq!(outcome, RebuildOutcome::Superseded);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_is_superseded_when_configuration_moves_during_capture() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let (validation, _receiver) = IndexValidation::new();
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let state = RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let outcome = super::rebuild_workspace_serialized_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            0,
+            |_, _, _| Ok(WorkspaceCandidate::ConfigurationChanged),
+        )?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+        assert_eq!(
+            validation.observed_epoch(),
+            1,
+            "a moved configuration must trigger another observation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_marks_the_watch_unhealthy_when_blocking_work_is_gone() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, invalidations) = IndexValidation::new();
+        let current = stable_candidate(directory.path(), 0)?;
+        let published = Arc::new(RwLock::new(IndexState {
+            current,
+            failure: None,
+        }));
+        let watcher = super::workspace_watcher(directory.path(), &validation)
+            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
+        blocking.operations.close();
+        let supervisor = tokio::spawn(super::run_index_supervisor(
+            watcher,
+            invalidations,
+            super::IndexSupervisorContext {
+                root: directory.path().to_path_buf(),
+                limits: WorkspaceIndexLimits::default(),
+                published: Arc::clone(&published),
+                change_lane: Arc::new(crate::server::ChangeLane::default()),
+                validation: Arc::clone(&validation),
+                blocking,
+            },
+        ));
+        let notified = validation.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        validation
+            .observe()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        notified.as_mut().await;
+        assert!(
+            validation.watch_failed.load(Ordering::Acquire),
+            "a supervisor that cannot run blocking work must mark the watch unhealthy"
+        );
+        validation.cancellation.cancel();
+        supervisor.await?;
         Ok(())
     }
 

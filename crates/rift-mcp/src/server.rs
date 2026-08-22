@@ -32,8 +32,8 @@ use crate::validation::{
 /// Bounded Tokio admission for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockingExecutor {
-    operations: Arc<Semaphore>,
-    queue_timeout_ms: u64,
+    pub(crate) operations: Arc<Semaphore>,
+    pub(crate) queue_timeout_ms: u64,
 }
 
 impl BlockingExecutor {
@@ -1557,6 +1557,55 @@ pub fn beacon() -> u64 {
         assert!(
             summary.diagnostics[0].message.contains("could not refresh"),
             "diagnostic must explain the stale snapshot: {:?}",
+            summary.diagnostics[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applied_change_that_moves_configuration_reports_stale_snapshot() -> TestResult {
+        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new();
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let root = directory.path().to_path_buf();
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &validation,
+            &changes,
+            move |_, _| {
+                let moved = "[providers.history]\nenabled = false\n";
+                fs::write(root.join("rift.toml"), moved).map_err(|error| {
+                    ReadFault::task("test configuration write", error.to_string())
+                })?;
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        paths: Vec::new(),
+                        edits: Vec::new(),
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+            panic!("the applied change must survive a moved configuration");
+        };
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(
+            summary.diagnostics[0]
+                .message
+                .contains("configuration changed during snapshot rebuild"),
+            "diagnostic must name the moved configuration: {:?}",
             summary.diagnostics[0]
         );
         Ok(())
