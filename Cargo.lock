@@ -2694,6 +2694,7 @@ dependencies = [
 name = "rift-core"
 version = "0.0.8"
 dependencies = [
+ "percent-encoding",
  "rift-protocol",
  "serde",
  "serde_json",

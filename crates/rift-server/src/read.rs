@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use data_encoding::BASE32_NOPAD;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_PROVIDER_ID};
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
+use rift_core::{
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileAdmission,
+};
 use rift_history::{HistoryError, Repository};
 use rift_index::{
     IndexedFile, SymbolMatch, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
@@ -234,6 +235,7 @@ impl ReadService {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
+        text_admission: &TextFileAdmission,
     ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
             "index.build",
@@ -243,10 +245,11 @@ impl ReadService {
             outcome = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let index = WorkspaceIndex::build(root, limits, visibility).map_err(|source| {
-            span.record("outcome", "error");
-            ReadFault::index(source)
-        })?;
+        let index =
+            WorkspaceIndex::build(root, limits, visibility, text_admission).map_err(|source| {
+                span.record("outcome", "error");
+                ReadFault::index(source)
+            })?;
         let snapshot = captured_snapshot(&index, None);
         span.record("files_count", index.files().len());
         span.record("tree_revision", snapshot.tree_revision.0.as_str());
@@ -483,10 +486,9 @@ pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
             .qualified_name
             .rsplit_once("::")
             .map(|(container, _)| {
-                SymbolId(format!(
-                    "rift://symbol/rust/{}/{}",
-                    encode_path(matched.file.path().as_str()),
-                    encode_path(container)
+                SymbolId(rift_core::rust_symbol_identity(
+                    matched.file.path().as_str(),
+                    container,
                 ))
             }),
         modifiers: Vec::new(),
@@ -535,7 +537,10 @@ pub(crate) fn rust_language() -> Language {
 }
 
 pub(crate) fn file_id(file: &IndexedFile) -> FileId {
-    FileId(format!("rift://file/{}", encode_path(file.path().as_str())))
+    FileId(format!(
+        "rift://file/{}",
+        rift_core::encode_path(file.path().as_str())
+    ))
 }
 
 /// Mints the project resolver's source-unit identity: the resolver name, then the
@@ -543,7 +548,7 @@ pub(crate) fn file_id(file: &IndexedFile) -> FileId {
 pub(crate) fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
     SourceUnitId(format!(
         "rift://source/project/{}",
-        encode_path(file.path().as_str())
+        rift_core::encode_path(file.path().as_str())
     ))
 }
 
@@ -553,10 +558,9 @@ pub(crate) fn project_path(file: &IndexedFile) -> ProjectPath {
 }
 
 fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
-    SymbolId(format!(
-        "rift://symbol/rust/{}/{}",
-        encode_path(file.path().as_str()),
-        encode_path(&symbol.qualified_name)
+    SymbolId(rift_core::rust_symbol_identity(
+        file.path().as_str(),
+        &symbol.qualified_name,
     ))
 }
 
@@ -567,7 +571,7 @@ fn node_id(file: &IndexedFile, node: &RustNode) -> NodeId {
 fn node_address(file: &IndexedFile, range: ByteRange) -> String {
     format!(
         "rift://node/rust/{}@{}-{}#{}",
-        encode_path(file.path().as_str()),
+        rift_core::encode_path(file.path().as_str()),
         range.start,
         range.end,
         node_witness(file.source(), range)
@@ -640,34 +644,6 @@ pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
     let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
     encoded.truncate(OPAQUE_ID_DIGEST_CHARS);
     encoded
-}
-
-/// ASCII bytes percent-encoded inside `rift://` path segments.
-///
-/// The kept characters are the RFC 3986 path set; every other byte,
-/// including each byte of multi-byte UTF-8 sequences, is `%XX`-escaped.
-const PATH_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~')
-    .remove(b'!')
-    .remove(b'$')
-    .remove(b'&')
-    .remove(b'\'')
-    .remove(b'(')
-    .remove(b')')
-    .remove(b'*')
-    .remove(b'+')
-    .remove(b',')
-    .remove(b';')
-    .remove(b'=')
-    .remove(b':')
-    .remove(b'@')
-    .remove(b'/')
-    .remove(b'-');
-
-pub(crate) fn encode_path(value: &str) -> String {
-    utf8_percent_encode(value, PATH_ESCAPE_SET).to_string()
 }
 
 /// Complete coverage for a request served in full from `snapshot`, carrying the real
@@ -794,6 +770,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -808,6 +785,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -854,6 +832,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -1022,6 +1001,7 @@ pub fn compute() -> i32 {
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )
         .expect_err("missing root must fail");
 
@@ -1253,6 +1233,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         assert_ne!(
             at_head.snapshot().tree_revision,

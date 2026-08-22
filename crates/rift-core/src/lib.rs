@@ -11,7 +11,7 @@ mod path;
 pub mod constants;
 pub mod line;
 
-pub use configuration::SourceVisibility;
+pub use configuration::{SourceVisibility, TextFileAdmission};
 pub use error::{
     CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, RetryDirective,
     RiftError, fault_label, render_failure,
@@ -21,6 +21,7 @@ pub use identity::{
     ModelRevision, ProviderId, ProviderRevision, RevisionError, RevisionFault, SourceResolverId,
     SourceResolverIdError, SourceResolverIdFault, SourceResolverIdViolation, SourceRevision,
     SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
+    encode_path, rust_symbol_identity,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
 pub use measurement::{

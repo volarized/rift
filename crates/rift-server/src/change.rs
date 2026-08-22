@@ -25,9 +25,7 @@ use rift_syntax::{ByteRange, RustSource, RustSyntaxLimits, RustSyntaxProvider};
 use sha2::{Digest as _, Sha256};
 
 use crate::patch::{self, FileRewrite, RewriteKind};
-use crate::read::{
-    ReadError, ReadFault, ReadService, digest_hex8, encode_path, file_id, node_witness,
-};
+use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id, node_witness};
 
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
@@ -441,7 +439,7 @@ impl ChangeService {
                 Some(file) => file_id(file),
                 None => FileId(format!(
                     "rift://file/{}",
-                    encode_path(rewrite.path.as_str())
+                    rift_core::encode_path(rewrite.path.as_str())
                 )),
             };
             edits.push(Edit::Replace {
@@ -489,10 +487,9 @@ impl ChangeService {
     ) -> Result<Resolution, ReadError> {
         let symbol_address = || {
             vec![PreconditionAddress::Symbol {
-                symbol: rift_protocol::read::SymbolId(format!(
-                    "rift://symbol/rust/{}/{}",
-                    crate::read::encode_path(path.as_str()),
-                    crate::read::encode_path(qualified_name),
+                symbol: rift_protocol::read::SymbolId(rift_core::rust_symbol_identity(
+                    path.as_str(),
+                    qualified_name,
                 )),
             }]
         };
@@ -825,6 +822,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         let changes = ChangeService::new(directory.path());
         Ok((directory, reads, changes))
@@ -1025,6 +1023,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         let result = changes.insert_symbol(
             &reads,
@@ -1116,6 +1115,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         let result = changes.insert_symbol(
             &reads,
