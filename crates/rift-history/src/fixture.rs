@@ -101,7 +101,11 @@ pub fn commit_all(root: &Path, message: &str) {
 ///
 /// Panics when git cannot run or exits nonzero.
 pub fn commit_raw_path(root: &Path, raw_path: &[u8], branch: &str) {
-    let blob = plumb(root, &["hash-object", "-w", "--stdin"], b"pub fn raw() {}\n");
+    let blob = plumb(
+        root,
+        &["hash-object", "-w", "--stdin"],
+        b"pub fn raw() {}\n",
+    );
     let mut entry = format!("100644 blob {blob}\t").into_bytes();
     entry.extend_from_slice(raw_path);
     entry.push(b'\n');

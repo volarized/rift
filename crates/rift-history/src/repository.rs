@@ -331,11 +331,13 @@ fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> Option<&'a [
 /// One committed path's UTF-8 form. The refusal renders the full
 /// repository-relative spelling, so the reader sees the path git records.
 fn utf8_path(relative: &[u8], filepath: &[u8]) -> Result<String, HistoryError> {
-    std::str::from_utf8(relative).map(str::to_owned).map_err(|_| {
-        Error::new(HistoryFault::PathUnrepresentable {
-            path: String::from_utf8_lossy(filepath).into_owned(),
+    std::str::from_utf8(relative)
+        .map(str::to_owned)
+        .map_err(|_| {
+            Error::new(HistoryFault::PathUnrepresentable {
+                path: String::from_utf8_lossy(filepath).into_owned(),
+            })
         })
-    })
 }
 
 /// A [`gix::traverse::tree::Recorder`] behind an entry budget: every visited
