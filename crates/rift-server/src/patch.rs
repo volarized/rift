@@ -29,6 +29,19 @@ pub(crate) const PATCH_FILES_MAX: usize = 64;
 /// Longest hunk-mismatch detail one precondition value carries.
 const PATCH_MISMATCH_DETAIL_BYTES_MAX: usize = 256;
 
+/// Opens a unified diff's original-file header line, such as `--- a/src/lib.rs`.
+const ORIGINAL_HEADER_PREFIX: &str = "--- ";
+
+/// Opens a unified diff's modified-file header line, such as `+++ b/src/lib.rs`.
+const MODIFIED_HEADER_PREFIX: &str = "+++ ";
+
+/// Opens a unified diff's hunk header line, such as `@@ -1,2 +1,3 @@`.
+const HUNK_HEADER_PREFIX: &str = "@@";
+
+/// The header path marking that a segment creates or deletes its file
+/// instead of editing an existing one.
+const NULL_TARGET: &str = "/dev/null";
+
 /// How one resolved file segment changes the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RewriteKind {
@@ -61,7 +74,7 @@ pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError>
     let mut segments: Vec<String> = Vec::new();
     let mut segment_line = 0_usize;
     for line in patch.split_inclusive('\n') {
-        if line.starts_with("--- ") {
+        if line.starts_with(ORIGINAL_HEADER_PREFIX) {
             if segments.len() == PATCH_FILES_MAX {
                 return Err(ReadFault::invalid(
                     "patch",
@@ -73,8 +86,8 @@ pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError>
         }
         if let Some(segment) = segments.last_mut() {
             let structural = segment_line == 0
-                || (segment_line == 1 && line.starts_with("+++ "))
-                || line.starts_with("@@");
+                || (segment_line == 1 && line.starts_with(MODIFIED_HEADER_PREFIX))
+                || line.starts_with(HUNK_HEADER_PREFIX);
             push_segment_line(segment, line, structural);
             segment_line += 1;
         }
@@ -153,7 +166,7 @@ fn split_into_hunks(segment: &str) -> (String, Vec<String>) {
     let mut header = String::new();
     let mut hunks: Vec<String> = Vec::new();
     for line in segment.split_inclusive('\n') {
-        if line.starts_with("@@") {
+        if line.starts_with(HUNK_HEADER_PREFIX) {
             hunks.push(String::new());
         }
         match hunks.last_mut() {
@@ -192,7 +205,7 @@ fn resolve_patch_target(
              relative on every platform, such as `src/lib.rs`",
         ));
     }
-    let target = match (original == "/dev/null", modified == "/dev/null") {
+    let target = match (original == NULL_TARGET, modified == NULL_TARGET) {
         (true, true) => {
             return Ok(Err(ChangeResult::refused(
                 RefusalReason::Unsupported,
@@ -441,8 +454,14 @@ fn post_image_lines<'a>(hunk: &Hunk<'a, str>) -> Vec<&'a str> {
         .collect()
 }
 
+/// Renders the standard `@@ -old +new @@` git hunk header text, through
+/// diffy's own `Display` for `hunk`'s old and new ranges.
 fn hunk_header_text(hunk: &Hunk<'_, str>) -> String {
-    format!("@@ -{} +{} @@", hunk.old_range(), hunk.new_range())
+    format!(
+        "{HUNK_HEADER_PREFIX} -{} +{} {HUNK_HEADER_PREFIX}",
+        hunk.old_range(),
+        hunk.new_range()
+    )
 }
 
 fn without_line_ending(line: &str) -> &str {
