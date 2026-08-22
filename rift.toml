@@ -2,7 +2,9 @@
 
 [source]
 include = []
-exclude = []
+# Agent worktrees and local tooling state hold full copies of the source tree; keep them out of
+# the index even if gitignore inheritance is ever disabled.
+exclude = [".claude/**", ".agents/**"]
 respect_gitignore = true
 
 [[hooks]]
