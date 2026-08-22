@@ -244,8 +244,9 @@ distinguish a compiler-resolved answer from a syntax fallback.
 
 <VersionBadge version="v0.0.8" languages={["Rust"]} />
 
-The server keeps an immutable in-memory index over Rust project source. Tree-sitter extracts
-declarations and syntax nodes from the files admitted by the workspace's source policy.
+The server keeps an immutable in-memory index over the project's source. Tree-sitter extracts
+declarations and syntax nodes from the files admitted by the workspace's source policy; the
+badge above names the languages the index currently covers.
 
 The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories. The index
 stays in memory, so indexing writes no state into the workspace.
@@ -254,10 +255,11 @@ At startup, the server starts a native filesystem watcher before it schedules th
 a Tokio-managed blocking task. Filesystem traversal and parsing therefore do not occupy an async
 MCP worker.
 
-Blocking work shares four process-wide slots. When every slot is busy, a request waits in Tokio's
-semaphore queue for 30 seconds by default; `rift mcp --blocking-queue-timeout-ms 5000` changes this
-bound. Once the bound expires, the server returns `temporarily_unavailable`, so the client can retry
-without adding another blocking worker.
+Blocking work shares a bounded pool of slots. When every slot is busy, a request waits in Tokio's
+semaphore queue; once the wait expires, the server returns `temporarily_unavailable`, so the client
+can retry without adding another blocking worker. The [`server` table](/docs/configuration#server)
+in `rift.toml` sets both bounds — four slots and a 30-second wait by default — and the server sizes
+the pool once at startup.
 
 Native watcher events and Rift-applied changes advance one workspace change counter and enter the
 same serialized rebuild lane. Before each current-tree read, the server reconciles watcher state

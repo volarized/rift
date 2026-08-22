@@ -20,6 +20,30 @@ Treat `rift.toml` as executable workspace configuration. Hooks named by a reposi
 Rift applies a change, using the server's OS permissions, so inspect the file before enabling the
 workspace.
 
+## Server
+
+<VersionBadge version="v0.0.8" />
+
+`server` bounds the server's own blocking work — the filesystem scans and parses behind reads,
+changes, and index rebuilds:
+
+```toml
+[server]
+blocking_slots = 4
+blocking_queue_timeout = "30s"
+```
+
+Each key is shown at its default:
+
+- `blocking_slots` caps blocking operations running at once, 1 to 64
+- `blocking_queue_timeout` bounds one request's wait for a free slot, 1ms to 1h — when it
+  expires, the request fails with `temporarily_unavailable` and the client can retry without
+  stacking another waiter
+
+The blocking pool exists before the first request, so the server sizes it once at startup: a
+change to this table applies on the next start, while every other table applies to later
+requests as soon as the file validates.
+
 ## Source
 
 <VersionBadge version="v0.0.6" />
