@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use ignore::{DirEntry, Walk, WalkBuilder};
 use rift_core::constants::{
-    READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, SOURCE_FILE_EXTENSIONS,
-    WORKSPACE_BYTES_MAX_DEFAULT, WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
-    WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
+    READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, WORKSPACE_BYTES_MAX_DEFAULT,
+    WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
+    WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
     CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
@@ -15,6 +15,7 @@ use rift_core::{
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{
     RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxError, RustSyntaxProvider,
+    SOURCE_FILE_EXTENSIONS,
 };
 use serde::Serialize;
 
@@ -665,18 +666,18 @@ fn hard_floor_admits(entry: &DirEntry) -> bool {
     !(is_dir && is_ignored_directory(entry.file_name()))
 }
 
-fn is_ignored_directory(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
-}
-
-/// Whether `path`'s extension is one of [`SOURCE_FILE_EXTENSIONS`]: the single list every
-/// workspace walk consults, so a new grammar's extension joins the scan by extending that list
-/// alone.
+/// Whether `path`'s extension is one some shipped syntax provider declares
+/// ([`rift_syntax::SOURCE_FILE_EXTENSIONS`]): the walk admits exactly what a provider can
+/// parse, so a new grammar joins the scan by declaring its extensions on its provider.
 fn has_source_extension(path: &Path) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
         .is_some_and(|extension| SOURCE_FILE_EXTENSIONS.contains(&extension))
+}
+
+fn is_ignored_directory(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
 }
 
 /// The path one `ignore` walk failure names, when its cause names one.
