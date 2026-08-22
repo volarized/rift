@@ -15,6 +15,7 @@ use std::path::Path;
 
 use diffy::{Hunk, HunkRange, Line, ParsePatchError, Patch};
 use rift_core::ProjectPath as CoreProjectPath;
+use rift_core::line;
 use rift_protocol::change::{
     ChangeResult, OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus,
     PreconditionValue, RefusalReason,
@@ -92,7 +93,7 @@ pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError>
 /// lines count as structural and why.
 fn normalize_segment(raw: &str) -> String {
     let mut segment = String::new();
-    for (index, text) in raw.split_inclusive('\n').enumerate() {
+    for (index, text) in line::lines_inclusive(raw).enumerate() {
         let structural = index == 0
             || (index == 1 && text.starts_with(MODIFIED_HEADER_PREFIX))
             || text.starts_with(HUNK_HEADER_PREFIX);
@@ -101,27 +102,28 @@ fn normalize_segment(raw: &str) -> String {
     segment
 }
 
-/// Appends one diff line to its segment. A structural line — the `---` and
-/// `+++` file headers and `@@` hunk headers — sheds a CRLF ending, because
-/// the diff parser rejects `\r` there; body lines keep their exact bytes so
-/// hunk content matches the stored source byte-for-byte.
+/// Appends one diff line to its segment. A structural line — the `--- ` and
+/// `+++ ` file headers and `@@` hunk headers — sheds a CRLF ending down to
+/// bare `\n`, because the diff parser rejects `\r` there; body lines keep
+/// their exact bytes, CRLF included, so hunk content matches the stored
+/// source byte-for-byte.
 fn push_segment_line(segment: &mut String, line: &str, structural: bool) {
-    match (structural, line.strip_suffix("\r\n")) {
+    match (structural, line.strip_suffix(rift_core::line::CRLF)) {
         (true, Some(stripped)) => {
             segment.push_str(stripped);
-            segment.push('\n');
+            segment.push_str(rift_core::line::LineEnding::Lf.as_str());
         }
         _ => segment.push_str(line),
     }
 }
 
-/// Scans `text` line by line, opening a new segment whenever
-/// `opens_segment` matches a line, and returns the bytes before the first
-/// match alongside each segment's own bytes.
+/// Scans `text` line by line through [`line::lines_inclusive`], opening a
+/// new segment whenever `opens_segment` matches a line, and returns the
+/// bytes before the first match alongside each segment's own bytes.
 fn split_at_marker(text: &str, opens_segment: impl Fn(&str) -> bool) -> (String, Vec<String>) {
     let mut prefix = String::new();
     let mut segments: Vec<String> = Vec::new();
-    for text_line in text.split_inclusive('\n') {
+    for text_line in line::lines_inclusive(text) {
         if opens_segment(text_line) {
             segments.push(String::new());
         }
@@ -359,8 +361,7 @@ impl<'a> ImageLine<'a> {
 /// positions, since the search distance never usefully exceeds the
 /// image's length.
 fn apply_segment(starting: &str, parsed: &Patch<'_, str>) -> Result<String, MismatchDetail> {
-    let mut image: Vec<ImageLine<'_>> = starting
-        .split_inclusive('\n')
+    let mut image: Vec<ImageLine<'_>> = line::lines_inclusive(starting)
         .map(ImageLine::Original)
         .collect();
     let mut delta: i64 = 0;
@@ -485,12 +486,6 @@ fn hunk_header_text(hunk: &Hunk<'_, str>) -> String {
     )
 }
 
-fn without_line_ending(line: &str) -> &str {
-    line.strip_suffix("\r\n")
-        .or_else(|| line.strip_suffix('\n'))
-        .unwrap_or(line)
-}
-
 /// What a hunk expected at the position it could not be found: the hunk
 /// that failed, the line it was tried at, and what stood there instead.
 struct MismatchDetail {
@@ -518,10 +513,10 @@ impl MismatchDetail {
             ordinal,
             header: hunk_header_text(hunk),
             line: anchor + 1,
-            expected: without_line_ending(expected).to_owned(),
+            expected: line::without_ending(expected).to_owned(),
             observed: observed.map_or_else(
                 || "end of file".to_owned(),
-                |text| without_line_ending(text).to_owned(),
+                |text| line::without_ending(text).to_owned(),
             ),
         }
     }
@@ -613,7 +608,7 @@ fn source_drift_refusal(path: &CoreProjectPath, indexed: &str, disk: &str) -> Ch
 }
 
 fn deletion_incomplete_refusal(path: &CoreProjectPath, remaining: &str) -> ChangeResult {
-    let lines = remaining.split_inclusive('\n').count();
+    let lines = line::lines_inclusive(remaining).count();
     precondition_refusal(
         OperationPreconditionKind::SourceUnchanged,
         path,
