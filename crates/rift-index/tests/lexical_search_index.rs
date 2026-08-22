@@ -421,8 +421,8 @@ struct ConcurrentUnitRecord {
 }
 
 #[derive(Debug, toasty::Model)]
-#[table = "index_state"]
-struct ConcurrentIndexStateRecord {
+#[table = "lexical_index_state"]
+struct ConcurrentLexicalIndexStateRecord {
     #[key]
     id: i64,
     tree_revision: String,
@@ -430,7 +430,7 @@ struct ConcurrentIndexStateRecord {
 
 async fn open_concurrent_probe(path: &Path) -> toasty::Result<Db> {
     let mut builder = Db::builder();
-    let models = toasty::models!(ConcurrentUnitRecord, ConcurrentIndexStateRecord);
+    let models = toasty::models!(ConcurrentUnitRecord, ConcurrentLexicalIndexStateRecord);
     builder.models(models).max_pool_size(1);
     builder.build(Sqlite::open(path)).await
 }
