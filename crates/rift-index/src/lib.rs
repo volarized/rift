@@ -1,10 +1,15 @@
 //! In-memory indexing and retrieval.
 
 mod glob;
+mod lexical;
 mod revision;
 mod workspace;
 
 pub use glob::PathMatcher;
+pub use lexical::{
+    LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch,
+    LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
+};
 pub use workspace::{
     IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceFingerprint, WorkspaceIndex,
     WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits, WorkspaceIndexViolation,
