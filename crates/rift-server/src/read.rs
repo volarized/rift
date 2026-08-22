@@ -316,6 +316,32 @@ impl ReadService {
         self.index.fingerprint()
     }
 
+    /// Returns the tree revision this snapshot's wire answers report — the
+    /// same eight-hex-character string every `ReadSnapshot` in this
+    /// service's results carries. A lexical population stamps this exact
+    /// string, and a search request compares its query-time lexical
+    /// revision against it, so the two never drift apart.
+    #[must_use]
+    pub fn tree_revision(&self) -> &str {
+        &self.snapshot.tree_revision.0
+    }
+
+    /// Derives this snapshot's lexical search units: one per indexed
+    /// symbol and admitted text file, chunked where a text file exceeds
+    /// `[search.text].max_chunk`.
+    #[must_use]
+    pub fn lexical_units(&self) -> Vec<rift_index::LexicalUnit> {
+        self.index.lexical_units()
+    }
+
+    /// Returns each admitted text file split into more than one lexical
+    /// chunk, paired with its chunk count, so a caller can warn about the
+    /// split instead of it passing silently.
+    #[must_use]
+    pub fn chunked_text_files(&self) -> Vec<(CoreProjectPath, usize)> {
+        self.index.chunked_text_files()
+    }
+
     /// Reads Rust syntax nodes covering one UTF-8 byte position. The tree
     /// the nodes come from is the one this service holds; `params.rev` was
     /// already honored by building the service at that revision.
@@ -434,7 +460,7 @@ fn wire_node(file: &IndexedFile, node: &RustNode) -> Node {
     Node {
         id: node_id(file, node),
         symbol: symbol_for_range(file, node.range).map(|symbol| symbol_id(file, symbol)),
-        unit: file_id(file),
+        unit: file_id(file.path()),
         language: rust_language(),
         kind: ExactKind(format!("rust.{}", node.kind)),
         facets: node_facets(node),
@@ -456,7 +482,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
         || Node {
             id: NodeId(node_address(matched.file, matched.symbol.range)),
             symbol: Some(symbol_id(matched.file, matched.symbol)),
-            unit: file_id(matched.file),
+            unit: file_id(matched.file.path()),
             language: rust_language(),
             kind: ExactKind(symbol_kind(matched.symbol.kind).to_owned()),
             facets: vec![NodeFacet::Declaration, NodeFacet::Definition],
@@ -480,7 +506,7 @@ pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
         origin: SymbolOrigin {
             location: Some(SourceLocation::Project { package: None }),
             source_kind: SourceKind::Authored,
-            unit: Some(source_unit_id(matched.file)),
+            unit: Some(source_unit_id(matched.file.path())),
         },
         container: symbol
             .qualified_name
@@ -510,14 +536,14 @@ pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
         .min(file.source().len());
     let text = file.source().get(start..end).unwrap_or_default().to_owned();
     SourceExcerpt {
-        span: source_span(file, range),
+        span: source_span(file.path(), range),
         text,
     }
 }
 
-pub(crate) fn source_span(file: &IndexedFile, range: ByteRange) -> SourceUnitSpan {
+pub(crate) fn source_span(path: &CoreProjectPath, range: ByteRange) -> SourceUnitSpan {
     SourceUnitSpan {
-        unit: source_unit_id(file),
+        unit: source_unit_id(path),
         range: text_range(range),
     }
 }
@@ -536,25 +562,25 @@ pub(crate) fn rust_language() -> Language {
     }
 }
 
-pub(crate) fn file_id(file: &IndexedFile) -> FileId {
+pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
     FileId(format!(
         "rift://file/{}",
-        rift_core::encode_path(file.path().as_str())
+        rift_core::encode_path(path.as_str())
     ))
 }
 
 /// Mints the project resolver's source-unit identity: the resolver name, then the
 /// project-relative path as the resolver's own canonical unit key.
-pub(crate) fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
+pub(crate) fn source_unit_id(path: &CoreProjectPath) -> SourceUnitId {
     SourceUnitId(format!(
         "rift://source/project/{}",
-        rift_core::encode_path(file.path().as_str())
+        rift_core::encode_path(path.as_str())
     ))
 }
 
-/// Project-relative path of one indexed file, as the wire model carries it.
-pub(crate) fn project_path(file: &IndexedFile) -> ProjectPath {
-    ProjectPath(file.path().as_str().to_owned())
+/// Project-relative path, as the wire model carries it.
+pub(crate) fn project_path(path: &CoreProjectPath) -> ProjectPath {
+    ProjectPath(path.as_str().to_owned())
 }
 
 fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
