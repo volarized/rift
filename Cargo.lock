@@ -2413,6 +2413,7 @@ version = "0.0.6"
 dependencies = [
  "ignore",
  "rift-core",
+ "rift-history",
  "rift-model",
  "rift-provider",
  "rift-syntax",
