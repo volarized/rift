@@ -4,12 +4,8 @@ title: MCP
 
 <VersionBadge version="planned" />
 
-
-The Rift server terminates MCP over [Streamable
-HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports#streamable-http) on the
-port its lock file names.
-`rift mcp` is a small stdio proxy for harnesses that launch MCP servers as subprocesses: it
-forwards frames unchanged and decides nothing.
+`rift mcp` serves MCP over stdio for harnesses that launch servers as subprocesses. Stdout carries
+MCP frames; the process writes tracing events to stderr.
 
 Requests do not open connection-scoped sessions. Each call names a
 [`ProjectionId`](/docs/protocol/reference#ProjectionId), or the workspace tree when it
@@ -496,4 +492,3 @@ permanent the next time:
 
 A `limit_exceeded` also carries which limit and by how much, so a request can be resized without
 parsing the message meant for a human.
-

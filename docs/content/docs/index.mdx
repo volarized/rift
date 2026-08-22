@@ -3,7 +3,7 @@ title: Rift
 description: Install Rift, connect its MCP server, and read Rust workspaces.
 ---
 
-<VersionBadge version="v0.0.5" />
+<VersionBadge version="v0.0.8" />
 
 Rift is an agentic development toolkit for reading, discovering, and editing codebases.
 
@@ -44,22 +44,33 @@ client's MCP configuration — for Claude Code, `.mcp.json` in the project root:
 }
 ```
 
-## Rust index
+## Read Rust code
 
-`rift mcp` reads `.rs` files from the current folder into one immutable in-memory snapshot.
-Tree-sitter extracts Rust declarations and syntax nodes, while the typed provider composition records
-the source-to-syntax-to-index pipeline.
+Rift reads the Rust files in the folder where the MCP client launches `rift mcp`. Later calls
+include edits made through Rift, your editor, a formatter, or another process.
 
-The scanner skips symlinks and the `.git`, `.rift`, and `target` directories. It writes no index or
-projection state to the codebase.
+### Search
 
-The MCP server advertises the read tools:
+When you know what the code does but not its name, ask your agent to search for it:
 
-- `search` finds declarations and matching source lines.
-- `get_symbol` returns declarations with source excerpts when the name is known.
-- `nodes` lists the syntax nodes covering one byte position, outermost first. Each node id ends
-  in a witness — a hash of the node's source bytes — which is what a later `replace_node`
-  verifies before writing.
+> Use Rift to find where workspace file fingerprints are calculated.
+
+The agent calls [`search`](/docs/protocol/mcp#tool-search), which returns matching declarations and
+source lines with their paths.
+
+### Retrieve symbol
+
+When you know the declaration name, ask for it directly:
+
+> Use Rift to retrieve the `ReadService` declaration.
+
+The agent calls [`get_symbol`](/docs/protocol/mcp#tool-get_symbol), which returns the declaration
+and its source excerpt. It can pass a returned path and byte position to
+[`nodes`](/docs/protocol/mcp#tool-nodes) when it needs the surrounding syntax structure.
+
+The [MCP reference](/docs/protocol/mcp#reads) defines request fields and result shapes for client
+integrations. The [index architecture](/docs/architecture#index) explains how Rift keeps those
+reads aligned with filesystem changes.
 
 ## Changes
 

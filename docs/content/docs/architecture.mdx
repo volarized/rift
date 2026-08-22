@@ -242,27 +242,38 @@ distinguish a compiler-resolved answer from a syntax fallback.
 
 ## Index
 
-The server keeps a context-rich index over project source and discovered dependencies. Syntax and
-semantic providers populate it from the source catalog. The index is embedded in the server and
-stored under `.rift`.
+<VersionBadge version="v0.0.8" languages={["Rust"]} />
 
-The index build starts as a background task when `rift server` starts. If a query arrives while
-the index is still building, the server returns a response from the published portion and reports
-partial coverage. Its [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) carries the
-project-tree, source-catalog, and index revisions used for the answer. Index freshness requires both
-the project tree and source catalog to match.
+The server keeps an immutable in-memory index over the project's source. Tree-sitter extracts
+declarations and syntax nodes from the files admitted by the workspace's source policy; the
+badge above names the languages the index currently covers.
 
-Each index update is a new immutable base-plus-delta view. Workspace reads use the current base
-and its changed-path delta; projection reads layer the projection's delta over the base revision
-captured at creation. Once an update finishes, the server compacts those layers in the
-background. A running read retains its captured view until its last page, while a newer read can
-use the newly published revision.
+The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories. The index
+stays in memory, so indexing writes no state into the workspace.
 
-Before returning a fresh indexed read, the server checks the tree and index revisions before and
-after it builds the result. If either changes, the server waits for the active index build, then
-retries the complete capture at most three times within one thirty-second deadline. Continued
-movement returns [`temporarily_unavailable`](/docs/protocol/mcp#errors) with
-`same_request`; a cursor page resumes its stored capture without consulting newer revisions.
+At startup, the server starts a native filesystem watcher before it schedules the initial scan on
+a Tokio-managed blocking task. Filesystem traversal and parsing therefore do not occupy an async
+MCP worker.
+
+Blocking work shares a bounded pool of slots. When every slot is busy, a request waits in Tokio's
+semaphore queue; once the wait expires, the server returns `temporarily_unavailable`, so the client
+can retry without adding another blocking worker. The [`server` table](/docs/configuration#server)
+in `rift.toml` sets both bounds — four slots and a 30-second wait by default — and the server sizes
+the pool once at startup.
+
+Native watcher events and Rift-applied changes advance one workspace change counter and enter the
+same serialized rebuild lane. Before each current-tree read, the server reconciles watcher state
+against an exact fingerprint of the admitted workspace files, then waits until the published index
+counter matches it.
+
+From the implementation perspective, a rebuild constructs the read index and admitted configuration
+outside the async lock, then swaps the complete immutable value under its write lock. Each request
+clones the published value under a read lock and retains that capture through its result, so reads
+never combine state from two index revisions.
+
+The [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) reports the tree, source-catalog, and
+index revisions used for the answer. It reports the index as current only after request-time
+reconciliation established that the published revision matches the workspace.
 
 ### Search
 
