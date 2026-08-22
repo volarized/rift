@@ -158,6 +158,25 @@ as references, definitions, types, and hover information. For Python, Rift embed
 [ty](https://github.com/astral-sh/ty) and builds one analysis database per targeted tree on first
 use.
 
+The analyzer behind a semantic provider is its **language engine**. An engine takes one of these
+shapes:
+
+- an embedded library, compiled into the server — ty is one; there is no process to supervise,
+  and the engine version ships with the Rift release
+- a language server the server spawns for the workspace and speaks
+  [LSP](https://microsoft.github.io/language-server-protocol/) to —
+  [rust-analyzer](https://rust-analyzer.github.io/) answers this way; the process stays warm and
+  reanalyzes incrementally, which suits a long editing session
+- a batch indexer whose output the server reads — a [SCIP](https://github.com/sourcegraph/scip)
+  index such as the one `rust-analyzer scip` emits, the same format Rift itself
+  [exports](/docs/protocol/scip); the index describes exactly one tree revision, so the server
+  caches it per revision
+
+The provider contract is the same in front of every shape, so a language can swap engines —
+or use one engine for facts and another for [edit plans](#semantic-edits) — without changing any
+tool an agent calls. A missing engine degrades rather than breaks: when rust-analyzer is not
+installed, the semantic family reports `unavailable` coverage and syntax facts still answer.
+
 The Python provider composition supplies ty with the source catalog and tree-sitter facts. Ty maps
 resolved facts back to the same declarations and concrete source ranges, while syntax remains the
 fallback where semantic analysis has no answer.
@@ -426,6 +445,60 @@ other paths retain their original baselines.
 Projections outlive the agent that made them. After a server restart,
 [`projection_list`](/docs/protocol/mcp#tool-projection_list) returns the same pinned base.
 `projection_remove` is the operation that deletes the directory and any unpublished work.
+
+## Semantic edits
+
+Threading a new parameter through twenty call sites is one decision followed by twenty mechanical
+edits. The change tools address one declaration per call, so that decision costs the agent a read
+and a write per site. The missing step turns the decision into the full edit set, and
+finding every site is reference resolution — a semantic fact.
+
+An **edit plan** is that set before any of it is applied: each affected site as a concrete byte
+range with its replacement, resolved by the language engine for the plan's language. The server
+asks the engine where the edits go; applying them stays the server's job. A plan compiles into
+the same [`Edit`](/docs/protocol/reference#Edit) set every change tool produces — one shared
+input state, no overlaps, atomic application across files — so plans add no second write path.
+
+A language server normally hands its edits straight to the editor that hosts it, and whether
+every file got its share is the editor's problem. Rift treats the engine's answer as a proposal:
+resolution recomputes each witness as the plan applies, so a plan computed against bytes that
+have since moved refuses with a failed `source_unchanged` precondition — the same guard every
+direct write gets.
+
+The engine works against the projection directory, for the reason the directory exists at all: a
+language server and a batch indexer take a directory, like `cargo test` and the linter before
+them. A live language server reads the projection's bytes as the change tools write them, so its
+analysis tracks the plan as it lands. A batch indexer runs over the pinned snapshot, and pinning
+is what makes its output usable — the index describes one revision, and the projection still is
+that revision.
+
+<IsoDiagram
+  alt="An agent asks the rift server for a rename. The server requests an edit plan from the language engine — a language server or a SCIP index — which reads the projection directory. The server compiles the plan into witnessed edits, applies them to the projection as one change, and publish carries the result into the workspace tree."
+  chart={`
+    flowchart LR
+      agent["agent"]:::agent -- "rename" --> server["rift server"]:::rift
+      server -- "plan request" --> engine["language engine<br/>language server or SCIP index"]:::provider
+      engine -- "edit plan" --> server
+      server -- "witnessed edits" --> projection["projection"]:::store
+      engine -. "reads" .-> projection
+      projection -- "publish" --> workspace["workspace tree"]:::store
+  `}
+/>
+
+An engine can miss sites — a name built at runtime, an occurrence in a doc comment or a template
+no resolver parses. After a plan applies, the server sweeps the projection for surviving
+occurrences of the replaced name, and each finding becomes an open warning
+[`Advisory`](/docs/protocol/reference#Advisory) on the change. In a projection an open warning
+mints a [`ConfirmationRequirement`](/docs/protocol/reference#ConfirmationRequirement), so
+[`publish`](/docs/protocol/mcp#tool-publish) refuses the rename until someone has looked at what
+the engine left behind.
+
+The engine's whole job is the plan. Everything after it — witnessing, atomic application, the
+publish gate — the server already owned before engines existed, so swapping a language's engine,
+a live language server for a cached SCIP index or the reverse, is a provider change invisible
+above the provider contract. A custom integration contributes a plan source the way it
+contributes facts: implement the [fact provider](/docs/protocol/core#semantic-facts) contract,
+and the composition routes the language to it.
 
 ## Execution
 
