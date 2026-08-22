@@ -16,6 +16,7 @@ use rift_core::{
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{
     RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxError, RustSyntaxProvider,
+    SOURCE_FILE_EXTENSIONS,
 };
 use serde::Serialize;
 
@@ -504,7 +505,7 @@ fn discover(
             continue;
         }
         let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "rs") {
+        if !has_source_extension(path) {
             continue;
         }
         if !source_admitted(include.as_ref(), exclude.as_ref(), path) {
@@ -533,6 +534,15 @@ fn hard_floor_admits(entry: &DirEntry) -> bool {
         .file_type()
         .is_some_and(|file_type| file_type.is_dir());
     !(is_dir && is_ignored_directory(entry.file_name()))
+}
+
+/// Whether `path`'s extension is one some shipped syntax provider declares
+/// ([`rift_syntax::SOURCE_FILE_EXTENSIONS`]): the walk admits exactly what a provider can
+/// parse, so a new grammar joins the scan by declaring its extensions on its provider.
+fn has_source_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| SOURCE_FILE_EXTENSIONS.contains(&extension))
 }
 
 fn is_ignored_directory(name: &OsStr) -> bool {
