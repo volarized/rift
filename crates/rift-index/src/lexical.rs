@@ -8,7 +8,7 @@
 //! `SQLite` FTS5 is reached through raw SQL because Toasty 0.10 has no typed
 //! virtual-table or `MATCH` API, the same boundary the Toasty compatibility
 //! test documents. Raw SQL stays isolated to the FTS virtual table and its
-//! rows; the authoritative `lexical_units` and `index_state` tables are
+//! rows; the authoritative `lexical_units` and `lexical_index_state` tables are
 //! ordinary Toasty models.
 
 use std::path::{Path, PathBuf};
@@ -49,8 +49,8 @@ const LEXICAL_NAME_RANK_WEIGHT: f64 = 10.0;
 /// `bm25` column weight applied to the FTS `content` column.
 const LEXICAL_CONTENT_RANK_WEIGHT: f64 = 1.0;
 
-/// Primary key of the single `index_state` row this adapter maintains.
-const INDEX_STATE_ID: i64 = 1;
+/// Primary key of the single `lexical_index_state` row this adapter maintains.
+const LEXICAL_INDEX_STATE_ID: i64 = 1;
 
 const MIGRATION_FILES: &[MigrationFile] = &[MigrationFile::new(
     1,
@@ -64,7 +64,7 @@ const MIGRATION_FILES: &[MigrationFile] = &[MigrationFile::new(
         content TEXT NOT NULL
     )
 -- #[toasty::breakpoint]
-CREATE TABLE index_state(
+CREATE TABLE lexical_index_state(
         id BIGINT PRIMARY KEY NOT NULL,
         tree_revision TEXT NOT NULL
     )
@@ -589,8 +589,8 @@ struct LexicalUnitRecord {
 }
 
 #[derive(Debug, toasty::Model)]
-#[table = "index_state"]
-struct IndexStateRecord {
+#[table = "lexical_index_state"]
+struct LexicalIndexStateRecord {
     #[key]
     id: i64,
     tree_revision: String,
@@ -735,7 +735,7 @@ impl LexicalSearchIndex {
     ) -> Result<Self, LexicalIndexError> {
         let mut builder = Db::builder();
         builder
-            .models(toasty::models!(LexicalUnitRecord, IndexStateRecord))
+            .models(toasty::models!(LexicalUnitRecord, LexicalIndexStateRecord))
             .max_pool_size(bound_as_usize(limits.pool_slots()));
         let database = builder
             .build(Sqlite::open(database_path))
@@ -818,7 +818,7 @@ impl LexicalSearchIndex {
             insert_lexical_unit(&mut transaction, unit).await?;
         }
 
-        IndexStateRecord::upsert_by_id(INDEX_STATE_ID)
+        LexicalIndexStateRecord::upsert_by_id(LEXICAL_INDEX_STATE_ID)
             .tree_revision(tree_revision.to_owned())
             .exec(&mut transaction)
             .await
@@ -903,7 +903,7 @@ impl LexicalSearchIndex {
     /// Cancellation performs no writes; this issues one read-only lookup.
     pub async fn tree_revision(&self) -> Result<Option<String>, LexicalIndexError> {
         let mut connection = self.configured_connection().await?;
-        let record = IndexStateRecord::filter_by_id(INDEX_STATE_ID)
+        let record = LexicalIndexStateRecord::filter_by_id(LEXICAL_INDEX_STATE_ID)
             .first()
             .exec(&mut connection)
             .await
