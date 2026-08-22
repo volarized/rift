@@ -44,33 +44,33 @@ client's MCP configuration — for Claude Code, `.mcp.json` in the project root:
 }
 ```
 
-## Rust index
+## Read Rust code
 
-`rift mcp` starts a native filesystem watcher before it scans the current folder. The initial scan
-runs in a bounded blocking task managed by Tokio, so filesystem traversal and tree-sitter parsing do
-not block the async MCP executor.
+Rift reads the Rust files in the folder where the MCP client launches `rift mcp`. Later calls
+include edits made through Rift, your editor, a formatter, or another process.
 
-External writes and Rift changes advance the same workspace change counter and enter one serialized
-rebuild lane. Before each current-tree read, the server reconciles watcher state against an exact
-fingerprint of the admitted workspace files and waits until the published index has caught up.
+### Search
 
-The server publishes the read index and admitted configuration together as one immutable snapshot.
-Each request retains its captured snapshot while later rebuilds publish newer ones, so a read never
-combines files or policy from different workspace states.
+When you know what the code does but not its name, ask your agent to search for it:
 
-The scanner skips symlinks and the `.git`, `.rift`, and `target` directories. It writes no index or
-projection state to the codebase.
+> Use Rift to find where workspace file fingerprints are calculated.
 
-`rift mcp` writes tracing events to stderr. Stdout carries MCP frames, so diagnostics never enter the
-protocol stream.
+The agent calls [`search`](/docs/protocol/mcp#tool-search), which returns matching declarations and
+source lines with their paths.
 
-The MCP server advertises the read tools:
+### Retrieve symbol
 
-- `search` finds declarations and matching source lines.
-- `get_symbol` returns declarations with source excerpts when the name is known.
-- `nodes` lists the syntax nodes covering one byte position, outermost first. Each node id ends
-  in a witness — a hash of the node's source bytes — which is what a later `replace_node`
-  verifies before writing.
+When you know the declaration name, ask for it directly:
+
+> Use Rift to retrieve the `ReadService` declaration.
+
+The agent calls [`get_symbol`](/docs/protocol/mcp#tool-get_symbol), which returns the declaration
+and its source excerpt. It can pass a returned path and byte position to
+[`nodes`](/docs/protocol/mcp#tool-nodes) when it needs the surrounding syntax structure.
+
+The [MCP reference](/docs/protocol/mcp#reads) defines request fields and result shapes for client
+integrations. The [index architecture](/docs/architecture#index) explains how Rift keeps those
+reads aligned with filesystem changes.
 
 ## Changes
 
