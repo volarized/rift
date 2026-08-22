@@ -157,7 +157,8 @@ pub enum MatchedField {
     Relationship,
 }
 
-/// Project-relative glob using *, ?, **, and character classes.
+/// Project-relative glob using *, ?, **, and character classes. Forward-slash separated on
+/// every platform, whatever separator the host OS uses natively.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
@@ -167,6 +168,64 @@ pub struct PathPattern(
     ))]
     pub String,
 );
+
+impl PathPattern {
+    /// Classifies this pattern against the forward-slash-only contract [`PathPattern`]
+    /// advertises. `schemars` regexes are declarative only — nothing enforces them at
+    /// runtime — so every admission point calls this before the pattern reaches a glob
+    /// engine, where a stray backslash would otherwise be read as an escape.
+    #[must_use]
+    pub fn violation(&self) -> Option<PathPatternViolation> {
+        path_pattern_violation(&self.0)
+    }
+}
+
+/// Reason a path pattern breaks the forward-slash-only contract every glob list enforces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathPatternViolation {
+    /// Pattern is empty.
+    Empty,
+    /// Pattern starts with `/`.
+    Absolute,
+    /// Pattern contains a `\` byte; backslash is never treated as an escape or separator.
+    Backslash,
+    /// Pattern contains an ASCII control character.
+    ControlCharacter,
+    /// A `/`-separated segment is `.` or `..`.
+    DotSegment,
+}
+
+impl PathPatternViolation {
+    /// This violation's wire spelling, equal to its `Serialize` output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Absolute => "absolute",
+            Self::Backslash => "backslash",
+            Self::ControlCharacter => "control_character",
+            Self::DotSegment => "dot_segment",
+        }
+    }
+}
+
+/// Classifies one path-pattern value against the rules [`PathPattern`]'s schema advertises.
+/// Arms are ordered by precedence: the first matching rule names the violation.
+fn path_pattern_violation(value: &str) -> Option<PathPatternViolation> {
+    match value.as_bytes() {
+        [] => Some(PathPatternViolation::Empty),
+        [b'/', ..] => Some(PathPatternViolation::Absolute),
+        bytes if bytes.contains(&b'\\') => Some(PathPatternViolation::Backslash),
+        _ if value.chars().any(char::is_control) => Some(PathPatternViolation::ControlCharacter),
+        _ if value.split('/').any(is_dot_segment) => Some(PathPatternViolation::DotSegment),
+        _ => None,
+    }
+}
+
+fn is_dot_segment(segment: &str) -> bool {
+    matches!(segment, "." | "..")
+}
 
 /// Which files a query runs over, as three lists of globs matched against the project-relative
 /// path. The same glob engine backs the workspace's `[source]` policy. `include: ["src/**"]`
@@ -518,4 +577,53 @@ pub enum TraversalDirection {
     Incoming,
     /// Walks edges in both directions.
     Both,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PathPattern, PathPatternViolation};
+    use serde_json::json;
+
+    #[test]
+    fn path_pattern_violation_classifies_every_schema_rule() {
+        let cases = [
+            ("", Some(PathPatternViolation::Empty)),
+            ("/src/lib.rs", Some(PathPatternViolation::Absolute)),
+            ("src\\lib.rs", Some(PathPatternViolation::Backslash)),
+            ("dir/back\\slash.rs", Some(PathPatternViolation::Backslash)),
+            (
+                "src/line\n.rs",
+                Some(PathPatternViolation::ControlCharacter),
+            ),
+            ("../outside.rs", Some(PathPatternViolation::DotSegment)),
+            ("src/../lib.rs", Some(PathPatternViolation::DotSegment)),
+            ("src/**/*.rs", None),
+            ("README.md", None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                PathPattern(value.to_owned()).violation(),
+                expected,
+                "value={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_pattern_violation_as_str_matches_serde_spelling() {
+        let violations = [
+            PathPatternViolation::Empty,
+            PathPatternViolation::Absolute,
+            PathPatternViolation::Backslash,
+            PathPatternViolation::ControlCharacter,
+            PathPatternViolation::DotSegment,
+        ];
+        for violation in violations {
+            assert_eq!(
+                serde_json::to_value(violation).ok(),
+                Some(json!(violation.as_str())),
+                "violation={violation:?}"
+            );
+        }
+    }
 }

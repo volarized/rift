@@ -94,6 +94,26 @@ fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     if params.target == SearchParamsTarget::Node {
         return Err(ReadFault::unsupported("node search"));
     }
+    if let Some(selector) = params.paths.as_ref() {
+        validate_path_selector(selector)?;
+    }
+    Ok(())
+}
+
+/// Refuses `selector` when any `include`, `exclude`, or `force_include` pattern breaks
+/// [`PathPattern`]'s forward-slash-only contract, before it reaches a glob engine that would
+/// otherwise read a stray backslash as an escape.
+fn validate_path_selector(selector: &PathSelector) -> Result<(), ReadError> {
+    let patterns = selector
+        .include
+        .iter()
+        .chain(&selector.exclude)
+        .chain(&selector.force_include);
+    for pattern in patterns {
+        if let Some(violation) = pattern.violation() {
+            return Err(ReadFault::invalid("paths", violation.as_str()));
+        }
+    }
     Ok(())
 }
 
@@ -760,6 +780,23 @@ pub fn compute() -> i32 {
                 .expect_err("an invalid include glob must refuse")
                 .fault(),
             ReadFault::Index(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn search_paths_backslash_pattern_refuses_before_reaching_the_glob_engine() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "Beacon",
+            "paths": {"include": ["src\\lib.rs"]}
+        }))?;
+        assert!(matches!(
+            service
+                .search(&params)
+                .expect_err("a backslash pattern must be refused")
+                .fault(),
+            ReadFault::Invalid { field: "paths", .. }
         ));
         Ok(())
     }
