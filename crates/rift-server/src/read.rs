@@ -15,9 +15,8 @@ use rift_protocol::read::{
     FactFamily, FileId, Freshness, GetSymbolHit, GetSymbolParams, GetSymbolResult, IndexSnapshot,
     Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProjectPath, ProviderId,
     ProviderOrigin, ReadSnapshot, RevisionId, SearchScope, SemanticCoverage, SourceExcerpt,
-    SourceKind,
-    SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
-    TextRange,
+    SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId,
+    SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -1139,8 +1138,7 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(
-            value["hits"][0]["source"]["text"],
-            "pub fn beacon() {}",
+            value["hits"][0]["source"]["text"], "pub fn beacon() {}",
             "the committed body answers, not the drifted working tree"
         );
         let revision = value["snapshot"]["revision"]

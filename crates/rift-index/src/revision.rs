@@ -130,8 +130,9 @@ fn revision_composition() -> Result<ProviderComposition, WorkspaceIndexError> {
     let source = component::<(), RevisionFiles>("git-history-source")?;
     let syntax = component::<RevisionFiles, RustFacts>("rust-tree-sitter")?;
     let index = component::<RustFacts, ReadIndex>("memory-index")?;
-    let mut builder =
-        CompositionBuilder::new(CompositionId::new("rust-revision-read").map_err(composition_error)?);
+    let mut builder = CompositionBuilder::new(
+        CompositionId::new("rust-revision-read").map_err(composition_error)?,
+    );
     let files = builder.source("history", &source);
     let facts = builder.then(files, "syntax", &syntax);
     let reads = builder.then(facts, "index", &index);
@@ -188,8 +189,14 @@ mod tests {
             &SourceVisibility::default(),
         )
         .expect("revision index");
-        assert!(has_symbol(&index, "committed"), "the committed declaration answers");
-        assert!(!has_symbol(&index, "drifted"), "working-tree drift is invisible");
+        assert!(
+            has_symbol(&index, "committed"),
+            "the committed declaration answers"
+        );
+        assert!(
+            !has_symbol(&index, "drifted"),
+            "working-tree drift is invisible"
+        );
         let paths: Vec<&str> = index
             .files()
             .iter()
@@ -215,12 +222,19 @@ mod tests {
         )
         .expect("source");
         fs::create_dir_all(directory.path().join("target")).expect("directory");
-        fs::write(directory.path().join("target/gen.rs"), "pub fn floor() {}\n").expect("source");
+        fs::write(
+            directory.path().join("target/gen.rs"),
+            "pub fn floor() {}\n",
+        )
+        .expect("source");
         commit_all(directory.path(), "commit vendored and floor files");
-        let visibility =
-            SourceVisibility::new(Vec::new(), vec!["vendor/**".to_owned()], true);
-        let index = revision_index(directory.path(), WorkspaceIndexLimits::default(), &visibility)
-            .expect("revision index");
+        let visibility = SourceVisibility::new(Vec::new(), vec!["vendor/**".to_owned()], true);
+        let index = revision_index(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+        )
+        .expect("revision index");
         assert!(has_symbol(&index, "committed"));
         assert!(!has_symbol(&index, "vendored"), "[source] exclude applies");
         assert!(!has_symbol(&index, "floor"), "the hard floor applies");
@@ -241,7 +255,10 @@ mod tests {
             .iter()
             .map(|step| step.component().as_str())
             .collect();
-        assert_eq!(steps, ["git-history-source", "rust-tree-sitter", "memory-index"]);
+        assert_eq!(
+            steps,
+            ["git-history-source", "rust-tree-sitter", "memory-index"]
+        );
     }
 
     #[test]
@@ -250,9 +267,8 @@ mod tests {
         fs::write(directory.path().join("extra.rs"), "pub fn extra() {}\n").expect("source");
         commit_all(directory.path(), "second source file");
         let one_file = WorkspaceIndexLimits::new(1, 1_000, 2_000, 4, 5).expect("limits");
-        let count_error =
-            revision_index(directory.path(), one_file, &SourceVisibility::default())
-                .expect_err("two committed sources must refuse a one-file bound");
+        let count_error = revision_index(directory.path(), one_file, &SourceVisibility::default())
+            .expect_err("two committed sources must refuse a one-file bound");
         assert_eq!(
             count_error.fault().violation(),
             WorkspaceIndexViolation::TooManyFiles
@@ -266,9 +282,8 @@ mod tests {
         .expect("source");
         commit_all(directory.path(), "deeply nested source");
         let shallow = WorkspaceIndexLimits::new(5, 1_000, 4_000, 1, 5).expect("limits");
-        let depth_error =
-            revision_index(directory.path(), shallow, &SourceVisibility::default())
-                .expect_err("deep/nest/lowest.rs must refuse a one-level depth bound");
+        let depth_error = revision_index(directory.path(), shallow, &SourceVisibility::default())
+            .expect_err("deep/nest/lowest.rs must refuse a one-level depth bound");
         assert_eq!(
             depth_error.fault().violation(),
             WorkspaceIndexViolation::TooDeep

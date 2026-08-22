@@ -1429,9 +1429,7 @@ pub struct TypeExpression {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Digest, REVISION_ID_BYTES_MAX, RevisionId, RevisionIdViolation, SourceUnitId,
-    };
+    use super::{Digest, REVISION_ID_BYTES_MAX, RevisionId, RevisionIdViolation, SourceUnitId};
     use schemars::schema_for;
     use serde_json::json;
 
@@ -1448,9 +1446,15 @@ mod tests {
     fn revision_id_violation_classifies_what_the_schema_pattern_rejects() {
         let cases = [
             ("", Some(RevisionIdViolation::Empty)),
-            ("a".repeat(REVISION_ID_BYTES_MAX + 1).leak() as &str, Some(RevisionIdViolation::TooLong)),
+            (
+                "a".repeat(REVISION_ID_BYTES_MAX + 1).leak() as &str,
+                Some(RevisionIdViolation::TooLong),
+            ),
             ("HEAD~1", Some(RevisionIdViolation::CharsetForbidden)),
-            ("rev with space", Some(RevisionIdViolation::CharsetForbidden)),
+            (
+                "rev with space",
+                Some(RevisionIdViolation::CharsetForbidden),
+            ),
             ("main", None),
             ("feature/rev-reads", None),
             ("v0.0.6", None),
@@ -1473,7 +1477,10 @@ mod tests {
             (RevisionIdViolation::CharsetForbidden, "charset_forbidden"),
         ] {
             assert_eq!(violation.as_str(), label);
-            assert_eq!(serde_json::to_value(violation).expect("serialize"), json!(label));
+            assert_eq!(
+                serde_json::to_value(violation).expect("serialize"),
+                json!(label)
+            );
         }
     }
 

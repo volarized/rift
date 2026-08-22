@@ -53,7 +53,10 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
         ("get_symbol", json!({ "name": "beacon_one", "rev": "main" })),
         ("search", json!({ "query": "beacon", "rev": "main" })),
-        ("nodes", json!({ "path": "lib.rs", "position": 0, "rev": "main" })),
+        (
+            "nodes",
+            json!({ "path": "lib.rs", "position": 0, "rev": "main" }),
+        ),
         (
             "replace_symbol",
             json!({

@@ -1049,7 +1049,10 @@ pub fn compute() -> i32 {
             "pub fn committed_probe() {}\n",
         )?;
         rift_history::fixture::commit_all(directory.path(), "introduce probe");
-        fs::write(directory.path().join("lib.rs"), "pub fn drifted_probe() {}\n")?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn drifted_probe() {}\n",
+        )?;
         let service = ReadService::at_revision(
             directory.path(),
             &rift_protocol::read::RevisionId("main".to_owned()),
@@ -1062,8 +1065,7 @@ pub fn compute() -> i32 {
     #[test]
     fn search_at_a_revision_serves_committed_matches_only() -> TestResult {
         let (_directory, service) = committed_fixture()?;
-        let committed: SearchParams =
-            serde_json::from_value(json!({"query": "committed_probe"}))?;
+        let committed: SearchParams = serde_json::from_value(json!({"query": "committed_probe"}))?;
         let value = serde_json::to_value(service.search(&committed)?)?;
         let results = value["results"].as_array().ok_or("results array")?;
         assert!(!results.is_empty(), "the committed declaration matches");
@@ -1088,9 +1090,9 @@ pub fn compute() -> i32 {
             "query": "committed_probe",
             "paths": {"force_include": ["lib.rs"]}
         }))?;
-        let error = service
-            .search(&params)
-            .expect_err("force_include walks the working tree, which a revision search has none of");
+        let error = service.search(&params).expect_err(
+            "force_include walks the working tree, which a revision search has none of",
+        );
         assert!(matches!(
             error.fault(),
             ReadFault::Unsupported {

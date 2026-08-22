@@ -729,7 +729,16 @@ mod tests {
             (
                 "SearchParams",
                 serde_json::to_value(schema_for!(SearchParams)).expect("schema"),
-                &["query", "filter", "traversal", "target", "scope", "paths", "rev", "projection"],
+                &[
+                    "query",
+                    "filter",
+                    "traversal",
+                    "target",
+                    "scope",
+                    "paths",
+                    "rev",
+                    "projection",
+                ],
             ),
             (
                 "RelationFilter",

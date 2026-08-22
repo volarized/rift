@@ -218,15 +218,15 @@ impl Repository {
             .rev_parse_single(rev.as_bytes().as_bstr())
             .map_err(|_| unknown())?;
         let object = id.object().map_err(|_| unknown())?;
-        let commit = object.peel_to_kind(gix::object::Kind::Commit).map_err(|_| {
-            Error::new(HistoryFault::RevisionNotCommit {
-                rev: rev.to_owned(),
-                kind: object_kind(&self.inner, id.detach()),
-            })
-        })?;
-        Ok(ResolvedRevision {
-            commit: commit.id,
-        })
+        let commit = object
+            .peel_to_kind(gix::object::Kind::Commit)
+            .map_err(|_| {
+                Error::new(HistoryFault::RevisionNotCommit {
+                    rev: rev.to_owned(),
+                    kind: object_kind(&self.inner, id.detach()),
+                })
+            })?;
+        Ok(ResolvedRevision { commit: commit.id })
     }
 
     /// Lists the revision's committed regular files inside the workspace
@@ -456,8 +456,8 @@ mod tests {
 
     #[test]
     fn test_open_refuses_a_missing_root_as_storage() {
-        let error = Repository::open(Path::new("missing-rift-history-root"))
-            .expect_err("missing root");
+        let error =
+            Repository::open(Path::new("missing-rift-history-root")).expect_err("missing root");
         assert!(matches!(error.fault(), HistoryFault::Storage { .. }));
     }
 
@@ -494,7 +494,10 @@ mod tests {
         let error = repository
             .resolve("feature/absent")
             .expect_err("unknown revision");
-        assert!(matches!(error.fault(), HistoryFault::RevisionUnknown { .. }));
+        assert!(matches!(
+            error.fault(),
+            HistoryFault::RevisionUnknown { .. }
+        ));
         assert_eq!(
             error.to_string(),
             "the requested resource does not exist in the current snapshot: \
@@ -534,7 +537,15 @@ mod tests {
             .collect();
         assert_eq!(all, ["README.md", "lib.rs", "src/extra.rs"]);
         let rust_only: Vec<String> = repository
-            .tree_files(&head, &|path| Path::new(path).extension().is_some_and(|extension| extension == "rs"), REVISION_TREE_ENTRIES_MAX)
+            .tree_files(
+                &head,
+                &|path| {
+                    Path::new(path)
+                        .extension()
+                        .is_some_and(|extension| extension == "rs")
+                },
+                REVISION_TREE_ENTRIES_MAX,
+            )
             .expect("filtered listing")
             .iter()
             .map(|file| file.path().to_owned())
@@ -547,23 +558,29 @@ mod tests {
         let directory = repository_fixture();
         let repository = Repository::open(directory.path()).expect("repository");
         let head = repository.resolve("main").expect("head resolves");
-        fs::write(directory.path().join("uncommitted.rs"), "pub fn later() {}\n")
-            .expect("uncommitted source");
+        fs::write(
+            directory.path().join("uncommitted.rs"),
+            "pub fn later() {}\n",
+        )
+        .expect("uncommitted source");
         let listed: Vec<String> = repository
             .tree_files(&head, &admit_all, REVISION_TREE_ENTRIES_MAX)
             .expect("listing")
             .iter()
             .map(|file| file.path().to_owned())
             .collect();
-        assert_eq!(listed, ["lib.rs"], "an uncommitted file is not in the revision");
+        assert_eq!(
+            listed,
+            ["lib.rs"],
+            "an uncommitted file is not in the revision"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn test_tree_files_skips_symbolic_links() {
         let directory = repository_fixture();
-        std::os::unix::fs::symlink("lib.rs", directory.path().join("alias.rs"))
-            .expect("symlink");
+        std::os::unix::fs::symlink("lib.rs", directory.path().join("alias.rs")).expect("symlink");
         commit_all(directory.path(), "add symlink");
         let repository = Repository::open(directory.path()).expect("repository");
         let head = repository.resolve("HEAD").expect("head resolves");
@@ -649,6 +666,9 @@ mod tests {
         init(directory.path());
         let repository = Repository::open(directory.path()).expect("repository");
         let error = repository.resolve("HEAD").expect_err("unborn branch");
-        assert!(matches!(error.fault(), HistoryFault::RevisionUnknown { .. }));
+        assert!(matches!(
+            error.fault(),
+            HistoryFault::RevisionUnknown { .. }
+        ));
     }
 }

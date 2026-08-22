@@ -242,7 +242,10 @@ pub(crate) fn index_error(violation: WorkspaceIndexViolation) -> WorkspaceIndexE
     })
 }
 
-pub(crate) fn index_error_at(violation: WorkspaceIndexViolation, path: &Path) -> WorkspaceIndexError {
+pub(crate) fn index_error_at(
+    violation: WorkspaceIndexViolation,
+    path: &Path,
+) -> WorkspaceIndexError {
     Error::new(WorkspaceIndexFault {
         violation,
         path: Some(path.to_path_buf()),
@@ -794,7 +797,11 @@ pub(crate) fn admitted_file(
         ));
     }
     let source = String::from_utf8(bytes).map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::InvalidSource, Some(context_path), error)
+        index_error_caused_by(
+            WorkspaceIndexViolation::InvalidSource,
+            Some(context_path),
+            error,
+        )
     })?;
     let syntax = parser
         .analyze(RustSource {
