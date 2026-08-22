@@ -49,7 +49,7 @@ const ERROR_CAUSES_MAX: usize = 8;
 const INDEX_INVALIDATIONS_MAX: usize = 1;
 /// Delay collecting one bounded filesystem-event batch.
 const INDEX_DEBOUNCE: Duration = Duration::from_millis(50);
-/// Deadline for one request to obtain a coherent current snapshot.
+/// Deadline for one request to obtain a validated current snapshot.
 const INDEX_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Deadline for joining the index supervisor during shutdown.
 const INDEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -159,7 +159,7 @@ pub struct RiftMcp {
     root: PathBuf,
     limits: WorkspaceIndexLimits,
     published: Arc<RwLock<IndexState>>,
-    coherence: Arc<IndexCoherence>,
+    validation: Arc<IndexValidation>,
     changes: Arc<ChangeService>,
     change_lane: Arc<ChangeLane>,
     blocking: BlockingExecutor,
@@ -168,7 +168,7 @@ pub struct RiftMcp {
 
 impl Drop for RiftMcp {
     fn drop(&mut self) {
-        self.coherence.cancellation.cancel();
+        self.validation.cancellation.cancel();
     }
 }
 
@@ -190,7 +190,7 @@ struct IndexState {
 }
 
 impl IndexState {
-    /// Clones one coherent publication and its latest failure.
+    /// Clones one validated publication and its latest failure.
     fn snapshot(&self) -> (Arc<PublishedWorkspace>, Option<(u64, Arc<ReadError>)>) {
         (Arc::clone(&self.current), self.failure.clone())
     }
@@ -217,7 +217,7 @@ impl IndexState {
 
 /// Filesystem observation and supervisor ownership shared with handlers.
 #[derive(Debug)]
-struct IndexCoherence {
+struct IndexValidation {
     observed_epoch: Arc<AtomicU64>,
     watch_failed: Arc<AtomicBool>,
     invalidations: mpsc::Sender<()>,
@@ -231,7 +231,7 @@ struct IndexCoherence {
 /// Owned shutdown handle for the workspace index supervisor.
 #[derive(Debug, Clone)]
 pub(crate) struct IndexSupervisor {
-    coherence: Arc<IndexCoherence>,
+    validation: Arc<IndexValidation>,
 }
 
 /// Rebuild dependencies owned by index supervisor task.
@@ -240,7 +240,7 @@ struct IndexSupervisorContext {
     limits: WorkspaceIndexLimits,
     published: Arc<RwLock<IndexState>>,
     change_lane: Arc<ChangeLane>,
-    coherence: Arc<IndexCoherence>,
+    validation: Arc<IndexValidation>,
     blocking: BlockingExecutor,
 }
 
@@ -329,7 +329,7 @@ fn configuration_fingerprint(root: &Path) -> ConfigurationFingerprint {
     ConfigurationFingerprint::Content(Sha256::digest(raw).into())
 }
 
-impl IndexCoherence {
+impl IndexValidation {
     /// Creates one bounded invalidation stream and its receiver.
     fn new() -> (Arc<Self>, mpsc::Receiver<()>) {
         let (invalidations, receiver) = mpsc::channel(INDEX_INVALIDATIONS_MAX);
@@ -469,7 +469,7 @@ impl IndexCoherence {
     }
 }
 
-impl Drop for IndexCoherence {
+impl Drop for IndexValidation {
     fn drop(&mut self) {
         self.cancellation.cancel();
     }
@@ -487,8 +487,8 @@ impl IndexSupervisor {
     /// Cancellation is requested before the join begins. Dropping this future
     /// after it takes task ownership detaches that terminating task.
     pub(crate) async fn shutdown(&self) -> Result<(), ReadError> {
-        self.coherence.cancellation.cancel();
-        let Some(mut task) = self.coherence.task.lock().await.take() else {
+        self.validation.cancellation.cancel();
+        let Some(mut task) = self.validation.task.lock().await.take() else {
             return Ok(());
         };
         if let Ok(result) = tokio::time::timeout(INDEX_SHUTDOWN_TIMEOUT, &mut task).await {
@@ -507,15 +507,15 @@ impl IndexSupervisor {
 /// Creates one native watcher rooted before the initial index scan.
 fn workspace_watcher(
     root: &Path,
-    coherence: &Arc<IndexCoherence>,
+    validation: &Arc<IndexValidation>,
 ) -> Result<notify::RecommendedWatcher, ReadError> {
     let watched_root = std::fs::canonicalize(root)
         .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     let event_root = watched_root.clone();
-    let coherence = Arc::clone(coherence);
+    let validation = Arc::clone(validation);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         if let Ok(event) = result {
-            if coherence.observe_event(&event_root, &event).is_err() {
+            if validation.observe_event(&event_root, &event).is_err() {
                 tracing::error!(
                     component = "index",
                     operation = "watch.observe",
@@ -523,7 +523,7 @@ fn workspace_watcher(
                 );
             }
         } else {
-            let _ = coherence.observe_watch_failure();
+            let _ = validation.observe_watch_failure();
             tracing::warn!(
                 component = "index",
                 operation = "watch.receive",
@@ -539,7 +539,7 @@ fn workspace_watcher(
 }
 
 /// Whether one native event can change visible Rust source or its policy.
-fn relevant_watch_event(root: &Path, coherence: &IndexCoherence, event: &Event) -> bool {
+fn relevant_watch_event(root: &Path, validation: &IndexValidation, event: &Event) -> bool {
     if matches!(event.kind, EventKind::Access(_)) {
         return false;
     }
@@ -547,7 +547,7 @@ fn relevant_watch_event(root: &Path, coherence: &IndexCoherence, event: &Event) 
         .paths
         .iter()
         .filter(|path| hard_floor_admits_watch_path(root, path))
-        .any(|path| watch_kind_reaches_path(root, coherence, event.kind, path))
+        .any(|path| watch_kind_reaches_path(root, validation, event.kind, path))
 }
 
 /// Rejects paths below Rift's hard-floor directories.
@@ -566,23 +566,23 @@ fn hard_floor_admits_watch_path(root: &Path, path: &Path) -> bool {
 /// Applies event-kind filtering without trusting editor-specific event shapes.
 fn watch_kind_reaches_path(
     root: &Path,
-    coherence: &IndexCoherence,
+    validation: &IndexValidation,
     kind: EventKind,
     path: &Path,
 ) -> bool {
-    let workspace_configuration = coherence.workspace_configuration_is_relevant(root, path);
+    let workspace_configuration = validation.workspace_configuration_is_relevant(root, path);
     let gitignore = path.file_name() == Some(std::ffi::OsStr::new(".gitignore"))
         && path
             .parent()
-            .is_some_and(|parent| coherence.source_directory_is_relevant(parent));
+            .is_some_and(|parent| validation.source_directory_is_relevant(parent));
     let policy_file = workspace_configuration || gitignore;
-    let source_file = coherence.source_path_is_relevant(path);
+    let source_file = validation.source_path_is_relevant(path);
     let directory_event = matches!(
         kind,
         EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
-    ) && coherence.source_directory_is_relevant(path);
+    ) && validation.source_directory_is_relevant(path);
     let possible_directory =
-        path.extension().is_none() && coherence.source_directory_is_relevant(path);
+        path.extension().is_none() && validation.source_directory_is_relevant(path);
     match kind {
         EventKind::Create(_) | EventKind::Remove(_) => {
             policy_file || source_file || directory_event
@@ -599,11 +599,11 @@ fn watch_kind_reaches_path(
 async fn initial_workspace(
     root: &Path,
     limits: WorkspaceIndexLimits,
-    coherence: &IndexCoherence,
+    validation: &IndexValidation,
     blocking: &BlockingExecutor,
 ) -> Result<Arc<PublishedWorkspace>, ReadError> {
     for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
-        let epoch = coherence.observed_epoch();
+        let epoch = validation.observed_epoch();
         let build_root = root.to_path_buf();
         let span = tracing::info_span!(
             "index.build",
@@ -621,19 +621,20 @@ async fn initial_workspace(
         let WorkspaceCandidate::Stable(built) = built else {
             continue;
         };
-        let stable_epoch = coherence.observed_epoch() == epoch;
-        let watch_healthy = !coherence.watch_failed.load(Ordering::Acquire);
+        let stable_epoch = validation.observed_epoch() == epoch;
+        let watch_healthy = !validation.watch_failed.load(Ordering::Acquire);
         if stable_epoch && watch_healthy {
-            let publication = coherence
+            let publication = validation
                 .publication_lane
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if coherence.observed_epoch() != epoch || coherence.watch_failed.load(Ordering::Acquire)
+            if validation.observed_epoch() != epoch
+                || validation.watch_failed.load(Ordering::Acquire)
             {
                 drop(publication);
                 continue;
             }
-            coherence.replace_source_policy_locked(Arc::clone(&built.source_policy));
+            validation.replace_source_policy_locked(Arc::clone(&built.source_policy));
             drop(publication);
             tracing::info!(
                 component = "index",
@@ -702,22 +703,22 @@ async fn run_index_supervisor(
         limits,
         published,
         change_lane,
-        coherence,
+        validation,
         blocking,
     } = context;
     loop {
         let received = tokio::select! {
-            () = coherence.cancellation.cancelled() => false,
+            () = validation.cancellation.cancelled() => false,
             received = invalidations.recv() => received.is_some(),
         };
         if !received {
             return;
         }
         tokio::select! {
-            () = coherence.cancellation.cancelled() => return,
+            () = validation.cancellation.cancelled() => return,
             () = tokio::time::sleep(INDEX_DEBOUNCE) => {}
         }
-        let epoch = coherence.observed_epoch();
+        let epoch = validation.observed_epoch();
         tracing::debug!(
             component = "index",
             operation = "watch.batch",
@@ -729,7 +730,7 @@ async fn run_index_supervisor(
             limits,
             Arc::clone(&published),
             Arc::clone(&change_lane),
-            Arc::clone(&coherence),
+            Arc::clone(&validation),
             blocking.clone(),
             epoch,
         )
@@ -749,21 +750,21 @@ async fn run_index_supervisor(
                 "index rebuild failed"
             );
             let failed_state = Arc::clone(&published);
-            let failed_coherence = Arc::clone(&coherence);
+            let failed_validation = Arc::clone(&validation);
             let recorded = blocking
                 .run("index failure publication", move || {
                     Ok(record_rebuild_failure(
                         &failed_state,
-                        &failed_coherence,
+                        &failed_validation,
                         epoch,
                         error,
                     ))
                 })
                 .await;
             if recorded.is_err() {
-                let _ = coherence.observe_watch_failure();
+                let _ = validation.observe_watch_failure();
             }
-            coherence.changed.notify_waiters();
+            validation.changed.notify_waiters();
         }
     }
 }
@@ -774,13 +775,13 @@ async fn rebuild_workspace(
     limits: WorkspaceIndexLimits,
     published: Arc<RwLock<IndexState>>,
     change_lane: Arc<ChangeLane>,
-    coherence: Arc<IndexCoherence>,
+    validation: Arc<IndexValidation>,
     blocking: BlockingExecutor,
     epoch: u64,
 ) -> Result<RebuildOutcome, ReadError> {
     blocking
         .run("filesystem index rebuild", move || {
-            rebuild_workspace_blocking(&root, limits, &published, &change_lane, &coherence, epoch)
+            rebuild_workspace_blocking(&root, limits, &published, &change_lane, &validation, epoch)
         })
         .await
 }
@@ -791,10 +792,10 @@ fn rebuild_workspace_blocking(
     limits: WorkspaceIndexLimits,
     published: &RwLock<IndexState>,
     change_lane: &ChangeLane,
-    coherence: &IndexCoherence,
+    validation: &IndexValidation,
     epoch: u64,
 ) -> Result<RebuildOutcome, ReadError> {
-    change_lane.run(|| rebuild_workspace_serialized(root, limits, published, coherence, epoch))
+    change_lane.run(|| rebuild_workspace_serialized(root, limits, published, validation, epoch))
 }
 
 /// Rebuilds workspace while mutation lane is held.
@@ -802,65 +803,65 @@ fn rebuild_workspace_serialized(
     root: &Path,
     limits: WorkspaceIndexLimits,
     published: &RwLock<IndexState>,
-    coherence: &IndexCoherence,
+    validation: &IndexValidation,
     epoch: u64,
 ) -> Result<RebuildOutcome, ReadError> {
-    if !admit_rebuild(coherence, epoch)? {
+    if !admit_rebuild(validation, epoch)? {
         return Ok(RebuildOutcome::Superseded);
     }
     let candidate = build_workspace_candidate(root, limits, epoch)?;
     let WorkspaceCandidate::Stable(candidate) = candidate else {
-        let _ = coherence.observe();
+        let _ = validation.observe();
         return Ok(RebuildOutcome::Superseded);
     };
-    let outcome = publish_rebuild(published, coherence, candidate);
+    let outcome = publish_rebuild(published, validation, candidate);
     if outcome == RebuildOutcome::Published {
         trace_publication(epoch);
-        coherence.changed.notify_waiters();
+        validation.changed.notify_waiters();
     }
     Ok(outcome)
 }
 
 /// Refuses rebuild when watcher failed or candidate epoch already moved.
-fn admit_rebuild(coherence: &IndexCoherence, epoch: u64) -> Result<bool, ReadError> {
-    if coherence.watch_failed.load(Ordering::Acquire) {
+fn admit_rebuild(validation: &IndexValidation, epoch: u64) -> Result<bool, ReadError> {
+    if validation.watch_failed.load(Ordering::Acquire) {
         return Err(ReadFault::unavailable(
             "filesystem index rebuild",
             "filesystem watcher failed",
         ));
     }
-    Ok(coherence.observed_epoch() == epoch)
+    Ok(validation.observed_epoch() == epoch)
 }
 
 /// Atomically publishes candidate when observation still matches.
 fn publish_rebuild(
     published: &RwLock<IndexState>,
-    coherence: &IndexCoherence,
+    validation: &IndexValidation,
     candidate: Arc<PublishedWorkspace>,
 ) -> RebuildOutcome {
-    publish_rebuild_after(published, coherence, candidate, || {})
+    publish_rebuild_after(published, validation, candidate, || {})
 }
 
 /// Publishes under observation lane; hook enables deterministic overlap tests.
 fn publish_rebuild_after(
     published: &RwLock<IndexState>,
-    coherence: &IndexCoherence,
+    validation: &IndexValidation,
     candidate: Arc<PublishedWorkspace>,
     after_state_lock: impl FnOnce(),
 ) -> RebuildOutcome {
-    let publication = coherence
+    let publication = validation
         .publication_lane
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut state = published.blocking_write();
     after_state_lock();
-    let observed_epoch = coherence.observed_epoch();
+    let observed_epoch = validation.observed_epoch();
     if candidate.epoch != observed_epoch {
         drop(state);
         drop(publication);
         return RebuildOutcome::Superseded;
     }
-    coherence.replace_source_policy_locked(Arc::clone(&candidate.source_policy));
+    validation.replace_source_policy_locked(Arc::clone(&candidate.source_policy));
     let published = state.publish(candidate, observed_epoch);
     drop(state);
     drop(publication);
@@ -874,15 +875,15 @@ fn publish_rebuild_after(
 /// Records failure under same observation linearization as publication.
 fn record_rebuild_failure(
     published: &RwLock<IndexState>,
-    coherence: &IndexCoherence,
+    validation: &IndexValidation,
     epoch: u64,
     error: ReadError,
 ) -> bool {
-    let publication = coherence
+    let publication = validation
         .publication_lane
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let observed_epoch = coherence.observed_epoch();
+    let observed_epoch = validation.observed_epoch();
     let recorded = published
         .blocking_write()
         .record_failure(epoch, observed_epoch, error);
@@ -927,12 +928,12 @@ impl RiftMcp {
                 .map_err(|error| ReadFault::task("configuration admission", error.to_string()))?;
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
-        let (coherence, invalidations) = IndexCoherence::new();
+        let (validation, invalidations) = IndexValidation::new();
         let watch_root = root.clone();
-        let watch_coherence = Arc::clone(&coherence);
+        let watch_validation = Arc::clone(&validation);
         let watcher = blocking
             .run("workspace watch setup", move || {
-                workspace_watcher(&watch_root, &watch_coherence)
+                workspace_watcher(&watch_root, &watch_validation)
             })
             .instrument(tracing::info_span!(
                 "index.watch",
@@ -940,7 +941,7 @@ impl RiftMcp {
                 operation = "watch.setup"
             ))
             .await?;
-        let published = initial_workspace(&root, limits, &coherence, &blocking).await?;
+        let published = initial_workspace(&root, limits, &validation, &blocking).await?;
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
             failure: None,
@@ -954,18 +955,18 @@ impl RiftMcp {
                 limits,
                 published: Arc::clone(&published),
                 change_lane: Arc::clone(&change_lane),
-                coherence: Arc::clone(&coherence),
+                validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
             },
         ));
-        let mut task = coherence.task.lock().await;
+        let mut task = validation.task.lock().await;
         *task = Some(supervisor_task);
         drop(task);
         Ok(Self {
             root: root.clone(),
             limits,
             published,
-            coherence,
+            validation,
             changes: Arc::new(ChangeService::new(&root)),
             change_lane,
             blocking,
@@ -976,7 +977,7 @@ impl RiftMcp {
     /// Returns owned supervisor shutdown access for transport adapters.
     pub(crate) fn index_supervisor(&self) -> IndexSupervisor {
         IndexSupervisor {
-            coherence: Arc::clone(&self.coherence),
+            validation: Arc::clone(&self.validation),
         }
     }
 
@@ -1159,18 +1160,18 @@ impl RiftMcp {
             let (fingerprint, configuration_fingerprint) = match capture {
                 Ok(capture) => capture,
                 Err(error) => {
-                    let _ = self.coherence.observe();
+                    let _ = self.validation.observe();
                     return Err(error.tool_error(phase));
                 }
             };
             let configuration_matches =
                 current.configuration.fingerprint == configuration_fingerprint;
-            let epoch_matches = current.epoch == self.coherence.observed_epoch();
+            let epoch_matches = current.epoch == self.validation.observed_epoch();
             if fingerprint == current.fingerprint && configuration_matches && epoch_matches {
                 current.configuration.admitted(phase)?;
                 return Ok(current);
             }
-            self.coherence
+            self.validation
                 .observe()
                 .map_err(|error| error.tool_error(phase))?;
         }
@@ -1187,14 +1188,14 @@ impl RiftMcp {
         phase: wire::ErrorPhase,
     ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
         loop {
-            let changed = self.coherence.changed.notified();
+            let changed = self.validation.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let observed_epoch = self.coherence.observed_epoch();
+            let observed_epoch = self.validation.observed_epoch();
             let state = self.published.read().await;
             let (current, failure) = state.snapshot();
             drop(state);
-            if self.coherence.watch_failed.load(Ordering::Acquire) {
+            if self.validation.watch_failed.load(Ordering::Acquire) {
                 return Err(ReadFault::unavailable(
                     "current workspace read",
                     "filesystem watcher failed",
@@ -1238,14 +1239,19 @@ impl RiftMcp {
         let root = self.root.clone();
         let limits = self.limits;
         let published = Arc::clone(&self.published);
-        let coherence = Arc::clone(&self.coherence);
+        let validation = Arc::clone(&self.validation);
         let changes = Arc::clone(&self.changes);
         let change_lane = Arc::clone(&self.change_lane);
         self.blocking
             .run("workspace change", move || {
                 change_lane.run(|| {
                     Self::change_serialized(
-                        &root, limits, &published, &coherence, &changes, operation,
+                        &root,
+                        limits,
+                        &published,
+                        &validation,
+                        &changes,
+                        operation,
                     )
                 })
             })
@@ -1253,19 +1259,19 @@ impl RiftMcp {
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?
     }
 
-    /// Runs one already-serialized change through coherent publication.
+    /// Runs one already-serialized change through validated publication.
     fn change_serialized(
         root: &Path,
         limits: WorkspaceIndexLimits,
         published: &RwLock<IndexState>,
-        coherence: &IndexCoherence,
+        validation: &IndexValidation,
         changes: &ChangeService,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
     ) -> Result<Result<Json<ChangeResult>, ErrorData>, ReadError> {
         let state = published.blocking_read();
         let (current, _) = state.snapshot();
         drop(state);
-        if current.epoch != coherence.observed_epoch() {
+        if current.epoch != validation.observed_epoch() {
             return Ok(Err(ReadFault::unavailable(
                 "workspace change",
                 "index changed before operation admission",
@@ -1278,7 +1284,7 @@ impl RiftMcp {
         };
         let mut result = operation(&current.reads, changes)?;
         if let ChangeResult::Applied { summary } = &mut result {
-            let epoch = match coherence.observe() {
+            let epoch = match validation.observe() {
                 Ok(epoch) => epoch,
                 Err(error) => {
                     summary.diagnostics.push(stale_snapshot_diagnostic(&error));
@@ -1304,7 +1310,7 @@ impl RiftMcp {
                             "workspace change",
                             "configuration changed during snapshot rebuild",
                         );
-                        let _ = coherence.observe();
+                        let _ = validation.observe();
                         summary.diagnostics.push(stale_snapshot_diagnostic(&error));
                         return Ok(Ok(Json(result)));
                     }
@@ -1315,7 +1321,7 @@ impl RiftMcp {
                         source_policy,
                         epoch,
                     });
-                    if publish_rebuild(published, coherence, next) == RebuildOutcome::Published {
+                    if publish_rebuild(published, validation, next) == RebuildOutcome::Published {
                         tracing::info!(
                             component = "index",
                             operation = "index.publish",
@@ -1323,7 +1329,7 @@ impl RiftMcp {
                             epoch,
                             "index snapshot published"
                         );
-                        coherence.changed.notify_waiters();
+                        validation.changed.notify_waiters();
                     }
                 }
                 Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
@@ -1557,10 +1563,10 @@ mod tests {
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
 
     use super::{
-        BlockingExecutor, ChangeLane, ConfigurationFingerprint, ConfigurationState, IndexCoherence,
-        IndexState, Parameters, PublishedWorkspace, RebuildOutcome, RiftMcp, WorkspaceCandidate,
-        build_workspace_candidate, publish_rebuild, publish_rebuild_after, record_rebuild_failure,
-        relevant_watch_event,
+        BlockingExecutor, ChangeLane, ConfigurationFingerprint, ConfigurationState, IndexState,
+        IndexValidation, Parameters, PublishedWorkspace, RebuildOutcome, RiftMcp,
+        WorkspaceCandidate, build_workspace_candidate, publish_rebuild, publish_rebuild_after,
+        record_rebuild_failure, relevant_watch_event,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1649,15 +1655,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn parallel_observations_are_monotonic_and_coalesce_one_signal() -> TestResult {
         const OBSERVATIONS: usize = 32;
-        let (coherence, mut invalidations) = IndexCoherence::new();
+        let (validation, mut invalidations) = IndexValidation::new();
         let barrier = Arc::new(AsyncBarrier::new(OBSERVATIONS + 1));
         let mut tasks = Vec::with_capacity(OBSERVATIONS);
         for _ in 0..OBSERVATIONS {
-            let coherence = Arc::clone(&coherence);
+            let validation = Arc::clone(&validation);
             let barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                coherence.observe().map_err(|error| error.to_string())
+                validation.observe().map_err(|error| error.to_string())
             }));
         }
         barrier.wait().await;
@@ -1677,17 +1683,17 @@ mod tests {
 
     #[test]
     fn observation_refuses_closed_channel_and_exhausted_epoch() {
-        let (closed, receiver) = IndexCoherence::new();
+        let (closed, receiver) = IndexValidation::new();
         drop(receiver);
         assert!(closed.observe().is_err());
         assert!(closed.watch_failed.load(Ordering::Acquire));
 
-        let (exhausted, _receiver) = IndexCoherence::new();
+        let (exhausted, _receiver) = IndexValidation::new();
         exhausted.observed_epoch.store(u64::MAX, Ordering::Release);
         assert!(exhausted.observe().is_err());
         assert!(exhausted.watch_failed.load(Ordering::Acquire));
 
-        let (failed, _receiver) = IndexCoherence::new();
+        let (failed, _receiver) = IndexValidation::new();
         assert_eq!(failed.observe_watch_failure().expect("failure epoch"), 1);
         assert!(failed.watch_failed.load(Ordering::Acquire));
     }
@@ -1711,63 +1717,63 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &visibility,
         )?;
-        let (coherence, _invalidations) = IndexCoherence::new();
-        coherence.install_source_policy(Arc::new(policy));
+        let (validation, _invalidations) = IndexValidation::new();
+        validation.install_source_policy(Arc::new(policy));
         let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
 
         assert!(relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Modify(ModifyKind::Any), "src/lib.rs")
         ));
         assert!(!relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Modify(ModifyKind::Any), "src/generated/code.rs")
         ));
         assert!(!relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Modify(ModifyKind::Any), "src/ignored.rs")
         ));
         assert!(relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Remove(RemoveKind::Folder), "src")
         ));
         assert!(!relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Create(CreateKind::Folder), "examples")
         ));
         assert!(!relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Remove(RemoveKind::Folder), "src/generated")
         ));
         assert!(relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Modify(ModifyKind::Any), ".gitignore")
         ));
         assert!(!relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Modify(ModifyKind::Any), "examples/.gitignore")
         ));
         assert!(!relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Modify(ModifyKind::Any), "src/rift.toml")
         ));
         assert!(!relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Modify(ModifyKind::Any), "target/.gitignore")
         ));
         assert!(relevant_watch_event(
             &watched_root,
-            &coherence,
+            &validation,
             &event(EventKind::Modify(ModifyKind::Any), "rift.toml")
         ));
         Ok(())
@@ -1798,7 +1804,7 @@ mod tests {
         before: Arc<super::PublishedWorkspace>,
         after: Arc<super::PublishedWorkspace>,
         state: Arc<RwLock<IndexState>>,
-        coherence: Arc<IndexCoherence>,
+        validation: Arc<IndexValidation>,
         _invalidations: tokio::sync::mpsc::Receiver<()>,
     }
 
@@ -1814,21 +1820,21 @@ mod tests {
             current: Arc::clone(&before),
             failure: None,
         }));
-        let (coherence, invalidations) = IndexCoherence::new();
-        coherence.install_source_policy(Arc::clone(&before.source_policy));
+        let (validation, invalidations) = IndexValidation::new();
+        validation.install_source_policy(Arc::clone(&before.source_policy));
         fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
         fs::write(
             directory.path().join("rift.toml"),
             "[source]\nrespect_gitignore = false\n",
         )?;
-        let epoch = coherence.observe()?;
+        let epoch = validation.observe()?;
         let after = stable_candidate(directory.path(), epoch)?;
         Ok(PublicationFixture {
             _directory: directory,
             before,
             after,
             state,
-            coherence,
+            validation,
             _invalidations: invalidations,
         })
     }
@@ -1884,7 +1890,7 @@ mod tests {
         assert_workspace_identity(&state.current, &fixture.after);
         drop(state);
         let policy = fixture
-            .coherence
+            .validation
             .source_policy
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1904,14 +1910,14 @@ mod tests {
         let publication_locked = Arc::new(ThreadBarrier::new(2));
         let publication_released = Arc::new(ThreadBarrier::new(2));
         let publisher_state = Arc::clone(&fixture.state);
-        let publisher_coherence = Arc::clone(&fixture.coherence);
+        let publisher_validation = Arc::clone(&fixture.validation);
         let published_candidate = Arc::clone(&fixture.after);
         let locked = Arc::clone(&publication_locked);
         let released = Arc::clone(&publication_released);
         let publisher = std::thread::spawn(move || {
             publish_rebuild_after(
                 &publisher_state,
-                &publisher_coherence,
+                &publisher_validation,
                 published_candidate,
                 || {
                     locked.wait();
@@ -1925,11 +1931,11 @@ mod tests {
             spawn_blocked_snapshot_readers(&fixture.state, &fixture.after, READERS);
         blocked_readers_ready.wait();
         let observation_started = Arc::new(ThreadBarrier::new(2));
-        let observer_coherence = Arc::clone(&fixture.coherence);
+        let observer_validation = Arc::clone(&fixture.validation);
         let observer_started = Arc::clone(&observation_started);
         let observer = std::thread::spawn(move || {
             observer_started.wait();
-            observer_coherence.observe()
+            observer_validation.observe()
         });
         observation_started.wait();
         publication_released.wait();
@@ -1942,7 +1948,7 @@ mod tests {
             reader.join().expect("reader thread must not panic");
         }
         assert_published_fixture(&fixture);
-        assert_eq!(fixture.coherence.observed_epoch(), 2);
+        assert_eq!(fixture.validation.observed_epoch(), 2);
         Ok(())
     }
 
@@ -1972,18 +1978,18 @@ mod tests {
             current: Arc::clone(&before),
             failure: None,
         });
-        let (coherence, _invalidations) = IndexCoherence::new();
-        coherence.install_source_policy(Arc::clone(&before.source_policy));
-        assert_eq!(coherence.observe()?, 1);
-        assert_eq!(coherence.observe()?, 2);
+        let (validation, _invalidations) = IndexValidation::new();
+        validation.install_source_policy(Arc::clone(&before.source_policy));
+        assert_eq!(validation.observe()?, 1);
+        assert_eq!(validation.observe()?, 2);
         assert_eq!(
-            publish_rebuild(&state, &coherence, Arc::clone(&after)),
+            publish_rebuild(&state, &validation, Arc::clone(&after)),
             RebuildOutcome::Superseded
         );
         let state_snapshot = state.blocking_read();
         assert_workspace_identity(&state_snapshot.current, &before);
         drop(state_snapshot);
-        let source_policy = coherence
+        let source_policy = validation
             .source_policy
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1996,7 +2002,7 @@ mod tests {
         drop(source_policy);
         assert!(!record_rebuild_failure(
             &state,
-            &coherence,
+            &validation,
             1,
             ReadFault::unavailable("test rebuild", "superseded failure")
         ));
@@ -2134,10 +2140,10 @@ mod tests {
         let (_directory, server) = fixture().await?;
         let supervisor = server.index_supervisor();
         drop(server);
-        assert!(supervisor.coherence.cancellation.is_cancelled());
+        assert!(supervisor.validation.cancellation.is_cancelled());
         supervisor.shutdown().await?;
         supervisor.shutdown().await?;
-        assert!(supervisor.coherence.task.lock().await.is_none());
+        assert!(supervisor.validation.task.lock().await.is_none());
         Ok(())
     }
 
@@ -2436,7 +2442,7 @@ mod tests {
             }),
             failure: None,
         });
-        let (coherence, _invalidations) = IndexCoherence::new();
+        let (validation, _invalidations) = IndexValidation::new();
         let changes = ChangeService::new(directory.path());
         let operation_called = AtomicBool::new(false);
 
@@ -2444,7 +2450,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &published,
-            &coherence,
+            &validation,
             &changes,
             |_, _| {
                 operation_called.store(true, Ordering::SeqCst);
