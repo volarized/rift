@@ -526,6 +526,12 @@ pub struct SearchResult {
     pub next_cursor: Option<Cursor>,
 }
 
+/// Default `max_hops` for a search traversal: one hop, because a second hop can multiply weak
+/// edges.
+pub const SEARCH_TRAVERSAL_HOPS_DEFAULT: u64 = 1;
+/// Default `max_nodes` for a search traversal.
+pub const SEARCH_TRAVERSAL_NODES_DEFAULT: u64 = 25;
+
 /// A bounded relationship walk starting at one symbol. The server visits at most
 /// `max_nodes` symbols outside `seed` and expands no path beyond `max_hops`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -558,11 +564,11 @@ pub struct SearchTraversal {
 }
 
 fn default_search_traversal_max_hops() -> u64 {
-    1
+    SEARCH_TRAVERSAL_HOPS_DEFAULT
 }
 
 fn default_search_traversal_max_nodes() -> u64 {
-    25
+    SEARCH_TRAVERSAL_NODES_DEFAULT
 }
 
 /// Which edge direction the server walks from each visited symbol.
@@ -581,7 +587,10 @@ pub enum TraversalDirection {
 
 #[cfg(test)]
 mod tests {
-    use super::{PathPattern, PathPatternViolation};
+    use super::{
+        PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_HOPS_DEFAULT,
+        SEARCH_TRAVERSAL_NODES_DEFAULT, SearchTraversal,
+    };
     use serde_json::json;
 
     #[test]
@@ -625,5 +634,22 @@ mod tests {
                 "violation={violation:?}"
             );
         }
+    }
+
+    /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
+    /// from the schema; this pins the advertised default to the constant the field's default
+    /// function returns.
+    #[test]
+    fn search_traversal_schema_defaults_equal_the_enforced_constants() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchTraversal)).expect("schema");
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["max_hops"]["default"],
+            json!(SEARCH_TRAVERSAL_HOPS_DEFAULT)
+        );
+        assert_eq!(
+            properties["max_nodes"]["default"],
+            json!(SEARCH_TRAVERSAL_NODES_DEFAULT)
+        );
     }
 }
