@@ -54,12 +54,19 @@ pub const READ_RESULTS_MAX_DEFAULT: usize = 1_000;
 pub const WORKSPACE_IGNORED_DIRECTORIES: &[&str] = &[".git", ".rift", "target"];
 /// Default maximum results returned by one search call.
 pub const SEARCH_RESULTS_DEFAULT: usize = 20;
+/// Maximum files one search's `paths.force_include` may pull into the index on demand.
+pub const FORCE_INCLUDE_FILES_MAX: usize = 256;
 /// Canonical identity of the built-in Rust read provider.
 pub const RUST_READ_PROVIDER_ID: &str = "rift.rust.read";
 /// Hexadecimal characters in one SHA-256 digest.
 pub const SHA256_HEX_LENGTH: usize = 64;
-/// Base32 characters kept from one SHA-256 digest in a source-unit identity.
-pub const SOURCE_UNIT_DIGEST_CHARS: usize = 26;
+/// Hexadecimal characters kept from a SHA-256 digest on the wire. Full-length
+/// hashing stays internal to identity computation; a wire `Digest` truncates
+/// to this width at the boundary.
+pub const DIGEST_WIRE_CHARS: usize = 8;
+/// Base32 characters kept from a SHA-256 digest minting an opaque `chg_`- or
+/// `prj_`-style identity.
+pub const OPAQUE_ID_DIGEST_CHARS: usize = 26;
 /// GitHub API endpoint naming the latest official Rift release.
 pub const RELEASE_API_URL: &str = "https://api.github.com/repos/volarized/rift/releases/latest";
 /// Base URL below which official Rift release assets are downloaded.

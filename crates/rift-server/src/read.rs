@@ -4,22 +4,18 @@ use std::path::Path;
 use data_encoding::BASE32_NOPAD;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_core::ProjectPath as CoreProjectPath;
-use rift_core::constants::{
-    RUST_READ_PROVIDER_ID, SEARCH_RESULTS_DEFAULT, SHA256_HEX_LENGTH, SOURCE_UNIT_DIGEST_CHARS,
-};
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_PROVIDER_ID};
+use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
 use rift_index::{
-    IndexedFile, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexError,
-    WorkspaceIndexLimits,
+    IndexedFile, SymbolMatch, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
 };
 use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
-    FactFamily, File, FileContent, FileId, Freshness, GetSymbolHit, GetSymbolParams,
-    GetSymbolResult, IndexSnapshot, Language, MatchedField, Node, NodeFacet, NodeId, NodesParams,
-    NodesResult, ProviderId, ProviderOrigin, ReadSnapshot, SearchHit, SearchHitTarget,
-    SearchParams, SearchParamsTarget, SearchResult, SearchScope, SemanticCoverage, SourceExcerpt,
-    SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TextRange,
+    FactFamily, FileId, Freshness, GetSymbolHit, GetSymbolParams, GetSymbolResult, IndexSnapshot,
+    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProjectPath, ProviderId,
+    ProviderOrigin, ReadSnapshot, SearchScope, SemanticCoverage, SourceExcerpt, SourceKind,
+    SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
+    TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -134,7 +130,7 @@ impl ReadFault {
         })
     }
 
-    fn index(source: WorkspaceIndexError) -> ReadError {
+    pub(crate) fn index(source: WorkspaceIndexError) -> ReadError {
         Error::new(Self::Index(source))
     }
 }
@@ -150,23 +146,29 @@ pub struct ReadService {
 }
 
 impl ReadService {
-    /// Builds one in-memory snapshot from real workspace files.
+    /// Builds one in-memory snapshot from real workspace files, applying
+    /// `visibility`'s `.gitignore` and `[source]` policy on top of the hard
+    /// floor.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] when root cannot be indexed within bounds.
-    pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let index = WorkspaceIndex::build(root, limits).map_err(ReadFault::index)?;
-        let digest = workspace_digest(&index);
+    pub fn build(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+    ) -> Result<Self, ReadError> {
+        let index = WorkspaceIndex::build(root, limits, visibility).map_err(ReadFault::index)?;
+        let revision = wire_digest(&workspace_digest(&index));
         let snapshot = ReadSnapshot {
-            tree_revision: Digest(digest.clone()),
+            tree_revision: revision.clone(),
             index: Some(IndexSnapshot {
-                revision: Digest(digest.clone()),
-                tree_revision: Digest(digest.clone()),
+                revision: revision.clone(),
+                tree_revision: revision.clone(),
                 freshness: Freshness::Current,
-                source_revision: Digest(digest.clone()),
+                source_revision: revision.clone(),
             }),
-            source_revision: Digest(digest),
+            source_revision: revision,
         };
         Ok(Self { index, snapshot })
     }
@@ -174,6 +176,11 @@ impl ReadService {
     /// Returns the immutable workspace index this snapshot serves.
     pub(crate) const fn index(&self) -> &WorkspaceIndex {
         &self.index
+    }
+
+    /// Returns the tree and index revisions captured for this snapshot.
+    pub(crate) const fn snapshot(&self) -> &ReadSnapshot {
+        &self.snapshot
     }
 
     /// Reads Rust syntax nodes covering one UTF-8 byte position.
@@ -209,7 +216,7 @@ impl ReadService {
         Ok(NodesResult {
             nodes,
             source,
-            coverage: semantic_coverage(FactFamily::Nodes),
+            coverage: semantic_coverage(FactFamily::Nodes, &self.snapshot),
             snapshot: self.snapshot.clone(),
         })
     }
@@ -246,63 +253,16 @@ impl ReadService {
             .collect();
         Ok(GetSymbolResult {
             hits,
-            coverage: complete_coverage(),
+            coverage: complete_coverage(&self.snapshot),
             next_cursor: None,
             snapshot: self.snapshot.clone(),
-        })
-    }
-
-    /// Searches Rust declarations and source lines.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] for deferred filters, traversal, cursors, projections, or scopes.
-    pub fn search(&self, params: &SearchParams) -> Result<SearchResult, ReadError> {
-        validate_search(params)?;
-        let query = params
-            .query
-            .as_deref()
-            .ok_or_else(|| ReadFault::invalid("query", "missing"))?;
-        if query.is_empty() {
-            return Err(ReadFault::invalid("query", "empty"));
-        }
-        let limit = admitted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
-        let mut results = Vec::new();
-        if matches!(
-            params.target,
-            SearchParamsTarget::All | SearchParamsTarget::Symbol
-        ) {
-            for matched in self.index.symbols(query, limit).map_err(ReadFault::index)? {
-                results.push(symbol_search_hit(matched));
-            }
-        }
-        if results.len() < limit
-            && matches!(
-                params.target,
-                SearchParamsTarget::All | SearchParamsTarget::File
-            )
-        {
-            for (file, line, text) in self
-                .index
-                .source_matches(query, limit - results.len())
-                .map_err(ReadFault::index)?
-            {
-                results.push(file_search_hit(file, line, text));
-            }
-        }
-        results.truncate(limit);
-        Ok(SearchResult {
-            snapshot: self.snapshot.clone(),
-            coverage: complete_coverage(),
-            results,
-            next_cursor: None,
         })
     }
 }
 
 /// Admits a caller-supplied result limit: positive, and inside this
 /// platform's addressable range.
-fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
+pub(crate) fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
     if requested == 0 {
         return Err(ReadFault::invalid("limit", "zero"));
     }
@@ -310,27 +270,16 @@ fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
         .map_err(|_| ReadFault::invalid("limit", format!("{requested} exceeds this platform")))
 }
 
-fn validate_common(cursor: bool, projection: bool, scope: SearchScope) -> Result<(), ReadError> {
+pub(crate) fn validate_common(
+    cursor: bool,
+    projection: bool,
+    scope: SearchScope,
+) -> Result<(), ReadError> {
     if cursor || projection {
         return Err(ReadFault::unsupported("cursor and projection reads"));
     }
     if scope == SearchScope::Dependencies {
         return Err(ReadFault::unsupported("dependency reads"));
-    }
-    Ok(())
-}
-
-fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
-    validate_common(
-        params.cursor.is_some(),
-        params.projection.is_some(),
-        params.scope,
-    )?;
-    if params.filter.is_some() || params.paths.is_some() || params.traversal.is_some() {
-        return Err(ReadFault::unsupported("filtered and traversal search"));
-    }
-    if params.target == SearchParamsTarget::Node {
-        return Err(ReadFault::unsupported("node search"));
     }
     Ok(())
 }
@@ -374,7 +323,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
     )
 }
 
-fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
+pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
     let symbol = matched.symbol;
     Symbol {
         id: symbol_id(matched.file, symbol),
@@ -407,60 +356,7 @@ fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
     }
 }
 
-fn symbol_search_hit(matched: SymbolMatch<'_>) -> SearchHit {
-    let score = symbol_match_score(matched.rank);
-    SearchHit {
-        hit: SearchHitTarget::Symbol {
-            symbol: wire_symbol(matched),
-        },
-        score,
-        matched_by: vec![MatchedField::Name],
-        relationships: None,
-        source: Some(excerpt(matched.file, matched.symbol.range)),
-        diagnostics: None,
-        span: Some(source_span(matched.file, matched.symbol.range)),
-        line: Some(line_number(
-            matched.file.source(),
-            matched.symbol.range.start,
-        )),
-        path: None,
-        distance: None,
-    }
-}
-
-fn file_search_hit(file: &IndexedFile, line: usize, text: String) -> SearchHit {
-    let start = line_start(file.source(), line);
-    let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
-    let range = ByteRange { start, end };
-    SearchHit {
-        hit: SearchHitTarget::File {
-            file: File {
-                id: file_id(file),
-                content: FileContent::Regular {
-                    size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
-                    executable: false,
-                },
-                languages: vec![rust_language()],
-                regions: Vec::new(),
-                semantic: true,
-            },
-        },
-        score: 1.0,
-        matched_by: vec![MatchedField::Content],
-        relationships: None,
-        source: Some(SourceExcerpt {
-            span: source_span(file, range),
-            text,
-        }),
-        diagnostics: None,
-        span: Some(source_span(file, range)),
-        line: Some(u64::try_from(line).unwrap_or(u64::MAX)),
-        path: None,
-        distance: None,
-    }
-}
-
-fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
+pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
     let start = usize::try_from(range.start)
         .unwrap_or(file.source().len())
         .min(file.source().len());
@@ -488,7 +384,7 @@ fn text_range(range: ByteRange) -> TextRange {
     }
 }
 
-fn rust_language() -> Language {
+pub(crate) fn rust_language() -> Language {
     Language {
         name: "rust".to_owned(),
         dialect: None,
@@ -499,12 +395,18 @@ pub(crate) fn file_id(file: &IndexedFile) -> FileId {
     FileId(format!("rift://file/{}", encode_path(file.path().as_str())))
 }
 
+/// Mints the project resolver's source-unit identity: the resolver name, then the
+/// project-relative path as the resolver's own canonical unit key.
 pub(crate) fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
-    let digest = Sha256::digest(file.path().as_str().as_bytes());
     SourceUnitId(format!(
-        "rift://source/src_{}",
-        digest_prefix_base32(&digest)
+        "rift://source/project/{}",
+        encode_path(file.path().as_str())
     ))
+}
+
+/// Project-relative path of one indexed file, as the wire model carries it.
+pub(crate) fn project_path(file: &IndexedFile) -> ProjectPath {
+    ProjectPath(file.path().as_str().to_owned())
 }
 
 fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
@@ -540,13 +442,9 @@ fn workspace_digest(index: &WorkspaceIndex) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Renders the leading `SOURCE_UNIT_DIGEST_CHARS` base32 characters of one digest.
-///
-/// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with
-/// `O`, `I`, `B`, and `g`; source-unit identities use its lowercase form.
-/// The witness a node address carries: the first eight lowercase hex
-/// characters of the SHA-256 of the node's source bytes. Recomputing it is
-/// how resolution proves the bytes behind an address have not drifted.
+/// The witness a node address carries: the first eight lowercase hex characters of the
+/// SHA-256 of the node's source bytes. Recomputing it is how resolution proves the bytes
+/// behind an address have not drifted.
 pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
     let start = usize::try_from(range.start)
         .unwrap_or(source.len())
@@ -554,16 +452,32 @@ pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
     let end = usize::try_from(range.end)
         .unwrap_or(source.len())
         .min(source.len());
-    let fingerprint = Sha256::digest(source.get(start..end).unwrap_or_default().as_bytes());
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        fingerprint[0], fingerprint[1], fingerprint[2], fingerprint[3]
-    )
+    digest_hex8(source.get(start..end).unwrap_or_default())
 }
 
+/// First `DIGEST_WIRE_CHARS` lowercase hex characters of the SHA-256 of `source` — the sole
+/// wire constructor for a witness or a `Digest`. A 64-character digest reaching the wire is a
+/// defect this stays the single choke point against.
+pub(crate) fn digest_hex8(source: &str) -> String {
+    let fingerprint = Sha256::digest(source.as_bytes());
+    format!("{fingerprint:x}")[..DIGEST_WIRE_CHARS].to_owned()
+}
+
+/// Truncates an already-hashed full-length hex digest to its wire form. `full` keeps
+/// collision resistance for internal identity computation; only the truncated form crosses
+/// the wire boundary.
+fn wire_digest(full: &str) -> Digest {
+    Digest(full[..DIGEST_WIRE_CHARS].to_owned())
+}
+
+/// Renders the leading `OPAQUE_ID_DIGEST_CHARS` base32 characters of one digest, minting an
+/// opaque `chg_`-style identity.
+///
+/// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with `O`, `I`, `B`, and
+/// `g`; opaque identities use its lowercase form.
 pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
     let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
-    encoded.truncate(SOURCE_UNIT_DIGEST_CHARS);
+    encoded.truncate(OPAQUE_ID_DIGEST_CHARS);
     encoded
 }
 
@@ -595,8 +509,13 @@ pub(crate) fn encode_path(value: &str) -> String {
     utf8_percent_encode(value, PATH_ESCAPE_SET).to_string()
 }
 
-fn complete_coverage() -> Coverage {
-    let revision = Digest("0".repeat(SHA256_HEX_LENGTH));
+/// Complete coverage for a request served in full from `snapshot`, carrying the real
+/// revisions the answer used — never a fabricated digest.
+pub(crate) fn complete_coverage(snapshot: &ReadSnapshot) -> Coverage {
+    let revision = snapshot.index.as_ref().map_or_else(
+        || snapshot.tree_revision.clone(),
+        |index| index.revision.clone(),
+    );
     Coverage::Complete {
         state: CoverageCompleteState::Complete,
         scope: CoverageScope::Reach {
@@ -604,23 +523,29 @@ fn complete_coverage() -> Coverage {
         },
         origins: vec![ProviderOrigin {
             provider: ProviderId(RUST_READ_PROVIDER_ID.to_owned()),
-            revision: revision.clone(),
-            tree_revision: revision.clone(),
+            revision,
+            tree_revision: snapshot.tree_revision.clone(),
             freshness: Freshness::Current,
-            source_revision: revision,
+            source_revision: snapshot.source_revision.clone(),
         }],
     }
 }
 
-fn semantic_coverage(family: FactFamily) -> SemanticCoverage {
-    SemanticCoverage(BTreeMap::from([(family, complete_coverage())]))
+fn semantic_coverage(family: FactFamily, snapshot: &ReadSnapshot) -> SemanticCoverage {
+    SemanticCoverage(BTreeMap::from([(family, complete_coverage(snapshot))]))
 }
 
+/// Finds the symbol a witnessed syntax node belongs to.
+///
+/// A node's range matches a symbol's declaration range (the whole
+/// declaration, including attached docs and attributes) for most nodes, but
+/// the item node itself only spans its own bytes, so it matches on
+/// `item_range` instead.
 fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&RustSymbol> {
     file.syntax()
         .symbols()
         .iter()
-        .find(|symbol| symbol.range == range)
+        .find(|symbol| symbol.range == range || symbol.item_range == range)
 }
 
 fn node_facets(node: &RustNode) -> Vec<NodeFacet> {
@@ -679,49 +604,19 @@ fn authored_visibility(visibility: &RustVisibility) -> String {
     }
 }
 
-const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
-    match rank {
-        SymbolMatchRank::QualifiedExact => 1.0,
-        SymbolMatchRank::NameExact => 0.9,
-        SymbolMatchRank::QualifiedSuffix => 0.8,
-        SymbolMatchRank::Substring => 0.7,
-    }
-}
-
-fn line_number(source: &str, position: u64) -> u64 {
-    let end = usize::try_from(position)
-        .unwrap_or(source.len())
-        .min(source.len());
-    u64::try_from(source[..end].match_indices('\n').count() + 1).unwrap_or(u64::MAX)
-}
-
-fn line_start(source: &str, line: usize) -> u64 {
-    let mut current = 1_usize;
-    for (index, byte) in source.bytes().enumerate() {
-        if current == line {
-            return u64::try_from(index).unwrap_or(u64::MAX);
-        }
-        if byte == b'\n' {
-            current += 1;
-        }
-    }
-    u64::try_from(source.len()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
     use std::fs;
 
-    use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
-    use rift_index::SymbolMatchRank;
+    use rift_core::SourceVisibility;
     use rift_protocol::read::{
-        GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, SearchParams,
+        Digest, GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, ReadSnapshot,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{ReadFault, ReadService, WorkspaceIndexLimits, symbol_match_score};
+    use super::{ReadFault, ReadService, WorkspaceIndexLimits};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -733,7 +628,25 @@ mod tests {
             "pub struct Beacon;\nimpl Beacon { pub fn signal(&self) {} }\n",
         )?;
         fs::write(directory.path().join("README.md"), "Beacon docs")?;
-        let service = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
+        Ok((directory, service))
+    }
+
+    const DOCUMENTED_SOURCE: &str = "/// A beacon.\n#[derive(Debug)]\npub struct Beacon;\n";
+
+    fn documented_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), DOCUMENTED_SOURCE)?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         Ok((directory, service))
     }
 
@@ -775,7 +688,11 @@ pub fn compute() -> i32 {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), RICH_SOURCE)?;
-        let service = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         Ok((directory, service))
     }
 
@@ -812,8 +729,23 @@ pub fn compute() -> i32 {
         );
         assert_eq!(
             value["snapshot"]["tree_revision"].as_str().map(str::len),
-            Some(64)
+            Some(8)
         );
+        Ok(())
+    }
+
+    /// The wire `Digest` truncates to eight characters, but the internal identity computation
+    /// it truncates from keeps its full sixty-four-character SHA-256, unchanged from before
+    /// this release: freshness and any future identity comparison still work off the strong
+    /// hash, not the short wire witness.
+    #[test]
+    fn workspace_digest_keeps_its_full_hash_before_wire_truncation() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let full = super::workspace_digest(service.index());
+        assert_eq!(full.len(), 64);
+        let wire = &service.snapshot().tree_revision.0;
+        assert_eq!(wire.len(), 8);
+        assert!(full.starts_with(wire.as_str()));
         Ok(())
     }
 
@@ -836,37 +768,44 @@ pub fn compute() -> i32 {
                 .is_some_and(|id| id.contains("/Beacon"))
         );
         assert_eq!(value["hits"][0]["source"]["text"], "pub struct Beacon;");
+        assert_eq!(
+            value["hits"][0]["symbol"]["origin"]["unit"],
+            json!("rift://source/project/src/lib.rs")
+        );
         assert_eq!(value["next_cursor"], Value::Null);
         Ok(())
     }
 
+    /// `complete_coverage` fills its `ProviderOrigin` from the snapshot the answer actually
+    /// used; a fabricated all-zero digest here would be a defect.
     #[test]
-    fn search_combines_symbol_and_source_matches_with_limit() -> TestResult {
+    fn get_symbol_coverage_origins_carry_the_snapshots_real_revisions() -> TestResult {
         let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "limit": 3
-        }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0]["hit"]["target"], "symbol");
-        assert_eq!(results[0]["score"], 1.0);
-        assert_eq!(results[2]["hit"]["target"], "file");
-        assert_eq!(results[2]["line"], 1);
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let snapshot_tree = value["snapshot"]["tree_revision"].clone();
+        let snapshot_source = value["snapshot"]["source_revision"].clone();
+        let origin = &value["coverage"]["origins"][0];
+        assert_eq!(origin["tree_revision"], snapshot_tree);
+        assert_eq!(origin["source_revision"], snapshot_source);
+        assert_ne!(origin["tree_revision"], json!("00000000"));
         Ok(())
     }
 
+    /// `complete_coverage` falls back to `tree_revision` when the read consulted no index,
+    /// instead of unwrapping the absent `IndexSnapshot`.
     #[test]
-    fn symbol_scores_preserve_semantic_rank() {
-        let scores = [
-            symbol_match_score(SymbolMatchRank::QualifiedExact),
-            symbol_match_score(SymbolMatchRank::NameExact),
-            symbol_match_score(SymbolMatchRank::QualifiedSuffix),
-            symbol_match_score(SymbolMatchRank::Substring),
-        ];
-        assert!(scores.windows(2).all(|pair| pair[0] > pair[1]));
+    fn complete_coverage_falls_back_to_tree_revision_without_an_index_snapshot() -> TestResult {
+        let snapshot = ReadSnapshot {
+            tree_revision: Digest("deadbeef".to_owned()),
+            index: None,
+            source_revision: Digest("cafef00d".to_owned()),
+        };
+        let value = serde_json::to_value(super::complete_coverage(&snapshot))?;
+        assert_eq!(value["origins"][0]["revision"], json!("deadbeef"));
+        assert_eq!(value["origins"][0]["tree_revision"], json!("deadbeef"));
+        assert_eq!(value["origins"][0]["source_revision"], json!("cafef00d"));
+        Ok(())
     }
 
     #[test]
@@ -897,20 +836,8 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn unsupported_filter_and_missing_source_are_distinct() -> TestResult {
+    fn nodes_missing_source_is_not_found() -> TestResult {
         let (_directory, service) = fixture()?;
-        let search: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "filter": {"kind": "field", "field": {"field": "name", "op": "eq", "value": "Beacon"}}
-        }))?;
-        assert!(matches!(
-            service
-                .search(&search)
-                .expect_err("filter must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-
         let missing = service.nodes(NodesParams {
             path: ProjectPath("src/missing.rs".to_owned()),
             position: 0,
@@ -928,6 +855,7 @@ pub fn compute() -> i32 {
         let error = ReadService::build(
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
         )
         .expect_err("missing root must fail");
 
@@ -962,105 +890,6 @@ pub fn compute() -> i32 {
                 .fault(),
             ReadFault::Unsupported { .. }
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn search_rejects_cursor_and_node_target() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let cursor: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "cursor": "page-two"}))?;
-        assert!(matches!(
-            service
-                .search(&cursor)
-                .expect_err("cursor reads must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-
-        let node_target: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "target": "node"}))?;
-        assert!(matches!(
-            service
-                .search(&node_target)
-                .expect_err("node target must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn search_requires_query_and_rejects_zero_limit() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let missing_query: SearchParams = serde_json::from_value(json!({}))?;
-        assert!(matches!(
-            service
-                .search(&missing_query)
-                .expect_err("missing query must fail")
-                .fault(),
-            ReadFault::Invalid { .. }
-        ));
-
-        let zero_limit: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
-        let error = service
-            .search(&zero_limit)
-            .expect_err("zero limit must fail");
-        assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
-        assert_eq!(
-            error.to_string(),
-            "the request does not match the documented form: field limit, \
-             violation zero; correct the reported field and resend the request"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn search_target_file_propagates_oversized_result_limit() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "target": "file",
-            "limit": READ_RESULTS_MAX_DEFAULT as u64 + 1
-        }))?;
-        assert!(matches!(
-            service
-                .search(&params)
-                .expect_err("oversized file-target limit must fail")
-                .fault(),
-            ReadFault::Index(_)
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn search_target_symbol_excludes_file_hits() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "target": "symbol",
-            "limit": 5
-        }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|hit| hit["hit"]["target"] == "symbol"));
-        Ok(())
-    }
-
-    #[test]
-    fn search_reports_multi_line_file_match_position() -> TestResult {
-        let (_directory, service) = rich_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "lookout marker",
-            "target": "file"
-        }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert_eq!(results.len(), 1);
-        assert!(results[0]["line"].as_u64().is_some_and(|line| line > 1));
-        assert_eq!(results[0]["source"]["text"], "    // lookout marker");
         Ok(())
     }
 
@@ -1115,42 +944,75 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_resolves_every_rust_symbol_kind_and_visibility() -> TestResult {
-        let (_directory, service) = rich_fixture()?;
-        let cases = [
-            ("Level", "rust.enum", None),
-            ("Speaks", "rust.trait", None),
-            ("Alias", "rust.type_alias", None),
-            ("MAX", "rust.constant", None),
-            ("NAME", "rust.static", None),
-            ("inner", "rust.module", None),
-            ("noop", "rust.macro", None),
-            ("Hidden", "rust.struct", Some("private")),
-            ("scoped", "rust.function", Some("pub(crate)")),
-        ];
-        for (name, kind, visibility) in cases {
-            let params: SearchParams = serde_json::from_value(json!({
-                "query": name,
-                "target": "symbol",
-                "limit": 1
-            }))?;
-            let value = serde_json::to_value(service.search(&params)?)?;
-            let hit = &value["results"][0]["hit"]["symbol"];
-            assert_eq!(hit["kind"], kind, "unexpected kind for {name}");
-            if let Some(expected_visibility) = visibility {
-                assert_eq!(
-                    hit["visibility"], expected_visibility,
-                    "unexpected visibility for {name}"
-                );
-                assert!(
-                    !hit["facets"]
-                        .as_array()
-                        .ok_or("facets must be array")?
-                        .contains(&json!("public")),
-                    "{name} must not carry public facet"
-                );
-            }
-        }
+    fn nodes_backlink_documented_item_to_its_symbol() -> TestResult {
+        let (_directory, service) = documented_fixture()?;
+        let position = DOCUMENTED_SOURCE
+            .find("Beacon")
+            .ok_or("fixture must contain the struct name")? as u64;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position,
+            projection: None,
+        })?;
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        let item = nodes
+            .iter()
+            .find(|node| node["kind"] == "rust.struct_item")
+            .ok_or("fixture must witness the struct_item node")?;
+        assert!(
+            item["symbol"]
+                .as_str()
+                .is_some_and(|id| id.contains("/Beacon")),
+            "documented struct item must backlink to its symbol, got {:?}",
+            item["symbol"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_backlink_undocumented_item_to_its_symbol() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let position = "pub struct ".len() as u64;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position,
+            projection: None,
+        })?;
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        let item = nodes
+            .iter()
+            .find(|node| node["kind"] == "rust.struct_item")
+            .ok_or("fixture must witness the struct_item node")?;
+        assert!(
+            item["symbol"]
+                .as_str()
+                .is_some_and(|id| id.contains("/Beacon")),
+            "undocumented struct item must still backlink to its symbol"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_report_no_symbol_backlink_for_non_symbol_node() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let position = "pub struct Beacon;\n".len() as u64;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position,
+            projection: None,
+        })?;
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        let impl_node = nodes
+            .iter()
+            .find(|node| node["kind"] == "rust.impl_item")
+            .ok_or("fixture must witness the impl_item node")?;
+        assert!(
+            impl_node["symbol"].is_null(),
+            "impl_item is not itself a declared symbol"
+        );
         Ok(())
     }
 }

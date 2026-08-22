@@ -101,7 +101,7 @@ to its inputs. A synthetic declaration has no source unit.
 
 ```json
 {
-  "id": "rift://source/src_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "id": "rift://source/pypi/pydantic/main.py",
   "location": {
     "kind": "dependency",
     "package": { "manager": "pypi", "name": "pydantic", "version": "2.8.2" }
@@ -109,11 +109,16 @@ to its inputs. A synthetic declaration has no source unit.
   "path": "pydantic/main.py",
   "source_kind": "authored",
   "languages": [{ "name": "python", "dialect": null }],
-  "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "digest": "6f2a9c31",
   "generator": null,
   "mappings": []
 }
 ```
+
+An id is two parts: the resolver identity (`pypi`), then that resolver's own human-readable key
+for the unit (`pydantic/main.py`). `digest` is the short form every content digest takes on the
+wire — the first eight hex characters of a SHA-256, the same convention `NodeId`'s witness uses;
+the full digest is computed and compared internally and never travels whole.
 
 [`SourceResolverSummary`](/docs/protocol/reference#SourceResolverSummary) reports each resolver's
 identity, locations, catalog revision, and lifecycle state. Resolver revisions change with files,

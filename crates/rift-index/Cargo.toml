@@ -11,6 +11,7 @@ description = "Persistent indexing and retrieval for Rift"
 workspace = true
 
 [dependencies]
+ignore.workspace = true
 rift-core.workspace = true
 serde.workspace = true
 rift-model.workspace = true

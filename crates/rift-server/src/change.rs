@@ -10,31 +10,27 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use diffy::Patch;
 use percent_encoding::percent_decode_str;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_protocol::change::{
-    ChangeId, ChangeResult, ChangeSummary, Edit, InsertPosition, OperationPrecondition,
-    OperationPreconditionKind, OperationPreconditionStatus, PatchParams, PreconditionAddress,
-    PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
+    ChangeId, ChangeResult, ChangeSummary, Edit, InsertPosition, InsertSymbolParams,
+    OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus, PatchParams,
+    PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::read::{
-    Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, Severity, SourceSpan,
-    TextRange,
+    Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Severity,
+    SourceSpan, TextRange,
 };
 use rift_syntax::{ByteRange, RustSource, RustSyntaxLimits, RustSyntaxProvider};
 use sha2::{Digest as _, Sha256};
 
-use crate::read::{ReadError, ReadFault, ReadService, file_id, node_witness};
+use crate::patch::{self, FileRewrite, RewriteKind};
+use crate::read::{
+    ReadError, ReadFault, ReadService, digest_hex8, encode_path, file_id, node_witness,
+};
 
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
-
-/// Most files one unified diff may address.
-const PATCH_FILES_MAX: usize = 64;
-
-/// Longest hunk-mismatch detail one precondition value carries.
-const PATCH_MISMATCH_DETAIL_BYTES_MAX: usize = 256;
 
 /// Byte length of the hashed material a change identity keeps: 16 bytes
 /// encode to the 26 base32 characters the `chg_` pattern requires.
@@ -64,6 +60,53 @@ enum Resolution {
         reason: RefusalReason,
         preconditions: Vec<OperationPrecondition>,
     },
+}
+
+/// Where one `insert_symbol` request lands, once `anchor`/`file`/
+/// `create_missing` have been proven mutually consistent.
+#[derive(Debug)]
+enum InsertTarget<'a> {
+    /// Insert beside the resolved declaration of the named anchor symbol.
+    BesideAnchor(&'a str),
+    /// Insert at the boundary of the named file, creating it first when
+    /// `create_missing` is set and it does not exist.
+    AtFile {
+        /// File the body lands in.
+        file: &'a rift_protocol::read::ProjectPath,
+        /// Whether a missing file may be created instead of refusing.
+        create_missing: bool,
+    },
+}
+
+/// Classifies an `insert_symbol` request into its target, holding every
+/// refusal arm for an illegal combination of `anchor`, `file`, and
+/// `create_missing`.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when both or neither of `anchor` and `file` are
+/// set, or when `create_missing` is set together with an `anchor` target.
+fn insert_target(params: &InsertSymbolParams) -> Result<InsertTarget<'_>, ReadError> {
+    match (params.anchor.as_ref(), params.file.as_ref()) {
+        (Some(_), Some(_)) => Err(ReadFault::invalid(
+            "file",
+            "insert_symbol accepts exactly one of anchor or file, not both",
+        )),
+        (None, None) => Err(ReadFault::invalid(
+            "anchor",
+            "insert_symbol requires exactly one of anchor or file",
+        )),
+        (Some(_), None) if params.create_missing => Err(ReadFault::invalid(
+            "create_missing",
+            "cannot be set with an anchor target; an anchor always addresses \
+             an existing file",
+        )),
+        (Some(anchor), None) => Ok(InsertTarget::BesideAnchor(&anchor.0)),
+        (None, Some(file)) => Ok(InsertTarget::AtFile {
+            file,
+            create_missing: params.create_missing,
+        }),
+    }
 }
 
 impl ChangeService {
@@ -101,21 +144,41 @@ impl ChangeService {
         self.conclude(reads, resolution)
     }
 
-    /// Inserts a new declaration beside the anchor symbol.
+    /// Inserts a new declaration beside the anchor symbol, or content at a file
+    /// target.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for a malformed address or a filesystem failure;
-    /// a resolvable request that cannot land returns a refused
-    /// [`ChangeResult`] instead.
+    /// Returns [`ReadError`] for a malformed address, a request naming both or
+    /// neither of `anchor` and `file`, `create_missing` set with `anchor`, or a
+    /// filesystem failure; a resolvable request that cannot land returns a
+    /// refused [`ChangeResult`] instead.
     pub fn insert_symbol(
         &self,
         reads: &ReadService,
-        params: &rift_protocol::change::InsertSymbolParams,
+        params: &InsertSymbolParams,
     ) -> Result<ChangeResult, ReadError> {
-        let (path, qualified_name) = parse_symbol_address(&params.anchor.0)?;
-        let body = params.body.clone();
-        let position = params.position;
+        match insert_target(params)? {
+            InsertTarget::BesideAnchor(anchor) => {
+                self.insert_beside_anchor(reads, anchor, params.position, &params.body)
+            }
+            InsertTarget::AtFile {
+                file,
+                create_missing,
+            } => self.insert_at_file(reads, file, params.position, &params.body, create_missing),
+        }
+    }
+
+    /// Inserts a new declaration beside the anchor symbol.
+    fn insert_beside_anchor(
+        &self,
+        reads: &ReadService,
+        anchor: &str,
+        position: InsertPosition,
+        body: &str,
+    ) -> Result<ChangeResult, ReadError> {
+        let (path, qualified_name) = parse_symbol_address(anchor)?;
+        let body = body.to_owned();
         let resolution = self.resolve_symbol_spans(reads, &path, &qualified_name, |range| {
             let (at, text) = match position {
                 InsertPosition::Before => (range.start, format!("{body}\n\n")),
@@ -128,6 +191,59 @@ impl ChangeService {
             }
         })?;
         self.conclude(reads, resolution)
+    }
+
+    /// Inserts content at a file target: the start of the file for `before`, the
+    /// end for `after`, one blank line from what was already there. A missing
+    /// file is created, parent directories included, only when `create_missing`
+    /// is set; otherwise resolution refuses, naming the missing target. The body
+    /// lands verbatim — no parser involvement — so any project-relative path is
+    /// a legal target.
+    fn insert_at_file(
+        &self,
+        reads: &ReadService,
+        file: &rift_protocol::read::ProjectPath,
+        position: InsertPosition,
+        body: &str,
+        create_missing: bool,
+    ) -> Result<ChangeResult, ReadError> {
+        let path = CoreProjectPath::new(file.0.as_str()).map_err(|error| {
+            ReadFault::invalid("file", rift_core::fault_label(&error.fault().violation()))
+        })?;
+        let absolute = self.root.join(path.as_str());
+        let existing = match fs::read_to_string(&absolute) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(ReadFault::storage(path.as_str(), "read", &error)),
+        };
+        let rewrite = match existing {
+            Some(content) => FileRewrite {
+                previous_len: content.len() as u64,
+                next_source: spliced_at_file_edge(&content, position, body),
+                kind: RewriteKind::Modify,
+                path,
+            },
+            None if create_missing => FileRewrite {
+                path,
+                kind: RewriteKind::Create,
+                previous_len: 0,
+                next_source: body.to_owned(),
+            },
+            None => {
+                return Ok(ChangeResult::refused(
+                    RefusalReason::UnmetPrecondition,
+                    vec![OperationPrecondition::new(
+                        OperationPreconditionKind::TargetExists,
+                        OperationPreconditionStatus::Failed,
+                        Vec::new(),
+                        vec![path.as_str().to_owned()],
+                        PreconditionValue::Boolean { value: true },
+                        PreconditionValue::Boolean { value: false },
+                    )],
+                ));
+            }
+        };
+        self.apply_rewrites(reads, &[rewrite])
     }
 
     /// Replaces one syntax node through a witnessed address.
@@ -194,98 +310,58 @@ impl ChangeService {
 
     /// Applies unified-diff hunks to workspace files atomically.
     ///
+    /// Hunk context locates each hunk; header line numbers are hints, as
+    /// with `git apply`. A `/dev/null` header creates or deletes the file.
+    ///
     /// # Errors
     ///
     /// Returns [`ReadError`] for a diff that does not parse, addresses an
-    /// illegal path, or fails at the filesystem; hunk-context drift and
-    /// file-level changes this release does not serve return a refused
-    /// [`ChangeResult`] instead.
+    /// illegal path, or fails at the filesystem; hunk-context that cannot
+    /// be located, and a rename or copy, which this release does not
+    /// serve, return a refused [`ChangeResult`] instead.
     pub fn patch(
         &self,
         reads: &ReadService,
         params: &PatchParams,
     ) -> Result<ChangeResult, ReadError> {
-        let segments = split_file_segments(&params.patch)?;
+        let segments = patch::split_file_segments(&params.patch)?;
         let mut rewrites: Vec<FileRewrite> = Vec::with_capacity(segments.len());
-        for segment in &segments {
-            let parsed = Patch::from_str(segment)
-                .map_err(|error| ReadFault::invalid("patch", error.to_string()))?;
-            let path = match patched_project_path(&parsed)? {
-                Ok(path) => path,
+        for (index, segment) in segments.iter().enumerate() {
+            match patch::resolve_segment(&self.root, reads, segment, index + 1)? {
+                Ok(rewrite) => rewrites.push(rewrite),
                 Err(refusal) => return Ok(refusal),
-            };
-            let Some(file) = reads.index().file(&path) else {
-                return Ok(ChangeResult::refused(
-                    RefusalReason::UnmetPrecondition,
-                    vec![OperationPrecondition::new(
-                        OperationPreconditionKind::TargetExists,
-                        OperationPreconditionStatus::Failed,
-                        Vec::new(),
-                        vec![path.as_str().to_owned()],
-                        PreconditionValue::Boolean { value: true },
-                        PreconditionValue::Boolean { value: false },
-                    )],
-                ));
-            };
-            if let Resolution::Refused {
-                reason,
-                preconditions,
-            } = self.verified_against_disk(
-                reads,
-                &path,
-                ChangePlan {
-                    path: path.clone(),
-                    range: ByteRange { start: 0, end: 0 },
-                    text: String::new(),
-                },
-            )? {
-                return Ok(ChangeResult::refused(reason, preconditions));
-            }
-            match diffy::apply(file.source(), &parsed) {
-                Ok(next_source) => rewrites.push(FileRewrite {
-                    path,
-                    previous_len: file.source().len() as u64,
-                    next_source,
-                }),
-                Err(error) => {
-                    let mut detail = error.to_string();
-                    detail.truncate(PATCH_MISMATCH_DETAIL_BYTES_MAX);
-                    return Ok(ChangeResult::refused(
-                        RefusalReason::UnmetPrecondition,
-                        vec![OperationPrecondition::new(
-                            OperationPreconditionKind::SourceUnchanged,
-                            OperationPreconditionStatus::Failed,
-                            Vec::new(),
-                            vec![path.as_str().to_owned()],
-                            PreconditionValue::Text {
-                                value: "every hunk context matches".to_owned(),
-                            },
-                            PreconditionValue::Text { value: detail },
-                        )],
-                    ));
-                }
             }
         }
         self.apply_rewrites(reads, &rewrites)
     }
 
-    /// Restores the files a partial publish already renamed, rewriting each
-    /// from its indexed source. Rollback is best-effort inside the failure
-    /// path: a file whose index entry cannot serve its source stays as
-    /// published, and the storage error the caller returns names the file
-    /// that stopped the publish.
+    /// Restores the files a partial publish already changed: a modified or
+    /// deleted file gets its indexed source back, and a created file is
+    /// removed. Rollback is best-effort inside the failure path: a file
+    /// whose index entry cannot serve its source stays as published, and
+    /// the storage error the caller returns names the file that stopped
+    /// the publish.
     fn roll_back_published(&self, reads: &ReadService, published: &[&FileRewrite]) {
         for landed in published {
-            if let Some(file) = reads.index().file(&landed.path) {
-                let _ = fs::write(self.root.join(landed.path.as_str()), file.source());
+            let absolute = self.root.join(landed.path.as_str());
+            match landed.kind {
+                RewriteKind::Create => {
+                    let _ = fs::remove_file(&absolute);
+                }
+                RewriteKind::Modify | RewriteKind::Delete => {
+                    if let Some(file) = reads.index().file(&landed.path) {
+                        let _ = fs::write(&absolute, file.source());
+                    }
+                }
             }
         }
     }
 
     /// Stages and publishes whole-file rewrites, all or none.
     ///
-    /// Every stage lands before the first rename; a failed rename restores
-    /// the files already renamed from their indexed source.
+    /// Every stage lands before the first publish; a failed publish
+    /// restores every file already published, from its indexed source or,
+    /// for a file this batch created, by removing it.
     fn apply_rewrites(
         &self,
         reads: &ReadService,
@@ -295,25 +371,45 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut staged_paths = Vec::with_capacity(rewrites.len());
+        let mut staged: Vec<Option<PathBuf>> = Vec::with_capacity(rewrites.len());
         for rewrite in rewrites {
-            let staged = self
-                .root
-                .join(rewrite.path.as_str())
-                .with_extension("rift-staged");
-            if let Err(error) = fs::write(&staged, &rewrite.next_source) {
-                discard_staged(&staged_paths);
-                let _ = fs::remove_file(&staged);
+            if rewrite.kind == RewriteKind::Delete {
+                staged.push(None);
+                continue;
+            }
+            let absolute = self.root.join(rewrite.path.as_str());
+            if rewrite.kind == RewriteKind::Create
+                && let Some(parent) = absolute.parent()
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                discard_staged(staged.iter().flatten());
+                return Err(ReadFault::storage(
+                    rewrite.path.as_str(),
+                    "create_dir",
+                    &error,
+                ));
+            }
+            let staged_path = absolute.with_extension("rift-staged");
+            if let Err(error) = fs::write(&staged_path, &rewrite.next_source) {
+                discard_staged(staged.iter().flatten());
+                let _ = fs::remove_file(&staged_path);
                 return Err(ReadFault::storage(rewrite.path.as_str(), "stage", &error));
             }
-            staged_paths.push(staged);
+            staged.push(Some(staged_path));
         }
         let mut published: Vec<&FileRewrite> = Vec::with_capacity(rewrites.len());
-        for (rewrite, staged) in rewrites.iter().zip(&staged_paths) {
+        for (rewrite, staged_path) in rewrites.iter().zip(&staged) {
             let absolute = self.root.join(rewrite.path.as_str());
-            if let Err(error) = fs::rename(staged, &absolute) {
+            let outcome = match (rewrite.kind, staged_path) {
+                (RewriteKind::Delete, _) => fs::remove_file(&absolute),
+                (_, Some(staged_path)) => fs::rename(staged_path, &absolute),
+                (_, None) => Err(std::io::Error::other(
+                    "staged rewrite is missing its staged file",
+                )),
+            };
+            if let Err(error) = outcome {
                 self.roll_back_published(reads, &published);
-                discard_staged(&staged_paths);
+                discard_staged(staged.iter().flatten());
                 return Err(ReadFault::storage(rewrite.path.as_str(), "publish", &error));
             }
             published.push(rewrite);
@@ -331,24 +427,31 @@ impl ChangeService {
             paths.push(rift_protocol::read::ProjectPath(
                 rewrite.path.as_str().to_owned(),
             ));
-            if let Some(file) = reads.index().file(&rewrite.path) {
-                edits.push(Edit::Replace {
-                    span: SourceSpan {
-                        unit: file_id(file),
-                        range: TextRange {
-                            start: 0,
-                            end: rewrite.previous_len,
-                        },
+            let unit = match reads.index().file(&rewrite.path) {
+                Some(file) => file_id(file),
+                None => FileId(format!(
+                    "rift://file/{}",
+                    encode_path(rewrite.path.as_str())
+                )),
+            };
+            edits.push(Edit::Replace {
+                span: SourceSpan {
+                    unit: unit.clone(),
+                    range: TextRange {
+                        start: 0,
+                        end: rewrite.previous_len,
                     },
-                    text: rewrite.next_source.clone(),
-                });
+                },
+                text: rewrite.next_source.clone(),
+            });
+            if rewrite.kind != RewriteKind::Delete {
+                diagnostics.extend(reparse_diagnostics(
+                    unit,
+                    &rewrite.path,
+                    &rewrite.next_source,
+                ));
+                diagnostics.truncate(CHANGE_DIAGNOSTICS_MAX);
             }
-            diagnostics.extend(reparse_diagnostics(
-                reads,
-                &rewrite.path,
-                &rewrite.next_source,
-            ));
-            diagnostics.truncate(CHANGE_DIAGNOSTICS_MAX);
         }
         let digest = identity.finalize();
         Ok(ChangeResult::Applied {
@@ -521,9 +624,10 @@ impl ChangeService {
         }
         drop(guard);
 
+        let unit = file_id(file);
         let edit = Edit::Replace {
             span: SourceSpan {
-                unit: file_id(file),
+                unit: unit.clone(),
                 range: TextRange {
                     start: plan.range.start,
                     end: plan.range.end,
@@ -538,114 +642,27 @@ impl ChangeService {
                     plan.path.as_str().to_owned(),
                 )],
                 edits: vec![edit],
-                diagnostics: reparse_diagnostics(reads, &plan.path, &next_source),
+                diagnostics: reparse_diagnostics(unit, &plan.path, &next_source),
                 guarantees: Vec::new(),
             },
         })
     }
 }
 
-/// One whole-file rewrite a patch resolved to.
-#[derive(Debug)]
-struct FileRewrite {
-    path: CoreProjectPath,
-    previous_len: u64,
-    next_source: String,
-}
-
 /// Removes every staged sidecar file, ignoring entries already gone.
-fn discard_staged(staged_paths: &[PathBuf]) {
+fn discard_staged<'a>(staged_paths: impl IntoIterator<Item = &'a PathBuf>) {
     for staged in staged_paths {
         let _ = fs::remove_file(staged);
     }
 }
 
-/// Splits one unified diff into its per-file segments. Only a header line
-/// opens a segment: hunk body lines never start with `---` at column zero,
-/// because context lines carry a leading space and removals a single `-`.
-///
-/// Hunk body bytes pass through untouched — a CRLF patch keeps its `\r`
-/// so its context matches a CRLF source, and an ending mismatch surfaces
-/// as hunk-context drift, never a silent rewrite. Only structural lines
-/// shed a CRLF ending, because the diff parser rejects `\r` in headers.
-fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
-    let mut segments: Vec<String> = Vec::new();
-    let mut segment_line = 0_usize;
-    for line in patch.split_inclusive('\n') {
-        if line.starts_with("--- ") {
-            if segments.len() == PATCH_FILES_MAX {
-                return Err(ReadFault::invalid(
-                    "patch",
-                    format!("addresses more than {PATCH_FILES_MAX} files"),
-                ));
-            }
-            segments.push(String::new());
-            segment_line = 0;
-        }
-        if let Some(segment) = segments.last_mut() {
-            let structural = segment_line == 0
-                || (segment_line == 1 && line.starts_with("+++ "))
-                || line.starts_with("@@");
-            push_segment_line(segment, line, structural);
-            segment_line += 1;
-        }
+/// Splices new content at a file boundary, matching the anchor-insert spacing
+/// policy: one blank line separates the new content from what was already there.
+fn spliced_at_file_edge(existing: &str, position: InsertPosition, body: &str) -> String {
+    match position {
+        InsertPosition::Before => format!("{body}\n\n{existing}"),
+        InsertPosition::After => format!("{existing}\n\n{body}"),
     }
-    if segments.is_empty() {
-        return Err(ReadFault::invalid("patch", "carries no `---` file header"));
-    }
-    Ok(segments)
-}
-
-/// Appends one diff line to its segment. A structural line — the `---` and
-/// `+++` file headers and `@@` hunk headers — sheds a CRLF ending, because
-/// the diff parser rejects `\r` there; body lines keep their exact bytes so
-/// hunk content matches the stored source byte-for-byte.
-fn push_segment_line(segment: &mut String, line: &str, structural: bool) {
-    match (structural, line.strip_suffix("\r\n")) {
-        (true, Some(stripped)) => {
-            segment.push_str(stripped);
-            segment.push('\n');
-        }
-        _ => segment.push_str(line),
-    }
-}
-
-/// Resolves the project path one parsed segment addresses, or the refusal
-/// for file-level changes this release does not serve.
-///
-/// Patch paths are wire values, not OS paths: forward-slash relative on
-/// every platform, with git's literal `a/`, `b/`, and `/dev/null`
-/// conventions, which git emits unchanged on Windows and macOS alike.
-fn patched_project_path(
-    parsed: &Patch<'_, str>,
-) -> Result<Result<CoreProjectPath, ChangeResult>, ReadError> {
-    let original = parsed.original().unwrap_or_default();
-    let modified = parsed.modified().unwrap_or_default();
-    if original.contains('\\') || modified.contains('\\') {
-        return Err(ReadFault::invalid(
-            "patch",
-            "path uses backslash separators; project paths are forward-slash \
-             relative on every platform, such as `src/lib.rs`",
-        ));
-    }
-    if original == "/dev/null" || modified == "/dev/null" {
-        return Ok(Err(ChangeResult::refused(
-            RefusalReason::Unsupported,
-            Vec::new(),
-        )));
-    }
-    let original = original.strip_prefix("a/").unwrap_or(original);
-    let modified = modified.strip_prefix("b/").unwrap_or(modified);
-    if original != modified {
-        return Ok(Err(ChangeResult::refused(
-            RefusalReason::Unsupported,
-            Vec::new(),
-        )));
-    }
-    let path = CoreProjectPath::new(original).map_err(|error| {
-        ReadFault::invalid("patch", rift_core::fault_label(&error.fault().violation()))
-    })?;
-    Ok(Ok(path))
 }
 
 /// A parsed witnessed node address.
@@ -708,15 +725,6 @@ fn decoded(encoded: &str) -> Option<String> {
         .map(std::borrow::Cow::into_owned)
 }
 
-/// First eight hex characters of the SHA-256 of one source text.
-fn digest_hex8(source: &str) -> String {
-    let digest = Sha256::digest(source.as_bytes());
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3]
-    )
-}
-
 /// Mints the identity of one landed change from its path and result bytes.
 fn change_id(path: &str, next_source: &str) -> ChangeId {
     let digest = Sha256::digest(format!("{path}\u{0}{next_source}").as_bytes());
@@ -730,19 +738,14 @@ fn change_id(path: &str, next_source: &str) -> ChangeId {
 ///
 /// A change that breaks the syntax still lands — the tree is the caller's —
 /// but the result says so instead of leaving the discovery to the next read.
-fn reparse_diagnostics(
-    reads: &ReadService,
-    path: &CoreProjectPath,
-    source: &str,
-) -> Vec<Diagnostic> {
-    let Some(file) = reads.index().file(path) else {
-        return Vec::new();
-    };
+/// `unit` names the changed file even when it has no prior index entry, as
+/// for a file a patch just created.
+fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Vec<Diagnostic> {
     let provider = RustSyntaxProvider::new(RustSyntaxLimits::default());
     let parsed = provider.analyze(RustSource { path, text: source });
     match parsed {
         Err(error) => vec![change_diagnostic(
-            file_id(file),
+            unit,
             format!("the changed file no longer parses within bounds: {error}"),
             None,
         )],
@@ -753,7 +756,7 @@ fn reparse_diagnostics(
             .take(CHANGE_DIAGNOSTICS_MAX)
             .map(|node| {
                 change_diagnostic(
-                    file_id(file),
+                    unit.clone(),
                     "the parser marked this region erroneous after the change".to_owned(),
                     Some(node.range),
                 )
@@ -795,6 +798,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
+    use rift_core::SourceVisibility;
     use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
@@ -813,7 +817,11 @@ mod tests {
     fn fixture(source: &str) -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), source)?;
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         let changes = ChangeService::new(directory.path());
         Ok((directory, reads, changes))
     }
@@ -940,9 +948,11 @@ mod tests {
         let result = changes.insert_symbol(
             &reads,
             &InsertSymbolParams {
-                anchor: symbol("beacon"),
+                anchor: Some(symbol("beacon")),
+                file: None,
                 position: InsertPosition::Before,
                 body: "/// Docs.\npub fn early() {}".to_owned(),
+                create_missing: false,
             },
         )?;
         applied_summary(result);
@@ -952,13 +962,19 @@ mod tests {
             "/// Docs.\npub fn early() {}\n\npub fn beacon() {}\n"
         );
 
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
         let result = changes.insert_symbol(
             &reads,
             &InsertSymbolParams {
-                anchor: symbol("beacon"),
+                anchor: Some(symbol("beacon")),
+                file: None,
                 position: InsertPosition::After,
                 body: "pub fn late() {}".to_owned(),
+                create_missing: false,
             },
         )?;
         applied_summary(result);
@@ -967,6 +983,286 @@ mod tests {
             written,
             "/// Docs.\npub fn early() {}\n\npub fn beacon() {}\n\npub fn late() {}\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_before_a_documented_anchor_lands_above_its_doc_comment() -> TestResult {
+        let (directory, reads, changes) =
+            fixture("/// Beacon docs.\n#[derive(Debug)]\npub struct Beacon;\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: Some(symbol("Beacon")),
+                file: None,
+                position: InsertPosition::Before,
+                body: "pub struct Early;".to_owned(),
+                create_missing: false,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written,
+            "pub struct Early;\n\n/// Beacon docs.\n#[derive(Debug)]\npub struct Beacon;\n",
+            "the insertion must land above the doc comment, not between it and the struct"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_symbol_on_a_documented_declaration_leaves_no_orphaned_doc_or_attribute() -> TestResult
+    {
+        let (directory, reads, changes) =
+            fixture("/// Old docs.\n#[derive(Debug)]\npub struct Beacon;\n")?;
+        let result = changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("Beacon"),
+                region: None,
+                body: "/// New docs.\npub struct Beacon {\n    pub signal: u8,\n}".to_owned(),
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written,
+            "/// New docs.\npub struct Beacon {\n    pub signal: u8,\n}\n"
+        );
+        assert!(
+            !written.contains("Old docs") && !written.contains("derive"),
+            "the old doc comment and attribute must not survive the replacement: {written}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_file_target_lands_at_the_requested_edge() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("lib.rs".to_owned())),
+                position: InsertPosition::Before,
+                body: "//! Module docs.".to_owned(),
+                create_missing: false,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "//! Module docs.\n\npub fn beacon() {}\n");
+
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("lib.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "pub fn tail() {}".to_owned(),
+                create_missing: false,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written,
+            "//! Module docs.\n\npub fn beacon() {}\n\n\npub fn tail() {}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_creates_missing_file_with_nested_parent_directories() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("notes/todo/plan.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "// plan".to_owned(),
+                create_missing: true,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("notes/todo/plan.rs"))?;
+        assert_eq!(
+            written, "// plan",
+            "a created file's body lands exactly, with no anchor-insert spacing added"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_refuses_a_missing_file_without_create_missing() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("missing.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "pub fn late() {}".to_owned(),
+                create_missing: false,
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a missing file target without create_missing must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        assert_eq!(
+            preconditions[0].paths,
+            vec![ProjectPath("missing.rs".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insert_symbol_file_target_surfaces_read_storage_failure() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let target = directory.path().join("lib.rs");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000))?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("lib.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "pub fn late() {}".to_owned(),
+                create_missing: false,
+            },
+        );
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))?;
+        let error = result.expect_err("an unreadable existing file must fail to insert");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation read"),
+            "failure must name the read operation: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_create_missing_on_an_existing_file_just_inserts() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("lib.rs".to_owned())),
+                position: InsertPosition::After,
+                body: "pub fn late() {}".to_owned(),
+                create_missing: true,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "pub fn beacon() {}\n\n\npub fn late() {}");
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_file_target_accepts_a_non_rust_extension() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: None,
+                file: Some(ProjectPath("notes/TODO.md".to_owned())),
+                position: InsertPosition::Before,
+                body: "- write docs".to_owned(),
+                create_missing: true,
+            },
+        )?;
+        applied_summary(result);
+        let written = fs::read_to_string(directory.path().join("notes/TODO.md"))?;
+        assert_eq!(written, "- write docs");
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_rejects_invalid_target_combinations() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let both = changes
+            .insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: Some(symbol("beacon")),
+                    file: Some(ProjectPath("lib.rs".to_owned())),
+                    position: InsertPosition::After,
+                    body: "pub fn late() {}".to_owned(),
+                    create_missing: false,
+                },
+            )
+            .expect_err("both anchor and file must be rejected");
+        assert_eq!(both.descriptor().code(), "invalid_request");
+
+        let neither = changes
+            .insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: None,
+                    file: None,
+                    position: InsertPosition::After,
+                    body: "pub fn late() {}".to_owned(),
+                    create_missing: false,
+                },
+            )
+            .expect_err("a request naming neither target must be rejected");
+        assert_eq!(neither.descriptor().code(), "invalid_request");
+
+        let create_missing_with_anchor = changes
+            .insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: Some(symbol("beacon")),
+                    file: None,
+                    position: InsertPosition::After,
+                    body: "pub fn late() {}".to_owned(),
+                    create_missing: true,
+                },
+            )
+            .expect_err("create_missing with an anchor target must be rejected");
+        assert_eq!(
+            create_missing_with_anchor.descriptor().code(),
+            "invalid_request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_file_target_rejects_rift_state_paths() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let error = changes
+            .insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: None,
+                    file: Some(ProjectPath(".rift/x.rs".to_owned())),
+                    position: InsertPosition::After,
+                    body: "x".to_owned(),
+                    create_missing: true,
+                },
+            )
+            .expect_err("a .rift-state file target must be rejected");
+        assert_eq!(error.descriptor().code(), "invalid_request");
         Ok(())
     }
 
@@ -1040,152 +1336,6 @@ mod tests {
             !summary.diagnostics.is_empty(),
             "a body that breaks the parse must say so on the result"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_applies_hunks_and_reports_the_rewrite() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\npub fn steady() {}\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1,2 +1,2 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            " pub fn steady() {}",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.clone(),
-            },
-        )?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(written, "pub fn beacon() -> u8 { 7 }\npub fn steady() {}\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_drifted_context_and_touches_nothing() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1 +1 @@",
-            "-pub fn vanished() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.clone(),
-            },
-        )?;
-        let ChangeResult::Refused {
-            reason,
-            preconditions,
-            ..
-        } = result
-        else {
-            panic!("drifted hunk context must refuse");
-        };
-        assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        assert_eq!(
-            preconditions[0].kind,
-            OperationPreconditionKind::SourceUnchanged
-        );
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() {}\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_file_creation_as_unsupported() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = [
-            "--- /dev/null",
-            "+++ b/new.rs",
-            "@@ -0,0 +1 @@",
-            "+pub fn fresh() {}",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.clone(),
-            },
-        )?;
-        let ChangeResult::Refused { reason, .. } = result else {
-            panic!("file creation must refuse this release");
-        };
-        assert_eq!(reason, RefusalReason::Unsupported);
-        Ok(())
-    }
-
-    #[test]
-    fn patch_rewrites_several_files_in_one_change() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("aid.rs"), "pub fn aid() {}\n")?;
-        let reads = ReadService::build(directory.path(), WorkspaceIndexLimits::default())?;
-        let changes = ChangeService::new(directory.path());
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1 +1 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            "--- a/aid.rs",
-            "+++ b/aid.rs",
-            "@@ -1 +1 @@",
-            "-pub fn aid() {}",
-            "+pub fn aid() -> u8 { 9 }",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.clone(),
-            },
-        )?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.paths.len(), 2);
-        assert_eq!(summary.edits.len(), 2);
-        assert!(fs::read_to_string(directory.path().join("lib.rs"))?.contains("-> u8"));
-        assert!(fs::read_to_string(directory.path().join("aid.rs"))?.contains("-> u8"));
-        Ok(())
-    }
-
-    #[test]
-    fn patch_rejects_malformed_and_escaping_input() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let no_header = changes
-            .patch(
-                &reads,
-                &rift_protocol::change::PatchParams {
-                    patch: "not a diff".to_owned(),
-                },
-            )
-            .expect_err("headerless input must error");
-        assert_eq!(no_header.descriptor().code(), "invalid_request");
-        let escaping = changes
-            .patch(
-                &reads,
-                &rift_protocol::change::PatchParams {
-                    patch: "--- a/../escape.rs\n+++ b/../escape.rs\n@@ -1 +1 @@\n-x\n+y\n"
-                        .to_owned(),
-                },
-            )
-            .expect_err("dot segments must error");
-        assert_eq!(escaping.descriptor().code(), "invalid_request");
         Ok(())
     }
 
@@ -1274,9 +1424,11 @@ mod tests {
         let result = changes.insert_symbol(
             &reads,
             &InsertSymbolParams {
-                anchor: symbol("vanished"),
+                anchor: Some(symbol("vanished")),
+                file: None,
                 position: InsertPosition::After,
                 body: "pub fn late() {}".to_owned(),
+                create_missing: false,
             },
         )?;
         let ChangeResult::Refused {
@@ -1426,196 +1578,6 @@ mod tests {
         assert_eq!(
             preconditions[0].paths,
             vec![ProjectPath("ghost.rs".to_owned())]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_rejects_more_files_than_the_bound() -> TestResult {
-        use std::fmt::Write as _;
-
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let mut patch = String::new();
-        for index in 0..=super::PATCH_FILES_MAX {
-            let _ = writeln!(
-                patch,
-                "--- a/f{index}.rs\n+++ b/f{index}.rs\n@@ -1 +1 @@\n-x\n+y"
-            );
-        }
-        let error = changes
-            .patch(&reads, &rift_protocol::change::PatchParams { patch })
-            .expect_err("a diff past the file bound must error");
-        assert_eq!(error.descriptor().code(), "invalid_request");
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("more than {} files", super::PATCH_FILES_MAX)),
-            "message must name the bound: {error}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_file_rename_as_unsupported() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/other.rs",
-            "@@ -1 +1 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
-        let ChangeResult::Refused { reason, .. } = result else {
-            panic!("file rename must refuse this release");
-        };
-        assert_eq!(reason, RefusalReason::Unsupported);
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() {}\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_a_path_the_index_does_not_serve() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = "--- a/ghost.rs\n+++ b/ghost.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.to_owned(),
-            },
-        )?;
-        let ChangeResult::Refused {
-            reason,
-            preconditions,
-            ..
-        } = result
-        else {
-            panic!("a patch for an unindexed path must refuse");
-        };
-        assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        assert_eq!(
-            preconditions[0].kind,
-            OperationPreconditionKind::TargetExists
-        );
-        assert_eq!(
-            preconditions[0].paths,
-            vec![ProjectPath("ghost.rs".to_owned())]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_refuses_when_disk_drifted_from_snapshot() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() { }\n")?;
-        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.to_owned(),
-            },
-        )?;
-        let ChangeResult::Refused {
-            reason,
-            preconditions,
-            ..
-        } = result
-        else {
-            panic!("a drifted file under a patch must refuse before writing");
-        };
-        assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        assert_eq!(
-            preconditions[0].kind,
-            OperationPreconditionKind::SourceUnchanged
-        );
-        assert_ne!(preconditions[0].expected, preconditions[0].observed);
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() { }\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_with_crlf_endings_applies_and_preserves_them() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\r\npub fn steady() {}\r\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1,2 +1,2 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            " pub fn steady() {}",
-            "",
-        ]
-        .join("\r\n");
-        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(
-            written, "pub fn beacon() -> u8 { 7 }\r\npub fn steady() {}\r\n",
-            "CRLF endings must survive the rewrite byte-for-byte"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn patch_with_lf_context_refuses_a_crlf_source() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\r\n")?;
-        let patch = [
-            "--- a/lib.rs",
-            "+++ b/lib.rs",
-            "@@ -1 +1 @@",
-            "-pub fn beacon() {}",
-            "+pub fn beacon() -> u8 { 7 }",
-            "",
-        ]
-        .join("\n");
-        let result = changes.patch(&reads, &rift_protocol::change::PatchParams { patch })?;
-        let ChangeResult::Refused { reason, .. } = result else {
-            panic!("an ending mismatch must refuse as context drift, not rewrite endings");
-        };
-        assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() {}\r\n");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_without_a_trailing_newline_applies() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }";
-        let result = changes.patch(
-            &reads,
-            &rift_protocol::change::PatchParams {
-                patch: patch.to_owned(),
-            },
-        )?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(written, "pub fn beacon() -> u8 { 7 }");
-        Ok(())
-    }
-
-    #[test]
-    fn patch_with_backslash_paths_names_the_expected_form() -> TestResult {
-        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let patch = "--- \"a\\\\lib.rs\"\n+++ \"b\\\\lib.rs\"\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
-        let error = changes
-            .patch(
-                &reads,
-                &rift_protocol::change::PatchParams {
-                    patch: patch.to_owned(),
-                },
-            )
-            .expect_err("backslash separators must fail as an invalid path");
-        assert_eq!(error.descriptor().code(), "invalid_request");
-        assert!(
-            error.to_string().contains("forward-slash"),
-            "message must name the expected form: {error}"
         );
         Ok(())
     }

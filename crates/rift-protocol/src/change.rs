@@ -8,6 +8,7 @@ use crate::configuration::GuaranteeKind;
 use crate::read::{
     CoverageScope, Diagnostic, NodeId, ProjectPath, RegionRole, SourceSpan, SymbolId,
 };
+use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +22,7 @@ pub struct ChangeId(
     pub String,
 );
 
-/// Which side of the anchor receives the new declaration.
+/// Which side of the anchor or file target receives the new content.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -263,7 +264,8 @@ impl ChangeResult {
 }
 
 /// Replaces one declaration addressed by symbol. The parser derives the span, so the
-/// caller supplies no offsets.
+/// caller supplies no offsets. The whole declaration includes attached outer attributes
+/// and doc comments.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceSymbolParams {
@@ -279,17 +281,29 @@ pub struct ReplaceSymbolParams {
     pub body: String,
 }
 
-/// Inserts a new declaration beside an existing one, addressed by its anchor symbol.
+/// Inserts a new declaration beside an anchor symbol, or content at a file target.
+/// The request carries exactly one of `anchor` or `file`; an anchored insertion lands
+/// beside the whole declaration, attached outer attributes and doc comments included.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::insert_symbol_addresses_one_target)]
 pub struct InsertSymbolParams {
     /// The existing declaration the new one lands beside.
-    pub anchor: SymbolId,
-    /// Which side of the anchor receives the new declaration.
+    #[serde(default)]
+    pub anchor: Option<SymbolId>,
+    /// The file the content lands in, created first when `create_missing` is set and
+    /// it does not exist.
+    #[serde(default)]
+    pub file: Option<ProjectPath>,
+    /// Which side of the anchor or file target receives the new content.
     pub position: InsertPosition,
-    /// The new declaration's source.
+    /// The new content: a declaration beside `anchor`, or a file target's whole body.
     #[schemars(length(max = 1_048_576))]
     pub body: String,
+    /// Creates a missing `file` target instead of refusing. Invalid together with
+    /// `anchor`.
+    #[serde(default)]
+    pub create_missing: bool,
 }
 
 /// Replaces one syntax node through a witnessed address from `nodes`. The server
@@ -313,8 +327,8 @@ pub struct ReplaceNodeParams {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatchParams {
-    /// A unified diff. Hunk context guards the change, and a context mismatch refuses
-    /// with an unmet precondition.
+    /// A unified diff. Hunk context guards the change; header line numbers are hints,
+    /// as with `git apply`. `/dev/null` headers create or delete files.
     #[schemars(length(min = 1, max = 4_194_304))]
     pub patch: String,
 }

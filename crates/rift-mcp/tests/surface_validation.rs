@@ -28,7 +28,7 @@ const FOLLOWED_PAGES_MAX: usize = 16;
 /// Sample validation corpus with various scenarios: one request per
 /// advertised tool behavior worth proving.
 fn corpus() -> Vec<(&'static str, Value)> {
-    vec![
+    let mut requests = vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
         ("get_symbol", json!({ "name": "beacon", "limit": 1 })),
         (
@@ -37,6 +37,18 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("search", json!({ "query": "beacon" })),
         ("search", json!({ "query": "beacon", "limit": 1 })),
+        (
+            "search",
+            json!({ "query": "beacon", "paths": { "include": ["lib.rs"] } }),
+        ),
+        (
+            "search",
+            json!({
+                "query": "phantom",
+                "target": "symbol",
+                "paths": { "force_include": ["hidden.rs"] }
+            }),
+        ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
         (
@@ -87,6 +99,20 @@ fn corpus() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            "patch",
+            json!({
+                // The header claims line 1; the unique match actually sits
+                // at line 5, proving header line numbers are hints only.
+                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon_three() {}\n+pub fn beacon_three() -> u8 { 3 }\n"
+            }),
+        ),
+        (
+            "patch",
+            json!({
+                "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
+            }),
+        ),
+        (
             "replace_symbol",
             json!({
                 "symbol": "rift://symbol/rust/lib.rs/dual",
@@ -100,6 +126,73 @@ fn corpus() -> Vec<(&'static str, Value)> {
                 "body": "pub fn beacon_three( {"
             }),
         ),
+    ];
+    requests.extend(insert_symbol_file_target_corpus());
+    requests
+}
+
+/// `insert_symbol` file-target requests: an append to an existing file, a
+/// created file with nested parent directories, and a missing-target refusal.
+fn insert_symbol_file_target_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "insert_symbol",
+            json!({
+                "file": "lib.rs",
+                "position": "after",
+                "body": "pub fn beacon_extra() {}"
+            }),
+        ),
+        (
+            "insert_symbol",
+            json!({
+                "file": "docs/notes.md",
+                "position": "before",
+                "create_missing": true,
+                "body": "# Notes"
+            }),
+        ),
+        (
+            "insert_symbol",
+            json!({
+                "file": "docs/missing.md",
+                "position": "after",
+                "body": "# Missing"
+            }),
+        ),
+    ]
+}
+
+/// `insert_symbol` requests that must fail the advertised input schema before
+/// any tool ever resolves them: each proves one refused target-shape rule.
+fn invalid_insert_symbol_corpus() -> Vec<Value> {
+    vec![
+        json!({
+            "anchor": "rift://symbol/rust/lib.rs/beacon_one",
+            "file": "notes/extra.md",
+            "position": "after",
+            "body": "x"
+        }),
+        json!({
+            "position": "after",
+            "body": "x"
+        }),
+        json!({
+            "anchor": "rift://symbol/rust/lib.rs/beacon_one",
+            "position": "after",
+            "body": "x",
+            "create_missing": true
+        }),
+        json!({
+            "file": ".rift/x.rs",
+            "position": "after",
+            "body": "x"
+        }),
+        json!({
+            "file": "../escape.rs",
+            "position": "after",
+            "body": "x"
+        }),
     ]
 }
 
@@ -121,6 +214,79 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     );
 }
 
+/// Whether every byte of `text` is a lowercase hex digit.
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Walks `value`, refusing a bare 64-character lowercase-hex string anywhere on the wire: the
+/// only digest form the wire now carries is the eight-character witness.
+fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
+    match value {
+        Value::String(text) => assert!(
+            !(text.len() == 64 && is_lowercase_hex(text)),
+            "{context} must not carry a bare 64-character digest, only the 8-character wire \
+             form: {text}"
+        ),
+        Value::Array(items) => {
+            for item in items {
+                assert_no_bare_sha256_digest(item, context);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                assert_no_bare_sha256_digest(item, context);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Proves one tool result carries no oversized digest and no non-project source-unit
+/// resolver, and that every `search` hit names its project-relative path.
+fn assert_wire_hygiene(name: &str, structured: &Value) {
+    let context = format!("{name} result");
+    assert_no_bare_sha256_digest(structured, &context);
+    assert_source_unit_ids_use_project_resolver(structured, &context);
+    if name == "search"
+        && let Some(results) = structured["results"].as_array()
+    {
+        for hit in results {
+            assert!(
+                !hit["path"].is_null(),
+                "a search hit's path must not be null: {hit:#}"
+            );
+        }
+    }
+}
+
+/// Walks `value`, proving every `rift://source/` identity uses the project resolver: the
+/// only source resolver this release serves.
+fn assert_source_unit_ids_use_project_resolver(value: &Value, context: &str) {
+    match value {
+        Value::String(text) => {
+            if let Some(rest) = text.strip_prefix("rift://source/") {
+                assert!(
+                    rest.starts_with("project/"),
+                    "{context} source-unit id must use the project resolver: {text}"
+                );
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_source_unit_ids_use_project_resolver(item, context);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                assert_source_unit_ids_use_project_resolver(item, context);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 /// Builds the shared fixture workspace and serves it to one client.
 async fn served_fixture() -> TestResult<(
     tempfile::TempDir,
@@ -132,6 +298,13 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("lib.rs"),
         "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n\
          #[cfg(unix)]\npub fn dual() {}\n#[cfg(windows)]\npub fn dual() {}\n",
+    )?;
+    // Gitignored, so a plain search never reaches it; `paths.force_include` is the only way
+    // in, proving that arm of the surface end to end.
+    fs::write(directory.path().join(".gitignore"), "hidden.rs\n")?;
+    fs::write(
+        directory.path().join("hidden.rs"),
+        "pub fn phantom_signal() {}\n",
     )?;
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
@@ -209,6 +382,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 .structured_content
                 .ok_or_else(|| format!("{name} must return structured content"))?;
             assert_validates(output_validator, &structured, &format!("{name} result"));
+            assert_wire_hygiene(name, &structured);
             match structured["status"].as_str() {
                 Some("applied") => {
                     applied_changes += 1;
@@ -266,6 +440,71 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
             "the corpus must prove the {reason} refusal arm; proven: {refusal_reasons:?}"
         );
     }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_symbol_schema_rejects_invalid_target_combinations() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+    let (input_validator, _) = &validators["insert_symbol"];
+    for request in invalid_insert_symbol_corpus() {
+        assert!(
+            input_validator.iter_errors(&request).next().is_some(),
+            "insert_symbol request must fail its advertised schema: {request:#}"
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A file `insert_symbol` creates lands in the rebuilt snapshot, so a later
+/// read sees the symbol it declares.
+#[tokio::test]
+async fn insert_symbol_file_target_creation_is_visible_to_a_later_read() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+
+    let created = client
+        .call_tool(
+            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
+                "file": "extra.rs",
+                "position": "after",
+                "create_missing": true,
+                "body": "pub fn beacon_extra_read() {}"
+            }))?),
+        )
+        .await?;
+    let created = created
+        .structured_content
+        .ok_or("insert_symbol must return structured content")?;
+    assert_eq!(
+        created["status"],
+        json!("applied"),
+        "a missing file target with create_missing must land: {created:#}"
+    );
+
+    let found = client
+        .call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({ "name": "beacon_extra_read" }))?),
+        )
+        .await?;
+    let found = found
+        .structured_content
+        .ok_or("get_symbol must return structured content")?;
+    let hits = found["hits"]
+        .as_array()
+        .ok_or("get_symbol must return hits")?;
+    assert!(
+        !hits.is_empty(),
+        "a file insert_symbol just created must be visible to a later read: {found:#}"
+    );
 
     client.cancel().await?;
     server_task.await?;

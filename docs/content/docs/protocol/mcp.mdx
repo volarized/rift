@@ -25,7 +25,8 @@ same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is 
 [`ChangeResult`](/docs/protocol/reference#ChangeResult) saying refused, never `isError` —
 while [`ErrorData`](/docs/protocol/reference#ErrorData) travels as the
 [JSON-RPC error](https://www.jsonrpc.org/specification#error_object)
-object's `data`, under code `-32000`.
+object's `data`, under code `-32000`. The exported schema at
+[`mcp.json`](https://volar.sh/rift/mcp.json) is the authoritative served shape.
 
 The server serializes change application per targeted tree: two concurrent changes against one
 tree apply one after the other, and the later one meets its preconditions against the earlier
@@ -58,9 +59,6 @@ filesystem tools.
 
 <VersionBadge version="v0.0.4" languages={["Rust"]} />
 
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
-
 `get_symbol` is the read to start from when the name is known. Its default `scope: "all"` searches
 project, dependency, standard-library, and external declarations. A hit includes source when its
 resolver supplied readable bytes; synthetic and source-less dependency declarations still carry
@@ -69,35 +67,34 @@ symbols and attaches their version-control timeline and co-change coupling.
 
 ### search [#tool-search]
 
-<VersionBadge version="v0.0.4" languages={["Rust"]} />
+<VersionBadge version="v0.0.6" languages={["Rust"]} />
 
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
+`search` takes a lexical `query`, narrowed or extended by a `paths` selector. `include` and
+`exclude` glob the project-relative path — the same glob engine backs the workspace's
+[`[source]`](/docs/configuration#source) policy — narrowing the indexed candidates before
+scoring. `force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
+index is parsed on demand and searched alongside the indexed hits, up to 256 matched files per
+request; a request whose `force_include` matches more than that refuses with `limit_exceeded`
+rather than searching a silently truncated set.
 
-`search` takes a lexical `query`, a `filter` over resolved provider facts, a bounded
-`traversal`, or a combination. A traversal starts from one symbol and states its intent.
-`trace` follows outgoing `calls`; `find_tests` follows incoming `tests`; `edit_ripple` follows
-incoming `calls`; and `review_context` follows `calls` in both directions. `direction` and
-`facets` override those defaults.
+The request shape also carries a `filter` over resolved provider facts and a bounded relationship
+`traversal`. The server does not implement either yet: a request naming one refuses with
+`capability_unavailable`. The server serves `query` and `paths` alone.
 
 Search defaults to `scope: "project"`. `scope: "dependencies"` searches resolved dependencies;
 `scope: "all"` also includes project, standard-library, and external declarations. A `paths`
 selector only applies to project scope because dependency paths belong to their packages, not the
 workspace folder.
 
-The server walks one hop unless `max_hops` asks for two, and visits no more than `max_nodes`.
-Each reached symbol carries `distance` and a `path` of audited relationship steps. This makes a
-two-hop result distinguishable from direct callers. Each relationship carries its source-node
-evidence and derivation; result coverage names the contributing provider revisions.
-
-For example, this request finds direct tests of one symbol without a separate graph tool:
+This request narrows the search to the tests tree, then reaches one file the workspace's
+`[source]` policy excludes from the index:
 
 ```json
 {
-  "traversal": {
-    "seed": "rift://symbol/python/pkg.solver.fit~1",
-    "intent": "find_tests",
-    "max_nodes": 10
+  "query": "test_fit",
+  "paths": {
+    "include": ["tests/**"],
+    "force_include": ["tests/legacy/test_solver.py"]
   }
 }
 ```
@@ -109,7 +106,7 @@ For example, this request finds direct tests of one symbol without a separate gr
   "hit": {
     "target": "symbol",
     "symbol": {
-      "id": "rift://symbol/python/tests.test_solver.test_fit",
+      "id": "rift://symbol/python/tests.legacy.test_solver.test_fit",
       "language": { "name": "python" },
       "name": "test_fit",
       "kind": "function",
@@ -117,7 +114,7 @@ For example, this request finds direct tests of one symbol without a separate gr
       "origin": {
         "location": { "kind": "project", "package": null },
         "source_kind": "authored",
-        "unit": "rift://source/src_mfrggzdfmztwq2lknnwg23tpob"
+        "unit": "rift://source/project/tests/legacy/test_solver.py"
       },
       "container": null,
       "modifiers": [],
@@ -130,28 +127,13 @@ For example, this request finds direct tests of one symbol without a separate gr
     }
   },
   "score": 1.0,
-  "matched_by": ["relationship"],
+  "matched_by": ["name"],
   "span": {
-    "unit": "rift://source/src_mfrggzdfmztwq2lknnwg23tpob",
+    "unit": "rift://source/project/tests/legacy/test_solver.py",
     "range": { "start": 120, "end": 168 }
   },
   "line": 8,
-  "path": [
-    {
-      "relationship": {
-        "from": "rift://symbol/python/tests.test_solver.test_fit",
-        "kind": "call",
-        "facets": ["calls", "tests"],
-        "to": "rift://symbol/python/pkg.solver.fit",
-        "evidence": [],
-        "derivation": "syntax",
-        "confidence": null,
-        "extensions": {}
-      },
-      "direction": "incoming"
-    }
-  ],
-  "distance": 1
+  "path": "tests/legacy/test_solver.py"
 }
 ```
 
@@ -204,15 +186,24 @@ A provider can return a declaration even when installed source is unavailable:
 }
 ```
 
-A traversal with `max_hops: 3` exceeds the contract bound.
+This request names a `traversal`, which the server does not serve:
+
+```json
+{
+  "traversal": {
+    "seed": "rift://symbol/python/pkg.solver.fit~1",
+    "intent": "find_tests"
+  }
+}
+```
 
 **Error data:**
 
 ```json
 {
-  "code": "invalid_request",
-  "message": "max_hops must be less than or equal to 2",
-  "retry": "never",
+  "code": "capability_unavailable",
+  "message": "no configured provider serves this request: capability filtered and traversal search; adjust the request to a served capability, or configure a provider that serves it",
+  "retry": "operator_action",
   "phase": "read",
   "diagnostics": [],
   "causes": []
@@ -222,9 +213,6 @@ A traversal with `max_hops: 3` exceeds the contract bound.
 ### nodes [#tool-nodes]
 
 <VersionBadge version="v0.0.4" languages={["Rust"]} />
-
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
 
 `nodes` lists the syntax regions covering one position, outermost first. Each identity carries
 the witness a later
@@ -267,43 +255,56 @@ first; a page requested after eviction or process restart returns `cursor_expire
 
 ### replace_symbol [#tool-replace_symbol]
 
-<VersionBadge version="v0.0.4" languages={["Rust"]} />
-
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
+<VersionBadge version="v0.0.6" languages={["Rust"]} />
 
 `replace_symbol` replaces one whole declaration addressed by symbol. The parser derives its
 span, so the caller supplies no offsets.
 
+That span reaches back over the declaration's attached outer attributes and doc comments —
+`#[derive(Debug)]` above a struct, the `///` lines above a function — so a replacement body also
+replaces that documentation. A blank line between a comment and the declaration detaches it,
+matching rustdoc's own attachment rule.
+
 ### insert_symbol [#tool-insert_symbol]
 
-<VersionBadge version="v0.0.4" languages={["Rust"]} />
-
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
+<VersionBadge version="v0.0.6" languages={["Rust"]} />
 
 `insert_symbol` inserts a new declaration before or after an existing one, addressed by its
-anchor symbol. The parser derives the anchor's span, so the caller supplies no offsets.
+anchor symbol, or content at a file target addressed by `file`. The parser derives the anchor's
+position from the same whole-declaration span `replace_symbol` uses, so inserting before an
+anchor lands above its attached doc comments and attributes rather than splicing between them
+and the declaration. A file target skips the parser: the body lands verbatim at the file's start
+or end.
+
+`create_missing` creates a missing file target first, parent directories included; without
+it, resolution refuses and names the missing target. `create_missing` is invalid together
+with `anchor`, which always addresses an existing file.
 
 ### replace_node [#tool-replace_node]
 
 <VersionBadge version="v0.0.4" languages={["Rust"]} />
-
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
 
 `replace_node` reaches below a declaration through a witnessed node address from
 [`nodes`](#tool-nodes).
 
 ### patch [#tool-patch]
 
-<VersionBadge version="v0.0.4" languages={["Rust"]} />
+<VersionBadge version="v0.0.6" languages={["Rust"]} />
 
-v0.0.4 serves this tool for Rust; the exported schema at `docs/protocol/mcp.json` is the
-authoritative served shape.
+`patch` applies a unified diff following [`git apply`](https://git-scm.com/docs/git-apply)
+semantics: a hunk's context and deleted lines locate it, and its `@@` header's line numbers are
+only a hint. Resolution starts each hunk's search at its header position, corrected by the drift
+already found from earlier hunks in the same file, then widens outward — nearer positions first,
+the earlier position breaking a tie.
 
-`patch` expresses scattered hunks and file-level changes through a unified diff guarded by its
-context lines.
+A `--- /dev/null` header creates the named file; a `+++ /dev/null` header deletes it. A hunk that
+renames or copies a file refuses as `unsupported`, because `patch` carries no rename or copy
+support.
+
+Earlier releases applied hunks through the `diffy` crate's own matcher, which needed the target
+file to already exist and, on a mismatch, reported only the parser's own error text. v0.0.6
+locates hunks itself and refuses with `unmet_precondition`, naming the failed hunk's ordinal, the
+file line the search reached, and the context it expected against what stood there instead.
 
 ### Change results
 

@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::read::{CoverageScope, ProjectPath};
+use crate::source::SourceConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
@@ -298,6 +299,8 @@ pub struct WorkspaceConfiguration {
     pub execution: ExecutionConfiguration,
     /// The embedding model that adds dense ranking to lexical search.
     pub search: SearchConfiguration,
+    /// Which files below the workspace root the index and reads consider visible.
+    pub source: SourceConfiguration,
     /// Hooks run in the changed tree, in list order, each time a change
     /// applies.
     #[schemars(length(max = 32))]
@@ -324,6 +327,7 @@ impl WorkspaceConfiguration {
             .violation()
             .or_else(|| self.providers.history.violation())
             .or_else(|| self.search.violation())
+            .or_else(|| self.source.violation())
             .or_else(|| hooks_violation(&self.hooks))
     }
 }
@@ -664,6 +668,15 @@ pub enum ConfigurationViolation {
         /// The rejected key.
         key: String,
     },
+    /// A `source.include` or `source.exclude` entry breaks the forward-slash-only path-pattern
+    /// contract: it is empty, absolute, carries a backslash or control character, or a `.` or
+    /// `..` segment.
+    PathPatternInvalid {
+        /// The key's path in the file: `source.include` or `source.exclude`.
+        field: &'static str,
+        /// The rejected pattern.
+        pattern: String,
+    },
 }
 
 impl ConfigurationViolation {
@@ -696,6 +709,9 @@ impl ConfigurationViolation {
             Self::HookEnvironmentKeyInvalid { id, key } => {
                 vec![("id", id.clone()), ("key", key.clone())]
             }
+            Self::PathPatternInvalid { field, pattern } => {
+                vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
+            }
         }
     }
 }
@@ -717,7 +733,7 @@ fn out_of_range(
 
 /// The first table row whose value sits outside its range, rows in key
 /// order.
-fn first_out_of_range<const ROWS: usize>(
+pub(crate) fn first_out_of_range<const ROWS: usize>(
     limits: [(&'static str, u64, u64, u64); ROWS],
 ) -> Option<ConfigurationViolation> {
     limits
@@ -883,6 +899,7 @@ fn is_absolute_program(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::SOURCE_PATTERNS_MAX;
     use serde_json::json;
 
     fn hook() -> CommandHook {
@@ -1043,6 +1060,9 @@ mod tests {
         assert!(configuration.providers.history.enabled);
         assert_eq!(configuration.providers.history.max_revisions, 500);
         assert_eq!(configuration.search.embedding, None);
+        assert!(configuration.source.include.is_empty());
+        assert!(configuration.source.exclude.is_empty());
+        assert!(configuration.source.respect_gitignore);
         assert!(configuration.hooks.is_empty());
         assert_eq!(configuration.validate(), Ok(()));
     }
@@ -1055,6 +1075,7 @@ mod tests {
             json!({ "providers": { "unknown": {} } }),
             json!({ "providers": { "history": { "unknown": 1 } } }),
             json!({ "search": { "unknown": "x" } }),
+            json!({ "source": { "unknown": "x" } }),
         ];
         for case in cases {
             assert!(
@@ -1412,6 +1433,16 @@ mod tests {
                 },
                 vec![("id", id()), ("key", "BAD=KEY".to_owned())],
             ),
+            (
+                ConfigurationViolation::PathPatternInvalid {
+                    field: "source.include",
+                    pattern: "src\\lib.rs".to_owned(),
+                },
+                vec![
+                    ("field", "source.include".to_owned()),
+                    ("pattern", "src\\lib.rs".to_owned()),
+                ],
+            ),
         ];
         for (violation, expected) in cases {
             assert_eq!(violation.evidence(), expected, "{violation:?}");
@@ -1468,6 +1499,7 @@ mod tests {
         let execution = &definitions["ExecutionConfiguration"]["properties"];
         let history = &definitions["HistoryConfiguration"]["properties"];
         let search = &definitions["SearchConfiguration"]["properties"];
+        let source = &definitions["SourceConfiguration"]["properties"];
         let hook = &definitions["CommandHook"]["properties"];
         let guarantee = &definitions["HookGuarantee"]["properties"];
         let cases = [
@@ -1506,6 +1538,16 @@ mod tests {
                 "embedding max",
                 &search["embedding"]["maxLength"],
                 json!(EMBEDDING_MODEL_BYTES_MAX),
+            ),
+            (
+                "source include max",
+                &source["include"]["maxItems"],
+                json!(SOURCE_PATTERNS_MAX),
+            ),
+            (
+                "source exclude max",
+                &source["exclude"]["maxItems"],
+                json!(SOURCE_PATTERNS_MAX),
             ),
             ("id min", &hook["id"]["minLength"], json!(1)),
             ("id max", &hook["id"]["maxLength"], json!(HOOK_ID_BYTES_MAX)),

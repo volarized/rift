@@ -1,14 +1,78 @@
-//! Registry conformance for the configuration model's fault types.
+//! Registry conformance for the configuration model's fault types, and the
+//! policy values `rift-index` reads out of it.
 //!
 //! The `rift.toml` model lives in `rift-protocol`, below this crate, so its
 //! fault types cannot implement [`Fault`] where they are defined. This module
 //! implements the registry trait over them, giving every configuration
-//! refusal the registry's identity, explanation, and rendering.
+//! refusal the registry's identity, explanation, and rendering. It also
+//! holds [`SourceVisibility`]: `rift-index` has no dependency on
+//! `rift-protocol`, so the workspace's `[source]` table is translated into
+//! this plain value here, beside the wire type it comes from.
 
 use rift_protocol::configuration::{ConfigurationViolation, UnitParseError};
+use rift_protocol::source::SourceConfiguration;
 
 use crate::error::{ErrorContext, ErrorName, Fault, fault_label};
 use rift_protocol::error::ErrorCode;
+
+/// Which files below a workspace root the index may see: the resolved
+/// `[source]` policy, independent of the wire model it was read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceVisibility {
+    include: Vec<String>,
+    exclude: Vec<String>,
+    respect_gitignore: bool,
+}
+
+impl SourceVisibility {
+    /// Builds one visibility policy from its three switches.
+    #[must_use]
+    pub const fn new(include: Vec<String>, exclude: Vec<String>, respect_gitignore: bool) -> Self {
+        Self {
+            include,
+            exclude,
+            respect_gitignore,
+        }
+    }
+
+    /// Patterns a file must match to stay visible; empty admits every file.
+    #[must_use]
+    pub fn include(&self) -> &[String] {
+        &self.include
+    }
+
+    /// Patterns that drop a file from visibility.
+    #[must_use]
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
+    /// Whether the workspace's own `.gitignore` chain hides matching files.
+    #[must_use]
+    pub const fn respect_gitignore(&self) -> bool {
+        self.respect_gitignore
+    }
+}
+
+impl Default for SourceVisibility {
+    /// Every file admitted, none excluded, `.gitignore` respected.
+    fn default() -> Self {
+        Self::new(Vec::new(), Vec::new(), true)
+    }
+}
+
+impl From<&SourceConfiguration> for SourceVisibility {
+    fn from(source: &SourceConfiguration) -> Self {
+        let patterns = |list: &[rift_protocol::read::PathPattern]| {
+            list.iter().map(|pattern| pattern.0.clone()).collect()
+        };
+        Self::new(
+            patterns(&source.include),
+            patterns(&source.exclude),
+            source.respect_gitignore,
+        )
+    }
+}
 
 impl Fault for UnitParseError {
     fn name(&self) -> ErrorName {
@@ -44,6 +108,28 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use rift_protocol::configuration::{ByteSize, Duration};
+    use rift_protocol::read::PathPattern;
+
+    #[test]
+    fn test_source_visibility_converts_from_wire_configuration() {
+        let source = SourceConfiguration {
+            include: vec![PathPattern("src/**".to_owned())],
+            exclude: vec![PathPattern("src/generated/**".to_owned())],
+            respect_gitignore: false,
+        };
+        let visibility = SourceVisibility::from(&source);
+        assert_eq!(visibility.include(), ["src/**"]);
+        assert_eq!(visibility.exclude(), ["src/generated/**"]);
+        assert!(!visibility.respect_gitignore());
+    }
+
+    #[test]
+    fn test_source_visibility_default_admits_everything_and_respects_gitignore() {
+        let visibility = SourceVisibility::default();
+        assert!(visibility.include().is_empty());
+        assert!(visibility.exclude().is_empty());
+        assert!(visibility.respect_gitignore());
+    }
 
     #[test]
     fn test_unit_parse_failure_renders_through_the_registry() {
