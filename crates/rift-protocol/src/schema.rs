@@ -315,6 +315,25 @@ pub fn declare_server_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`TextSearchConfiguration`](crate::configuration::TextSearchConfiguration) states its
+/// `ByteSize` ceiling as `rift:range` on the key: schema validation alone cannot compare
+/// `"1mb"` against a ceiling, so the server enforces the bound at load and the schema carries
+/// it for readers.
+pub fn declare_text_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ByteSize, TEXT_CHUNK_BYTES_MAX, TEXT_CHUNK_BYTES_MIN, TextSearchConfiguration,
+    };
+    annotate_property(
+        schema,
+        property!(TextSearchConfiguration, max_chunk),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(TEXT_CHUNK_BYTES_MIN),
+            &ByteSize::from_bytes(TEXT_CHUNK_BYTES_MAX),
+        ),
+    );
+}
+
 /// An [`ErrorData`](crate::error::ErrorData) carries `limit` only when
 /// `code` is `limit_exceeded`; any other code forbids it.
 pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
@@ -689,6 +708,18 @@ mod tests {
             schema["properties"]["blocking_queue_timeout"][RIFT_RANGE],
             json!({ "min": "1ms", "max": "1h" }),
             "blocking_queue_timeout must state its admitted range"
+        );
+    }
+
+    #[test]
+    fn text_search_configuration_schema_states_range_on_max_chunk() {
+        let schema =
+            serde_json::to_value(schema_for!(crate::configuration::TextSearchConfiguration))
+                .expect("schema");
+        assert_eq!(
+            schema["properties"]["max_chunk"][RIFT_RANGE],
+            json!({ "min": "1kb", "max": "16mb" }),
+            "max_chunk must state its admitted range"
         );
     }
 
