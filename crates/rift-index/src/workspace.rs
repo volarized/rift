@@ -1956,4 +1956,60 @@ mod tests {
             WorkspaceIndexViolation::InvalidSource
         );
     }
+
+    #[test]
+    fn test_descendant_admission_refuses_paths_outside_root() {
+        let directory = fixture();
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("source policy");
+        assert!(!policy.may_admit_descendant(Path::new("/rift-elsewhere")));
+    }
+
+    #[test]
+    fn test_hard_floor_refuses_event_paths_outside_root() {
+        assert!(!hard_floor_admits_path(
+            Path::new("/rift-workspace"),
+            Path::new("/rift-elsewhere/lib.rs")
+        ));
+    }
+
+    #[test]
+    fn test_gitignore_files_beyond_the_file_bound_are_refused() {
+        let directory = fixture();
+        fs::write(directory.path().join(".gitignore"), "target\n").expect("root ignore");
+        fs::write(directory.path().join("src/.gitignore"), "generated\n").expect("nested ignore");
+        let tight = WorkspaceIndexLimits::new(1, 4_096, 65_536, 8, 10).expect("bounds");
+        let error =
+            WorkspaceSourcePolicy::build(directory.path(), tight, &SourceVisibility::default())
+                .expect_err("second ignore file must breach the file bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::TooManyFiles
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unreadable_gitignore_is_a_filesystem_refusal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = fixture();
+        let ignore = directory.path().join(".gitignore");
+        fs::write(&ignore, "target\n").expect("ignore fixture");
+        fs::set_permissions(&ignore, fs::Permissions::from_mode(0o000)).expect("revoke read");
+        let error = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect_err("unreadable ignore file must be refused");
+        fs::set_permissions(&ignore, fs::Permissions::from_mode(0o644)).expect("restore read");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+    }
 }

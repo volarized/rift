@@ -150,6 +150,13 @@ mod tests {
     }
 
     #[test]
+    fn test_directory_admission_refuses_paths_outside_root() {
+        let root = Path::new("/workspace");
+        let matcher = PathMatcher::build(root, &["src/**".to_owned()], &[]).expect("valid glob");
+        assert!(!matcher.may_admit_descendant(Path::new("/elsewhere/src")));
+    }
+
+    #[test]
     fn test_directory_admission_tracks_possible_includes_and_excluded_subtrees() {
         let root = Path::new("/workspace");
         let matcher = PathMatcher::build(
