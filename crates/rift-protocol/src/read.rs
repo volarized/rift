@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 // here keeps every existing `rift_protocol::read::SearchParams`-style path resolving.
 pub use crate::search::{
     ElementFilter, FieldFilter, FieldFilterOp, Filter, GraphHop, HopDirection, MatchedField,
-    PathPattern, PathSelector, RelationFilter, RelationFilterDirection, RelationFilterQuantifier,
-    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchIntent, SearchParams,
-    SearchParamsTarget, SearchResult, SearchTraversal, TraversalDirection,
+    PathPattern, PathPatternViolation, PathSelector, RelationFilter, RelationFilterDirection,
+    RelationFilterQuantifier, ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchIntent,
+    SearchParams, SearchParamsTarget, SearchResult, SearchTraversal, TraversalDirection,
 };
 
 pub(crate) fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

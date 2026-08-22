@@ -6433,7 +6433,7 @@
             ]
           },
           "PathPattern": {
-            "description": "Project-relative glob using *, ?, **, and character classes.",
+            "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
             "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$",
             "type": "string"
           },

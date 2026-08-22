@@ -2,11 +2,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ignore::{DirEntry, WalkBuilder};
+use ignore::{DirEntry, Walk, WalkBuilder};
 use rift_core::constants::{
-    READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, WORKSPACE_BYTES_MAX_DEFAULT,
-    WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
-    WORKSPACE_IGNORED_DIRECTORIES,
+    READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, SOURCE_FILE_EXTENSIONS,
+    WORKSPACE_BYTES_MAX_DEFAULT, WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
+    WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
     CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
@@ -412,8 +412,12 @@ impl WorkspaceIndex {
         let parser = RustSyntaxProvider::default();
         let mut extra_bytes = 0_usize;
         let mut files = Vec::new();
-        let walker = walk_without_gitignore(&self.root, self.limits.directory_depth_max);
-        for entry in walker.build() {
+        let walker = source_walk(
+            &self.root,
+            self.limits.directory_depth_max,
+            GitignorePolicy::Ignore,
+        );
+        for entry in walker {
             let entry = entry.map_err(|error| walk_error(&self.root, error))?;
             let file_type = entry.file_type();
             if file_type.is_some_and(|file_type| file_type.is_dir()) {
@@ -429,7 +433,7 @@ impl WorkspaceIndex {
                 continue;
             }
             let path = entry.path();
-            if path.extension().is_none_or(|extension| extension != "rs") {
+            if !has_source_extension(path) {
                 continue;
             }
             if !matcher.admits(path) {
@@ -574,10 +578,9 @@ fn discover(
     visibility: &SourceVisibility,
 ) -> Result<Vec<PathBuf>, WorkspaceIndexError> {
     let matcher = PathMatcher::build(root, visibility.include(), visibility.exclude())?;
-    let mut walker = base_walker(root, limits.directory_depth_max);
-    walker.git_ignore(visibility.respect_gitignore());
+    let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
     let mut files = Vec::new();
-    for entry in walker.build() {
+    for entry in source_walk(root, limits.directory_depth_max, gitignore) {
         let entry = entry.map_err(|error| walk_error(root, error))?;
         let file_type = entry.file_type();
         if file_type.is_some_and(|file_type| file_type.is_dir()) {
@@ -593,7 +596,7 @@ fn discover(
             continue;
         }
         let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "rs") {
+        if !has_source_extension(path) {
             continue;
         }
         if !matcher.admits(path) {
@@ -608,27 +611,42 @@ fn discover(
     Ok(files)
 }
 
-/// One depth-bounded, hard-floor-filtered walk builder rooted at `root`, shared by the
-/// `[source]`-scoped scan and `force_include`'s on-demand walk. The caller still chooses whether
-/// `.gitignore` applies.
-fn base_walker(root: &Path, directory_depth_max: usize) -> WalkBuilder {
-    let mut walker = WalkBuilder::new(root);
-    walker
+/// Whether a workspace walk also consults the workspace's own `.gitignore` chain, on top of the
+/// hard floor it always applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitignorePolicy {
+    /// `.gitignore` files, root and nested, hide the paths they match.
+    Respect,
+    /// `.gitignore` is not consulted; only the hard floor stays unreachable.
+    Ignore,
+}
+
+impl GitignorePolicy {
+    /// The policy matching `SourceVisibility::respect_gitignore`'s configured value.
+    const fn from_respecting(respect_gitignore: bool) -> Self {
+        if respect_gitignore {
+            Self::Respect
+        } else {
+            Self::Ignore
+        }
+    }
+}
+
+/// One depth-bounded, hard-floor-filtered walk rooted at `root`, shared by the `[source]`-scoped
+/// scan and `force_include`'s on-demand walk. `gitignore` selects whether the workspace's own
+/// `.gitignore` chain also applies; the hard floor, depth bound, and file-name order are the
+/// same either way.
+fn source_walk(root: &Path, directory_depth_max: usize, gitignore: GitignorePolicy) -> Walk {
+    let mut builder = WalkBuilder::new(root);
+    builder
         .standard_filters(false)
         .require_git(false)
         .follow_links(false)
         .max_depth(Some(directory_depth_max.saturating_add(1)))
         .sort_by_file_name(OsStr::cmp)
-        .filter_entry(hard_floor_admits);
-    walker
-}
-
-/// The walk `force_include` uses to reach files the ordinary scan excludes: the hard floor still
-/// applies, but `.gitignore` and `[source]` policy do not.
-fn walk_without_gitignore(root: &Path, directory_depth_max: usize) -> WalkBuilder {
-    let mut walker = base_walker(root, directory_depth_max);
-    walker.git_ignore(false);
-    walker
+        .filter_entry(hard_floor_admits)
+        .git_ignore(gitignore == GitignorePolicy::Respect);
+    builder.build()
 }
 
 /// The hard floor every workspace applies before `.gitignore` or
@@ -650,6 +668,15 @@ fn hard_floor_admits(entry: &DirEntry) -> bool {
 fn is_ignored_directory(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
+}
+
+/// Whether `path`'s extension is one of [`SOURCE_FILE_EXTENSIONS`]: the single list every
+/// workspace walk consults, so a new grammar's extension joins the scan by extending that list
+/// alone.
+fn has_source_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| SOURCE_FILE_EXTENSIONS.contains(&extension))
 }
 
 /// The path one `ignore` walk failure names, when its cause names one.

@@ -15,6 +15,7 @@ use std::path::Path;
 
 use diffy::{Hunk, HunkRange, Line, ParsePatchError, Patch};
 use rift_core::ProjectPath as CoreProjectPath;
+use rift_core::line;
 use rift_protocol::change::{
     ChangeResult, OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus,
     PreconditionValue, RefusalReason,
@@ -28,6 +29,19 @@ pub(crate) const PATCH_FILES_MAX: usize = 64;
 
 /// Longest hunk-mismatch detail one precondition value carries.
 const PATCH_MISMATCH_DETAIL_BYTES_MAX: usize = 256;
+
+/// Opens a unified diff's original-file header line, such as `--- a/src/lib.rs`.
+const ORIGINAL_HEADER_PREFIX: &str = "--- ";
+
+/// Opens a unified diff's modified-file header line, such as `+++ b/src/lib.rs`.
+const MODIFIED_HEADER_PREFIX: &str = "+++ ";
+
+/// Opens a unified diff's hunk header line, such as `@@ -1,2 +1,3 @@`.
+const HUNK_HEADER_PREFIX: &str = "@@";
+
+/// The header path marking that a segment creates or deletes its file
+/// instead of editing an existing one.
+const NULL_TARGET: &str = "/dev/null";
 
 /// How one resolved file segment changes the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,45 +72,67 @@ pub(crate) struct FileRewrite {
 /// as hunk-context drift, never a silent rewrite. Only structural lines
 /// shed a CRLF ending, because the diff parser rejects `\r` in headers.
 pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
-    let mut segments: Vec<String> = Vec::new();
-    let mut segment_line = 0_usize;
-    for line in patch.split_inclusive('\n') {
-        if line.starts_with("--- ") {
-            if segments.len() == PATCH_FILES_MAX {
-                return Err(ReadFault::invalid(
-                    "patch",
-                    format!("addresses more than {PATCH_FILES_MAX} files"),
-                ));
-            }
-            segments.push(String::new());
-            segment_line = 0;
-        }
-        if let Some(segment) = segments.last_mut() {
-            let structural = segment_line == 0
-                || (segment_line == 1 && line.starts_with("+++ "))
-                || line.starts_with("@@");
-            push_segment_line(segment, line, structural);
-            segment_line += 1;
-        }
+    let (_, raw_segments) = split_at_marker(patch, |line| line.starts_with(ORIGINAL_HEADER_PREFIX));
+    if raw_segments.len() > PATCH_FILES_MAX {
+        return Err(ReadFault::invalid(
+            "patch",
+            format!("addresses more than {PATCH_FILES_MAX} files"),
+        ));
     }
-    if segments.is_empty() {
+    if raw_segments.is_empty() {
         return Err(ReadFault::invalid("patch", "carries no `---` file header"));
     }
-    Ok(segments)
+    Ok(raw_segments
+        .iter()
+        .map(|raw| normalize_segment(raw))
+        .collect())
 }
 
-/// Appends one diff line to its segment. A structural line — the `---` and
-/// `+++` file headers and `@@` hunk headers — sheds a CRLF ending, because
-/// the diff parser rejects `\r` there; body lines keep their exact bytes so
-/// hunk content matches the stored source byte-for-byte.
+/// Sheds each of `raw`'s structural line endings down to a bare `\n`,
+/// leaving body-line bytes untouched. See [`push_segment_line`] for which
+/// lines count as structural and why.
+fn normalize_segment(raw: &str) -> String {
+    let mut segment = String::new();
+    for (index, text) in line::lines_inclusive(raw).enumerate() {
+        let structural = index == 0
+            || (index == 1 && text.starts_with(MODIFIED_HEADER_PREFIX))
+            || text.starts_with(HUNK_HEADER_PREFIX);
+        push_segment_line(&mut segment, text, structural);
+    }
+    segment
+}
+
+/// Appends one diff line to its segment. A structural line — the `--- ` and
+/// `+++ ` file headers and `@@` hunk headers — sheds a CRLF ending down to
+/// bare `\n`, because the diff parser rejects `\r` there; body lines keep
+/// their exact bytes, CRLF included, so hunk content matches the stored
+/// source byte-for-byte.
 fn push_segment_line(segment: &mut String, line: &str, structural: bool) {
-    match (structural, line.strip_suffix("\r\n")) {
+    match (structural, line.strip_suffix(rift_core::line::CRLF)) {
         (true, Some(stripped)) => {
             segment.push_str(stripped);
-            segment.push('\n');
+            segment.push_str(rift_core::line::LineEnding::Lf.as_str());
         }
         _ => segment.push_str(line),
     }
+}
+
+/// Scans `text` line by line through [`line::lines_inclusive`], opening a
+/// new segment whenever `opens_segment` matches a line, and returns the
+/// bytes before the first match alongside each segment's own bytes.
+fn split_at_marker(text: &str, opens_segment: impl Fn(&str) -> bool) -> (String, Vec<String>) {
+    let mut prefix = String::new();
+    let mut segments: Vec<String> = Vec::new();
+    for text_line in line::lines_inclusive(text) {
+        if opens_segment(text_line) {
+            segments.push(String::new());
+        }
+        match segments.last_mut() {
+            Some(segment) => segment.push_str(text_line),
+            None => prefix.push_str(text_line),
+        }
+    }
+    (prefix, segments)
 }
 
 /// Resolves one file segment to its rewrite plan, or the refusal for a
@@ -150,18 +186,7 @@ fn named_parse_error(segment: &str, ordinal: usize, error: &ParsePatchError) -> 
 /// Splits one file segment into its shared header and each hunk's own
 /// text, so a hunk can be re-parsed against the header alone.
 fn split_into_hunks(segment: &str) -> (String, Vec<String>) {
-    let mut header = String::new();
-    let mut hunks: Vec<String> = Vec::new();
-    for line in segment.split_inclusive('\n') {
-        if line.starts_with("@@") {
-            hunks.push(String::new());
-        }
-        match hunks.last_mut() {
-            Some(hunk) => hunk.push_str(line),
-            None => header.push_str(line),
-        }
-    }
-    (header, hunks)
+    split_at_marker(segment, |text| text.starts_with(HUNK_HEADER_PREFIX))
 }
 
 /// What one parsed file segment addresses.
@@ -192,7 +217,7 @@ fn resolve_patch_target(
              relative on every platform, such as `src/lib.rs`",
         ));
     }
-    let target = match (original == "/dev/null", modified == "/dev/null") {
+    let target = match (original == NULL_TARGET, modified == NULL_TARGET) {
         (true, true) => {
             return Ok(Err(ChangeResult::refused(
                 RefusalReason::Unsupported,
@@ -336,18 +361,23 @@ impl<'a> ImageLine<'a> {
 /// positions, since the search distance never usefully exceeds the
 /// image's length.
 fn apply_segment(starting: &str, parsed: &Patch<'_, str>) -> Result<String, MismatchDetail> {
-    let mut image: Vec<ImageLine<'_>> = starting
-        .split_inclusive('\n')
+    let mut image: Vec<ImageLine<'_>> = line::lines_inclusive(starting)
         .map(ImageLine::Original)
         .collect();
     let mut delta: i64 = 0;
     for (index, hunk) in parsed.hunks().iter().enumerate() {
-        let pre_image = pre_image_lines(hunk);
-        let post_image = post_image_lines(hunk);
+        let pre_image = image_lines(hunk, HunkImage::Pre);
+        let post_image = image_lines(hunk, HunkImage::Post);
         let expected = zero_based_start(hunk.new_range());
         let anchor = clamp_anchor(expected, delta, image.len());
         let Some(found) = find_hunk_position(&image, &pre_image, anchor) else {
-            return Err(mismatch_detail(index + 1, hunk, anchor, &pre_image, &image));
+            return Err(MismatchDetail::new(
+                index + 1,
+                hunk,
+                anchor,
+                &pre_image,
+                &image,
+            ));
         };
         delta = i64::try_from(found).unwrap_or(0) - i64::try_from(expected).unwrap_or(0);
         let patched: Vec<ImageLine<'_>> =
@@ -421,34 +451,39 @@ fn matches_at(image: &[ImageLine<'_>], pre_image: &[&str], pos: usize) -> bool {
         .eq(pre_image.iter().copied())
 }
 
-fn pre_image_lines<'a>(hunk: &Hunk<'a, str>) -> Vec<&'a str> {
+/// Which half of a hunk's lines [`image_lines`] selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HunkImage {
+    /// The lines a hunk expects to find at its position: context and
+    /// deleted lines.
+    Pre,
+    /// The lines a hunk leaves behind after applying: context and
+    /// inserted lines.
+    Post,
+}
+
+/// Selects one side of `hunk`'s lines: [`HunkImage::Pre`] keeps context
+/// and deleted lines (what the search must locate), [`HunkImage::Post`]
+/// keeps context and inserted lines (what replaces the located run).
+fn image_lines<'a>(hunk: &Hunk<'a, str>, image: HunkImage) -> Vec<&'a str> {
     hunk.lines()
         .iter()
-        .filter_map(|line| match line {
-            Line::Context(text) | Line::Delete(text) => Some(*text),
-            Line::Insert(_) => None,
+        .filter_map(|line| match (image, line) {
+            (HunkImage::Pre, Line::Context(text) | Line::Delete(text))
+            | (HunkImage::Post, Line::Context(text) | Line::Insert(text)) => Some(*text),
+            _ => None,
         })
         .collect()
 }
 
-fn post_image_lines<'a>(hunk: &Hunk<'a, str>) -> Vec<&'a str> {
-    hunk.lines()
-        .iter()
-        .filter_map(|line| match line {
-            Line::Context(text) | Line::Insert(text) => Some(*text),
-            Line::Delete(_) => None,
-        })
-        .collect()
-}
-
+/// Renders the standard `@@ -old +new @@` git hunk header text, through
+/// diffy's own `Display` for `hunk`'s old and new ranges.
 fn hunk_header_text(hunk: &Hunk<'_, str>) -> String {
-    format!("@@ -{} +{} @@", hunk.old_range(), hunk.new_range())
-}
-
-fn without_line_ending(line: &str) -> &str {
-    line.strip_suffix("\r\n")
-        .or_else(|| line.strip_suffix('\n'))
-        .unwrap_or(line)
+    format!(
+        "{HUNK_HEADER_PREFIX} -{} +{} {HUNK_HEADER_PREFIX}",
+        hunk.old_range(),
+        hunk.new_range()
+    )
 }
 
 /// What a hunk expected at the position it could not be found: the hunk
@@ -461,43 +496,41 @@ struct MismatchDetail {
     observed: String,
 }
 
-fn mismatch_detail(
-    ordinal: usize,
-    hunk: &Hunk<'_, str>,
-    anchor: usize,
-    pre_image: &[&str],
-    image: &[ImageLine<'_>],
-) -> MismatchDetail {
-    let expected = pre_image.first().copied().unwrap_or_default();
-    let observed = image.get(anchor).copied().map(ImageLine::text);
-    MismatchDetail {
-        ordinal,
-        header: hunk_header_text(hunk),
-        line: anchor + 1,
-        expected: without_line_ending(expected).to_owned(),
-        observed: observed.map_or_else(
-            || "end of file".to_owned(),
-            |text| without_line_ending(text).to_owned(),
-        ),
-    }
-}
-
 impl MismatchDetail {
+    /// Builds the detail for hunk `ordinal`'s failed search: the header it
+    /// carries, the position `anchor` it was tried at, what it expected to
+    /// find there, and what stood there instead.
+    fn new(
+        ordinal: usize,
+        hunk: &Hunk<'_, str>,
+        anchor: usize,
+        pre_image: &[&str],
+        image: &[ImageLine<'_>],
+    ) -> Self {
+        let expected = pre_image.first().copied().unwrap_or_default();
+        let observed = image.get(anchor).copied().map(ImageLine::text);
+        Self {
+            ordinal,
+            header: hunk_header_text(hunk),
+            line: anchor + 1,
+            expected: line::without_ending(expected).to_owned(),
+            observed: observed.map_or_else(
+                || "end of file".to_owned(),
+                |text| line::without_ending(text).to_owned(),
+            ),
+        }
+    }
+
     fn into_refusal(self, path: &CoreProjectPath) -> ChangeResult {
-        ChangeResult::refused(
-            RefusalReason::UnmetPrecondition,
-            vec![OperationPrecondition::new(
-                OperationPreconditionKind::SourceUnchanged,
-                OperationPreconditionStatus::Failed,
-                Vec::new(),
-                vec![path.as_str().to_owned()],
-                PreconditionValue::Text {
-                    value: truncate_detail(self.side_text("expected", &self.expected)),
-                },
-                PreconditionValue::Text {
-                    value: truncate_detail(self.side_text("found", &self.observed)),
-                },
-            )],
+        precondition_refusal(
+            OperationPreconditionKind::SourceUnchanged,
+            path,
+            PreconditionValue::Text {
+                value: truncate_detail(self.side_text("expected", &self.expected)),
+            },
+            PreconditionValue::Text {
+                value: truncate_detail(self.side_text("found", &self.observed)),
+            },
         )
     }
 
@@ -520,68 +553,71 @@ fn truncate_detail(mut value: String) -> String {
     value
 }
 
-fn target_missing_refusal(path: &CoreProjectPath) -> ChangeResult {
+/// Builds an `UnmetPrecondition` refusal for `path`, naming `kind`'s
+/// expected and observed values. Every fixed-shape single-precondition
+/// refusal in this module routes through this constructor, so their
+/// differences stay only in `kind`, `expected`, and `observed`.
+fn precondition_refusal(
+    kind: OperationPreconditionKind,
+    path: &CoreProjectPath,
+    expected: PreconditionValue,
+    observed: PreconditionValue,
+) -> ChangeResult {
     ChangeResult::refused(
         RefusalReason::UnmetPrecondition,
         vec![OperationPrecondition::new(
-            OperationPreconditionKind::TargetExists,
+            kind,
             OperationPreconditionStatus::Failed,
             Vec::new(),
             vec![path.as_str().to_owned()],
-            PreconditionValue::Boolean { value: true },
-            PreconditionValue::Boolean { value: false },
+            expected,
+            observed,
         )],
+    )
+}
+
+fn target_missing_refusal(path: &CoreProjectPath) -> ChangeResult {
+    precondition_refusal(
+        OperationPreconditionKind::TargetExists,
+        path,
+        PreconditionValue::Boolean { value: true },
+        PreconditionValue::Boolean { value: false },
     )
 }
 
 fn already_exists_refusal(path: &CoreProjectPath) -> ChangeResult {
-    ChangeResult::refused(
-        RefusalReason::UnmetPrecondition,
-        vec![OperationPrecondition::new(
-            OperationPreconditionKind::TargetExists,
-            OperationPreconditionStatus::Failed,
-            Vec::new(),
-            vec![path.as_str().to_owned()],
-            PreconditionValue::Boolean { value: false },
-            PreconditionValue::Boolean { value: true },
-        )],
+    precondition_refusal(
+        OperationPreconditionKind::TargetExists,
+        path,
+        PreconditionValue::Boolean { value: false },
+        PreconditionValue::Boolean { value: true },
     )
 }
 
 fn source_drift_refusal(path: &CoreProjectPath, indexed: &str, disk: &str) -> ChangeResult {
-    ChangeResult::refused(
-        RefusalReason::UnmetPrecondition,
-        vec![OperationPrecondition::new(
-            OperationPreconditionKind::SourceUnchanged,
-            OperationPreconditionStatus::Failed,
-            Vec::new(),
-            vec![path.as_str().to_owned()],
-            PreconditionValue::Text {
-                value: digest_hex8(indexed),
-            },
-            PreconditionValue::Text {
-                value: digest_hex8(disk),
-            },
-        )],
+    precondition_refusal(
+        OperationPreconditionKind::SourceUnchanged,
+        path,
+        PreconditionValue::Text {
+            value: digest_hex8(indexed),
+        },
+        PreconditionValue::Text {
+            value: digest_hex8(disk),
+        },
     )
 }
 
 fn deletion_incomplete_refusal(path: &CoreProjectPath, remaining: &str) -> ChangeResult {
-    let lines = remaining.split_inclusive('\n').count();
-    ChangeResult::refused(
-        RefusalReason::UnmetPrecondition,
-        vec![OperationPrecondition::new(
-            OperationPreconditionKind::SourceUnchanged,
-            OperationPreconditionStatus::Failed,
-            Vec::new(),
-            vec![path.as_str().to_owned()],
-            PreconditionValue::Text {
-                value: "file fully deleted".to_owned(),
-            },
-            PreconditionValue::Text {
-                value: truncate_detail(format!("{lines} line(s) remain after applying the hunks")),
-            },
-        )],
+    let lines = line::lines_inclusive(remaining).count();
+    precondition_refusal(
+        OperationPreconditionKind::SourceUnchanged,
+        path,
+        PreconditionValue::Text {
+            value: "file fully deleted".to_owned(),
+        },
+        PreconditionValue::Text {
+            value: truncate_detail(format!("{lines} line(s) remain after applying the hunks")),
+        },
     )
 }
 
