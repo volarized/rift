@@ -52,6 +52,9 @@ pub const WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT: usize = 64;
 pub const READ_RESULTS_MAX_DEFAULT: usize = 1_000;
 /// Directories excluded from current-workspace indexing.
 pub const WORKSPACE_IGNORED_DIRECTORIES: &[&str] = &[".git", ".rift", "target"];
+/// File extensions a workspace walk admits as source, without their leading dot. Extend this
+/// list, and only this list, when a new grammar joins the workspace scan.
+pub const SOURCE_FILE_EXTENSIONS: &[&str] = &["rs"];
 /// Default maximum results returned by one search call.
 pub const SEARCH_RESULTS_DEFAULT: usize = 20;
 /// Maximum files one search's `paths.force_include` may pull into the index on demand.

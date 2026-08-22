@@ -38,14 +38,14 @@ impl PathMatcher {
     /// `exclude`.
     #[must_use]
     pub fn admits(&self, path: &Path) -> bool {
-        let admitted = self
-            .include
-            .as_ref()
-            .is_none_or(|overrides| matches(overrides, path));
-        let dropped = self
-            .exclude
-            .as_ref()
-            .is_some_and(|overrides| matches(overrides, path));
+        let admitted = match &self.include {
+            Some(overrides) => matches(overrides, path),
+            None => true,
+        };
+        let dropped = match &self.exclude {
+            Some(overrides) => matches(overrides, path),
+            None => false,
+        };
         admitted && !dropped
     }
 }
@@ -112,6 +112,20 @@ mod tests {
         .expect("valid globs");
         assert!(matcher.admits(Path::new("/workspace/src/lib.rs")));
         assert!(!matcher.admits(Path::new("/workspace/src/generated/gen.rs")));
+    }
+
+    #[test]
+    fn test_admits_matches_a_candidate_path_built_with_join() {
+        // Patterns are always forward-slash; the candidate path is not. Building it with
+        // `Path::join` instead of a forward-slash literal exercises the OS-native separator
+        // `ignore::overrides::Override` sees on every platform, Windows included.
+        let root = Path::new("/workspace");
+        let matcher =
+            PathMatcher::build(root, &["src/**/*.rs".to_owned()], &[]).expect("valid glob");
+        let candidate = root.join("src").join("nested").join("deep.rs");
+        assert!(matcher.admits(&candidate));
+        let excluded = root.join("other.rs");
+        assert!(!matcher.admits(&excluded));
     }
 
     #[test]

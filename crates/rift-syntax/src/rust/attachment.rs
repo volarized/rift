@@ -7,6 +7,8 @@
 //! go-to-definition do: replacing or inserting beside a symbol must not
 //! splice between its documentation and its item.
 
+use std::sync::OnceLock;
+
 use tree_sitter::Node;
 
 /// Grammar field naming the marker that classifies a `line_comment` or
@@ -16,6 +18,65 @@ use tree_sitter::Node;
 /// rustdoc's own `///` / `////` / `/**` / `/***` / `/**/` lexing rules from
 /// comment text.
 const OUTER_DOC_MARKER_FIELD: &str = "outer";
+
+/// Grammar spelling of an outer attribute, from tree-sitter-rust's
+/// `node-types.json`.
+const ATTRIBUTE_ITEM_KIND: &str = "attribute_item";
+/// Grammar spelling of a `//` comment, from tree-sitter-rust's
+/// `node-types.json`.
+const LINE_COMMENT_KIND: &str = "line_comment";
+/// Grammar spelling of a `/* */` comment, from tree-sitter-rust's
+/// `node-types.json`.
+const BLOCK_COMMENT_KIND: &str = "block_comment";
+
+/// Numeric grammar ids for the node kinds [`is_attached`] classifies,
+/// resolved once from the pinned Tree-sitter Rust language so each
+/// classification compares integers instead of node-kind strings.
+struct AttachmentKinds {
+    attribute_item: u16,
+    line_comment: u16,
+    block_comment: u16,
+}
+
+impl AttachmentKinds {
+    /// Resolves every kind id this module reads from `language`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pinned grammar has no node kind by one of the named
+    /// spellings: `id_for_node_kind` returning `0` means the grammar the
+    /// runtime loaded no longer defines a kind this module depends on, a
+    /// programmer/grammar-version error rather than a reachable runtime
+    /// state.
+    fn resolve(language: &tree_sitter::Language) -> Self {
+        let attribute_item = language.id_for_node_kind(ATTRIBUTE_ITEM_KIND, true);
+        let line_comment = language.id_for_node_kind(LINE_COMMENT_KIND, true);
+        let block_comment = language.id_for_node_kind(BLOCK_COMMENT_KIND, true);
+        assert!(
+            attribute_item != 0,
+            "pinned Rust grammar must define node kind: kind={ATTRIBUTE_ITEM_KIND}"
+        );
+        assert!(
+            line_comment != 0,
+            "pinned Rust grammar must define node kind: kind={LINE_COMMENT_KIND}"
+        );
+        assert!(
+            block_comment != 0,
+            "pinned Rust grammar must define node kind: kind={BLOCK_COMMENT_KIND}"
+        );
+        Self {
+            attribute_item,
+            line_comment,
+            block_comment,
+        }
+    }
+}
+
+/// Returns the process-wide resolved [`AttachmentKinds`], computing it once.
+fn attachment_kinds() -> &'static AttachmentKinds {
+    static KINDS: OnceLock<AttachmentKinds> = OnceLock::new();
+    KINDS.get_or_init(|| AttachmentKinds::resolve(&super::rust_language()))
+}
 
 /// Returns the byte offset where `node`'s whole declaration starts.
 ///
@@ -53,13 +114,15 @@ pub(super) fn declaration_start(node: Node<'_>, text: &str) -> usize {
 /// Reports whether `node` is an attribute or an outer doc comment, either
 /// of which can attach to a following declaration.
 fn is_attached(node: Node<'_>) -> bool {
-    match node.kind() {
-        "attribute_item" => true,
-        "line_comment" | "block_comment" => {
-            node.child_by_field_name(OUTER_DOC_MARKER_FIELD).is_some()
-        }
-        _ => false,
+    let kinds = attachment_kinds();
+    let kind_id = node.kind_id();
+    if kind_id == kinds.attribute_item {
+        return true;
     }
+    if kind_id == kinds.line_comment || kind_id == kinds.block_comment {
+        return node.child_by_field_name(OUTER_DOC_MARKER_FIELD).is_some();
+    }
+    false
 }
 
 /// Reports whether the whitespace between an attachable sibling and the

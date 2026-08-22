@@ -38,7 +38,8 @@ impl Default for SourceConfiguration {
 }
 
 impl SourceConfiguration {
-    /// The table's list-length bounds, in key order.
+    /// The table's list-length bounds, then each pattern's forward-slash-only contract, in
+    /// key then list order.
     pub(crate) fn violation(&self) -> Option<ConfigurationViolation> {
         first_out_of_range([
             (
@@ -54,7 +55,24 @@ impl SourceConfiguration {
                 SOURCE_PATTERNS_MAX as u64,
             ),
         ])
+        .or_else(|| pattern_list_violation("source.include", &self.include))
+        .or_else(|| pattern_list_violation("source.exclude", &self.exclude))
     }
+}
+
+/// The first pattern in `patterns` breaking [`PathPattern`]'s forward-slash-only contract,
+/// patterns in list order.
+fn pattern_list_violation(
+    field: &'static str,
+    patterns: &[PathPattern],
+) -> Option<ConfigurationViolation> {
+    patterns
+        .iter()
+        .find(|pattern| pattern.violation().is_some())
+        .map(|pattern| ConfigurationViolation::PathPatternInvalid {
+            field,
+            pattern: pattern.0.clone(),
+        })
 }
 
 #[cfg(test)]
@@ -98,6 +116,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_source_pattern_backslash_and_dot_segment_are_refused() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.source.include = vec![PathPattern("src\\lib.rs".to_owned())];
+        let violation = configuration
+            .validate()
+            .expect_err("a backslash pattern must be refused");
+        assert_eq!(
+            violation,
+            ConfigurationViolation::PathPatternInvalid {
+                field: "source.include",
+                pattern: "src\\lib.rs".to_owned(),
+            }
+        );
+
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.source.exclude = vec![PathPattern("../outside.rs".to_owned())];
+        let violation = configuration
+            .validate()
+            .expect_err("a dot-segment pattern must be refused");
+        assert_eq!(
+            violation,
+            ConfigurationViolation::PathPatternInvalid {
+                field: "source.exclude",
+                pattern: "../outside.rs".to_owned(),
+            }
+        );
+
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.source.include = vec![PathPattern("src/**/*.rs".to_owned())];
+        assert_eq!(configuration.validate(), Ok(()));
     }
 
     #[test]
