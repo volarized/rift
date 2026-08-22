@@ -920,6 +920,31 @@ pub fn compute() -> i32 {
     }
 
     #[test]
+    fn search_force_include_matches_file_content_lines() -> TestResult {
+        let (_directory, service) = force_include_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "phantom_gitignored",
+            "target": "file",
+            "paths": {"force_include": ["gitignored.rs"]}
+        }))?;
+        let value = serde_json::to_value(service.search(&params)?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert_eq!(results.len(), 1);
+        let hit = &results[0];
+        assert_eq!(hit["matched_by"][0], "content");
+        let id = hit["hit"]["file"]["id"]
+            .as_str()
+            .ok_or("content hit must carry a file id")?;
+        assert!(id.contains("gitignored.rs"));
+        let text = hit["source"]
+            .as_str()
+            .ok_or("content hit must carry the matched line")?;
+        assert!(text.contains("phantom_gitignored"));
+        assert!(hit["line"].is_u64());
+        Ok(())
+    }
+
+    #[test]
     fn search_force_include_of_indexed_file_does_not_duplicate_hits() -> TestResult {
         let (_directory, service) = force_include_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
