@@ -170,7 +170,10 @@ callers after a signature changes.
 ### History
 
 The history source resolver reads the workspace's git objects in place, with no checkout or `git`
-subprocess. It publishes a bounded series of source catalogs keyed by revision.
+subprocess. It publishes a bounded series of source catalogs keyed by revision. The same in-place
+access serves revision-addressed reads: `get_symbol`, `search`, and `nodes` accept a `rev`, and
+the server indexes that commit's tree — the same syntax providers, over committed bytes — without
+touching the working tree.
 
 The provider composition runs the same syntax providers over changed files at each revision. A
 history enricher then matches revision-qualified declarations, so a symbol gets a timeline —

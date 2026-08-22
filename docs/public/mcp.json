@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds Rust declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt; `include_body: false` omits\nboth. Use `search` when the name is not exactly known.",
+      "description": "Finds Rust declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt; `include_body: false` omits\nboth. `rev` serves the lookup from a version-control revision instead of\nthe current tree. Use `search` when the name is not exactly known.",
       "input_schema": {
         "$defs": {
           "Cursor": {
@@ -43,6 +43,11 @@
             "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
             "type": "string"
           },
+          "RevisionId": {
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "type": "string"
+          },
           "SearchScope": {
             "description": "Which source locations a symbol lookup or search may return.",
             "oneOf": [
@@ -66,6 +71,16 @@
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
+        "allOf": [
+          {
+            "not": {
+              "required": [
+                "rev",
+                "projection"
+              ]
+            }
+          }
+        ],
         "properties": {
           "cursor": {
             "anyOf": [
@@ -126,6 +141,18 @@
             ],
             "default": null,
             "description": "The projection to read. Null reads the workspace tree."
+          },
+          "rev": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RevisionId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The version-control revision to read — a branch, tag, or commit id as the\nworkspace's version control spells it. Null reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
           },
           "scope": {
             "$ref": "#/$defs/SearchScope",
@@ -945,6 +972,18 @@
                 ],
                 "default": null,
                 "description": "Search-index state used by the read, or null when the read did not use the index."
+              },
+              "revision": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/RevisionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records — so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
               },
               "source_revision": {
                 "$ref": "#/$defs/Digest",
@@ -2821,7 +2860,7 @@
       }
     },
     {
-      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift.",
+      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree.",
       "input_schema": {
         "$defs": {
           "ProjectPath": {
@@ -2834,10 +2873,25 @@
             "description": "Identity of one projection, and the URI that resolves it. The server mints it when\n`projection_create` materializes the projection and retires it when `projection_remove`\ndeletes the directory. A change request that omits its `projection` field applies to the\nworkspace tree itself.",
             "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
             "type": "string"
+          },
+          "RevisionId": {
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "type": "string"
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
+        "allOf": [
+          {
+            "not": {
+              "required": [
+                "rev",
+                "projection"
+              ]
+            }
+          }
+        ],
         "properties": {
           "path": {
             "$ref": "#/$defs/ProjectPath",
@@ -2861,6 +2915,18 @@
             ],
             "default": null,
             "description": "The projection to read. Null reads the workspace tree."
+          },
+          "rev": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RevisionId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The version-control revision to read — a branch, tag, or commit id as the\nworkspace's version control spells it. Null reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
           }
         },
         "required": [
@@ -3454,6 +3520,18 @@
                 "default": null,
                 "description": "Search-index state used by the read, or null when the read did not use the index."
               },
+              "revision": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/RevisionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records — so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
+              },
               "source_revision": {
                 "$ref": "#/$defs/Digest",
                 "description": "Source-catalog revision captured for the read."
@@ -3508,6 +3586,11 @@
                 "type": "string"
               }
             ]
+          },
+          "RevisionId": {
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "type": "string"
           },
           "SemanticCoverage": {
             "additionalProperties": {
@@ -6190,7 +6273,7 @@
       }
     },
     {
-      "description": "Searches indexed Rust declarations and source lines by lexical `query`. Use\n`get_symbol` when the declaration name is known.",
+      "description": "Searches indexed Rust declarations and source lines by lexical `query`.\n`rev` searches a version-control revision instead of the current tree.\nUse `get_symbol` when the declaration name is known.",
       "input_schema": {
         "$defs": {
           "Cursor": {
@@ -6777,6 +6860,11 @@
               }
             ]
           },
+          "RevisionId": {
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "type": "string"
+          },
           "SearchInclude": {
             "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so the caller\nrequests only what it will read.",
             "oneOf": [
@@ -6992,6 +7080,14 @@
                 }
               }
             }
+          },
+          {
+            "not": {
+              "required": [
+                "rev",
+                "projection"
+              ]
+            }
           }
         ],
         "anyOf": [
@@ -7097,6 +7193,18 @@
               "string",
               "null"
             ]
+          },
+          "rev": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RevisionId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The version-control revision to search — a branch, tag, or commit id as the\nworkspace's version control spells it. Null searches the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision search when the\nworkspace has no version-control repository."
           },
           "scope": {
             "$ref": "#/$defs/SearchScope",
@@ -8308,6 +8416,18 @@
                 "default": null,
                 "description": "Search-index state used by the read, or null when the read did not use the index."
               },
+              "revision": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/RevisionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records — so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
+              },
               "source_revision": {
                 "$ref": "#/$defs/Digest",
                 "description": "Source-catalog revision captured for the read."
@@ -8594,6 +8714,11 @@
                 "type": "string"
               }
             ]
+          },
+          "RevisionId": {
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "type": "string"
           },
           "SearchHit": {
             "additionalProperties": false,

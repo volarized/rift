@@ -55,6 +55,47 @@ Every read accepts an optional `projection` and reads the workspace tree when it
 [`rift://fs`](#resource-fs) serves file bytes and directory listings to consumers without host
 filesystem tools.
 
+### Revision-addressed reads [#revision-reads]
+
+<VersionBadge version="v0.0.7" languages={["Rust"]} />
+
+Every read also accepts `rev` — a branch, tag, or commit id, spelled the way git spells it:
+`main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
+git objects, with no checkout, and indexes that commit's tree under the same
+[`[source]`](/docs/configuration#source) policy and bounds as the working-tree scan. A revision
+read answers from committed bytes, so uncommitted working-tree edits never appear in it.
+
+This `get_symbol` request reads a declaration as it stands on `main`, whatever the working tree
+currently holds:
+
+```json
+{ "name": "ReadService", "rev": "main" }
+```
+
+The result's snapshot carries the revision resolved to its full commit id, so an answer read at
+`main` stays attributable after `main` moves. `rev` and `projection` never combine. A revision
+search refuses `force_include`: reaching index-excluded files is a walk of the working tree,
+which a revision does not have.
+
+A workspace with no git repository refuses a revision read and names the remedy:
+
+**Error:**
+
+```json
+{
+  "code": "capability_unavailable",
+  "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository — run `git init`, or omit `rev` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
+  "retry": "operator_action",
+  "phase": "read",
+  "diagnostics": [],
+  "causes": []
+}
+```
+
+An unknown revision refuses with `resource_not_found`, and
+[`[providers.history]`](/docs/configuration#providers) owns the capability: `enabled = false`
+refuses every revision read.
+
 ### get_symbol [#tool-get_symbol]
 
 <VersionBadge version="v0.0.4" languages={["Rust"]} />

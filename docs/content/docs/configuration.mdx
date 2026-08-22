@@ -88,11 +88,10 @@ resource reports what survived that intersection per language.
 
 ## Providers
 
-<VersionBadge version="planned" />
+<VersionBadge version="v0.0.7" languages={["Rust"]} />
 
 The built-in providers run without configuration; the `providers` table exists to bound or
-disable them. The history provider is the one with a budget worth setting, because its cost
-scales with how far back it walks:
+disable them:
 
 ```toml
 [providers.history]
@@ -100,11 +99,17 @@ enabled = true
 max_revisions = 500
 ```
 
-`max_revisions` bounds the walk from the current head, 1 to 100000. Timelines and co-change
-coupling are computed inside that depth, and a
-[`SymbolHistory`](/docs/protocol/reference#SymbolHistory) whose walk ended early reports
-partial coverage rather than pretending the symbol has no earlier past. A workspace without
-version control reports the family `not_applicable` whatever this table says.
+`enabled = false` turns the history provider off: the server refuses a revision-addressed read —
+`rev` on [`get_symbol`](/docs/protocol/mcp#tool-get_symbol), `search`, or `nodes` — with
+`capability_unavailable`. A workspace without version control cannot serve those reads whatever
+this table says.
+
+<VersionBadge version="planned" />
+
+`max_revisions` bounds the timeline walk from the current head, 1 to 100000, because the walk's
+cost scales with how far back it reaches. Timelines and co-change coupling are computed inside
+that depth, and a [`SymbolHistory`](/docs/protocol/reference#SymbolHistory) whose walk ended
+early reports partial coverage rather than pretending the symbol has no earlier past.
 
 Provider configuration does not set merge order or freshness. The server reports provider order,
 state, and revision through `rift://workspace`; each answer reports the exact provider revisions

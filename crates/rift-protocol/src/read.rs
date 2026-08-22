@@ -371,6 +371,7 @@ pub struct GetSymbolHit {
 /// a search followed by paging through the file.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::forbid_get_symbol_rev_with_projection)]
 pub struct GetSymbolParams {
     /// The declaration name to look up — a name, not a free-text query; `search` takes
     /// those. An exact symbol name ranks first, then prefix matches, then qualified-name
@@ -398,6 +399,12 @@ pub struct GetSymbolParams {
     /// The projection to read. Null reads the workspace tree.
     #[serde(default)]
     pub projection: Option<ProjectionId>,
+    /// The version-control revision to read — a branch, tag, or commit id as the
+    /// workspace's version control spells it. Null reads the current tree, and `rev`
+    /// never combines with `projection`. The server refuses a revision read when the
+    /// workspace has no version-control repository.
+    #[serde(default)]
+    pub rev: Option<RevisionId>,
     /// Source locations eligible for matches. All is the default because a known name may
     /// identify a dependency or standard-library declaration.
     #[serde(default = "default_get_symbol_params_scope")]
@@ -593,6 +600,7 @@ pub struct NodeRegion {
 /// address for an edit smaller than a declaration, such as one call expression.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::forbid_nodes_rev_with_projection)]
 pub struct NodesParams {
     /// Project-relative file to inspect.
     #[schemars(length(min = 1))]
@@ -604,6 +612,12 @@ pub struct NodesParams {
     /// The projection to read. Null reads the workspace tree.
     #[serde(default)]
     pub projection: Option<ProjectionId>,
+    /// The version-control revision to read — a branch, tag, or commit id as the
+    /// workspace's version control spells it. Null reads the current tree, and `rev`
+    /// never combines with `projection`. The server refuses a revision read when the
+    /// workspace has no version-control repository.
+    #[serde(default)]
+    pub rev: Option<RevisionId>,
 }
 
 /// The nodes covering one position. Each identity carries its witness, so an address taken
@@ -734,6 +748,11 @@ pub struct ReadSnapshot {
     pub index: Option<IndexSnapshot>,
     /// Source-catalog revision captured for the read.
     pub source_revision: Digest,
+    /// The version-control revision the read served, resolved to the full commit id the
+    /// repository records — so a branch answer stays attributable after the branch moves.
+    /// Null when the read served the current tree.
+    #[serde(default)]
+    pub revision: Option<RevisionId>,
 }
 
 /// One named part of a node. A language marks these out inside a declaration, so an
@@ -872,6 +891,10 @@ pub enum RelationshipFacet {
     Binds,
 }
 
+/// Longest revision spelling the wire admits, in bytes; the admitted charset is ASCII, so
+/// the schema's `{1,128}` repetition counts the same units.
+pub const REVISION_ID_BYTES_MAX: usize = 128;
+
 /// Identity of one revision in the workspace's version-control history, spelled the way the
 /// version-control system spells it. Rift carries it opaquely and never orders two revisions
 /// by comparing their identifiers.
@@ -879,6 +902,54 @@ pub enum RelationshipFacet {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] pub String);
+
+impl RevisionId {
+    /// Classifies this spelling against the charset and length its schema advertises.
+    /// `schemars` regexes are declarative only — nothing enforces them at
+    /// deserialization — so every admission point calls this before the spelling
+    /// reaches revision resolution.
+    #[must_use]
+    pub fn violation(&self) -> Option<RevisionIdViolation> {
+        revision_id_violation(&self.0)
+    }
+}
+
+/// Reason a revision spelling breaks the contract [`RevisionId`]'s schema advertises.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionIdViolation {
+    /// The spelling is empty.
+    Empty,
+    /// The spelling is longer than [`REVISION_ID_BYTES_MAX`] bytes.
+    TooLong,
+    /// The spelling carries a byte outside `A-Z a-z 0-9 . _ / -`.
+    CharsetForbidden,
+}
+
+impl RevisionIdViolation {
+    /// This violation's wire spelling, equal to its `Serialize` output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::TooLong => "too_long",
+            Self::CharsetForbidden => "charset_forbidden",
+        }
+    }
+}
+
+/// Classifies one revision spelling against the rules [`RevisionId`]'s schema advertises.
+/// Arms are ordered by precedence: the first matching rule names the violation.
+fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
+    let admitted =
+        |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-');
+    match value.as_bytes() {
+        [] => Some(RevisionIdViolation::Empty),
+        bytes if bytes.len() > REVISION_ID_BYTES_MAX => Some(RevisionIdViolation::TooLong),
+        bytes if !bytes.iter().all(admitted) => Some(RevisionIdViolation::CharsetForbidden),
+        _ => None,
+    }
+}
 
 /// Which source locations a symbol lookup or search may return.
 #[derive(
@@ -1358,9 +1429,60 @@ pub struct TypeExpression {
 
 #[cfg(test)]
 mod tests {
-    use super::{Digest, SourceUnitId};
+    use super::{Digest, REVISION_ID_BYTES_MAX, RevisionId, RevisionIdViolation, SourceUnitId};
     use schemars::schema_for;
     use serde_json::json;
+
+    #[test]
+    fn revision_id_schema_pattern_states_the_enforced_length_bound() {
+        let schema = serde_json::to_value(schema_for!(RevisionId)).expect("revision id schema");
+        assert_eq!(
+            schema["pattern"],
+            json!(format!("^[A-Za-z0-9._/-]{{1,{REVISION_ID_BYTES_MAX}}}$"))
+        );
+    }
+
+    #[test]
+    fn revision_id_violation_classifies_what_the_schema_pattern_rejects() {
+        let cases = [
+            ("", Some(RevisionIdViolation::Empty)),
+            (
+                "a".repeat(REVISION_ID_BYTES_MAX + 1).leak() as &str,
+                Some(RevisionIdViolation::TooLong),
+            ),
+            ("HEAD~1", Some(RevisionIdViolation::CharsetForbidden)),
+            (
+                "rev with space",
+                Some(RevisionIdViolation::CharsetForbidden),
+            ),
+            ("main", None),
+            ("feature/rev-reads", None),
+            ("v0.0.6", None),
+            ("dd0a482", None),
+        ];
+        for (spelling, expected) in cases {
+            assert_eq!(
+                RevisionId(spelling.to_owned()).violation(),
+                expected,
+                "spelling {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn revision_id_violations_spell_their_serialized_labels() {
+        for (violation, label) in [
+            (RevisionIdViolation::Empty, "empty"),
+            (RevisionIdViolation::TooLong, "too_long"),
+            (RevisionIdViolation::CharsetForbidden, "charset_forbidden"),
+        ] {
+            assert_eq!(violation.as_str(), label);
+            assert_eq!(
+                serde_json::to_value(violation).expect("serialize"),
+                json!(label)
+            );
+        }
+    }
 
     #[test]
     fn digest_schema_pattern_is_eight_lowercase_hex_characters() {

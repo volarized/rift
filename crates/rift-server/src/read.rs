@@ -6,6 +6,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_PROVIDER_ID};
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
+use rift_history::{HistoryError, Repository};
 use rift_index::{
     IndexedFile, SymbolMatch, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
 };
@@ -13,9 +14,9 @@ use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
     FactFamily, FileId, Freshness, GetSymbolHit, GetSymbolParams, GetSymbolResult, IndexSnapshot,
     Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProjectPath, ProviderId,
-    ProviderOrigin, ReadSnapshot, SearchScope, SemanticCoverage, SourceExcerpt, SourceKind,
-    SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
-    TextRange,
+    ProviderOrigin, ReadSnapshot, RevisionId, SearchScope, SemanticCoverage, SourceExcerpt,
+    SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId,
+    SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -29,6 +30,8 @@ use sha2::{Digest as _, Sha256};
 pub enum ReadFault {
     /// Workspace could not be indexed.
     Index(WorkspaceIndexError),
+    /// The workspace's version control could not serve the requested revision.
+    History(HistoryError),
     /// Request uses functionality this release does not serve.
     Unsupported {
         /// The unserved capability the request named.
@@ -61,6 +64,7 @@ impl Fault for ReadFault {
     fn name(&self) -> ErrorName {
         match self {
             Self::Index(source) => source.descriptor().name(),
+            Self::History(source) => source.descriptor().name(),
             Self::Unsupported { .. } => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
             Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
@@ -71,6 +75,7 @@ impl Fault for ReadFault {
     fn context(&self) -> Vec<ErrorContext> {
         match self {
             Self::Index(source) => source.context(),
+            Self::History(source) => source.context(),
             Self::Unsupported { capability } => {
                 vec![ErrorContext::new("capability", *capability)]
             }
@@ -94,6 +99,7 @@ impl Fault for ReadFault {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Index(source) => Some(source),
+            Self::History(source) => Some(source),
             Self::Unsupported { .. }
             | Self::Invalid { .. }
             | Self::NotFound { .. }
@@ -133,6 +139,10 @@ impl ReadFault {
     pub(crate) fn index(source: WorkspaceIndexError) -> ReadError {
         Error::new(Self::Index(source))
     }
+
+    pub(crate) fn history(source: HistoryError) -> ReadError {
+        Error::new(Self::History(source))
+    }
 }
 
 /// Opaque read-service failure.
@@ -143,6 +153,8 @@ pub type ReadError = Error<ReadFault>;
 pub struct ReadService {
     index: WorkspaceIndex,
     snapshot: ReadSnapshot,
+    /// The resolved commit this service serves, or null for the current tree.
+    revision: Option<RevisionId>,
 }
 
 impl ReadService {
@@ -159,18 +171,45 @@ impl ReadService {
         visibility: &SourceVisibility,
     ) -> Result<Self, ReadError> {
         let index = WorkspaceIndex::build(root, limits, visibility).map_err(ReadFault::index)?;
-        let revision = wire_digest(&workspace_digest(&index));
-        let snapshot = ReadSnapshot {
-            tree_revision: revision.clone(),
-            index: Some(IndexSnapshot {
-                revision: revision.clone(),
-                tree_revision: revision.clone(),
-                freshness: Freshness::Current,
-                source_revision: revision.clone(),
-            }),
-            source_revision: revision,
-        };
-        Ok(Self { index, snapshot })
+        let snapshot = captured_snapshot(&index, None);
+        Ok(Self {
+            index,
+            snapshot,
+            revision: None,
+        })
+    }
+
+    /// Builds one in-memory snapshot of the workspace at a version-control
+    /// revision, read in place from the workspace's repository with no
+    /// checkout. The revision tree passes the same `[source]` policy and
+    /// bounds as the workspace scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the spelling breaks the advertised
+    /// charset, the workspace has no repository, the revision does not
+    /// resolve to a commit, or the revision tree cannot be indexed within
+    /// bounds.
+    pub fn at_revision(
+        root: &Path,
+        rev: &RevisionId,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+    ) -> Result<Self, ReadError> {
+        if let Some(violation) = rev.violation() {
+            return Err(ReadFault::invalid("rev", violation.as_str()));
+        }
+        let repository = Repository::open(root).map_err(ReadFault::history)?;
+        let resolved = repository.resolve(&rev.0).map_err(ReadFault::history)?;
+        let index = WorkspaceIndex::at_revision(&repository, &resolved, limits, visibility)
+            .map_err(ReadFault::index)?;
+        let revision = RevisionId(resolved.commit_id());
+        let snapshot = captured_snapshot(&index, Some(revision.clone()));
+        Ok(Self {
+            index,
+            snapshot,
+            revision: Some(revision),
+        })
     }
 
     /// Returns the immutable workspace index this snapshot serves.
@@ -183,15 +222,26 @@ impl ReadService {
         &self.snapshot
     }
 
-    /// Reads Rust syntax nodes covering one UTF-8 byte position.
+    /// Returns the resolved commit this service serves, or none for the
+    /// current tree.
+    pub(crate) const fn revision(&self) -> Option<&RevisionId> {
+        self.revision.as_ref()
+    }
+
+    /// Reads Rust syntax nodes covering one UTF-8 byte position. The tree
+    /// the nodes come from is the one this service holds; `params.rev` was
+    /// already honored by building the service at that revision.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] for projections, invalid paths, or missing files.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
-        if params.projection.is_some() {
-            return Err(ReadFault::unsupported("projection reads"));
-        }
+        validate_common(
+            false,
+            params.projection.is_some(),
+            params.rev.is_some(),
+            SearchScope::Project,
+        )?;
         let path = CoreProjectPath::new(params.path.0).map_err(|error| {
             ReadFault::invalid("path", rift_core::fault_label(&error.fault().violation()))
         })?;
@@ -230,6 +280,7 @@ impl ReadService {
         validate_common(
             params.cursor.is_some(),
             params.projection.is_some(),
+            params.rev.is_some(),
             params.scope,
         )?;
         if params.include_history {
@@ -273,8 +324,15 @@ pub(crate) fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
 pub(crate) fn validate_common(
     cursor: bool,
     projection: bool,
+    rev: bool,
     scope: SearchScope,
 ) -> Result<(), ReadError> {
+    if rev && projection {
+        return Err(ReadFault::invalid(
+            "rev",
+            "combines with projection; a read serves one tree",
+        ));
+    }
     if cursor || projection {
         return Err(ReadFault::unsupported("cursor and projection reads"));
     }
@@ -429,6 +487,24 @@ fn node_address(file: &IndexedFile, range: ByteRange) -> String {
         range.end,
         node_witness(file.source(), range)
     )
+}
+
+/// The snapshot one read service captures at build time: every revision
+/// field is the indexed tree's content digest, and `revision` carries the
+/// resolved commit for a revision-addressed service.
+fn captured_snapshot(index: &WorkspaceIndex, revision: Option<RevisionId>) -> ReadSnapshot {
+    let digest = wire_digest(&workspace_digest(index));
+    ReadSnapshot {
+        tree_revision: digest.clone(),
+        index: Some(IndexSnapshot {
+            revision: digest.clone(),
+            tree_revision: digest.clone(),
+            freshness: Freshness::Current,
+            source_revision: digest.clone(),
+        }),
+        source_revision: digest,
+        revision,
+    }
 }
 
 fn workspace_digest(index: &WorkspaceIndex) -> String {
@@ -612,6 +688,7 @@ mod tests {
     use rift_core::SourceVisibility;
     use rift_protocol::read::{
         Digest, GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, ReadSnapshot,
+        RevisionId,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -713,6 +790,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 5,
             projection: None,
+            rev: None,
         })?;
         let value = serde_json::to_value(result)?;
 
@@ -800,6 +878,7 @@ pub fn compute() -> i32 {
             tree_revision: Digest("deadbeef".to_owned()),
             index: None,
             source_revision: Digest("cafef00d".to_owned()),
+            revision: None,
         };
         let value = serde_json::to_value(super::complete_coverage(&snapshot))?;
         assert_eq!(value["origins"][0]["revision"], json!("deadbeef"));
@@ -817,6 +896,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 0,
             projection: Some(projection),
+            rev: None,
         });
         assert!(matches!(
             nodes.expect_err("projection must fail").fault(),
@@ -842,6 +922,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/missing.rs".to_owned()),
             position: 0,
             projection: None,
+            rev: None,
         });
         assert!(matches!(
             missing.expect_err("missing source must fail").fault(),
@@ -870,6 +951,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("/etc/passwd".to_owned()),
             position: 0,
             projection: None,
+            rev: None,
         });
         assert!(matches!(
             result.expect_err("absolute path must fail").fault(),
@@ -905,6 +987,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: expression_position,
             projection: None,
+            rev: None,
         })?;
         assert!(any_node_has_facet(&expression, "expression")?);
 
@@ -915,6 +998,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: statement_position,
             projection: None,
+            rev: None,
         })?;
         assert!(any_node_has_facet(&statement, "statement")?);
 
@@ -925,6 +1009,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: comment_position,
             projection: None,
+            rev: None,
         })?;
         assert!(any_node_has_facet(&comment, "comment")?);
 
@@ -953,6 +1038,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
             projection: None,
+            rev: None,
         })?;
         let value = serde_json::to_value(result)?;
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
@@ -978,6 +1064,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
             projection: None,
+            rev: None,
         })?;
         let value = serde_json::to_value(result)?;
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
@@ -1002,6 +1089,7 @@ pub fn compute() -> i32 {
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
             projection: None,
+            rev: None,
         })?;
         let value = serde_json::to_value(result)?;
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
@@ -1013,6 +1101,168 @@ pub fn compute() -> i32 {
             impl_node["symbol"].is_null(),
             "impl_item is not itself a declared symbol"
         );
+        Ok(())
+    }
+
+    /// One committed source file, then uncommitted working-tree drift on top
+    /// of it, so a revision read and a working-tree read answer differently.
+    fn committed_fixture() -> TestResult<TempDir> {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn beacon() -> u8 {\n    7\n}\n",
+        )?;
+        Ok(directory)
+    }
+
+    fn revision_service(
+        root: &std::path::Path,
+        rev: &str,
+    ) -> Result<ReadService, super::ReadError> {
+        ReadService::at_revision(
+            root,
+            &RevisionId(rev.to_owned()),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+    }
+
+    #[test]
+    fn revision_read_serves_the_committed_declaration() -> TestResult {
+        let directory = committed_fixture()?;
+        let service = revision_service(directory.path(), "main")?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        assert_eq!(
+            value["hits"][0]["source"]["text"], "pub fn beacon() {}",
+            "the committed body answers, not the drifted working tree"
+        );
+        let revision = value["snapshot"]["revision"]
+            .as_str()
+            .ok_or("a revision read's snapshot must carry the resolved commit")?;
+        assert_eq!(revision.len(), 40, "the echo is the full commit id");
+        assert!(revision.chars().all(|c| c.is_ascii_hexdigit()));
+        Ok(())
+    }
+
+    #[test]
+    fn revision_snapshot_differs_from_the_drifted_working_tree() -> TestResult {
+        let directory = committed_fixture()?;
+        let at_head = revision_service(directory.path(), "main")?;
+        let working = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
+        assert_ne!(
+            at_head.snapshot().tree_revision,
+            working.snapshot().tree_revision,
+            "drifted bytes must produce a different tree digest"
+        );
+        assert_eq!(
+            working.snapshot().revision,
+            None,
+            "a working-tree read carries no revision echo"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revision_nodes_list_committed_syntax() -> TestResult {
+        let directory = committed_fixture()?;
+        let service = revision_service(directory.path(), "main")?;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: 8,
+            projection: None,
+            rev: Some(RevisionId("main".to_owned())),
+        })?;
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node["kind"] == "rust.function_item"),
+            "position 8 sits inside the committed `pub fn beacon`"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revision_read_refuses_an_unversioned_workspace_with_the_actionable_message() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let error = revision_service(directory.path(), "main")
+            .expect_err("a workspace without a repository must refuse");
+        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        let canonical = fs::canonicalize(directory.path())?;
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "no configured provider serves this request: workspace {}, \
+                 requires a git repository — run `git init`, or omit `rev` to \
+                 read the current tree; adjust the request to a served \
+                 capability, or configure a provider that serves it",
+                canonical.display()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revision_read_refuses_an_unknown_revision_as_not_found() -> TestResult {
+        let directory = committed_fixture()?;
+        let error = revision_service(directory.path(), "feature/absent")
+            .expect_err("an unknown revision must refuse");
+        assert_eq!(error.descriptor().code(), "resource_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn revision_read_refuses_a_forbidden_spelling_as_invalid() -> TestResult {
+        let directory = committed_fixture()?;
+        let error = revision_service(directory.path(), "HEAD~1")
+            .expect_err("a spelling outside the advertised charset must refuse");
+        assert_eq!(
+            error.to_string(),
+            "the request does not match the documented form: field rev, \
+             violation charset_forbidden; correct the reported field and \
+             resend the request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rev_with_projection_is_refused_as_invalid() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({
+            "name": "Beacon",
+            "rev": "main",
+            "projection": "rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }))?;
+        let error = service
+            .get_symbol(&params)
+            .expect_err("rev with projection must refuse before either is served");
+        assert!(matches!(
+            error.fault(),
+            ReadFault::Invalid { field: "rev", .. }
+        ));
+        let nodes = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: 0,
+            projection: Some(ProjectionId(
+                "rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            )),
+            rev: Some(RevisionId("main".to_owned())),
+        });
+        assert!(matches!(
+            nodes.expect_err("rev with projection must refuse").fault(),
+            ReadFault::Invalid { field: "rev", .. }
+        ));
         Ok(())
     }
 }

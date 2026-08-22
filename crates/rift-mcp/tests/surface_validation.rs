@@ -127,8 +127,22 @@ fn corpus() -> Vec<(&'static str, Value)> {
             }),
         ),
     ];
+    requests.extend(revision_read_corpus());
     requests.extend(insert_symbol_file_target_corpus());
     requests
+}
+
+/// Revision-addressed requests, one per read tool: each answers from the
+/// fixture's committed baseline and proves the snapshot's revision echo.
+fn revision_read_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        ("get_symbol", json!({ "name": "beacon_one", "rev": "main" })),
+        ("search", json!({ "query": "beacon", "rev": "main" })),
+        (
+            "nodes",
+            json!({ "path": "lib.rs", "position": 0, "rev": "main" }),
+        ),
+    ]
 }
 
 /// `insert_symbol` file-target requests: an append to an existing file, a
@@ -306,6 +320,11 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("hidden.rs"),
         "pub fn phantom_signal() {}\n",
     )?;
+    // A committed baseline, so the corpus can prove revision-addressed reads:
+    // `hidden.rs` stays gitignored and uncommitted, everything else lands in
+    // the fixture's one commit on `main`.
+    rift_history::fixture::init(directory.path());
+    rift_history::fixture::commit_all(directory.path(), "fixture baseline");
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -317,6 +336,90 @@ async fn served_fixture() -> TestResult<(
     });
     let client = ().serve(client_transport).await?;
     Ok((directory, client, server_task))
+}
+
+/// Result-arm coverage the corpus walk accumulates: every arm a result
+/// union can take must be proven by a live payload, and the walk fails when
+/// one was never produced.
+#[derive(Default)]
+struct CorpusArms {
+    null_cursor_pages: usize,
+    present_cursor_pages: usize,
+    revision_snapshots: usize,
+    current_tree_snapshots: usize,
+    applied_changes: usize,
+    applied_with_findings: usize,
+    refusal_reasons: BTreeSet<String>,
+}
+
+impl CorpusArms {
+    /// Records which snapshot-revision and change-status arms one structured
+    /// result proves.
+    fn observe(&mut self, name: &str, structured: &Value) {
+        match &structured["snapshot"]["revision"] {
+            Value::String(commit) => {
+                assert_eq!(
+                    commit.len(),
+                    40,
+                    "{name} snapshot revision must be the full commit id: {commit}"
+                );
+                self.revision_snapshots += 1;
+            }
+            Value::Null if structured.get("snapshot").is_some() => {
+                self.current_tree_snapshots += 1;
+            }
+            _ => {}
+        }
+        match structured["status"].as_str() {
+            Some("applied") => {
+                self.applied_changes += 1;
+                if structured["summary"]["diagnostics"]
+                    .as_array()
+                    .is_some_and(|findings| !findings.is_empty())
+                {
+                    self.applied_with_findings += 1;
+                }
+            }
+            Some("refused") => {
+                if let Some(reason) = structured["reason"].as_str() {
+                    self.refusal_reasons.insert(reason.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fails the walk unless every tracked arm was produced live.
+    fn assert_proven(&self) {
+        assert!(
+            self.null_cursor_pages > 0 && self.present_cursor_pages > 0,
+            "the corpus must prove both next_cursor arms against the schema: \
+             null_cursor_pages={}, present_cursor_pages={}",
+            self.null_cursor_pages,
+            self.present_cursor_pages
+        );
+        assert!(
+            self.revision_snapshots > 0 && self.current_tree_snapshots > 0,
+            "the corpus must prove both snapshot.revision arms against the schema: \
+             revision_snapshots={}, current_tree_snapshots={}",
+            self.revision_snapshots,
+            self.current_tree_snapshots
+        );
+        assert!(
+            self.applied_changes >= 3 && self.applied_with_findings >= 1,
+            "the corpus must prove the applied arm with and without parser findings: \
+             applied={}, with_findings={}",
+            self.applied_changes,
+            self.applied_with_findings
+        );
+        for reason in ["unmet_precondition", "ambiguous_target", "unsupported"] {
+            assert!(
+                self.refusal_reasons.contains(reason),
+                "the corpus must prove the {reason} refusal arm; proven: {:?}",
+                self.refusal_reasons
+            );
+        }
+    }
 }
 
 /// Compiles one input and one output validator per advertised tool.
@@ -357,11 +460,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
 
     let validators = tool_validators(&tools)?;
 
-    let mut null_cursor_pages = 0_usize;
-    let mut present_cursor_pages = 0_usize;
-    let mut applied_changes = 0_usize;
-    let mut applied_with_findings = 0_usize;
-    let mut refusal_reasons: BTreeSet<String> = BTreeSet::new();
+    let mut arms = CorpusArms::default();
     for (name, request) in corpus() {
         let (input_validator, output_validator) = validators
             .get(name)
@@ -383,23 +482,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 .ok_or_else(|| format!("{name} must return structured content"))?;
             assert_validates(output_validator, &structured, &format!("{name} result"));
             assert_wire_hygiene(name, &structured);
-            match structured["status"].as_str() {
-                Some("applied") => {
-                    applied_changes += 1;
-                    if structured["summary"]["diagnostics"]
-                        .as_array()
-                        .is_some_and(|findings| !findings.is_empty())
-                    {
-                        applied_with_findings += 1;
-                    }
-                }
-                Some("refused") => {
-                    if let Some(reason) = structured["reason"].as_str() {
-                        refusal_reasons.insert(reason.to_owned());
-                    }
-                }
-                _ => {}
-            }
+            arms.observe(name, &structured);
             if structured.get("next_cursor").is_some() {
                 let mut continued = structured.clone();
                 continued["next_cursor"] = json!("b3BhcXVl");
@@ -408,38 +491,23 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                     &continued,
                     &format!("{name} result with a present cursor"),
                 );
-                present_cursor_pages += 1;
+                arms.present_cursor_pages += 1;
             }
             match &structured["next_cursor"] {
                 Value::String(cursor) => {
-                    present_cursor_pages += 1;
+                    arms.present_cursor_pages += 1;
                     followed_pages += 1;
                     request["cursor"] = json!(cursor);
                 }
                 Value::Null => {
-                    null_cursor_pages += 1;
+                    arms.null_cursor_pages += 1;
                     break;
                 }
                 other => panic!("{name} next_cursor must be a string or null, got {other}"),
             }
         }
     }
-    assert!(
-        null_cursor_pages > 0 && present_cursor_pages > 0,
-        "the corpus must prove both next_cursor arms against the schema: \
-         null_cursor_pages={null_cursor_pages}, present_cursor_pages={present_cursor_pages}"
-    );
-    assert!(
-        applied_changes >= 3 && applied_with_findings >= 1,
-        "the corpus must prove the applied arm with and without parser findings: \
-         applied={applied_changes}, with_findings={applied_with_findings}"
-    );
-    for reason in ["unmet_precondition", "ambiguous_target", "unsupported"] {
-        assert!(
-            refusal_reasons.contains(reason),
-            "the corpus must prove the {reason} refusal arm; proven: {refusal_reasons:?}"
-        );
-    }
+    arms.assert_proven();
 
     client.cancel().await?;
     server_task.await?;

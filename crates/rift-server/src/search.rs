@@ -28,6 +28,9 @@ impl ReadService {
     /// invalid `paths` glob, or a `force_include` bound crossed.
     pub fn search(&self, params: &SearchParams) -> Result<SearchResult, ReadError> {
         validate_search(params)?;
+        if self.revision().is_some() && force_include_requested(params) {
+            return Err(ReadFault::unsupported("force_include at a revision"));
+        }
         let query = params
             .query
             .as_deref()
@@ -83,10 +86,21 @@ impl ReadService {
     }
 }
 
+/// Whether the request's `paths` selector names any `force_include` glob.
+/// Reaching index-excluded files is a walk of the working tree, which a
+/// revision-addressed search has no tree to run against.
+fn force_include_requested(params: &SearchParams) -> bool {
+    params
+        .paths
+        .as_ref()
+        .is_some_and(|selector| !selector.force_include.is_empty())
+}
+
 fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     validate_common(
         params.cursor.is_some(),
         params.projection.is_some(),
+        params.rev.is_some(),
         params.scope,
     )?;
     if params.filter.is_some() || params.traversal.is_some() {
@@ -1021,6 +1035,69 @@ pub fn compute() -> i32 {
                 .expect_err("an invalid force_include glob must refuse")
                 .fault(),
             ReadFault::Index(_)
+        ));
+        Ok(())
+    }
+
+    /// One committed source file, then uncommitted drift, so a revision
+    /// search and a working-tree search answer differently.
+    fn committed_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn committed_probe() {}\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "introduce probe");
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn drifted_probe() {}\n",
+        )?;
+        let service = ReadService::at_revision(
+            directory.path(),
+            &rift_protocol::read::RevisionId("main".to_owned()),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )?;
+        Ok((directory, service))
+    }
+
+    #[test]
+    fn search_at_a_revision_serves_committed_matches_only() -> TestResult {
+        let (_directory, service) = committed_fixture()?;
+        let committed: SearchParams = serde_json::from_value(json!({"query": "committed_probe"}))?;
+        let value = serde_json::to_value(service.search(&committed)?)?;
+        let results = value["results"].as_array().ok_or("results array")?;
+        assert!(!results.is_empty(), "the committed declaration matches");
+        assert!(
+            value["snapshot"]["revision"].as_str().is_some(),
+            "a revision search's snapshot carries the resolved commit"
+        );
+        let drifted: SearchParams = serde_json::from_value(json!({"query": "drifted_probe"}))?;
+        let drifted_value = serde_json::to_value(service.search(&drifted)?)?;
+        assert_eq!(
+            drifted_value["results"].as_array().map(Vec::len),
+            Some(0),
+            "uncommitted drift is invisible at the revision"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_at_a_revision_refuses_force_include() -> TestResult {
+        let (_directory, service) = committed_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "committed_probe",
+            "paths": {"force_include": ["lib.rs"]}
+        }))?;
+        let error = service.search(&params).expect_err(
+            "force_include walks the working tree, which a revision search has none of",
+        );
+        assert!(matches!(
+            error.fault(),
+            ReadFault::Unsupported {
+                capability: "force_include at a revision"
+            }
         ));
         Ok(())
     }

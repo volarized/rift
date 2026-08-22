@@ -22,11 +22,11 @@ use serde::Serialize;
 use crate::glob::PathMatcher;
 
 #[derive(Debug)]
-struct WorkspaceFiles;
+pub(crate) struct WorkspaceFiles;
 #[derive(Debug)]
-struct RustFacts;
+pub(crate) struct RustFacts;
 #[derive(Debug)]
-struct ReadIndex;
+pub(crate) struct ReadIndex;
 
 /// Direct-workspace scan and result bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +80,21 @@ impl WorkspaceIndexLimits {
     pub const fn results_max(self) -> usize {
         self.results_max
     }
+
+    /// Returns maximum admitted source files per index.
+    pub(crate) const fn files_max(self) -> usize {
+        self.files_max
+    }
+
+    /// Returns maximum bytes of one admitted source file.
+    pub(crate) const fn file_bytes_max(self) -> usize {
+        self.file_bytes_max
+    }
+
+    /// Returns maximum directory depth an index reaches below the root.
+    pub(crate) const fn directory_depth_max(self) -> usize {
+        self.directory_depth_max
+    }
 }
 
 impl Default for WorkspaceIndexLimits {
@@ -124,6 +139,8 @@ pub enum WorkspaceIndexViolation {
     ResultLimit,
     /// A `source.include` or `source.exclude` entry is not a valid glob.
     SourcePatternInvalid,
+    /// The workspace's version-control repository could not serve the tree.
+    History,
 }
 
 /// One workspace indexing failure: its violation, the offending path when
@@ -140,6 +157,17 @@ impl WorkspaceIndexFault {
     #[must_use]
     pub const fn violation(&self) -> WorkspaceIndexViolation {
         self.violation
+    }
+
+    /// The version-control failure behind a `History` violation, which owns
+    /// this fault's registry identity and evidence.
+    fn history_source(&self) -> Option<&rift_history::HistoryError> {
+        if self.violation != WorkspaceIndexViolation::History {
+            return None;
+        }
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<rift_history::HistoryError>())
     }
 
     /// Returns involved filesystem path when available.
@@ -178,6 +206,10 @@ impl Fault for WorkspaceIndexFault {
                     || ErrorName::Wire(ErrorCode::InternalError),
                     |error| error.descriptor().name(),
                 ),
+            WorkspaceIndexViolation::History => self.history_source().map_or_else(
+                || ErrorName::Wire(ErrorCode::InternalError),
+                |error| error.descriptor().name(),
+            ),
         }
     }
 
@@ -185,6 +217,9 @@ impl Fault for WorkspaceIndexFault {
         let mut context = vec![ErrorContext::new("violation", fault_label(&self.violation))];
         if let Some(path) = &self.path {
             context.push(ErrorContext::new("path", path.display().to_string()));
+        }
+        if let Some(error) = self.history_source() {
+            context.extend(error.context());
         }
         context
     }
@@ -199,7 +234,7 @@ impl Fault for WorkspaceIndexFault {
 /// Opaque workspace indexing failure.
 pub type WorkspaceIndexError = Error<WorkspaceIndexFault>;
 
-fn index_error(violation: WorkspaceIndexViolation) -> WorkspaceIndexError {
+pub(crate) fn index_error(violation: WorkspaceIndexViolation) -> WorkspaceIndexError {
     Error::new(WorkspaceIndexFault {
         violation,
         path: None,
@@ -207,7 +242,10 @@ fn index_error(violation: WorkspaceIndexViolation) -> WorkspaceIndexError {
     })
 }
 
-fn index_error_at(violation: WorkspaceIndexViolation, path: &Path) -> WorkspaceIndexError {
+pub(crate) fn index_error_at(
+    violation: WorkspaceIndexViolation,
+    path: &Path,
+) -> WorkspaceIndexError {
     Error::new(WorkspaceIndexFault {
         violation,
         path: Some(path.to_path_buf()),
@@ -321,6 +359,23 @@ impl WorkspaceIndex {
             composition,
             limits,
         })
+    }
+
+    /// Assembles an index from files another source already admitted — the
+    /// revision build, whose bytes come from git objects instead of a
+    /// directory walk.
+    pub(crate) fn from_parts(
+        root: PathBuf,
+        files: Vec<IndexedFile>,
+        composition: ProviderComposition,
+        limits: WorkspaceIndexLimits,
+    ) -> Self {
+        Self {
+            root,
+            files,
+            composition,
+            limits,
+        }
     }
 
     /// Returns canonical real workspace root.
@@ -552,7 +607,7 @@ fn composition() -> Result<ProviderComposition, WorkspaceIndexError> {
     builder.output(reads).build().map_err(composition_error)
 }
 
-fn component<Input: 'static, Output: 'static>(
+pub(crate) fn component<Input: 'static, Output: 'static>(
     id: &str,
 ) -> Result<Component<Input, Output>, WorkspaceIndexError> {
     Ok(Component::new(
@@ -560,7 +615,7 @@ fn component<Input: 'static, Output: 'static>(
     ))
 }
 
-fn composition_error(
+pub(crate) fn composition_error(
     source: impl std::error::Error + Send + Sync + 'static,
 ) -> WorkspaceIndexError {
     index_error_caused_by(WorkspaceIndexViolation::Composition, None, source)
@@ -669,7 +724,7 @@ fn hard_floor_admits(entry: &DirEntry) -> bool {
 /// Whether `path`'s extension is one some shipped syntax provider declares
 /// ([`rift_syntax::SOURCE_FILE_EXTENSIONS`]): the walk admits exactly what a provider can
 /// parse, so a new grammar joins the scan by declaring its extensions on its provider.
-fn has_source_extension(path: &Path) -> bool {
+pub(crate) fn has_source_extension(path: &Path) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
         .is_some_and(|extension| SOURCE_FILE_EXTENSIONS.contains(&extension))
@@ -707,32 +762,54 @@ fn read_file(
     let bytes = fs::read(path).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
-    if bytes.len() > limits.file_bytes_max {
-        return Err(index_error_at(WorkspaceIndexViolation::FileTooLarge, path));
-    }
-    *workspace_bytes = workspace_bytes
-        .checked_add(bytes.len())
-        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, path))?;
-    if *workspace_bytes > limits.workspace_bytes_max {
-        return Err(index_error_at(
-            WorkspaceIndexViolation::WorkspaceTooLarge,
-            path,
-        ));
-    }
-    let source = String::from_utf8(bytes).map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::InvalidSource, Some(path), error)
-    })?;
     let relative = path.strip_prefix(root).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
     })?;
     let project_path = relative_path(relative)?;
+    admitted_file(project_path, bytes, path, parser, limits, workspace_bytes)
+}
+
+/// Admits one source file's bytes into an index, whatever supplied them: the
+/// per-file and aggregate byte bounds, UTF-8, and the syntax parse are the
+/// same for a directory walk and a committed revision tree. `context_path`
+/// names the file in refusals.
+pub(crate) fn admitted_file(
+    project_path: ProjectPath,
+    bytes: Vec<u8>,
+    context_path: &Path,
+    parser: &RustSyntaxProvider,
+    limits: WorkspaceIndexLimits,
+    workspace_bytes: &mut usize,
+) -> Result<IndexedFile, WorkspaceIndexError> {
+    if bytes.len() > limits.file_bytes_max {
+        return Err(index_error_at(
+            WorkspaceIndexViolation::FileTooLarge,
+            context_path,
+        ));
+    }
+    *workspace_bytes = workspace_bytes
+        .checked_add(bytes.len())
+        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, context_path))?;
+    if *workspace_bytes > limits.workspace_bytes_max {
+        return Err(index_error_at(
+            WorkspaceIndexViolation::WorkspaceTooLarge,
+            context_path,
+        ));
+    }
+    let source = String::from_utf8(bytes).map_err(|error| {
+        index_error_caused_by(
+            WorkspaceIndexViolation::InvalidSource,
+            Some(context_path),
+            error,
+        )
+    })?;
     let syntax = parser
         .analyze(RustSource {
             path: &project_path,
             text: &source,
         })
         .map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(path), error)
+            index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(context_path), error)
         })?;
     Ok(IndexedFile {
         path: project_path,
@@ -1375,6 +1452,11 @@ mod tests {
                 WorkspaceIndexViolation::SourcePatternInvalid,
                 "the workspace configuration failed validation: violation source_pattern_invalid; \
                  correct the reported configuration field, then retry",
+            ),
+            (
+                WorkspaceIndexViolation::History,
+                "the server failed in a way it did not classify: violation history; \
+                 retry once, and report the full message if the failure repeats",
             ),
         ];
         for (violation, message) in cases {

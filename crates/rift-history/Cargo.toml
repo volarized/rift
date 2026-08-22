@@ -1,0 +1,23 @@
+[package]
+name = "rift-history"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Version-control access for Rift workspaces"
+
+[lints]
+workspace = true
+
+[dependencies]
+gix.workspace = true
+rift-core.workspace = true
+serde.workspace = true
+
+[features]
+# Deterministic git fixtures for dependent crates' tests; never a production feature.
+fixtures = []
+
+[dev-dependencies]
+tempfile.workspace = true

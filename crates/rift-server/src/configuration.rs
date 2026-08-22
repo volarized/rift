@@ -211,7 +211,13 @@ embedding = "potion-retrieval-32M"
         let configuration =
             admit_configuration(raw).expect("the repository's rift.toml must admit cleanly");
         assert!(configuration.source.include.is_empty());
-        assert!(configuration.source.exclude.is_empty());
+        let excluded: Vec<&str> = configuration
+            .source
+            .exclude
+            .iter()
+            .map(|pattern| pattern.0.as_str())
+            .collect();
+        assert_eq!(excluded, [".claude/**", ".agents/**"]);
         assert!(configuration.source.respect_gitignore);
         assert_eq!(configuration.hooks.len(), 2);
         assert_eq!(configuration.hooks[0].id, "format");

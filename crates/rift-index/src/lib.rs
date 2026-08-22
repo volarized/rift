@@ -1,6 +1,7 @@
 //! In-memory indexing and retrieval.
 
 mod glob;
+mod revision;
 mod workspace;
 
 pub use glob::PathMatcher;

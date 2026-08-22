@@ -1273,6 +1273,7 @@ mod tests {
             path: ProjectPath("lib.rs".to_owned()),
             position: 3,
             projection: None,
+            rev: None,
         })?;
         let address = listing.nodes[0].id.0.clone();
 
