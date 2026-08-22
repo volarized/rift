@@ -66,9 +66,9 @@ pub enum ReadFault {
         /// Runtime failure account.
         detail: String,
     },
-    /// Current workspace index cannot become coherent within its deadline.
+    /// Current workspace index cannot be validated within its deadline.
     Unavailable {
-        /// Operation waiting for coherent state.
+        /// Operation waiting for a validated state.
         operation: &'static str,
         /// Bounded failure account.
         detail: String,
@@ -192,7 +192,7 @@ impl ReadFault {
         })
     }
 
-    /// Classifies coherence work that cannot finish within its deadline.
+    /// Classifies validation work that cannot finish within its deadline.
     pub fn unavailable(operation: &'static str, detail: impl Into<String>) -> ReadError {
         Error::new(Self::Unavailable {
             operation,

@@ -1,107 +1,59 @@
-use std::fmt::Write as _;
-use std::io::Read as _;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as SyncMutex, OnceLock, RwLock as SyncRwLock};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use notify::event::{CreateKind, ModifyKind, RemoveKind};
-use notify::{Event, EventKind, RecursiveMode, Watcher as _};
-use rift_core::constants::{WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES};
-use rift_core::{ErrorName, Fault, SourceVisibility};
+use rift_core::SourceVisibility;
 use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
     ReplaceNodeParams, ReplaceSymbolParams,
 };
-use rift_protocol::configuration::{CommandHook, WorkspaceConfiguration};
+use rift_protocol::configuration::{CommandHook, SERVER_BLOCKING_SLOTS_MAX, ServerConfiguration};
 use rift_protocol::error as wire;
 use rift_protocol::read::{
-    DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams,
-    SearchResult,
+    GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
 };
-use rift_server::{
-    CONFIGURATION_FILE_BYTES_MAX, ChangeService, ConfigurationError, HookRun, HookStatus,
-    ReadError, ReadFault, ReadService, load_configuration, run_hooks,
-};
+use rift_server::{ChangeService, HookStatus, ReadError, ReadFault, ReadService, run_hooks};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
-use sha2::{Digest as _, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, Semaphore, mpsc};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use tracing::Instrument as _;
 
-/// JSON-RPC error code every Rift operating failure travels under: the
-/// first code of the server-defined range (-32000 to -32099), which rmcp
-/// exports no constant for — its constants name only MCP-defined codes. The
-/// machine-readable classification is the [`wire::ErrorData`] in `data`.
-const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
-
-/// Most `causes` entries one wire error carries, matching the advertised
-/// schema bound.
-const ERROR_CAUSES_MAX: usize = 8;
-
-/// Blocking filesystem and syntax operations admitted across MCP servers.
-const BLOCKING_OPERATIONS_MAX: usize = 4;
-
-/// Filesystem events coalesced while one rebuild is pending.
-const INDEX_INVALIDATIONS_MAX: usize = 1;
-/// Delay collecting one bounded filesystem-event batch.
-const INDEX_DEBOUNCE: Duration = Duration::from_millis(50);
-/// Deadline for one request to obtain a coherent current snapshot.
-const INDEX_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(30);
-/// Deadline for joining the index supervisor during shutdown.
-const INDEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-/// Complete capture retries while the tree keeps moving.
-const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
-/// Milliseconds one operation may wait for blocking capacity.
-const BLOCKING_QUEUE_TIMEOUT_MS_DEFAULT: u64 = 30_000;
-
-/// Runtime policy for blocking MCP operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RiftMcpOptions {
-    blocking_queue_timeout_ms: u64,
-}
-
-impl RiftMcpOptions {
-    /// Sets maximum queue wait before a retryable capacity failure.
-    #[must_use]
-    pub fn with_blocking_queue_timeout_ms(mut self, timeout_ms: NonZeroU64) -> Self {
-        self.blocking_queue_timeout_ms = timeout_ms.get();
-        self
-    }
-}
-
-impl Default for RiftMcpOptions {
-    fn default() -> Self {
-        Self {
-            blocking_queue_timeout_ms: BLOCKING_QUEUE_TIMEOUT_MS_DEFAULT,
-        }
-    }
-}
+use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
+use crate::validation::{
+    ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, INDEX_FRESHNESS_TIMEOUT, IndexState,
+    IndexSupervisor, IndexSupervisorContext, IndexValidation, PublishedWorkspace, RebuildOutcome,
+    configuration_fingerprint, initial_workspace, publish_rebuild, run_index_supervisor,
+    workspace_watcher,
+};
 
 /// Bounded Tokio admission for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
-struct BlockingExecutor {
-    operations: Arc<Semaphore>,
-    queue_timeout_ms: u64,
+pub(crate) struct BlockingExecutor {
+    pub(crate) operations: Arc<Semaphore>,
+    pub(crate) queue_timeout_ms: u64,
 }
 
 impl BlockingExecutor {
-    /// Uses process-wide capacity with one server's queue-wait policy.
-    fn process_wide(options: RiftMcpOptions) -> Self {
+    /// Sizes the workspace's pool and queue wait from one admitted
+    /// `[server]` table.
+    pub(crate) fn for_configuration(server: &ServerConfiguration) -> Self {
+        // Admission bounds the value to 1..=SERVER_BLOCKING_SLOTS_MAX, so
+        // the clamp only guards the usize conversion.
+        let slots = usize::try_from(server.blocking_slots.min(SERVER_BLOCKING_SLOTS_MAX))
+            .unwrap_or(1)
+            .max(1);
         Self {
-            operations: Arc::clone(blocking_operations()),
-            queue_timeout_ms: options.blocking_queue_timeout_ms,
+            operations: Arc::new(Semaphore::new(slots)),
+            queue_timeout_ms: server.blocking_queue_timeout.milliseconds(),
         }
     }
 
     /// Creates an isolated executor for deterministic capacity tests.
     #[cfg(test)]
-    fn isolated(operations_max: usize, queue_timeout_ms: u64) -> Self {
+    pub(crate) fn isolated(operations_max: usize, queue_timeout_ms: u64) -> Self {
         assert!(
             operations_max > 0,
             "blocking operation capacity must be positive: operations_max={operations_max}"
@@ -117,7 +69,7 @@ impl BlockingExecutor {
     }
 
     /// Runs one blocking operation after queued, bounded admission.
-    async fn run<Output>(
+    pub(crate) async fn run<Output>(
         &self,
         operation: &'static str,
         work: impl FnOnce() -> Result<Output, ReadError> + Send + 'static,
@@ -141,21 +93,15 @@ impl BlockingExecutor {
     }
 }
 
-/// Workspace blocking operations admitted process-wide.
-fn blocking_operations() -> &'static Arc<Semaphore> {
-    static OPERATIONS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    OPERATIONS.get_or_init(|| Arc::new(Semaphore::new(BLOCKING_OPERATIONS_MAX)))
-}
-
 /// Serializes workspace mutations and snapshot publication.
 #[derive(Debug, Default)]
-struct ChangeLane {
+pub(crate) struct ChangeLane {
     admission: AsyncMutex<()>,
 }
 
 impl ChangeLane {
     /// Runs one operation after FIFO admission to the workspace lane.
-    fn run<Output>(&self, operation: impl FnOnce() -> Output) -> Output {
+    pub(crate) fn run<Output>(&self, operation: impl FnOnce() -> Output) -> Output {
         let guard = self.admission.blocking_lock();
         let output = operation();
         // Filesystem mutation and snapshot publication finish before release.
@@ -186,7 +132,7 @@ pub struct RiftMcp {
     root: PathBuf,
     limits: WorkspaceIndexLimits,
     published: Arc<RwLock<IndexState>>,
-    coherence: Arc<IndexCoherence>,
+    validation: Arc<IndexValidation>,
     changes: Arc<ChangeService>,
     change_lane: Arc<ChangeLane>,
     blocking: BlockingExecutor,
@@ -195,737 +141,18 @@ pub struct RiftMcp {
 
 impl Drop for RiftMcp {
     fn drop(&mut self) {
-        self.coherence.cancellation.cancel();
+        self.validation.cancellation.cancel();
     }
-}
-
-/// Read index and configuration policy published as one immutable value.
-#[derive(Debug)]
-struct PublishedWorkspace {
-    reads: Arc<ReadService>,
-    configuration: ConfigurationState,
-    fingerprint: WorkspaceFingerprint,
-    source_policy: Arc<WorkspaceSourcePolicy>,
-    epoch: u64,
-}
-
-/// Published workspace plus failure for latest observed epoch.
-#[derive(Debug)]
-struct IndexState {
-    current: Arc<PublishedWorkspace>,
-    failure: Option<(u64, Arc<ReadError>)>,
-}
-
-impl IndexState {
-    /// Clones one coherent publication and its latest failure.
-    fn snapshot(&self) -> (Arc<PublishedWorkspace>, Option<(u64, Arc<ReadError>)>) {
-        (Arc::clone(&self.current), self.failure.clone())
-    }
-
-    /// Publishes candidate only while its observation remains current.
-    fn publish(&mut self, candidate: Arc<PublishedWorkspace>, observed_epoch: u64) -> bool {
-        if candidate.epoch != observed_epoch {
-            return false;
-        }
-        self.current = candidate;
-        self.failure = None;
-        true
-    }
-
-    /// Records failure only while its observation remains current.
-    fn record_failure(&mut self, epoch: u64, observed_epoch: u64, error: ReadError) -> bool {
-        if epoch != observed_epoch {
-            return false;
-        }
-        self.failure = Some((epoch, Arc::new(error)));
-        true
-    }
-}
-
-/// Filesystem observation and supervisor ownership shared with handlers.
-#[derive(Debug)]
-struct IndexCoherence {
-    observed_epoch: Arc<AtomicU64>,
-    watch_failed: Arc<AtomicBool>,
-    invalidations: mpsc::Sender<()>,
-    changed: Arc<Notify>,
-    publication_lane: SyncMutex<()>,
-    source_policy: SyncRwLock<Option<Arc<WorkspaceSourcePolicy>>>,
-    cancellation: CancellationToken,
-    task: AsyncMutex<Option<JoinHandle<()>>>,
-}
-
-/// Owned shutdown handle for the workspace index supervisor.
-#[derive(Debug, Clone)]
-pub(crate) struct IndexSupervisor {
-    coherence: Arc<IndexCoherence>,
-}
-
-/// Rebuild dependencies owned by index supervisor task.
-struct IndexSupervisorContext {
-    root: PathBuf,
-    limits: WorkspaceIndexLimits,
-    published: Arc<RwLock<IndexState>>,
-    change_lane: Arc<ChangeLane>,
-    coherence: Arc<IndexCoherence>,
-    blocking: BlockingExecutor,
-}
-
-/// The last admission of the workspace's `rift.toml`, kept with the file
-/// state it was read from so an edited file is re-admitted on the next
-/// request and an unchanged one is not re-parsed per call.
-#[derive(Debug, Clone)]
-struct ConfigurationState {
-    admitted: Result<WorkspaceConfiguration, Arc<ConfigurationError>>,
-    fingerprint: ConfigurationFingerprint,
-}
-
-impl ConfigurationState {
-    /// Admits the workspace's current `rift.toml`.
-    fn admit(root: &Path) -> Self {
-        let fingerprint = configuration_fingerprint(root);
-        Self {
-            admitted: load_configuration(root).map_err(Arc::new),
-            fingerprint,
-        }
-    }
-
-    /// The admission's outcome as one request sees it: the configuration to
-    /// serve under, or the typed refusal naming what to fix.
-    fn admitted(&self, phase: wire::ErrorPhase) -> Result<WorkspaceConfiguration, ErrorData> {
-        match &self.admitted {
-            Ok(configuration) => Ok(configuration.clone()),
-            Err(error) => Err(error.tool_error(phase)),
-        }
-    }
-
-    /// The `[source]` policy from the last admission, or the default policy
-    /// while `rift.toml` is invalid.
-    fn source_visibility(&self) -> SourceVisibility {
-        self.admitted.as_ref().map_or_else(
-            |_| SourceVisibility::default(),
-            |configuration| SourceVisibility::from(&configuration.source),
-        )
-    }
-}
-
-/// Exact bounded identity of the configuration policy source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigurationFingerprint {
-    /// No readable configuration file exists.
-    MissingOrUnreadable,
-    /// File bytes within the admitted bound.
-    Content([u8; 32]),
-    /// File is already invalid by size; its contents cannot change policy.
-    Oversized(u64),
-}
-
-/// The current `rift.toml` file state, or null when the file is absent or
-/// unreadable — either way the next admission decides what that means.
-fn configuration_fingerprint(root: &Path) -> ConfigurationFingerprint {
-    let path = root.join(WORKSPACE_CONFIGURATION_FILE);
-    let Ok(metadata) = std::fs::metadata(&path) else {
-        return ConfigurationFingerprint::MissingOrUnreadable;
-    };
-    if metadata.len() > CONFIGURATION_FILE_BYTES_MAX {
-        return ConfigurationFingerprint::Oversized(metadata.len());
-    }
-    let Ok(file) = std::fs::File::open(path) else {
-        return ConfigurationFingerprint::MissingOrUnreadable;
-    };
-    let mut raw = Vec::new();
-    if file
-        .take(CONFIGURATION_FILE_BYTES_MAX + 1)
-        .read_to_end(&mut raw)
-        .is_err()
-    {
-        return ConfigurationFingerprint::MissingOrUnreadable;
-    }
-    if raw.len() as u64 > CONFIGURATION_FILE_BYTES_MAX {
-        return ConfigurationFingerprint::Oversized(raw.len() as u64);
-    }
-    ConfigurationFingerprint::Content(Sha256::digest(raw).into())
-}
-
-impl IndexCoherence {
-    /// Creates one bounded invalidation stream and its receiver.
-    fn new() -> (Arc<Self>, mpsc::Receiver<()>) {
-        let (invalidations, receiver) = mpsc::channel(INDEX_INVALIDATIONS_MAX);
-        (
-            Arc::new(Self {
-                observed_epoch: Arc::new(AtomicU64::new(0)),
-                watch_failed: Arc::new(AtomicBool::new(false)),
-                invalidations,
-                changed: Arc::new(Notify::new()),
-                publication_lane: SyncMutex::new(()),
-                source_policy: SyncRwLock::new(None),
-                cancellation: CancellationToken::new(),
-                task: AsyncMutex::new(None),
-            }),
-            receiver,
-        )
-    }
-
-    /// Records one invalidation before coalescing its rebuild signal.
-    fn observe(&self) -> Result<u64, ReadError> {
-        let publication = self
-            .publication_lane
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = self.observe_locked();
-        drop(publication);
-        result
-    }
-
-    /// Marks watcher unhealthy and records invalidation in one critical section.
-    fn observe_watch_failure(&self) -> Result<u64, ReadError> {
-        let publication = self
-            .publication_lane
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.watch_failed.store(true, Ordering::Release);
-        let result = self.observe_locked();
-        drop(publication);
-        result
-    }
-
-    /// Records one invalidation while caller owns publication lane.
-    fn observe_locked(&self) -> Result<u64, ReadError> {
-        let previous = self
-            .observed_epoch
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
-                epoch.checked_add(1)
-            })
-            .map_err(|_| {
-                self.watch_failed.store(true, Ordering::Release);
-                ReadFault::unavailable("index observation", "filesystem event epoch exhausted")
-            })?;
-        let epoch = previous + 1;
-        match self.invalidations.try_send(()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
-            Err(mpsc::error::TrySendError::Closed(())) => {
-                self.watch_failed.store(true, Ordering::Release);
-                return Err(ReadFault::unavailable(
-                    "index observation",
-                    "index supervisor is not running",
-                ));
-            }
-        }
-        Ok(epoch)
-    }
-
-    /// Returns latest filesystem-event epoch.
-    fn observed_epoch(&self) -> u64 {
-        self.observed_epoch.load(Ordering::SeqCst)
-    }
-
-    /// Installs event admission policy under publication linearization.
-    #[cfg(test)]
-    fn install_source_policy(&self, policy: Arc<WorkspaceSourcePolicy>) {
-        let publication = self
-            .publication_lane
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.replace_source_policy_locked(policy);
-        drop(publication);
-    }
-
-    /// Replaces event admission policy while caller owns publication lane.
-    fn replace_source_policy_locked(&self, policy: Arc<WorkspaceSourcePolicy>) {
-        let mut current = self
-            .source_policy
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *current = Some(policy);
-    }
-
-    /// Filters and observes event within same publication critical section.
-    fn observe_event(&self, root: &Path, event: &Event) -> Result<Option<u64>, ReadError> {
-        let publication = self
-            .publication_lane
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = if relevant_watch_event(root, self, event) {
-            self.observe_locked().map(Some)
-        } else {
-            Ok(None)
-        };
-        drop(publication);
-        result
-    }
-
-    /// Returns whether current policy admits one source event path.
-    fn source_path_is_relevant(&self, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().is_none_or(|policy| policy.admits(path))
-    }
-
-    /// Returns whether current policy can admit source below one directory.
-    fn source_directory_is_relevant(&self, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current
-            .as_ref()
-            .is_none_or(|policy| policy.may_admit_descendant(path))
-    }
-
-    /// Returns whether path is current root workspace configuration.
-    fn workspace_configuration_is_relevant(&self, root: &Path, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().map_or_else(
-            || path == root.join(WORKSPACE_CONFIGURATION_FILE),
-            |policy| policy.is_workspace_configuration(path),
-        )
-    }
-}
-
-impl Drop for IndexCoherence {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-    }
-}
-
-impl IndexSupervisor {
-    /// Cancels and joins the workspace index supervisor.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when the task panics or misses its shutdown deadline.
-    ///
-    /// # Cancel safety
-    ///
-    /// Cancellation is requested before the join begins. Dropping this future
-    /// after it takes task ownership detaches that terminating task.
-    pub(crate) async fn shutdown(&self) -> Result<(), ReadError> {
-        self.coherence.cancellation.cancel();
-        let Some(mut task) = self.coherence.task.lock().await.take() else {
-            return Ok(());
-        };
-        if let Ok(result) = tokio::time::timeout(INDEX_SHUTDOWN_TIMEOUT, &mut task).await {
-            result.map_err(|error| ReadFault::task("index supervisor shutdown", error.to_string()))
-        } else {
-            task.abort();
-            let _ = task.await;
-            Err(ReadFault::unavailable(
-                "index supervisor shutdown",
-                "shutdown deadline elapsed",
-            ))
-        }
-    }
-}
-
-/// Creates one native watcher rooted before the initial index scan.
-fn workspace_watcher(
-    root: &Path,
-    coherence: &Arc<IndexCoherence>,
-) -> Result<notify::RecommendedWatcher, ReadError> {
-    let watched_root = std::fs::canonicalize(root)
-        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
-    let event_root = watched_root.clone();
-    let coherence = Arc::clone(coherence);
-    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-        if let Ok(event) = result {
-            if coherence.observe_event(&event_root, &event).is_err() {
-                tracing::error!(
-                    component = "index",
-                    operation = "watch.observe",
-                    "index watch failed"
-                );
-            }
-        } else {
-            let _ = coherence.observe_watch_failure();
-            tracing::warn!(
-                component = "index",
-                operation = "watch.receive",
-                "index watch backend reported failure"
-            );
-        }
-    })
-    .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
-    watcher
-        .watch(&watched_root, RecursiveMode::Recursive)
-        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
-    Ok(watcher)
-}
-
-/// Whether one native event can change visible Rust source or its policy.
-fn relevant_watch_event(root: &Path, coherence: &IndexCoherence, event: &Event) -> bool {
-    if matches!(event.kind, EventKind::Access(_)) {
-        return false;
-    }
-    event
-        .paths
-        .iter()
-        .filter(|path| hard_floor_admits_watch_path(root, path))
-        .any(|path| watch_kind_reaches_path(root, coherence, event.kind, path))
-}
-
-/// Rejects paths below Rift's hard-floor directories.
-fn hard_floor_admits_watch_path(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return true;
-    };
-    !relative.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
-    })
-}
-
-/// Applies event-kind filtering without trusting editor-specific event shapes.
-fn watch_kind_reaches_path(
-    root: &Path,
-    coherence: &IndexCoherence,
-    kind: EventKind,
-    path: &Path,
-) -> bool {
-    let workspace_configuration = coherence.workspace_configuration_is_relevant(root, path);
-    let gitignore = path.file_name() == Some(std::ffi::OsStr::new(".gitignore"))
-        && path
-            .parent()
-            .is_some_and(|parent| coherence.source_directory_is_relevant(parent));
-    let policy_file = workspace_configuration || gitignore;
-    let source_file = coherence.source_path_is_relevant(path);
-    let directory_event = matches!(
-        kind,
-        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
-    ) && coherence.source_directory_is_relevant(path);
-    let possible_directory =
-        path.extension().is_none() && coherence.source_directory_is_relevant(path);
-    match kind {
-        EventKind::Create(_) | EventKind::Remove(_) => {
-            policy_file || source_file || directory_event
-        }
-        EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any | EventKind::Other => {
-            policy_file || source_file || possible_directory
-        }
-        EventKind::Modify(_) => policy_file || source_file,
-        EventKind::Access(_) => false,
-    }
-}
-
-/// Builds the first snapshot while rejecting concurrent filesystem movement.
-async fn initial_workspace(
-    root: &Path,
-    limits: WorkspaceIndexLimits,
-    coherence: &IndexCoherence,
-    blocking: &BlockingExecutor,
-) -> Result<Arc<PublishedWorkspace>, ReadError> {
-    for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
-        let epoch = coherence.observed_epoch();
-        let build_root = root.to_path_buf();
-        let span = tracing::info_span!(
-            "index.build",
-            component = "index",
-            trigger = "startup",
-            epoch,
-            attempt
-        );
-        let built = blocking
-            .run("initial index build", move || {
-                build_workspace_candidate(&build_root, limits, epoch)
-            })
-            .instrument(span)
-            .await?;
-        let WorkspaceCandidate::Stable(built) = built else {
-            continue;
-        };
-        let stable_epoch = coherence.observed_epoch() == epoch;
-        let watch_healthy = !coherence.watch_failed.load(Ordering::Acquire);
-        if stable_epoch && watch_healthy {
-            let publication = coherence
-                .publication_lane
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if coherence.observed_epoch() != epoch || coherence.watch_failed.load(Ordering::Acquire)
-            {
-                drop(publication);
-                continue;
-            }
-            coherence.replace_source_policy_locked(Arc::clone(&built.source_policy));
-            drop(publication);
-            tracing::info!(
-                component = "index",
-                operation = "index.publish",
-                trigger = "startup",
-                epoch,
-                "index snapshot published"
-            );
-            return Ok(built);
-        }
-    }
-    Err(ReadFault::unavailable(
-        "initial index build",
-        "workspace kept changing across bounded capture attempts",
-    ))
-}
-
-/// Result of one bounded workspace candidate capture.
-enum WorkspaceCandidate {
-    /// Index, configuration, and source policy share one stable capture.
-    Stable(Arc<PublishedWorkspace>),
-    /// Configuration moved during capture.
-    ConfigurationChanged,
-}
-
-/// Builds one snapshot candidate and verifies configuration around its scan.
-fn build_workspace_candidate(
-    root: &Path,
-    limits: WorkspaceIndexLimits,
-    epoch: u64,
-) -> Result<WorkspaceCandidate, ReadError> {
-    let configuration = ConfigurationState::admit(root);
-    let visibility = configuration.source_visibility();
-    let reads = ReadService::build(root, limits, &visibility)?;
-    let source_policy = WorkspaceSourcePolicy::build(root, limits, &visibility)
-        .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
-    if configuration.fingerprint != configuration_fingerprint(root) {
-        return Ok(WorkspaceCandidate::ConfigurationChanged);
-    }
-    Ok(WorkspaceCandidate::Stable(Arc::new(PublishedWorkspace {
-        fingerprint: reads.workspace_fingerprint().clone(),
-        reads: Arc::new(reads),
-        configuration,
-        source_policy: Arc::new(source_policy),
-        epoch,
-    })))
-}
-
-/// Outcome of one background reconciliation attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RebuildOutcome {
-    /// Candidate became current and was published.
-    Published,
-    /// New observation invalidated candidate before publication.
-    Superseded,
-}
-
-/// Owns native watcher and reconciles coalesced invalidations until shutdown.
-async fn run_index_supervisor(
-    _watcher: notify::RecommendedWatcher,
-    mut invalidations: mpsc::Receiver<()>,
-    context: IndexSupervisorContext,
-) {
-    let IndexSupervisorContext {
-        root,
-        limits,
-        published,
-        change_lane,
-        coherence,
-        blocking,
-    } = context;
-    loop {
-        let received = tokio::select! {
-            () = coherence.cancellation.cancelled() => false,
-            received = invalidations.recv() => received.is_some(),
-        };
-        if !received {
-            return;
-        }
-        tokio::select! {
-            () = coherence.cancellation.cancelled() => return,
-            () = tokio::time::sleep(INDEX_DEBOUNCE) => {}
-        }
-        let epoch = coherence.observed_epoch();
-        tracing::debug!(
-            component = "index",
-            operation = "watch.batch",
-            epoch,
-            "filesystem invalidations coalesced"
-        );
-        let result = rebuild_workspace(
-            root.clone(),
-            limits,
-            Arc::clone(&published),
-            Arc::clone(&change_lane),
-            Arc::clone(&coherence),
-            blocking.clone(),
-            epoch,
-        )
-        .instrument(tracing::info_span!(
-            "index.build",
-            component = "index",
-            trigger = "filesystem",
-            epoch
-        ))
-        .await;
-        if let Err(error) = result {
-            tracing::warn!(
-                component = "index",
-                operation = "index.build",
-                epoch,
-                error_code = error.descriptor().code(),
-                "index rebuild failed"
-            );
-            let failed_state = Arc::clone(&published);
-            let failed_coherence = Arc::clone(&coherence);
-            let recorded = blocking
-                .run("index failure publication", move || {
-                    Ok(record_rebuild_failure(
-                        &failed_state,
-                        &failed_coherence,
-                        epoch,
-                        error,
-                    ))
-                })
-                .await;
-            if recorded.is_err() {
-                let _ = coherence.observe_watch_failure();
-            }
-            coherence.changed.notify_waiters();
-        }
-    }
-}
-
-/// Rebuilds and atomically publishes only a still-current candidate.
-async fn rebuild_workspace(
-    root: PathBuf,
-    limits: WorkspaceIndexLimits,
-    published: Arc<RwLock<IndexState>>,
-    change_lane: Arc<ChangeLane>,
-    coherence: Arc<IndexCoherence>,
-    blocking: BlockingExecutor,
-    epoch: u64,
-) -> Result<RebuildOutcome, ReadError> {
-    blocking
-        .run("filesystem index rebuild", move || {
-            rebuild_workspace_blocking(&root, limits, &published, &change_lane, &coherence, epoch)
-        })
-        .await
-}
-
-/// Runs one serialized filesystem rebuild on blocking executor.
-fn rebuild_workspace_blocking(
-    root: &Path,
-    limits: WorkspaceIndexLimits,
-    published: &RwLock<IndexState>,
-    change_lane: &ChangeLane,
-    coherence: &IndexCoherence,
-    epoch: u64,
-) -> Result<RebuildOutcome, ReadError> {
-    change_lane.run(|| rebuild_workspace_serialized(root, limits, published, coherence, epoch))
-}
-
-/// Rebuilds workspace while mutation lane is held.
-fn rebuild_workspace_serialized(
-    root: &Path,
-    limits: WorkspaceIndexLimits,
-    published: &RwLock<IndexState>,
-    coherence: &IndexCoherence,
-    epoch: u64,
-) -> Result<RebuildOutcome, ReadError> {
-    if !admit_rebuild(coherence, epoch)? {
-        return Ok(RebuildOutcome::Superseded);
-    }
-    let candidate = build_workspace_candidate(root, limits, epoch)?;
-    let WorkspaceCandidate::Stable(candidate) = candidate else {
-        let _ = coherence.observe();
-        return Ok(RebuildOutcome::Superseded);
-    };
-    let outcome = publish_rebuild(published, coherence, candidate);
-    if outcome == RebuildOutcome::Published {
-        trace_publication(epoch);
-        coherence.changed.notify_waiters();
-    }
-    Ok(outcome)
-}
-
-/// Refuses rebuild when watcher failed or candidate epoch already moved.
-fn admit_rebuild(coherence: &IndexCoherence, epoch: u64) -> Result<bool, ReadError> {
-    if coherence.watch_failed.load(Ordering::Acquire) {
-        return Err(ReadFault::unavailable(
-            "filesystem index rebuild",
-            "filesystem watcher failed",
-        ));
-    }
-    Ok(coherence.observed_epoch() == epoch)
-}
-
-/// Atomically publishes candidate when observation still matches.
-fn publish_rebuild(
-    published: &RwLock<IndexState>,
-    coherence: &IndexCoherence,
-    candidate: Arc<PublishedWorkspace>,
-) -> RebuildOutcome {
-    publish_rebuild_after(published, coherence, candidate, || {})
-}
-
-/// Publishes under observation lane; hook enables deterministic overlap tests.
-fn publish_rebuild_after(
-    published: &RwLock<IndexState>,
-    coherence: &IndexCoherence,
-    candidate: Arc<PublishedWorkspace>,
-    after_state_lock: impl FnOnce(),
-) -> RebuildOutcome {
-    let publication = coherence
-        .publication_lane
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut state = published.blocking_write();
-    after_state_lock();
-    let observed_epoch = coherence.observed_epoch();
-    if candidate.epoch != observed_epoch {
-        drop(state);
-        drop(publication);
-        return RebuildOutcome::Superseded;
-    }
-    coherence.replace_source_policy_locked(Arc::clone(&candidate.source_policy));
-    let published = state.publish(candidate, observed_epoch);
-    drop(state);
-    drop(publication);
-    if published {
-        RebuildOutcome::Published
-    } else {
-        RebuildOutcome::Superseded
-    }
-}
-
-/// Records failure under same observation linearization as publication.
-fn record_rebuild_failure(
-    published: &RwLock<IndexState>,
-    coherence: &IndexCoherence,
-    epoch: u64,
-    error: ReadError,
-) -> bool {
-    let publication = coherence
-        .publication_lane
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let observed_epoch = coherence.observed_epoch();
-    let recorded = published
-        .blocking_write()
-        .record_failure(epoch, observed_epoch, error);
-    drop(publication);
-    recorded
-}
-
-/// Emits one path-free filesystem publication event.
-fn trace_publication(epoch: u64) {
-    tracing::info!(
-        component = "index",
-        operation = "index.publish",
-        trigger = "filesystem",
-        epoch,
-        "index snapshot published"
-    );
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl RiftMcp {
     /// Builds server from one direct-workspace snapshot, applying the
-    /// admitted `rift.toml`'s `[source]` policy to the initial index. While
-    /// `rift.toml` is invalid, the initial index still builds under the
-    /// default policy; every request then fails as `configuration_invalid`
-    /// until the file is fixed.
+    /// admitted `rift.toml`'s `[source]` policy to the initial index and its
+    /// `[server]` table to the blocking pool. While `rift.toml` is invalid,
+    /// the initial index still builds under the default policies; every
+    /// request then fails as `configuration_invalid` until the file is
+    /// fixed.
     ///
     /// # Errors
     ///
@@ -935,19 +162,21 @@ impl RiftMcp {
     ///
     /// Dropping this future discards construction. An admitted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
-    pub async fn build(
-        root: &Path,
-        limits: WorkspaceIndexLimits,
-        options: RiftMcpOptions,
-    ) -> Result<Self, ReadError> {
+    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
         let root = root.to_path_buf();
-        let blocking = BlockingExecutor::process_wide(options);
-        let (coherence, invalidations) = IndexCoherence::new();
+        let admission_root = root.clone();
+        let startup_configuration =
+            tokio::task::spawn_blocking(move || ConfigurationState::admit(&admission_root))
+                .await
+                .map_err(|error| ReadFault::task("configuration admission", error.to_string()))?;
+        let blocking =
+            BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
+        let (validation, invalidations) = IndexValidation::new();
         let watch_root = root.clone();
-        let watch_coherence = Arc::clone(&coherence);
+        let watch_validation = Arc::clone(&validation);
         let watcher = blocking
             .run("workspace watch setup", move || {
-                workspace_watcher(&watch_root, &watch_coherence)
+                workspace_watcher(&watch_root, &watch_validation)
             })
             .instrument(tracing::info_span!(
                 "index.watch",
@@ -955,7 +184,7 @@ impl RiftMcp {
                 operation = "watch.setup"
             ))
             .await?;
-        let published = initial_workspace(&root, limits, &coherence, &blocking).await?;
+        let published = initial_workspace(&root, limits, &validation, &blocking).await?;
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
             failure: None,
@@ -969,18 +198,18 @@ impl RiftMcp {
                 limits,
                 published: Arc::clone(&published),
                 change_lane: Arc::clone(&change_lane),
-                coherence: Arc::clone(&coherence),
+                validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
             },
         ));
-        let mut task = coherence.task.lock().await;
+        let mut task = validation.task.lock().await;
         *task = Some(supervisor_task);
         drop(task);
         Ok(Self {
             root: root.clone(),
             limits,
             published,
-            coherence,
+            validation,
             changes: Arc::new(ChangeService::new(&root)),
             change_lane,
             blocking,
@@ -991,7 +220,7 @@ impl RiftMcp {
     /// Returns owned supervisor shutdown access for transport adapters.
     pub(crate) fn index_supervisor(&self) -> IndexSupervisor {
         IndexSupervisor {
-            coherence: Arc::clone(&self.coherence),
+            validation: Arc::clone(&self.validation),
         }
     }
 
@@ -1174,18 +403,18 @@ impl RiftMcp {
             let (fingerprint, configuration_fingerprint) = match capture {
                 Ok(capture) => capture,
                 Err(error) => {
-                    let _ = self.coherence.observe();
+                    let _ = self.validation.observe();
                     return Err(error.tool_error(phase));
                 }
             };
             let configuration_matches =
                 current.configuration.fingerprint == configuration_fingerprint;
-            let epoch_matches = current.epoch == self.coherence.observed_epoch();
+            let epoch_matches = current.epoch == self.validation.observed_epoch();
             if fingerprint == current.fingerprint && configuration_matches && epoch_matches {
                 current.configuration.admitted(phase)?;
                 return Ok(current);
             }
-            self.coherence
+            self.validation
                 .observe()
                 .map_err(|error| error.tool_error(phase))?;
         }
@@ -1202,14 +431,14 @@ impl RiftMcp {
         phase: wire::ErrorPhase,
     ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
         loop {
-            let changed = self.coherence.changed.notified();
+            let changed = self.validation.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let observed_epoch = self.coherence.observed_epoch();
+            let observed_epoch = self.validation.observed_epoch();
             let state = self.published.read().await;
             let (current, failure) = state.snapshot();
             drop(state);
-            if self.coherence.watch_failed.load(Ordering::Acquire) {
+            if self.validation.watch_failed.load(Ordering::Acquire) {
                 return Err(ReadFault::unavailable(
                     "current workspace read",
                     "filesystem watcher failed",
@@ -1253,14 +482,19 @@ impl RiftMcp {
         let root = self.root.clone();
         let limits = self.limits;
         let published = Arc::clone(&self.published);
-        let coherence = Arc::clone(&self.coherence);
+        let validation = Arc::clone(&self.validation);
         let changes = Arc::clone(&self.changes);
         let change_lane = Arc::clone(&self.change_lane);
         self.blocking
             .run("workspace change", move || {
                 change_lane.run(|| {
                     Self::change_serialized(
-                        &root, limits, &published, &coherence, &changes, operation,
+                        &root,
+                        limits,
+                        &published,
+                        &validation,
+                        &changes,
+                        operation,
                     )
                 })
             })
@@ -1268,19 +502,19 @@ impl RiftMcp {
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?
     }
 
-    /// Runs one already-serialized change through coherent publication.
+    /// Runs one already-serialized change through validated publication.
     fn change_serialized(
         root: &Path,
         limits: WorkspaceIndexLimits,
         published: &RwLock<IndexState>,
-        coherence: &IndexCoherence,
+        validation: &IndexValidation,
         changes: &ChangeService,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
     ) -> Result<Result<Json<ChangeResult>, ErrorData>, ReadError> {
         let state = published.blocking_read();
         let (current, _) = state.snapshot();
         drop(state);
-        if current.epoch != coherence.observed_epoch() {
+        if current.epoch != validation.observed_epoch() {
             return Ok(Err(ReadFault::unavailable(
                 "workspace change",
                 "index changed before operation admission",
@@ -1293,7 +527,7 @@ impl RiftMcp {
         };
         let mut result = operation(&current.reads, changes)?;
         if let ChangeResult::Applied { summary } = &mut result {
-            let epoch = match coherence.observe() {
+            let epoch = match validation.observe() {
                 Ok(epoch) => epoch,
                 Err(error) => {
                     summary.diagnostics.push(stale_snapshot_diagnostic(&error));
@@ -1319,7 +553,7 @@ impl RiftMcp {
                             "workspace change",
                             "configuration changed during snapshot rebuild",
                         );
-                        let _ = coherence.observe();
+                        let _ = validation.observe();
                         summary.diagnostics.push(stale_snapshot_diagnostic(&error));
                         return Ok(Ok(Json(result)));
                     }
@@ -1330,7 +564,7 @@ impl RiftMcp {
                         source_policy,
                         epoch,
                     });
-                    if publish_rebuild(published, coherence, next) == RebuildOutcome::Published {
+                    if publish_rebuild(published, validation, next) == RebuildOutcome::Published {
                         tracing::info!(
                             component = "index",
                             operation = "index.publish",
@@ -1338,7 +572,7 @@ impl RiftMcp {
                             epoch,
                             "index snapshot published"
                         );
-                        coherence.changed.notify_waiters();
+                        validation.changed.notify_waiters();
                     }
                 }
                 Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
@@ -1372,86 +606,6 @@ impl RiftMcp {
     }
 }
 
-/// Bytes of each captured hook stream a failure finding quotes. The finding
-/// also states the full sizes, so a truncated quote stays distinguishable
-/// from a short log.
-const HOOK_FINDING_STREAM_BYTES_MAX: usize = 1_024;
-
-/// The finding an applied change carries for one hook that did not pass:
-/// what ended the run, then each non-empty stream's size and bounded quote.
-fn hook_failure_diagnostic(hook: &CommandHook, run: &HookRun) -> rift_protocol::read::Diagnostic {
-    let account = match &run.status {
-        HookStatus::Passed => unreachable!(
-            "a passing hook contributes guarantees, not findings: hook={:?}",
-            hook.id
-        ),
-        HookStatus::Failed => match run.exit_code {
-            Some(code) => format!("exited {code}"),
-            None => "exited nonzero".to_owned(),
-        },
-        HookStatus::TimedOut => format!("killed after {}ms", hook.timeout_ms),
-        HookStatus::Error(message) => message.clone(),
-    };
-    let mut message = format!("hook {} did not pass: {account}", hook.id);
-    for (stream_name, stream) in [("stdout", &run.stdout), ("stderr", &run.stderr)] {
-        if stream.total_bytes == 0 {
-            continue;
-        }
-        let quoted = bounded_prefix(&stream.text, HOOK_FINDING_STREAM_BYTES_MAX);
-        let _ = write!(
-            message,
-            "; {stream_name} ({} of {} bytes): {quoted}",
-            quoted.len(),
-            stream.total_bytes,
-        );
-    }
-    rift_protocol::read::Diagnostic {
-        severity: rift_protocol::read::Severity::Error,
-        code: Some(DiagnosticCode::HookFailed.code()),
-        message,
-        span: None,
-        related: Vec::new(),
-        tags: Vec::new(),
-        reliability: rift_protocol::read::DiagnosticReliability::Reliable,
-        continuation: rift_protocol::read::DiagnosticContinuation::Unknown,
-        extensions: rift_protocol::read::Extensions(std::collections::BTreeMap::new()),
-        language: None,
-    }
-}
-
-/// The longest prefix of `text` within `bytes_max` that ends on a character
-/// boundary. The walk back is bounded by UTF-8 itself: at most three steps.
-fn bounded_prefix(text: &str, bytes_max: usize) -> &str {
-    if text.len() <= bytes_max {
-        return text;
-    }
-    let mut end = bytes_max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-/// Finding carried when follow-up snapshot cannot rebuild. Current-tree
-/// reads refuse that dirty epoch until one can.
-fn stale_snapshot_diagnostic(error: &ReadError) -> rift_protocol::read::Diagnostic {
-    rift_protocol::read::Diagnostic {
-        severity: rift_protocol::read::Severity::Warning,
-        code: Some(DiagnosticCode::SnapshotStale.code()),
-        message: format!(
-            "the change landed, and the read snapshot could not refresh; \
-             current-tree reads wait for a successful workspace reindex: {error}"
-        ),
-        span: None,
-        related: Vec::new(),
-        tags: Vec::new(),
-        reliability: rift_protocol::read::DiagnosticReliability::Reliable,
-        continuation: rift_protocol::read::DiagnosticContinuation::Unknown,
-        extensions: rift_protocol::read::Extensions(std::collections::BTreeMap::new()),
-        language: None,
-    }
-}
-
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
     fn get_info(&self) -> ServerInfo {
@@ -1466,117 +620,28 @@ impl ServerHandler for RiftMcp {
     }
 }
 
-/// Boundary view of a read failure: the projection a tool handler serves as
-/// the JSON-RPC error object the design documents — code `-32000`, the
-/// rendered failure line as `message`, and the typed [`wire::ErrorData`] as
-/// `data`.
-trait WireFailure {
-    /// The JSON-RPC error object for this failure, naming the phase it
-    /// stopped in.
-    fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData;
-
-    /// The typed wire payload for this failure.
-    fn wire_error(&self, phase: wire::ErrorPhase) -> wire::ErrorData;
-
-    /// The failure's source chain as bounded `causes` entries, outermost
-    /// first. Each level inherits the outer classification, which the read
-    /// error already resolved through the concrete failure it wraps.
-    fn wire_causes(&self) -> Vec<wire::ErrorCause>;
-}
-
-impl<K: Fault> WireFailure for rift_core::Error<K> {
-    fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData {
-        let message = self.to_string();
-        let data = serde_json::to_value(self.wire_error(phase)).ok();
-        ErrorData::new(RIFT_ERROR_CODE, message, data)
-    }
-
-    fn wire_error(&self, phase: wire::ErrorPhase) -> wire::ErrorData {
-        let descriptor = self.descriptor();
-        wire::ErrorData {
-            code: wire_code(descriptor.name()),
-            message: self.to_string(),
-            retry: descriptor.retry(),
-            phase,
-            diagnostics: Vec::new(),
-            limit: None,
-            causes: self.wire_causes(),
-        }
-    }
-
-    fn wire_causes(&self) -> Vec<wire::ErrorCause> {
-        let descriptor = self.descriptor();
-        bounded_causes(
-            wire_code(descriptor.name()),
-            descriptor.retry(),
-            std::error::Error::source(self),
-        )
-    }
-}
-
-/// Walks one source chain into bounded `causes` entries, outermost first.
-/// Every level inherits the classification and retry guidance passed in,
-/// which the failure already resolved through the concrete fault it wraps.
-fn bounded_causes(
-    code: wire::ErrorCode,
-    retry: wire::RetryDirective,
-    outermost: Option<&(dyn std::error::Error + 'static)>,
-) -> Vec<wire::ErrorCause> {
-    let mut causes = Vec::new();
-    let mut source = outermost;
-    while let Some(current) = source {
-        if causes.len() == ERROR_CAUSES_MAX {
-            break;
-        }
-        causes.push(wire::ErrorCause {
-            code,
-            message: current.to_string(),
-            retry,
-        });
-        source = current.source();
-    }
-    causes
-}
-
-/// The wire code for one registry identity. The registry composes the wire
-/// enum, so this is a projection, not a mapping; a CLI-only identity never
-/// reaches this boundary, and classifies as `internal_error` if one does.
-fn wire_code(name: ErrorName) -> wire::ErrorCode {
-    match name {
-        ErrorName::Wire(code) => code,
-        ErrorName::Cli(_) => wire::ErrorCode::InternalError,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
     use std::fs;
-    use std::num::NonZeroU64;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier as ThreadBarrier};
     use std::time::Duration;
 
-    use notify::event::{CreateKind, ModifyKind, RemoveKind};
-    use notify::{Event, EventKind};
-    use rift_core::{CliCode, ErrorName, SourceVisibility};
-    use rift_index::{WorkspaceIndexLimits, WorkspaceSourcePolicy};
-    use rift_protocol::error as wire;
-    use rift_protocol::read::GetSymbolResult;
-    use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault, ReadService};
+    use rift_index::WorkspaceIndexLimits;
 
-    use super::WireFailure;
+    use rift_protocol::read::GetSymbolResult;
+    use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault};
+
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
     use serde_json::json;
-    use tokio::sync::{Barrier as AsyncBarrier, RwLock};
 
-    use super::{
-        BlockingExecutor, ChangeLane, ConfigurationFingerprint, ConfigurationState, IndexCoherence,
-        IndexState, Parameters, PublishedWorkspace, RebuildOutcome, RiftMcp, RiftMcpOptions,
-        WorkspaceCandidate, build_workspace_candidate, publish_rebuild, publish_rebuild_after,
-        record_rebuild_failure, relevant_watch_event,
+    use super::{BlockingExecutor, ChangeLane, Parameters, RiftMcp};
+    use crate::validation::{
+        ConfigurationState, IndexState, IndexValidation, PublishedWorkspace, WorkspaceCandidate,
+        build_workspace_candidate, configuration_fingerprint, record_rebuild_failure,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1584,12 +649,7 @@ mod tests {
     async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let server = RiftMcp::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            RiftMcpOptions::default(),
-        )
-        .await?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         Ok((directory, server))
     }
 
@@ -1611,10 +671,7 @@ mod tests {
             .ok_or_else(|| "tool arguments must be an object".into())
     }
 
-    fn stable_candidate(
-        root: &std::path::Path,
-        epoch: u64,
-    ) -> TestResult<Arc<super::PublishedWorkspace>> {
+    fn stable_candidate(root: &std::path::Path, epoch: u64) -> TestResult<Arc<PublishedWorkspace>> {
         match build_workspace_candidate(root, WorkspaceIndexLimits::default(), epoch)? {
             WorkspaceCandidate::Stable(candidate) => Ok(candidate),
             WorkspaceCandidate::ConfigurationChanged => {
@@ -1628,405 +685,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture must exist");
         fs::write(directory.path().join("invalid.rs"), [0xff])
             .expect("invalid source fixture must write");
-        let error = RiftMcp::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            RiftMcpOptions::default(),
-        )
-        .await
-        .expect_err("invalid source must fail");
+        let error = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+            .await
+            .expect_err("invalid source must fail");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
-    }
-
-    #[test]
-    fn configuration_capture_covers_content_invalid_policy_and_oversize() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[source]\nrespect_gitignore = false\n",
-        )?;
-        assert!(matches!(
-            super::configuration_fingerprint(directory.path()),
-            ConfigurationFingerprint::Content(_)
-        ));
-
-        fs::write(directory.path().join("rift.toml"), "invalid = true\n")?;
-        let invalid = ConfigurationState::admit(directory.path());
-        assert!(invalid.admitted.is_err());
-        assert_eq!(invalid.source_visibility(), SourceVisibility::default());
-
-        fs::write(
-            directory.path().join("rift.toml"),
-            vec![
-                b'x';
-                usize::try_from(rift_server::CONFIGURATION_FILE_BYTES_MAX)
-                    .expect("configuration bound must fit usize")
-                    + 1
-            ],
-        )?;
-        assert!(matches!(
-            super::configuration_fingerprint(directory.path()),
-            ConfigurationFingerprint::Oversized(_)
-        ));
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn parallel_observations_are_monotonic_and_coalesce_one_signal() -> TestResult {
-        const OBSERVATIONS: usize = 32;
-        let (coherence, mut invalidations) = IndexCoherence::new();
-        let barrier = Arc::new(AsyncBarrier::new(OBSERVATIONS + 1));
-        let mut tasks = Vec::with_capacity(OBSERVATIONS);
-        for _ in 0..OBSERVATIONS {
-            let coherence = Arc::clone(&coherence);
-            let barrier = Arc::clone(&barrier);
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                coherence.observe().map_err(|error| error.to_string())
-            }));
-        }
-        barrier.wait().await;
-        let mut epochs = Vec::with_capacity(OBSERVATIONS);
-        for task in tasks {
-            epochs.push(task.await??);
-        }
-        epochs.sort_unstable();
-        assert_eq!(epochs, (1..=OBSERVATIONS as u64).collect::<Vec<_>>());
-        assert_eq!(invalidations.try_recv(), Ok(()));
-        assert!(matches!(
-            invalidations.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn observation_refuses_closed_channel_and_exhausted_epoch() {
-        let (closed, receiver) = IndexCoherence::new();
-        drop(receiver);
-        assert!(closed.observe().is_err());
-        assert!(closed.watch_failed.load(Ordering::Acquire));
-
-        let (exhausted, _receiver) = IndexCoherence::new();
-        exhausted.observed_epoch.store(u64::MAX, Ordering::Release);
-        assert!(exhausted.observe().is_err());
-        assert!(exhausted.watch_failed.load(Ordering::Acquire));
-
-        let (failed, _receiver) = IndexCoherence::new();
-        assert_eq!(failed.observe_watch_failure().expect("failure epoch"), 1);
-        assert!(failed.watch_failed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn watcher_events_follow_source_policy_gitignore_and_hard_floor() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let watched_root = directory.path().join(".");
-        let event_root = directory.path().canonicalize()?;
-        fs::create_dir_all(directory.path().join("src/generated"))?;
-        fs::create_dir_all(directory.path().join("examples"))?;
-        fs::create_dir_all(directory.path().join("target"))?;
-        fs::write(directory.path().join(".gitignore"), "src/ignored.rs\n")?;
-        let visibility = SourceVisibility::new(
-            vec!["src/**".to_owned()],
-            vec!["src/generated/**".to_owned()],
-            true,
-        );
-        let policy = WorkspaceSourcePolicy::build(
-            &watched_root,
-            WorkspaceIndexLimits::default(),
-            &visibility,
-        )?;
-        let (coherence, _invalidations) = IndexCoherence::new();
-        coherence.install_source_policy(Arc::new(policy));
-        let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
-
-        assert!(relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Modify(ModifyKind::Any), "src/lib.rs")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Modify(ModifyKind::Any), "src/generated/code.rs")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Modify(ModifyKind::Any), "src/ignored.rs")
-        ));
-        assert!(relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Remove(RemoveKind::Folder), "src")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Create(CreateKind::Folder), "examples")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Remove(RemoveKind::Folder), "src/generated")
-        ));
-        assert!(relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Modify(ModifyKind::Any), ".gitignore")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Modify(ModifyKind::Any), "examples/.gitignore")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Modify(ModifyKind::Any), "src/rift.toml")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Modify(ModifyKind::Any), "target/.gitignore")
-        ));
-        assert!(relevant_watch_event(
-            &watched_root,
-            &coherence,
-            &event(EventKind::Modify(ModifyKind::Any), "rift.toml")
-        ));
-        Ok(())
-    }
-
-    fn assert_workspace_identity(
-        actual: &super::PublishedWorkspace,
-        expected: &super::PublishedWorkspace,
-    ) {
-        assert_eq!(actual.epoch, expected.epoch);
-        assert_eq!(actual.fingerprint, expected.fingerprint);
-        assert_eq!(
-            actual.configuration.fingerprint,
-            expected.configuration.fingerprint
-        );
-        assert_eq!(
-            actual.configuration.source_visibility().respect_gitignore(),
-            expected
-                .configuration
-                .source_visibility()
-                .respect_gitignore()
-        );
-        assert!(Arc::ptr_eq(&actual.source_policy, &expected.source_policy));
-    }
-
-    struct PublicationFixture {
-        _directory: tempfile::TempDir,
-        before: Arc<super::PublishedWorkspace>,
-        after: Arc<super::PublishedWorkspace>,
-        state: Arc<RwLock<IndexState>>,
-        coherence: Arc<IndexCoherence>,
-        _invalidations: tokio::sync::mpsc::Receiver<()>,
-    }
-
-    fn publication_fixture() -> TestResult<PublicationFixture> {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[source]\nrespect_gitignore = true\n",
-        )?;
-        let before = stable_candidate(directory.path(), 0)?;
-        let state = Arc::new(RwLock::new(IndexState {
-            current: Arc::clone(&before),
-            failure: None,
-        }));
-        let (coherence, invalidations) = IndexCoherence::new();
-        coherence.install_source_policy(Arc::clone(&before.source_policy));
-        fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[source]\nrespect_gitignore = false\n",
-        )?;
-        let epoch = coherence.observe()?;
-        let after = stable_candidate(directory.path(), epoch)?;
-        Ok(PublicationFixture {
-            _directory: directory,
-            before,
-            after,
-            state,
-            coherence,
-            _invalidations: invalidations,
-        })
-    }
-
-    fn spawn_snapshot_readers(
-        state: &Arc<RwLock<IndexState>>,
-        expected: &Arc<super::PublishedWorkspace>,
-        readers_count: usize,
-    ) -> (Arc<ThreadBarrier>, Vec<std::thread::JoinHandle<()>>) {
-        let capture_barrier = Arc::new(ThreadBarrier::new(readers_count + 1));
-        let mut readers = Vec::with_capacity(readers_count);
-        for _ in 0..readers_count {
-            let state = Arc::clone(state);
-            let reader_barrier = Arc::clone(&capture_barrier);
-            let expected = Arc::clone(expected);
-            readers.push(std::thread::spawn(move || {
-                let state = state.blocking_read();
-                let (snapshot, failure) = state.snapshot();
-                drop(state);
-                reader_barrier.wait();
-                assert!(failure.is_none());
-                assert_workspace_identity(&snapshot, &expected);
-            }));
-        }
-        (capture_barrier, readers)
-    }
-
-    fn spawn_blocked_snapshot_readers(
-        state: &Arc<RwLock<IndexState>>,
-        expected: &Arc<super::PublishedWorkspace>,
-        readers_count: usize,
-    ) -> (Arc<ThreadBarrier>, Vec<std::thread::JoinHandle<()>>) {
-        let ready_barrier = Arc::new(ThreadBarrier::new(readers_count + 1));
-        let mut readers = Vec::with_capacity(readers_count);
-        for _ in 0..readers_count {
-            let state = Arc::clone(state);
-            let reader_barrier = Arc::clone(&ready_barrier);
-            let expected = Arc::clone(expected);
-            readers.push(std::thread::spawn(move || {
-                reader_barrier.wait();
-                let state = state.blocking_read();
-                let (snapshot, failure) = state.snapshot();
-                drop(state);
-                assert!(failure.is_none());
-                assert_workspace_identity(&snapshot, &expected);
-            }));
-        }
-        (ready_barrier, readers)
-    }
-
-    fn assert_published_fixture(fixture: &PublicationFixture) {
-        let state = fixture.state.blocking_read();
-        assert_workspace_identity(&state.current, &fixture.after);
-        drop(state);
-        let policy = fixture
-            .coherence
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(Arc::ptr_eq(
-            policy.as_ref().expect("policy must be published"),
-            &fixture.after.source_policy
-        ));
-    }
-
-    #[test]
-    fn parallel_reads_span_atomic_publication_without_mixed_identity() -> TestResult {
-        const READERS: usize = 8;
-        let fixture = publication_fixture()?;
-        let (prepublication_captures, prepublication_readers) =
-            spawn_snapshot_readers(&fixture.state, &fixture.before, READERS);
-        prepublication_captures.wait();
-        let publication_locked = Arc::new(ThreadBarrier::new(2));
-        let publication_released = Arc::new(ThreadBarrier::new(2));
-        let publisher_state = Arc::clone(&fixture.state);
-        let publisher_coherence = Arc::clone(&fixture.coherence);
-        let published_candidate = Arc::clone(&fixture.after);
-        let locked = Arc::clone(&publication_locked);
-        let released = Arc::clone(&publication_released);
-        let publisher = std::thread::spawn(move || {
-            publish_rebuild_after(
-                &publisher_state,
-                &publisher_coherence,
-                published_candidate,
-                || {
-                    locked.wait();
-                    released.wait();
-                },
-            )
-        });
-        publication_locked.wait();
-
-        let (blocked_readers_ready, blocked_readers) =
-            spawn_blocked_snapshot_readers(&fixture.state, &fixture.after, READERS);
-        blocked_readers_ready.wait();
-        let observation_started = Arc::new(ThreadBarrier::new(2));
-        let observer_coherence = Arc::clone(&fixture.coherence);
-        let observer_started = Arc::clone(&observation_started);
-        let observer = std::thread::spawn(move || {
-            observer_started.wait();
-            observer_coherence.observe()
-        });
-        observation_started.wait();
-        publication_released.wait();
-        assert_eq!(
-            publisher.join().expect("publisher thread must not panic"),
-            RebuildOutcome::Published
-        );
-        assert_eq!(observer.join().expect("observer thread must not panic")?, 2);
-        for reader in prepublication_readers.into_iter().chain(blocked_readers) {
-            reader.join().expect("reader thread must not panic");
-        }
-        assert_published_fixture(&fixture);
-        assert_eq!(fixture.coherence.observed_epoch(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn superseded_state_updates_are_rejected_and_success_clears_failure() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
-        let before = stable_candidate(directory.path(), 0)?;
-        fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
-        let after = stable_candidate(directory.path(), 1)?;
-        let mut state = IndexState {
-            current: Arc::clone(&before),
-            failure: None,
-        };
-
-        assert!(!state.publish(Arc::clone(&after), 2));
-        assert_workspace_identity(&state.current, &before);
-        assert!(!state.record_failure(1, 2, ReadFault::unavailable("test rebuild", "superseded")));
-        assert!(state.failure.is_none());
-        assert!(state.record_failure(1, 1, ReadFault::unavailable("test rebuild", "failed")));
-        assert!(state.failure.is_some());
-        assert!(state.publish(Arc::clone(&after), 1));
-        assert_workspace_identity(&state.current, &after);
-        assert!(state.failure.is_none());
-
-        let state = RwLock::new(IndexState {
-            current: Arc::clone(&before),
-            failure: None,
-        });
-        let (coherence, _invalidations) = IndexCoherence::new();
-        coherence.install_source_policy(Arc::clone(&before.source_policy));
-        assert_eq!(coherence.observe()?, 1);
-        assert_eq!(coherence.observe()?, 2);
-        assert_eq!(
-            publish_rebuild(&state, &coherence, Arc::clone(&after)),
-            RebuildOutcome::Superseded
-        );
-        let state_snapshot = state.blocking_read();
-        assert_workspace_identity(&state_snapshot.current, &before);
-        drop(state_snapshot);
-        let source_policy = coherence
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(Arc::ptr_eq(
-            source_policy
-                .as_ref()
-                .expect("policy must remain installed"),
-            &before.source_policy
-        ));
-        drop(source_policy);
-        assert!(!record_rebuild_failure(
-            &state,
-            &coherence,
-            1,
-            ReadFault::unavailable("test rebuild", "superseded failure")
-        ));
-        assert!(state.blocking_read().failure.is_none());
-        Ok(())
     }
 
     #[tokio::test]
@@ -2094,12 +756,10 @@ mod tests {
         fs::write(&path, "pub fn beacon() {}\n")?;
         let tight =
             WorkspaceIndexLimits::new(4, 60, 60, 4, 100).map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight, RiftMcpOptions::default()).await?;
+        let server = RiftMcp::build(directory.path(), tight).await?;
 
-        fs::write(
-            &path,
-            format!("pub fn oversized() {{}}\n{}", " ".repeat(80)),
-        )?;
+        let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
+        fs::write(&path, oversized)?;
         let error = get_symbol(&server, "oversized")
             .await
             .expect_err("oversized external edit must refuse a current answer");
@@ -2159,19 +819,55 @@ mod tests {
         let (_directory, server) = fixture().await?;
         let supervisor = server.index_supervisor();
         drop(server);
-        assert!(supervisor.coherence.cancellation.is_cancelled());
+        assert!(supervisor.validation.cancellation.is_cancelled());
         supervisor.shutdown().await?;
         supervisor.shutdown().await?;
-        assert!(supervisor.coherence.task.lock().await.is_none());
+        assert!(supervisor.validation.task.lock().await.is_none());
         Ok(())
     }
 
-    #[test]
-    fn mcp_options_configure_process_wide_queue_wait() {
-        let timeout_ms = NonZeroU64::new(1_250).expect("test timeout must be positive");
-        let options = RiftMcpOptions::default().with_blocking_queue_timeout_ms(timeout_ms);
-        let executor = BlockingExecutor::process_wide(options);
-        assert_eq!(executor.queue_timeout_ms, timeout_ms.get());
+    #[tokio::test]
+    async fn server_table_sizes_blocking_pool_and_queue_wait() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let configured = "[server]\nblocking_slots = 2\nblocking_queue_timeout = \"1250ms\"\n";
+        fs::write(directory.path().join("rift.toml"), configured)?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert_eq!(server.blocking.queue_timeout_ms, 1_250);
+        assert_eq!(server.blocking.operations.available_permits(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_server_table_keeps_default_blocking_policy() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let default_table = rift_protocol::configuration::ServerConfiguration::default();
+        assert_eq!(
+            server.blocking.queue_timeout_ms,
+            default_table.blocking_queue_timeout.milliseconds()
+        );
+        assert_eq!(
+            server.blocking.operations.available_permits() as u64,
+            default_table.blocking_slots
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_configuration_builds_default_blocking_policy() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[server]\nblocking_slots = 0\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let default_table = rift_protocol::configuration::ServerConfiguration::default();
+        assert_eq!(
+            server.blocking.operations.available_permits() as u64,
+            default_table.blocking_slots
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2417,7 +1113,7 @@ mod tests {
                 reads: Arc::clone(&candidate.reads),
                 configuration: ConfigurationState {
                     admitted: Err(Arc::new(configuration_error)),
-                    fingerprint: super::configuration_fingerprint(directory.path()),
+                    fingerprint: configuration_fingerprint(directory.path()),
                 },
                 fingerprint: candidate.fingerprint.clone(),
                 source_policy: Arc::clone(&candidate.source_policy),
@@ -2425,7 +1121,7 @@ mod tests {
             }),
             failure: None,
         });
-        let (coherence, _invalidations) = IndexCoherence::new();
+        let (validation, _invalidations) = IndexValidation::new();
         let changes = ChangeService::new(directory.path());
         let operation_called = AtomicBool::new(false);
 
@@ -2433,7 +1129,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &published,
-            &coherence,
+            &validation,
             &changes,
             |_, _| {
                 operation_called.store(true, Ordering::SeqCst);
@@ -2681,14 +1377,10 @@ mod tests {
     #[tokio::test]
     async fn applied_change_reports_failed_snapshot_rebuild_as_warning() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(
-            directory.path().join("lib.rs"),
-            "pub fn beacon() {}
-",
-        )?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight, RiftMcpOptions::default()).await?;
+        let server = RiftMcp::build(directory.path(), tight).await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -2794,174 +1486,210 @@ pub fn beacon() -> u64 {
     }
 
     #[test]
-    fn cli_identity_projects_to_internal_error_on_the_wire() {
-        assert_eq!(
-            super::wire_code(ErrorName::Cli(CliCode::ArtifactStale)),
-            wire::ErrorCode::InternalError
-        );
-    }
-
-    #[derive(Debug)]
-    struct Link {
-        depth: usize,
-        inner: Option<Box<Link>>,
-    }
-
-    impl std::fmt::Display for Link {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "link {}", self.depth)
-        }
-    }
-
-    impl Error for Link {
-        fn source(&self) -> Option<&(dyn Error + 'static)> {
-            self.inner
-                .as_deref()
-                .map(|link| link as &(dyn Error + 'static))
-        }
-    }
-
-    #[test]
-    fn cause_walk_stops_at_the_declared_bound() {
-        let mut chained = Link {
-            depth: 0,
-            inner: None,
-        };
-        for depth in 1..=super::ERROR_CAUSES_MAX + 2 {
-            chained = Link {
-                depth,
-                inner: Some(Box::new(chained)),
-            };
-        }
-        let causes = super::bounded_causes(
-            wire::ErrorCode::StorageFailure,
-            wire::RetryDirective::Never,
-            Some(&chained),
-        );
-        assert_eq!(
-            causes.len(),
-            super::ERROR_CAUSES_MAX,
-            "a chain deeper than the bound must truncate at the bound"
-        );
-    }
-
-    fn probe_hook() -> rift_protocol::configuration::CommandHook {
-        use rift_protocol::configuration::{ChangedPaths, Determinism, HookKind, HookType};
-        rift_protocol::configuration::CommandHook {
-            r#type: HookType::Command,
-            id: "tests".to_owned(),
-            kind: HookKind::Test,
-            program: "cargo".to_owned(),
-            arguments: vec!["test".to_owned()],
-            changed_paths: ChangedPaths::None,
-            working_directory: rift_protocol::read::ProjectPath(String::new()),
-            environment: std::collections::BTreeMap::new(),
-            timeout_ms: 120_000,
-            output_limit_bytes: 4_096,
-            guarantees: Vec::new(),
-            determinism: Determinism::Deterministic,
-        }
-    }
-
-    fn silent_run(status: rift_server::HookStatus, exit_code: Option<i32>) -> rift_server::HookRun {
-        rift_server::HookRun {
-            id: "tests".to_owned(),
-            status,
-            exit_code,
-            stdout: rift_server::CapturedStream::default(),
-            stderr: rift_server::CapturedStream::default(),
-        }
-    }
-
-    #[test]
-    fn failed_hook_finding_quotes_exit_code_and_nonempty_streams() {
-        use rift_server::{CapturedStream, HookStatus};
-        let mut run = silent_run(HookStatus::Failed, Some(1));
-        run.stdout = CapturedStream {
-            text: "boom".to_owned(),
-            captured_bytes: 4,
-            total_bytes: 4,
-            truncated: false,
-        };
-        let finding = super::hook_failure_diagnostic(&probe_hook(), &run);
-        assert_eq!(finding.severity, rift_protocol::read::Severity::Error);
-        assert_eq!(finding.code.as_deref(), Some("rift.hook.failed"));
-        assert!(
-            finding.message.contains("exited 1")
-                && finding.message.contains("stdout (4 of 4 bytes): boom")
-                && !finding.message.contains("stderr"),
-            "{}",
-            finding.message
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "a passing hook contributes guarantees, not findings")]
-    fn passing_hook_finding_is_a_programmer_error() {
-        let run = silent_run(rift_server::HookStatus::Passed, Some(0));
-        let _ = super::hook_failure_diagnostic(&probe_hook(), &run);
-    }
-
-    #[test]
-    fn hook_finding_accounts_for_every_non_passing_outcome() {
-        use rift_server::HookStatus;
-        let cases = [
-            (HookStatus::Failed, None, "exited nonzero"),
-            (HookStatus::TimedOut, None, "killed after 120000ms"),
-            (
-                HookStatus::Error("failed to launch: missing".to_owned()),
-                None,
-                "failed to launch: missing",
-            ),
-        ];
-        for (status, exit_code, expected) in cases {
-            let finding =
-                super::hook_failure_diagnostic(&probe_hook(), &silent_run(status, exit_code));
-            assert!(
-                finding.message.contains(expected),
-                "{expected} missing from {}",
-                finding.message
-            );
-        }
-    }
-
-    #[test]
-    fn bounded_prefix_cuts_on_character_boundaries() {
-        assert_eq!(super::bounded_prefix("short", 16), "short");
-        assert_eq!(super::bounded_prefix("ééé", 3), "é");
-        assert_eq!(super::bounded_prefix("ééé", 4), "éé");
-    }
-
-    #[test]
-    fn stale_snapshot_finding_carries_its_code_and_the_render() {
-        let error = rift_server::ReadError::from(ReadFault::Unsupported {
-            capability: "probe",
+    fn serialized_change_refuses_when_index_already_moved() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new();
+        validation
+            .observe()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
         });
-        let finding = super::stale_snapshot_diagnostic(&error);
-        assert_eq!(finding.code.as_deref(), Some("rift.snapshot.stale"));
-        assert_eq!(finding.severity, rift_protocol::read::Severity::Warning);
+        let changes = ChangeService::new(directory.path());
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &validation,
+            &changes,
+            |_, _| panic!("a moved index must refuse before the operation runs"),
+        )?;
+        let Err(error) = outcome else {
+            panic!("a moved index must refuse the change");
+        };
         assert!(
-            finding.message.contains("the change landed"),
-            "{}",
-            finding.message
+            error
+                .message
+                .contains("index changed before operation admission"),
+            "unexpected refusal: {error:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn wire_causes_walk_the_source_chain_with_inherited_classification() {
-        let error = ReadService::build(
-            std::path::Path::new("not-a-real-rift-workspace"),
+    fn applied_change_reports_lost_observation_as_stale_snapshot() -> TestResult {
+        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, receiver) = IndexValidation::new();
+        drop(receiver);
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
             WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-        )
-        .expect_err("missing root must fail");
-        let causes = error.wire_causes();
-        assert!(!causes.is_empty(), "sourced failure must yield causes");
-        assert!(causes.len() <= super::ERROR_CAUSES_MAX);
-        let code = super::wire_code(error.descriptor().name());
-        for cause in &causes {
-            assert!(!cause.message.is_empty(), "cause message must be rendered");
-            assert_eq!(cause.code, code);
-        }
+            &published,
+            &validation,
+            &changes,
+            |_, _| {
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        paths: Vec::new(),
+                        edits: Vec::new(),
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+            panic!("the applied change must survive a lost observation");
+        };
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(
+            summary.diagnostics[0].message.contains("could not refresh"),
+            "diagnostic must explain the stale snapshot: {:?}",
+            summary.diagnostics[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applied_change_that_moves_configuration_reports_stale_snapshot() -> TestResult {
+        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new();
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let root = directory.path().to_path_buf();
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &validation,
+            &changes,
+            move |_, _| {
+                let moved = "[providers.history]\nenabled = false\n";
+                fs::write(root.join("rift.toml"), moved).map_err(|error| {
+                    ReadFault::task("test configuration write", error.to_string())
+                })?;
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        paths: Vec::new(),
+                        edits: Vec::new(),
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+            panic!("the applied change must survive a moved configuration");
+        };
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(
+            summary.diagnostics[0]
+                .message
+                .contains("configuration changed during snapshot rebuild"),
+            "diagnostic must name the moved configuration: {:?}",
+            summary.diagnostics[0]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_fail_fast_after_watcher_failure() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let _ = server.validation.observe_watch_failure();
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a failed watcher must refuse current reads");
+        assert!(
+            error.message.contains("filesystem watcher failed"),
+            "unexpected refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorded_rebuild_failure_serves_reads_the_typed_error() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let lane_guard = server.change_lane.admission.lock().await;
+        let epoch = server
+            .validation
+            .observe()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        let published = Arc::clone(&server.published);
+        let validation = Arc::clone(&server.validation);
+        let recorded = tokio::task::spawn_blocking(move || {
+            record_rebuild_failure(
+                &published,
+                &validation,
+                epoch,
+                ReadFault::unavailable("test rebuild", "injected failure"),
+            )
+        })
+        .await?;
+        assert!(
+            recorded,
+            "the failure must be recorded at the current epoch"
+        );
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a recorded rebuild failure must refuse current reads");
+        assert!(
+            error.message.contains("injected failure"),
+            "unexpected refusal: {error:?}"
+        );
+        drop(lane_guard);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reads_time_out_while_publication_is_stalled() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        // Advance the observed epoch without an invalidation signal, so no
+        // rebuild ever publishes a matching snapshot and the read must wait.
+        server
+            .validation
+            .observed_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a stalled publication must miss the freshness deadline");
+        assert!(
+            error.message.contains("index freshness deadline elapsed"),
+            "unexpected refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn traced_read_reconciles_under_an_active_subscriber() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_directory, server) = fixture().await?;
+        let result = get_symbol(&server, "beacon")
+            .await
+            .map_err(|error| format!("traced read must serve: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+        Ok(())
     }
 }
