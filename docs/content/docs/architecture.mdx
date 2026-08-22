@@ -377,13 +377,13 @@ later calls address the projection and where its directory appears; the descript
 abandoned work gets found.
 
 A fresh projection is a pinned, byte-identical snapshot of the workspace. The server records a
-tree digest and a manifest of every entry, and [riftfs](#riftfs) serves that captured revision
+tree digest and a manifest of every entry, and [Rift FS](#rift-fs) serves that captured revision
 as the projection's directory. A later `git pull` changes the workspace but leaves the
 projection at its captured revision.
 
 Serving is lazy — content materializes on first read — so creating a projection costs the same
 for a ten-file tree and a monorepo. Symlinks are served and never followed. On a host where
-riftfs cannot mount, the server copies the tree into a plain directory instead: the same
+Rift FS cannot mount, the server copies the tree into a plain directory instead: the same
 contract, paid at creation.
 
 The projection is a real directory, at a predictable place below the workspace:
@@ -396,14 +396,14 @@ That's deliberate: plenty of what a developer runs can't be handed a protocol �
 `prettier`, a linter your team wrote in 2019. They take a directory, so the projection is one,
 and the [projection resource](/docs/protocol/mcp#resource-projection) hands out its path.
 
-A write into the directory lands in the projection alone: riftfs detaches the written path into
+A write into the directory lands in the projection alone: Rift FS detaches the written path into
 the projection's own store, and the workspace file is never touched. The path stays put until
 [`projection_remove`](/docs/protocol/mcp#tool-projection_remove) deletes the directory —
 without waiting for whatever still runs inside it, because a lock there would let one abandoned
 `cargo watch` wedge cleanup forever.
 
 Rift change tools record their edits as they apply. An ordinary process can bypass those tools by
-writing into the projection directory — and because riftfs is that directory, the server
+writing into the projection directory — and because Rift FS is that directory, the server
 observes each bypassing write as it lands.
 
 The server groups the observed delta into a
@@ -491,7 +491,7 @@ The engine works against the targeted tree's directory, because a language serve
 indexer take a directory, like `cargo test` and the linter before them. A live language server
 reads the tree's bytes as the change tools write them, so its analysis tracks the plan as it
 lands. A batch indexer needs a tree that holds still: a projection is already pinned, and for the
-workspace target the server pins an internal tree through [riftfs](#riftfs) — that tree feeds
+workspace target the server pins an internal tree through [Rift FS](#rift-fs) — that tree feeds
 the indexer and is never a projection the agent has to manage.
 
 <IsoDiagram
@@ -542,12 +542,12 @@ absolute path can reach outside the copy, including the workspace.
 
 `rift.toml` decides [which languages may execute at all](/docs/configuration#execution).
 
-## riftfs
+## Rift FS
 
 Projection directories, execution copies, and the pinned trees batch engines index share one
-requirement: a real directory that is not the workspace. **riftfs** is the filesystem layer that
+requirement: a real directory that is not the workspace. **Rift FS** is the filesystem layer that
 serves them. To every program it is an ordinary directory; no tool names it and nothing on the
-protocol surface addresses it — an agent meets riftfs only as a path that works.
+protocol surface addresses it — an agent meets Rift FS only as a path that works.
 
 Each served tree holds one contract:
 
@@ -561,10 +561,10 @@ Each served tree holds one contract:
   half-deleted under it.
 
 <IsoDiagram
-  alt="riftfs serves the workspace tree's pinned base as projection directories and the execution copy. External tools read and write a projection directory; riftfs routes every access through the rift server, which observes each write, reindexes exactly the changed paths, and notifies a language server rooted in the projection."
+  alt="Rift FS serves the workspace tree's pinned base as projection directories and the execution copy. External tools read and write a projection directory; Rift FS routes every access through the rift server, which observes each write, reindexes exactly the changed paths, and notifies a language server rooted in the projection."
   chart={`
     flowchart LR
-      workspace["workspace tree"]:::store -- "pinned base" --> riftfs["riftfs"]:::rift
+      workspace["workspace tree"]:::store -- "pinned base" --> riftfs["Rift FS"]:::rift
       riftfs -- "serves" --> proj["projection<br/>my-feature-one"]:::store
       riftfs -- "serves" --> exec["execution copy"]:::store
       tool["external tool<br/>cargo test, prettier"]:::agent -- "reads + writes" --> proj
@@ -575,7 +575,7 @@ Each served tree holds one contract:
 />
 
 Every read and write of a served tree passes through the server, and that observation is what
-riftfs buys beyond a cheap copy. The workspace needs a native watcher because other programs
+Rift FS buys beyond a cheap copy. The workspace needs a native watcher because other programs
 write it directly; a served tree needs none — the server is its write path. An observed write
 advances the tree's change counter, invalidates facts for exactly the changed paths, and joins
 the same serialized rebuild lane the workspace [index](#index) uses.
