@@ -13,10 +13,12 @@ workspace = true
 [dependencies]
 ignore.workspace = true
 rift-core.workspace = true
+rift-history.workspace = true
 serde.workspace = true
 rift-model.workspace = true
 rift-provider.workspace = true
 rift-syntax.workspace = true
 
 [dev-dependencies]
+rift-history = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true

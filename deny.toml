@@ -19,7 +19,11 @@ multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
 # rmcp 3.1.3 enables tracing-attributes 0.1.31, whose proc macro still uses syn 2.
-skip = [{ name = "syn", version = "2.0.119" }]
+# gix-pack's clru 0.6.3 still pins hashbrown 0.16 while indexmap is on 0.17.
+skip = [
+  { name = "syn", version = "2.0.119" },
+  { name = "hashbrown", version = "0.16.1" },
+]
 
 [sources]
 unknown-registry = "deny"
