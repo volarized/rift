@@ -317,11 +317,7 @@ mod tests {
         // A backslash is legal in a git tree entry and on unix filesystems,
         // and `ProjectPath` refuses it on every platform; plumbing commits it
         // without touching the host filesystem.
-        rift_history::fixture::commit_raw_path(
-            directory.path(),
-            b"bad\\path.rs",
-            "refs/heads/raw",
-        );
+        rift_history::fixture::commit_raw_path(directory.path(), b"bad\\path.rs", "refs/heads/raw");
         let (repository, _) = open_head(directory.path());
         let raw = repository.resolve("raw").expect("raw branch resolves");
         let error = WorkspaceIndex::at_revision(
