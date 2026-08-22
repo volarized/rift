@@ -32,7 +32,7 @@ files. [Hooks](/docs/configuration#hooks) extend this pipeline with configured t
 formatters, linters, and test runners, which check each change after it lands.
 
 <IsoDiagram
-  alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers analyze it, and their facts feed an embedded search index. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
+  alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers analyze it, and their facts feed an embedded search index. Semantic providers delegate resolution to language engines — an embedded library, a language server, or a SCIP index — which read the projection directory and answer with facts and edit plans. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp"]:::rift
@@ -46,6 +46,9 @@ formatters, linters, and test runners, which check each change after it lands.
       resolvers -- "inspect" --> workspace["workspace tree"]:::store
       resolvers -- "units" --> catalog["source catalog<br/>project + dependencies"]:::store
       providers -- "analyze" --> catalog
+      providers -- "resolve" --> engines["language engines<br/>embedded, LSP, or SCIP"]:::provider
+      engines -- "facts + edit plans" --> providers
+      engines -. "read" .-> projection
       providers -- "symbols + text" --> search["search index<br/>lexical + vectors"]:::store
       server -- "query + rank" --> search
       search -- "embeddings" --> localmodel["local embedding model<br/>ships with Rift"]:::model
