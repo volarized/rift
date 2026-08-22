@@ -56,8 +56,8 @@ pub enum DiagnosticCode {
     /// A configured hook did not pass over an applied change.
     #[serde(rename = "rift.hook.failed")]
     HookFailed,
-    /// The read snapshot could not refresh after an applied change; reads serve the pre-change
-    /// tree until the workspace indexes again.
+    /// Snapshot rebuild failed after an applied change; current-tree reads refuse until the
+    /// server publishes a fresh snapshot.
     #[serde(rename = "rift.snapshot.stale")]
     SnapshotStale,
 }

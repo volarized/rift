@@ -69,15 +69,42 @@ impl StdioServeError {
 /// # Errors
 ///
 /// Returns [`StdioServeError`] for indexing, initialization, or service-task failure.
+///
+/// # Cancel safety
+///
+/// Dropping this future closes its owned MCP service. An admitted initial
+/// index scan still finishes in the bounded blocking executor.
 pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
-    let server =
-        RiftMcp::build(root, WorkspaceIndexLimits::default()).map_err(StdioServeError::Read)?;
-    let service = server
-        .serve(transport::stdio())
+    tracing::info!(
+        component = "mcp",
+        transport = "stdio",
+        "MCP server starting"
+    );
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
         .await
-        .map_err(|error| StdioServeError::Initialize(Box::new(error)))?;
-    let reason = service.waiting().await.map_err(StdioServeError::Task)?;
-    quit_reason_result(reason)
+        .map_err(StdioServeError::Read)?;
+    let supervisor = server.index_supervisor();
+    let service = match server.serve(transport::stdio()).await {
+        Ok(service) => service,
+        Err(error) => {
+            let _ = supervisor.shutdown().await;
+            return Err(StdioServeError::Initialize(Box::new(error)));
+        }
+    };
+    tracing::info!(component = "mcp", transport = "stdio", "MCP server ready");
+    let reason = service.waiting().await;
+    let index_outcome = supervisor.shutdown().await.map_err(StdioServeError::Read);
+    let outcome = reason
+        .map_err(StdioServeError::Task)
+        .and_then(quit_reason_result);
+    tracing::info!(
+        component = "mcp",
+        transport = "stdio",
+        outcome = if outcome.is_ok() { "ok" } else { "error" },
+        "MCP server stopped"
+    );
+    index_outcome?;
+    outcome
 }
 
 /// Maps a service quit reason to its outcome.
@@ -108,11 +135,12 @@ mod tests {
         assert!(error.source().is_none());
     }
 
-    #[test]
-    fn workspace_read_error_preserves_source() {
+    #[tokio::test]
+    async fn workspace_read_error_preserves_source() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let missing = directory.path().join("missing");
         let read = RiftMcp::build(&missing, WorkspaceIndexLimits::default())
+            .await
             .expect_err("missing workspace must fail");
         let expected = read.descriptor();
         let error = StdioServeError::Read(read);

@@ -8,7 +8,8 @@ use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    IndexedFile, SymbolMatch, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
+    IndexedFile, SymbolMatch, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
+    WorkspaceIndexLimits,
 };
 use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
@@ -58,6 +59,20 @@ pub enum ReadFault {
         /// The rendered I/O failure.
         io: String,
     },
+    /// Tokio could not run or join one bounded blocking operation.
+    Task {
+        /// Operation submitted to the blocking executor.
+        operation: &'static str,
+        /// Runtime failure account.
+        detail: String,
+    },
+    /// Current workspace index cannot become coherent within its deadline.
+    Unavailable {
+        /// Operation waiting for coherent state.
+        operation: &'static str,
+        /// Bounded failure account.
+        detail: String,
+    },
 }
 
 impl Fault for ReadFault {
@@ -69,6 +84,8 @@ impl Fault for ReadFault {
             Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
             Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
+            Self::Task { .. } => ErrorName::Wire(ErrorCode::InternalError),
+            Self::Unavailable { .. } => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
         }
     }
 
@@ -93,6 +110,10 @@ impl Fault for ReadFault {
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("io", io.clone()),
             ],
+            Self::Task { operation, detail } | Self::Unavailable { operation, detail } => vec![
+                ErrorContext::new("operation", *operation),
+                ErrorContext::new("detail", detail.clone()),
+            ],
         }
     }
 
@@ -103,7 +124,9 @@ impl Fault for ReadFault {
             Self::Unsupported { .. }
             | Self::Invalid { .. }
             | Self::NotFound { .. }
-            | Self::Storage { .. } => None,
+            | Self::Storage { .. }
+            | Self::Task { .. }
+            | Self::Unavailable { .. } => None,
         }
     }
 }
@@ -143,6 +166,22 @@ impl ReadFault {
     pub(crate) fn history(source: HistoryError) -> ReadError {
         Error::new(Self::History(source))
     }
+
+    /// Classifies a Tokio blocking-executor failure.
+    pub fn task(operation: &'static str, detail: impl Into<String>) -> ReadError {
+        Error::new(Self::Task {
+            operation,
+            detail: detail.into(),
+        })
+    }
+
+    /// Classifies coherence work that cannot finish within its deadline.
+    pub fn unavailable(operation: &'static str, detail: impl Into<String>) -> ReadError {
+        Error::new(Self::Unavailable {
+            operation,
+            detail: detail.into(),
+        })
+    }
 }
 
 /// Opaque read-service failure.
@@ -170,8 +209,22 @@ impl ReadService {
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
     ) -> Result<Self, ReadError> {
-        let index = WorkspaceIndex::build(root, limits, visibility).map_err(ReadFault::index)?;
+        let span = tracing::info_span!(
+            "index.build",
+            component = "index",
+            files_count = tracing::field::Empty,
+            tree_revision = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let index = WorkspaceIndex::build(root, limits, visibility).map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
         let snapshot = captured_snapshot(&index, None);
+        span.record("files_count", index.files().len());
+        span.record("tree_revision", snapshot.tree_revision.0.as_str());
+        span.record("outcome", "ok");
         Ok(Self {
             index,
             snapshot,
@@ -226,6 +279,12 @@ impl ReadService {
     /// current tree.
     pub(crate) const fn revision(&self) -> Option<&RevisionId> {
         self.revision.as_ref()
+    }
+
+    /// Returns exact visible source identity captured by this service.
+    #[must_use]
+    pub const fn workspace_fingerprint(&self) -> &WorkspaceFingerprint {
+        self.index.fingerprint()
     }
 
     /// Reads Rust syntax nodes covering one UTF-8 byte position. The tree
@@ -1026,6 +1085,17 @@ pub fn compute() -> i32 {
         assert_eq!(keys, ["path", "operation", "io"]);
         assert_eq!(context[0].value(), "src/lib.rs");
         assert_eq!(context[2].value(), "sealed");
+    }
+
+    #[test]
+    fn task_fault_is_internal_and_names_the_blocking_operation() {
+        let error = ReadFault::task("initial index build", "worker panicked");
+        assert_eq!(error.descriptor().code(), "internal_error");
+        let context = error.context();
+        assert_eq!(context[0].key(), "operation");
+        assert_eq!(context[0].value(), "initial index build");
+        assert_eq!(context[1].key(), "detail");
+        assert_eq!(context[1].value(), "worker panicked");
     }
 
     #[test]

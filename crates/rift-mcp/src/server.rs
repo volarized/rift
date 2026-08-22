@@ -1,11 +1,15 @@
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
-use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
+use notify::event::ModifyKind;
+use notify::{Event, EventKind, RecursiveMode, Watcher as _};
+use rift_core::constants::{WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES};
 use rift_core::{ErrorName, Fault, SourceVisibility};
-use rift_index::WorkspaceIndexLimits;
+use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
     ReplaceNodeParams, ReplaceSymbolParams,
@@ -17,12 +21,17 @@ use rift_protocol::read::{
     SearchResult,
 };
 use rift_server::{
-    ChangeService, ConfigurationError, HookRun, HookStatus, ReadError, ReadFault, ReadService,
-    load_configuration, run_hooks,
+    CONFIGURATION_FILE_BYTES_MAX, ChangeService, ConfigurationError, HookRun, HookStatus,
+    ReadError, ReadFault, ReadService, load_configuration, run_hooks,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, Semaphore, mpsc};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 /// JSON-RPC error code every Rift operating failure travels under: the
 /// first code of the server-defined range (-32000 to -32099), which rmcp
@@ -34,33 +43,114 @@ const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
 /// schema bound.
 const ERROR_CAUSES_MAX: usize = 8;
 
+/// Blocking filesystem and syntax operations admitted across MCP servers.
+const BLOCKING_OPERATIONS_MAX: usize = 4;
+
+/// Filesystem events coalesced while one rebuild is pending.
+const INDEX_INVALIDATIONS_MAX: usize = 1;
+/// Delay collecting one bounded filesystem-event batch.
+const INDEX_DEBOUNCE: Duration = Duration::from_millis(50);
+/// Deadline for one request to obtain a coherent current snapshot.
+const INDEX_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for joining the index supervisor during shutdown.
+const INDEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Complete capture retries while the tree keeps moving.
+const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
+
+/// Workspace blocking operations admitted process-wide.
+fn blocking_operations() -> &'static Arc<Semaphore> {
+    static OPERATIONS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    OPERATIONS.get_or_init(|| Arc::new(Semaphore::new(BLOCKING_OPERATIONS_MAX)))
+}
+
+/// Runs one blocking operation under process-wide bounded admission.
+async fn bounded_blocking<Output>(
+    operation: &'static str,
+    work: impl FnOnce() -> Result<Output, ReadError> + Send + 'static,
+) -> Result<Output, ReadError>
+where
+    Output: Send + 'static,
+{
+    let permit = Arc::clone(blocking_operations())
+        .acquire_owned()
+        .await
+        .map_err(|error| ReadFault::task(operation, error.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|error| ReadFault::task(operation, error.to_string()))?
+}
+
 /// Rust workspace MCP server: reads serve an immutable snapshot, changes
 /// write the workspace and swap in a fresh snapshot.
 #[derive(Debug)]
 pub struct RiftMcp {
     root: PathBuf,
     limits: WorkspaceIndexLimits,
-    reads: RwLock<ReadService>,
-    changes: ChangeService,
-    configuration: RwLock<ConfigurationState>,
+    published: Arc<RwLock<PublishedState>>,
+    coherence: Arc<IndexCoherence>,
+    changes: Arc<ChangeService>,
+    change_lane: Arc<Mutex<()>>,
     tool_router: ToolRouter<Self>,
+}
+
+impl Drop for RiftMcp {
+    fn drop(&mut self) {
+        self.coherence.cancellation.cancel();
+    }
+}
+
+/// Read index and configuration policy published as one immutable value.
+#[derive(Debug)]
+struct PublishedWorkspace {
+    reads: Arc<ReadService>,
+    configuration: ConfigurationState,
+    fingerprint: WorkspaceFingerprint,
+    epoch: u64,
+}
+
+/// Published workspace plus failure for the latest observed epoch.
+#[derive(Debug)]
+struct PublishedState {
+    current: Arc<PublishedWorkspace>,
+    failure: Option<(u64, Arc<ReadError>)>,
+}
+
+/// Filesystem observation and supervisor ownership shared with handlers.
+#[derive(Debug)]
+struct IndexCoherence {
+    observed_epoch: Arc<AtomicU64>,
+    watch_failed: Arc<AtomicBool>,
+    invalidations: mpsc::Sender<()>,
+    changed: Arc<Notify>,
+    cancellation: CancellationToken,
+    task: AsyncMutex<Option<JoinHandle<()>>>,
+}
+
+/// Owned shutdown handle for the workspace index supervisor.
+#[derive(Debug, Clone)]
+pub(crate) struct IndexSupervisor {
+    coherence: Arc<IndexCoherence>,
 }
 
 /// The last admission of the workspace's `rift.toml`, kept with the file
 /// state it was read from so an edited file is re-admitted on the next
 /// request and an unchanged one is not re-parsed per call.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ConfigurationState {
-    admitted: Result<WorkspaceConfiguration, ConfigurationError>,
-    fingerprint: Option<ConfigurationFingerprint>,
+    admitted: Result<WorkspaceConfiguration, Arc<ConfigurationError>>,
+    fingerprint: ConfigurationFingerprint,
 }
 
 impl ConfigurationState {
     /// Admits the workspace's current `rift.toml`.
     fn admit(root: &Path) -> Self {
+        let fingerprint = configuration_fingerprint(root);
         Self {
-            admitted: load_configuration(root),
-            fingerprint: configuration_fingerprint(root),
+            admitted: load_configuration(root).map_err(Arc::new),
+            fingerprint,
         }
     }
 
@@ -83,16 +173,396 @@ impl ConfigurationState {
     }
 }
 
-/// The file state one admission was read from. Size rides modification
-/// time because same-second edits are common at a shell; an edit that
-/// preserves both is not re-admitted until either moves.
-type ConfigurationFingerprint = (SystemTime, u64);
+/// Exact bounded identity of the configuration policy source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigurationFingerprint {
+    /// No readable configuration file exists.
+    MissingOrUnreadable,
+    /// File bytes within the admitted bound.
+    Content([u8; 32]),
+    /// File is already invalid by size; its contents cannot change policy.
+    Oversized(u64),
+}
 
 /// The current `rift.toml` file state, or null when the file is absent or
 /// unreadable — either way the next admission decides what that means.
-fn configuration_fingerprint(root: &Path) -> Option<ConfigurationFingerprint> {
-    let metadata = std::fs::metadata(root.join(WORKSPACE_CONFIGURATION_FILE)).ok()?;
-    Some((metadata.modified().ok()?, metadata.len()))
+fn configuration_fingerprint(root: &Path) -> ConfigurationFingerprint {
+    let path = root.join(WORKSPACE_CONFIGURATION_FILE);
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return ConfigurationFingerprint::MissingOrUnreadable;
+    };
+    if metadata.len() > CONFIGURATION_FILE_BYTES_MAX {
+        return ConfigurationFingerprint::Oversized(metadata.len());
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return ConfigurationFingerprint::MissingOrUnreadable;
+    };
+    let mut raw = Vec::new();
+    if file
+        .take(CONFIGURATION_FILE_BYTES_MAX + 1)
+        .read_to_end(&mut raw)
+        .is_err()
+    {
+        return ConfigurationFingerprint::MissingOrUnreadable;
+    }
+    if raw.len() as u64 > CONFIGURATION_FILE_BYTES_MAX {
+        return ConfigurationFingerprint::Oversized(raw.len() as u64);
+    }
+    ConfigurationFingerprint::Content(Sha256::digest(raw).into())
+}
+
+impl IndexCoherence {
+    /// Creates one bounded invalidation stream and its receiver.
+    fn new() -> (Arc<Self>, mpsc::Receiver<()>) {
+        let (invalidations, receiver) = mpsc::channel(INDEX_INVALIDATIONS_MAX);
+        (
+            Arc::new(Self {
+                observed_epoch: Arc::new(AtomicU64::new(0)),
+                watch_failed: Arc::new(AtomicBool::new(false)),
+                invalidations,
+                changed: Arc::new(Notify::new()),
+                cancellation: CancellationToken::new(),
+                task: AsyncMutex::new(None),
+            }),
+            receiver,
+        )
+    }
+
+    /// Records one invalidation before coalescing its rebuild signal.
+    fn observe(&self) -> Result<u64, ReadError> {
+        let previous = self
+            .observed_epoch
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| {
+                self.watch_failed.store(true, Ordering::Release);
+                ReadFault::unavailable("index observation", "filesystem event epoch exhausted")
+            })?;
+        let epoch = previous + 1;
+        match self.invalidations.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.watch_failed.store(true, Ordering::Release);
+                return Err(ReadFault::unavailable(
+                    "index observation",
+                    "index supervisor is not running",
+                ));
+            }
+        }
+        Ok(epoch)
+    }
+
+    /// Returns latest filesystem-event epoch.
+    fn observed_epoch(&self) -> u64 {
+        self.observed_epoch.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for IndexCoherence {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl IndexSupervisor {
+    /// Cancels and joins the workspace index supervisor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the task panics or misses its shutdown deadline.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation is requested before the join begins. Dropping this future
+    /// after it takes task ownership detaches that terminating task.
+    pub(crate) async fn shutdown(&self) -> Result<(), ReadError> {
+        self.coherence.cancellation.cancel();
+        let Some(mut task) = self.coherence.task.lock().await.take() else {
+            return Ok(());
+        };
+        if let Ok(result) = tokio::time::timeout(INDEX_SHUTDOWN_TIMEOUT, &mut task).await {
+            result.map_err(|error| ReadFault::task("index supervisor shutdown", error.to_string()))
+        } else {
+            task.abort();
+            let _ = task.await;
+            Err(ReadFault::unavailable(
+                "index supervisor shutdown",
+                "shutdown deadline elapsed",
+            ))
+        }
+    }
+}
+
+/// Creates one native watcher rooted before the initial index scan.
+fn workspace_watcher(
+    root: &Path,
+    coherence: &Arc<IndexCoherence>,
+) -> Result<notify::RecommendedWatcher, ReadError> {
+    let watched_root = root.to_path_buf();
+    let event_root = watched_root.clone();
+    let coherence = Arc::clone(coherence);
+    let mut watcher =
+        notify::recommended_watcher(move |result: notify::Result<Event>| match result {
+            Ok(event) if relevant_watch_event(&event_root, &event) => {
+                if coherence.observe().is_err() {
+                    tracing::error!(
+                        component = "index",
+                        operation = "watch.observe",
+                        "index watch failed"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                coherence.watch_failed.store(true, Ordering::Release);
+                let _ = coherence.observe();
+                tracing::warn!(
+                    component = "index",
+                    operation = "watch.receive",
+                    "index watch backend reported failure"
+                );
+            }
+        })
+        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+    watcher
+        .watch(&watched_root, RecursiveMode::Recursive)
+        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+    Ok(watcher)
+}
+
+/// Whether one native event can change visible Rust source or its policy.
+fn relevant_watch_event(root: &Path, event: &Event) -> bool {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
+    event
+        .paths
+        .iter()
+        .filter(|path| hard_floor_admits_watch_path(root, path))
+        .any(|path| watch_kind_reaches_path(event.kind, path))
+}
+
+/// Rejects paths below Rift's hard-floor directories.
+fn hard_floor_admits_watch_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    !relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
+    })
+}
+
+/// Applies event-kind filtering without trusting editor-specific event shapes.
+fn watch_kind_reaches_path(kind: EventKind, path: &Path) -> bool {
+    let policy_file = path
+        .file_name()
+        .is_some_and(|name| name == WORKSPACE_CONFIGURATION_FILE || name == ".gitignore");
+    let rust_source = path.extension().is_some_and(|extension| extension == "rs");
+    match kind {
+        EventKind::Create(_)
+        | EventKind::Remove(_)
+        | EventKind::Modify(ModifyKind::Name(_))
+        | EventKind::Any
+        | EventKind::Other => true,
+        EventKind::Modify(_) => policy_file || rust_source,
+        EventKind::Access(_) => false,
+    }
+}
+
+/// Builds the first snapshot while rejecting concurrent filesystem movement.
+async fn initial_workspace(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    coherence: &IndexCoherence,
+) -> Result<Arc<PublishedWorkspace>, ReadError> {
+    for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
+        let epoch = coherence.observed_epoch();
+        let build_root = root.to_path_buf();
+        let span = tracing::info_span!(
+            "index.build",
+            component = "index",
+            trigger = "startup",
+            epoch,
+            attempt
+        );
+        let built = bounded_blocking("initial index build", move || {
+            let configuration = ConfigurationState::admit(&build_root);
+            let visibility = configuration.source_visibility();
+            let reads = ReadService::build(&build_root, limits, &visibility)?;
+            let fingerprint = reads.workspace_fingerprint().clone();
+            if configuration.fingerprint != configuration_fingerprint(&build_root) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(PublishedWorkspace {
+                reads: Arc::new(reads),
+                configuration,
+                fingerprint,
+                epoch,
+            })))
+        })
+        .instrument(span)
+        .await?;
+        let Some(built) = built else {
+            continue;
+        };
+        let stable_epoch = coherence.observed_epoch() == epoch;
+        let watch_healthy = !coherence.watch_failed.load(Ordering::Acquire);
+        if stable_epoch && watch_healthy {
+            tracing::info!(
+                component = "index",
+                operation = "index.publish",
+                trigger = "startup",
+                epoch,
+                "index snapshot published"
+            );
+            return Ok(built);
+        }
+    }
+    Err(ReadFault::unavailable(
+        "initial index build",
+        "workspace kept changing across bounded capture attempts",
+    ))
+}
+
+/// Outcome of one background reconciliation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildOutcome {
+    /// Candidate became current and was published.
+    Published,
+    /// New observation invalidated candidate before publication.
+    Superseded,
+}
+
+/// Owns native watcher and reconciles coalesced invalidations until shutdown.
+async fn run_index_supervisor(
+    _watcher: notify::RecommendedWatcher,
+    mut invalidations: mpsc::Receiver<()>,
+    root: PathBuf,
+    limits: WorkspaceIndexLimits,
+    published: Arc<RwLock<PublishedState>>,
+    change_lane: Arc<Mutex<()>>,
+    coherence: Arc<IndexCoherence>,
+) {
+    loop {
+        let received = tokio::select! {
+            () = coherence.cancellation.cancelled() => false,
+            received = invalidations.recv() => received.is_some(),
+        };
+        if !received {
+            return;
+        }
+        tokio::select! {
+            () = coherence.cancellation.cancelled() => return,
+            () = tokio::time::sleep(INDEX_DEBOUNCE) => {}
+        }
+        let epoch = coherence.observed_epoch();
+        tracing::debug!(
+            component = "index",
+            operation = "watch.batch",
+            epoch,
+            "filesystem invalidations coalesced"
+        );
+        let result = rebuild_workspace(
+            root.clone(),
+            limits,
+            Arc::clone(&published),
+            Arc::clone(&change_lane),
+            Arc::clone(&coherence),
+            epoch,
+        )
+        .instrument(tracing::info_span!(
+            "index.build",
+            component = "index",
+            trigger = "filesystem",
+            epoch
+        ))
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(
+                component = "index",
+                operation = "index.build",
+                epoch,
+                error_code = error.descriptor().code(),
+                "index rebuild failed"
+            );
+            let mut state = published.write().await;
+            if coherence.observed_epoch() == epoch {
+                state.failure = Some((epoch, Arc::new(error)));
+            }
+            drop(state);
+            coherence.changed.notify_waiters();
+        }
+    }
+}
+
+/// Rebuilds and atomically publishes only a still-current candidate.
+async fn rebuild_workspace(
+    root: PathBuf,
+    limits: WorkspaceIndexLimits,
+    published: Arc<RwLock<PublishedState>>,
+    change_lane: Arc<Mutex<()>>,
+    coherence: Arc<IndexCoherence>,
+    epoch: u64,
+) -> Result<RebuildOutcome, ReadError> {
+    bounded_blocking("filesystem index rebuild", move || {
+        let lane = change_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if coherence.watch_failed.load(Ordering::Acquire) {
+            drop(lane);
+            return Err(ReadFault::unavailable(
+                "filesystem index rebuild",
+                "filesystem watcher failed",
+            ));
+        }
+        if coherence.observed_epoch() != epoch {
+            drop(lane);
+            return Ok(RebuildOutcome::Superseded);
+        }
+        let configuration = ConfigurationState::admit(&root);
+        let visibility = configuration.source_visibility();
+        let reads = ReadService::build(&root, limits, &visibility)?;
+        let fingerprint = reads.workspace_fingerprint().clone();
+        if configuration.fingerprint != configuration_fingerprint(&root) {
+            let _ = coherence.observe();
+            drop(lane);
+            return Ok(RebuildOutcome::Superseded);
+        }
+        if coherence.observed_epoch() != epoch {
+            drop(lane);
+            return Ok(RebuildOutcome::Superseded);
+        }
+        let next = Arc::new(PublishedWorkspace {
+            reads: Arc::new(reads),
+            configuration,
+            fingerprint,
+            epoch,
+        });
+        let mut state = published.blocking_write();
+        if coherence.observed_epoch() != epoch {
+            drop(state);
+            drop(lane);
+            return Ok(RebuildOutcome::Superseded);
+        }
+        state.current = next;
+        state.failure = None;
+        drop(state);
+        drop(lane);
+        tracing::info!(
+            component = "index",
+            operation = "index.publish",
+            trigger = "filesystem",
+            epoch,
+            "index snapshot published"
+        );
+        coherence.changed.notify_waiters();
+        Ok(RebuildOutcome::Published)
+    })
+    .await
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
@@ -106,17 +576,59 @@ impl RiftMcp {
     /// # Errors
     ///
     /// Returns [`ReadError`] when workspace cannot be indexed within bounds.
-    pub fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let configuration = ConfigurationState::admit(root);
-        let visibility = configuration.source_visibility();
-        Ok(Self {
-            root: root.to_path_buf(),
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future discards construction. An admitted blocking scan
+    /// finishes in the bounded executor before releasing its capacity permit.
+    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
+        let root = root.to_path_buf();
+        let (coherence, invalidations) = IndexCoherence::new();
+        let watch_root = root.clone();
+        let watch_coherence = Arc::clone(&coherence);
+        let watcher = bounded_blocking("workspace watch setup", move || {
+            workspace_watcher(&watch_root, &watch_coherence)
+        })
+        .instrument(tracing::info_span!(
+            "index.watch",
+            component = "index",
+            operation = "watch.setup"
+        ))
+        .await?;
+        let published = initial_workspace(&root, limits, &coherence).await?;
+        let published = Arc::new(RwLock::new(PublishedState {
+            current: published,
+            failure: None,
+        }));
+        let change_lane = Arc::new(Mutex::new(()));
+        let supervisor_task = tokio::spawn(run_index_supervisor(
+            watcher,
+            invalidations,
+            root.clone(),
             limits,
-            reads: RwLock::new(ReadService::build(root, limits, &visibility)?),
-            changes: ChangeService::new(root),
-            configuration: RwLock::new(configuration),
+            Arc::clone(&published),
+            Arc::clone(&change_lane),
+            Arc::clone(&coherence),
+        ));
+        let mut task = coherence.task.lock().await;
+        *task = Some(supervisor_task);
+        drop(task);
+        Ok(Self {
+            root: root.clone(),
+            limits,
+            published,
+            coherence,
+            changes: Arc::new(ChangeService::new(&root)),
+            change_lane,
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Returns owned supervisor shutdown access for transport adapters.
+    pub(crate) fn index_supervisor(&self) -> IndexSupervisor {
+        IndexSupervisor {
+            coherence: Arc::clone(&self.coherence),
+        }
     }
 
     /// Finds Rust declarations and their source by exact symbol name. Each hit
@@ -124,24 +636,25 @@ impl RiftMcp {
     /// both. `rev` serves the lookup from a version-control revision instead of
     /// the current tree. Use `search` when the name is not exactly known.
     #[tool]
-    fn get_symbol(
+    async fn get_symbol(
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
         let rev = params.rev.clone();
-        self.read_at(rev.as_ref(), |reads| reads.get_symbol(&params))
+        self.read_at(rev, move |reads| reads.get_symbol(&params))
+            .await
     }
 
     /// Searches indexed Rust declarations and source lines by lexical `query`.
     /// `rev` searches a version-control revision instead of the current tree.
     /// Use `get_symbol` when the declaration name is known.
     #[tool]
-    fn search(
+    async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let rev = params.rev.clone();
-        self.read_at(rev.as_ref(), |reads| reads.search(&params))
+        self.read_at(rev, move |reads| reads.search(&params)).await
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
@@ -150,12 +663,12 @@ impl RiftMcp {
     /// lists the nodes as of a version-control revision instead of the
     /// current tree.
     #[tool]
-    fn nodes(
+    async fn nodes(
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ErrorData> {
         let rev = params.rev.clone();
-        self.read_at(rev.as_ref(), |reads| reads.nodes(params))
+        self.read_at(rev, move |reads| reads.nodes(params)).await
     }
 
     /// Replaces one declaration addressed by symbol. The whole declaration
@@ -163,11 +676,12 @@ impl RiftMcp {
     /// derives the span, so the caller supplies no offsets; a refusal
     /// names the failed precondition and leaves the workspace untouched.
     #[tool]
-    fn replace_symbol(
+    async fn replace_symbol(
         &self,
         Parameters(params): Parameters<ReplaceSymbolParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(|reads, changes| changes.replace_symbol(reads, &params))
+        self.change(move |reads, changes| changes.replace_symbol(reads, &params))
+            .await
     }
 
     /// Inserts a new declaration beside an anchor symbol, or content at a file
@@ -177,45 +691,36 @@ impl RiftMcp {
     /// when `create_missing` is set and it is missing. A refusal names the
     /// failed precondition and leaves the workspace untouched.
     #[tool]
-    fn insert_symbol(
+    async fn insert_symbol(
         &self,
         Parameters(params): Parameters<InsertSymbolParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(|reads, changes| changes.insert_symbol(reads, &params))
+        self.change(move |reads, changes| changes.insert_symbol(reads, &params))
+            .await
     }
 
     /// Replaces one syntax node through a witnessed address from `nodes`.
     /// The server recomputes the witness before writing and refuses when the
     /// bytes drifted, so a stale address never splices into moved code.
     #[tool]
-    fn replace_node(
+    async fn replace_node(
         &self,
         Parameters(params): Parameters<ReplaceNodeParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(|reads, changes| changes.replace_node(reads, &params))
+        self.change(move |reads, changes| changes.replace_node(reads, &params))
+            .await
     }
 
     /// Applies unified-diff hunks to workspace files atomically. Hunk
     /// context guards the change; header line numbers are hints, as with
     /// `git apply`. A `/dev/null` header creates or deletes the file.
     #[tool]
-    fn patch(
+    async fn patch(
         &self,
         Parameters(params): Parameters<PatchParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(|reads, changes| changes.patch(reads, &params))
-    }
-
-    /// Takes the current read snapshot.
-    ///
-    /// # Panics
-    ///
-    /// Recovers a poisoned lock instead of panicking: the snapshot is
-    /// replaced whole, so a poisoned guard still holds a coherent value.
-    fn snapshot(&self) -> std::sync::RwLockReadGuard<'_, ReadService> {
-        self.reads
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.change(move |reads, changes| changes.patch(reads, &params))
+            .await
     }
 
     /// Runs one read against the tree the request names — the current
@@ -225,15 +730,23 @@ impl RiftMcp {
     /// A revision snapshot is built per request from the workspace's git
     /// objects, under the same `[source]` policy and bounds as the current
     /// one; `[providers.history] enabled = false` refuses it.
-    fn read_at<Answer>(
+    async fn read_at<Answer>(
         &self,
-        rev: Option<&rift_protocol::read::RevisionId>,
-        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError>,
-    ) -> Result<Json<Answer>, ErrorData> {
-        let configuration = self.admitted_configuration(wire::ErrorPhase::Read)?;
+        rev: Option<rift_protocol::read::RevisionId>,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+    ) -> Result<Json<Answer>, ErrorData>
+    where
+        Answer: Send + 'static,
+    {
+        let published = self.published_workspace(wire::ErrorPhase::Read).await?;
+        let configuration = published.configuration.admitted(wire::ErrorPhase::Read)?;
         let read_error = |error: ReadError| error.tool_error(wire::ErrorPhase::Read);
         let Some(rev) = rev else {
-            return operation(&self.snapshot()).map(Json).map_err(read_error);
+            let reads = Arc::clone(&published.reads);
+            return bounded_blocking("current workspace read", move || operation(&reads))
+                .await
+                .map(Json)
+                .map_err(read_error);
         };
         if !configuration.providers.history.enabled {
             return Err(read_error(ReadError::from(ReadFault::Unsupported {
@@ -241,40 +754,103 @@ impl RiftMcp {
             })));
         }
         let visibility = SourceVisibility::from(&configuration.source);
-        let reads = ReadService::at_revision(&self.root, rev, self.limits, &visibility)
-            .map_err(read_error)?;
-        operation(&reads).map(Json).map_err(read_error)
+        let root = self.root.clone();
+        let limits = self.limits;
+        bounded_blocking("revision workspace read", move || {
+            let reads = ReadService::at_revision(&root, &rev, limits, &visibility)?;
+            operation(&reads)
+        })
+        .await
+        .map(Json)
+        .map_err(read_error)
     }
 
-    /// The admitted workspace configuration, re-admitting `rift.toml` when
-    /// the file changed since the last request. While the file is invalid,
-    /// every request fails as `configuration_invalid` until it is fixed.
-    ///
-    /// # Panics
-    ///
-    /// Recovers a poisoned lock instead of panicking: the admission is
-    /// replaced whole, so a poisoned guard still holds a coherent value.
-    fn admitted_configuration(
+    /// Returns one atomically published index and configuration policy.
+    async fn published_workspace(
         &self,
         phase: wire::ErrorPhase,
-    ) -> Result<WorkspaceConfiguration, ErrorData> {
-        let current = configuration_fingerprint(&self.root);
-        let state = self
-            .configuration
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.fingerprint == current {
-            return state.admitted(phase);
+    ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
+        match tokio::time::timeout(INDEX_FRESHNESS_TIMEOUT, self.reconcile_workspace(phase)).await {
+            Ok(result) => result,
+            Err(_) => Err(ReadFault::unavailable(
+                "current workspace read",
+                "index freshness deadline elapsed",
+            )
+            .tool_error(phase)),
         }
-        drop(state);
-        let mut state = self
-            .configuration
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.fingerprint != current {
-            *state = ConfigurationState::admit(&self.root);
+    }
+
+    /// Reconciles native observations with an exact request-time fingerprint.
+    async fn reconcile_workspace(
+        &self,
+        phase: wire::ErrorPhase,
+    ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
+        for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
+            let current = self.await_current_workspace(phase).await?;
+            let root = self.root.clone();
+            let limits = self.limits;
+            let visibility = current.configuration.source_visibility();
+            let capture = bounded_blocking("workspace fingerprint", move || {
+                let fingerprint = WorkspaceFingerprint::capture(&root, limits, &visibility)
+                    .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+                Ok((fingerprint, configuration_fingerprint(&root)))
+            })
+            .instrument(tracing::debug_span!(
+                "index.reconcile",
+                component = "index",
+                operation = "fingerprint.capture",
+                epoch = current.epoch
+            ))
+            .await;
+            let (fingerprint, configuration_fingerprint) = match capture {
+                Ok(capture) => capture,
+                Err(error) => {
+                    let _ = self.coherence.observe();
+                    return Err(error.tool_error(phase));
+                }
+            };
+            let configuration_matches =
+                current.configuration.fingerprint == configuration_fingerprint;
+            let epoch_matches = current.epoch == self.coherence.observed_epoch();
+            if fingerprint == current.fingerprint && configuration_matches && epoch_matches {
+                current.configuration.admitted(phase)?;
+                return Ok(current);
+            }
+            self.coherence
+                .observe()
+                .map_err(|error| error.tool_error(phase))?;
         }
-        state.admitted(phase)
+        Err(ReadFault::unavailable(
+            "current workspace read",
+            "workspace changed across bounded reconciliation attempts",
+        )
+        .tool_error(phase))
+    }
+
+    /// Waits until published and observed epochs agree or latest build failed.
+    async fn await_current_workspace(
+        &self,
+        phase: wire::ErrorPhase,
+    ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
+        loop {
+            let changed = self.coherence.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let observed_epoch = self.coherence.observed_epoch();
+            let state = self.published.read().await;
+            let current = Arc::clone(&state.current);
+            let failure = state.failure.clone();
+            drop(state);
+            if current.epoch == observed_epoch {
+                return Ok(current);
+            }
+            if let Some((failed_epoch, error)) = failure
+                && failed_epoch == observed_epoch
+            {
+                return Err(error.tool_error(phase));
+            }
+            changed.as_mut().await;
+        }
     }
 
     /// Runs one change against the current snapshot and, when it lands,
@@ -288,37 +864,111 @@ impl RiftMcp {
     /// failure after a landed change rides the result as a diagnostic
     /// rather than failing the call: the write happened, and the caller
     /// must not be told otherwise.
-    fn change(
+    ///
+    /// Dropping this future after blocking work starts does not cancel that
+    /// work. The serialized operation finishes through snapshot publication
+    /// before releasing its lane.
+    async fn change(
         &self,
-        operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
+        operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>
+        + Send
+        + 'static,
     ) -> Result<Json<ChangeResult>, ErrorData> {
-        let configuration = self.admitted_configuration(wire::ErrorPhase::Change)?;
-        let mut result = operation(&self.snapshot(), &self.changes)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        if let ChangeResult::Applied { summary } = &mut result {
-            self.attach_hook_verdicts(&configuration.hooks, summary);
-            let visibility = SourceVisibility::from(&configuration.source);
-            match ReadService::build(&self.root, self.limits, &visibility) {
-                Ok(rebuilt) => {
-                    *self
-                        .reads
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = rebuilt;
-                }
-                Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
+        self.published_workspace(wire::ErrorPhase::Change).await?;
+        let root = self.root.clone();
+        let limits = self.limits;
+        let published = Arc::clone(&self.published);
+        let coherence = Arc::clone(&self.coherence);
+        let changes = Arc::clone(&self.changes);
+        let change_lane = Arc::clone(&self.change_lane);
+        bounded_blocking("workspace change", move || {
+            let lane = change_lane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = published.blocking_read();
+            let current = Arc::clone(&state.current);
+            drop(state);
+            if current.epoch != coherence.observed_epoch() {
+                drop(lane);
+                return Ok(Err(ReadFault::unavailable(
+                    "workspace change",
+                    "index changed before operation admission",
+                )
+                .tool_error(wire::ErrorPhase::Change)));
             }
-        }
-        Ok(Json(result))
+            let configuration = match current.configuration.admitted(wire::ErrorPhase::Change) {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    drop(lane);
+                    return Ok(Err(error));
+                }
+            };
+            let mut result = operation(&current.reads, &changes)?;
+            if let ChangeResult::Applied { summary } = &mut result {
+                let epoch = match coherence.observe() {
+                    Ok(epoch) => epoch,
+                    Err(error) => {
+                        summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                        drop(lane);
+                        return Ok(Ok(Json(result)));
+                    }
+                };
+                Self::attach_hook_verdicts(&root, &configuration.hooks, summary);
+                let visibility = SourceVisibility::from(&configuration.source);
+                match ReadService::build(&root, limits, &visibility) {
+                    Ok(rebuilt) => {
+                        let fingerprint = rebuilt.workspace_fingerprint().clone();
+                        if current.configuration.fingerprint != configuration_fingerprint(&root) {
+                            let error = ReadFault::unavailable(
+                                "workspace change",
+                                "configuration changed during snapshot rebuild",
+                            );
+                            let _ = coherence.observe();
+                            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                            drop(lane);
+                            return Ok(Ok(Json(result)));
+                        }
+                        let next = Arc::new(PublishedWorkspace {
+                            reads: Arc::new(rebuilt),
+                            configuration: current.configuration.clone(),
+                            fingerprint,
+                            epoch,
+                        });
+                        if coherence.observed_epoch() == epoch {
+                            let mut state = published.blocking_write();
+                            if coherence.observed_epoch() == epoch {
+                                state.current = next;
+                                state.failure = None;
+                                tracing::info!(
+                                    component = "index",
+                                    operation = "index.publish",
+                                    trigger = "rift_change",
+                                    epoch,
+                                    "index snapshot published"
+                                );
+                            }
+                            drop(state);
+                            coherence.changed.notify_waiters();
+                        }
+                    }
+                    Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
+                }
+            }
+            drop(lane);
+            Ok(Ok(Json(result)))
+        })
+        .await
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?
     }
 
     /// Runs the configured hooks over one applied change and attaches what
     /// they established: a passing hook's configured guarantees become
     /// evidence, and every other outcome becomes an error finding.
-    fn attach_hook_verdicts(&self, hooks: &[CommandHook], summary: &mut ChangeSummary) {
+    fn attach_hook_verdicts(root: &Path, hooks: &[CommandHook], summary: &mut ChangeSummary) {
         if hooks.is_empty() {
             return;
         }
-        let runs = run_hooks(hooks, &self.root, &summary.paths);
+        let runs = run_hooks(hooks, root, &summary.paths);
         for (hook, run) in hooks.iter().zip(&runs) {
             if run.status == HookStatus::Passed {
                 summary
@@ -396,15 +1046,15 @@ fn bounded_prefix(text: &str, bytes_max: usize) -> &str {
     &text[..end]
 }
 
-/// The finding an applied change carries when the follow-up snapshot could
-/// not be rebuilt: reads keep serving the pre-change snapshot until one can.
+/// Finding carried when follow-up snapshot cannot rebuild. Current-tree
+/// reads refuse that dirty epoch until one can.
 fn stale_snapshot_diagnostic(error: &ReadError) -> rift_protocol::read::Diagnostic {
     rift_protocol::read::Diagnostic {
         severity: rift_protocol::read::Severity::Warning,
         code: Some(DiagnosticCode::SnapshotStale.code()),
         message: format!(
             "the change landed, and the read snapshot could not refresh; \
-             reads serve the pre-change tree until the workspace indexes again: {error}"
+             current-tree reads wait for a successful workspace reindex: {error}"
         ),
         span: None,
         related: Vec::new(),
@@ -516,10 +1166,12 @@ fn wire_code(name: ErrorName) -> wire::ErrorCode {
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::time::Duration;
 
     use rift_core::{CliCode, ErrorName, SourceVisibility};
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::error as wire;
+    use rift_protocol::read::GetSymbolResult;
     use rift_server::{ReadFault, ReadService};
 
     use super::WireFailure;
@@ -528,15 +1180,24 @@ mod tests {
     use rmcp::model::{CallToolRequestParams, ErrorCode};
     use serde_json::json;
 
-    use super::RiftMcp;
+    use super::{Parameters, RiftMcp};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
+    async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         Ok((directory, server))
+    }
+
+    async fn get_symbol(server: &RiftMcp, name: &str) -> Result<GetSymbolResult, rmcp::ErrorData> {
+        let params = serde_json::from_value(json!({"name": name}))
+            .expect("test symbol parameters must deserialize");
+        server
+            .get_symbol(Parameters(params))
+            .await
+            .map(|result| result.0)
     }
 
     fn arguments(
@@ -548,19 +1209,157 @@ mod tests {
             .ok_or_else(|| "tool arguments must be an object".into())
     }
 
-    #[test]
-    fn build_propagates_workspace_index_failure() {
-        let error = RiftMcp::build(
-            std::path::Path::new("not-a-real-rift-workspace"),
-            WorkspaceIndexLimits::default(),
-        )
-        .expect_err("missing root must fail");
+    #[tokio::test]
+    async fn build_propagates_workspace_index_failure() {
+        let directory = tempfile::tempdir().expect("fixture must exist");
+        fs::write(directory.path().join("invalid.rs"), [0xff])
+            .expect("invalid source fixture must write");
+        let error = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+            .await
+            .expect_err("invalid source must fail");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
     }
 
     #[tokio::test]
+    async fn external_create_modify_rename_and_delete_stay_current() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let created = directory.path().join("external.rs");
+        fs::write(&created, "pub fn external_created() {}\n")?;
+        let result = get_symbol(&server, "external_created")
+            .await
+            .map_err(|error| format!("external create must reconcile: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+
+        fs::write(&created, "pub fn external_modified() {}\n")?;
+        let result = get_symbol(&server, "external_modified")
+            .await
+            .map_err(|error| format!("external modify must reconcile: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+        assert!(
+            get_symbol(&server, "external_created")
+                .await?
+                .hits
+                .is_empty()
+        );
+
+        let renamed = directory.path().join("renamed.rs");
+        fs::rename(&created, &renamed)?;
+        let result = get_symbol(&server, "external_modified")
+            .await
+            .map_err(|error| format!("external rename must reconcile: {error:?}"))?;
+        let unit = result.hits[0]
+            .symbol
+            .origin
+            .unit
+            .as_ref()
+            .ok_or("renamed symbol must retain source unit")?;
+        assert!(unit.0.ends_with("/renamed.rs"));
+
+        fs::remove_file(renamed)?;
+        let result = get_symbol(&server, "external_modified")
+            .await
+            .map_err(|error| format!("external delete must reconcile: {error:?}"))?;
+        assert!(result.hits.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_burst_coalesces_without_losing_final_bytes() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let path = directory.path().join("burst.rs");
+        for sequence in 0..32 {
+            fs::write(&path, format!("pub fn burst_{sequence}() {{}}\n"))?;
+        }
+        let result = get_symbol(&server, "burst_31")
+            .await
+            .map_err(|error| format!("burst final state must reconcile: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+        assert!(get_symbol(&server, "burst_0").await?.hits.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_rebuild_failure_recovers_after_tree_is_valid() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lib.rs");
+        fs::write(&path, "pub fn beacon() {}\n")?;
+        let tight =
+            WorkspaceIndexLimits::new(4, 60, 60, 4, 100).map_err(|error| error.to_string())?;
+        let server = RiftMcp::build(directory.path(), tight).await?;
+
+        fs::write(
+            &path,
+            format!("pub fn oversized() {{}}\n{}", " ".repeat(80)),
+        )?;
+        let error = get_symbol(&server, "oversized")
+            .await
+            .expect_err("oversized external edit must refuse a current answer");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some("limit_exceeded"));
+
+        fs::write(&path, "pub fn recovered() {}\n")?;
+        let mut recovered = false;
+        for _attempt in 0..100 {
+            if get_symbol(&server, "recovered")
+                .await
+                .is_ok_and(|result| result.hits.len() == 1)
+            {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(recovered, "valid external edit must recover failed rebuild");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ignore_policy_and_hard_floor_exclude_external_source() -> TestResult {
+        let (directory, server) = fixture().await?;
+        fs::write(
+            directory.path().join("policy.rs"),
+            "pub fn policy_hidden() {}\n",
+        )?;
+        assert_eq!(get_symbol(&server, "policy_hidden").await?.hits.len(), 1);
+
+        fs::write(directory.path().join(".gitignore"), "policy.rs\n")?;
+        assert!(get_symbol(&server, "policy_hidden").await?.hits.is_empty());
+        fs::remove_file(directory.path().join(".gitignore"))?;
+        assert_eq!(get_symbol(&server, "policy_hidden").await?.hits.len(), 1);
+
+        fs::create_dir(directory.path().join("target"))?;
+        fs::write(
+            directory.path().join("target/ignored.rs"),
+            "pub fn hard_floor_hidden() {}\n",
+        )?;
+        assert!(
+            get_symbol(&server, "hard_floor_hidden")
+                .await?
+                .hits
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_supervisor_shutdown_is_joined_and_idempotent() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let supervisor = server.index_supervisor();
+        drop(server);
+        assert!(supervisor.coherence.cancellation.is_cancelled());
+        supervisor.shutdown().await?;
+        supervisor.shutdown().await?;
+        assert!(supervisor.coherence.task.lock().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn client_lists_and_calls_exact_read_only_surface() -> TestResult {
-        let (_directory, server) = fixture()?;
+        let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -656,7 +1455,7 @@ mod tests {
 
     #[tokio::test]
     async fn exported_schema_document_matches_served_tools() -> TestResult {
-        let (_directory, server) = fixture()?;
+        let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -689,7 +1488,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_change_lands_and_reads_serve_the_new_snapshot() -> TestResult {
-        let (_directory, server) = fixture()?;
+        let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -737,6 +1536,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_inserts_publish_from_serialized_fresh_snapshots() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+        let first_client = client.peer().clone();
+        let second_client = client.peer().clone();
+        let first = first_client.call_tool(
+            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
+                "anchor": "rift://symbol/rust/lib.rs/beacon",
+                "position": "after",
+                "body": "pub fn first_insert() {}"
+            }))?),
+        );
+        let second = second_client.call_tool(
+            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
+                "anchor": "rift://symbol/rust/lib.rs/beacon",
+                "position": "after",
+                "body": "pub fn second_insert() {}"
+            }))?),
+        );
+        let (first, second) = tokio::join!(first, second);
+        for result in [first?, second?] {
+            let structured = result
+                .structured_content
+                .ok_or("insert_symbol must return structured content")?;
+            assert_eq!(structured["status"], json!("applied"));
+        }
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert!(
+            written.contains("first_insert"),
+            "first concurrent insert must survive: {written}"
+        );
+        assert!(
+            written.contains("second_insert"),
+            "second concurrent insert must survive: {written}"
+        );
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn applied_change_reports_failed_snapshot_rebuild_as_warning() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
@@ -746,7 +1595,7 @@ mod tests {
         )?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight)?;
+        let server = RiftMcp::build(directory.path(), tight).await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -798,7 +1647,7 @@ pub fn beacon() -> u64 {
         arguments_value: &serde_json::Value,
         tool: &'static str,
     ) -> TestResult<rmcp::ErrorData> {
-        let (_directory, server) = fixture()?;
+        let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server

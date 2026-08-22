@@ -13,7 +13,7 @@ use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguratio
 
 /// Bytes a `rift.toml` may hold, at most. The file states bounded tables
 /// and hook lists; one this large is not configuration.
-const CONFIGURATION_FILE_BYTES_MAX: u64 = 256 << 10;
+pub const CONFIGURATION_FILE_BYTES_MAX: u64 = 256 << 10;
 
 /// One configuration failure: why the workspace's `rift.toml` cannot be
 /// admitted.

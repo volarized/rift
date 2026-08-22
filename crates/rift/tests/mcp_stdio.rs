@@ -24,7 +24,10 @@ async fn rift_reads_its_own_rust_source_over_real_stdio_mcp() -> TestResult {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let (transport, stderr) = TokioChildProcess::builder(
         tokio::process::Command::new(env!("CARGO_BIN_EXE_rift")).configure(|command| {
-            command.arg("mcp").current_dir(root);
+            command
+                .arg("mcp")
+                .current_dir(&root)
+                .env("RUST_LOG", "rift=info,rift_mcp=info,rift_server=info");
         }),
     )
     .stderr(Stdio::piped())
@@ -79,6 +82,17 @@ async fn rift_reads_its_own_rust_source_over_real_stdio_mcp() -> TestResult {
 
     client.cancel().await?;
     let stderr = stderr_task.await??;
-    assert!(stderr.is_empty(), "stdio server wrote stderr: {stderr}");
+    assert!(stderr.contains("MCP server starting"), "{stderr}");
+    assert!(stderr.contains("index.build"), "{stderr}");
+    assert!(stderr.contains("MCP server ready"), "{stderr}");
+    assert!(stderr.contains("MCP server stopped"), "{stderr}");
+    assert!(
+        !stderr.contains(&root.display().to_string()),
+        "tracing exposed workspace root: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cli_command"),
+        "tracing exposed request content: {stderr}"
+    );
     Ok(())
 }
