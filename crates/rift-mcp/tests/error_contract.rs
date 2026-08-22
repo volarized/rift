@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fs;
 
 use rift_index::WorkspaceIndexLimits;
-use rift_mcp::RiftMcp;
+use rift_mcp::{RiftMcp, RiftMcpOptions};
 use rift_protocol::error::ErrorData;
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
@@ -20,7 +20,12 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        RiftMcpOptions::default(),
+    )
+    .await?;
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server
@@ -113,7 +118,12 @@ async fn failing_wire_error(
     tool: &'static str,
     request: serde_json::Value,
 ) -> TestResult<serde_json::Value> {
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        RiftMcpOptions::default(),
+    )
+    .await?;
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server
