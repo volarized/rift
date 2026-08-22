@@ -189,6 +189,27 @@ pub struct LexicalMatch {
 }
 
 impl LexicalMatch {
+    /// Constructs one lexical match directly. Production code only ever builds these from
+    /// a live [`LexicalSearchIndex::search`]; this constructor exists for callers that
+    /// merge or resolve matches from a search result they already hold — most notably
+    /// tests exercising that merge without a live database.
+    #[must_use]
+    pub fn new(
+        identity: impl Into<String>,
+        path: ProjectPath,
+        kind: LexicalUnitKind,
+        name: Option<String>,
+        rank: f64,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            path,
+            kind,
+            name,
+            rank,
+        }
+    }
+
     /// Returns the matched unit's stable identity.
     #[must_use]
     pub fn identity(&self) -> &str {

@@ -3,13 +3,20 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{SourceVisibility, TextFileAdmission};
-use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
+use rift_index::{
+    LexicalIndexLimits, LexicalMatch, LexicalSearchIndex, WorkspaceFingerprint,
+    WorkspaceIndexLimits, WorkspaceSourcePolicy,
+};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
     ReplaceNodeParams, ReplaceSymbolParams,
 };
-use rift_protocol::configuration::{CommandHook, SERVER_BLOCKING_SLOTS_MAX, ServerConfiguration};
+use rift_protocol::configuration::{
+    CommandHook, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX, SERVER_BLOCKING_SLOTS_MAX,
+    SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+};
 use rift_protocol::error as wire;
 use rift_protocol::read::{
     GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
@@ -25,9 +32,15 @@ use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagno
 use crate::validation::{
     ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, INDEX_FRESHNESS_TIMEOUT, IndexState,
     IndexSupervisor, IndexSupervisorContext, IndexValidation, PublishedWorkspace, RebuildOutcome,
-    configuration_fingerprint, initial_workspace, publish_rebuild, run_index_supervisor,
-    workspace_watcher,
+    configuration_fingerprint, initial_workspace, populate_lexical, publish_rebuild,
+    run_index_supervisor, workspace_watcher,
 };
+
+/// Overfetches lexical matches beyond the caller's requested `limit` before the identifier
+/// and lexical hit lists merge: the merge can collapse a lexical hit into an
+/// identifier-matched one it duplicates, so asking for exactly `limit` lexical matches would
+/// under-fill the final page whenever duplicates exist.
+const LEXICAL_OVERFETCH_FACTOR: u32 = 4;
 
 /// Bounded Tokio admission for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
@@ -125,6 +138,85 @@ impl ChangeLane {
     }
 }
 
+/// Sizes the lexical search index's connection pool and busy-wait budget from one admitted
+/// `[search]` table, keeping this release's fixed unit, query-term, and match-count bounds.
+fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
+    let defaults = LexicalIndexLimits::default();
+    // Admission bounds pool_slots to 1..=SEARCH_POOL_SLOTS_MAX and busy_timeout to
+    // SEARCH_BUSY_TIMEOUT_MS_MIN..=SEARCH_BUSY_TIMEOUT_MS_MAX, so these clamps only guard the
+    // narrowing conversion into the adapter's `u32` fields.
+    let pool_slots = u32::try_from(search.pool_slots.min(SEARCH_POOL_SLOTS_MAX))
+        .unwrap_or(1)
+        .max(1);
+    let busy_timeout_ms = u32::try_from(
+        search
+            .busy_timeout
+            .milliseconds()
+            .min(SEARCH_BUSY_TIMEOUT_MS_MAX),
+    )
+    .unwrap_or(1_000);
+    LexicalIndexLimits::new(
+        defaults.units_max(),
+        defaults.unit_bytes_max(),
+        defaults.query_terms_max(),
+        defaults.matches_max(),
+        pool_slots,
+        busy_timeout_ms,
+    )
+}
+
+/// Opens the workspace's lexical search database at `.rift/db`, creating `.rift` first.
+///
+/// The database is a derived index, rebuildable from the workspace tree at any time: an
+/// open failure deletes the file and retries exactly once before this run gives up on the
+/// lexical tier, rather than refusing to start the server over a file Rift itself can
+/// always regenerate. The server serves identifier search alone when both attempts fail.
+async fn open_lexical_index(
+    root: &Path,
+    limits: LexicalIndexLimits,
+) -> Option<Arc<LexicalSearchIndex>> {
+    let state_directory = root.join(RIFT_STATE_DIRECTORY);
+    if let Err(error) = tokio::fs::create_dir_all(&state_directory).await {
+        tracing::warn!(
+            component = "search",
+            operation = "lexical.open",
+            path = %state_directory.display(),
+            error = %error,
+            "could not create the workspace state directory; the server starts without the \
+             lexical search tier"
+        );
+        return None;
+    }
+    let database_path = state_directory.join(WORKSPACE_DATABASE_FILE_NAME);
+    match LexicalSearchIndex::open(&database_path, limits).await {
+        Ok(index) => return Some(Arc::new(index)),
+        Err(error) => {
+            tracing::warn!(
+                component = "search",
+                operation = "lexical.open",
+                path = %database_path.display(),
+                error = %error,
+                "lexical search database failed to open; deleting and recreating it once"
+            );
+        }
+    }
+    let _ = tokio::fs::remove_file(&database_path).await;
+    match LexicalSearchIndex::open(&database_path, limits).await {
+        Ok(index) => Some(Arc::new(index)),
+        Err(error) => {
+            tracing::warn!(
+                component = "search",
+                operation = "lexical.open",
+                path = %database_path.display(),
+                error = %error,
+                "lexical search database failed to open after recreation; the server starts \
+                 without the lexical search tier"
+            );
+            None
+        }
+    }
+}
+
 /// Rust workspace MCP server: reads serve an immutable snapshot, changes
 /// write the workspace and swap in a fresh snapshot.
 #[derive(Debug)]
@@ -136,12 +228,33 @@ pub struct RiftMcp {
     changes: Arc<ChangeService>,
     change_lane: Arc<ChangeLane>,
     blocking: BlockingExecutor,
+    /// The lexical search database, absent when it could not be opened at
+    /// startup; `search` then serves identifier matching alone.
+    lexical: Option<Arc<LexicalSearchIndex>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl Drop for RiftMcp {
     fn drop(&mut self) {
         self.validation.cancellation.cancel();
+    }
+}
+
+/// One already-serialized change's outcome, threaded out of the blocking executor so the
+/// async `change` method can await lexical population against exactly the workspace this
+/// change published, without a second, possibly-superseded read of shared state.
+struct SerializedChange {
+    result: Result<Json<ChangeResult>, ErrorData>,
+    published: Option<Arc<PublishedWorkspace>>,
+}
+
+impl SerializedChange {
+    /// A refusal or a diagnostic-only outcome: no fresh snapshot to populate.
+    const fn wire(result: Result<Json<ChangeResult>, ErrorData>) -> Self {
+        Self {
+            result,
+            published: None,
+        }
     }
 }
 
@@ -185,6 +298,15 @@ impl RiftMcp {
             ))
             .await?;
         let published = initial_workspace(&root, limits, &validation, &blocking).await?;
+        // The lexical database lives under the workspace's own `.rift` directory, so it
+        // opens only once the workspace root itself is proven real by a successful initial
+        // scan — never before, or a missing root would be silently fabricated by creating
+        // `.rift` under it.
+        let lexical_limits = lexical_index_limits(&startup_configuration.search_configuration());
+        let lexical = open_lexical_index(&root, lexical_limits).await;
+        if let Some(lexical) = lexical.as_ref() {
+            populate_lexical(lexical, &published).await;
+        }
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
             failure: None,
@@ -200,6 +322,7 @@ impl RiftMcp {
                 change_lane: Arc::clone(&change_lane),
                 validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
+                lexical: lexical.clone(),
             },
         ));
         let mut task = validation.task.lock().await;
@@ -213,6 +336,7 @@ impl RiftMcp {
             changes: Arc::new(ChangeService::new(&root)),
             change_lane,
             blocking,
+            lexical,
             tool_router: Self::tool_router(),
         })
     }
@@ -238,16 +362,60 @@ impl RiftMcp {
             .await
     }
 
-    /// Searches indexed Rust declarations and source lines by lexical `query`.
-    /// `rev` searches a version-control revision instead of the current tree.
-    /// Use `get_symbol` when the declaration name is known.
+    /// Searches indexed Rust declarations and source lines by lexical `query`, merged with
+    /// full-text matches from admitted `[search.text]` files and declaration bodies. `rev`
+    /// searches a version-control revision instead of the current tree. Use `get_symbol`
+    /// when the declaration name is known.
     #[tool]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let rev = params.rev.clone();
-        self.read_at(rev, move |reads| reads.search(&params)).await
+        let lexical_matches = self.lexical_search_matches(&params).await?;
+        self.read_at(rev, move |reads| reads.search(&params, &lexical_matches))
+            .await
+    }
+
+    /// Runs the lexical search-index tier for one search request against the currently
+    /// published workspace, when the tier is available and its stamped tree revision still
+    /// matches what is published. A revision mismatch or an absent handle answers with no
+    /// lexical matches, so identifier search proceeds alone rather than serving a possibly
+    /// stale tier — a request naming `rev` never consults this tier, since the tier only
+    /// ever holds the current tree. A query-term limit the adapter refuses surfaces as this
+    /// request's own `limit_exceeded` error, never a silent degrade.
+    async fn lexical_search_matches(
+        &self,
+        params: &SearchParams,
+    ) -> Result<Vec<LexicalMatch>, ErrorData> {
+        if params.rev.is_some() {
+            return Ok(Vec::new());
+        }
+        let Some(lexical) = self.lexical.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let Some(query) = params.query.as_deref().filter(|query| !query.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        let Ok(published) = self.published_workspace(wire::ErrorPhase::Read).await else {
+            return Ok(Vec::new());
+        };
+        let Ok(current_revision) = lexical.tree_revision().await else {
+            return Ok(Vec::new());
+        };
+        if current_revision.as_deref() != Some(published.reads.tree_revision()) {
+            return Ok(Vec::new());
+        }
+        let requested_limit = params
+            .limit
+            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64);
+        let fetch_limit =
+            u32::try_from(requested_limit.saturating_mul(u64::from(LEXICAL_OVERFETCH_FACTOR)))
+                .unwrap_or(u32::MAX);
+        lexical
+            .search(query, fetch_limit)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
@@ -487,7 +655,8 @@ impl RiftMcp {
         let validation = Arc::clone(&self.validation);
         let changes = Arc::clone(&self.changes);
         let change_lane = Arc::clone(&self.change_lane);
-        self.blocking
+        let outcome = self
+            .blocking
             .run("workspace change", move || {
                 change_lane.run(|| {
                     Self::change_serialized(
@@ -501,10 +670,16 @@ impl RiftMcp {
                 })
             })
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
+        if let (Some(lexical), Some(next)) = (self.lexical.as_ref(), outcome.published.as_ref()) {
+            populate_lexical(lexical, next).await;
+        }
+        outcome.result
     }
 
-    /// Runs one already-serialized change through validated publication.
+    /// One already-serialized change's outcome: the wire result, and the freshly published
+    /// workspace exactly when this change's own rebuild published a new snapshot — absent
+    /// for a refusal, and for a landed change whose rebuild only appended a diagnostic.
     fn change_serialized(
         root: &Path,
         limits: WorkspaceIndexLimits,
@@ -512,80 +687,109 @@ impl RiftMcp {
         validation: &IndexValidation,
         changes: &ChangeService,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
-    ) -> Result<Result<Json<ChangeResult>, ErrorData>, ReadError> {
+    ) -> Result<SerializedChange, ReadError> {
         let state = published.blocking_read();
         let (current, _) = state.snapshot();
         drop(state);
         if current.epoch != validation.observed_epoch() {
-            return Ok(Err(ReadFault::unavailable(
+            return Ok(SerializedChange::wire(Err(ReadFault::unavailable(
                 "workspace change",
                 "index changed before operation admission",
             )
-            .tool_error(wire::ErrorPhase::Change)));
+            .tool_error(wire::ErrorPhase::Change))));
         }
         let configuration = match current.configuration.admitted(wire::ErrorPhase::Change) {
             Ok(configuration) => configuration,
-            Err(error) => return Ok(Err(error)),
+            Err(error) => return Ok(SerializedChange::wire(Err(error))),
         };
         let mut result = operation(&current.reads, changes)?;
-        if let ChangeResult::Applied { summary } = &mut result {
-            let epoch = match validation.observe() {
-                Ok(epoch) => epoch,
+        let published_next = if let ChangeResult::Applied { summary } = &mut result {
+            Self::rebuild_after_applied_change(
+                root,
+                limits,
+                published,
+                validation,
+                &configuration,
+                &current,
+                summary,
+            )
+        } else {
+            None
+        };
+        Ok(SerializedChange {
+            result: Ok(Json(result)),
+            published: published_next,
+        })
+    }
+
+    /// Rebuilds and publishes the snapshot after one landed change, running its hooks
+    /// first. Returns the freshly published workspace only when publication actually
+    /// happened; every failure rides `summary` as a diagnostic instead of failing the call,
+    /// since the write already landed.
+    fn rebuild_after_applied_change(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        published: &RwLock<IndexState>,
+        validation: &IndexValidation,
+        configuration: &WorkspaceConfiguration,
+        current: &PublishedWorkspace,
+        summary: &mut ChangeSummary,
+    ) -> Option<Arc<PublishedWorkspace>> {
+        let epoch = match validation.observe() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                return None;
+            }
+        };
+        Self::attach_hook_verdicts(root, &configuration.hooks, summary);
+        let visibility = SourceVisibility::from(&configuration.source);
+        let text_admission = TextFileAdmission::from(&configuration.search);
+        let rebuilt = match ReadService::build(root, limits, &visibility, &text_admission) {
+            Ok(rebuilt) => rebuilt,
+            Err(error) => {
+                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                return None;
+            }
+        };
+        let fingerprint = rebuilt.workspace_fingerprint().clone();
+        let source_policy =
+            match WorkspaceSourcePolicy::build(root, limits, &visibility, &text_admission) {
+                Ok(policy) => Arc::new(policy),
                 Err(error) => {
+                    let error = ReadError::from(ReadFault::Index(error));
                     summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                    return Ok(Ok(Json(result)));
+                    return None;
                 }
             };
-            Self::attach_hook_verdicts(root, &configuration.hooks, summary);
-            let visibility = SourceVisibility::from(&configuration.source);
-            let text_admission = TextFileAdmission::from(&configuration.search);
-            match ReadService::build(root, limits, &visibility, &text_admission) {
-                Ok(rebuilt) => {
-                    let fingerprint = rebuilt.workspace_fingerprint().clone();
-                    let source_policy = match WorkspaceSourcePolicy::build(
-                        root,
-                        limits,
-                        &visibility,
-                        &text_admission,
-                    ) {
-                        Ok(policy) => Arc::new(policy),
-                        Err(error) => {
-                            let error = ReadError::from(ReadFault::Index(error));
-                            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                            return Ok(Ok(Json(result)));
-                        }
-                    };
-                    if current.configuration.fingerprint != configuration_fingerprint(root) {
-                        let error = ReadFault::unavailable(
-                            "workspace change",
-                            "configuration changed during snapshot rebuild",
-                        );
-                        let _ = validation.observe();
-                        summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                        return Ok(Ok(Json(result)));
-                    }
-                    let next = Arc::new(PublishedWorkspace {
-                        reads: Arc::new(rebuilt),
-                        configuration: current.configuration.clone(),
-                        fingerprint,
-                        source_policy,
-                        epoch,
-                    });
-                    if publish_rebuild(published, validation, next) == RebuildOutcome::Published {
-                        tracing::info!(
-                            component = "index",
-                            operation = "index.publish",
-                            trigger = "rift_change",
-                            epoch,
-                            "index snapshot published"
-                        );
-                        validation.changed.notify_waiters();
-                    }
-                }
-                Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
-            }
+        if current.configuration.fingerprint != configuration_fingerprint(root) {
+            let error = ReadFault::unavailable(
+                "workspace change",
+                "configuration changed during snapshot rebuild",
+            );
+            let _ = validation.observe();
+            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+            return None;
         }
-        Ok(Ok(Json(result)))
+        let next = Arc::new(PublishedWorkspace {
+            reads: Arc::new(rebuilt),
+            configuration: current.configuration.clone(),
+            fingerprint,
+            source_policy,
+            epoch,
+        });
+        if publish_rebuild(published, validation, Arc::clone(&next)) == RebuildOutcome::Published {
+            tracing::info!(
+                component = "index",
+                operation = "index.publish",
+                trigger = "rift_change",
+                epoch,
+                "index snapshot published"
+            );
+            validation.changed.notify_waiters();
+            return Some(next);
+        }
+        None
     }
 
     /// Runs the configured hooks over one applied change and attaches what
@@ -1143,7 +1347,8 @@ mod tests {
                 panic!("invalid configuration must stop before operation")
             },
         )?;
-        let Err(error) = outcome else {
+        assert!(outcome.published.is_none());
+        let Err(error) = outcome.result else {
             panic!("invalid configuration must refuse change");
         };
         let data = error.data.expect("Rift error must carry typed data");
@@ -1324,6 +1529,177 @@ mod tests {
         assert!(
             excerpt.contains("-> u8"),
             "reads after an applied change must serve the new snapshot: {excerpt}"
+        );
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    /// A multi-word prose query neither identifier search path can serve: no line contains
+    /// the literal phrase, and no declaration name contains it either. `scale_value`'s doc
+    /// comment supplies just the word "units" and `guide.md` supplies "replace" and "all",
+    /// so only the lexical search-index tier's per-term matching can produce either hit.
+    #[tokio::test]
+    async fn client_search_merges_lexical_symbol_and_text_file_hits() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "/// Converts a raw measurement into base units.\npub fn scale_value(value: f64) -> f64 {\n    value * 2.0\n}\n",
+        )?;
+        fs::write(
+            directory.path().join("guide.md"),
+            "# Guide\n\nThis document explains how to replace all safely.\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+
+        let search = client
+            .call_tool(
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments(&json!({"query": "replace all units"}))?),
+            )
+            .await?;
+        let structured = search
+            .structured_content
+            .ok_or("search must return structured content")?;
+        let results = structured["results"]
+            .as_array()
+            .ok_or("results must be an array")?;
+
+        let file_hit = results
+            .iter()
+            .find(|hit| hit["hit"]["target"] == "file" && hit["path"] == json!("guide.md"))
+            .ok_or_else(|| {
+                format!("a text-file hit for guide.md must be present: {structured:#}")
+            })?;
+        assert_eq!(file_hit["matched_by"], json!(["content"]));
+
+        let symbol_hit = results
+            .iter()
+            .find(|hit| {
+                hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
+            })
+            .ok_or_else(|| {
+                format!(
+                    "scale_value must be found through its doc comment's content: {structured:#}"
+                )
+            })?;
+        assert!(
+            symbol_hit["matched_by"]
+                .as_array()
+                .is_some_and(|fields| fields.contains(&json!("content"))),
+            "the symbol hit must name content as a matched field: {symbol_hit:#}"
+        );
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    /// Corrupt bytes fail `SQLite`'s file-format check deterministically, exercising the
+    /// documented recreate-once path: the server still starts, and the recreated database
+    /// serves lexical search once repopulated.
+    #[tokio::test]
+    async fn build_recovers_from_a_corrupt_lexical_database_by_recreating_it_once() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("guide.md"),
+            "notes about the beacon subsystem\n",
+        )?;
+        let state_directory = directory.path().join(".rift");
+        fs::create_dir_all(&state_directory)?;
+        fs::write(state_directory.join("db"), b"not a sqlite database")?;
+
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+            .await
+            .map_err(|error| {
+                format!("a corrupt lexical database must not fail startup: {error:?}")
+            })?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+
+        let search = client
+            .call_tool(
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments(&json!({"query": "beacon subsystem"}))?),
+            )
+            .await?;
+        let structured = search
+            .structured_content
+            .ok_or("search must return structured content")?;
+        let results = structured["results"]
+            .as_array()
+            .ok_or("results must be an array")?;
+        assert!(
+            results.iter().any(|hit| hit["path"] == json!("guide.md")),
+            "the recreated lexical database must be populated and serve results: {structured:#}"
+        );
+
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
+    }
+
+    /// A `.md` file created after startup exists only because the change-applied rebuild
+    /// path repopulates the lexical tier; the initial population at `build` never saw it.
+    #[tokio::test]
+    async fn client_change_creating_a_text_file_populates_lexical_search() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+
+        let diff = "--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1 @@\n+the migration guide covers replacing every legacy unit\n";
+        let change = client
+            .call_tool(
+                CallToolRequestParams::new("patch")
+                    .with_arguments(arguments(&json!({"patch": diff}))?),
+            )
+            .await?;
+        let structured = change
+            .structured_content
+            .ok_or("patch must return structured content")?;
+        assert_eq!(structured["status"], json!("applied"));
+
+        let search = client
+            .call_tool(
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments(&json!({"query": "replacing legacy unit"}))?),
+            )
+            .await?;
+        let structured = search
+            .structured_content
+            .ok_or("search must return structured content")?;
+        let results = structured["results"]
+            .as_array()
+            .ok_or("results must be an array")?;
+        assert!(
+            results.iter().any(|hit| hit["path"] == json!("notes.md")),
+            "the change-applied rebuild must repopulate the lexical tier with the new file: \
+             {structured:#}"
         );
 
         client.cancel().await?;
@@ -1539,7 +1915,8 @@ pub fn beacon() -> u64 {
             &changes,
             |_, _| panic!("a moved index must refuse before the operation runs"),
         )?;
-        let Err(error) = outcome else {
+        assert!(outcome.published.is_none());
+        let Err(error) = outcome.result else {
             panic!("a moved index must refuse the change");
         };
         assert!(
@@ -1582,7 +1959,8 @@ pub fn beacon() -> u64 {
                 })
             },
         )?;
-        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+        assert!(outcome.published.is_none());
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
             panic!("the applied change must survive a lost observation");
         };
         assert_eq!(summary.diagnostics.len(), 1);
@@ -1629,7 +2007,8 @@ pub fn beacon() -> u64 {
                 })
             },
         )?;
-        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+        assert!(outcome.published.is_none());
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
             panic!("the applied change must survive a moved configuration");
         };
         assert_eq!(summary.diagnostics.len(), 1);

@@ -41,7 +41,7 @@ tar = "0.4.46"
 toasty = { version = "=0.10.0", default-features = false, features = ["migration", "sqlite"] }
 toasty-driver-sqlite = "=0.10.0"
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -11,8 +11,12 @@ use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use rift_core::constants::{WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES};
 use rift_core::{SourceVisibility, TextFileAdmission};
-use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
-use rift_protocol::configuration::{ServerConfiguration, WorkspaceConfiguration};
+use rift_index::{
+    LexicalSearchIndex, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+};
+use rift_protocol::configuration::{
+    SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+};
 use rift_protocol::error as wire;
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ReadError, ReadFault, ReadService,
@@ -118,6 +122,8 @@ pub(crate) struct IndexSupervisorContext {
     pub(crate) change_lane: Arc<ChangeLane>,
     pub(crate) validation: Arc<IndexValidation>,
     pub(crate) blocking: BlockingExecutor,
+    /// The lexical search database, absent when it could not be opened at startup.
+    pub(crate) lexical: Option<Arc<LexicalSearchIndex>>,
 }
 
 /// The last admission of the workspace's `rift.toml`, kept with the file
@@ -176,6 +182,15 @@ impl ConfigurationState {
             |_| TextFileAdmission::default(),
             |configuration| TextFileAdmission::from(&configuration.search),
         )
+    }
+
+    /// The `[search]` table from the last admission, or the default table
+    /// while `rift.toml` is invalid.
+    pub(crate) fn search_configuration(&self) -> SearchConfiguration {
+        self.admitted
+            .as_ref()
+            .map(|configuration| configuration.search.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -609,6 +624,39 @@ pub(crate) fn build_workspace_candidate(
     })))
 }
 
+/// Derives `published`'s lexical units and replaces the lexical search database's whole
+/// content with them, stamped with the same tree revision `published`'s wire answers
+/// report — the exact string a search request compares its query-time lexical revision
+/// against before trusting that tier's matches.
+///
+/// Population failure is a warning, never a request failure: the search-time revision guard
+/// keeps served results honest whether or not this population landed, and the next
+/// successful rebuild repopulates from scratch regardless.
+pub(crate) async fn populate_lexical(lexical: &LexicalSearchIndex, published: &PublishedWorkspace) {
+    for (path, chunks) in published.reads.chunked_text_files() {
+        tracing::warn!(
+            component = "search",
+            operation = "lexical.populate",
+            path = %path.as_str(),
+            chunks,
+            "a [search.text] file exceeds max_chunk and was indexed in chunks; exclude it in \
+             [source], or drop its extension from [search.text].extensions, to avoid this"
+        );
+    }
+    let units = published.reads.lexical_units();
+    let tree_revision = published.reads.tree_revision();
+    if let Err(error) = lexical.replace_all(&units, tree_revision).await {
+        tracing::warn!(
+            component = "search",
+            operation = "lexical.populate",
+            tree_revision,
+            error = %error,
+            "lexical search index population failed; identifier search continues to serve \
+             results until the next successful rebuild repopulates it"
+        );
+    }
+}
+
 /// Outcome of one background reconciliation attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RebuildOutcome {
@@ -631,6 +679,7 @@ pub(crate) async fn run_index_supervisor(
         change_lane,
         validation,
         blocking,
+        lexical,
     } = context;
     loop {
         let received = tokio::select! {
@@ -667,30 +716,39 @@ pub(crate) async fn run_index_supervisor(
             epoch
         ))
         .await;
-        if let Err(error) = result {
-            tracing::warn!(
-                component = "index",
-                operation = "index.build",
-                epoch,
-                error_code = error.descriptor().code(),
-                "index rebuild failed"
-            );
-            let failed_state = Arc::clone(&published);
-            let failed_validation = Arc::clone(&validation);
-            let recorded = blocking
-                .run("index failure publication", move || {
-                    Ok(record_rebuild_failure(
-                        &failed_state,
-                        &failed_validation,
-                        epoch,
-                        error,
-                    ))
-                })
-                .await;
-            if recorded.is_err() {
-                let _ = validation.observe_watch_failure();
+        match result {
+            Ok(RebuildOutcome::Published) => {
+                if let Some(lexical) = lexical.as_ref() {
+                    let (current, _) = published.read().await.snapshot();
+                    populate_lexical(lexical, &current).await;
+                }
             }
-            validation.changed.notify_waiters();
+            Ok(RebuildOutcome::Superseded) => {}
+            Err(error) => {
+                tracing::warn!(
+                    component = "index",
+                    operation = "index.build",
+                    epoch,
+                    error_code = error.descriptor().code(),
+                    "index rebuild failed"
+                );
+                let failed_state = Arc::clone(&published);
+                let failed_validation = Arc::clone(&validation);
+                let recorded = blocking
+                    .run("index failure publication", move || {
+                        Ok(record_rebuild_failure(
+                            &failed_state,
+                            &failed_validation,
+                            epoch,
+                            error,
+                        ))
+                    })
+                    .await;
+                if recorded.is_err() {
+                    let _ = validation.observe_watch_failure();
+                }
+                validation.changed.notify_waiters();
+            }
         }
     }
 }
@@ -1436,6 +1494,7 @@ mod tests {
                 change_lane: Arc::new(crate::server::ChangeLane::default()),
                 validation: Arc::clone(&validation),
                 blocking,
+                lexical: None,
             },
         ));
         let notified = validation.changed.notified();
@@ -1491,6 +1550,7 @@ mod tests {
                 change_lane: Arc::new(crate::server::ChangeLane::default()),
                 validation: Arc::clone(&validation),
                 blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
+                lexical: None,
             },
         ));
         let notified = validation.changed.notified();
