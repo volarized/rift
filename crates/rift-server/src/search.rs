@@ -5,6 +5,7 @@ use std::path::Path;
 
 use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT};
+use rift_core::line;
 use rift_index::{PathMatcher, SymbolMatch, SymbolMatchRank, WorkspaceIndex};
 use rift_protocol::read::{
     File, FileContent, MatchedField, PathPattern, PathSelector, SearchHit, SearchHitTarget,
@@ -93,6 +94,26 @@ fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     }
     if params.target == SearchParamsTarget::Node {
         return Err(ReadFault::unsupported("node search"));
+    }
+    if let Some(selector) = params.paths.as_ref() {
+        validate_path_selector(selector)?;
+    }
+    Ok(())
+}
+
+/// Refuses `selector` when any `include`, `exclude`, or `force_include` pattern breaks
+/// [`PathPattern`]'s forward-slash-only contract, before it reaches a glob engine that would
+/// otherwise read a stray backslash as an escape.
+fn validate_path_selector(selector: &PathSelector) -> Result<(), ReadError> {
+    let patterns = selector
+        .include
+        .iter()
+        .chain(&selector.exclude)
+        .chain(&selector.force_include);
+    for pattern in patterns {
+        if let Some(violation) = pattern.violation() {
+            return Err(ReadFault::invalid("paths", violation.as_str()));
+        }
     }
     Ok(())
 }
@@ -226,7 +247,7 @@ fn symbol_search_hit(matched: SymbolMatch<'_>) -> SearchHit {
         source: Some(excerpt(matched.file, matched.symbol.range).text),
         diagnostics: None,
         span: Some(source_span(matched.file, matched.symbol.range)),
-        line: Some(line_number(
+        line: Some(line::line_number_at(
             matched.file.source(),
             matched.symbol.range.start,
         )),
@@ -236,8 +257,8 @@ fn symbol_search_hit(matched: SymbolMatch<'_>) -> SearchHit {
     }
 }
 
-fn file_search_hit(file: &rift_index::IndexedFile, line: usize, text: String) -> SearchHit {
-    let start = line_start(file.source(), line);
+fn file_search_hit(file: &rift_index::IndexedFile, line_index: usize, text: String) -> SearchHit {
+    let start = line::line_start_offset(file.source(), line_index);
     let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
     let range = ByteRange { start, end };
     SearchHit {
@@ -259,7 +280,7 @@ fn file_search_hit(file: &rift_index::IndexedFile, line: usize, text: String) ->
         source: Some(text),
         diagnostics: None,
         span: Some(source_span(file, range)),
-        line: Some(u64::try_from(line).unwrap_or(u64::MAX)),
+        line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
         path: Some(project_path(file)),
         traversal_path: None,
         distance: None,
@@ -275,26 +296,6 @@ const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
     }
 }
 
-fn line_number(source: &str, position: u64) -> u64 {
-    let end = usize::try_from(position)
-        .unwrap_or(source.len())
-        .min(source.len());
-    u64::try_from(source[..end].match_indices('\n').count() + 1).unwrap_or(u64::MAX)
-}
-
-fn line_start(source: &str, line: usize) -> u64 {
-    let mut current = 1_usize;
-    for (index, byte) in source.bytes().enumerate() {
-        if current == line {
-            return u64::try_from(index).unwrap_or(u64::MAX);
-        }
-        if byte == b'\n' {
-            current += 1;
-        }
-    }
-    u64::try_from(source.len()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -307,7 +308,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{ReadFault, ReadService, SymbolMatchRank, line_start, symbol_match_score};
+    use super::{ReadFault, ReadService, SymbolMatchRank, symbol_match_score};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -529,15 +530,6 @@ pub fn compute() -> i32 {
             symbol_match_score(SymbolMatchRank::Substring),
         ];
         assert!(scores.windows(2).all(|pair| pair[0] > pair[1]));
-    }
-
-    #[test]
-    fn line_start_beyond_source_line_count_returns_source_length() {
-        let source = "one\ntwo\nthree\n";
-        assert_eq!(
-            line_start(source, 100),
-            u64::try_from(source.len()).expect("small fixture length fits u64")
-        );
     }
 
     #[test]
@@ -862,6 +854,23 @@ pub fn compute() -> i32 {
                 .expect_err("an invalid include glob must refuse")
                 .fault(),
             ReadFault::Index(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn search_paths_backslash_pattern_refuses_before_reaching_the_glob_engine() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "Beacon",
+            "paths": {"include": ["src\\lib.rs"]}
+        }))?;
+        assert!(matches!(
+            service
+                .search(&params)
+                .expect_err("a backslash pattern must be refused")
+                .fault(),
+            ReadFault::Invalid { field: "paths", .. }
         ));
         Ok(())
     }

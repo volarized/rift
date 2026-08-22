@@ -9,6 +9,7 @@ mod name;
 mod path;
 
 pub mod constants;
+pub mod line;
 
 pub use configuration::SourceVisibility;
 pub use error::{

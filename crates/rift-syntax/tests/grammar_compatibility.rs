@@ -71,3 +71,16 @@ fn test_rust_grammar_uses_supported_abi() {
         rust.abi_version(),
     );
 }
+
+#[test]
+fn test_rust_grammar_resolves_attachment_node_kind_ids() {
+    let language = rust_language();
+    for kind in ["attribute_item", "line_comment", "block_comment"] {
+        assert_ne!(
+            language.id_for_node_kind(kind, true),
+            0,
+            "pinned Rust grammar must define node kind used by attachment \
+             classification: kind={kind}",
+        );
+    }
+}
