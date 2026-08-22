@@ -5,7 +5,7 @@
 
 use crate::read::{
     Coverage, Cursor, DiagnosticContext, File, Node, ProjectPath, ProjectionId, ReadSnapshot,
-    Relationship, RelationshipFacet, SearchScope, SourceUnitSpan, Symbol, SymbolId,
+    Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitSpan, Symbol, SymbolId,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -432,6 +432,7 @@ pub enum SearchIntent {
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::restrict_traversal_and_paths)]
 #[schemars(transform = schema::require_query_filter_or_traversal)]
+#[schemars(transform = schema::forbid_search_rev_with_projection)]
 pub struct SearchParams {
     /// Which entity kinds may be returned — a kind selector, never the text to search for;
     /// that is `query`. Omitted, every kind may match. Type data is attached to the Symbol
@@ -473,6 +474,12 @@ pub struct SearchParams {
     /// The projection to search. Null searches the workspace tree.
     #[serde(default)]
     pub projection: Option<ProjectionId>,
+    /// The version-control revision to search — a branch, tag, or commit id as the
+    /// workspace's version control spells it. Null searches the current tree, and `rev`
+    /// never combines with `projection`. The server refuses a revision search when the
+    /// workspace has no version-control repository.
+    #[serde(default)]
+    pub rev: Option<RevisionId>,
     /// A bounded relationship walk. It may stand alone or add graph hits to a lexical or
     /// filtered search; duplicate symbols keep their shortest path.
     #[serde(default)]

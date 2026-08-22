@@ -450,6 +450,44 @@ pub fn require_query_filter_or_traversal(schema: &mut Schema) {
     );
 }
 
+/// A read names at most one alternate tree to serve from — a version-control
+/// `rev` or a materialized `projection`, never both — so the answer's origin
+/// is always a single tree.
+fn forbid_rev_with_projection(schema: &mut Schema, rev: &str, projection: &str) {
+    append(schema, Composition::All, not(requires(&[rev, projection])));
+}
+
+/// [`GetSymbolParams`](crate::read::GetSymbolParams) reads one tree: `rev`
+/// and `projection` never combine.
+pub fn forbid_get_symbol_rev_with_projection(schema: &mut Schema) {
+    use crate::read::GetSymbolParams;
+    forbid_rev_with_projection(
+        schema,
+        property!(GetSymbolParams, rev),
+        property!(GetSymbolParams, projection),
+    );
+}
+
+/// [`NodesParams`](crate::read::NodesParams) reads one tree: `rev` and
+/// `projection` never combine.
+pub fn forbid_nodes_rev_with_projection(schema: &mut Schema) {
+    use crate::read::NodesParams;
+    forbid_rev_with_projection(
+        schema,
+        property!(NodesParams, rev),
+        property!(NodesParams, projection),
+    );
+}
+
+/// [`SearchParams`] read one tree: `rev` and `projection` never combine.
+pub fn forbid_search_rev_with_projection(schema: &mut Schema) {
+    forbid_rev_with_projection(
+        schema,
+        property!(SearchParams, rev),
+        property!(SearchParams, projection),
+    );
+}
+
 /// [`InsertSymbolParams`](crate::change::InsertSymbolParams) addresses exactly one
 /// target, and `create_missing` combines only with `file`.
 pub fn insert_symbol_addresses_one_target(schema: &mut Schema) {
@@ -655,7 +693,17 @@ mod tests {
     /// proves serde serves it under the same name, closing the rename gap.
     #[test]
     fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 6] = [
+        let cases: [(&str, Value, &[&str]); 8] = [
+            (
+                "GetSymbolParams",
+                serde_json::to_value(schema_for!(crate::read::GetSymbolParams)).expect("schema"),
+                &["rev", "projection"],
+            ),
+            (
+                "NodesParams",
+                serde_json::to_value(schema_for!(crate::read::NodesParams)).expect("schema"),
+                &["rev", "projection"],
+            ),
             (
                 "ExecutionConfiguration",
                 serde_json::to_value(schema_for!(crate::configuration::ExecutionConfiguration))
@@ -681,7 +729,7 @@ mod tests {
             (
                 "SearchParams",
                 serde_json::to_value(schema_for!(SearchParams)).expect("schema"),
-                &["query", "filter", "traversal", "target", "scope", "paths"],
+                &["query", "filter", "traversal", "target", "scope", "paths", "rev", "projection"],
             ),
             (
                 "RelationFilter",
@@ -700,6 +748,36 @@ mod tests {
                      would silently detach the rule from the model"
                 );
             }
+        }
+    }
+
+    /// Every read-params schema forbids naming `rev` and `projection`
+    /// together, in the exact clause shape the transform builds.
+    #[test]
+    fn read_params_schemas_forbid_rev_with_projection() {
+        let cases = [
+            (
+                "GetSymbolParams",
+                serde_json::to_value(schema_for!(crate::read::GetSymbolParams)).expect("schema"),
+            ),
+            (
+                "NodesParams",
+                serde_json::to_value(schema_for!(crate::read::NodesParams)).expect("schema"),
+            ),
+            (
+                "SearchParams",
+                serde_json::to_value(schema_for!(SearchParams)).expect("schema"),
+            ),
+        ];
+        let forbidden = json!({ "not": { "required": ["rev", "projection"] } });
+        for (model, schema) in cases {
+            let clauses = schema["allOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{model} schema must carry allOf clauses"));
+            assert!(
+                clauses.contains(&forbidden),
+                "{model} schema must forbid rev with projection: {clauses:?}"
+            );
         }
     }
 

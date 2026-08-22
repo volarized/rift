@@ -2470,6 +2470,7 @@ dependencies = [
  "diffy",
  "percent-encoding",
  "rift-core",
+ "rift-history",
  "rift-index",
  "rift-protocol",
  "rift-provider",
