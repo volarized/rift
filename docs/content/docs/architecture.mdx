@@ -32,7 +32,7 @@ files. [Hooks](/docs/configuration#hooks) extend this pipeline with configured t
 formatters, linters, and test runners, which check each change after it lands.
 
 <IsoDiagram
-  alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers analyze it, and their facts feed an embedded search index. Semantic providers delegate resolution to language engines — an embedded library, a language server, or a SCIP index — which read the projection directory and answer with facts and edit plans. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
+  alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers analyze it, and their facts feed an embedded search index. Semantic providers delegate resolution to language engines — an embedded library, a language server, or a SCIP index — which read the targeted tree and answer with facts and edit plans. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp"]:::rift
@@ -48,7 +48,7 @@ formatters, linters, and test runners, which check each change after it lands.
       providers -- "analyze" --> catalog
       providers -- "resolve" --> engines["language engines<br/>embedded, LSP, or SCIP"]:::provider
       engines -- "facts + edit plans" --> providers
-      engines -. "read" .-> projection
+      engines -. "read" .-> workspace
       providers -- "symbols + text" --> search["search index<br/>lexical + vectors"]:::store
       server -- "query + rank" --> search
       search -- "embeddings" --> localmodel["local embedding model<br/>ships with Rift"]:::model
@@ -468,15 +468,21 @@ resolution recomputes each witness as the plan applies, so a plan computed again
 have since moved refuses with a failed `source_unchanged` precondition — the same guard every
 direct write gets.
 
-The engine works against the projection directory, for the reason the directory exists at all: a
-language server and a batch indexer take a directory, like `cargo test` and the linter before
-them. A live language server reads the projection's bytes as the change tools write them, so its
-analysis tracks the plan as it lands. A batch indexer runs over the pinned snapshot, and pinning
-is what makes its output usable — the index describes one revision, and the projection still is
-that revision.
+A plan targets a tree the way every change does: the workspace by default, or a projection the
+call names. Projections stay the agent's decision — the server never creates one on the agent's
+behalf. A quick rename with a clean plan lands directly; a refactor worth reviewing whole runs in
+a projection the agent created for it.
+
+The engine works against the targeted tree's directory, because a language server and a batch
+indexer take a directory, like `cargo test` and the linter before them. A live language server
+reads the tree's bytes as the change tools write them, so its analysis tracks the plan as it
+lands. A batch indexer needs a tree that holds still: a projection is already pinned, and for the
+workspace target the server refreshes an internal copy under `.rift` the way the
+[execution copy](#execution) does — that copy feeds the indexer and is never a projection the
+agent has to manage.
 
 <IsoDiagram
-  alt="An agent asks the rift server for a rename. The server requests an edit plan from the language engine — a language server or a SCIP index — which reads the projection directory. The server compiles the plan into witnessed edits, applies them to the projection as one change, and publish carries the result into the workspace tree."
+  alt="An agent asks the rift server for a rename, here targeting a projection the agent created. The server requests an edit plan from the language engine — a language server or a SCIP index — which reads the projection directory. The server compiles the plan into witnessed edits, applies them to the projection as one change, and publish carries the result into the workspace tree. A workspace-targeted plan lands in the workspace tree directly."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "rename" --> server["rift server"]:::rift
@@ -491,8 +497,10 @@ that revision.
 An engine can miss sites — a name built at runtime, an occurrence in a doc comment or a template
 no resolver parses. After a plan applies, the server sweeps the projection for surviving
 occurrences of the replaced name, and each finding becomes an open warning
-[`Advisory`](/docs/protocol/reference#Advisory) on the change. In a projection an open warning
-mints a [`ConfirmationRequirement`](/docs/protocol/reference#ConfirmationRequirement), so
+[`Advisory`](/docs/protocol/reference#Advisory) on the change. On a workspace-targeted plan those
+warnings ride the result for the caller to act on, like any direct write's advisories. In a
+projection an open warning mints a
+[`ConfirmationRequirement`](/docs/protocol/reference#ConfirmationRequirement), so
 [`publish`](/docs/protocol/mcp#tool-publish) refuses the rename until someone has looked at what
 the engine left behind.
 
