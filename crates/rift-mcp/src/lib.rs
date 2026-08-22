@@ -4,7 +4,7 @@ pub mod schema;
 mod server;
 mod stdio;
 
-pub use server::RiftMcp;
+pub use server::{RiftMcp, RiftMcpOptions};
 pub use stdio::{StdioServeError, serve_stdio};
 
 /// Compile-time marker for MCP-layer ownership.
