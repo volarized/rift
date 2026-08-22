@@ -71,31 +71,34 @@ pub(crate) struct FileRewrite {
 /// as hunk-context drift, never a silent rewrite. Only structural lines
 /// shed a CRLF ending, because the diff parser rejects `\r` in headers.
 pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
-    let mut segments: Vec<String> = Vec::new();
-    let mut segment_line = 0_usize;
-    for line in patch.split_inclusive('\n') {
-        if line.starts_with(ORIGINAL_HEADER_PREFIX) {
-            if segments.len() == PATCH_FILES_MAX {
-                return Err(ReadFault::invalid(
-                    "patch",
-                    format!("addresses more than {PATCH_FILES_MAX} files"),
-                ));
-            }
-            segments.push(String::new());
-            segment_line = 0;
-        }
-        if let Some(segment) = segments.last_mut() {
-            let structural = segment_line == 0
-                || (segment_line == 1 && line.starts_with(MODIFIED_HEADER_PREFIX))
-                || line.starts_with(HUNK_HEADER_PREFIX);
-            push_segment_line(segment, line, structural);
-            segment_line += 1;
-        }
+    let (_, raw_segments) = split_at_marker(patch, |line| line.starts_with(ORIGINAL_HEADER_PREFIX));
+    if raw_segments.len() > PATCH_FILES_MAX {
+        return Err(ReadFault::invalid(
+            "patch",
+            format!("addresses more than {PATCH_FILES_MAX} files"),
+        ));
     }
-    if segments.is_empty() {
+    if raw_segments.is_empty() {
         return Err(ReadFault::invalid("patch", "carries no `---` file header"));
     }
-    Ok(segments)
+    Ok(raw_segments
+        .iter()
+        .map(|raw| normalize_segment(raw))
+        .collect())
+}
+
+/// Sheds each of `raw`'s structural line endings down to a bare `\n`,
+/// leaving body-line bytes untouched. See [`push_segment_line`] for which
+/// lines count as structural and why.
+fn normalize_segment(raw: &str) -> String {
+    let mut segment = String::new();
+    for (index, text) in raw.split_inclusive('\n').enumerate() {
+        let structural = index == 0
+            || (index == 1 && text.starts_with(MODIFIED_HEADER_PREFIX))
+            || text.starts_with(HUNK_HEADER_PREFIX);
+        push_segment_line(&mut segment, text, structural);
+    }
+    segment
 }
 
 /// Appends one diff line to its segment. A structural line — the `---` and
@@ -110,6 +113,24 @@ fn push_segment_line(segment: &mut String, line: &str, structural: bool) {
         }
         _ => segment.push_str(line),
     }
+}
+
+/// Scans `text` line by line, opening a new segment whenever
+/// `opens_segment` matches a line, and returns the bytes before the first
+/// match alongside each segment's own bytes.
+fn split_at_marker(text: &str, opens_segment: impl Fn(&str) -> bool) -> (String, Vec<String>) {
+    let mut prefix = String::new();
+    let mut segments: Vec<String> = Vec::new();
+    for text_line in text.split_inclusive('\n') {
+        if opens_segment(text_line) {
+            segments.push(String::new());
+        }
+        match segments.last_mut() {
+            Some(segment) => segment.push_str(text_line),
+            None => prefix.push_str(text_line),
+        }
+    }
+    (prefix, segments)
 }
 
 /// Resolves one file segment to its rewrite plan, or the refusal for a
@@ -163,18 +184,7 @@ fn named_parse_error(segment: &str, ordinal: usize, error: &ParsePatchError) -> 
 /// Splits one file segment into its shared header and each hunk's own
 /// text, so a hunk can be re-parsed against the header alone.
 fn split_into_hunks(segment: &str) -> (String, Vec<String>) {
-    let mut header = String::new();
-    let mut hunks: Vec<String> = Vec::new();
-    for line in segment.split_inclusive('\n') {
-        if line.starts_with(HUNK_HEADER_PREFIX) {
-            hunks.push(String::new());
-        }
-        match hunks.last_mut() {
-            Some(hunk) => hunk.push_str(line),
-            None => header.push_str(line),
-        }
-    }
-    (header, hunks)
+    split_at_marker(segment, |text| text.starts_with(HUNK_HEADER_PREFIX))
 }
 
 /// What one parsed file segment addresses.
@@ -355,12 +365,18 @@ fn apply_segment(starting: &str, parsed: &Patch<'_, str>) -> Result<String, Mism
         .collect();
     let mut delta: i64 = 0;
     for (index, hunk) in parsed.hunks().iter().enumerate() {
-        let pre_image = pre_image_lines(hunk);
-        let post_image = post_image_lines(hunk);
+        let pre_image = image_lines(hunk, HunkImage::Pre);
+        let post_image = image_lines(hunk, HunkImage::Post);
         let expected = zero_based_start(hunk.new_range());
         let anchor = clamp_anchor(expected, delta, image.len());
         let Some(found) = find_hunk_position(&image, &pre_image, anchor) else {
-            return Err(mismatch_detail(index + 1, hunk, anchor, &pre_image, &image));
+            return Err(MismatchDetail::new(
+                index + 1,
+                hunk,
+                anchor,
+                &pre_image,
+                &image,
+            ));
         };
         delta = i64::try_from(found).unwrap_or(0) - i64::try_from(expected).unwrap_or(0);
         let patched: Vec<ImageLine<'_>> =
@@ -434,22 +450,27 @@ fn matches_at(image: &[ImageLine<'_>], pre_image: &[&str], pos: usize) -> bool {
         .eq(pre_image.iter().copied())
 }
 
-fn pre_image_lines<'a>(hunk: &Hunk<'a, str>) -> Vec<&'a str> {
-    hunk.lines()
-        .iter()
-        .filter_map(|line| match line {
-            Line::Context(text) | Line::Delete(text) => Some(*text),
-            Line::Insert(_) => None,
-        })
-        .collect()
+/// Which half of a hunk's lines [`image_lines`] selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HunkImage {
+    /// The lines a hunk expects to find at its position: context and
+    /// deleted lines.
+    Pre,
+    /// The lines a hunk leaves behind after applying: context and
+    /// inserted lines.
+    Post,
 }
 
-fn post_image_lines<'a>(hunk: &Hunk<'a, str>) -> Vec<&'a str> {
+/// Selects one side of `hunk`'s lines: [`HunkImage::Pre`] keeps context
+/// and deleted lines (what the search must locate), [`HunkImage::Post`]
+/// keeps context and inserted lines (what replaces the located run).
+fn image_lines<'a>(hunk: &Hunk<'a, str>, image: HunkImage) -> Vec<&'a str> {
     hunk.lines()
         .iter()
-        .filter_map(|line| match line {
-            Line::Context(text) | Line::Insert(text) => Some(*text),
-            Line::Delete(_) => None,
+        .filter_map(|line| match (image, line) {
+            (HunkImage::Pre, Line::Context(text) | Line::Delete(text))
+            | (HunkImage::Post, Line::Context(text) | Line::Insert(text)) => Some(*text),
+            _ => None,
         })
         .collect()
 }
@@ -480,28 +501,31 @@ struct MismatchDetail {
     observed: String,
 }
 
-fn mismatch_detail(
-    ordinal: usize,
-    hunk: &Hunk<'_, str>,
-    anchor: usize,
-    pre_image: &[&str],
-    image: &[ImageLine<'_>],
-) -> MismatchDetail {
-    let expected = pre_image.first().copied().unwrap_or_default();
-    let observed = image.get(anchor).copied().map(ImageLine::text);
-    MismatchDetail {
-        ordinal,
-        header: hunk_header_text(hunk),
-        line: anchor + 1,
-        expected: without_line_ending(expected).to_owned(),
-        observed: observed.map_or_else(
-            || "end of file".to_owned(),
-            |text| without_line_ending(text).to_owned(),
-        ),
-    }
-}
-
 impl MismatchDetail {
+    /// Builds the detail for hunk `ordinal`'s failed search: the header it
+    /// carries, the position `anchor` it was tried at, what it expected to
+    /// find there, and what stood there instead.
+    fn new(
+        ordinal: usize,
+        hunk: &Hunk<'_, str>,
+        anchor: usize,
+        pre_image: &[&str],
+        image: &[ImageLine<'_>],
+    ) -> Self {
+        let expected = pre_image.first().copied().unwrap_or_default();
+        let observed = image.get(anchor).copied().map(ImageLine::text);
+        Self {
+            ordinal,
+            header: hunk_header_text(hunk),
+            line: anchor + 1,
+            expected: without_line_ending(expected).to_owned(),
+            observed: observed.map_or_else(
+                || "end of file".to_owned(),
+                |text| without_line_ending(text).to_owned(),
+            ),
+        }
+    }
+
     fn into_refusal(self, path: &CoreProjectPath) -> ChangeResult {
         ChangeResult::refused(
             RefusalReason::UnmetPrecondition,
