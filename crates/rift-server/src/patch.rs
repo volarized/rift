@@ -527,20 +527,15 @@ impl MismatchDetail {
     }
 
     fn into_refusal(self, path: &CoreProjectPath) -> ChangeResult {
-        ChangeResult::refused(
-            RefusalReason::UnmetPrecondition,
-            vec![OperationPrecondition::new(
-                OperationPreconditionKind::SourceUnchanged,
-                OperationPreconditionStatus::Failed,
-                Vec::new(),
-                vec![path.as_str().to_owned()],
-                PreconditionValue::Text {
-                    value: truncate_detail(self.side_text("expected", &self.expected)),
-                },
-                PreconditionValue::Text {
-                    value: truncate_detail(self.side_text("found", &self.observed)),
-                },
-            )],
+        precondition_refusal(
+            OperationPreconditionKind::SourceUnchanged,
+            path,
+            PreconditionValue::Text {
+                value: truncate_detail(self.side_text("expected", &self.expected)),
+            },
+            PreconditionValue::Text {
+                value: truncate_detail(self.side_text("found", &self.observed)),
+            },
         )
     }
 
@@ -563,68 +558,71 @@ fn truncate_detail(mut value: String) -> String {
     value
 }
 
-fn target_missing_refusal(path: &CoreProjectPath) -> ChangeResult {
+/// Builds an `UnmetPrecondition` refusal for `path`, naming `kind`'s
+/// expected and observed values. Every fixed-shape single-precondition
+/// refusal in this module routes through this constructor, so their
+/// differences stay only in `kind`, `expected`, and `observed`.
+fn precondition_refusal(
+    kind: OperationPreconditionKind,
+    path: &CoreProjectPath,
+    expected: PreconditionValue,
+    observed: PreconditionValue,
+) -> ChangeResult {
     ChangeResult::refused(
         RefusalReason::UnmetPrecondition,
         vec![OperationPrecondition::new(
-            OperationPreconditionKind::TargetExists,
+            kind,
             OperationPreconditionStatus::Failed,
             Vec::new(),
             vec![path.as_str().to_owned()],
-            PreconditionValue::Boolean { value: true },
-            PreconditionValue::Boolean { value: false },
+            expected,
+            observed,
         )],
+    )
+}
+
+fn target_missing_refusal(path: &CoreProjectPath) -> ChangeResult {
+    precondition_refusal(
+        OperationPreconditionKind::TargetExists,
+        path,
+        PreconditionValue::Boolean { value: true },
+        PreconditionValue::Boolean { value: false },
     )
 }
 
 fn already_exists_refusal(path: &CoreProjectPath) -> ChangeResult {
-    ChangeResult::refused(
-        RefusalReason::UnmetPrecondition,
-        vec![OperationPrecondition::new(
-            OperationPreconditionKind::TargetExists,
-            OperationPreconditionStatus::Failed,
-            Vec::new(),
-            vec![path.as_str().to_owned()],
-            PreconditionValue::Boolean { value: false },
-            PreconditionValue::Boolean { value: true },
-        )],
+    precondition_refusal(
+        OperationPreconditionKind::TargetExists,
+        path,
+        PreconditionValue::Boolean { value: false },
+        PreconditionValue::Boolean { value: true },
     )
 }
 
 fn source_drift_refusal(path: &CoreProjectPath, indexed: &str, disk: &str) -> ChangeResult {
-    ChangeResult::refused(
-        RefusalReason::UnmetPrecondition,
-        vec![OperationPrecondition::new(
-            OperationPreconditionKind::SourceUnchanged,
-            OperationPreconditionStatus::Failed,
-            Vec::new(),
-            vec![path.as_str().to_owned()],
-            PreconditionValue::Text {
-                value: digest_hex8(indexed),
-            },
-            PreconditionValue::Text {
-                value: digest_hex8(disk),
-            },
-        )],
+    precondition_refusal(
+        OperationPreconditionKind::SourceUnchanged,
+        path,
+        PreconditionValue::Text {
+            value: digest_hex8(indexed),
+        },
+        PreconditionValue::Text {
+            value: digest_hex8(disk),
+        },
     )
 }
 
 fn deletion_incomplete_refusal(path: &CoreProjectPath, remaining: &str) -> ChangeResult {
     let lines = remaining.split_inclusive('\n').count();
-    ChangeResult::refused(
-        RefusalReason::UnmetPrecondition,
-        vec![OperationPrecondition::new(
-            OperationPreconditionKind::SourceUnchanged,
-            OperationPreconditionStatus::Failed,
-            Vec::new(),
-            vec![path.as_str().to_owned()],
-            PreconditionValue::Text {
-                value: "file fully deleted".to_owned(),
-            },
-            PreconditionValue::Text {
-                value: truncate_detail(format!("{lines} line(s) remain after applying the hunks")),
-            },
-        )],
+    precondition_refusal(
+        OperationPreconditionKind::SourceUnchanged,
+        path,
+        PreconditionValue::Text {
+            value: "file fully deleted".to_owned(),
+        },
+        PreconditionValue::Text {
+            value: truncate_detail(format!("{lines} line(s) remain after applying the hunks")),
+        },
     )
 }
 
