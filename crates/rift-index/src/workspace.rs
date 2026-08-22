@@ -18,6 +18,7 @@ use rift_syntax::{
     SOURCE_FILE_EXTENSIONS,
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::glob::PathMatcher;
 
@@ -94,6 +95,11 @@ impl WorkspaceIndexLimits {
     /// Returns maximum directory depth an index reaches below the root.
     pub(crate) const fn directory_depth_max(self) -> usize {
         self.directory_depth_max
+    }
+
+    /// Returns maximum aggregate source bytes admitted per index.
+    pub(crate) const fn workspace_bytes_max(self) -> usize {
+        self.workspace_bytes_max
     }
 }
 
@@ -317,6 +323,43 @@ pub enum SymbolMatchRank {
     Substring,
 }
 
+/// Exact identity of visible workspace source paths and bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFingerprint([u8; 32]);
+
+/// Separates one path from its source bytes in workspace identity material.
+const FINGERPRINT_PATH_SEPARATOR: u8 = 0;
+/// Separates adjacent files in workspace identity material.
+const FINGERPRINT_FILE_SEPARATOR: u8 = 0xff;
+
+impl WorkspaceFingerprint {
+    /// Captures visible source paths and bytes without parsing syntax.
+    ///
+    /// Work is bounded by [`WorkspaceIndexLimits`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for discovery, read, encoding, or
+    /// configured-bound failures.
+    pub fn capture(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+    ) -> Result<Self, WorkspaceIndexError> {
+        let root = canonical_root(root)?;
+        let paths = discover(&root, limits, visibility)?;
+        fingerprint_paths(&root, &paths, limits)
+    }
+
+    fn from_files(files: &[IndexedFile]) -> Self {
+        let mut hasher = Sha256::new();
+        for file in files {
+            update_fingerprint(&mut hasher, file.path(), file.source().as_bytes());
+        }
+        Self(hasher.finalize().into())
+    }
+}
+
 /// Immutable current-workspace Rust read index.
 #[derive(Debug)]
 pub struct WorkspaceIndex {
@@ -324,6 +367,7 @@ pub struct WorkspaceIndex {
     files: Vec<IndexedFile>,
     composition: ProviderComposition,
     limits: WorkspaceIndexLimits,
+    fingerprint: WorkspaceFingerprint,
 }
 
 impl WorkspaceIndex {
@@ -353,11 +397,13 @@ impl WorkspaceIndex {
             let file = read_file(&root, &path, &parser, limits, &mut workspace_bytes)?;
             files.push(file);
         }
+        let fingerprint = WorkspaceFingerprint::from_files(&files);
         Ok(Self {
             root,
             files,
             composition,
             limits,
+            fingerprint,
         })
     }
 
@@ -370,11 +416,13 @@ impl WorkspaceIndex {
         composition: ProviderComposition,
         limits: WorkspaceIndexLimits,
     ) -> Self {
+        let fingerprint = WorkspaceFingerprint::from_files(&files);
         Self {
             root,
             files,
             composition,
             limits,
+            fingerprint,
         }
     }
 
@@ -394,6 +442,12 @@ impl WorkspaceIndex {
     #[must_use]
     pub const fn composition(&self) -> &ProviderComposition {
         &self.composition
+    }
+
+    /// Returns exact visible source identity captured by this index.
+    #[must_use]
+    pub const fn fingerprint(&self) -> &WorkspaceFingerprint {
+        &self.fingerprint
     }
 
     /// Returns the maximum result count accepted per query against this index.
@@ -665,6 +719,50 @@ fn discover(
     }
     files.sort();
     Ok(files)
+}
+
+/// Hashes one already-discovered source set without parsing its syntax.
+fn fingerprint_paths(
+    root: &Path,
+    paths: &[PathBuf],
+    limits: WorkspaceIndexLimits,
+) -> Result<WorkspaceFingerprint, WorkspaceIndexError> {
+    let mut hasher = Sha256::new();
+    let mut workspace_bytes = 0_usize;
+    for path in paths {
+        let bytes = fs::read(path).map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        })?;
+        if bytes.len() > limits.file_bytes_max() {
+            return Err(index_error_at(WorkspaceIndexViolation::FileTooLarge, path));
+        }
+        workspace_bytes = workspace_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, path))?;
+        if workspace_bytes > limits.workspace_bytes_max() {
+            return Err(index_error_at(
+                WorkspaceIndexViolation::WorkspaceTooLarge,
+                path,
+            ));
+        }
+        let relative = path.strip_prefix(root).map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
+        })?;
+        let project_path = relative_path(relative)?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::InvalidSource, Some(path), error)
+        })?;
+        update_fingerprint(&mut hasher, &project_path, source.as_bytes());
+    }
+    Ok(WorkspaceFingerprint(hasher.finalize().into()))
+}
+
+/// Adds one unambiguous project-path/source pair to workspace identity.
+fn update_fingerprint(hasher: &mut Sha256, path: &ProjectPath, source: &[u8]) {
+    hasher.update(path.as_str().as_bytes());
+    hasher.update([FINGERPRINT_PATH_SEPARATOR]);
+    hasher.update(source);
+    hasher.update([FINGERPRINT_FILE_SEPARATOR]);
 }
 
 /// Whether a workspace walk also consults the workspace's own `.gitignore` chain, on top of the

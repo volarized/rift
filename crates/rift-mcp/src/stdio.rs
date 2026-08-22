@@ -83,19 +83,27 @@ pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
         .await
         .map_err(StdioServeError::Read)?;
-    let service = server
-        .serve(transport::stdio())
-        .await
-        .map_err(|error| StdioServeError::Initialize(Box::new(error)))?;
+    let supervisor = server.index_supervisor();
+    let service = match server.serve(transport::stdio()).await {
+        Ok(service) => service,
+        Err(error) => {
+            let _ = supervisor.shutdown().await;
+            return Err(StdioServeError::Initialize(Box::new(error)));
+        }
+    };
     tracing::info!(component = "mcp", transport = "stdio", "MCP server ready");
-    let reason = service.waiting().await.map_err(StdioServeError::Task)?;
-    let outcome = quit_reason_result(reason);
+    let reason = service.waiting().await;
+    let index_outcome = supervisor.shutdown().await.map_err(StdioServeError::Read);
+    let outcome = reason
+        .map_err(StdioServeError::Task)
+        .and_then(quit_reason_result);
     tracing::info!(
         component = "mcp",
         transport = "stdio",
         outcome = if outcome.is_ok() { "ok" } else { "error" },
         "MCP server stopped"
     );
+    index_outcome?;
     outcome
 }
 

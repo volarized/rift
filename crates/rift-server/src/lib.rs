@@ -8,7 +8,9 @@ mod read;
 mod search;
 
 pub use change::ChangeService;
-pub use configuration::{ConfigurationError, ConfigurationFault, load_configuration};
+pub use configuration::{
+    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault, load_configuration,
+};
 pub use hook::{CapturedStream, HookRun, HookStatus, run_hooks};
 pub use read::{ReadError, ReadFault, ReadService};
 

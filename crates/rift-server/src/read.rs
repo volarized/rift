@@ -8,7 +8,8 @@ use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    IndexedFile, SymbolMatch, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
+    IndexedFile, SymbolMatch, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
+    WorkspaceIndexLimits,
 };
 use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
@@ -65,6 +66,13 @@ pub enum ReadFault {
         /// Runtime failure account.
         detail: String,
     },
+    /// Current workspace index cannot become coherent within its deadline.
+    Unavailable {
+        /// Operation waiting for coherent state.
+        operation: &'static str,
+        /// Bounded failure account.
+        detail: String,
+    },
 }
 
 impl Fault for ReadFault {
@@ -77,6 +85,7 @@ impl Fault for ReadFault {
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
             Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
             Self::Task { .. } => ErrorName::Wire(ErrorCode::InternalError),
+            Self::Unavailable { .. } => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
         }
     }
 
@@ -101,7 +110,7 @@ impl Fault for ReadFault {
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("io", io.clone()),
             ],
-            Self::Task { operation, detail } => vec![
+            Self::Task { operation, detail } | Self::Unavailable { operation, detail } => vec![
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("detail", detail.clone()),
             ],
@@ -116,7 +125,8 @@ impl Fault for ReadFault {
             | Self::Invalid { .. }
             | Self::NotFound { .. }
             | Self::Storage { .. }
-            | Self::Task { .. } => None,
+            | Self::Task { .. }
+            | Self::Unavailable { .. } => None,
         }
     }
 }
@@ -160,6 +170,14 @@ impl ReadFault {
     /// Classifies a Tokio blocking-executor failure.
     pub fn task(operation: &'static str, detail: impl Into<String>) -> ReadError {
         Error::new(Self::Task {
+            operation,
+            detail: detail.into(),
+        })
+    }
+
+    /// Classifies coherence work that cannot finish within its deadline.
+    pub fn unavailable(operation: &'static str, detail: impl Into<String>) -> ReadError {
+        Error::new(Self::Unavailable {
             operation,
             detail: detail.into(),
         })
@@ -261,6 +279,12 @@ impl ReadService {
     /// current tree.
     pub(crate) const fn revision(&self) -> Option<&RevisionId> {
         self.revision.as_ref()
+    }
+
+    /// Returns exact visible source identity captured by this service.
+    #[must_use]
+    pub const fn workspace_fingerprint(&self) -> &WorkspaceFingerprint {
+        self.index.fingerprint()
     }
 
     /// Reads Rust syntax nodes covering one UTF-8 byte position. The tree
