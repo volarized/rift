@@ -58,6 +58,20 @@ pub enum ReadFault {
         /// The rendered I/O failure.
         io: String,
     },
+    /// Tokio could not run or join one bounded blocking operation.
+    Task {
+        /// Operation submitted to the blocking executor.
+        operation: &'static str,
+        /// Runtime failure account.
+        detail: String,
+    },
+    /// A blocking operation waited past its configured queue bound.
+    CapacityTimeout {
+        /// Operation waiting for blocking capacity.
+        operation: &'static str,
+        /// Configured queue wait bound in milliseconds.
+        timeout_ms: u64,
+    },
 }
 
 impl Fault for ReadFault {
@@ -69,6 +83,8 @@ impl Fault for ReadFault {
             Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
             Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
+            Self::Task { .. } => ErrorName::Wire(ErrorCode::InternalError),
+            Self::CapacityTimeout { .. } => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
         }
     }
 
@@ -93,6 +109,17 @@ impl Fault for ReadFault {
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("io", io.clone()),
             ],
+            Self::Task { operation, detail } => vec![
+                ErrorContext::new("operation", *operation),
+                ErrorContext::new("detail", detail.clone()),
+            ],
+            Self::CapacityTimeout {
+                operation,
+                timeout_ms,
+            } => vec![
+                ErrorContext::new("operation", *operation),
+                ErrorContext::new("timeout_ms", timeout_ms.to_string()),
+            ],
         }
     }
 
@@ -103,7 +130,9 @@ impl Fault for ReadFault {
             Self::Unsupported { .. }
             | Self::Invalid { .. }
             | Self::NotFound { .. }
-            | Self::Storage { .. } => None,
+            | Self::Storage { .. }
+            | Self::Task { .. }
+            | Self::CapacityTimeout { .. } => None,
         }
     }
 }
@@ -142,6 +171,23 @@ impl ReadFault {
 
     pub(crate) fn history(source: HistoryError) -> ReadError {
         Error::new(Self::History(source))
+    }
+
+    /// Classifies a Tokio blocking-executor failure.
+    pub fn task(operation: &'static str, detail: impl Into<String>) -> ReadError {
+        Error::new(Self::Task {
+            operation,
+            detail: detail.into(),
+        })
+    }
+
+    /// Classifies exhausted wait for bounded blocking capacity.
+    #[must_use]
+    pub fn capacity_timeout(operation: &'static str, timeout_ms: u64) -> ReadError {
+        Error::new(Self::CapacityTimeout {
+            operation,
+            timeout_ms,
+        })
     }
 }
 
@@ -1026,6 +1072,17 @@ pub fn compute() -> i32 {
         assert_eq!(keys, ["path", "operation", "io"]);
         assert_eq!(context[0].value(), "src/lib.rs");
         assert_eq!(context[2].value(), "sealed");
+    }
+
+    #[test]
+    fn task_fault_is_internal_and_names_the_blocking_operation() {
+        let error = ReadFault::task("initial index build", "worker panicked");
+        assert_eq!(error.descriptor().code(), "internal_error");
+        let context = error.context();
+        assert_eq!(context[0].key(), "operation");
+        assert_eq!(context[0].value(), "initial index build");
+        assert_eq!(context[1].key(), "detail");
+        assert_eq!(context[1].value(), "worker panicked");
     }
 
     #[test]

@@ -69,9 +69,15 @@ impl StdioServeError {
 /// # Errors
 ///
 /// Returns [`StdioServeError`] for indexing, initialization, or service-task failure.
+///
+/// # Cancel safety
+///
+/// Dropping this future closes its owned MCP service. An admitted initial
+/// index scan still finishes in the bounded blocking executor.
 pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
-    let server =
-        RiftMcp::build(root, WorkspaceIndexLimits::default()).map_err(StdioServeError::Read)?;
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+        .await
+        .map_err(StdioServeError::Read)?;
     let service = server
         .serve(transport::stdio())
         .await
@@ -108,11 +114,12 @@ mod tests {
         assert!(error.source().is_none());
     }
 
-    #[test]
-    fn workspace_read_error_preserves_source() {
+    #[tokio::test]
+    async fn workspace_read_error_preserves_source() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let missing = directory.path().join("missing");
         let read = RiftMcp::build(&missing, WorkspaceIndexLimits::default())
+            .await
             .expect_err("missing workspace must fail");
         let expected = read.descriptor();
         let error = StdioServeError::Read(read);

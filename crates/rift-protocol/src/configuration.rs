@@ -13,6 +13,10 @@ use crate::source::SourceConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
+/// Blocking operations the server may run at once, at most.
+pub const SERVER_BLOCKING_SLOTS_MAX: u64 = 64;
+/// Milliseconds one request may wait for a blocking slot, at most: one hour.
+pub const SERVER_QUEUE_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
 /// Milliseconds one evaluation may run, at most: one day.
@@ -293,6 +297,8 @@ fn split_magnitude<'text>(
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceConfiguration {
+    /// The server's own blocking-work bounds: pool size and queue wait.
+    pub server: ServerConfiguration,
     /// Bounds and switches for the built-in providers.
     pub providers: ProvidersConfiguration,
     /// Enablement and limits for caller-provided code.
@@ -323,12 +329,57 @@ impl WorkspaceConfiguration {
 
     /// The first violated bound, in the order the file declares its tables.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        self.execution
+        self.server
             .violation()
+            .or_else(|| self.execution.violation())
             .or_else(|| self.providers.history.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
             .or_else(|| hooks_violation(&self.hooks))
+    }
+}
+
+/// The `[server]` table. Filesystem scans and parses run on a bounded
+/// blocking pool; this table sizes the pool and bounds the queue wait.
+/// The server reads the table at startup, so a change applies on the
+/// next start.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_server_ranges)]
+pub struct ServerConfiguration {
+    /// Blocking filesystem and parser operations running at once, 1 to 64.
+    #[schemars(range(min = 1, max = 64))]
+    pub blocking_slots: u64,
+    /// Wall-clock bound one request waits for a blocking slot, 1ms to 1h.
+    pub blocking_queue_timeout: Duration,
+}
+
+impl Default for ServerConfiguration {
+    fn default() -> Self {
+        Self {
+            blocking_slots: 4,
+            blocking_queue_timeout: Duration::from_millis(30_000),
+        }
+    }
+}
+
+impl ServerConfiguration {
+    /// The table's bounds in key order.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([
+            (
+                "server.blocking_slots",
+                self.blocking_slots,
+                1,
+                SERVER_BLOCKING_SLOTS_MAX,
+            ),
+            (
+                "server.blocking_queue_timeout",
+                self.blocking_queue_timeout.milliseconds(),
+                1,
+                SERVER_QUEUE_TIMEOUT_MS_MAX,
+            ),
+        ])
     }
 }
 
@@ -1156,6 +1207,49 @@ mod tests {
     }
 
     #[test]
+    fn test_server_defaults_state_four_slots_and_thirty_seconds() {
+        let table = ServerConfiguration::default();
+        assert_eq!(table.blocking_slots, 4);
+        assert_eq!(table.blocking_queue_timeout, Duration::from_millis(30_000));
+        assert_eq!(WorkspaceConfiguration::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_server_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for slots in [0, SERVER_BLOCKING_SLOTS_MAX + 1] {
+            configuration.server.blocking_slots = slots;
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "server.blocking_slots",
+                        ..
+                    })
+                ),
+                "blocking_slots {slots} must be refused"
+            );
+        }
+        configuration.server.blocking_slots = SERVER_BLOCKING_SLOTS_MAX;
+        for timeout_ms in [0, SERVER_QUEUE_TIMEOUT_MS_MAX + 1] {
+            configuration.server.blocking_queue_timeout = Duration::from_millis(timeout_ms);
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "server.blocking_queue_timeout",
+                        ..
+                    })
+                ),
+                "blocking_queue_timeout {timeout_ms}ms must be refused"
+            );
+        }
+        configuration.server.blocking_queue_timeout =
+            Duration::from_millis(SERVER_QUEUE_TIMEOUT_MS_MAX);
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
     fn test_history_depth_bound_is_enforced() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.providers.history.max_revisions = 0;
@@ -1491,17 +1585,26 @@ mod tests {
     /// Attribute arguments take only literals, so the schema attributes
     /// restate the bound constants; this pins each advertised bound to the
     /// constant `validate` enforces.
+    /// Asserts each advertised schema bound equals its enforced constant.
+    fn assert_schema_bounds(cases: &[(&str, &serde_json::Value, serde_json::Value)]) {
+        for (name, advertised, enforced) in cases {
+            assert_eq!(
+                *advertised, enforced,
+                "the schema's {name} bound must equal the enforced constant"
+            );
+        }
+    }
+
     #[test]
-    fn test_schema_attribute_bounds_equal_the_enforced_constants() {
+    fn test_table_schema_bounds_equal_the_enforced_constants() {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let definitions = &schema["$defs"];
+        let server = &definitions["ServerConfiguration"]["properties"];
         let execution = &definitions["ExecutionConfiguration"]["properties"];
         let history = &definitions["HistoryConfiguration"]["properties"];
         let search = &definitions["SearchConfiguration"]["properties"];
         let source = &definitions["SourceConfiguration"]["properties"];
-        let hook = &definitions["CommandHook"]["properties"];
-        let guarantee = &definitions["HookGuarantee"]["properties"];
         let cases = [
             (
                 "hooks max",
@@ -1512,6 +1615,16 @@ mod tests {
                 "allow max",
                 &execution["allow"]["maxItems"],
                 json!(EXECUTION_ALLOW_ITEMS_MAX),
+            ),
+            (
+                "blocking slots min",
+                &server["blocking_slots"]["minimum"],
+                json!(1),
+            ),
+            (
+                "blocking slots max",
+                &server["blocking_slots"]["maximum"],
+                json!(SERVER_BLOCKING_SLOTS_MAX),
             ),
             (
                 "concurrent min",
@@ -1549,6 +1662,18 @@ mod tests {
                 &source["exclude"]["maxItems"],
                 json!(SOURCE_PATTERNS_MAX),
             ),
+        ];
+        assert_schema_bounds(&cases);
+    }
+
+    #[test]
+    fn test_hook_schema_bounds_equal_the_enforced_constants() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let definitions = &schema["$defs"];
+        let hook = &definitions["CommandHook"]["properties"];
+        let guarantee = &definitions["HookGuarantee"]["properties"];
+        let cases = [
             ("id min", &hook["id"]["minLength"], json!(1)),
             ("id max", &hook["id"]["maxLength"], json!(HOOK_ID_BYTES_MAX)),
             ("program min", &hook["program"]["minLength"], json!(1)),
@@ -1585,11 +1710,6 @@ mod tests {
                 json!(HOOK_GUARANTEE_DETAIL_BYTES_MAX),
             ),
         ];
-        for (name, advertised, enforced) in cases {
-            assert_eq!(
-                advertised, &enforced,
-                "the schema's {name} bound must equal the enforced constant"
-            );
-        }
+        assert_schema_bounds(&cases);
     }
 }

@@ -134,6 +134,10 @@ impl ChangeService {
         if params.region.is_some() {
             return Err(ReadFault::unsupported("region-scoped replacement"));
         }
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (path, qualified_name) = parse_symbol_address(&params.symbol.0)?;
         let resolution =
             self.resolve_symbol_spans(reads, &path, &qualified_name, |range| ChangePlan {
@@ -158,6 +162,10 @@ impl ChangeService {
         reads: &ReadService,
         params: &InsertSymbolParams,
     ) -> Result<ChangeResult, ReadError> {
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match insert_target(params)? {
             InsertTarget::BesideAnchor(anchor) => {
                 self.insert_beside_anchor(reads, anchor, params.position, &params.body)
@@ -260,6 +268,10 @@ impl ChangeService {
         if params.region.is_some() {
             return Err(ReadFault::unsupported("region-scoped replacement"));
         }
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let address: NodeAddress = params.node.0.parse()?;
         let Some(file) = reads.index().file(&address.path) else {
             return Ok(ChangeResult::refused(
@@ -324,6 +336,10 @@ impl ChangeService {
         reads: &ReadService,
         params: &PatchParams,
     ) -> Result<ChangeResult, ReadError> {
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let segments = patch::split_file_segments(&params.patch)?;
         let mut rewrites: Vec<FileRewrite> = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
@@ -367,10 +383,6 @@ impl ChangeService {
         reads: &ReadService,
         rewrites: &[FileRewrite],
     ) -> Result<ChangeResult, ReadError> {
-        let guard = self
-            .application
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut staged: Vec<Option<PathBuf>> = Vec::with_capacity(rewrites.len());
         for rewrite in rewrites {
             if rewrite.kind == RewriteKind::Delete {
@@ -414,8 +426,6 @@ impl ChangeService {
             }
             published.push(rewrite);
         }
-        drop(guard);
-
         let mut identity = Sha256::new();
         let mut paths = Vec::with_capacity(rewrites.len());
         let mut edits = Vec::with_capacity(rewrites.len());
@@ -585,14 +595,9 @@ impl ChangeService {
 
     /// Writes one plan atomically and reports what landed.
     ///
-    /// The application lock serializes writers; the plan's source was proven
-    /// against disk during resolution, and the lock holds that proof until
-    /// the rename lands.
+    /// The public operation holds the application lock from resolution
+    /// through this rename, so the disk proof cannot race another Rift write.
     fn apply(&self, reads: &ReadService, plan: ChangePlan) -> Result<ChangeResult, ReadError> {
-        let guard = self
-            .application
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(file) = reads.index().file(&plan.path) else {
             return Err(ReadFault::not_found(plan.path.as_str()));
         };
@@ -622,8 +627,6 @@ impl ChangeService {
             let _ = fs::remove_file(&staged);
             return Err(ReadFault::storage(plan.path.as_str(), "publish", &error));
         }
-        drop(guard);
-
         let unit = file_id(file);
         let edit = Edit::Replace {
             span: SourceSpan {
@@ -797,6 +800,7 @@ fn change_diagnostic(
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::sync::{Arc, Barrier};
 
     use rift_core::SourceVisibility;
     use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
@@ -894,6 +898,61 @@ mod tests {
         assert_eq!(
             untouched, "pub fn beacon() { }\n",
             "refusal leaves the tree untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_replacements_cannot_both_publish_from_one_snapshot() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let barrier = Arc::new(Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let first_barrier = Arc::clone(&barrier);
+            let first_changes = &changes;
+            let first_reads = &reads;
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                first_changes.replace_symbol(
+                    first_reads,
+                    &ReplaceSymbolParams {
+                        symbol: symbol("beacon"),
+                        region: None,
+                        body: "pub fn beacon() -> u8 { 1 }".to_owned(),
+                    },
+                )
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                changes.replace_symbol(
+                    &reads,
+                    &ReplaceSymbolParams {
+                        symbol: symbol("beacon"),
+                        region: None,
+                        body: "pub fn beacon() -> u8 { 2 }".to_owned(),
+                    },
+                )
+            });
+            [
+                first.join().expect("first change task must not panic"),
+                second.join().expect("second change task must not panic"),
+            ]
+        });
+        let [first, second] = results;
+        let results = [first?, second?];
+        let applied_count = results
+            .iter()
+            .filter(|result| matches!(result, ChangeResult::Applied { .. }))
+            .count();
+        let refused_count = results
+            .iter()
+            .filter(|result| matches!(result, ChangeResult::Refused { .. }))
+            .count();
+        assert_eq!(applied_count, 1, "one replacement must publish");
+        assert_eq!(refused_count, 1, "stale replacement must refuse");
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert!(
+            written.contains("-> u8 { 1 }") || written.contains("-> u8 { 2 }"),
+            "published file must contain one complete replacement: {written}"
         );
         Ok(())
     }

@@ -179,6 +179,10 @@ mod tests {
     fn mcp_command_accepts_no_extra_arguments() {
         let parsed = Cli::try_parse_from(["rift", "mcp"]).expect("mcp must parse");
         assert!(matches!(parsed.command, Some(CliCommand::Mcp)));
+        assert!(
+            Cli::try_parse_from(["rift", "mcp", "--blocking-queue-timeout-ms", "1250"]).is_err(),
+            "blocking bounds live in rift.toml's [server] table, not CLI flags"
+        );
         assert!(Cli::try_parse_from(["rift", "mcp", "--root", "."]).is_err());
     }
 
