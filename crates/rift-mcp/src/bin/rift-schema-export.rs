@@ -1,11 +1,11 @@
 //! Writes the served MCP tool surface and the `rift.toml` schema to disk.
 //!
 //! `rift-schema-export [--check] [OUTPUT_DIR]` renders
-//! [`rift_mcp::schema::schema_document`] into `OUTPUT_DIR/mcp.json` and
+//! [`rift_mcp::schema::schema_document`] into `OUTPUT_DIR/public/mcp.json` and
 //! [`rift_mcp::schema::configuration_schema_document`] into
-//! `OUTPUT_DIR/rift.schema.json` (default `docs/protocol`). With `--check`
-//! it compares instead of writing, so CI can prove the committed documents
-//! match what the server derives.
+//! `OUTPUT_DIR/public/rift.schema.json` (default `OUTPUT_DIR` is `docs`). With
+//! `--check` it compares instead of writing, so CI can prove the committed
+//! documents match what the server derives.
 
 use std::env;
 use std::process::ExitCode;

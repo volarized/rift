@@ -28,8 +28,10 @@ const DOCUMENT_DESCRIPTION: &str =
 /// carries its own path below it.
 const OUTPUT_DIR_DEFAULT: &str = "docs";
 
-/// Path of the exported tool-surface document below the output directory.
-const SCHEMA_DOCUMENT_PATH: &str = "protocol/mcp.json";
+/// Path of the exported tool-surface document below the output directory. It
+/// lands in the docs site's static files, so readers fetch it from the
+/// site's own origin rather than the repository host.
+const SCHEMA_DOCUMENT_PATH: &str = "public/mcp.json";
 
 /// Path of the exported `rift.toml` schema below the output directory. It
 /// lands in the docs site's static files, so readers fetch it from the

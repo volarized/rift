@@ -12,9 +12,9 @@
       "!**/.source",
       "!**/.next",
       "!**/bun.lock",
-      "!protocol",
       "!public/schemas",
-      "!public/rift.schema.json"
+      "!public/rift.schema.json",
+      "!public/mcp.json"
     ]
   },
   "formatter": {
