@@ -7,7 +7,7 @@ use rift_server::ReadError;
 use rmcp::service::{QuitReason, ServerInitializeError};
 use rmcp::{ServiceExt as _, transport};
 
-use crate::{RiftMcp, RiftMcpOptions};
+use crate::RiftMcp;
 
 /// Failure while starting or running stdio MCP transport.
 #[derive(Debug)]
@@ -74,8 +74,8 @@ impl StdioServeError {
 ///
 /// Dropping this future closes its owned MCP service. An admitted initial
 /// index scan still finishes in the bounded blocking executor.
-pub async fn serve_stdio(root: &Path, options: RiftMcpOptions) -> Result<(), StdioServeError> {
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default(), options)
+pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
         .await
         .map_err(StdioServeError::Read)?;
     let service = server
@@ -105,7 +105,7 @@ mod tests {
     use rmcp::service::{QuitReason, ServerInitializeError};
 
     use super::{StdioServeError, quit_reason_result};
-    use crate::{RiftMcp, RiftMcpOptions};
+    use crate::RiftMcp;
 
     #[test]
     fn unexpected_quit_has_stable_message_without_source() {
@@ -118,13 +118,9 @@ mod tests {
     async fn workspace_read_error_preserves_source() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let missing = directory.path().join("missing");
-        let read = RiftMcp::build(
-            &missing,
-            WorkspaceIndexLimits::default(),
-            RiftMcpOptions::default(),
-        )
-        .await
-        .expect_err("missing workspace must fail");
+        let read = RiftMcp::build(&missing, WorkspaceIndexLimits::default())
+            .await
+            .expect_err("missing workspace must fail");
         let expected = read.descriptor();
         let error = StdioServeError::Read(read);
         assert_eq!(error.to_string(), "workspace read service failed");

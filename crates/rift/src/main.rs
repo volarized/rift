@@ -2,7 +2,6 @@
 
 mod update;
 use std::fmt;
-use std::num::NonZeroU64;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -20,11 +19,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum CliCommand {
     /// Serve Rust workspace reads and edits over stdio MCP.
-    Mcp {
-        /// Maximum milliseconds one operation waits for blocking capacity.
-        #[arg(long, default_value = "30000")]
-        blocking_queue_timeout_ms: NonZeroU64,
-    },
+    Mcp,
     /// Replace current Rift binary with latest official release.
     Update,
     /// Delete the backup binary left behind by a Windows self-update.
@@ -98,12 +93,8 @@ impl std::error::Error for CliError {
 async fn run(cli: Cli) -> Result<Option<update::UpdateOutcome>, CliError> {
     match cli.command {
         None => Ok(None),
-        Some(CliCommand::Mcp {
-            blocking_queue_timeout_ms,
-        }) => {
-            let options = rift_mcp::RiftMcpOptions::default()
-                .with_blocking_queue_timeout_ms(blocking_queue_timeout_ms);
-            rift_mcp::serve_stdio(Path::new("."), options)
+        Some(CliCommand::Mcp) => {
+            rift_mcp::serve_stdio(Path::new("."))
                 .await
                 .map_err(CliError::Mcp)?;
             Ok(None)
@@ -185,24 +176,13 @@ mod tests {
     }
 
     #[test]
-    fn mcp_command_configures_bounded_queue_wait() {
+    fn mcp_command_accepts_no_extra_arguments() {
         let parsed = Cli::try_parse_from(["rift", "mcp"]).expect("mcp must parse");
-        assert!(matches!(
-            parsed.command,
-            Some(CliCommand::Mcp {
-                blocking_queue_timeout_ms,
-            }) if blocking_queue_timeout_ms.get() == 30_000
-        ));
-        let configured =
-            Cli::try_parse_from(["rift", "mcp", "--blocking-queue-timeout-ms", "1250"])
-                .expect("mcp queue timeout must parse");
-        assert!(matches!(
-            configured.command,
-            Some(CliCommand::Mcp {
-                blocking_queue_timeout_ms,
-            }) if blocking_queue_timeout_ms.get() == 1_250
-        ));
-        assert!(Cli::try_parse_from(["rift", "mcp", "--blocking-queue-timeout-ms", "0"]).is_err());
+        assert!(matches!(parsed.command, Some(CliCommand::Mcp)));
+        assert!(
+            Cli::try_parse_from(["rift", "mcp", "--blocking-queue-timeout-ms", "1250"]).is_err(),
+            "blocking bounds live in rift.toml's [server] table, not CLI flags"
+        );
         assert!(Cli::try_parse_from(["rift", "mcp", "--root", "."]).is_err());
     }
 
