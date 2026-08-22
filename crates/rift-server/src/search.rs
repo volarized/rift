@@ -338,6 +338,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -382,6 +383,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -407,6 +409,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -439,6 +442,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &visibility,
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -1007,6 +1011,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "extra",

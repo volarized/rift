@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use rift_core::SourceVisibility;
+use rift_core::{SourceVisibility, TextFileAdmission};
 use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
@@ -386,11 +386,13 @@ impl RiftMcp {
             let root = self.root.clone();
             let limits = self.limits;
             let visibility = current.configuration.source_visibility();
+            let text_admission = current.configuration.text_admission();
             let capture = self
                 .blocking
                 .run("workspace fingerprint", move || {
-                    let fingerprint = WorkspaceFingerprint::capture(&root, limits, &visibility)
-                        .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+                    let fingerprint =
+                        WorkspaceFingerprint::capture(&root, limits, &visibility, &text_admission)
+                            .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
                     Ok((fingerprint, configuration_fingerprint(&root)))
                 })
                 .instrument(tracing::debug_span!(
@@ -536,18 +538,23 @@ impl RiftMcp {
             };
             Self::attach_hook_verdicts(root, &configuration.hooks, summary);
             let visibility = SourceVisibility::from(&configuration.source);
-            match ReadService::build(root, limits, &visibility) {
+            let text_admission = TextFileAdmission::from(&configuration.search);
+            match ReadService::build(root, limits, &visibility, &text_admission) {
                 Ok(rebuilt) => {
                     let fingerprint = rebuilt.workspace_fingerprint().clone();
-                    let source_policy =
-                        match WorkspaceSourcePolicy::build(root, limits, &visibility) {
-                            Ok(policy) => Arc::new(policy),
-                            Err(error) => {
-                                let error = ReadError::from(ReadFault::Index(error));
-                                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                                return Ok(Ok(Json(result)));
-                            }
-                        };
+                    let source_policy = match WorkspaceSourcePolicy::build(
+                        root,
+                        limits,
+                        &visibility,
+                        &text_admission,
+                    ) {
+                        Ok(policy) => Arc::new(policy),
+                        Err(error) => {
+                            let error = ReadError::from(ReadFault::Index(error));
+                            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                            return Ok(Ok(Json(result)));
+                        }
+                    };
                     if current.configuration.fingerprint != configuration_fingerprint(root) {
                         let error = ReadFault::unavailable(
                             "workspace change",

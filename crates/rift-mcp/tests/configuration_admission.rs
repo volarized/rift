@@ -49,6 +49,20 @@ guarantees = []
 determinism = "deterministic"
 "#;
 
+/// A `[search.text]` block whose `max_chunk` breaks its documented 1kb..16mb bound.
+const INVALID_TEXT_CONFIGURATION: &str = r#"
+[search.text]
+extensions = ["md", "mdx", "txt"]
+max_chunk = "1b"
+"#;
+
+/// A `[search.text]` block with a custom, in-bound extension list and chunk bound.
+const VALID_TEXT_CONFIGURATION: &str = r#"
+[search.text]
+extensions = ["md", "rst"]
+max_chunk = "2mb"
+"#;
+
 fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
@@ -165,6 +179,45 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
     fs::write(directory.path().join("rift.toml"), INVALID_CONFIGURATION)?;
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
     assert_eq!(refused["code"], json!("configuration_invalid"));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_search_text_configuration_fails_reads_typed() -> TestResult {
+    let directory = workspace_with(Some(INVALID_TEXT_CONFIGURATION))?;
+    let client = client_for(directory.path()).await?;
+
+    let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
+    assert_eq!(read["code"], json!("configuration_invalid"));
+    assert_eq!(read["retry"], json!("operator_action"));
+    let message = read["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("search.text.max_chunk"),
+        "the refusal must name the out-of-range field: {message}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn valid_search_text_configuration_serves_normally() -> TestResult {
+    let directory = workspace_with(Some(VALID_TEXT_CONFIGURATION))?;
+    fs::write(directory.path().join("guide.md"), "guide body")?;
+    let client = client_for(directory.path()).await?;
+
+    let served = client
+        .call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+        )
+        .await?;
+    assert_eq!(
+        served.structured_content.ok_or("structured content")?["hits"][0]["symbol"]["name"],
+        json!("beacon")
+    );
 
     client.cancel().await?;
     Ok(())
