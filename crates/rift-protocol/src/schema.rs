@@ -353,6 +353,36 @@ pub fn declare_text_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`CommandHook`](crate::configuration::CommandHook) states its `Duration`
+/// and `ByteSize` ceilings as `rift:range` on their keys: schema validation
+/// alone cannot compare `"120s"` or `"4kb"` against a ceiling, so the server
+/// enforces the bound at load and the schema carries it for readers.
+pub fn declare_hook_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ByteSize, CommandHook, Duration, HOOK_OUTPUT_BYTES_MAX, HOOK_OUTPUT_BYTES_MIN,
+        HOOK_TIMEOUT_MS_MAX,
+    };
+    let ranges = [
+        (
+            property!(CommandHook, timeout),
+            range(
+                &Duration::from_millis(1),
+                &Duration::from_millis(HOOK_TIMEOUT_MS_MAX),
+            ),
+        ),
+        (
+            property!(CommandHook, output_limit),
+            range(
+                &ByteSize::from_bytes(HOOK_OUTPUT_BYTES_MIN),
+                &ByteSize::from_bytes(HOOK_OUTPUT_BYTES_MAX),
+            ),
+        ),
+    ];
+    for (name, admitted) in ranges {
+        annotate_property(schema, name, RIFT_RANGE, admitted);
+    }
+}
+
 /// An [`ErrorData`](crate::error::ErrorData) carries `limit` only when
 /// `code` is `limit_exceeded`; any other code forbids it.
 pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
@@ -751,6 +781,22 @@ mod tests {
             json!({ "min": "1kb", "max": "16mb" }),
             "max_chunk must state its admitted range"
         );
+    }
+
+    #[test]
+    fn command_hook_schema_states_ranges_on_each_bounded_key() {
+        let schema =
+            serde_json::to_value(schema_for!(crate::configuration::CommandHook)).expect("schema");
+        let cases = [
+            ("timeout", json!({ "min": "1ms", "max": "1h" })),
+            ("output_limit", json!({ "min": "256b", "max": "4kb" })),
+        ];
+        for (name, admitted) in cases {
+            assert_eq!(
+                schema["properties"][name][RIFT_RANGE], admitted,
+                "{name} must state its admitted range"
+            );
+        }
     }
 
     #[test]

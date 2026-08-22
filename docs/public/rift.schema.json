@@ -65,24 +65,26 @@
           "$ref": "#/$defs/HookKind",
           "description": "What the hook is: a test suite, a linter, a build, or something else."
         },
-        "output_limit_bytes": {
-          "description": "Bytes of each output stream Rift keeps, 256 to 4096. The full size\nis still reported.",
-          "format": "uint64",
-          "maximum": 4096,
-          "minimum": 256,
-          "type": "integer"
+        "output_limit": {
+          "$ref": "#/$defs/ByteSize",
+          "description": "Bytes of each output stream Rift keeps, 256b to 4kb. The full size\nis still reported.",
+          "rift:range": {
+            "max": "4kb",
+            "min": "256b"
+          }
         },
         "program": {
           "description": "The executable Rift starts. An absolute path is refused; a bare name\nresolves through `PATH`, a relative one below `working_directory`.",
           "minLength": 1,
           "type": "string"
         },
-        "timeout_ms": {
-          "description": "Milliseconds before Rift kills the process, 1 to 3600000.",
-          "format": "uint64",
-          "maximum": 3600000,
-          "minimum": 1,
-          "type": "integer"
+        "timeout": {
+          "$ref": "#/$defs/Duration",
+          "description": "Wall-clock bound before Rift kills the process, 1ms to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1ms"
+          }
         },
         "type": {
           "$ref": "#/$defs/HookType",
@@ -102,8 +104,8 @@
         "changed_paths",
         "working_directory",
         "environment",
-        "timeout_ms",
-        "output_limit_bytes",
+        "timeout",
+        "output_limit",
         "guarantees",
         "determinism"
       ],

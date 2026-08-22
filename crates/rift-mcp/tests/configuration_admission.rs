@@ -15,7 +15,7 @@ use serde_json::json;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// A `[[hooks]]` block whose `timeout_ms` breaks its documented bound.
+/// A `[[hooks]]` block whose `timeout` breaks its documented bound.
 const INVALID_CONFIGURATION: &str = r#"
 [[hooks]]
 type = "command"
@@ -26,8 +26,8 @@ arguments = ["test"]
 changed_paths = "none"
 working_directory = ""
 environment = {}
-timeout_ms = 0
-output_limit_bytes = 4096
+timeout = "0ms"
+output_limit = "4kb"
 guarantees = []
 determinism = "deterministic"
 "#;
@@ -43,8 +43,8 @@ arguments = ["test"]
 changed_paths = "none"
 working_directory = ""
 environment = {}
-timeout_ms = 120000
-output_limit_bytes = 4096
+timeout = "120s"
+output_limit = "4kb"
 guarantees = []
 determinism = "deterministic"
 "#;
@@ -120,7 +120,7 @@ async fn invalid_configuration_fails_reads_and_changes_typed() -> TestResult {
     assert_eq!(read["phase"], json!("read"));
     let message = read["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("hooks.timeout_ms") && message.contains("1..=3600000"),
+        message.contains("hooks.timeout") && message.contains("1..=3600000"),
         "the refusal must name the field and its range: {message}"
     );
 

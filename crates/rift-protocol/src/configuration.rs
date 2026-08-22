@@ -708,6 +708,7 @@ fn text_extensions_violation(extensions: &[String]) -> Option<ConfigurationViola
 /// required; the schema carries no defaults.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_hook_ranges)]
 pub struct CommandHook {
     /// How the hook runs; `command` is the only type.
     pub r#type: HookType,
@@ -732,13 +733,11 @@ pub struct CommandHook {
     /// Environment values added on top of the environment the server
     /// inherited.
     pub environment: BTreeMap<String, String>,
-    /// Milliseconds before Rift kills the process, 1 to 3600000.
-    #[schemars(range(min = 1, max = 3_600_000))]
-    pub timeout_ms: u64,
-    /// Bytes of each output stream Rift keeps, 256 to 4096. The full size
+    /// Wall-clock bound before Rift kills the process, 1ms to 1h.
+    pub timeout: Duration,
+    /// Bytes of each output stream Rift keeps, 256b to 4kb. The full size
     /// is still reported.
-    #[schemars(range(min = 256, max = 4_096))]
-    pub output_limit_bytes: u64,
+    pub output_limit: ByteSize,
     /// What a passing run establishes. Each entry becomes evidence on the
     /// change the hook checked.
     #[schemars(length(max = 16))]
@@ -1087,10 +1086,15 @@ fn hook_bounds_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
             0,
             HOOK_ENVIRONMENT_ENTRIES_MAX as u64,
         ),
-        ("hooks.timeout_ms", hook.timeout_ms, 1, HOOK_TIMEOUT_MS_MAX),
         (
-            "hooks.output_limit_bytes",
-            hook.output_limit_bytes,
+            "hooks.timeout",
+            hook.timeout.milliseconds(),
+            1,
+            HOOK_TIMEOUT_MS_MAX,
+        ),
+        (
+            "hooks.output_limit",
+            hook.output_limit.bytes(),
             HOOK_OUTPUT_BYTES_MIN,
             HOOK_OUTPUT_BYTES_MAX,
         ),
@@ -1146,8 +1150,8 @@ mod tests {
             changed_paths: ChangedPaths::None,
             working_directory: ProjectPath(String::new()),
             environment: BTreeMap::new(),
-            timeout_ms: 120_000,
-            output_limit_bytes: 4_096,
+            timeout: Duration::from_millis(120_000),
+            output_limit: ByteSize::from_bytes(4_096),
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
         }
@@ -1768,24 +1772,26 @@ mod tests {
                 },
             ),
             (
-                |hook| hook.timeout_ms = 0,
+                |hook| hook.timeout = Duration::from_millis(0),
                 |violation| {
                     matches!(
                         violation,
                         ConfigurationViolation::LimitOutOfRange {
-                            field: "hooks.timeout_ms",
+                            field: "hooks.timeout",
                             ..
                         }
                     )
                 },
             ),
             (
-                |hook| hook.output_limit_bytes = HOOK_OUTPUT_BYTES_MIN - 1,
+                |hook| {
+                    hook.output_limit = ByteSize::from_bytes(HOOK_OUTPUT_BYTES_MIN - 1);
+                },
                 |violation| {
                     matches!(
                         violation,
                         ConfigurationViolation::LimitOutOfRange {
-                            field: "hooks.output_limit_bytes",
+                            field: "hooks.output_limit",
                             ..
                         }
                     )
@@ -1826,7 +1832,7 @@ mod tests {
     #[test]
     fn test_violation_evidence_names_field_value_and_range() {
         let violation = ConfigurationViolation::LimitOutOfRange {
-            field: "hooks.timeout_ms",
+            field: "hooks.timeout",
             value: 0,
             min: 1,
             max: HOOK_TIMEOUT_MS_MAX,
@@ -1834,7 +1840,7 @@ mod tests {
         assert_eq!(
             violation.evidence(),
             vec![
-                ("field", "hooks.timeout_ms".to_owned()),
+                ("field", "hooks.timeout".to_owned()),
                 ("value", "0".to_owned()),
                 ("range", "1..=3600000".to_owned()),
             ]
@@ -2076,22 +2082,6 @@ mod tests {
                 "arguments max",
                 &hook["arguments"]["maxItems"],
                 json!(HOOK_ARGUMENTS_MAX),
-            ),
-            ("timeout min", &hook["timeout_ms"]["minimum"], json!(1)),
-            (
-                "timeout max",
-                &hook["timeout_ms"]["maximum"],
-                json!(HOOK_TIMEOUT_MS_MAX),
-            ),
-            (
-                "output min",
-                &hook["output_limit_bytes"]["minimum"],
-                json!(HOOK_OUTPUT_BYTES_MIN),
-            ),
-            (
-                "output max",
-                &hook["output_limit_bytes"]["maximum"],
-                json!(HOOK_OUTPUT_BYTES_MAX),
             ),
             (
                 "guarantees max",

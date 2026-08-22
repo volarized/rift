@@ -41,7 +41,7 @@ pub(crate) fn hook_failure_diagnostic(
             Some(code) => format!("exited {code}"),
             None => "exited nonzero".to_owned(),
         },
-        HookStatus::TimedOut => format!("killed after {}ms", hook.timeout_ms),
+        HookStatus::TimedOut => format!("killed after {}ms", hook.timeout.milliseconds()),
         HookStatus::Error(message) => message.clone(),
     };
     let mut message = format!("hook {} did not pass: {account}", hook.id);
@@ -260,8 +260,8 @@ mod tests {
             changed_paths: ChangedPaths::None,
             working_directory: rift_protocol::read::ProjectPath(String::new()),
             environment: std::collections::BTreeMap::new(),
-            timeout_ms: 120_000,
-            output_limit_bytes: 4_096,
+            timeout: rift_protocol::configuration::Duration::from_millis(120_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
         }

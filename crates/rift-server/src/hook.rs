@@ -2,7 +2,7 @@
 //!
 //! Each hook is an executable started directly — no shell — inside the
 //! changed tree, its streams captured up to the configured prefix, its
-//! wall-clock bounded by `timeout_ms`. A command starts from the environment
+//! wall-clock bounded by `timeout`. A command starts from the environment
 //! the server inherited, with the hook's `environment` entries laid on top.
 //! Hooks observe an already-applied change: a failing hook rides the result
 //! as evidence and never rolls the change back.
@@ -16,14 +16,14 @@ use rift_protocol::configuration::{ChangedPaths, CommandHook};
 use rift_protocol::read::ProjectPath;
 
 /// How long the runner sleeps between checks on a running hook. The wait
-/// loop wakes at most `timeout_ms / HOOK_POLL_INTERVAL + 1` times.
+/// loop wakes at most `timeout / HOOK_POLL_INTERVAL + 1` times.
 const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Bytes read from a hook stream per read call.
 const STREAM_READ_BYTES: usize = 8 << 10;
 
 /// Bytes of one hook stream the runner counts before it stops reading. A
-/// hook that produces more blocks on its full pipe until `timeout_ms` kills
+/// hook that produces more blocks on its full pipe until `timeout` kills
 /// it, and the reported total stays at this ceiling.
 const STREAM_TOTAL_BYTES_MAX: u64 = 64 << 20;
 
@@ -36,9 +36,9 @@ pub struct HookRun {
     pub status: HookStatus,
     /// The process exit code, where the platform reported one.
     pub exit_code: Option<i32>,
-    /// Captured standard output, bounded by `output_limit_bytes`.
+    /// Captured standard output, bounded by `output_limit`.
     pub stdout: CapturedStream,
-    /// Captured standard error, bounded by `output_limit_bytes`.
+    /// Captured standard error, bounded by `output_limit`.
     pub stderr: CapturedStream,
 }
 
@@ -49,7 +49,7 @@ pub enum HookStatus {
     Passed,
     /// The process exited nonzero.
     Failed,
-    /// The process overstayed `timeout_ms` and was killed.
+    /// The process overstayed `timeout` and was killed.
     TimedOut,
     /// The hook never produced a verdict: it was refused or failed to
     /// launch or be observed.
@@ -72,7 +72,7 @@ pub struct CapturedStream {
 
 /// Runs every configured hook inside the changed tree, in list order, over
 /// the byte-ordered changed paths. The work is bounded by configuration:
-/// at most the configured hook count, each killed at its `timeout_ms`.
+/// at most the configured hook count, each killed at its `timeout`.
 #[must_use]
 pub fn run_hooks(
     hooks: &[CommandHook],
@@ -87,7 +87,7 @@ pub fn run_hooks(
         .collect()
 }
 
-/// Runs one hook to completion, killing it at `timeout_ms`.
+/// Runs one hook to completion, killing it at `timeout`.
 fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> HookRun {
     let error = |message: String| HookRun {
         id: hook.id.clone(),
@@ -129,14 +129,17 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
     };
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "output_limit_bytes is validated to at most 4096, which fits usize on every \
+        reason = "output_limit is validated to at most 4096 bytes, which fits usize on every \
                   served target"
     )]
-    let capture_bytes = hook.output_limit_bytes as usize;
+    let capture_bytes = hook.output_limit.bytes() as usize;
     let stdout_drain = drain_thread(child.stdout.take(), capture_bytes);
     let stderr_drain = drain_thread(child.stderr.take(), capture_bytes);
 
-    let (exit, timed_out) = wait_bounded(&mut child, Duration::from_millis(hook.timeout_ms));
+    let (exit, timed_out) = wait_bounded(
+        &mut child,
+        Duration::from_millis(hook.timeout.milliseconds()),
+    );
     let stdout = join_drain(stdout_drain);
     let stderr = join_drain(stderr_drain);
 
@@ -238,6 +241,7 @@ fn drain(mut stream: impl Read, capture_bytes: usize) -> CapturedStream {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use rift_protocol::configuration as hook_configuration;
     use rift_protocol::configuration::{Determinism, HookKind, HookType};
     use std::collections::BTreeMap;
 
@@ -254,8 +258,8 @@ mod tests {
             changed_paths: ChangedPaths::None,
             working_directory: ProjectPath(String::new()),
             environment: BTreeMap::new(),
-            timeout_ms: 10_000,
-            output_limit_bytes: 4_096,
+            timeout: hook_configuration::Duration::from_millis(10_000),
+            output_limit: hook_configuration::ByteSize::from_bytes(4_096),
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
         }
@@ -303,7 +307,7 @@ mod tests {
     fn test_timeout_kills_the_hook_without_waiting_it_out() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut slow = hook("sleep", &["10"]);
-        slow.timeout_ms = 200;
+        slow.timeout = hook_configuration::Duration::from_millis(200);
         let started = Instant::now();
         let runs = run_hooks(&[slow], directory.path(), &[]);
         assert_eq!(runs[0].status, HookStatus::TimedOut);
@@ -319,7 +323,7 @@ mod tests {
     fn test_output_is_capped_and_full_size_reported() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut noisy = hook("seq", &["1", "5000"]);
-        noisy.output_limit_bytes = 256;
+        noisy.output_limit = hook_configuration::ByteSize::from_bytes(256);
         let runs = run_hooks(&[noisy], directory.path(), &[]);
         let stdout = &runs[0].stdout;
         assert_eq!(stdout.captured_bytes, 256);
