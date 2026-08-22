@@ -367,38 +367,52 @@ Sometimes you don't want the agent writing into your files at all — a refactor
 review whole, or several agents working the same workspace without treading on each other. A
 **projection** is the opt-in for that:
 [`projection_create`](/docs/protocol/mcp#tool-projection_create) gives the agent a
-pinned copy of the workspace, every change tool takes the projection's identity as its
+pinned copy of the workspace, every change tool takes the projection's name as its
 target, and nothing reaches your files until [`publish`](/docs/protocol/mcp#tool-publish).
 
+Creating a projection names it. The call carries a **name** — a valid directory name, such as
+`my-feature-one` — and a short description of the task the projection holds. The name is how
+later calls address the projection and where its directory appears; the description is what lets
+[`projection_list`](/docs/protocol/mcp#tool-projection_list) read as a task list, which is how
+abandoned work gets found.
+
 A fresh projection is a pinned, byte-identical snapshot of the workspace. The server records a
-tree digest and a manifest of every entry, then clones regular files with filesystem reflinks
-where the host supports them. It copies files on other hosts and always recreates directories
-and symlinks without following them. A later `git pull` changes the workspace but leaves the
+tree digest and a manifest of every entry, and [riftfs](#riftfs) serves that captured revision
+as the projection's directory. A later `git pull` changes the workspace but leaves the
 projection at its captured revision.
+
+Serving is lazy — content materializes on first read — so creating a projection costs the same
+for a ten-file tree and a monorepo. Symlinks are served and never followed. On a host where
+riftfs cannot mount, the server copies the tree into a plain directory instead: the same
+contract, paid at creation.
 
 The projection is a real directory, at a predictable place below the workspace:
 
 ```
-~/projects/charming-aurora/.rift/projections/prj_7k2mq4vx6ntbwpj3rfd6a2zcyh
+~/projects/charming-aurora/.rift/projections/my-feature-one
 ```
 
 That's deliberate: plenty of what a developer runs can't be handed a protocol — `cargo test`,
 `prettier`, a linter your team wrote in 2019. They take a directory, so the projection is one,
 and the [projection resource](/docs/protocol/mcp#resource-projection) hands out its path.
 
-A write into the directory lands in the projection alone because every entry belongs to that
-directory; reflinked file extents detach when written. The path stays put until
+A write into the directory lands in the projection alone: riftfs detaches the written path into
+the projection's own store, and the workspace file is never touched. The path stays put until
 [`projection_remove`](/docs/protocol/mcp#tool-projection_remove) deletes the directory —
 without waiting for whatever still runs inside it, because a lock there would let one abandoned
 `cargo watch` wedge cleanup forever.
 
 Rift change tools record their edits as they apply. An ordinary process can bypass those tools by
-writing into the projection directory, so the server also compares the directory with its
-manifest before each projection read and publication. It groups an observed delta into a
+writing into the projection directory — and because riftfs is that directory, the server
+observes each bypassing write as it lands.
+
+The server groups the observed delta into a
 [`ChangeSummary`](/docs/protocol/reference#ChangeSummary) whose `origin` is `filesystem`,
 records the exact changed `paths`, reruns providers and hooks, and attaches an `external`
-confirmation. Binary files and new symlinks stay publishable even though their bytes have no
-portable `Edit` representation; their paths remain the authoritative scope.
+confirmation. A copy-backed projection reaches the same summary by comparison: the server checks
+the directory against its manifest before each projection read and publication. Binary files and
+new symlinks stay publishable even though their bytes have no portable `Edit` representation;
+their paths remain the authoritative scope.
 
 That reconciliation can discover a change during `publish`. In that case publication returns
 the newly minted change id in `unaccepted` and writes nothing. The caller reads
@@ -477,9 +491,8 @@ The engine works against the targeted tree's directory, because a language serve
 indexer take a directory, like `cargo test` and the linter before them. A live language server
 reads the tree's bytes as the change tools write them, so its analysis tracks the plan as it
 lands. A batch indexer needs a tree that holds still: a projection is already pinned, and for the
-workspace target the server refreshes an internal copy under `.rift` the way the
-[execution copy](#execution) does — that copy feeds the indexer and is never a projection the
-agent has to manage.
+workspace target the server pins an internal tree through [riftfs](#riftfs) — that tree feeds
+the indexer and is never a projection the agent has to manage.
 
 <IsoDiagram
   alt="An agent asks the rift server for a rename, here targeting a projection the agent created. The server requests an edit plan from the language engine — a language server or a SCIP index — which reads the projection directory. The server compiles the plan into witnessed edits, applies them to the projection as one change, and publish carries the result into the workspace tree. A workspace-targeted plan lands in the workspace tree directly."
@@ -528,3 +541,50 @@ The execution copy does not sandbox code. The runtime uses the server's OS permi
 absolute path can reach outside the copy, including the workspace.
 
 `rift.toml` decides [which languages may execute at all](/docs/configuration#execution).
+
+## riftfs
+
+Projection directories, execution copies, and the pinned trees batch engines index share one
+requirement: a real directory that is not the workspace. **riftfs** is the filesystem layer that
+serves them. To every program it is an ordinary directory; no tool names it and nothing on the
+protocol surface addresses it — an agent meets riftfs only as a path that works.
+
+Each served tree holds one contract:
+
+- The tree serves its pinned base — the revision captured at creation. Later workspace motion is
+  invisible inside it.
+- The first write to a path detaches that path into the tree's own store. A write into a served
+  tree never touches the workspace.
+- A deletion holds in that tree alone.
+- `.rift` is never visible inside a served tree, so a tree cannot reach its own machinery.
+- Removal is immediate. A process still running inside gets I/O errors; the tree is never
+  half-deleted under it.
+
+<IsoDiagram
+  alt="riftfs serves the workspace tree's pinned base as projection directories and the execution copy. External tools read and write a projection directory; riftfs routes every access through the rift server, which observes each write, reindexes exactly the changed paths, and notifies a language server rooted in the projection."
+  chart={`
+    flowchart LR
+      workspace["workspace tree"]:::store -- "pinned base" --> riftfs["riftfs"]:::rift
+      riftfs -- "serves" --> proj["projection<br/>my-feature-one"]:::store
+      riftfs -- "serves" --> exec["execution copy"]:::store
+      tool["external tool<br/>cargo test, prettier"]:::agent -- "reads + writes" --> proj
+      riftfs -- "observed writes" --> server["rift server"]:::rift
+      server -- "reindex changed paths" --> index["search index"]:::store
+      server -- "notifies" --> ls["language server"]:::provider
+  `}
+/>
+
+Every read and write of a served tree passes through the server, and that observation is what
+riftfs buys beyond a cheap copy. The workspace needs a native watcher because other programs
+write it directly; a served tree needs none — the server is its write path. An observed write
+advances the tree's change counter, invalidates facts for exactly the changed paths, and joins
+the same serialized rebuild lane the workspace [index](#index) uses.
+
+Projections scale by staying apart. Each one is its own targeted tree with its own store,
+changeset, read set, and fact revisions, so a write in one invalidates nothing in another and
+nothing in the workspace index. The trees meet only at
+[`publish`](/docs/protocol/mcp#tool-publish), which stays serialized workspace-wide.
+
+Observation also covers the one thing a served tree cannot do: deliver filesystem-watcher
+events. A live language server rooted at a projection is notified by the server instead, which
+knows every write — the plans it applied and each external one.
