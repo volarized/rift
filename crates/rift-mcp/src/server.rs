@@ -1,8 +1,9 @@
 use std::fmt::Write as _;
 use std::io::Read as _;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock as SyncRwLock};
+use std::sync::{Arc, Mutex as SyncMutex, OnceLock, RwLock as SyncRwLock};
 use std::time::Duration;
 
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
@@ -56,6 +57,89 @@ const INDEX_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(30);
 const INDEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Complete capture retries while the tree keeps moving.
 const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
+/// Milliseconds one operation may wait for blocking capacity.
+const BLOCKING_QUEUE_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+
+/// Runtime policy for blocking MCP operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RiftMcpOptions {
+    blocking_queue_timeout_ms: u64,
+}
+
+impl RiftMcpOptions {
+    /// Sets maximum queue wait before a retryable capacity failure.
+    #[must_use]
+    pub fn with_blocking_queue_timeout_ms(mut self, timeout_ms: NonZeroU64) -> Self {
+        self.blocking_queue_timeout_ms = timeout_ms.get();
+        self
+    }
+}
+
+impl Default for RiftMcpOptions {
+    fn default() -> Self {
+        Self {
+            blocking_queue_timeout_ms: BLOCKING_QUEUE_TIMEOUT_MS_DEFAULT,
+        }
+    }
+}
+
+/// Bounded Tokio admission for blocking filesystem and parser work.
+#[derive(Clone, Debug)]
+struct BlockingExecutor {
+    operations: Arc<Semaphore>,
+    queue_timeout_ms: u64,
+}
+
+impl BlockingExecutor {
+    /// Uses process-wide capacity with one server's queue-wait policy.
+    fn process_wide(options: RiftMcpOptions) -> Self {
+        Self {
+            operations: Arc::clone(blocking_operations()),
+            queue_timeout_ms: options.blocking_queue_timeout_ms,
+        }
+    }
+
+    /// Creates an isolated executor for deterministic capacity tests.
+    #[cfg(test)]
+    fn isolated(operations_max: usize, queue_timeout_ms: u64) -> Self {
+        assert!(
+            operations_max > 0,
+            "blocking operation capacity must be positive: operations_max={operations_max}"
+        );
+        assert!(
+            queue_timeout_ms > 0,
+            "blocking queue timeout must be positive: queue_timeout_ms={queue_timeout_ms}"
+        );
+        Self {
+            operations: Arc::new(Semaphore::new(operations_max)),
+            queue_timeout_ms,
+        }
+    }
+
+    /// Runs one blocking operation after queued, bounded admission.
+    async fn run<Output>(
+        &self,
+        operation: &'static str,
+        work: impl FnOnce() -> Result<Output, ReadError> + Send + 'static,
+    ) -> Result<Output, ReadError>
+    where
+        Output: Send + 'static,
+    {
+        let acquire = Arc::clone(&self.operations).acquire_owned();
+        let permit = tokio::time::timeout(Duration::from_millis(self.queue_timeout_ms), acquire)
+            .await
+            .map_err(|_| ReadFault::capacity_timeout(operation, self.queue_timeout_ms))?
+            .map_err(|error| ReadFault::task(operation, error.to_string()))?;
+        tokio::task::spawn_blocking(move || {
+            let result = work();
+            // Explicit success-path release; unwinding also drops the owned permit.
+            drop(permit);
+            result
+        })
+        .await
+        .map_err(|error| ReadFault::task(operation, error.to_string()))?
+    }
+}
 
 /// Workspace blocking operations admitted process-wide.
 fn blocking_operations() -> &'static Arc<Semaphore> {
@@ -63,24 +147,36 @@ fn blocking_operations() -> &'static Arc<Semaphore> {
     OPERATIONS.get_or_init(|| Arc::new(Semaphore::new(BLOCKING_OPERATIONS_MAX)))
 }
 
-/// Runs one blocking operation under process-wide bounded admission.
-async fn bounded_blocking<Output>(
-    operation: &'static str,
-    work: impl FnOnce() -> Result<Output, ReadError> + Send + 'static,
-) -> Result<Output, ReadError>
-where
-    Output: Send + 'static,
-{
-    let permit = Arc::clone(blocking_operations())
-        .acquire_owned()
-        .await
-        .map_err(|error| ReadFault::task(operation, error.to_string()))?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        work()
-    })
-    .await
-    .map_err(|error| ReadFault::task(operation, error.to_string()))?
+/// Serializes workspace mutations and snapshot publication.
+#[derive(Debug, Default)]
+struct ChangeLane {
+    admission: AsyncMutex<()>,
+}
+
+impl ChangeLane {
+    /// Runs one operation after FIFO admission to the workspace lane.
+    fn run<Output>(&self, operation: impl FnOnce() -> Output) -> Output {
+        let guard = self.admission.blocking_lock();
+        let output = operation();
+        // Filesystem mutation and snapshot publication finish before release.
+        drop(guard);
+        output
+    }
+
+    /// Verifies occupied admission, reports it, then uses the production lane.
+    #[cfg(test)]
+    fn run_after_contention<Output>(
+        &self,
+        on_contention: impl FnOnce(),
+        operation: impl FnOnce() -> Output,
+    ) -> Output {
+        assert!(
+            self.admission.try_lock().is_err(),
+            "contention witness requires an occupied change lane"
+        );
+        on_contention();
+        self.run(operation)
+    }
 }
 
 /// Rust workspace MCP server: reads serve an immutable snapshot, changes
@@ -92,7 +188,8 @@ pub struct RiftMcp {
     published: Arc<RwLock<IndexState>>,
     coherence: Arc<IndexCoherence>,
     changes: Arc<ChangeService>,
-    change_lane: Arc<Mutex<()>>,
+    change_lane: Arc<ChangeLane>,
+    blocking: BlockingExecutor,
     tool_router: ToolRouter<Self>,
 }
 
@@ -152,7 +249,7 @@ struct IndexCoherence {
     watch_failed: Arc<AtomicBool>,
     invalidations: mpsc::Sender<()>,
     changed: Arc<Notify>,
-    publication_lane: Mutex<()>,
+    publication_lane: SyncMutex<()>,
     source_policy: SyncRwLock<Option<Arc<WorkspaceSourcePolicy>>>,
     cancellation: CancellationToken,
     task: AsyncMutex<Option<JoinHandle<()>>>,
@@ -162,6 +259,16 @@ struct IndexCoherence {
 #[derive(Debug, Clone)]
 pub(crate) struct IndexSupervisor {
     coherence: Arc<IndexCoherence>,
+}
+
+/// Rebuild dependencies owned by index supervisor task.
+struct IndexSupervisorContext {
+    root: PathBuf,
+    limits: WorkspaceIndexLimits,
+    published: Arc<RwLock<IndexState>>,
+    change_lane: Arc<ChangeLane>,
+    coherence: Arc<IndexCoherence>,
+    blocking: BlockingExecutor,
 }
 
 /// The last admission of the workspace's `rift.toml`, kept with the file
@@ -250,7 +357,7 @@ impl IndexCoherence {
                 watch_failed: Arc::new(AtomicBool::new(false)),
                 invalidations,
                 changed: Arc::new(Notify::new()),
-                publication_lane: Mutex::new(()),
+                publication_lane: SyncMutex::new(()),
                 source_policy: SyncRwLock::new(None),
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
@@ -511,6 +618,7 @@ async fn initial_workspace(
     root: &Path,
     limits: WorkspaceIndexLimits,
     coherence: &IndexCoherence,
+    blocking: &BlockingExecutor,
 ) -> Result<Arc<PublishedWorkspace>, ReadError> {
     for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
         let epoch = coherence.observed_epoch();
@@ -522,11 +630,12 @@ async fn initial_workspace(
             epoch,
             attempt
         );
-        let built = bounded_blocking("initial index build", move || {
-            build_workspace_candidate(&build_root, limits, epoch)
-        })
-        .instrument(span)
-        .await?;
+        let built = blocking
+            .run("initial index build", move || {
+                build_workspace_candidate(&build_root, limits, epoch)
+            })
+            .instrument(span)
+            .await?;
         let WorkspaceCandidate::Stable(built) = built else {
             continue;
         };
@@ -604,12 +713,16 @@ enum RebuildOutcome {
 async fn run_index_supervisor(
     _watcher: notify::RecommendedWatcher,
     mut invalidations: mpsc::Receiver<()>,
-    root: PathBuf,
-    limits: WorkspaceIndexLimits,
-    published: Arc<RwLock<IndexState>>,
-    change_lane: Arc<Mutex<()>>,
-    coherence: Arc<IndexCoherence>,
+    context: IndexSupervisorContext,
 ) {
+    let IndexSupervisorContext {
+        root,
+        limits,
+        published,
+        change_lane,
+        coherence,
+        blocking,
+    } = context;
     loop {
         let received = tokio::select! {
             () = coherence.cancellation.cancelled() => false,
@@ -635,6 +748,7 @@ async fn run_index_supervisor(
             Arc::clone(&published),
             Arc::clone(&change_lane),
             Arc::clone(&coherence),
+            blocking.clone(),
             epoch,
         )
         .instrument(tracing::info_span!(
@@ -654,15 +768,16 @@ async fn run_index_supervisor(
             );
             let failed_state = Arc::clone(&published);
             let failed_coherence = Arc::clone(&coherence);
-            let recorded = bounded_blocking("index failure publication", move || {
-                Ok(record_rebuild_failure(
-                    &failed_state,
-                    &failed_coherence,
-                    epoch,
-                    error,
-                ))
-            })
-            .await;
+            let recorded = blocking
+                .run("index failure publication", move || {
+                    Ok(record_rebuild_failure(
+                        &failed_state,
+                        &failed_coherence,
+                        epoch,
+                        error,
+                    ))
+                })
+                .await;
             if recorded.is_err() {
                 let _ = coherence.observe_watch_failure();
             }
@@ -676,14 +791,16 @@ async fn rebuild_workspace(
     root: PathBuf,
     limits: WorkspaceIndexLimits,
     published: Arc<RwLock<IndexState>>,
-    change_lane: Arc<Mutex<()>>,
+    change_lane: Arc<ChangeLane>,
     coherence: Arc<IndexCoherence>,
+    blocking: BlockingExecutor,
     epoch: u64,
 ) -> Result<RebuildOutcome, ReadError> {
-    bounded_blocking("filesystem index rebuild", move || {
-        rebuild_workspace_blocking(&root, limits, &published, &change_lane, &coherence, epoch)
-    })
-    .await
+    blocking
+        .run("filesystem index rebuild", move || {
+            rebuild_workspace_blocking(&root, limits, &published, &change_lane, &coherence, epoch)
+        })
+        .await
 }
 
 /// Runs one serialized filesystem rebuild on blocking executor.
@@ -691,25 +808,30 @@ fn rebuild_workspace_blocking(
     root: &Path,
     limits: WorkspaceIndexLimits,
     published: &RwLock<IndexState>,
-    change_lane: &Mutex<()>,
+    change_lane: &ChangeLane,
     coherence: &IndexCoherence,
     epoch: u64,
 ) -> Result<RebuildOutcome, ReadError> {
-    let lane = change_lane
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    change_lane.run(|| rebuild_workspace_serialized(root, limits, published, coherence, epoch))
+}
+
+/// Rebuilds workspace while mutation lane is held.
+fn rebuild_workspace_serialized(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    published: &RwLock<IndexState>,
+    coherence: &IndexCoherence,
+    epoch: u64,
+) -> Result<RebuildOutcome, ReadError> {
     if !admit_rebuild(coherence, epoch)? {
-        drop(lane);
         return Ok(RebuildOutcome::Superseded);
     }
     let candidate = build_workspace_candidate(root, limits, epoch)?;
     let WorkspaceCandidate::Stable(candidate) = candidate else {
         let _ = coherence.observe();
-        drop(lane);
         return Ok(RebuildOutcome::Superseded);
     };
     let outcome = publish_rebuild(published, coherence, candidate);
-    drop(lane);
     if outcome == RebuildOutcome::Published {
         trace_publication(epoch);
         coherence.changed.notify_waiters();
@@ -813,34 +935,43 @@ impl RiftMcp {
     ///
     /// Dropping this future discards construction. An admitted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
-    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
+    pub async fn build(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        options: RiftMcpOptions,
+    ) -> Result<Self, ReadError> {
         let root = root.to_path_buf();
+        let blocking = BlockingExecutor::process_wide(options);
         let (coherence, invalidations) = IndexCoherence::new();
         let watch_root = root.clone();
         let watch_coherence = Arc::clone(&coherence);
-        let watcher = bounded_blocking("workspace watch setup", move || {
-            workspace_watcher(&watch_root, &watch_coherence)
-        })
-        .instrument(tracing::info_span!(
-            "index.watch",
-            component = "index",
-            operation = "watch.setup"
-        ))
-        .await?;
-        let published = initial_workspace(&root, limits, &coherence).await?;
+        let watcher = blocking
+            .run("workspace watch setup", move || {
+                workspace_watcher(&watch_root, &watch_coherence)
+            })
+            .instrument(tracing::info_span!(
+                "index.watch",
+                component = "index",
+                operation = "watch.setup"
+            ))
+            .await?;
+        let published = initial_workspace(&root, limits, &coherence, &blocking).await?;
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
             failure: None,
         }));
-        let change_lane = Arc::new(Mutex::new(()));
+        let change_lane = Arc::new(ChangeLane::default());
         let supervisor_task = tokio::spawn(run_index_supervisor(
             watcher,
             invalidations,
-            root.clone(),
-            limits,
-            Arc::clone(&published),
-            Arc::clone(&change_lane),
-            Arc::clone(&coherence),
+            IndexSupervisorContext {
+                root: root.clone(),
+                limits,
+                published: Arc::clone(&published),
+                change_lane: Arc::clone(&change_lane),
+                coherence: Arc::clone(&coherence),
+                blocking: blocking.clone(),
+            },
         ));
         let mut task = coherence.task.lock().await;
         *task = Some(supervisor_task);
@@ -852,6 +983,7 @@ impl RiftMcp {
             coherence,
             changes: Arc::new(ChangeService::new(&root)),
             change_lane,
+            blocking,
             tool_router: Self::tool_router(),
         })
     }
@@ -975,7 +1107,9 @@ impl RiftMcp {
         let read_error = |error: ReadError| error.tool_error(wire::ErrorPhase::Read);
         let Some(rev) = rev else {
             let reads = Arc::clone(&published.reads);
-            return bounded_blocking("current workspace read", move || operation(&reads))
+            return self
+                .blocking
+                .run("current workspace read", move || operation(&reads))
                 .await
                 .map(Json)
                 .map_err(read_error);
@@ -988,13 +1122,14 @@ impl RiftMcp {
         let visibility = SourceVisibility::from(&configuration.source);
         let root = self.root.clone();
         let limits = self.limits;
-        bounded_blocking("revision workspace read", move || {
-            let reads = ReadService::at_revision(&root, &rev, limits, &visibility)?;
-            operation(&reads)
-        })
-        .await
-        .map(Json)
-        .map_err(read_error)
+        self.blocking
+            .run("revision workspace read", move || {
+                let reads = ReadService::at_revision(&root, &rev, limits, &visibility)?;
+                operation(&reads)
+            })
+            .await
+            .map(Json)
+            .map_err(read_error)
     }
 
     /// Returns one atomically published index and configuration policy.
@@ -1022,18 +1157,20 @@ impl RiftMcp {
             let root = self.root.clone();
             let limits = self.limits;
             let visibility = current.configuration.source_visibility();
-            let capture = bounded_blocking("workspace fingerprint", move || {
-                let fingerprint = WorkspaceFingerprint::capture(&root, limits, &visibility)
-                    .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
-                Ok((fingerprint, configuration_fingerprint(&root)))
-            })
-            .instrument(tracing::debug_span!(
-                "index.reconcile",
-                component = "index",
-                operation = "fingerprint.capture",
-                epoch = current.epoch
-            ))
-            .await;
+            let capture = self
+                .blocking
+                .run("workspace fingerprint", move || {
+                    let fingerprint = WorkspaceFingerprint::capture(&root, limits, &visibility)
+                        .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+                    Ok((fingerprint, configuration_fingerprint(&root)))
+                })
+                .instrument(tracing::debug_span!(
+                    "index.reconcile",
+                    component = "index",
+                    operation = "fingerprint.capture",
+                    epoch = current.epoch
+                ))
+                .await;
             let (fingerprint, configuration_fingerprint) = match capture {
                 Ok(capture) => capture,
                 Err(error) => {
@@ -1119,91 +1256,95 @@ impl RiftMcp {
         let coherence = Arc::clone(&self.coherence);
         let changes = Arc::clone(&self.changes);
         let change_lane = Arc::clone(&self.change_lane);
-        bounded_blocking("workspace change", move || {
-            let lane = change_lane
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let state = published.blocking_read();
-            let (current, _) = state.snapshot();
-            drop(state);
-            if current.epoch != coherence.observed_epoch() {
-                drop(lane);
-                return Ok(Err(ReadFault::unavailable(
-                    "workspace change",
-                    "index changed before operation admission",
-                )
-                .tool_error(wire::ErrorPhase::Change)));
-            }
-            let configuration = match current.configuration.admitted(wire::ErrorPhase::Change) {
-                Ok(configuration) => configuration,
+        self.blocking
+            .run("workspace change", move || {
+                change_lane.run(|| {
+                    Self::change_serialized(
+                        &root, limits, &published, &coherence, &changes, operation,
+                    )
+                })
+            })
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?
+    }
+
+    /// Runs one already-serialized change through coherent publication.
+    fn change_serialized(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        published: &RwLock<IndexState>,
+        coherence: &IndexCoherence,
+        changes: &ChangeService,
+        operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
+    ) -> Result<Result<Json<ChangeResult>, ErrorData>, ReadError> {
+        let state = published.blocking_read();
+        let (current, _) = state.snapshot();
+        drop(state);
+        if current.epoch != coherence.observed_epoch() {
+            return Ok(Err(ReadFault::unavailable(
+                "workspace change",
+                "index changed before operation admission",
+            )
+            .tool_error(wire::ErrorPhase::Change)));
+        }
+        let configuration = match current.configuration.admitted(wire::ErrorPhase::Change) {
+            Ok(configuration) => configuration,
+            Err(error) => return Ok(Err(error)),
+        };
+        let mut result = operation(&current.reads, changes)?;
+        if let ChangeResult::Applied { summary } = &mut result {
+            let epoch = match coherence.observe() {
+                Ok(epoch) => epoch,
                 Err(error) => {
-                    drop(lane);
-                    return Ok(Err(error));
+                    summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                    return Ok(Ok(Json(result)));
                 }
             };
-            let mut result = operation(&current.reads, &changes)?;
-            if let ChangeResult::Applied { summary } = &mut result {
-                let epoch = match coherence.observe() {
-                    Ok(epoch) => epoch,
-                    Err(error) => {
+            Self::attach_hook_verdicts(root, &configuration.hooks, summary);
+            let visibility = SourceVisibility::from(&configuration.source);
+            match ReadService::build(root, limits, &visibility) {
+                Ok(rebuilt) => {
+                    let fingerprint = rebuilt.workspace_fingerprint().clone();
+                    let source_policy =
+                        match WorkspaceSourcePolicy::build(root, limits, &visibility) {
+                            Ok(policy) => Arc::new(policy),
+                            Err(error) => {
+                                let error = ReadError::from(ReadFault::Index(error));
+                                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                                return Ok(Ok(Json(result)));
+                            }
+                        };
+                    if current.configuration.fingerprint != configuration_fingerprint(root) {
+                        let error = ReadFault::unavailable(
+                            "workspace change",
+                            "configuration changed during snapshot rebuild",
+                        );
+                        let _ = coherence.observe();
                         summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                        drop(lane);
                         return Ok(Ok(Json(result)));
                     }
-                };
-                Self::attach_hook_verdicts(&root, &configuration.hooks, summary);
-                let visibility = SourceVisibility::from(&configuration.source);
-                match ReadService::build(&root, limits, &visibility) {
-                    Ok(rebuilt) => {
-                        let fingerprint = rebuilt.workspace_fingerprint().clone();
-                        let source_policy =
-                            match WorkspaceSourcePolicy::build(&root, limits, &visibility) {
-                                Ok(policy) => Arc::new(policy),
-                                Err(error) => {
-                                    let error = ReadError::from(ReadFault::Index(error));
-                                    summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                                    drop(lane);
-                                    return Ok(Ok(Json(result)));
-                                }
-                            };
-                        if current.configuration.fingerprint != configuration_fingerprint(&root) {
-                            let error = ReadFault::unavailable(
-                                "workspace change",
-                                "configuration changed during snapshot rebuild",
-                            );
-                            let _ = coherence.observe();
-                            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                            drop(lane);
-                            return Ok(Ok(Json(result)));
-                        }
-                        let next = Arc::new(PublishedWorkspace {
-                            reads: Arc::new(rebuilt),
-                            configuration: current.configuration.clone(),
-                            fingerprint,
-                            source_policy,
+                    let next = Arc::new(PublishedWorkspace {
+                        reads: Arc::new(rebuilt),
+                        configuration: current.configuration.clone(),
+                        fingerprint,
+                        source_policy,
+                        epoch,
+                    });
+                    if publish_rebuild(published, coherence, next) == RebuildOutcome::Published {
+                        tracing::info!(
+                            component = "index",
+                            operation = "index.publish",
+                            trigger = "rift_change",
                             epoch,
-                        });
-                        if publish_rebuild(&published, &coherence, next)
-                            == RebuildOutcome::Published
-                        {
-                            tracing::info!(
-                                component = "index",
-                                operation = "index.publish",
-                                trigger = "rift_change",
-                                epoch,
-                                "index snapshot published"
-                            );
-                            coherence.changed.notify_waiters();
-                        }
+                            "index snapshot published"
+                        );
+                        coherence.changed.notify_waiters();
                     }
-                    Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
                 }
+                Err(error) => summary.diagnostics.push(stale_snapshot_diagnostic(&error)),
             }
-            drop(lane);
-            Ok(Ok(Json(result)))
-        })
-        .await
-        .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?
+        }
+        Ok(Ok(Json(result)))
     }
 
     /// Runs the configured hooks over one applied change and attaches what
@@ -1411,7 +1552,8 @@ fn wire_code(name: ErrorName) -> wire::ErrorCode {
 mod tests {
     use std::error::Error;
     use std::fs;
-    use std::sync::atomic::Ordering;
+    use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier as ThreadBarrier};
     use std::time::Duration;
 
@@ -1421,7 +1563,7 @@ mod tests {
     use rift_index::{WorkspaceIndexLimits, WorkspaceSourcePolicy};
     use rift_protocol::error as wire;
     use rift_protocol::read::GetSymbolResult;
-    use rift_server::{ReadFault, ReadService};
+    use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault, ReadService};
 
     use super::WireFailure;
     use rmcp::ServiceError;
@@ -1431,9 +1573,10 @@ mod tests {
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
 
     use super::{
-        ConfigurationFingerprint, ConfigurationState, IndexCoherence, IndexState, Parameters,
-        RebuildOutcome, RiftMcp, WorkspaceCandidate, build_workspace_candidate, publish_rebuild,
-        publish_rebuild_after, record_rebuild_failure, relevant_watch_event,
+        BlockingExecutor, ChangeLane, ConfigurationFingerprint, ConfigurationState, IndexCoherence,
+        IndexState, Parameters, PublishedWorkspace, RebuildOutcome, RiftMcp, RiftMcpOptions,
+        WorkspaceCandidate, build_workspace_candidate, publish_rebuild, publish_rebuild_after,
+        record_rebuild_failure, relevant_watch_event,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1441,7 +1584,12 @@ mod tests {
     async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let server = RiftMcp::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            RiftMcpOptions::default(),
+        )
+        .await?;
         Ok((directory, server))
     }
 
@@ -1480,9 +1628,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture must exist");
         fs::write(directory.path().join("invalid.rs"), [0xff])
             .expect("invalid source fixture must write");
-        let error = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
-            .await
-            .expect_err("invalid source must fail");
+        let error = RiftMcp::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            RiftMcpOptions::default(),
+        )
+        .await
+        .expect_err("invalid source must fail");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
     }
 
@@ -1942,7 +2094,7 @@ mod tests {
         fs::write(&path, "pub fn beacon() {}\n")?;
         let tight =
             WorkspaceIndexLimits::new(4, 60, 60, 4, 100).map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight).await?;
+        let server = RiftMcp::build(directory.path(), tight, RiftMcpOptions::default()).await?;
 
         fs::write(
             &path,
@@ -2011,6 +2163,290 @@ mod tests {
         supervisor.shutdown().await?;
         supervisor.shutdown().await?;
         assert!(supervisor.coherence.task.lock().await.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_options_configure_process_wide_queue_wait() {
+        let timeout_ms = NonZeroU64::new(1_250).expect("test timeout must be positive");
+        let options = RiftMcpOptions::default().with_blocking_queue_timeout_ms(timeout_ms);
+        let executor = BlockingExecutor::process_wide(options);
+        assert_eq!(executor.queue_timeout_ms, timeout_ms.get());
+    }
+
+    #[tokio::test]
+    async fn change_lane_waits_for_active_publication_before_entering() {
+        let lane = Arc::new(ChangeLane::default());
+        let (first_entered_sender, first_entered_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let first_lane = Arc::clone(&lane);
+        let first = tokio::task::spawn_blocking(move || {
+            first_lane.run(|| {
+                first_entered_sender
+                    .send(())
+                    .expect("first entry witness must still be listening");
+                release_receiver
+                    .recv()
+                    .expect("test must release first lane operation");
+                1_u8
+            })
+        });
+        first_entered_receiver
+            .await
+            .expect("first operation must enter change lane");
+
+        let second_entered = Arc::new(AtomicBool::new(false));
+        let second_flag = Arc::clone(&second_entered);
+        let (contended_sender, contended_receiver) = tokio::sync::oneshot::channel();
+        let second_lane = Arc::clone(&lane);
+        let second = tokio::task::spawn_blocking(move || {
+            second_lane.run_after_contention(
+                || {
+                    contended_sender
+                        .send(())
+                        .expect("contention witness must still be listening");
+                },
+                || {
+                    second_flag.store(true, Ordering::SeqCst);
+                    2_u8
+                },
+            )
+        });
+        contended_receiver
+            .await
+            .expect("second operation must reach occupied admission");
+        assert!(
+            !second_entered.load(Ordering::SeqCst),
+            "second operation must not enter before first publication releases"
+        );
+
+        release_sender
+            .send(())
+            .expect("first lane operation must accept release");
+        assert_eq!(first.await.expect("first lane task must join"), 1);
+        assert_eq!(second.await.expect("second lane task must join"), 2);
+        assert!(
+            second_entered.load(Ordering::SeqCst),
+            "second operation must proceed after publication releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_executor_queues_until_capacity_returns() {
+        let executor = BlockingExecutor::isolated(1, 1_000);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let held_executor = executor.clone();
+        let held = tokio::spawn(async move {
+            held_executor
+                .run("held operation", move || {
+                    let _ = started_sender.send(());
+                    release_receiver
+                        .recv()
+                        .expect("test must release held blocking operation");
+                    Ok(1_u8)
+                })
+                .await
+        });
+        started_receiver
+            .await
+            .expect("held blocking operation must start");
+
+        let queued_started = Arc::new(AtomicBool::new(false));
+        let queued_flag = Arc::clone(&queued_started);
+        let queued_executor = executor.clone();
+        let (queued_ready_sender, queued_ready_receiver) = tokio::sync::oneshot::channel();
+        let queued = tokio::spawn(async move {
+            queued_ready_sender
+                .send(())
+                .expect("queue witness must still be listening");
+            queued_executor
+                .run("queued operation", move || {
+                    queued_flag.store(true, Ordering::SeqCst);
+                    Ok(2_u8)
+                })
+                .await
+        });
+        queued_ready_receiver
+            .await
+            .expect("queued task must reach admission");
+        assert!(
+            !queued_started.load(Ordering::SeqCst),
+            "queued work must not start before capacity returns"
+        );
+
+        release_sender
+            .send(())
+            .expect("held blocking operation must accept release");
+        assert_eq!(
+            held.await
+                .expect("held task must join")
+                .expect("held operation must succeed"),
+            1
+        );
+        assert_eq!(
+            queued
+                .await
+                .expect("queued task must join")
+                .expect("queued operation must succeed"),
+            2
+        );
+        assert!(
+            queued_started.load(Ordering::SeqCst),
+            "queued work must start after capacity returns"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocking_executor_queue_timeout_is_retryable_and_bounded() {
+        const QUEUE_TIMEOUT_MS: u64 = 25;
+        let executor = BlockingExecutor::isolated(1, QUEUE_TIMEOUT_MS);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let held_executor = executor.clone();
+        let held = tokio::spawn(async move {
+            held_executor
+                .run("held operation", move || {
+                    let _ = started_sender.send(());
+                    release_receiver
+                        .recv()
+                        .expect("test must release held blocking operation");
+                    Ok(())
+                })
+                .await
+        });
+        started_receiver
+            .await
+            .expect("held blocking operation must start");
+        let queued_executor = executor.clone();
+        let (queued_ready_sender, queued_ready_receiver) = tokio::sync::oneshot::channel();
+        let queued = tokio::spawn(async move {
+            queued_ready_sender
+                .send(())
+                .expect("timeout witness must still be listening");
+            queued_executor.run("queued operation", || Ok(())).await
+        });
+        queued_ready_receiver
+            .await
+            .expect("timed operation must reach admission");
+        tokio::time::advance(Duration::from_millis(QUEUE_TIMEOUT_MS + 1)).await;
+        let error = queued
+            .await
+            .expect("queued task must join")
+            .expect_err("queue wait beyond timeout must fail");
+        assert!(matches!(
+            error.fault(),
+            ReadFault::CapacityTimeout {
+                operation: "queued operation",
+                timeout_ms: QUEUE_TIMEOUT_MS,
+            }
+        ));
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        let context = error.context();
+        assert_eq!(context[0].value(), "queued operation");
+        assert_eq!(context[1].value(), QUEUE_TIMEOUT_MS.to_string());
+
+        release_sender
+            .send(())
+            .expect("held blocking operation must accept release");
+        held.await
+            .expect("held task must join")
+            .expect("held operation must succeed");
+        executor
+            .run("operation after timeout", || Ok(()))
+            .await
+            .expect("timed-out waiter must leave capacity reusable");
+    }
+
+    #[tokio::test]
+    async fn blocking_executor_preserves_work_error() {
+        let executor = BlockingExecutor::isolated(1, 1_000);
+        let error = executor
+            .run("refused operation", || -> Result<(), ReadError> {
+                Err(ReadError::from(ReadFault::Unsupported {
+                    capability: "probe",
+                }))
+            })
+            .await
+            .expect_err("work refusal must survive blocking executor");
+        assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn blocking_executor_classifies_worker_panic_as_join_failure() {
+        let executor = BlockingExecutor::isolated(1, 1_000);
+        let error = executor
+            .run(
+                "panicking operation",
+                || -> Result<(), rift_server::ReadError> { panic!("test blocking worker panic") },
+            )
+            .await
+            .expect_err("worker panic must become task failure");
+        let ReadFault::Task { operation, detail } = error.fault() else {
+            panic!("worker panic must classify as task failure: {error:?}");
+        };
+        assert_eq!(*operation, "panicking operation");
+        assert!(detail.contains("panic"), "{detail}");
+        executor
+            .run("operation after panic", || Ok(()))
+            .await
+            .expect("panicked worker must release its capacity permit");
+    }
+
+    #[tokio::test]
+    async fn blocking_executor_classifies_closed_queue() {
+        let executor = BlockingExecutor::isolated(1, 1_000);
+        executor.operations.close();
+        let error = executor
+            .run("closed queue operation", || Ok(()))
+            .await
+            .expect_err("closed semaphore must fail admission");
+        assert!(matches!(error.fault(), ReadFault::Task { .. }));
+    }
+
+    #[test]
+    fn serialized_change_refuses_invalid_configuration_before_operation() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let configuration_error = rift_core::Error::new(ConfigurationFault::Malformed {
+            detail: "test invalid configuration".to_owned(),
+        });
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: Arc::new(PublishedWorkspace {
+                reads: Arc::clone(&candidate.reads),
+                configuration: ConfigurationState {
+                    admitted: Err(Arc::new(configuration_error)),
+                    fingerprint: super::configuration_fingerprint(directory.path()),
+                },
+                fingerprint: candidate.fingerprint.clone(),
+                source_policy: Arc::clone(&candidate.source_policy),
+                epoch: 0,
+            }),
+            failure: None,
+        });
+        let (coherence, _invalidations) = IndexCoherence::new();
+        let changes = ChangeService::new(directory.path());
+        let operation_called = AtomicBool::new(false);
+
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &coherence,
+            &changes,
+            |_, _| {
+                operation_called.store(true, Ordering::SeqCst);
+                panic!("invalid configuration must stop before operation")
+            },
+        )?;
+        let Err(error) = outcome else {
+            panic!("invalid configuration must refuse change");
+        };
+        let data = error.data.expect("Rift error must carry typed data");
+
+        assert_eq!(data["code"], json!("configuration_invalid"));
+        assert!(!operation_called.load(Ordering::SeqCst));
         Ok(())
     }
 
@@ -2252,7 +2688,7 @@ mod tests {
         )?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight).await?;
+        let server = RiftMcp::build(directory.path(), tight, RiftMcpOptions::default()).await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
