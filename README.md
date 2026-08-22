@@ -37,8 +37,15 @@ user account. Without a version argument or `RIFT_VERSION`, each installer resol
 
 ## MCP
 
-Run `rift mcp` from a Rust codebase. Rift scans real `.rs` files into an in-memory tree-sitter index
-and exposes `search` and `get_symbol` over stdio MCP.
+Run `rift mcp` from a Rust codebase. Rift starts a native filesystem watcher, then builds its
+in-memory tree-sitter index on a Tokio-managed blocking task. External writes and Rift changes feed
+the same serialized rebuild lane.
+
+Before each current-tree read, the server reconciles the watched state against an exact workspace
+fingerprint and waits for a matching published index. It swaps complete immutable snapshots, so one
+request cannot combine files or configuration from different workspace states. `search`,
+`get_symbol`, and `nodes` run over stdio MCP; tracing writes to stderr because stdout carries the
+protocol frames.
 
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration
 uses `rift` as command and `["mcp"]` as arguments.

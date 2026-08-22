@@ -5,11 +5,8 @@ title: MCP
 <VersionBadge version="planned" />
 
 
-The Rift server terminates MCP over [Streamable
-HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports#streamable-http) on the
-port its lock file names.
-`rift mcp` is a small stdio proxy for harnesses that launch MCP servers as subprocesses: it
-forwards frames unchanged and decides nothing.
+`rift mcp` serves MCP over stdio for harnesses that launch servers as subprocesses. Stdout carries
+MCP frames; the process writes tracing events to stderr.
 
 Requests do not open connection-scoped sessions. Each call names a
 [`ProjectionId`](/docs/protocol/reference#ProjectionId), or the workspace tree when it
@@ -54,6 +51,22 @@ stale when its tree or source-catalog input no longer matches.
 Every read accepts an optional `projection` and reads the workspace tree when it is absent.
 [`rift://fs`](#resource-fs) serves file bytes and directory listings to consumers without host
 filesystem tools.
+
+### Current-tree index [#current-tree-index]
+
+<VersionBadge version="v0.0.8" languages={["Rust"]} />
+
+The server starts a native filesystem watcher before its initial scan and runs index construction
+in a bounded blocking task managed by Tokio. A filesystem event or Rift-applied change advances the
+workspace change counter and schedules work through the same serialized rebuild lane.
+
+Before serving a current-tree read, the server reconciles watcher state against an exact fingerprint
+of the admitted workspace files. It waits until the published index counter matches the reconciled
+counter, then captures the index and admitted configuration as one immutable snapshot.
+
+Rebuilds construct a complete replacement outside the async lock and publish it atomically. A
+request retains its captured snapshot through the result, and reports `freshness: "current"` only
+when that snapshot matches the reconciled workspace state.
 
 ### Revision-addressed reads [#revision-reads]
 
@@ -496,4 +509,3 @@ permanent the next time:
 
 A `limit_exceeded` also carries which limit and by how much, so a request can be resized without
 parsing the message meant for a human.
-

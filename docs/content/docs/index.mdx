@@ -3,7 +3,7 @@ title: Rift
 description: Install Rift, connect its MCP server, and read Rust workspaces.
 ---
 
-<VersionBadge version="v0.0.5" />
+<VersionBadge version="v0.0.8" />
 
 Rift is an agentic development toolkit for reading, discovering, and editing codebases.
 
@@ -46,12 +46,23 @@ client's MCP configuration — for Claude Code, `.mcp.json` in the project root:
 
 ## Rust index
 
-`rift mcp` reads `.rs` files from the current folder into one immutable in-memory snapshot.
-Tree-sitter extracts Rust declarations and syntax nodes, while the typed provider composition records
-the source-to-syntax-to-index pipeline.
+`rift mcp` starts a native filesystem watcher before it scans the current folder. The initial scan
+runs in a bounded blocking task managed by Tokio, so filesystem traversal and tree-sitter parsing do
+not block the async MCP executor.
+
+External writes and Rift changes advance the same workspace change counter and enter one serialized
+rebuild lane. Before each current-tree read, the server reconciles watcher state against an exact
+fingerprint of the admitted workspace files and waits until the published index has caught up.
+
+The server publishes the read index and admitted configuration together as one immutable snapshot.
+Each request retains its captured snapshot while later rebuilds publish newer ones, so a read never
+combines files or policy from different workspace states.
 
 The scanner skips symlinks and the `.git`, `.rift`, and `target` directories. It writes no index or
 projection state to the codebase.
+
+`rift mcp` writes tracing events to stderr. Stdout carries MCP frames, so diagnostics never enter the
+protocol stream.
 
 The MCP server advertises the read tools:
 
