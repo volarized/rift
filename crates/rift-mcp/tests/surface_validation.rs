@@ -81,6 +81,32 @@ fn corpus() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            "replace_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/lib.rs/dual",
+                "body": "pub fn dual() -> u8 { 3 }"
+            }),
+        ),
+        (
+            "replace_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/lib.rs/beacon_three",
+                "body": "pub fn beacon_three( {"
+            }),
+        ),
+    ];
+    requests.extend(patch_corpus());
+    requests.extend(revision_read_corpus());
+    requests.extend(insert_symbol_file_target_corpus());
+    requests.extend(lexical_search_corpus());
+    requests
+}
+
+/// `patch` requests: modifying, creating, and renaming a file, each proving one
+/// unified-diff arm the tool advertises.
+fn patch_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
             "patch",
             json!({
                 "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon_one() {}\n+pub fn beacon_one() -> u8 { 1 }\n"
@@ -112,24 +138,18 @@ fn corpus() -> Vec<(&'static str, Value)> {
                 "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
             }),
         ),
-        (
-            "replace_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/lib.rs/dual",
-                "body": "pub fn dual() -> u8 { 3 }"
-            }),
-        ),
-        (
-            "replace_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/lib.rs/beacon_three",
-                "body": "pub fn beacon_three( {"
-            }),
-        ),
-    ];
-    requests.extend(revision_read_corpus());
-    requests.extend(insert_symbol_file_target_corpus());
-    requests
+    ]
+}
+
+/// Search requests only the lexical search-index tier can fully answer: a multi-word
+/// prose query merging in hits identifier search alone would not surface, and a query
+/// that only `notes.md` (admitted by the default `[search.text]` extensions) answers,
+/// since identifier search never reaches a non-source file.
+fn lexical_search_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        ("search", json!({ "query": "beacon two three" })),
+        ("search", json!({ "query": "rotating legacy sensor unit" })),
+    ]
 }
 
 /// Revision-addressed requests, one per read tool: each answers from the
@@ -320,6 +340,12 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("hidden.rs"),
         "pub fn phantom_signal() {}\n",
     )?;
+    // Admitted into the lexical search-index tier by the default `[search.text]`
+    // extensions, so the corpus can prove a text-file search hit end to end.
+    fs::write(
+        directory.path().join("notes.md"),
+        "# Notes\n\nBeacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
+    )?;
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
@@ -445,6 +471,32 @@ fn tool_validators(
     Ok(validators)
 }
 
+/// Most attempts one corpus request retries before giving up on admission.
+const ADMISSION_ATTEMPTS_MAX: usize = 8;
+
+/// Calls one tool, retrying the refusal the server advertises as
+/// `retry: same_request`: the workspace's own filesystem watcher can
+/// observe a corpus change's write and move the index between one
+/// request's snapshot and its admission, and the wire contract answers
+/// that race with a bounded retry rather than a failure.
+async fn call_tool_retrying_admission(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    params: CallToolRequestParams,
+) -> TestResult<rmcp::model::CallToolResult> {
+    for _attempt in 0..ADMISSION_ATTEMPTS_MAX {
+        match client.call_tool(params.clone()).await {
+            Ok(result) => return Ok(result),
+            Err(rmcp::ServiceError::McpError(error))
+                if error
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("the server kept refusing a retryable corpus request".into())
+}
+
 #[tokio::test]
 async fn every_tool_result_validates_against_served_output_schema() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
@@ -474,9 +526,11 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                  the fixture is too large or pagination never terminates"
             );
             assert_validates(input_validator, &request, &format!("{name} request"));
-            let result = client
-                .call_tool(CallToolRequestParams::new(name).with_arguments(arguments(&request)?))
-                .await?;
+            let result = call_tool_retrying_admission(
+                &client,
+                CallToolRequestParams::new(name).with_arguments(arguments(&request)?),
+            )
+            .await?;
             let structured = result
                 .structured_content
                 .ok_or_else(|| format!("{name} must return structured content"))?;
