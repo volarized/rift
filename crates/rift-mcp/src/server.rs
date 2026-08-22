@@ -817,6 +817,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_reuses_publication_while_fingerprint_is_unchanged() -> TestResult {
+        let (directory, server) = fixture().await?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[providers.history]\nenabled = false\n",
+        )?;
+        let refreshed = server
+            .refresh_configuration(wire::ErrorPhase::Read)
+            .await
+            .map_err(|error| format!("changed file must be re-admitted: {error:?}"))?;
+        let reused = server
+            .refresh_configuration(wire::ErrorPhase::Read)
+            .await
+            .map_err(|error| format!("unchanged file must serve the current value: {error:?}"))?;
+        assert!(
+            Arc::ptr_eq(&refreshed, &reused),
+            "an unchanged fingerprint must return the published workspace, not rebuild it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn change_lane_waits_for_active_publication_before_entering() {
         let lane = Arc::new(ChangeLane::default());
         let (first_entered_sender, first_entered_receiver) = tokio::sync::oneshot::channel();
