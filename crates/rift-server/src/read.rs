@@ -216,8 +216,22 @@ impl ReadService {
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
     ) -> Result<Self, ReadError> {
-        let index = WorkspaceIndex::build(root, limits, visibility).map_err(ReadFault::index)?;
+        let span = tracing::info_span!(
+            "index.build",
+            component = "index",
+            files_count = tracing::field::Empty,
+            tree_revision = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let index = WorkspaceIndex::build(root, limits, visibility).map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
         let snapshot = captured_snapshot(&index, None);
+        span.record("files_count", index.files().len());
+        span.record("tree_revision", snapshot.tree_revision.0.as_str());
+        span.record("outcome", "ok");
         Ok(Self {
             index,
             snapshot,

@@ -8,6 +8,10 @@ use std::process::ExitCode;
 #[cfg(test)]
 use clap::{Command, CommandFactory};
 use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
+
+/// Default filter keeps dependency diagnostics out of MCP stderr.
+const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info";
 
 #[derive(Debug, Parser)]
 #[command(name = "rift", version, about = "agentic development toolkit")]
@@ -40,6 +44,7 @@ fn cli_command() -> Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    initialize_tracing();
     match run(Cli::parse()).await {
         Ok(Some(outcome)) => {
             println!("{outcome}");
@@ -54,6 +59,18 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Installs process tracing with human diagnostics on stderr.
+fn initialize_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
+        )
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 #[derive(Debug)]

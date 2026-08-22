@@ -75,6 +75,11 @@ impl StdioServeError {
 /// Dropping this future closes its owned MCP service. An admitted initial
 /// index scan still finishes in the bounded blocking executor.
 pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
+    tracing::info!(
+        component = "mcp",
+        transport = "stdio",
+        "MCP server starting"
+    );
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
         .await
         .map_err(StdioServeError::Read)?;
@@ -82,8 +87,16 @@ pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
         .serve(transport::stdio())
         .await
         .map_err(|error| StdioServeError::Initialize(Box::new(error)))?;
+    tracing::info!(component = "mcp", transport = "stdio", "MCP server ready");
     let reason = service.waiting().await.map_err(StdioServeError::Task)?;
-    quit_reason_result(reason)
+    let outcome = quit_reason_result(reason);
+    tracing::info!(
+        component = "mcp",
+        transport = "stdio",
+        outcome = if outcome.is_ok() { "ok" } else { "error" },
+        "MCP server stopped"
+    );
+    outcome
 }
 
 /// Maps a service quit reason to its outcome.
