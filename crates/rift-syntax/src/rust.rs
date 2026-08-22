@@ -686,6 +686,10 @@ pub struct RustSyntaxProvider {
 }
 
 impl RustSyntaxProvider {
+    /// File extensions this provider parses, without their leading dot. The workspace walk
+    /// admits a file as source only when some shipped provider declares its extension.
+    pub const SOURCE_EXTENSIONS: &'static [&'static str] = &["rs"];
+
     /// Constructs provider with explicit bounds.
     #[must_use]
     pub const fn new(limits: RustSyntaxLimits) -> Self {
