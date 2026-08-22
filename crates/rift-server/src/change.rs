@@ -60,6 +60,53 @@ enum Resolution {
     },
 }
 
+/// Where one `insert_symbol` request lands, once `anchor`/`file`/
+/// `create_missing` have been proven mutually consistent.
+#[derive(Debug)]
+enum InsertTarget<'a> {
+    /// Insert beside the resolved declaration of the named anchor symbol.
+    BesideAnchor(&'a str),
+    /// Insert at the boundary of the named file, creating it first when
+    /// `create_missing` is set and it does not exist.
+    AtFile {
+        /// File the body lands in.
+        file: &'a rift_protocol::read::ProjectPath,
+        /// Whether a missing file may be created instead of refusing.
+        create_missing: bool,
+    },
+}
+
+/// Classifies an `insert_symbol` request into its target, holding every
+/// refusal arm for an illegal combination of `anchor`, `file`, and
+/// `create_missing`.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when both or neither of `anchor` and `file` are
+/// set, or when `create_missing` is set together with an `anchor` target.
+fn insert_target(params: &InsertSymbolParams) -> Result<InsertTarget<'_>, ReadError> {
+    match (params.anchor.as_ref(), params.file.as_ref()) {
+        (Some(_), Some(_)) => Err(ReadFault::invalid(
+            "file",
+            "insert_symbol accepts exactly one of anchor or file, not both",
+        )),
+        (None, None) => Err(ReadFault::invalid(
+            "anchor",
+            "insert_symbol requires exactly one of anchor or file",
+        )),
+        (Some(_), None) if params.create_missing => Err(ReadFault::invalid(
+            "create_missing",
+            "cannot be set with an anchor target; an anchor always addresses \
+             an existing file",
+        )),
+        (Some(anchor), None) => Ok(InsertTarget::BesideAnchor(&anchor.0)),
+        (None, Some(file)) => Ok(InsertTarget::AtFile {
+            file,
+            create_missing: params.create_missing,
+        }),
+    }
+}
+
 impl ChangeService {
     /// Builds a change service writing the given workspace root.
     #[must_use]
@@ -109,30 +156,14 @@ impl ChangeService {
         reads: &ReadService,
         params: &InsertSymbolParams,
     ) -> Result<ChangeResult, ReadError> {
-        match (params.anchor.as_ref(), params.file.as_ref()) {
-            (Some(_), Some(_)) => Err(ReadFault::invalid(
-                "file",
-                "insert_symbol accepts exactly one of anchor or file, not both",
-            )),
-            (None, None) => Err(ReadFault::invalid(
-                "anchor",
-                "insert_symbol requires exactly one of anchor or file",
-            )),
-            (Some(_), None) if params.create_missing => Err(ReadFault::invalid(
-                "create_missing",
-                "cannot be set with an anchor target; an anchor always addresses \
-                 an existing file",
-            )),
-            (Some(anchor), None) => {
-                self.insert_beside_anchor(reads, &anchor.0, params.position, &params.body)
+        match insert_target(params)? {
+            InsertTarget::BesideAnchor(anchor) => {
+                self.insert_beside_anchor(reads, anchor, params.position, &params.body)
             }
-            (None, Some(file)) => self.insert_at_file(
-                reads,
+            InsertTarget::AtFile {
                 file,
-                params.position,
-                &params.body,
-                params.create_missing,
-            ),
+                create_missing,
+            } => self.insert_at_file(reads, file, params.position, &params.body, create_missing),
         }
     }
 
