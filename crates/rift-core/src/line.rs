@@ -46,6 +46,14 @@ impl LineEnding {
     }
 }
 
+/// Segments `source` into lines that keep their exact ending bytes, so re-joining the pieces
+/// reproduces `source` byte-for-byte. A final line without a newline is yielded as-is; an empty
+/// `source` yields nothing.
+#[must_use]
+pub fn lines_inclusive(source: &str) -> std::str::SplitInclusive<'_, char> {
+    source.split_inclusive(char::from(LINE_FEED))
+}
+
 /// Strips `line`'s ending: `\r\n` first, then `\n`, leaving `line` unchanged when neither
 /// matches.
 #[must_use]
@@ -94,7 +102,17 @@ pub fn line_start_offset(source: &str, line: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineEnding, line_number_at, line_start_offset, without_ending};
+    use super::{LineEnding, line_number_at, line_start_offset, lines_inclusive, without_ending};
+
+    #[test]
+    fn lines_inclusive_round_trips_lf_crlf_and_missing_trailing_newline() {
+        for source in ["one\ntwo\n", "one\r\ntwo\r\n", "one\r\ntwo", ""] {
+            let rejoined: String = lines_inclusive(source).collect();
+            assert_eq!(rejoined, source);
+        }
+        let segments: Vec<&str> = lines_inclusive("one\r\ntwo\nthree").collect();
+        assert_eq!(segments, ["one\r\n", "two\n", "three"]);
+    }
 
     #[test]
     fn line_ending_of_reports_lf_and_crlf_and_neither() {
