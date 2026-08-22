@@ -503,11 +503,13 @@ impl ExecutionConfiguration {
     }
 }
 
-/// The `[search]` table. Search runs on a lexical index with nothing to
-/// configure; `embedding` names the model that adds dense ranking on top,
-/// and `text` admits non-source text files into that lexical index.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+/// The `[search]` table. Search runs on a lexical index; `pool_slots` and
+/// `busy_timeout` bound the `SQLite` connections behind it, `embedding`
+/// names the model that adds dense ranking on top, and `text` admits
+/// non-source text files into the lexical index.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_search_ranges)]
 pub struct SearchConfiguration {
     /// The embedding model identifier. Vectors are stored per model, so
     /// changing the value rebuilds the dense index; absent keeps search
@@ -518,13 +520,70 @@ pub struct SearchConfiguration {
     /// Which non-source text files join the lexical index alongside code
     /// symbols.
     pub text: TextSearchConfiguration,
+    /// Pooled `SQLite` connections the lexical search index may open at
+    /// once, 1 to 16.
+    #[schemars(range(min = 1, max = 16))]
+    #[serde(default = "default_search_pool_slots")]
+    pub pool_slots: u64,
+    /// Wall-clock budget one lexical search connection waits for `SQLite`'s
+    /// busy lock before `SQLITE_BUSY`, 100ms to 30s.
+    #[serde(default = "default_search_busy_timeout")]
+    pub busy_timeout: Duration,
+}
+
+impl Default for SearchConfiguration {
+    fn default() -> Self {
+        Self {
+            embedding: None,
+            text: TextSearchConfiguration::default(),
+            pool_slots: SEARCH_POOL_SLOTS_DEFAULT,
+            busy_timeout: default_search_busy_timeout(),
+        }
+    }
 }
 
 impl SearchConfiguration {
-    /// The model-identifier rule, then the `[search.text]` table's bounds, in key order.
+    /// The model-identifier rule, then the `[search.text]` table's bounds,
+    /// then this table's own numeric bounds, in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        embedding_violation(self.embedding.as_deref()).or_else(|| self.text.violation())
+        embedding_violation(self.embedding.as_deref())
+            .or_else(|| self.text.violation())
+            .or_else(|| {
+                first_out_of_range([
+                    (
+                        "search.pool_slots",
+                        self.pool_slots,
+                        1,
+                        SEARCH_POOL_SLOTS_MAX,
+                    ),
+                    (
+                        "search.busy_timeout",
+                        self.busy_timeout.milliseconds(),
+                        SEARCH_BUSY_TIMEOUT_MS_MIN,
+                        SEARCH_BUSY_TIMEOUT_MS_MAX,
+                    ),
+                ])
+            })
     }
+}
+
+/// `search.pool_slots` connections admitted, at most.
+pub const SEARCH_POOL_SLOTS_MAX: u64 = 16;
+/// `search.pool_slots` value used when the key is absent.
+const SEARCH_POOL_SLOTS_DEFAULT: u64 = 4;
+/// Milliseconds `search.busy_timeout` may hold, at least.
+pub const SEARCH_BUSY_TIMEOUT_MS_MIN: u64 = 100;
+/// Milliseconds `search.busy_timeout` may hold, at most: thirty seconds.
+pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
+/// Milliseconds `search.busy_timeout` holds when the key is absent.
+const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 1_000;
+
+fn default_search_pool_slots() -> u64 {
+    SEARCH_POOL_SLOTS_DEFAULT
+}
+
+fn default_search_busy_timeout() -> Duration {
+    Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_DEFAULT)
 }
 
 /// Whether `embedding` is a valid model identifier, when present.
@@ -1235,6 +1294,11 @@ mod tests {
         assert!(configuration.providers.history.enabled);
         assert_eq!(configuration.providers.history.max_revisions, 500);
         assert_eq!(configuration.search.embedding, None);
+        assert_eq!(configuration.search.pool_slots, 4);
+        assert_eq!(
+            configuration.search.busy_timeout,
+            Duration::from_millis(1_000)
+        );
         assert!(configuration.source.include.is_empty());
         assert!(configuration.source.exclude.is_empty());
         assert!(configuration.source.respect_gitignore);
@@ -1416,6 +1480,53 @@ mod tests {
             configuration.validate(),
             Err(ConfigurationViolation::EmbeddingModelInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn test_search_pool_slots_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for slots in [0, SEARCH_POOL_SLOTS_MAX + 1] {
+            configuration.search.pool_slots = slots;
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "search.pool_slots",
+                        ..
+                    })
+                ),
+                "pool_slots {slots} must be refused"
+            );
+        }
+        for slots in [1, SEARCH_POOL_SLOTS_MAX] {
+            configuration.search.pool_slots = slots;
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_search_busy_timeout_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for timeout_ms in [
+            SEARCH_BUSY_TIMEOUT_MS_MIN - 1,
+            SEARCH_BUSY_TIMEOUT_MS_MAX + 1,
+        ] {
+            configuration.search.busy_timeout = Duration::from_millis(timeout_ms);
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "search.busy_timeout",
+                        ..
+                    })
+                ),
+                "busy_timeout {timeout_ms}ms must be refused"
+            );
+        }
+        for timeout_ms in [SEARCH_BUSY_TIMEOUT_MS_MIN, SEARCH_BUSY_TIMEOUT_MS_MAX] {
+            configuration.search.busy_timeout = Duration::from_millis(timeout_ms);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
     }
 
     #[test]
@@ -1909,6 +2020,22 @@ mod tests {
                 "embedding max",
                 &search["embedding"]["maxLength"],
                 json!(EMBEDDING_MODEL_BYTES_MAX),
+            ),
+            ("pool slots min", &search["pool_slots"]["minimum"], json!(1)),
+            (
+                "pool slots max",
+                &search["pool_slots"]["maximum"],
+                json!(SEARCH_POOL_SLOTS_MAX),
+            ),
+            (
+                "pool slots default",
+                &search["pool_slots"]["default"],
+                json!(4),
+            ),
+            (
+                "busy timeout default",
+                &search["busy_timeout"]["default"],
+                json!("1s"),
             ),
             (
                 "source include max",

@@ -6273,7 +6273,7 @@
       }
     },
     {
-      "description": "Searches indexed Rust declarations and source lines by lexical `query`.\n`rev` searches a version-control revision instead of the current tree.\nUse `get_symbol` when the declaration name is known.",
+      "description": "Searches indexed Rust declarations and source lines by lexical `query`, merged with\nfull-text matches from admitted `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.",
       "input_schema": {
         "$defs": {
           "Cursor": {

@@ -389,8 +389,17 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search runs on a lexical index with nothing to\nconfigure; `embedding` names the model that adds dense ranking on top,\nand `text` admits non-source text files into that lexical index.",
+      "description": "The `[search]` table. Search runs on a lexical index; `pool_slots` and\n`busy_timeout` bound the `SQLite` connections behind it, `embedding`\nnames the model that adds dense ranking on top, and `text` admits\nnon-source text files into the lexical index.",
       "properties": {
+        "busy_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "1s",
+          "description": "Wall-clock budget one lexical search connection waits for `SQLite`'s\nbusy lock before `SQLITE_BUSY`, 100ms to 30s.",
+          "rift:range": {
+            "max": "30s",
+            "min": "100ms"
+          }
+        },
         "embedding": {
           "description": "The embedding model identifier. Vectors are stored per model, so\nchanging the value rebuilds the dense index; absent keeps search\nlexical.",
           "maxLength": 128,
@@ -399,6 +408,14 @@
             "string",
             "null"
           ]
+        },
+        "pool_slots": {
+          "default": 4,
+          "description": "Pooled `SQLite` connections the lexical search index may open at\nonce, 1 to 16.",
+          "format": "uint64",
+          "maximum": 16,
+          "minimum": 1,
+          "type": "integer"
         },
         "text": {
           "$ref": "#/$defs/TextSearchConfiguration",
@@ -536,6 +553,8 @@
     "search": {
       "$ref": "#/$defs/SearchConfiguration",
       "default": {
+        "busy_timeout": "1s",
+        "pool_slots": 4,
         "text": {
           "extensions": [
             "md",
