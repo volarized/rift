@@ -83,8 +83,24 @@ pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
         .await
         .map_err(StdioServeError::Read)?;
+    serve_connection(server, transport::stdio()).await
+}
+
+/// Serves one built server over `transport`, owning the index supervisor
+/// through initialization, quit, and shutdown.
+///
+/// Split from [`serve_stdio`] so initialization failure and quit handling
+/// are testable without live stdio I/O.
+async fn serve_connection<Transport, TransportError, Adapter>(
+    server: RiftMcp,
+    transport: Transport,
+) -> Result<(), StdioServeError>
+where
+    Transport: rmcp::transport::IntoTransport<rmcp::service::RoleServer, TransportError, Adapter>,
+    TransportError: std::error::Error + Send + Sync + 'static,
+{
     let supervisor = server.index_supervisor();
-    let service = match server.serve(transport::stdio()).await {
+    let service = match server.serve(transport).await {
         Ok(service) => service,
         Err(error) => {
             let _ = supervisor.shutdown().await;
@@ -125,8 +141,50 @@ mod tests {
     use rift_index::WorkspaceIndexLimits;
     use rmcp::service::{QuitReason, ServerInitializeError};
 
-    use super::{StdioServeError, quit_reason_result};
+    use super::{StdioServeError, quit_reason_result, serve_connection};
     use crate::RiftMcp;
+
+    async fn built_server() -> RiftMcp {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")
+            .expect("fixture source");
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+            .await
+            .expect("server must build");
+        // The TempDir guard is dropped deliberately: these connection tests
+        // never read the workspace again.
+        server
+    }
+
+    #[tokio::test]
+    async fn closed_transport_fails_initialization_and_shuts_the_supervisor_down() {
+        let server = built_server().await;
+        let supervisor = server.index_supervisor();
+        let (server_transport, client_transport) = tokio::io::duplex(1024);
+        drop(client_transport);
+        let error = serve_connection(server, server_transport)
+            .await
+            .expect_err("a closed transport must fail initialization");
+        assert!(matches!(error, StdioServeError::Initialize(_)));
+        supervisor
+            .shutdown()
+            .await
+            .expect("initialization failure must leave the supervisor stopped");
+    }
+
+    #[tokio::test]
+    async fn cancelled_client_ends_the_connection_cleanly() {
+        use rmcp::ServiceExt as _;
+        let server = built_server().await;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let connection = tokio::spawn(serve_connection(server, server_transport));
+        let client = ().serve(client_transport).await.expect("client must initialize");
+        client.cancel().await.expect("client must cancel");
+        connection
+            .await
+            .expect("serve task must join")
+            .expect("a cancelled client must end the connection cleanly");
+    }
 
     #[test]
     fn unexpected_quit_has_stable_message_without_source() {

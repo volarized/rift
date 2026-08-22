@@ -53,7 +53,7 @@ impl BlockingExecutor {
 
     /// Creates an isolated executor for deterministic capacity tests.
     #[cfg(test)]
-    fn isolated(operations_max: usize, queue_timeout_ms: u64) -> Self {
+    pub(crate) fn isolated(operations_max: usize, queue_timeout_ms: u64) -> Self {
         assert!(
             operations_max > 0,
             "blocking operation capacity must be positive: operations_max={operations_max}"
@@ -641,7 +641,7 @@ mod tests {
     use super::{BlockingExecutor, ChangeLane, Parameters, RiftMcp};
     use crate::validation::{
         ConfigurationState, IndexState, IndexValidation, PublishedWorkspace, WorkspaceCandidate,
-        build_workspace_candidate, configuration_fingerprint,
+        build_workspace_candidate, configuration_fingerprint, record_rebuild_failure,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -758,10 +758,8 @@ mod tests {
             WorkspaceIndexLimits::new(4, 60, 60, 4, 100).map_err(|error| error.to_string())?;
         let server = RiftMcp::build(directory.path(), tight).await?;
 
-        fs::write(
-            &path,
-            format!("pub fn oversized() {{}}\n{}", " ".repeat(80)),
-        )?;
+        let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
+        fs::write(&path, oversized)?;
         let error = get_symbol(&server, "oversized")
             .await
             .expect_err("oversized external edit must refuse a current answer");
@@ -1379,11 +1377,7 @@ mod tests {
     #[tokio::test]
     async fn applied_change_reports_failed_snapshot_rebuild_as_warning() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(
-            directory.path().join("lib.rs"),
-            "pub fn beacon() {}
-",
-        )?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
         let server = RiftMcp::build(directory.path(), tight).await?;
@@ -1488,6 +1482,165 @@ pub fn beacon() -> u64 {
         );
         let wire = data.data.ok_or("wire error data must be present")?;
         assert_eq!(wire["code"], json!("invalid_request"));
+        Ok(())
+    }
+
+    #[test]
+    fn serialized_change_refuses_when_index_already_moved() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new();
+        validation
+            .observe()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &validation,
+            &changes,
+            |_, _| panic!("a moved index must refuse before the operation runs"),
+        )?;
+        let Err(error) = outcome else {
+            panic!("a moved index must refuse the change");
+        };
+        assert!(
+            error
+                .message
+                .contains("index changed before operation admission"),
+            "unexpected refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applied_change_reports_lost_observation_as_stale_snapshot() -> TestResult {
+        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, receiver) = IndexValidation::new();
+        drop(receiver);
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &validation,
+            &changes,
+            |_, _| {
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        paths: Vec::new(),
+                        edits: Vec::new(),
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+            panic!("the applied change must survive a lost observation");
+        };
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(
+            summary.diagnostics[0].message.contains("could not refresh"),
+            "diagnostic must explain the stale snapshot: {:?}",
+            summary.diagnostics[0]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_fail_fast_after_watcher_failure() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let _ = server.validation.observe_watch_failure();
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a failed watcher must refuse current reads");
+        assert!(
+            error.message.contains("filesystem watcher failed"),
+            "unexpected refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorded_rebuild_failure_serves_reads_the_typed_error() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let lane_guard = server.change_lane.admission.lock().await;
+        let epoch = server
+            .validation
+            .observe()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        let published = Arc::clone(&server.published);
+        let validation = Arc::clone(&server.validation);
+        let recorded = tokio::task::spawn_blocking(move || {
+            record_rebuild_failure(
+                &published,
+                &validation,
+                epoch,
+                ReadFault::unavailable("test rebuild", "injected failure"),
+            )
+        })
+        .await?;
+        assert!(
+            recorded,
+            "the failure must be recorded at the current epoch"
+        );
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a recorded rebuild failure must refuse current reads");
+        assert!(
+            error.message.contains("injected failure"),
+            "unexpected refusal: {error:?}"
+        );
+        drop(lane_guard);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reads_time_out_while_publication_is_stalled() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        // Advance the observed epoch without an invalidation signal, so no
+        // rebuild ever publishes a matching snapshot and the read must wait.
+        server
+            .validation
+            .observed_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a stalled publication must miss the freshness deadline");
+        assert!(
+            error.message.contains("index freshness deadline elapsed"),
+            "unexpected refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn traced_read_reconciles_under_an_active_subscriber() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_directory, server) = fixture().await?;
+        let result = get_symbol(&server, "beacon")
+            .await
+            .map_err(|error| format!("traced read must serve: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
         Ok(())
     }
 }

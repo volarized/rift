@@ -393,28 +393,38 @@ pub(crate) fn workspace_watcher(
     let event_root = watched_root.clone();
     let validation = Arc::clone(validation);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-        if let Ok(event) = result {
-            if validation.observe_event(&event_root, &event).is_err() {
-                tracing::error!(
-                    component = "index",
-                    operation = "watch.observe",
-                    "index watch failed"
-                );
-            }
-        } else {
-            let _ = validation.observe_watch_failure();
-            tracing::warn!(
-                component = "index",
-                operation = "watch.receive",
-                "index watch backend reported failure"
-            );
-        }
+        report_watch_outcome(&event_root, &validation, result);
     })
     .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     watcher
         .watch(&watched_root, RecursiveMode::Recursive)
         .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     Ok(watcher)
+}
+
+/// Observes one watcher callback: a delivered event enters admission, and a
+/// backend failure marks the watch unhealthy.
+pub(crate) fn report_watch_outcome(
+    root: &Path,
+    validation: &IndexValidation,
+    outcome: notify::Result<Event>,
+) {
+    let Ok(event) = outcome else {
+        let _ = validation.observe_watch_failure();
+        tracing::warn!(
+            component = "index",
+            operation = "watch.receive",
+            "index watch backend reported failure"
+        );
+        return;
+    };
+    if validation.observe_event(root, &event).is_err() {
+        tracing::error!(
+            component = "index",
+            operation = "watch.observe",
+            "index watch failed"
+        );
+    }
 }
 
 /// Whether one native event can change visible Rust source or its policy.
@@ -485,6 +495,28 @@ pub(crate) async fn initial_workspace(
     validation: &IndexValidation,
     blocking: &BlockingExecutor,
 ) -> Result<Arc<PublishedWorkspace>, ReadError> {
+    initial_workspace_with(
+        root,
+        limits,
+        validation,
+        blocking,
+        build_workspace_candidate,
+    )
+    .await
+}
+
+/// Runs the bounded capture loop over an injectable capture, so tests can
+/// force each retry arm deterministically instead of racing the filesystem.
+pub(crate) async fn initial_workspace_with(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    validation: &IndexValidation,
+    blocking: &BlockingExecutor,
+    capture: impl Fn(&Path, WorkspaceIndexLimits, u64) -> Result<WorkspaceCandidate, ReadError>
+    + Clone
+    + Send
+    + 'static,
+) -> Result<Arc<PublishedWorkspace>, ReadError> {
     for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
         let epoch = validation.observed_epoch();
         let build_root = root.to_path_buf();
@@ -495,9 +527,10 @@ pub(crate) async fn initial_workspace(
             epoch,
             attempt
         );
+        let attempt_capture = capture.clone();
         let built = blocking
             .run("initial index build", move || {
-                build_workspace_candidate(&build_root, limits, epoch)
+                attempt_capture(&build_root, limits, epoch)
             })
             .instrument(span)
             .await?;
@@ -739,13 +772,13 @@ pub(crate) fn publish_rebuild_after(
     let mut state = published.blocking_write();
     after_state_lock();
     let observed_epoch = validation.observed_epoch();
-    if candidate.epoch != observed_epoch {
-        drop(state);
-        drop(publication);
-        return RebuildOutcome::Superseded;
-    }
-    validation.replace_source_policy_locked(Arc::clone(&candidate.source_policy));
+    let source_policy = Arc::clone(&candidate.source_policy);
+    // IndexState::publish owns the still-current check, so a superseded
+    // candidate is rejected in exactly one place.
     let published = state.publish(candidate, observed_epoch);
+    if published {
+        validation.replace_source_policy_locked(source_policy);
+    }
     drop(state);
     drop(publication);
     if published {
@@ -1204,6 +1237,213 @@ mod tests {
             ReadFault::unavailable("test rebuild", "superseded failure")
         ));
         assert!(state.blocking_read().failure.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn watch_backend_failure_marks_the_watch_unhealthy() {
+        let (validation, _receiver) = IndexValidation::new();
+        let root = std::path::Path::new("/rift-workspace");
+        super::report_watch_outcome(
+            root,
+            &validation,
+            Err(notify::Error::generic("test backend failure")),
+        );
+        assert!(validation.watch_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn watch_event_after_supervisor_loss_marks_the_watch_unhealthy() {
+        let (validation, receiver) = IndexValidation::new();
+        drop(receiver);
+        let root = std::path::Path::new("/rift-workspace");
+        let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("rift.toml"));
+        super::report_watch_outcome(root, &validation, Ok(event));
+        assert!(validation.watch_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn access_events_never_reach_admission() {
+        use notify::event::AccessKind;
+        let (validation, _receiver) = IndexValidation::new();
+        let root = std::path::Path::new("/rift-workspace");
+        let path = root.join("lib.rs");
+        let event = Event::new(EventKind::Access(AccessKind::Any)).add_path(path.clone());
+        assert!(!relevant_watch_event(root, &validation, &event));
+        assert!(!super::watch_kind_reaches_path(
+            root,
+            &validation,
+            EventKind::Access(AccessKind::Any),
+            &path
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_configuration_fingerprints_as_missing() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rift.toml");
+        fs::write(&path, "[providers.history]\nenabled = true\n")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))?;
+        let fingerprint = super::configuration_fingerprint(directory.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        assert_eq!(fingerprint, ConfigurationFingerprint::MissingOrUnreadable);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_configuration_bytes_fingerprint_as_missing() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("rift.toml"))?;
+        assert_eq!(
+            super::configuration_fingerprint(directory.path()),
+            ConfigurationFingerprint::MissingOrUnreadable
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_a_supervisor_that_misses_its_deadline() -> TestResult {
+        let (validation, _receiver) = IndexValidation::new();
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        *validation.task.lock().await = Some(stuck);
+        let supervisor = super::IndexSupervisor {
+            validation: Arc::clone(&validation),
+        };
+        let error = supervisor
+            .shutdown()
+            .await
+            .expect_err("a stuck supervisor must miss the shutdown deadline");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        supervisor
+            .shutdown()
+            .await
+            .map_err(|error| format!("second shutdown must be idempotent: {error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_is_superseded_when_epoch_already_moved() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let (validation, _receiver) = IndexValidation::new();
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let state = RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let outcome = super::rebuild_workspace_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            7,
+        )?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_admission_fails_after_watcher_failure() {
+        let (validation, receiver) = IndexValidation::new();
+        drop(receiver);
+        let _ = validation.observe_watch_failure();
+        let error = super::admit_rebuild(&validation, 0)
+            .expect_err("a failed watcher must refuse rebuild admission");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_records_rebuild_failure_and_notifies_waiters() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, invalidations) = IndexValidation::new();
+        let current = stable_candidate(directory.path(), 0)?;
+        let published = Arc::new(RwLock::new(IndexState {
+            current,
+            failure: None,
+        }));
+        let watcher = super::workspace_watcher(directory.path(), &validation)
+            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let supervisor = tokio::spawn(super::run_index_supervisor(
+            watcher,
+            invalidations,
+            super::IndexSupervisorContext {
+                root: directory.path().join("vanished"),
+                limits: WorkspaceIndexLimits::default(),
+                published: Arc::clone(&published),
+                change_lane: Arc::new(crate::server::ChangeLane::default()),
+                validation: Arc::clone(&validation),
+                blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
+            },
+        ));
+        let notified = validation.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let epoch = validation
+            .observe()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        notified.as_mut().await;
+        let state = published.read().await;
+        let (_, failure) = state.snapshot();
+        drop(state);
+        let (failed_epoch, error) = failure.ok_or("rebuild failure must be recorded")?;
+        assert_eq!(failed_epoch, epoch);
+        // A vanished root refuses at canonical-root resolution.
+        assert_eq!(error.descriptor().code(), "configuration_invalid");
+        validation.cancellation.cancel();
+        supervisor.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_capture_fails_after_bounded_attempts_of_epoch_movement() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) = IndexValidation::new();
+        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
+        let moving = Arc::clone(&validation);
+        let error = super::initial_workspace_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &validation,
+            &blocking,
+            move |root, limits, epoch| {
+                // Every capture observes one more filesystem event, so no
+                // attempt ever sees a stable epoch.
+                moving.observe()?;
+                super::build_workspace_candidate(root, limits, epoch)
+            },
+        )
+        .await
+        .expect_err("movement during every capture must exhaust bounded attempts");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_capture_fails_while_configuration_keeps_moving() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) = IndexValidation::new();
+        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
+        let error = super::initial_workspace_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &validation,
+            &blocking,
+            |_, _, _| Ok(WorkspaceCandidate::ConfigurationChanged),
+        )
+        .await
+        .expect_err("a configuration that keeps moving must exhaust capture attempts");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
         Ok(())
     }
 }
