@@ -236,13 +236,6 @@
                 "additionalProperties": false,
                 "description": "Everything in scope is here, so a fact that is missing is a fact that does not exist.",
                 "properties": {
-                  "origins": {
-                    "description": "Provider revisions that contributed this family, in merge precedence order. Empty\nonly when Rift establishes coverage without a provider.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
-                  },
                   "scope": {
                     "$ref": "#/$defs/CoverageScope",
                     "description": "What the claim covers."
@@ -254,8 +247,7 @@
                 },
                 "required": [
                   "state",
-                  "scope",
-                  "origins"
+                  "scope"
                 ],
                 "type": "object"
               },
@@ -271,13 +263,6 @@
                       "string",
                       "null"
                     ]
-                  },
-                  "origins": {
-                    "description": "Provider revisions that contributed available facts, in merge precedence order.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
                   },
                   "reason": {
                     "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
@@ -296,8 +281,7 @@
                 "required": [
                   "state",
                   "scope",
-                  "reason",
-                  "origins"
+                  "reason"
                 ],
                 "type": "object"
               },
@@ -305,13 +289,6 @@
                 "additionalProperties": false,
                 "description": "The family was never produced at all, so there is nothing here to be complete about.",
                 "properties": {
-                  "origins": {
-                    "description": "Provider revisions consulted before reaching this state. Empty for `unsupported`\nand `not_applicable`.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
-                  },
                   "reason": {
                     "description": "Which of the two this is, in words: the feature no provider has, or the concept\nthe language lacks.",
                     "maxLength": 4096,
@@ -329,8 +306,7 @@
                 "required": [
                   "state",
                   "scope",
-                  "reason",
-                  "origins"
+                  "reason"
                 ],
                 "type": "object"
               }
@@ -959,45 +935,6 @@
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
-          },
-          "ProviderId": {
-            "description": "Stable identity of one provider implementation. The identity remains unchanged across\nprovider restarts and fact revisions, so callers can compare origins from separate\nanswers.",
-            "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
-            "type": "string"
-          },
-          "ProviderOrigin": {
-            "additionalProperties": false,
-            "description": "The immutable provider state used for one fact-family answer. A provider publishes a new\n`revision` only after it has finished deriving facts from one workspace tree and source\ncatalog revision.",
-            "properties": {
-              "freshness": {
-                "$ref": "#/$defs/Freshness",
-                "description": "Whether both input revisions equal the answer's captured revisions."
-              },
-              "provider": {
-                "$ref": "#/$defs/ProviderId",
-                "description": "Stable identity of the provider that contributed facts."
-              },
-              "revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the immutable provider fact revision."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision from which the provider derived these facts."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Tree revision from which the provider derived this fact revision."
-              }
-            },
-            "required": [
-              "provider",
-              "revision",
-              "tree_revision",
-              "freshness",
-              "source_revision"
-            ],
-            "type": "object"
           },
           "ReadSnapshot": {
             "additionalProperties": false,
@@ -3047,13 +2984,6 @@
                 "additionalProperties": false,
                 "description": "Everything in scope is here, so a fact that is missing is a fact that does not exist.",
                 "properties": {
-                  "origins": {
-                    "description": "Provider revisions that contributed this family, in merge precedence order. Empty\nonly when Rift establishes coverage without a provider.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
-                  },
                   "scope": {
                     "$ref": "#/$defs/CoverageScope",
                     "description": "What the claim covers."
@@ -3065,8 +2995,7 @@
                 },
                 "required": [
                   "state",
-                  "scope",
-                  "origins"
+                  "scope"
                 ],
                 "type": "object"
               },
@@ -3082,13 +3011,6 @@
                       "string",
                       "null"
                     ]
-                  },
-                  "origins": {
-                    "description": "Provider revisions that contributed available facts, in merge precedence order.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
                   },
                   "reason": {
                     "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
@@ -3107,8 +3029,7 @@
                 "required": [
                   "state",
                   "scope",
-                  "reason",
-                  "origins"
+                  "reason"
                 ],
                 "type": "object"
               },
@@ -3116,13 +3037,6 @@
                 "additionalProperties": false,
                 "description": "The family was never produced at all, so there is nothing here to be complete about.",
                 "properties": {
-                  "origins": {
-                    "description": "Provider revisions consulted before reaching this state. Empty for `unsupported`\nand `not_applicable`.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
-                  },
                   "reason": {
                     "description": "Which of the two this is, in words: the feature no provider has, or the concept\nthe language lacks.",
                     "maxLength": 4096,
@@ -3140,8 +3054,7 @@
                 "required": [
                   "state",
                   "scope",
-                  "reason",
-                  "origins"
+                  "reason"
                 ],
                 "type": "object"
               }
@@ -3577,45 +3490,6 @@
             "required": [
               "role",
               "range"
-            ],
-            "type": "object"
-          },
-          "ProviderId": {
-            "description": "Stable identity of one provider implementation. The identity remains unchanged across\nprovider restarts and fact revisions, so callers can compare origins from separate\nanswers.",
-            "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
-            "type": "string"
-          },
-          "ProviderOrigin": {
-            "additionalProperties": false,
-            "description": "The immutable provider state used for one fact-family answer. A provider publishes a new\n`revision` only after it has finished deriving facts from one workspace tree and source\ncatalog revision.",
-            "properties": {
-              "freshness": {
-                "$ref": "#/$defs/Freshness",
-                "description": "Whether both input revisions equal the answer's captured revisions."
-              },
-              "provider": {
-                "$ref": "#/$defs/ProviderId",
-                "description": "Stable identity of the provider that contributed facts."
-              },
-              "revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the immutable provider fact revision."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision from which the provider derived these facts."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Tree revision from which the provider derived this fact revision."
-              }
-            },
-            "required": [
-              "provider",
-              "revision",
-              "tree_revision",
-              "freshness",
-              "source_revision"
             ],
             "type": "object"
           },
@@ -7481,13 +7355,6 @@
                 "additionalProperties": false,
                 "description": "Everything in scope is here, so a fact that is missing is a fact that does not exist.",
                 "properties": {
-                  "origins": {
-                    "description": "Provider revisions that contributed this family, in merge precedence order. Empty\nonly when Rift establishes coverage without a provider.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
-                  },
                   "scope": {
                     "$ref": "#/$defs/CoverageScope",
                     "description": "What the claim covers."
@@ -7499,8 +7366,7 @@
                 },
                 "required": [
                   "state",
-                  "scope",
-                  "origins"
+                  "scope"
                 ],
                 "type": "object"
               },
@@ -7516,13 +7382,6 @@
                       "string",
                       "null"
                     ]
-                  },
-                  "origins": {
-                    "description": "Provider revisions that contributed available facts, in merge precedence order.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
                   },
                   "reason": {
                     "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
@@ -7541,8 +7400,7 @@
                 "required": [
                   "state",
                   "scope",
-                  "reason",
-                  "origins"
+                  "reason"
                 ],
                 "type": "object"
               },
@@ -7550,13 +7408,6 @@
                 "additionalProperties": false,
                 "description": "The family was never produced at all, so there is nothing here to be complete about.",
                 "properties": {
-                  "origins": {
-                    "description": "Provider revisions consulted before reaching this state. Empty for `unsupported`\nand `not_applicable`.",
-                    "items": {
-                      "$ref": "#/$defs/ProviderOrigin"
-                    },
-                    "type": "array"
-                  },
                   "reason": {
                     "description": "Which of the two this is, in words: the feature no provider has, or the concept\nthe language lacks.",
                     "maxLength": 4096,
@@ -7574,8 +7425,7 @@
                 "required": [
                   "state",
                   "scope",
-                  "reason",
-                  "origins"
+                  "reason"
                 ],
                 "type": "object"
               }
@@ -8619,45 +8469,6 @@
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
-          },
-          "ProviderId": {
-            "description": "Stable identity of one provider implementation. The identity remains unchanged across\nprovider restarts and fact revisions, so callers can compare origins from separate\nanswers.",
-            "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
-            "type": "string"
-          },
-          "ProviderOrigin": {
-            "additionalProperties": false,
-            "description": "The immutable provider state used for one fact-family answer. A provider publishes a new\n`revision` only after it has finished deriving facts from one workspace tree and source\ncatalog revision.",
-            "properties": {
-              "freshness": {
-                "$ref": "#/$defs/Freshness",
-                "description": "Whether both input revisions equal the answer's captured revisions."
-              },
-              "provider": {
-                "$ref": "#/$defs/ProviderId",
-                "description": "Stable identity of the provider that contributed facts."
-              },
-              "revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the immutable provider fact revision."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision from which the provider derived these facts."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Tree revision from which the provider derived this fact revision."
-              }
-            },
-            "required": [
-              "provider",
-              "revision",
-              "tree_revision",
-              "freshness",
-              "source_revision"
-            ],
-            "type": "object"
           },
           "ReadSnapshot": {
             "additionalProperties": false,

@@ -81,9 +81,6 @@ pub enum Coverage {
         state: CoverageCompleteState,
         /// What the claim covers.
         scope: CoverageScope,
-        /// Provider revisions that contributed this family, in merge precedence order. Empty
-        /// only when Rift establishes coverage without a provider.
-        origins: Vec<ProviderOrigin>,
     },
     /// Some of what is in scope is missing. `reason` is required here because a caller that
     /// reads absence as proof would be wrong.
@@ -100,8 +97,6 @@ pub enum Coverage {
         #[serde(default)]
         #[schemars(length(max = 4096))]
         continuation: Option<String>,
-        /// Provider revisions that contributed available facts, in merge precedence order.
-        origins: Vec<ProviderOrigin>,
     },
     /// The family was never produced at all, so there is nothing here to be complete about.
     State {
@@ -113,9 +108,6 @@ pub enum Coverage {
         /// the language lacks.
         #[schemars(length(max = 4096))]
         reason: String,
-        /// Provider revisions consulted before reaching this state. Empty for `unsupported`
-        /// and `not_applicable`.
-        origins: Vec<ProviderOrigin>,
     },
 }
 
@@ -735,32 +727,6 @@ pub struct ProjectionId(
     #[schemars(regex(pattern = r"^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"))]
     pub String,
 );
-
-/// Stable identity of one provider implementation. The identity remains unchanged across
-/// provider restarts and fact revisions, so callers can compare origins from separate
-/// answers.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct ProviderId(#[schemars(regex(pattern = r"^[a-z][a-z0-9_.-]{0,127}$"))] pub String);
-
-/// The immutable provider state used for one fact-family answer. A provider publishes a new
-/// `revision` only after it has finished deriving facts from one workspace tree and source
-/// catalog revision.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderOrigin {
-    /// Stable identity of the provider that contributed facts.
-    pub provider: ProviderId,
-    /// SHA-256 identity of the immutable provider fact revision.
-    pub revision: Digest,
-    /// Tree revision from which the provider derived this fact revision.
-    pub tree_revision: Digest,
-    /// Whether both input revisions equal the answer's captured revisions.
-    pub freshness: Freshness,
-    /// Source-catalog revision from which the provider derived these facts.
-    pub source_revision: Digest,
-}
 
 /// Immutable state captured for one read. Every page produced from one cursor carries the
 /// same snapshot.

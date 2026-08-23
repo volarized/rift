@@ -94,10 +94,9 @@ impl ReadService {
         );
         order_by_relevance(&mut results);
         results.truncate(limit);
-        let snapshot = self.snapshot().clone();
         Ok(SearchResult {
-            coverage: complete_coverage(&snapshot),
-            snapshot,
+            coverage: complete_coverage(),
+            snapshot: self.snapshot().clone(),
             results,
             next_cursor: None,
         })
@@ -784,19 +783,17 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `complete_coverage` used to fill every origin revision with an all-zero digest; the
-    /// search answer now carries the snapshot's real revisions.
+    /// A search answer served in full claims complete coverage over the request.
     #[test]
-    fn search_result_origins_carry_the_snapshots_real_revisions() -> TestResult {
+    fn search_result_coverage_claims_complete_for_the_request() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: SearchParams = serde_json::from_value(json!({"query": "Beacon"}))?;
         let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let snapshot_tree = value["snapshot"]["tree_revision"].clone();
-        let snapshot_source = value["snapshot"]["source_revision"].clone();
-        let origin = &value["coverage"]["origins"][0];
-        assert_eq!(origin["tree_revision"], snapshot_tree);
-        assert_eq!(origin["source_revision"], snapshot_source);
-        assert_ne!(origin["tree_revision"], json!("00000000"));
+        assert_eq!(value["coverage"]["state"], json!("complete"));
+        assert_eq!(
+            value["coverage"]["scope"],
+            json!({"kind": "reach", "reach": "request"})
+        );
         Ok(())
     }
 

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use data_encoding::BASE32_NOPAD;
 use rift_core::ProjectPath as CoreProjectPath;
-use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_PROVIDER_ID};
+use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS};
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileInclusion,
 };
@@ -15,10 +15,9 @@ use rift_index::{
 use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
     FactFamily, FileId, Freshness, GetSymbolHit, GetSymbolParams, GetSymbolResult, IndexSnapshot,
-    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProjectPath, ProviderId,
-    ProviderOrigin, ReadSnapshot, RevisionId, SearchScope, SemanticCoverage, SourceExcerpt,
-    SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TextRange,
+    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProjectPath, ReadSnapshot,
+    RevisionId, SearchScope, SemanticCoverage, SourceExcerpt, SourceKind, SourceLocation,
+    SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -380,7 +379,7 @@ impl ReadService {
         Ok(NodesResult {
             nodes,
             source,
-            coverage: semantic_coverage(FactFamily::Nodes, &self.snapshot),
+            coverage: semantic_coverage(FactFamily::Nodes),
             snapshot: self.snapshot.clone(),
         })
     }
@@ -418,7 +417,7 @@ impl ReadService {
             .collect();
         Ok(GetSymbolResult {
             hits,
-            coverage: complete_coverage(&self.snapshot),
+            coverage: complete_coverage(),
             next_cursor: None,
             snapshot: self.snapshot.clone(),
         })
@@ -672,30 +671,19 @@ pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
     encoded
 }
 
-/// Complete coverage for a request served in full from `snapshot`, carrying the real
-/// revisions the answer used - never a fabricated digest.
-pub(crate) fn complete_coverage(snapshot: &ReadSnapshot) -> Coverage {
-    let revision = snapshot.index.as_ref().map_or_else(
-        || snapshot.tree_revision.clone(),
-        |index| index.revision.clone(),
-    );
+/// Complete coverage for a request served in full: everything in scope is present, so a
+/// missing fact is a fact that does not exist.
+pub(crate) fn complete_coverage() -> Coverage {
     Coverage::Complete {
         state: CoverageCompleteState::Complete,
         scope: CoverageScope::Reach {
             reach: CoverageReach::Request,
         },
-        origins: vec![ProviderOrigin {
-            provider: ProviderId(RUST_READ_PROVIDER_ID.to_owned()),
-            revision,
-            tree_revision: snapshot.tree_revision.clone(),
-            freshness: Freshness::Current,
-            source_revision: snapshot.source_revision.clone(),
-        }],
     }
 }
 
-fn semantic_coverage(family: FactFamily, snapshot: &ReadSnapshot) -> SemanticCoverage {
-    SemanticCoverage(BTreeMap::from([(family, complete_coverage(snapshot))]))
+fn semantic_coverage(family: FactFamily) -> SemanticCoverage {
+    SemanticCoverage(BTreeMap::from([(family, complete_coverage())]))
 }
 
 /// Finds the symbol a witnessed syntax node belongs to.
@@ -774,8 +762,7 @@ mod tests {
 
     use rift_core::SourceVisibility;
     use rift_protocol::read::{
-        Digest, GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, ReadSnapshot,
-        RevisionId,
+        GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, RevisionId,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -944,36 +931,17 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `complete_coverage` fills its `ProviderOrigin` from the snapshot the answer actually
-    /// used; a fabricated all-zero digest here would be a defect.
+    /// A `get_symbol` answer served in full claims complete coverage over the request.
     #[test]
-    fn get_symbol_coverage_origins_carry_the_snapshots_real_revisions() -> TestResult {
+    fn get_symbol_coverage_claims_complete_for_the_request() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
-        let snapshot_tree = value["snapshot"]["tree_revision"].clone();
-        let snapshot_source = value["snapshot"]["source_revision"].clone();
-        let origin = &value["coverage"]["origins"][0];
-        assert_eq!(origin["tree_revision"], snapshot_tree);
-        assert_eq!(origin["source_revision"], snapshot_source);
-        assert_ne!(origin["tree_revision"], json!("00000000"));
-        Ok(())
-    }
-
-    /// `complete_coverage` falls back to `tree_revision` when the read consulted no index,
-    /// instead of unwrapping the absent `IndexSnapshot`.
-    #[test]
-    fn complete_coverage_falls_back_to_tree_revision_without_an_index_snapshot() -> TestResult {
-        let snapshot = ReadSnapshot {
-            tree_revision: Digest("deadbeef".to_owned()),
-            index: None,
-            source_revision: Digest("cafef00d".to_owned()),
-            revision: None,
-        };
-        let value = serde_json::to_value(super::complete_coverage(&snapshot))?;
-        assert_eq!(value["origins"][0]["revision"], json!("deadbeef"));
-        assert_eq!(value["origins"][0]["tree_revision"], json!("deadbeef"));
-        assert_eq!(value["origins"][0]["source_revision"], json!("cafef00d"));
+        assert_eq!(value["coverage"]["state"], json!("complete"));
+        assert_eq!(
+            value["coverage"]["scope"],
+            json!({"kind": "reach", "reach": "request"})
+        );
         Ok(())
     }
 
