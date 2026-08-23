@@ -16,9 +16,12 @@ An editor that supports TOML schema directives can load the generated schema:
 #:schema https://volar.sh/rift/rift.schema.json
 ```
 
-Treat `rift.toml` as executable workspace configuration. Hooks named by a repository run after
-Rift applies a change, using the server's OS permissions, so inspect the file before enabling the
-workspace.
+Treat `rift.toml` as executable workspace configuration: hooks a repository names run with the
+server's OS permissions after each applied change. Inspect the file before running Rift in a
+cloned repository.
+
+Each section's example shows its keys at their defaults. Durations take `ms`, `s`, `m`, `h`, or
+`d`; byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
 
 ## Server
 
@@ -33,8 +36,6 @@ num_workers = 4
 worker_queue_timeout = "30s"
 idle_timeout = "30m"
 ```
-
-Each key is shown at its default:
 
 - `num_workers` caps the workers running blocking operations at once, 1 to 64
 - `worker_queue_timeout` bounds one request's wait for a free worker, 1ms to 1h - when it
@@ -67,11 +68,11 @@ respect_gitignore = true
 
 Empty `include` includes every file `exclude` and `.gitignore` leave standing; a match in `exclude`
 drops a file even when `include` also matches it. `respect_gitignore`, on by default, applies the
-workspace's own `.gitignore` files, root and nested - global and parent-directory ignore sources
-are never read.
+workspace's own `.gitignore` files, root and nested; the server never reads global or
+parent-directory ignore sources.
 
-`.git`, `.rift`, and `target` stay invisible under every `source` setting. This hard floor sits
-below `include`, `exclude`, and `.gitignore`, so nothing in the file can reach past it.
+`.git`, `.rift`, and `target` stay invisible whatever this table says: no `include`, `exclude`,
+or `.gitignore` entry can make the server serve them.
 
 `source` shapes what the index walks: a file it excludes stops reaching `search` and
 [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) results. A single `search` request can still
@@ -96,12 +97,11 @@ max_output = "8kb"
 max_concurrent = 2
 ```
 
-Every key below `allow` is shown at its default:
+`allow` has no default; the other keys are shown at theirs.
 
 - `max_code` bounds one submitted block, 1b to 32kb
 - `max_timeout` bounds one evaluation, 1ms to 1d - the evaluation only: refreshing the
-  execution copy is extra, and a refresh that outruns the same bound fails the call with
-  `deadline_exceeded`
+  execution copy is extra, and a refresh that outruns the same bound fails the call
 - `max_output` bounds each captured stream separately, up to 16kb, so a program that floods
   stdout gets a prefix and a byte count rather than a hung request
 - `max_concurrent` caps evaluations running at once across the whole workspace, 1 to 64
@@ -109,12 +109,9 @@ Every key below `allow` is shown at its default:
 The schema states each range as `rift:range` on the key, and the server enforces it at load -
 schema validation alone can't compare `"16kb"` against a ceiling.
 
-Durations take `ms`, `s`, `m`, `h`, or `d`; byte sizes take `b`, `kb`, `mb`, `gb`, or
-`tb` - binary units, so `1kb` is 1024 bytes.
-
-A runtime has to serve the language as well. Listing a language under `allow` does nothing when
-no runtime serves it. The [`rift://workspace`](/docs/protocol/mcp#resource-workspace)
-resource reports what survived that intersection per language.
+Listing a language under `allow` does nothing when no runtime serves it; the
+[`rift://workspace`](/docs/protocol/mcp#resource-workspace) resource reports what survives that
+intersection per language.
 
 ## Providers
 
@@ -137,14 +134,15 @@ this table says.
 <VersionBadge version="planned" />
 
 `max_revisions` bounds the timeline walk from the current head, 1 to 100000, because the walk's
-cost scales with how far back it reaches. Timelines and co-change coupling are computed inside
-that depth, and a [`SymbolHistory`](/docs/protocol/reference#SymbolHistory) whose walk ended
-early reports partial coverage rather than pretending the symbol has no earlier past.
+cost scales with how far back it reaches. The history provider computes timelines and co-change
+coupling inside that depth, and a [`SymbolHistory`](/docs/protocol/reference#SymbolHistory)
+whose walk ended early says so in the result's `warnings` rather than pretending the symbol has
+no earlier past.
 
 Provider configuration does not set merge order or freshness. The server reports provider order,
-state, and revision through `rift://workspace`; each answer reports the exact provider revisions
-it used through coverage. A provider rebuilding after a file change can serve its previous
-immutable revision as stale without presenting it as current.
+state, and revision through `rift://workspace`. A provider rebuilding after a file change can
+serve its previous immutable revision; the result then carries a `stale_index` entry in
+`warnings` naming the two tree revision digests.
 
 ## Search
 
@@ -163,8 +161,6 @@ max_chunk = "1mb"
 pool_slots = 4
 busy_timeout = "1s"
 ```
-
-Each key is shown at its default:
 
 - `extensions` names which file extensions, without the leading dot, join the index alongside
   source files - `md`, `mdx`, and `txt` by default, prose formats with no syntax provider of
@@ -186,8 +182,9 @@ embedding = "potion-retrieval-32M"
 ```
 
 With `embedding` set, the server embeds indexed declarations and fuses cosine similarity into
-the lexical score. Vectors are stored per model - two models' vectors aren't comparable - so
-changing the value rebuilds the dense index. Leaving the table out keeps search lexical.
+the lexical score. The server stores vectors per model - two models' vectors aren't
+comparable - so changing the value rebuilds the dense index. Leaving the key out keeps search
+lexical.
 
 ## Hooks
 
@@ -218,28 +215,27 @@ The keys that shape how the command runs:
 - `id` - unique within the list, labels the result
 - `program` - refuses an absolute path; a bare name resolves through the `PATH` of the
   environment the command runs with - the server's, with `environment` applied on top - and a
-  relative one below `working_directory`, which is itself relative to the workspace root; its
-  empty value selects the root
+  relative one below `working_directory`
+- `working_directory` - relative to the workspace root; its empty value selects the root
 - `arguments` - the program's literal arguments, in order; may be empty
 - `changed_paths` - `"append"` adds the changed project paths after `arguments` in byte order,
   for a linter that takes files; `"none"` leaves the command alone
 
-A hook runs the tree it checks - `cargo test` compiles the very change it's checking - so
-a configured hook executes the agent's change each time one applies.
+A hook runs in the tree it checks, so it executes the agent's change each time one applies -
+`cargo test` compiles the very change it's checking.
 
 Every key in the block is required - the schema carries no defaults, so a missing `environment`
 fails the file with `configuration_invalid`. The list holds at most 32 hooks.
 
 Two keys carry bounds: `timeout`, when Rift kills the process, takes `"1ms"` to `"1h"`, and
-`output_limit`, how much of each stream Rift keeps, takes `"256b"` to `"4kb"`. The full size is
-still reported, so you can tell a truncated log from a short one.
+`output_limit`, how much of each stream Rift keeps, takes `"256b"` to `"4kb"`. Rift still
+reports the full size, so you can tell a truncated log from a short one.
 
-`guarantees` declares what a pass actually establishes, which is what turns a green run into
-[`GuaranteeEvidence`](/docs/protocol/reference#GuaranteeEvidence) on the change rather than
-an unexplained tick. Each entry names the property (`kind`), what the check covers (`scope`),
-and the exact claim in words (`detail`); the evidence on the change carries them alongside the
-hook's `id`. `determinism` says whether the same tree and environment are expected to give the
-same answer twice.
+`guarantees` declares what a pass establishes, which turns a passing run into
+[`GuaranteeEvidence`](/docs/protocol/reference#GuaranteeEvidence) on the change. Each entry
+names the property (`kind`), what the check covers (`scope`), and the claim in words
+(`detail`); the evidence on the change carries them alongside the hook's `id`. `determinism`
+says whether the same tree and environment are expected to give the same answer twice.
 
 A hook that exits nonzero, overruns `timeout`, or fails to launch contributes an error
 finding under the code `rift.hook.failed`, naming what ended the run and quoting each non-empty
