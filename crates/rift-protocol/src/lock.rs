@@ -9,10 +9,14 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// The lowest loopback port the server may bind.
+/// The lowest port of the default serving range, used when `rift.toml`
+/// selects no port.
 pub const SERVER_PORT_MIN: u16 = 12_000;
-/// The highest loopback port the server may bind.
+/// The highest port of the default serving range.
 pub const SERVER_PORT_MAX: u16 = 13_000;
+/// The lowest port any workspace may select: below it, binding needs
+/// privileges the server never holds.
+pub const SERVER_PORT_FLOOR: u16 = 1_024;
 /// The lock file's name under the `.rift` state directory.
 pub const SERVER_LOCK_FILE_NAME: &str = "server.json";
 /// Characters a minted bearer token spells: 32 random bytes as unpadded
@@ -34,8 +38,8 @@ pub const SERVER_VERSION_PATTERN: &str =
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerLock {
-    /// Loopback TCP port the server listens on, 12000 to 13000.
-    #[schemars(range(min = 12_000, max = 13_000))]
+    /// Loopback TCP port the server listens on, 1024 or above.
+    #[schemars(range(min = 1_024))]
     pub port: u16,
     /// Bearer token every request to the server carries: 32 random bytes,
     /// spelled as unpadded base64url.
@@ -66,13 +70,11 @@ impl ServerLock {
     /// The first violated field contract, in declaration order.
     fn violation(&self) -> Option<ServerLockViolation> {
         match self {
-            lock if !(SERVER_PORT_MIN..=SERVER_PORT_MAX).contains(&lock.port) => {
-                Some(ServerLockViolation::PortOutOfRange {
-                    port: lock.port,
-                    min: SERVER_PORT_MIN,
-                    max: SERVER_PORT_MAX,
-                })
-            }
+            lock if lock.port < SERVER_PORT_FLOOR => Some(ServerLockViolation::PortOutOfRange {
+                port: lock.port,
+                min: SERVER_PORT_FLOOR,
+                max: u16::MAX,
+            }),
             lock if !token_well_formed(&lock.token) => Some(ServerLockViolation::TokenMalformed),
             lock if lock.pid == 0 => Some(ServerLockViolation::ProcessIdZero),
             lock if !version_well_formed(&lock.version) => {
@@ -166,8 +168,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, SERVER_TOKEN_PATTERN,
-        SERVER_VERSION_PATTERN, ServerLock, ServerLockViolation,
+        SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
+        SERVER_TOKEN_PATTERN, SERVER_VERSION_PATTERN, ServerLock, ServerLockViolation,
     };
 
     fn valid_lock() -> ServerLock {
@@ -185,16 +187,16 @@ mod tests {
     }
 
     #[test]
-    fn port_outside_range_is_refused() {
-        for port in [SERVER_PORT_MIN - 1, SERVER_PORT_MAX + 1] {
+    fn port_below_the_floor_is_refused() {
+        for port in [0, SERVER_PORT_FLOOR - 1] {
             let mut lock = valid_lock();
             lock.port = port;
             assert_eq!(
                 lock.validate(),
                 Err(ServerLockViolation::PortOutOfRange {
                     port,
-                    min: SERVER_PORT_MIN,
-                    max: SERVER_PORT_MAX,
+                    min: SERVER_PORT_FLOOR,
+                    max: u16::MAX,
                 }),
                 "port {port} must be refused"
             );
@@ -202,8 +204,13 @@ mod tests {
     }
 
     #[test]
-    fn range_boundary_ports_are_accepted() {
-        for port in [SERVER_PORT_MIN, SERVER_PORT_MAX] {
+    fn selectable_ports_are_accepted() {
+        for port in [
+            SERVER_PORT_FLOOR,
+            SERVER_PORT_MIN,
+            SERVER_PORT_MAX,
+            u16::MAX,
+        ] {
             let mut lock = valid_lock();
             lock.port = port;
             assert_eq!(lock.validate(), Ok(()), "port {port} must be accepted");
@@ -290,8 +297,12 @@ mod tests {
     fn schema_advertises_the_enforced_bounds() {
         let schema = serde_json::to_value(schema_for!(ServerLock)).expect("schema serializes");
         let properties = &schema["properties"];
-        assert_eq!(properties["port"]["minimum"], json!(SERVER_PORT_MIN));
-        assert_eq!(properties["port"]["maximum"], json!(SERVER_PORT_MAX));
+        assert_eq!(properties["port"]["minimum"], json!(SERVER_PORT_FLOOR));
+        assert_eq!(
+            properties["port"]["maximum"],
+            json!(u16::MAX),
+            "the port ceiling is the u16 domain itself"
+        );
         assert_eq!(properties["token"]["pattern"], json!(SERVER_TOKEN_PATTERN));
         assert_eq!(properties["pid"]["minimum"], json!(1));
         assert_eq!(

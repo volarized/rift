@@ -43,6 +43,18 @@ const SHORT_IDLE_CONFIGURATION: &str = r#"
 idle_timeout = "1s"
 "#;
 
+/// A `[server]` table selecting a custom range, away from the default one.
+const RANGED_PORT_CONFIGURATION: &str = r"
+[server]
+port_range = { min = 11500, max = 11510 }
+";
+
+/// A `[server]` table pinning one exact port.
+const PINNED_PORT_CONFIGURATION: &str = r"
+[server]
+port = 11777
+";
+
 fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
@@ -250,6 +262,29 @@ async fn two_concurrent_clients_are_both_served() -> TestResult {
 
     first.cancel().await?;
     second.cancel().await?;
+    shutdown.cancel();
+    stopped_within_deadline(server).await
+}
+
+#[tokio::test]
+async fn configured_port_selection_is_honored() -> TestResult {
+    let ranged = workspace_with(Some(RANGED_PORT_CONFIGURATION))?;
+    let (shutdown, server) = served(ranged.path()).await?;
+    assert!(
+        (11_500..=11_510).contains(&server.port()),
+        "a configured range must bound the bind, got port {}",
+        server.port()
+    );
+    shutdown.cancel();
+    stopped_within_deadline(server).await?;
+
+    let pinned = workspace_with(Some(PINNED_PORT_CONFIGURATION))?;
+    let (shutdown, server) = served(pinned.path()).await?;
+    assert_eq!(
+        server.port(),
+        11_777,
+        "a pinned port must be the bound port"
+    );
     shutdown.cancel();
     stopped_within_deadline(server).await
 }

@@ -16,7 +16,6 @@ use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_index::WorkspaceIndexLimits;
-use rift_protocol::lock::{SERVER_PORT_MAX, SERVER_PORT_MIN};
 use rift_server::ReadError;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
@@ -27,16 +26,22 @@ use tokio_util::sync::CancellationToken;
 use crate::RiftMcp;
 use crate::validation::IndexSupervisor;
 
+/// A route under the server's one API base path, spelled here once.
+macro_rules! api_path {
+    ($segment:literal) => {
+        concat!("/api", $segment)
+    };
+}
+
 /// Path the MCP Streamable-HTTP service is mounted at.
-pub(crate) const MCP_PATH: &str = "/api/mcp";
+pub(crate) const MCP_PATH: &str = api_path!("/mcp");
 /// Path an authorized `POST` stops the server through.
-pub(crate) const STOP_PATH: &str = "/api/stop";
+pub(crate) const STOP_PATH: &str = api_path!("/stop");
 /// Bytes of entropy behind one minted bearer token.
 const TOKEN_ENTROPY_BYTES: usize = 32;
-/// The authentication scheme the `WWW-Authenticate` refusal names.
+/// The authentication scheme: the `WWW-Authenticate` refusal names it, and
+/// an accepted `Authorization` value carries it before the single space.
 const BEARER_SCHEME: &str = "Bearer";
-/// The scheme-plus-space prefix an accepted `Authorization` value carries.
-const BEARER_PREFIX: &str = "Bearer ";
 /// The `Host` spellings that name the loopback the server binds.
 const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "[::1]"];
 
@@ -115,10 +120,12 @@ impl HttpServeFault {
 
 /// Serves the workspace at `root` over authenticated loopback Streamable HTTP.
 ///
-/// The workspace builds exactly as stdio serving does — an invalid
+/// The workspace builds exactly as stdio serving does - an invalid
 /// `rift.toml` still serves, refusing each request as
-/// `configuration_invalid` under default policies — then a bearer token is
-/// minted and the first free port in the loopback serving range is bound.
+/// `configuration_invalid` under default policies - then a bearer token is
+/// minted and the first free port of the accepted `[server]` selection is
+/// bound: the pinned `port`, the configured `port_range`, or the default
+/// serving range.
 /// The returned handle's listener is already accepting. Serving ends when
 /// `shutdown` cancels, an authorized `POST /api/stop` arrives, or the
 /// accepted `server.idle_timeout` passes without an authorized request.
@@ -143,16 +150,11 @@ pub async fn serve_http(
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
         .await
         .map_err(HttpServeFault::workspace)?;
-    let idle_timeout = Duration::from_millis(
-        server
-            .server_configuration()
-            .await
-            .idle_timeout
-            .milliseconds(),
-    );
+    let server_table = server.server_configuration().await;
+    let idle_timeout = Duration::from_millis(server_table.idle_timeout.milliseconds());
     let supervisor = server.index_supervisor();
     let token = mint_token()?;
-    let (port, listener) = bind_loopback_listener()?;
+    let (port, listener) = bind_loopback_listener(server_table.serving_ports())?;
     let stop = shutdown.child_token();
     let idle = Arc::new(IdleTracker::new());
     let router = authenticated_router(server, &token, &stop, &idle);
@@ -278,9 +280,12 @@ fn bind_first_free<Listener>(
     }))
 }
 
-/// Binds the first free loopback port in the serving range for the runtime.
-fn bind_loopback_listener() -> Result<(u16, tokio::net::TcpListener), HttpServeError> {
-    let (port, listener) = bind_first_free(SERVER_PORT_MIN..=SERVER_PORT_MAX, |port| {
+/// Binds the first free loopback port of the accepted selection for the
+/// runtime.
+fn bind_loopback_listener(
+    ports: RangeInclusive<u16>,
+) -> Result<(u16, tokio::net::TcpListener), HttpServeError> {
+    let (port, listener) = bind_first_free(ports, |port| {
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
     })?;
     listener
@@ -427,7 +432,10 @@ async fn authorize_request(
 /// only the request's own shape — a missing scheme or a wrong length —
 /// never a token byte.
 fn bearer_authorized(authorization: Option<&str>, token: &str) -> bool {
-    let Some(presented) = authorization.and_then(|value| value.strip_prefix(BEARER_PREFIX)) else {
+    let Some(presented) = authorization
+        .and_then(|value| value.strip_prefix(BEARER_SCHEME))
+        .and_then(|schemed| schemed.strip_prefix(' '))
+    else {
         return false;
     };
     if presented.len() != token.len() {
