@@ -1642,10 +1642,8 @@ mod tests {
     async fn build_recovers_from_a_corrupt_lexical_database_by_recreating_it_once() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(
-            directory.path().join("guide.md"),
-            "notes about the beacon subsystem\n",
-        )?;
+        let guide_md = "notes about the beacon subsystem\n";
+        fs::write(directory.path().join("guide.md"), guide_md)?;
         let state_directory = directory.path().join(".rift");
         fs::create_dir_all(&state_directory)?;
         fs::write(state_directory.join("db"), b"not a sqlite database")?;
