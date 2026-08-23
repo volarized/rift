@@ -1690,7 +1690,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn supervisor_dispatches_superseded_when_epoch_moves_before_admission() -> TestResult {
+    async fn supervisor_dispatches_superseded_when_epoch_moves_before_acceptance() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) = IndexValidation::new();

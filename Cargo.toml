@@ -20,8 +20,10 @@ rift-provider = { path = "crates/rift-provider" }
 rift-server = { path = "crates/rift-server" }
 rift-syntax = { path = "crates/rift-syntax" }
 
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.6.5", features = ["derive"] }
 data-encoding = "2.6.0"
+getrandom = { version = "0.4.3", features = ["std"] }
 diffy = "0.5.1"
 flate2 = "1.1.9"
 fs4 = "1.1.0"

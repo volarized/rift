@@ -1,0 +1,899 @@
+//! Streamable-HTTP transport: loopback serving behind a minted bearer token.
+
+use std::future::IntoFuture as _;
+use std::net::Ipv4Addr;
+use std::ops::RangeInclusive;
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse as _, Response};
+use axum::routing::post;
+use data_encoding::BASE64URL_NOPAD;
+use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_index::WorkspaceIndexLimits;
+use rift_server::ReadError;
+use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+use crate::RiftMcp;
+use crate::validation::IndexSupervisor;
+
+/// A route under the server's one API base path, spelled here once.
+macro_rules! api_path {
+    ($segment:literal) => {
+        concat!("/api", $segment)
+    };
+}
+
+/// Path the MCP Streamable-HTTP service is mounted at.
+pub(crate) const MCP_PATH: &str = api_path!("/mcp");
+/// Path an authorized `POST` stops the server through.
+pub(crate) const STOP_PATH: &str = api_path!("/stop");
+/// Bytes of entropy behind one minted bearer token.
+const TOKEN_ENTROPY_BYTES: usize = 32;
+/// The authentication scheme: the `WWW-Authenticate` refusal names it, and
+/// an accepted `Authorization` value carries it before the single space.
+const BEARER_SCHEME: &str = "Bearer";
+/// The `Host` spellings that name the loopback the server binds.
+const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "[::1]"];
+
+/// Failure while starting or running the Streamable-HTTP MCP transport.
+pub type HttpServeError = Error<HttpServeFault>;
+
+/// One HTTP transport failure: what stopped the server from starting or serving.
+#[derive(Debug)]
+pub enum HttpServeFault {
+    /// Workspace snapshot could not be built, or its index supervisor did
+    /// not shut down. Boxed to keep this transport error small beside it.
+    Workspace(Box<ReadError>),
+    /// Every port in the loopback serving range is already bound.
+    PortsExhausted {
+        /// The lowest port that was tried.
+        port_min: u16,
+        /// The highest port that was tried.
+        port_max: u16,
+    },
+    /// The listener could not be prepared, or a serving task failed.
+    Serve {
+        /// The listener or serving operation that failed.
+        operation: &'static str,
+        /// The underlying failure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl Fault for HttpServeFault {
+    fn name(&self) -> ErrorName {
+        match self {
+            Self::Workspace(source) => source.name(),
+            Self::PortsExhausted { .. } => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
+            Self::Serve { .. } => ErrorName::Wire(ErrorCode::InternalError),
+        }
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        match self {
+            Self::Workspace(source) => source.context(),
+            Self::PortsExhausted { port_min, port_max } => vec![
+                ErrorContext::new("ports", format!("{port_min}..={port_max}")),
+                ErrorContext::new(
+                    "detail",
+                    "every loopback port in the serving range is bound",
+                ),
+            ],
+            Self::Serve { operation, .. } => vec![ErrorContext::new("operation", *operation)],
+        }
+    }
+
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Workspace(source) => Some(source.as_ref()),
+            Self::PortsExhausted { .. } => None,
+            Self::Serve { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
+impl HttpServeFault {
+    fn workspace(source: ReadError) -> HttpServeError {
+        Error::new(Self::Workspace(Box::new(source)))
+    }
+
+    fn serve(
+        operation: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> HttpServeError {
+        Error::new(Self::Serve {
+            operation,
+            source: Box::new(source),
+        })
+    }
+}
+
+/// Serves the workspace at `root` over authenticated loopback Streamable HTTP.
+///
+/// The workspace builds exactly as stdio serving does - an invalid
+/// `rift.toml` still serves, refusing each request as
+/// `configuration_invalid` under default policies - then a bearer token is
+/// minted and the first free port of the accepted `[server]` selection is
+/// bound: the pinned `port`, the configured `port_range`, or the default
+/// serving range.
+/// The returned handle's listener is already accepting. Serving ends when
+/// `shutdown` cancels, an authorized `POST /api/stop` arrives, or the
+/// accepted `server.idle_timeout` passes without an authorized request.
+///
+/// # Errors
+///
+/// Returns [`HttpServeError`] when the workspace cannot be indexed, entropy
+/// for the token is unavailable, every port in the serving range is bound,
+/// or the listener cannot register with the runtime.
+///
+/// # Cancel safety
+///
+/// Dropping this future discards construction; an accepted initial index
+/// scan still finishes in the bounded blocking executor. A returned
+/// [`HttpServer`] owns the serving tasks and is driven through
+/// [`HttpServer::stopped`].
+pub async fn serve_http(
+    root: &Path,
+    shutdown: CancellationToken,
+) -> Result<HttpServer, HttpServeError> {
+    tracing::info!(component = "mcp", transport = "http", "MCP server starting");
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+        .await
+        .map_err(HttpServeFault::workspace)?;
+    let server_table = server.server_configuration().await;
+    let idle_timeout = Duration::from_millis(server_table.idle_timeout.milliseconds());
+    let supervisor = server.index_supervisor();
+    let token = mint_token()?;
+    let (port, listener) = bind_loopback_listener(server_table.serving_ports())?;
+    let stop = shutdown.child_token();
+    let idle = Arc::new(IdleTracker::new());
+    let router = authenticated_router(server, &token, &stop, &idle);
+    let serving = tokio::spawn(
+        axum::serve(listener, router)
+            .with_graceful_shutdown(stop.clone().cancelled_owned())
+            .into_future(),
+    );
+    let idle_watch = tokio::spawn(watch_idle(idle, idle_timeout, stop.clone()));
+    tracing::info!(
+        component = "mcp",
+        transport = "http",
+        port,
+        "MCP server ready"
+    );
+    Ok(HttpServer {
+        port,
+        token,
+        stop,
+        serving,
+        idle_watch,
+        supervisor,
+    })
+}
+
+/// One serving HTTP MCP server: its address facts and its serving tasks.
+#[derive(Debug)]
+pub struct HttpServer {
+    port: u16,
+    token: String,
+    stop: CancellationToken,
+    serving: JoinHandle<Result<(), std::io::Error>>,
+    idle_watch: JoinHandle<()>,
+    supervisor: IndexSupervisor,
+}
+
+impl HttpServer {
+    /// The loopback port the server accepts requests on.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The bearer token every request must present.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Waits until the server stopped and its index supervisor shut down.
+    ///
+    /// Resolves after the serve loop ended — through the external shutdown
+    /// token, an authorized `POST /api/stop`, or the idle timeout — and the
+    /// workspace index supervisor finished within its shutdown deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpServeError`] when the supervisor missed its shutdown
+    /// deadline or a serving task failed.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future detaches the serving tasks; a shutdown already
+    /// triggered still completes in the background.
+    pub async fn stopped(self) -> Result<(), HttpServeError> {
+        let serve_result = classify_serve_outcome(self.serving.await);
+        // The serve loop can end on its own I/O error, where nothing has
+        // cancelled the token yet; cancelling here unblocks the idle watch
+        // on every path.
+        self.stop.cancel();
+        let idle_outcome = self.idle_watch.await;
+        let supervisor_outcome = self
+            .supervisor
+            .shutdown()
+            .await
+            .map_err(HttpServeFault::workspace);
+        let outcome = stop_outcome_label(supervisor_outcome.is_ok() && serve_result.is_ok());
+        tracing::info!(
+            component = "mcp",
+            transport = "http",
+            outcome,
+            "MCP server stopped"
+        );
+        supervisor_outcome?;
+        serve_result?;
+        idle_outcome.map_err(|error| HttpServeFault::serve("idle watch task", error))
+    }
+}
+
+/// Maps the joined serve loop outcome onto the transport failure taxonomy:
+/// the loop's own I/O failure names the serve loop, a panicked or aborted
+/// serving task names the task.
+fn classify_serve_outcome(
+    outcome: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
+) -> Result<(), HttpServeError> {
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(HttpServeFault::serve("http serve loop", error)),
+        Err(error) => Err(HttpServeFault::serve("http serve task", error)),
+    }
+}
+
+/// The stop log's outcome field for whether every part shut down cleanly.
+fn stop_outcome_label(stopped_cleanly: bool) -> &'static str {
+    if stopped_cleanly { "ok" } else { "error" }
+}
+
+/// Mints one bearer token: 32 random bytes as unpadded base64url.
+///
+/// The encoding fixes the length: `TOKEN_ENTROPY_BYTES` entropy bytes
+/// spell exactly [`rift_protocol::lock::SERVER_TOKEN_LENGTH`] base64url
+/// characters.
+fn mint_token() -> Result<String, HttpServeError> {
+    let mut entropy = [0_u8; TOKEN_ENTROPY_BYTES];
+    getrandom::fill(&mut entropy).map_err(|error| HttpServeFault::serve("token mint", error))?;
+    Ok(BASE64URL_NOPAD.encode(&entropy))
+}
+
+/// The first port in `ports` that `bind` accepts, with what it bound.
+///
+/// A port `bind` refuses for any reason is skipped. The walk is bounded by
+/// the range itself; the typed failure names the exhausted range when every
+/// port refused.
+fn bind_first_free<Listener>(
+    ports: RangeInclusive<u16>,
+    mut bind: impl FnMut(u16) -> std::io::Result<Listener>,
+) -> Result<(u16, Listener), HttpServeError> {
+    let (port_min, port_max) = (*ports.start(), *ports.end());
+    for port in ports {
+        if let Ok(listener) = bind(port) {
+            return Ok((port, listener));
+        }
+    }
+    Err(Error::new(HttpServeFault::PortsExhausted {
+        port_min,
+        port_max,
+    }))
+}
+
+/// Binds the first free loopback port of the accepted selection for the
+/// runtime.
+fn bind_loopback_listener(
+    ports: RangeInclusive<u16>,
+) -> Result<(u16, tokio::net::TcpListener), HttpServeError> {
+    let (port, listener) = bind_first_free(ports, |port| {
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| HttpServeFault::serve("listener nonblocking mode", error))?;
+    let listener = tokio::net::TcpListener::from_std(listener)
+        .map_err(|error| HttpServeFault::serve("listener runtime registration", error))?;
+    Ok((port, listener))
+}
+
+/// Assembles the bearer-guarded routes over one served workspace.
+///
+/// Requests run statelessly: the service clones the server per request, and
+/// no session is ever created.
+fn authenticated_router(
+    server: RiftMcp,
+    token: &str,
+    stop: &CancellationToken,
+    idle: &Arc<IdleTracker>,
+) -> Router {
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(NeverSessionManager::default()),
+        StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(false)
+            .with_json_response(true)
+            .with_cancellation_token(stop.child_token()),
+    );
+    let gate = RequestGate {
+        token: Arc::from(token),
+        idle: Arc::clone(idle),
+    };
+    Router::new()
+        .nest_service(MCP_PATH, mcp_service)
+        .route(STOP_PATH, post(stop_server))
+        .with_state(stop.clone())
+        .layer(middleware::from_fn_with_state(gate, authorize_request))
+        .layer(middleware::from_fn(guard_loopback_boundary))
+}
+
+/// Refuses requests whose `Host` or `Origin` reaches past the loopback.
+///
+/// A remote page can reach a loopback port through DNS rebinding — its own
+/// name resolving here — or issue a request carrying its own origin. The
+/// server accepts only a loopback `Host`, and only a loopback `Origin` when
+/// one is present; non-browser MCP clients omit `Origin` and pass. The
+/// guard runs before authentication on every route, so the boundary holds
+/// for the stop route as well as the MCP service.
+async fn guard_loopback_boundary(request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let host_accepted = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(host_is_loopback);
+    if !host_accepted {
+        return boundary_refusal("Host");
+    }
+    let origin_accepted = match headers.get(header::ORIGIN) {
+        None => true,
+        Some(value) => value.to_str().is_ok_and(origin_is_loopback),
+    };
+    if !origin_accepted {
+        return boundary_refusal("Origin");
+    }
+    next.run(request).await
+}
+
+/// The `400` refusal naming the header that reached past the loopback.
+fn boundary_refusal(header_name: &'static str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("{header_name} header does not name the loopback this server binds"),
+    )
+        .into_response()
+}
+
+/// Whether a `Host` value names the loopback, with or without a port.
+///
+/// A bracketed IPv6 host keeps its brackets; otherwise a trailing
+/// all-digit `:port` is cut before the comparison, and a non-numeric tail
+/// stays part of the name and fails it.
+fn host_is_loopback(host: &str) -> bool {
+    let name = match host.find(']') {
+        Some(bracket_end) => &host[..=bracket_end],
+        None => host
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+            .map_or(host, |(name, _)| name),
+    };
+    let name = name.to_ascii_lowercase();
+    LOOPBACK_HOSTS.contains(&name.as_str())
+}
+
+/// Whether an `Origin` value names a loopback `http` or `https` origin.
+fn origin_is_loopback(origin: &str) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let scheme_known = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    scheme_known && host_is_loopback(rest)
+}
+
+/// Requests the same shutdown an external cancel performs.
+///
+/// Repeats answer identically: cancellation is idempotent.
+async fn stop_server(State(stop): State<CancellationToken>) -> StatusCode {
+    stop.cancel();
+    StatusCode::ACCEPTED
+}
+
+/// Per-request policy shared by every route: the token requests must
+/// present, and the activity instant authorized requests refresh.
+#[derive(Clone, Debug)]
+struct RequestGate {
+    token: Arc<str>,
+    idle: Arc<IdleTracker>,
+}
+
+/// Refuses requests without the exact bearer token, touching the idle
+/// tracker for every request that passes.
+///
+/// The token separates OS users sharing the machine; the loopback bind is
+/// the network boundary.
+async fn authorize_request(
+    State(gate): State<RequestGate>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authorization = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if !bearer_authorized(authorization, &gate.token) {
+        return unauthorized();
+    }
+    gate.idle.touch();
+    next.run(request).await
+}
+
+/// Whether an `Authorization` value presents exactly `Bearer` plus `token`.
+///
+/// Equal-length comparison touches every byte, so a refusal's timing does
+/// not reveal how much of the token matched. The earlier returns reveal
+/// only the request's own shape — a missing scheme or a wrong length —
+/// never a token byte.
+fn bearer_authorized(authorization: Option<&str>, token: &str) -> bool {
+    let Some(presented) = authorization
+        .and_then(|value| value.strip_prefix(BEARER_SCHEME))
+        .and_then(|schemed| schemed.strip_prefix(' '))
+    else {
+        return false;
+    };
+    if presented.len() != token.len() {
+        return false;
+    }
+    presented
+        .bytes()
+        .zip(token.bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+/// The `401` refusal naming the scheme a caller must authenticate with.
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(BEARER_SCHEME),
+        )],
+    )
+        .into_response()
+}
+
+/// The instant of the most recent authorized request.
+#[derive(Debug)]
+struct IdleTracker {
+    last_activity: Mutex<Instant>,
+}
+
+impl IdleTracker {
+    fn new() -> Self {
+        Self {
+            last_activity: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Records an authorized request at the current instant.
+    fn touch(&self) {
+        *self.lock_last_activity() = Instant::now();
+    }
+
+    /// The instant the server has been quiet for `idle_timeout`.
+    fn idle_deadline(&self, idle_timeout: Duration) -> Instant {
+        *self.lock_last_activity() + idle_timeout
+    }
+
+    /// The tracked instant, recovered from a poisoned lock: the stored
+    /// value is plain data, valid regardless of a panicked writer.
+    fn lock_last_activity(&self) -> MutexGuard<'_, Instant> {
+        match self.last_activity.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+/// Cancels `stop` once `idle_timeout` passes with no authorized request.
+///
+/// Each turn sleeps to the currently tracked deadline; a touch during the
+/// sleep moves the deadline, and the next turn waits out the remainder, so
+/// turns recur only as often as requests arrive.
+///
+/// # Cancel safety
+///
+/// Dropping this future ends the watch without cancelling `stop`.
+async fn watch_idle(idle: Arc<IdleTracker>, idle_timeout: Duration, stop: CancellationToken) {
+    loop {
+        let deadline = idle.idle_deadline(idle_timeout);
+        tokio::select! {
+            () = stop.cancelled() => return,
+            () = tokio::time::sleep_until(deadline) => {}
+        }
+        if Instant::now() >= idle.idle_deadline(idle_timeout) {
+            stop.cancel();
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::http::{StatusCode, header};
+    use rift_protocol::lock::{SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock};
+    use rift_server::ReadFault;
+    use tokio_util::sync::CancellationToken;
+
+    use tokio::time::Instant;
+
+    use super::{
+        HttpServeFault, IdleTracker, bearer_authorized, bind_first_free, classify_serve_outcome,
+        mint_token, stop_outcome_label, unauthorized, watch_idle,
+    };
+
+    #[test]
+    fn minted_token_satisfies_the_advertised_lock_contract() {
+        let token = mint_token().expect("token must mint");
+        assert_eq!(token.len(), SERVER_TOKEN_LENGTH);
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+            "token must stay within the base64url alphabet: {token}"
+        );
+        let lock = ServerLock {
+            port: SERVER_PORT_MIN,
+            token,
+            pid: 1,
+            version: "0.0.9".to_owned(),
+        };
+        assert_eq!(lock.validate(), Ok(()));
+    }
+
+    #[test]
+    fn two_minted_tokens_differ() {
+        let first = mint_token().expect("first token must mint");
+        let second = mint_token().expect("second token must mint");
+        assert_ne!(first, second, "two mints must draw fresh entropy");
+    }
+
+    #[test]
+    fn bind_selects_the_first_free_port() {
+        let (port, bound) =
+            bind_first_free(4..=6, Ok::<u16, std::io::Error>).expect("first port must bind");
+        assert_eq!((port, bound), (4, 4));
+    }
+
+    #[test]
+    fn bind_skips_busy_ports() {
+        let (port, bound) = bind_first_free(4..=6, |port| {
+            if port < 6 {
+                Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            } else {
+                Ok(port)
+            }
+        })
+        .expect("the free port must bind");
+        assert_eq!((port, bound), (6, 6));
+    }
+
+    #[test]
+    fn boundary_port_is_accepted() {
+        let (port, _) = bind_first_free(6..=6, Ok::<u16, std::io::Error>)
+            .expect("a single-port range must bind its boundary");
+        assert_eq!(port, 6);
+    }
+
+    #[test]
+    fn exhausted_range_names_its_bounds_and_classifies_transient() {
+        let error = bind_first_free(4..=6, |_| {
+            Err::<u16, _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+        })
+        .expect_err("an all-busy range must refuse");
+        assert!(matches!(
+            error.fault(),
+            HttpServeFault::PortsExhausted {
+                port_min: 4,
+                port_max: 6,
+            }
+        ));
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        let rendered = error.to_string();
+        assert!(rendered.contains("4..=6"), "{rendered}");
+    }
+
+    #[test]
+    fn workspace_fault_keeps_the_read_classification_and_source() {
+        let read = ReadFault::unavailable("probe", "detail");
+        let expected = read.descriptor();
+        let error = HttpServeFault::workspace(read);
+        assert_eq!(error.descriptor(), expected);
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the wrapped read failure must stay on the source chain"
+        );
+    }
+
+    #[test]
+    fn serve_fault_names_its_operation_and_exposes_the_source() {
+        let error = HttpServeFault::serve("http serve loop", std::io::Error::other("socket gone"));
+        assert_eq!(error.descriptor().code(), "internal_error");
+        let rendered = error.to_string();
+        assert!(rendered.contains("http serve loop"), "{rendered}");
+        let source = std::error::Error::source(&error).expect("source must be exposed");
+        assert_eq!(source.to_string(), "socket gone");
+    }
+
+    #[test]
+    fn workspace_fault_forwards_the_read_context() {
+        let expected = ReadFault::unavailable("probe", "detail").context();
+        assert!(
+            !expected.is_empty(),
+            "the read failure must carry evidence for the forwarding to matter"
+        );
+        let error = HttpServeFault::workspace(ReadFault::unavailable("probe", "detail"));
+        assert_eq!(error.context(), expected);
+    }
+
+    #[test]
+    fn ports_exhausted_carries_no_source() {
+        let error = bind_first_free(4..=6, |_| {
+            Err::<u16, _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+        })
+        .expect_err("an all-busy range must refuse");
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "an exhausted range has no underlying failure to expose"
+        );
+    }
+
+    #[test]
+    fn clean_serve_outcome_classifies_as_success() {
+        assert!(classify_serve_outcome(Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn serve_loop_failure_names_the_loop() {
+        let error = classify_serve_outcome(Ok(Err(std::io::Error::other("socket gone"))))
+            .expect_err("a serve loop failure must classify as an error");
+        let rendered = error.to_string();
+        assert!(rendered.contains("http serve loop"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn aborted_serve_task_names_the_task() {
+        let handle = tokio::spawn(std::future::pending::<Result<(), std::io::Error>>());
+        handle.abort();
+        let outcome = handle.await;
+        let error = classify_serve_outcome(outcome)
+            .expect_err("an aborted serving task must classify as an error");
+        let rendered = error.to_string();
+        assert!(rendered.contains("http serve task"), "{rendered}");
+    }
+
+    #[test]
+    fn stop_outcome_label_names_both_outcomes() {
+        assert_eq!(stop_outcome_label(true), "ok");
+        assert_eq!(stop_outcome_label(false), "error");
+    }
+
+    #[test]
+    fn poisoned_activity_lock_still_tracks_activity() {
+        let idle = Arc::new(IdleTracker::new());
+        let poisoner = Arc::clone(&idle);
+        std::thread::spawn(move || {
+            let _guard = poisoner
+                .last_activity
+                .lock()
+                .expect("the first lock of a fresh tracker must succeed");
+            panic!("poison the activity lock");
+        })
+        .join()
+        .expect_err("the poisoning thread must end by panic");
+        assert!(
+            idle.last_activity.lock().is_err(),
+            "the lock must be poisoned for the recovery arm to matter"
+        );
+        let before = Instant::now();
+        idle.touch();
+        let deadline = idle.idle_deadline(Duration::from_secs(5));
+        assert!(
+            deadline >= before + Duration::from_secs(5),
+            "a recovered tracker must keep tracking touches"
+        );
+    }
+
+    #[test]
+    fn exact_bearer_token_is_authorized() {
+        assert!(bearer_authorized(Some("Bearer secret"), "secret"));
+    }
+
+    #[test]
+    fn wrong_token_is_refused() {
+        assert!(!bearer_authorized(Some("Bearer secrex"), "secret"));
+        assert!(!bearer_authorized(Some("Bearer secre"), "secret"));
+        assert!(!bearer_authorized(Some("Bearer secrets"), "secret"));
+    }
+
+    #[test]
+    fn malformed_authorization_is_refused() {
+        for value in [
+            "secret",
+            "bearer secret",
+            "Bearer",
+            "Bearer  secret",
+            "Basic secret",
+            "",
+        ] {
+            assert!(
+                !bearer_authorized(Some(value), "secret"),
+                "malformed value must be refused: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_authorization_is_refused() {
+        assert!(!bearer_authorized(None, "secret"));
+    }
+
+    #[test]
+    fn refusal_carries_the_authenticate_scheme() {
+        let response = unauthorized();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer")
+        );
+    }
+
+    #[test]
+    fn loopback_hosts_are_accepted_with_and_without_ports() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:12345",
+            "localhost",
+            "localhost:80",
+            "LOCALHOST:13000",
+            "[::1]",
+            "[::1]:12000",
+        ] {
+            assert!(
+                super::host_is_loopback(host),
+                "host {host:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_hosts_are_refused() {
+        for host in [
+            "",
+            "rift.example",
+            "rift.example:12345",
+            "127.0.0.1.rift.example",
+            "localhost:port",
+            "[::2]:80",
+            "127.0.0.1:",
+        ] {
+            assert!(
+                !super::host_is_loopback(host),
+                "host {host:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_origins_are_accepted() {
+        for origin in [
+            "http://127.0.0.1:5500",
+            "https://localhost",
+            "HTTP://[::1]:13000",
+        ] {
+            assert!(
+                super::origin_is_loopback(origin),
+                "origin {origin:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_origins_are_refused() {
+        for origin in [
+            "",
+            "null",
+            "http://rift.example",
+            "https://rift.example:443",
+            "file://127.0.0.1",
+            "127.0.0.1",
+        ] {
+            assert!(
+                !super::origin_is_loopback(origin),
+                "origin {origin:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_refusal_names_the_header() {
+        let response = super::boundary_refusal("Origin");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_watch_stops_a_quiet_server() {
+        let idle = Arc::new(IdleTracker::new());
+        let stop = CancellationToken::new();
+        let watch = tokio::spawn(watch_idle(
+            Arc::clone(&idle),
+            Duration::from_secs(5),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        watch.await.expect("watch task must join");
+        assert!(
+            stop.is_cancelled(),
+            "a quiet span past the timeout must stop the server"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn touched_activity_defers_the_idle_stop() {
+        let idle = Arc::new(IdleTracker::new());
+        let stop = CancellationToken::new();
+        let watch = tokio::spawn(watch_idle(
+            Arc::clone(&idle),
+            Duration::from_secs(5),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        idle.touch();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !stop.is_cancelled(),
+            "a touch inside the span must defer the stop"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        watch.await.expect("watch task must join");
+        assert!(
+            stop.is_cancelled(),
+            "the deferred deadline must still stop the server"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_cancel_ends_the_idle_watch() {
+        let idle = Arc::new(IdleTracker::new());
+        let stop = CancellationToken::new();
+        let watch = tokio::spawn(watch_idle(
+            Arc::clone(&idle),
+            Duration::from_hours(1),
+            stop.clone(),
+        ));
+        stop.cancel();
+        watch
+            .await
+            .expect("an externally cancelled watch must end promptly");
+    }
+}

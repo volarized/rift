@@ -11,8 +11,11 @@ description = "Model Context Protocol transport for Rift"
 workspace = true
 
 [dependencies]
+axum.workspace = true
+data-encoding.workspace = true
+getrandom.workspace = true
 notify.workspace = true
-rmcp.workspace = true
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
 rift-core.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
@@ -20,13 +23,14 @@ rift-server.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+reqwest.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
-rmcp = { workspace = true, features = ["client"] }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 jsonschema.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

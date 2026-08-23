@@ -472,7 +472,7 @@ fn tool_validators(
 }
 
 /// Most attempts one corpus request retries before giving up on acceptance.
-const ADMISSION_ATTEMPTS_MAX: usize = 8;
+const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
 
 /// Calls one tool, retrying the refusal the server advertises as
 /// `retry: same_request`: the workspace's own filesystem watcher can
@@ -483,7 +483,7 @@ async fn call_tool_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,
 ) -> TestResult<rmcp::model::CallToolResult> {
-    for _attempt in 0..ADMISSION_ATTEMPTS_MAX {
+    for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
         match client.call_tool(params.clone()).await {
             Ok(result) => return Ok(result),
             Err(rmcp::ServiceError::McpError(error))
