@@ -127,9 +127,21 @@ export type IsoConnector = {
   labelAt: Ground | null;
 };
 
+/** A subgraph's box: drawn behind its member plates, titled along its top. */
+export type IsoGroup = {
+  id: string;
+  title: string[];
+  /** Centre of the box. */
+  x: number;
+  z: number;
+  width: number;
+  depth: number;
+};
+
 export type IsoScene = {
   plates: IsoPlate[];
   connectors: IsoConnector[];
+  groups: IsoGroup[];
   /** Everything's extent, so the camera can frame it. */
   bounds: { x0: number; x1: number; z0: number; z1: number };
   metrics: IsoMetrics;
@@ -266,7 +278,10 @@ export function buildScene(
 ): IsoScene {
   const metrics = { ...DEFAULT_METRICS, ...overrides };
 
-  const graph = new Graph<GraphLabel, NodeLabel, EdgeLabel>({ multigraph: true });
+  const graph = new Graph<GraphLabel, NodeLabel, EdgeLabel>({
+    multigraph: true,
+    compound: flow.groups.length > 0,
+  });
   graph.setGraph({
     rankdir: flow.direction,
     ranksep: metrics.rankSep,
@@ -290,6 +305,13 @@ export function buildScene(
       width: caption.width + metrics.margin * 2,
       height: Math.max(metrics.minDepth, caption.height + metrics.margin * 2),
     });
+  }
+
+  for (const group of flow.groups) {
+    graph.setNode(group.id, {});
+    for (const member of group.nodes) {
+      graph.setParent(member, group.id);
+    }
   }
 
   flow.edges.forEach((edge, index) => {
@@ -326,6 +348,7 @@ export function buildScene(
 
   const plates: IsoPlate[] = [];
   const tiles: Tile[] = [];
+  const tileByNode = new Map<string, Tile>();
 
   for (const node of flow.nodes) {
     const placed = graph.node(node.id);
@@ -345,12 +368,14 @@ export function buildScene(
       depth: placed.height,
     });
 
-    tiles.push({
+    const tile = {
       x0: x - placed.width / 2,
       x1: x + placed.width / 2,
       z0: z - placed.height / 2,
       z1: z + placed.height / 2,
-    });
+    };
+    tiles.push(tile);
+    tileByNode.set(node.id, tile);
   }
 
   const connectors: IsoConnector[] = flow.edges.flatMap((edge, index) => {
@@ -374,6 +399,33 @@ export function buildScene(
     ];
   });
 
+  // A group's box is the union of its members' footprints — dagre's compound
+  // pass keeps the members contiguous but reports the cluster's own box
+  // unreliably, so the box is derived from what was actually placed. Breathing
+  // room on every side, plus a band along the top for the title to sit in.
+  const titleBand = metrics.note * LEADING + metrics.margin / 2;
+  const groups: IsoGroup[] = flow.groups.flatMap((group) => {
+    const members = group.nodes
+      .map((id) => tileByNode.get(id))
+      .filter((tile): tile is Tile => tile !== undefined);
+    if (members.length === 0) return [];
+
+    const x0 = Math.min(...members.map((tile) => tile.x0)) - metrics.margin / 2;
+    const x1 = Math.max(...members.map((tile) => tile.x1)) + metrics.margin / 2;
+    const z0 = Math.min(...members.map((tile) => tile.z0)) - metrics.margin / 2 - titleBand;
+    const z1 = Math.max(...members.map((tile) => tile.z1)) + metrics.margin / 2;
+    return [
+      {
+        id: group.id,
+        title: group.title,
+        x: (x0 + x1) / 2,
+        z: (z0 + z1) / 2,
+        width: x1 - x0,
+        depth: z1 - z0,
+      },
+    ];
+  });
+
   const bounds = {
     x0: Number.POSITIVE_INFINITY,
     x1: Number.NEGATIVE_INFINITY,
@@ -393,6 +445,10 @@ export function buildScene(
     cover([tile.x1, tile.z1]);
   }
   for (const connector of connectors) for (const point of connector.points) cover(point);
+  for (const group of groups) {
+    cover([group.x - group.width / 2, group.z - group.depth / 2]);
+    cover([group.x + group.width / 2, group.z + group.depth / 2]);
+  }
 
-  return { plates, connectors, bounds, metrics };
+  return { plates, connectors, groups, bounds, metrics };
 }

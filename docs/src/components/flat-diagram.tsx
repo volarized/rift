@@ -38,7 +38,7 @@ const FLAT_METRICS: Partial<IsoMetrics> = {
 const FRAME_PADDING = 10;
 
 /** Ink opacities, matched to the isometric renderer's edge-first look. */
-const INK = { plate: 0.55, connector: 0.45, label: 0.9, note: 0.6 };
+const INK = { plate: 0.55, connector: 0.45, label: 0.9, note: 0.6, group: 0.3 };
 
 export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagramProps) {
   const flow = await parseFlowchart(chart);
@@ -58,6 +58,30 @@ export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagra
         aria-label={alt}
         className="w-full h-auto font-mono"
       >
+        {scene.groups.map((group) => (
+          <g key={group.id}>
+            <rect
+              x={group.x - group.width / 2}
+              y={group.z - group.depth / 2}
+              width={group.width}
+              height={group.depth}
+              rx={8}
+              fill="none"
+              stroke="currentColor"
+              strokeOpacity={INK.group}
+              strokeDasharray="3 5"
+            />
+            <text
+              x={group.x - group.width / 2 + 10}
+              y={group.z - group.depth / 2 + note * 1.3}
+              fontSize={note}
+              fill="currentColor"
+              fillOpacity={INK.note}
+            >
+              {group.title.join(" ")}
+            </text>
+          </g>
+        ))}
         {scene.connectors.map((connector) => (
           <g key={connector.key} opacity={INK.connector}>
             <path
