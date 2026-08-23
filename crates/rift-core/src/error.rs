@@ -13,8 +13,8 @@ pub use rift_protocol::error::{ErrorCode, LimitEvidence, RetryDirective};
 use serde::Serialize;
 use strum::VariantArray;
 
-/// CLI-only failure identities. They never cross the MCP wire: the update
-/// and artifact commands raise them directly to an operator.
+/// CLI-only failure identities. They never cross the MCP wire: the update,
+/// artifact, and server commands raise them directly to an operator.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, VariantArray)]
 #[serde(rename_all = "snake_case")]
 pub enum CliCode {
@@ -36,6 +36,14 @@ pub enum CliCode {
     UpdateRollbackFailed,
     /// Generated artifact no longer matches its source.
     ArtifactStale,
+    /// Another rift server already serves this workspace.
+    ServerAlreadyServing,
+    /// Rift server process could not be started.
+    ServerStartFailed,
+    /// Started rift server did not report serving in time.
+    ServerStartTimedOut,
+    /// Running rift server could not be stopped.
+    ServerStopFailed,
 }
 
 /// Stable machine-readable error identity: a wire code or a CLI-only code.
@@ -216,6 +224,26 @@ const fn cli_guidance(code: CliCode) -> (&'static str, RetryDirective, &'static 
             "a generated artifact no longer matches its source",
             RetryDirective::OperatorAction,
             "regenerate the artifact with the printed command",
+        ),
+        CliCode::ServerAlreadyServing => (
+            "another rift server already serves this workspace",
+            RetryDirective::OperatorAction,
+            "connect to the listed server, or run `rift server stop` before serving again",
+        ),
+        CliCode::ServerStartFailed => (
+            "the rift server process could not be started",
+            RetryDirective::OperatorAction,
+            "check that the rift binary is runnable, or run `rift server start --foreground` to serve in this process",
+        ),
+        CliCode::ServerStartTimedOut => (
+            "the started rift server did not report serving in time",
+            RetryDirective::OperatorAction,
+            "run `rift server start --foreground` to see the server's diagnostics on stderr",
+        ),
+        CliCode::ServerStopFailed => (
+            "the running rift server could not be stopped",
+            RetryDirective::OperatorAction,
+            "retry `rift server stop`; if the refusal repeats, end the reported pid manually",
         ),
     }
 }
@@ -488,6 +516,22 @@ mod tests {
         assert_eq!(
             ErrorName::Cli(CliCode::ArtifactStale).code(),
             "artifact_stale"
+        );
+        assert_eq!(
+            ErrorName::Cli(CliCode::ServerAlreadyServing).code(),
+            "server_already_serving"
+        );
+        assert_eq!(
+            ErrorName::Cli(CliCode::ServerStartFailed).code(),
+            "server_start_failed"
+        );
+        assert_eq!(
+            ErrorName::Cli(CliCode::ServerStartTimedOut).code(),
+            "server_start_timed_out"
+        );
+        assert_eq!(
+            ErrorName::Cli(CliCode::ServerStopFailed).code(),
+            "server_stop_failed"
         );
     }
 

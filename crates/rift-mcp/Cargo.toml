@@ -23,6 +23,7 @@ rift-server.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tokio-util.workspace = true
 tracing.workspace = true
@@ -32,6 +33,5 @@ reqwest.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 jsonschema.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

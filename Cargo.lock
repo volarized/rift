@@ -2740,6 +2740,7 @@ dependencies = [
 name = "rift"
 version = "0.0.9"
 dependencies = [
+ "axum",
  "clap",
  "flate2",
  "fs4",
@@ -2760,6 +2761,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "zip",
