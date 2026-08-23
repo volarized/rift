@@ -2,8 +2,6 @@
 title: Implementation
 ---
 
-<VersionBadge version="planned" />
-
 import { FlatDiagram } from "@/components/flat-diagram";
 
 This page goes into how Rift is built. It's developer-oriented — if you just want to use Rift,
@@ -98,8 +96,8 @@ index counter matches it — the mechanism behind the freshness the
 Rift FS mounts each served tree through the host's native client: NFSv3 loopback via
 [nfsserve](https://github.com/xetdata/nfsserve) on macOS — an unprivileged mount, no kernel
 extension — and FUSE via [fuser](https://github.com/cberner/fuser) on Linux, unprivileged
-through `fusermount3`. A host where neither mounts falls back to the copy backing with the same
-contract.
+through `fusermount3`. A host where neither mounts falls back to a copy-backed tree with the
+same contract.
 
 The overlay holds a pinned lower layer and a per-tree upper store. The first write to a path
 detaches it into the store; a deletion leaves a whiteout; `.rift` is never served. Lower-layer
@@ -112,8 +110,7 @@ still inside.
 <VersionBadge version="v0.0.9" languages={["Rust"]} />
 
 One [SQLite](https://www.sqlite.org/) database at `.rift/db` holds every store Rift persists
-for the workspace — the
-lexical index today, later stores beside it. The server lock, projection directories, and
+for the workspace — today, the lexical index. The server lock, projection directories, and
 execution copies stay separate entries under `.rift`; the database carries stores that are
 rows, not trees. Access goes through [Toasty](https://github.com/tokio-rs/toasty) models; the
 full-text surface is raw SQL, because Toasty 0.10 has no typed virtual-table or `MATCH` API,
@@ -122,14 +119,15 @@ and the raw boundary stays confined to the FTS table and its rows.
 Publication replaces the whole unit set and restamps the revision, so the store is never a
 partial mix of two trees.
 
-The lexical index is three tables. `lexical_units` holds one row per indexed unit — a code
-symbol, or a text file split into chunks past the
-[`[search.text]`](/docs/configuration#search) chunk bound. `lexical_index_state` stamps the set
-with the tree revision that published it; a search request trusts the store only when that
-stamp equals the snapshot it reads. `lexical_units_fts` is the
-[FTS5](https://www.sqlite.org/fts5.html) virtual table over `name`
-and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25` with
-per-column weights, comparable only within one search.
+The lexical index's tables:
+
+- `lexical_units` — one row per indexed unit: a code symbol, or a text file split into chunks
+  past the [`[search.text]`](/docs/configuration#search) chunk bound.
+- `lexical_index_state` — stamps the set with the tree revision that published it; a search
+  request trusts the store only when that stamp equals the snapshot it reads.
+- `lexical_units_fts` — the [FTS5](https://www.sqlite.org/fts5.html) virtual table over `name`
+  and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25`
+  with per-column weights, comparable only within one search.
 
 Search is a layered configuration: the default is this full-text store alone, and naming a model
 in [`search.embedding`](/docs/configuration#search) adds a per-model vector store whose cosine
@@ -137,6 +135,8 @@ similarity the server fuses into the lexical score — the layering the
 [architecture](/docs/architecture#search) page describes.
 
 ## Language providers
+
+<VersionBadge version="planned" />
 
 A provider composition is a typed pipeline of named stages — source resolvers, fact providers,
 enrichers, transforms — connected through declared input and output flows, with keyed joins for
@@ -154,6 +154,8 @@ return through the provider contract, and the server notifies the engine of writ
 because no filesystem watcher sees inside a served tree.
 
 ## Hooks and configuration
+
+<VersionBadge version="v0.0.5" />
 
 `rift.toml` at the workspace root is accepted at startup and re-accepted on change; its schema
 is exported beside the MCP surface as [`rift.schema.json`](https://volar.sh/rift/rift.schema.json),
