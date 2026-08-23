@@ -191,7 +191,7 @@ function JsonNode({
   value,
 }: JsonNodeProps) {
   const expandable = typeof value === "object" && value !== null;
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const resolved = structuralSchema(schema, root);
   const suffix = comma ? "," : "";
   const indentation = { paddingInlineStart: `${depth * 0.75}rem` };
