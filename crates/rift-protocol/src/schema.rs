@@ -47,7 +47,7 @@ macro_rules! property {
     }};
 }
 
-/// The Rift extension keyword stating an admitted range schema validation
+/// The Rift extension keyword stating an accepted range schema validation
 /// cannot compare itself: the bounds of a string-spelled `ByteSize` or
 /// `Duration` key.
 const RIFT_RANGE: &str = "rift:range";
@@ -165,10 +165,10 @@ fn constant<T: Serialize>(value: &T) -> Value {
     json!({ keyword::CONST: wire(value) })
 }
 
-/// A subclause admitting the wire forms of the listed model values.
+/// A subclause accepting the wire forms of the listed model values.
 fn enumeration<T: Serialize>(values: &[T]) -> Value {
-    let admitted: Vec<Value> = values.iter().map(wire).collect();
-    json!({ keyword::ENUM: admitted })
+    let accepted: Vec<Value> = values.iter().map(wire).collect();
+    json!({ keyword::ENUM: accepted })
 }
 
 /// A subclause bounding an array property's length.
@@ -241,7 +241,7 @@ fn nullable_without_type(object: &mut Map<String, Value>) {
     object.insert(keyword::ANY_OF.to_owned(), json!([inner, null_arm]));
 }
 
-/// A `rift:range` value: the smallest and largest admitted spelling, both
+/// A `rift:range` value: the smallest and largest accepted spelling, both
 /// serialized by the value type itself.
 fn range<T: Serialize>(min: &T, max: &T) -> Value {
     json!({ "min": wire(min), "max": wire(max) })
@@ -293,8 +293,8 @@ pub fn declare_execution_ranges(schema: &mut Schema) {
             ),
         ),
     ];
-    for (name, admitted) in ranges {
-        annotate_property(schema, name, RIFT_RANGE, admitted);
+    for (name, accepted) in ranges {
+        annotate_property(schema, name, RIFT_RANGE, accepted);
     }
 }
 
@@ -378,8 +378,8 @@ pub fn declare_hook_ranges(schema: &mut Schema) {
             ),
         ),
     ];
-    for (name, admitted) in ranges {
-        annotate_property(schema, name, RIFT_RANGE, admitted);
+    for (name, accepted) in ranges {
+        annotate_property(schema, name, RIFT_RANGE, accepted);
     }
 }
 
@@ -741,10 +741,10 @@ mod tests {
             ("max_timeout", json!({ "min": "1ms", "max": "1d" })),
             ("max_output", json!({ "min": "0b", "max": "16kb" })),
         ];
-        for (name, admitted) in cases {
+        for (name, accepted) in cases {
             assert_eq!(
-                schema["properties"][name][RIFT_RANGE], admitted,
-                "{name} must state its admitted range"
+                schema["properties"][name][RIFT_RANGE], accepted,
+                "{name} must state its accepted range"
             );
         }
     }
@@ -756,7 +756,7 @@ mod tests {
         assert_eq!(
             schema["properties"]["worker_queue_timeout"][RIFT_RANGE],
             json!({ "min": "1ms", "max": "1h" }),
-            "worker_queue_timeout must state its admitted range"
+            "worker_queue_timeout must state its accepted range"
         );
     }
 
@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(
             schema["properties"]["busy_timeout"][RIFT_RANGE],
             json!({ "min": "100ms", "max": "30s" }),
-            "busy_timeout must state its admitted range"
+            "busy_timeout must state its accepted range"
         );
     }
 
@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(
             schema["properties"]["max_chunk"][RIFT_RANGE],
             json!({ "min": "1kb", "max": "16mb" }),
-            "max_chunk must state its admitted range"
+            "max_chunk must state its accepted range"
         );
     }
 
@@ -791,10 +791,10 @@ mod tests {
             ("timeout", json!({ "min": "1ms", "max": "1h" })),
             ("output_limit", json!({ "min": "256b", "max": "4kb" })),
         ];
-        for (name, admitted) in cases {
+        for (name, accepted) in cases {
             assert_eq!(
-                schema["properties"][name][RIFT_RANGE], admitted,
-                "{name} must state its admitted range"
+                schema["properties"][name][RIFT_RANGE], accepted,
+                "{name} must state its accepted range"
             );
         }
     }
@@ -936,8 +936,8 @@ mod tests {
                 if let Some(value) = tagged["const"].as_str() {
                     values.push(value.to_owned());
                 }
-                if let Some(admitted) = tagged["enum"].as_array() {
-                    values.extend(admitted.iter().filter_map(Value::as_str).map(str::to_owned));
+                if let Some(accepted) = tagged["enum"].as_array() {
+                    values.extend(accepted.iter().filter_map(Value::as_str).map(str::to_owned));
                 }
             }
         }

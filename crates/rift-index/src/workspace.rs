@@ -12,7 +12,7 @@ use rift_core::constants::{
 };
 use rift_core::{
     CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
-    SourceVisibility, TextFileAdmission, fault_label,
+    SourceVisibility, TextFileInclusion, fault_label,
 };
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{
@@ -86,12 +86,12 @@ impl WorkspaceIndexLimits {
         self.results_max
     }
 
-    /// Returns maximum admitted source files per index.
+    /// Returns maximum source files accepted per index.
     pub(crate) const fn files_max(self) -> usize {
         self.files_max
     }
 
-    /// Returns maximum bytes of one admitted source file.
+    /// Returns maximum bytes accepted for one source file.
     pub(crate) const fn file_bytes_max(self) -> usize {
         self.file_bytes_max
     }
@@ -101,7 +101,7 @@ impl WorkspaceIndexLimits {
         self.directory_depth_max
     }
 
-    /// Returns maximum aggregate source bytes admitted per index.
+    /// Returns maximum aggregate source bytes accepted per index.
     pub(crate) const fn workspace_bytes_max(self) -> usize {
         self.workspace_bytes_max
     }
@@ -137,7 +137,7 @@ pub enum WorkspaceIndexViolation {
     WorkspaceTooLarge,
     /// Workspace path is not UTF-8 or canonical project syntax.
     InvalidPath,
-    /// An admitted file's bytes are not valid UTF-8: a Rust source file or a `[search.text]`
+    /// An included file's bytes are not valid UTF-8: a Rust source file or a `[search.text]`
     /// text file.
     InvalidSource,
     /// Filesystem operation failed.
@@ -355,14 +355,14 @@ pub enum SymbolMatchRank {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFingerprint([u8; 32]);
 
-/// Compiled source visibility used by filesystem event admission.
+/// Compiled source visibility used by filesystem event inclusion.
 #[derive(Debug)]
 pub struct WorkspaceSourcePolicy {
     root: PathBuf,
     watched_root: PathBuf,
     matcher: PathMatcher,
     gitignore: Option<Gitignore>,
-    text_admission: TextFileAdmission,
+    text_inclusion: TextFileInclusion,
 }
 
 /// Separates one path from its source bytes in workspace identity material.
@@ -371,7 +371,7 @@ const FINGERPRINT_PATH_SEPARATOR: u8 = 0;
 const FINGERPRINT_FILE_SEPARATOR: u8 = 0xff;
 
 impl WorkspaceFingerprint {
-    /// Captures visible source and admitted text paths and bytes without parsing syntax.
+    /// Captures visible source and included text paths and bytes without parsing syntax.
     ///
     /// Work is bounded by [`WorkspaceIndexLimits`].
     ///
@@ -383,10 +383,10 @@ impl WorkspaceFingerprint {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-        text_admission: &TextFileAdmission,
+        text_inclusion: &TextFileInclusion,
     ) -> Result<Self, WorkspaceIndexError> {
         let root = canonical_root(root)?;
-        let classified = discover(&root, limits, visibility, text_admission)?;
+        let classified = discover(&root, limits, visibility, text_inclusion)?;
         fingerprint_paths(&root, &classified, limits)
     }
 
@@ -403,7 +403,7 @@ impl WorkspaceFingerprint {
 }
 
 impl WorkspaceSourcePolicy {
-    /// Compiles path policy from admitted configuration and `.gitignore` files.
+    /// Compiles path policy from accepted configuration and `.gitignore` files.
     ///
     /// Work is bounded by [`WorkspaceIndexLimits`].
     ///
@@ -415,7 +415,7 @@ impl WorkspaceSourcePolicy {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-        text_admission: &TextFileAdmission,
+        text_inclusion: &TextFileInclusion,
     ) -> Result<Self, WorkspaceIndexError> {
         let watched_root = root.to_path_buf();
         let root = canonical_root(root)?;
@@ -429,53 +429,53 @@ impl WorkspaceSourcePolicy {
             watched_root,
             matcher,
             gitignore,
-            text_admission: text_admission.clone(),
+            text_inclusion: text_inclusion.clone(),
         })
     }
 
-    /// Returns whether one source or admitted-text path passes current workspace policy.
+    /// Returns whether one source or included-text path passes current workspace policy.
     /// Source and text-file candidates share this one predicate: only the extension gate
-    /// that admits a path into either class differs between them.
+    /// that includes a path in either class differs between them.
     #[must_use]
-    pub fn admits(&self, path: &Path) -> bool {
+    pub fn includes(&self, path: &Path) -> bool {
         let Some(path) = self.normalized_path(path) else {
             return false;
         };
         let path = path.as_ref();
-        let admissible_extension = has_source_extension(path) || self.text_admission.admits(path);
-        let above_hard_floor = hard_floor_admits_path(&self.root, path);
-        if !admissible_extension || !above_hard_floor {
+        let extension_included = has_source_extension(path) || self.text_inclusion.includes(path);
+        let above_hard_floor = hard_floor_includes_path(&self.root, path);
+        if !extension_included || !above_hard_floor {
             return false;
         }
-        let configuration_admits = self.matcher.admits(path);
-        let gitignore_admits = self.gitignore.as_ref().is_none_or(|gitignore| {
+        let configuration_includes = self.matcher.includes(path);
+        let gitignore_includes = self.gitignore.as_ref().is_none_or(|gitignore| {
             !matches!(
                 gitignore.matched_path_or_any_parents(path, false),
                 Match::Ignore(_)
             )
         });
-        configuration_admits && gitignore_admits
+        configuration_includes && gitignore_includes
     }
 
     /// Returns whether one directory can contain visible Rust source.
     #[must_use]
-    pub fn may_admit_descendant(&self, path: &Path) -> bool {
+    pub fn may_include_descendant(&self, path: &Path) -> bool {
         let Some(path) = self.normalized_path(path) else {
             return false;
         };
         let path = path.as_ref();
-        let above_hard_floor = hard_floor_admits_path(&self.root, path);
+        let above_hard_floor = hard_floor_includes_path(&self.root, path);
         if !above_hard_floor {
             return false;
         }
-        let configuration_admits = self.matcher.may_admit_descendant(path);
-        let gitignore_admits = self.gitignore.as_ref().is_none_or(|gitignore| {
+        let configuration_includes = self.matcher.may_include_descendant(path);
+        let gitignore_includes = self.gitignore.as_ref().is_none_or(|gitignore| {
             !matches!(
                 gitignore.matched_path_or_any_parents(path, true),
                 Match::Ignore(_)
             )
         });
-        configuration_admits && gitignore_admits
+        configuration_includes && gitignore_includes
     }
 
     /// Returns whether path identifies root workspace configuration file.
@@ -510,9 +510,9 @@ pub struct WorkspaceIndex {
 }
 
 impl WorkspaceIndex {
-    /// Scans current Rust files and admitted text files directly from workspace root,
+    /// Scans current Rust files and included text files directly from workspace root,
     /// applying `visibility`'s `.gitignore` and `[source]` include/exclude policy, and
-    /// `text_admission`'s extension list, on top of the hard floor.
+    /// `text_inclusion`'s extension list, on top of the hard floor.
     ///
     /// Symlinks, `.git`, `.rift`, and `target` are never followed or
     /// indexed, whatever `visibility` says.
@@ -525,11 +525,11 @@ impl WorkspaceIndex {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-        text_admission: &TextFileAdmission,
+        text_inclusion: &TextFileInclusion,
     ) -> Result<Self, WorkspaceIndexError> {
         let root = canonical_root(root)?;
         let composition = composition()?;
-        let classified = discover(&root, limits, visibility, text_admission)?;
+        let classified = discover(&root, limits, visibility, text_inclusion)?;
         let parser = RustSyntaxProvider::default();
         let mut workspace_bytes = 0_usize;
         let mut files = Vec::with_capacity(classified.source.len());
@@ -549,12 +549,12 @@ impl WorkspaceIndex {
             text_files,
             composition,
             limits,
-            text_chunk_bytes_max: text_admission.chunk_bytes_max(),
+            text_chunk_bytes_max: text_inclusion.chunk_bytes_max(),
             fingerprint,
         })
     }
 
-    /// Assembles an index from files another source already admitted — the
+    /// Assembles an index from files another source already accepted — the
     /// revision build, whose bytes come from git objects instead of a
     /// directory walk. Revision reads carry no text files: `text_chunk_bytes_max` is kept
     /// only so a future revision-text feature can reuse this constructor unchanged.
@@ -590,14 +590,14 @@ impl WorkspaceIndex {
         &self.files
     }
 
-    /// Returns deterministic project-path ordered admitted text files.
+    /// Returns deterministic project-path ordered included text files.
     #[must_use]
     pub fn text_files(&self) -> &[TextSourceFile] {
         &self.text_files
     }
 
     /// Derives lexical search units from this index: one unit per indexed symbol, carrying
-    /// its declaration source, and one or more units per admitted text file — one whole unit
+    /// its declaration source, and one or more units per included text file — one whole unit
     /// when the file is within `[search.text].max_chunk`, one unit per chunk otherwise. A
     /// chunked file's units share its real path and share an identity built from that path
     /// plus the chunk index, so a hit still maps back to the file it came from.
@@ -703,7 +703,7 @@ impl WorkspaceIndex {
     /// matches; a `files_max`-plus-one-th match refuses rather than truncating silently.
     ///
     /// This walk covers source units only: `force_include`'s contract is reading a source
-    /// declaration on demand for one request, not admitting text files into the persistent
+    /// declaration on demand for one request, not including text files in the persistent
     /// lexical index, so a `[search.text]` extension never joins it.
     ///
     /// # Errors
@@ -747,7 +747,7 @@ impl WorkspaceIndex {
             if !has_source_extension(path) {
                 continue;
             }
-            if !matcher.admits(path) {
+            if !matcher.includes(path) {
                 continue;
             }
             let relative = path.strip_prefix(&self.root).map_err(|error| {
@@ -876,8 +876,8 @@ pub(crate) fn composition_error(
     index_error_caused_by(WorkspaceIndexViolation::Composition, None, source)
 }
 
-/// A candidate path's admitted granularity: a provider-declared source extension always wins
-/// over a `[search.text]` extension when both sets would admit it.
+/// A candidate path's included granularity: a provider-declared source extension always wins
+/// over a `[search.text]` extension when both sets would include it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathClass {
     /// Parsed for symbols by a syntax provider.
@@ -895,22 +895,22 @@ struct DiscoveredPaths {
 
 /// Classifies `path` by extension alone, before any visibility policy is consulted: a
 /// provider-declared source extension is [`PathClass::Source`]; otherwise an extension
-/// [`TextFileAdmission`] admits is [`PathClass::Text`]; anything else is not a candidate.
-fn classify_path(path: &Path, text_admission: &TextFileAdmission) -> Option<PathClass> {
+/// [`TextFileInclusion`] includes is [`PathClass::Text`]; anything else is not a candidate.
+fn classify_path(path: &Path, text_inclusion: &TextFileInclusion) -> Option<PathClass> {
     if has_source_extension(path) {
         Some(PathClass::Source)
-    } else if text_admission.admits(path) {
+    } else if text_inclusion.includes(path) {
         Some(PathClass::Text)
     } else {
         None
     }
 }
 
-/// Source and admitted text paths visible below `root`: the hard floor (`.git`, `.rift`,
+/// Source and included text paths visible below `root`: the hard floor (`.git`, `.rift`,
 /// `target`, symlinks) is always applied, `visibility.respect_gitignore()` then layers the
 /// workspace's own `.gitignore` chain, and `visibility.include()`/`.exclude()` narrow or drop
 /// candidate files. A path is classified by extension first — source wins over text when an
-/// extension is admitted by both — and the same visibility policy then applies to whichever
+/// extension is included by both — and the same visibility policy then applies to whichever
 /// class it landed in, so a text file reaches the same `.gitignore` and `[source]` policy a
 /// source file does.
 ///
@@ -921,7 +921,7 @@ fn discover(
     root: &Path,
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
-    text_admission: &TextFileAdmission,
+    text_inclusion: &TextFileInclusion,
 ) -> Result<DiscoveredPaths, WorkspaceIndexError> {
     let matcher = PathMatcher::build(root, visibility.include(), visibility.exclude())?;
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
@@ -942,10 +942,10 @@ fn discover(
             continue;
         }
         let path = entry.path();
-        let Some(class) = classify_path(path, text_admission) else {
+        let Some(class) = classify_path(path, text_inclusion) else {
             continue;
         };
-        if !matcher.admits(path) {
+        if !matcher.includes(path) {
             continue;
         }
         let total = discovered.source.len() + discovered.text.len();
@@ -999,7 +999,7 @@ fn build_gitignore(
 /// Hashes one already-discovered source and text path set without parsing syntax. Source
 /// paths enforce [`WorkspaceIndexLimits::file_bytes_max`] per file, matching the bound the
 /// index build applies; text paths carry no per-file bound, matching
-/// [`admitted_text_file`] — both classes still count against the shared aggregate
+/// [`included_text_file`] — both classes still count against the shared aggregate
 /// `workspace_bytes_max`.
 fn fingerprint_paths(
     root: &Path,
@@ -1106,7 +1106,7 @@ fn source_walk(root: &Path, directory_depth_max: usize, gitignore: GitignorePoli
         .follow_links(false)
         .max_depth(Some(directory_depth_max.saturating_add(1)))
         .sort_by_file_name(OsStr::cmp)
-        .filter_entry(hard_floor_admits)
+        .filter_entry(hard_floor_includes)
         .git_ignore(gitignore == GitignorePolicy::Respect);
     builder.build()
 }
@@ -1114,7 +1114,7 @@ fn source_walk(root: &Path, directory_depth_max: usize, gitignore: GitignorePoli
 /// The hard floor every workspace applies before `.gitignore` or
 /// `[source]` are consulted: `.git`, `.rift`, and `target` are never
 /// descended into, and a symlink is never followed or indexed.
-fn hard_floor_admits(entry: &DirEntry) -> bool {
+fn hard_floor_includes(entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return true;
     }
@@ -1128,7 +1128,7 @@ fn hard_floor_admits(entry: &DirEntry) -> bool {
 }
 
 /// Applies the hard floor to one absolute event path.
-fn hard_floor_admits_path(root: &Path, path: &Path) -> bool {
+fn hard_floor_includes_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
@@ -1141,7 +1141,7 @@ fn hard_floor_admits_path(root: &Path, path: &Path) -> bool {
 }
 
 /// Whether `path`'s extension is one some shipped syntax provider declares
-/// ([`rift_syntax::SOURCE_FILE_EXTENSIONS`]): the walk admits exactly what a provider can
+/// ([`rift_syntax::SOURCE_FILE_EXTENSIONS`]): the walk includes exactly what a provider can
 /// parse, so a new grammar joins the scan by declaring its extensions on its provider.
 pub(crate) fn has_source_extension(path: &Path) -> bool {
     path.extension()
@@ -1185,14 +1185,14 @@ fn read_file(
         index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
     })?;
     let project_path = relative_path(relative)?;
-    admitted_file(project_path, bytes, path, parser, limits, workspace_bytes)
+    included_file(project_path, bytes, path, parser, limits, workspace_bytes)
 }
 
-/// Admits one source file's bytes into an index, whatever supplied them: the
+/// Includes one source file's bytes in an index, whatever supplied them: the
 /// per-file and aggregate byte bounds, UTF-8, and the syntax parse are the
 /// same for a directory walk and a committed revision tree. `context_path`
 /// names the file in refusals.
-pub(crate) fn admitted_file(
+pub(crate) fn included_file(
     project_path: ProjectPath,
     bytes: Vec<u8>,
     context_path: &Path,
@@ -1250,16 +1250,16 @@ fn read_text_file(
         index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
     })?;
     let project_path = relative_path(relative)?;
-    admitted_text_file(project_path, bytes, path, limits, workspace_bytes)
+    included_text_file(project_path, bytes, path, limits, workspace_bytes)
 }
 
-/// Admits one text file's bytes into an index: unlike [`admitted_file`], there is no
+/// Includes one text file's bytes in an index: unlike [`included_file`], there is no
 /// per-file byte bound — a text file joins the lexical index whole, however large, and
 /// [`WorkspaceIndex::lexical_units`] splits an oversized one into chunks rather than the
 /// index refusing it. The aggregate `workspace_bytes_max` bound still applies, and UTF-8
 /// validity is still required, matching a source file's `InvalidSource` refusal.
 /// `context_path` names the file in refusals.
-pub(crate) fn admitted_text_file(
+pub(crate) fn included_text_file(
     project_path: ProjectPath,
     bytes: Vec<u8>,
     context_path: &Path,
@@ -1359,12 +1359,12 @@ fn exceeds_chunk_bound(content_bytes: usize, chunk_bytes_max: u64) -> bool {
     u64::try_from(content_bytes).unwrap_or(u64::MAX) > chunk_bytes_max
 }
 
-/// Widens an already-admitted `[search.text].max_chunk` bound (1kb to 16mb) into the `usize`
+/// Widens an already-accepted `[search.text].max_chunk` bound (1kb to 16mb) into the `usize`
 /// domain the chunking kernel indexes with.
 fn checked_chunk_bytes_max(chunk_bytes_max: u64) -> usize {
     usize::try_from(chunk_bytes_max).unwrap_or_else(|_| {
         unreachable!(
-            "an admitted max_chunk bound must fit usize on supported platforms: \
+            "an accepted max_chunk bound must fit usize on supported platforms: \
              chunk_bytes_max={chunk_bytes_max}"
         )
     })
@@ -1456,7 +1456,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect("workspace index");
         assert_eq!(index.files().len(), 1);
@@ -1485,30 +1485,30 @@ mod tests {
             &watched_root,
             WorkspaceIndexLimits::default(),
             &visibility,
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )
         .expect("source policy");
 
-        assert!(policy.admits(&directory.path().join("src/lib.rs")));
-        assert!(!policy.admits(&directory.path().join("src/ignored.rs")));
-        assert!(!policy.admits(&directory.path().join("src/generated/code.rs")));
-        assert!(!policy.admits(&directory.path().join("target/code.rs")));
+        assert!(policy.includes(&directory.path().join("src/lib.rs")));
+        assert!(!policy.includes(&directory.path().join("src/ignored.rs")));
+        assert!(!policy.includes(&directory.path().join("src/generated/code.rs")));
+        assert!(!policy.includes(&directory.path().join("target/code.rs")));
         assert!(
-            !policy.admits(&directory.path().join("src/logo.png")),
-            "an extension neither a source provider nor [search.text] admits must be refused"
+            !policy.includes(&directory.path().join("src/logo.png")),
+            "an extension neither a source provider nor [search.text] includes must be refused"
         );
-        assert!(!policy.admits(Path::new("outside.rs")));
-        assert!(policy.may_admit_descendant(&directory.path().join("src")));
-        assert!(!policy.may_admit_descendant(&directory.path().join("examples")));
-        assert!(!policy.may_admit_descendant(&directory.path().join("src/generated")));
-        assert!(!policy.may_admit_descendant(&directory.path().join("target")));
+        assert!(!policy.includes(Path::new("outside.rs")));
+        assert!(policy.may_include_descendant(&directory.path().join("src")));
+        assert!(!policy.may_include_descendant(&directory.path().join("examples")));
+        assert!(!policy.may_include_descendant(&directory.path().join("src/generated")));
+        assert!(!policy.may_include_descendant(&directory.path().join("target")));
         let canonical_root = fs::canonicalize(directory.path()).expect("canonical workspace");
-        assert!(policy.admits(&canonical_root.join("src/lib.rs")));
-        assert!(policy.may_admit_descendant(&canonical_root.join("src")));
+        assert!(policy.includes(&canonical_root.join("src/lib.rs")));
+        assert!(policy.may_include_descendant(&canonical_root.join("src")));
     }
 
     #[test]
-    fn test_workspace_source_policy_admits_text_extensions_under_the_same_visibility_rules() {
+    fn test_workspace_source_policy_includes_text_extensions_under_the_same_visibility_rules() {
         // A `[search.text]` extension must reach the same visibility predicate a source
         // extension does: `.gitignore` and `[source]` exclude a text candidate exactly as
         // they would a source one.
@@ -1526,23 +1526,23 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &visibility,
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )
         .expect("source policy");
 
-        assert!(policy.admits(&directory.path().join("docs/guide.md")));
-        assert!(policy.admits(&directory.path().join("notes.txt")));
+        assert!(policy.includes(&directory.path().join("docs/guide.md")));
+        assert!(policy.includes(&directory.path().join("notes.txt")));
         assert!(
-            !policy.admits(&directory.path().join("docs/ignored.md")),
+            !policy.includes(&directory.path().join("docs/ignored.md")),
             "gitignore must hide a text candidate exactly as it would a source one"
         );
         assert!(
-            !policy.admits(&directory.path().join("docs/generated/gen.md")),
+            !policy.includes(&directory.path().join("docs/generated/gen.md")),
             "[source] exclude must hide a text candidate exactly as it would a source one"
         );
         assert!(
-            !policy.admits(&directory.path().join("logo.png")),
-            "an extension outside both admitted sets must be refused"
+            !policy.includes(&directory.path().join("logo.png")),
+            "an extension outside both included sets must be refused"
         );
     }
 
@@ -1564,7 +1564,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect("workspace index");
         assert!(index.symbols("escaped", 5).expect("symbol read").is_empty());
@@ -1584,7 +1584,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect("workspace index");
         assert_eq!(
@@ -1602,7 +1602,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             visibility,
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
     }
 
@@ -1701,7 +1701,7 @@ mod tests {
             directory.path(),
             limits,
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect("index bounded to depth 1, with the deep directory hidden by .gitignore");
         let error = shallow
@@ -1771,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn test_respect_gitignore_toggle_admits_or_hides_matching_files() {
+    fn test_respect_gitignore_toggle_includes_or_hides_matching_files() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::create_dir_all(directory.path().join("vendor")).expect("fixture directories");
         fs::write(directory.path().join(".gitignore"), "vendor/\n").expect("root gitignore");
@@ -1902,7 +1902,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::new(2, 4, 100, 4, 5).expect("positive limits"),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect_err("file byte bound");
         assert_eq!(
@@ -1914,7 +1914,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect("workspace index");
         assert_eq!(
@@ -1950,7 +1950,7 @@ mod tests {
             &missing,
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect_err("missing root");
         assert_eq!(
@@ -1967,7 +1967,7 @@ mod tests {
                 &file_root,
                 WorkspaceIndexLimits::default(),
                 &SourceVisibility::default(),
-                &rift_core::TextFileAdmission::default(),
+                &rift_core::TextFileInclusion::default(),
             )
             .expect_err("file root")
             .fault()
@@ -1981,7 +1981,7 @@ mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::new(1, 1_000, 2_000, 4, 5).expect("limits"),
                 &SourceVisibility::default(),
-                &rift_core::TextFileAdmission::default(),
+                &rift_core::TextFileInclusion::default(),
             )
             .expect_err("file count bound")
             .fault()
@@ -1993,7 +1993,7 @@ mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::new(5, 1_000, 8, 4, 5).expect("limits"),
                 &SourceVisibility::default(),
-                &rift_core::TextFileAdmission::default(),
+                &rift_core::TextFileInclusion::default(),
             )
             .expect_err("workspace byte bound")
             .fault()
@@ -2009,7 +2009,7 @@ mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::new(5, 1_000, 2_000, 1, 5).expect("limits"),
                 &SourceVisibility::default(),
-                &rift_core::TextFileAdmission::default(),
+                &rift_core::TextFileInclusion::default(),
             )
             .expect_err("depth bound")
             .fault()
@@ -2025,7 +2025,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect("workspace index");
         assert_eq!(
@@ -2224,7 +2224,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect_err("unreadable directory");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
@@ -2243,7 +2243,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect_err("unsearchable directory");
         fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755))
@@ -2290,7 +2290,7 @@ mod tests {
                 directory.path(),
                 limits,
                 &SourceVisibility::default(),
-                &rift_core::TextFileAdmission::default()
+                &rift_core::TextFileInclusion::default()
             )
             .expect_err("invalid source")
             .fault()
@@ -2431,21 +2431,21 @@ mod tests {
     }
 
     #[test]
-    fn test_descendant_admission_refuses_paths_outside_root() {
+    fn test_descendant_inclusion_refuses_paths_outside_root() {
         let directory = fixture();
         let policy = WorkspaceSourcePolicy::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect("source policy");
-        assert!(!policy.may_admit_descendant(Path::new("/rift-elsewhere")));
+        assert!(!policy.may_include_descendant(Path::new("/rift-elsewhere")));
     }
 
     #[test]
     fn test_hard_floor_refuses_event_paths_outside_root() {
-        assert!(!hard_floor_admits_path(
+        assert!(!hard_floor_includes_path(
             Path::new("/rift-workspace"),
             Path::new("/rift-elsewhere/lib.rs")
         ));
@@ -2461,7 +2461,7 @@ mod tests {
             directory.path(),
             tight,
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect_err("second ignore file must breach the file bound");
         assert_eq!(
@@ -2482,7 +2482,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect_err("unreadable ignore file must be refused");
         fs::set_permissions(&ignore, fs::Permissions::from_mode(0o644)).expect("restore read");
@@ -2493,33 +2493,33 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_path_source_wins_when_an_extension_is_admitted_by_both_sets() {
+    fn test_classify_path_source_wins_when_an_extension_is_included_by_both_sets() {
         // A source provider's extension always wins over a configured text extension when
         // the same extension appears in both sets.
-        let admission = TextFileAdmission::new(vec!["rs".to_owned()], 1_024);
+        let inclusion = TextFileInclusion::new(vec!["rs".to_owned()], 1_024);
         assert_eq!(
-            classify_path(Path::new("lib.rs"), &admission),
+            classify_path(Path::new("lib.rs"), &inclusion),
             Some(PathClass::Source)
         );
     }
 
     #[test]
-    fn test_classify_path_returns_text_for_an_admitted_non_source_extension() {
-        let admission = TextFileAdmission::new(vec!["md".to_owned()], 1_024);
+    fn test_classify_path_returns_text_for_an_included_non_source_extension() {
+        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 1_024);
         assert_eq!(
-            classify_path(Path::new("readme.md"), &admission),
+            classify_path(Path::new("readme.md"), &inclusion),
             Some(PathClass::Text)
         );
     }
 
     #[test]
-    fn test_classify_path_returns_none_for_an_unadmitted_extension() {
-        let admission = TextFileAdmission::new(vec!["md".to_owned()], 1_024);
-        assert_eq!(classify_path(Path::new("logo.png"), &admission), None);
+    fn test_classify_path_returns_none_for_an_extension_outside_both_sets() {
+        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 1_024);
+        assert_eq!(classify_path(Path::new("logo.png"), &inclusion), None);
     }
 
     #[test]
-    fn test_build_admits_text_files_behind_gitignore_and_source_excludes() {
+    fn test_build_includes_text_files_behind_gitignore_and_source_excludes() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::create_dir_all(directory.path().join("docs/generated")).expect("directories");
         fs::write(directory.path().join(".gitignore"), "docs/ignored.md\n").expect("ignore file");
@@ -2537,7 +2537,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &visibility,
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )
         .expect("workspace index");
         let text_paths: Vec<&str> = index
@@ -2556,7 +2556,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )
         .expect_err("invalid UTF-8 text must refuse");
         assert_eq!(
@@ -2575,7 +2575,7 @@ mod tests {
             directory.path(),
             limits,
             &SourceVisibility::default(),
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )
         .expect_err("one source file plus one text file must breach a one-file bound");
         assert_eq!(
@@ -2585,14 +2585,14 @@ mod tests {
     }
 
     #[test]
-    fn test_text_files_accessor_returns_admitted_text_files() {
+    fn test_text_files_accessor_returns_included_text_files() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::write(directory.path().join("readme.md"), "hello").expect("text file");
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )
         .expect("workspace index");
         assert_eq!(index.text_files().len(), 1);
@@ -2605,15 +2605,15 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary workspace");
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
-        let admission = TextFileAdmission::default();
+        let inclusion = TextFileInclusion::default();
 
         let empty =
-            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &admission)
+            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
                 .expect("fingerprint of an empty workspace");
 
         fs::write(directory.path().join("readme.md"), "first").expect("text file");
         let appeared =
-            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &admission)
+            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
                 .expect("fingerprint after the text file appears");
         assert_ne!(
             empty, appeared,
@@ -2622,7 +2622,7 @@ mod tests {
 
         fs::write(directory.path().join("readme.md"), "second").expect("edited text file");
         let edited =
-            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &admission)
+            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
                 .expect("fingerprint after the text file's bytes change");
         assert_ne!(
             appeared, edited,
@@ -2631,7 +2631,7 @@ mod tests {
 
         fs::remove_file(directory.path().join("readme.md")).expect("remove text file");
         let removed =
-            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &admission)
+            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
                 .expect("fingerprint after the text file disappears");
         assert_eq!(
             empty, removed,
@@ -2646,7 +2646,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )
         .expect("workspace index");
         let units = index.lexical_units();
@@ -2670,7 +2670,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )
         .expect("workspace index");
         let units = index.lexical_units();
@@ -2694,12 +2694,12 @@ mod tests {
         // so the eight-line file below must split into several chunk units.
         let content = "aaa\nbbb\nccc\nddd\neee\nfff\nggg\nhhh\n";
         fs::write(directory.path().join("big.md"), content).expect("oversized text file");
-        let admission = TextFileAdmission::new(vec!["md".to_owned()], 10);
+        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 10);
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &admission,
+            &inclusion,
         )
         .expect("workspace index");
 
@@ -2769,11 +2769,11 @@ mod tests {
     }
 
     #[test]
-    fn test_admitted_text_file_over_limit_without_overflow_reports_workspace_too_large() {
+    fn test_included_text_file_over_limit_without_overflow_reports_workspace_too_large() {
         let limits = WorkspaceIndexLimits::new(5, 1_000, 10, 4, 5).expect("limits");
         let mut workspace_bytes = 6_usize;
         let project_path = ProjectPath::new("big.md").expect("fixture path");
-        let error = admitted_text_file(
+        let error = included_text_file(
             project_path,
             b"12345".to_vec(),
             Path::new("big.md"),

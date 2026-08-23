@@ -10,7 +10,7 @@ use std::time::Duration;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use rift_core::constants::{WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES};
-use rift_core::{SourceVisibility, TextFileAdmission};
+use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::{
     LexicalSearchIndex, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
@@ -126,68 +126,68 @@ pub(crate) struct IndexSupervisorContext {
     pub(crate) lexical: Option<Arc<LexicalSearchIndex>>,
 }
 
-/// The last admission of the workspace's `rift.toml`, kept with the file
-/// state it was read from so an edited file is re-admitted on the next
+/// The last acceptance of the workspace's `rift.toml`, kept with the file
+/// state it was read from so an edited file is re-accepted on the next
 /// request and an unchanged one is not re-parsed per call.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigurationState {
-    pub(crate) admitted: Result<WorkspaceConfiguration, Arc<ConfigurationError>>,
+    pub(crate) accepted: Result<WorkspaceConfiguration, Arc<ConfigurationError>>,
     pub(crate) fingerprint: ConfigurationFingerprint,
 }
 
 impl ConfigurationState {
-    /// Admits the workspace's current `rift.toml`.
-    pub(crate) fn admit(root: &Path) -> Self {
+    /// Accepts the workspace's current `rift.toml`.
+    pub(crate) fn accept(root: &Path) -> Self {
         let fingerprint = configuration_fingerprint(root);
         Self {
-            admitted: load_configuration(root).map_err(Arc::new),
+            accepted: load_configuration(root).map_err(Arc::new),
             fingerprint,
         }
     }
 
-    /// The admission's outcome as one request sees it: the configuration to
+    /// The acceptance's outcome as one request sees it: the configuration to
     /// serve under, or the typed refusal naming what to fix.
-    pub(crate) fn admitted(
+    pub(crate) fn accepted(
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<WorkspaceConfiguration, ErrorData> {
-        match &self.admitted {
+        match &self.accepted {
             Ok(configuration) => Ok(configuration.clone()),
             Err(error) => Err(error.tool_error(phase)),
         }
     }
 
-    /// The `[server]` table from the last admission, or the default table
+    /// The `[server]` table from the last acceptance, or the default table
     /// while `rift.toml` is invalid.
     pub(crate) fn server_configuration(&self) -> ServerConfiguration {
-        self.admitted
+        self.accepted
             .as_ref()
             .map(|configuration| configuration.server.clone())
             .unwrap_or_default()
     }
 
-    /// The `[source]` policy from the last admission, or the default policy
+    /// The `[source]` policy from the last acceptance, or the default policy
     /// while `rift.toml` is invalid.
     pub(crate) fn source_visibility(&self) -> SourceVisibility {
-        self.admitted.as_ref().map_or_else(
+        self.accepted.as_ref().map_or_else(
             |_| SourceVisibility::default(),
             |configuration| SourceVisibility::from(&configuration.source),
         )
     }
 
-    /// The `[search.text]` admission from the last admission, or the default admission while
+    /// The `[search.text]` inclusion from the last acceptance, or the default inclusion while
     /// `rift.toml` is invalid.
-    pub(crate) fn text_admission(&self) -> TextFileAdmission {
-        self.admitted.as_ref().map_or_else(
-            |_| TextFileAdmission::default(),
-            |configuration| TextFileAdmission::from(&configuration.search),
+    pub(crate) fn text_inclusion(&self) -> TextFileInclusion {
+        self.accepted.as_ref().map_or_else(
+            |_| TextFileInclusion::default(),
+            |configuration| TextFileInclusion::from(&configuration.search),
         )
     }
 
-    /// The `[search]` table from the last admission, or the default table
+    /// The `[search]` table from the last acceptance, or the default table
     /// while `rift.toml` is invalid.
     pub(crate) fn search_configuration(&self) -> SearchConfiguration {
-        self.admitted
+        self.accepted
             .as_ref()
             .map(|configuration| configuration.search.clone())
             .unwrap_or_default()
@@ -199,14 +199,14 @@ impl ConfigurationState {
 pub(crate) enum ConfigurationFingerprint {
     /// No readable configuration file exists.
     MissingOrUnreadable,
-    /// File bytes within the admitted bound.
+    /// File bytes within the accepted bound.
     Content([u8; 32]),
     /// File is already invalid by size; its contents cannot change policy.
     Oversized(u64),
 }
 
 /// The current `rift.toml` file state, or null when the file is absent or
-/// unreadable — either way the next admission decides what that means.
+/// unreadable — either way the next acceptance decides what that means.
 pub(crate) fn configuration_fingerprint(root: &Path) -> ConfigurationFingerprint {
     let path = root.join(WORKSPACE_CONFIGURATION_FILE);
     let Ok(metadata) = std::fs::metadata(&path) else {
@@ -304,7 +304,7 @@ impl IndexValidation {
         self.observed_epoch.load(Ordering::SeqCst)
     }
 
-    /// Installs event admission policy under publication linearization.
+    /// Installs event inclusion policy under publication linearization.
     #[cfg(test)]
     fn install_source_policy(&self, policy: Arc<WorkspaceSourcePolicy>) {
         let publication = self
@@ -315,7 +315,7 @@ impl IndexValidation {
         drop(publication);
     }
 
-    /// Replaces event admission policy while caller owns publication lane.
+    /// Replaces event inclusion policy while caller owns publication lane.
     fn replace_source_policy_locked(&self, policy: Arc<WorkspaceSourcePolicy>) {
         let mut current = self
             .source_policy
@@ -339,16 +339,16 @@ impl IndexValidation {
         result
     }
 
-    /// Returns whether current policy admits one source event path.
+    /// Returns whether current policy includes one source event path.
     fn source_path_is_relevant(&self, path: &Path) -> bool {
         let current = self
             .source_policy
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().is_none_or(|policy| policy.admits(path))
+        current.as_ref().is_none_or(|policy| policy.includes(path))
     }
 
-    /// Returns whether current policy can admit source below one directory.
+    /// Returns whether current policy can include source below one directory.
     fn source_directory_is_relevant(&self, path: &Path) -> bool {
         let current = self
             .source_policy
@@ -356,7 +356,7 @@ impl IndexValidation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         current
             .as_ref()
-            .is_none_or(|policy| policy.may_admit_descendant(path))
+            .is_none_or(|policy| policy.may_include_descendant(path))
     }
 
     /// Returns whether path is current root workspace configuration.
@@ -426,7 +426,7 @@ pub(crate) fn workspace_watcher(
     Ok(watcher)
 }
 
-/// Observes one watcher callback: a delivered event enters admission, and a
+/// Observes one watcher callback: a delivered event enters the inclusion filter, and a
 /// backend failure marks the watch unhealthy.
 pub(crate) fn report_watch_outcome(
     root: &Path,
@@ -463,12 +463,12 @@ pub(crate) fn relevant_watch_event(
     event
         .paths
         .iter()
-        .filter(|path| hard_floor_admits_watch_path(root, path))
+        .filter(|path| hard_floor_includes_watch_path(root, path))
         .any(|path| watch_kind_reaches_path(root, validation, event.kind, path))
 }
 
 /// Rejects paths below Rift's hard-floor directories.
-pub(crate) fn hard_floor_admits_watch_path(root: &Path, path: &Path) -> bool {
+pub(crate) fn hard_floor_includes_watch_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
     };
@@ -606,11 +606,11 @@ pub(crate) fn build_workspace_candidate(
     limits: WorkspaceIndexLimits,
     epoch: u64,
 ) -> Result<WorkspaceCandidate, ReadError> {
-    let configuration = ConfigurationState::admit(root);
+    let configuration = ConfigurationState::accept(root);
     let visibility = configuration.source_visibility();
-    let text_admission = configuration.text_admission();
-    let reads = ReadService::build(root, limits, &visibility, &text_admission)?;
-    let source_policy = WorkspaceSourcePolicy::build(root, limits, &visibility, &text_admission)
+    let text_inclusion = configuration.text_inclusion();
+    let reads = ReadService::build(root, limits, &visibility, &text_inclusion)?;
+    let source_policy = WorkspaceSourcePolicy::build(root, limits, &visibility, &text_inclusion)
         .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
     if configuration.fingerprint != configuration_fingerprint(root) {
         return Ok(WorkspaceCandidate::ConfigurationChanged);
@@ -818,7 +818,7 @@ pub(crate) fn rebuild_workspace_serialized_with(
     epoch: u64,
     capture: impl FnOnce(&Path, WorkspaceIndexLimits, u64) -> Result<WorkspaceCandidate, ReadError>,
 ) -> Result<RebuildOutcome, ReadError> {
-    if !admit_rebuild(validation, epoch)? {
+    if !accept_rebuild(validation, epoch)? {
         return Ok(RebuildOutcome::Superseded);
     }
     let candidate = capture(root, limits, epoch)?;
@@ -835,7 +835,7 @@ pub(crate) fn rebuild_workspace_serialized_with(
 }
 
 /// Refuses rebuild when watcher failed or candidate epoch already moved.
-pub(crate) fn admit_rebuild(validation: &IndexValidation, epoch: u64) -> Result<bool, ReadError> {
+pub(crate) fn accept_rebuild(validation: &IndexValidation, epoch: u64) -> Result<bool, ReadError> {
     if validation.watch_failed.load(Ordering::Acquire) {
         return Err(ReadFault::unavailable(
             "filesystem index rebuild",
@@ -924,7 +924,7 @@ mod tests {
 
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
-    use rift_core::{SourceVisibility, TextFileAdmission};
+    use rift_core::{SourceVisibility, TextFileInclusion};
     use rift_index::{
         LexicalIndexLimits, LexicalSearchIndex, WorkspaceIndexLimits, WorkspaceSourcePolicy,
     };
@@ -962,8 +962,8 @@ mod tests {
         ));
 
         fs::write(directory.path().join("rift.toml"), "invalid = true\n")?;
-        let invalid = ConfigurationState::admit(directory.path());
-        assert!(invalid.admitted.is_err());
+        let invalid = ConfigurationState::accept(directory.path());
+        assert!(invalid.accepted.is_err());
         assert_eq!(invalid.source_visibility(), SourceVisibility::default());
 
         fs::write(
@@ -1046,7 +1046,7 @@ mod tests {
             &watched_root,
             WorkspaceIndexLimits::default(),
             &visibility,
-            &TextFileAdmission::default(),
+            &TextFileInclusion::default(),
         )?;
         let (validation, _invalidations) = IndexValidation::new();
         validation.install_source_policy(Arc::new(policy));
@@ -1063,7 +1063,7 @@ mod tests {
                 &validation,
                 &event(EventKind::Modify(ModifyKind::Any), "src/guide.md")
             ),
-            "an external edit to an admitted [search.text] extension must trigger a rebuild, \
+            "an external edit to an included [search.text] extension must trigger a rebuild, \
              the same as a source file"
         );
         assert!(!relevant_watch_event(
@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn access_events_never_reach_admission() {
+    fn access_events_never_reach_inclusion() {
         use notify::event::AccessKind;
         let (validation, _receiver) = IndexValidation::new();
         let root = std::path::Path::new("/rift-workspace");
@@ -1526,12 +1526,12 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_admission_fails_after_watcher_failure() {
+    fn rebuild_acceptance_fails_after_watcher_failure() {
         let (validation, receiver) = IndexValidation::new();
         drop(receiver);
         let _ = validation.observe_watch_failure();
-        let error = super::admit_rebuild(&validation, 0)
-            .expect_err("a failed watcher must refuse rebuild admission");
+        let error = super::accept_rebuild(&validation, 0)
+            .expect_err("a failed watcher must refuse rebuild acceptance");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
     }
 
@@ -1704,7 +1704,7 @@ mod tests {
 
         // One blocking slot, held by a placeholder so the supervisor's own rebuild for
         // epoch 1 is forced to queue behind it — a deterministic gate between the
-        // supervisor capturing that epoch and `admit_rebuild` checking it, exactly where a
+        // supervisor capturing that epoch and `accept_rebuild` checking it, exactly where a
         // second observation must land to supersede the rebuild.
         let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
         let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
@@ -1745,7 +1745,7 @@ mod tests {
         assert_eq!(first_epoch, 1);
         // Gives the supervisor's debounce (50ms) real wall-clock time to elapse and its
         // rebuild to reach and queue behind the held placeholder. The held slot — not this
-        // wait — is what guarantees the rebuild cannot be admitted until released; a
+        // wait — is what guarantees the rebuild cannot be accepted until released; a
         // slower scheduler just makes this wait less generous, never wrong.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1761,7 +1761,7 @@ mod tests {
 
         // A sentinel operation through the same one-slot executor only completes once the
         // supervisor's own queued rebuild has acquired, run, and released that slot —
-        // proving its `admit_rebuild` check (and therefore the Superseded verdict) already
+        // proving its `accept_rebuild` check (and therefore the Superseded verdict) already
         // landed, without hoping a fixed sleep was long enough.
         blocking
             .run("sentinel", || Ok::<(), rift_server::ReadError>(()))

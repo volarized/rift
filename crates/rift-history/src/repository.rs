@@ -230,7 +230,7 @@ impl Repository {
     }
 
     /// Lists the revision's committed regular files inside the workspace
-    /// whose workspace-relative path `admits` accepts, sorted by path.
+    /// whose workspace-relative path passes `includes`, sorted by path.
     ///
     /// Symbolic links and submodules are never listed. The traversal counts
     /// every visited tree entry against `entries_max` — callers pass
@@ -244,7 +244,7 @@ impl Repository {
     pub fn tree_files(
         &self,
         revision: &ResolvedRevision,
-        admits: &dyn Fn(&str) -> bool,
+        includes: &dyn Fn(&str) -> bool,
         entries_max: usize,
     ) -> Result<Vec<TreeFile>, HistoryError> {
         let commit = self
@@ -269,7 +269,7 @@ impl Repository {
             let Some(path) = self.workspace_relative(record.filepath.as_ref())? else {
                 continue;
             };
-            if !admits(&path) {
+            if !includes(&path) {
                 continue;
             }
             files.push(TreeFile {
@@ -441,7 +441,7 @@ mod tests {
         directory
     }
 
-    fn admit_all(_: &str) -> bool {
+    fn include_all(_: &str) -> bool {
         true
     }
 
@@ -539,7 +539,7 @@ mod tests {
         let repository = Repository::open(directory.path()).expect("repository");
         let head = repository.resolve("HEAD").expect("head resolves");
         let all: Vec<String> = repository
-            .tree_files(&head, &admit_all, REVISION_TREE_ENTRIES_MAX)
+            .tree_files(&head, &include_all, REVISION_TREE_ENTRIES_MAX)
             .expect("listing")
             .iter()
             .map(|file| file.path().to_owned())
@@ -573,7 +573,7 @@ mod tests {
         )
         .expect("uncommitted source");
         let listed: Vec<String> = repository
-            .tree_files(&head, &admit_all, REVISION_TREE_ENTRIES_MAX)
+            .tree_files(&head, &include_all, REVISION_TREE_ENTRIES_MAX)
             .expect("listing")
             .iter()
             .map(|file| file.path().to_owned())
@@ -594,7 +594,7 @@ mod tests {
         let repository = Repository::open(directory.path()).expect("repository");
         let head = repository.resolve("HEAD").expect("head resolves");
         let listed: Vec<String> = repository
-            .tree_files(&head, &admit_all, REVISION_TREE_ENTRIES_MAX)
+            .tree_files(&head, &include_all, REVISION_TREE_ENTRIES_MAX)
             .expect("listing")
             .iter()
             .map(|file| file.path().to_owned())
@@ -614,7 +614,7 @@ mod tests {
         let repository = Repository::open(&workspace).expect("repository");
         let head = repository.resolve("HEAD").expect("head resolves");
         let listed: Vec<String> = repository
-            .tree_files(&head, &admit_all, REVISION_TREE_ENTRIES_MAX)
+            .tree_files(&head, &include_all, REVISION_TREE_ENTRIES_MAX)
             .expect("listing")
             .iter()
             .map(|file| file.path().to_owned())
@@ -636,14 +636,14 @@ mod tests {
         let repository = Repository::open(directory.path()).expect("repository");
         let head = repository.resolve("HEAD").expect("head resolves");
         let error = repository
-            .tree_files(&head, &admit_all, 2)
+            .tree_files(&head, &include_all, 2)
             .expect_err("four entries must refuse a two-entry budget");
         let HistoryFault::TreeTooLarge { entries_max } = error.fault() else {
             panic!("expected TreeTooLarge, got {:?}", error.fault());
         };
         assert_eq!(*entries_max, 2);
         let exactly_enough = repository
-            .tree_files(&head, &admit_all, 4)
+            .tree_files(&head, &include_all, 4)
             .expect("a budget covering every entry lists the tree");
         assert_eq!(exactly_enough.len(), 3, "three files beside one directory");
     }
@@ -654,7 +654,7 @@ mod tests {
         let repository = Repository::open(directory.path()).expect("repository");
         let head = repository.resolve("HEAD").expect("head resolves");
         let files = repository
-            .tree_files(&head, &admit_all, REVISION_TREE_ENTRIES_MAX)
+            .tree_files(&head, &include_all, REVISION_TREE_ENTRIES_MAX)
             .expect("listing");
         let bytes = repository
             .blob_bytes(&files[0], 4_096)
@@ -760,7 +760,7 @@ mod tests {
         // Budget 1: the root's first entry spends it, so the `src` subtree
         // is refused before the walk ever descends into it.
         let error = repository
-            .tree_files(&head, &admit_all, 1)
+            .tree_files(&head, &include_all, 1)
             .expect_err("a subtree past the budget must refuse, not descend");
         assert!(matches!(error.fault(), HistoryFault::TreeTooLarge { .. }));
     }
@@ -772,7 +772,7 @@ mod tests {
         let repository = Repository::open(directory.path()).expect("repository");
         let raw = repository.resolve("raw").expect("raw branch resolves");
         let error = repository
-            .tree_files(&raw, &admit_all, REVISION_TREE_ENTRIES_MAX)
+            .tree_files(&raw, &include_all, REVISION_TREE_ENTRIES_MAX)
             .expect_err("a committed non-UTF-8 path must refuse");
         assert!(matches!(
             error.fault(),

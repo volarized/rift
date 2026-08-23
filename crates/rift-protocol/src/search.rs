@@ -172,7 +172,7 @@ pub struct PathPattern(
 impl PathPattern {
     /// Classifies this pattern against the forward-slash-only contract [`PathPattern`]
     /// advertises. `schemars` regexes are declarative only — nothing enforces them at
-    /// runtime — so every admission point calls this before the pattern reaches a glob
+    /// runtime — so every acceptance point calls this before the pattern reaches a glob
     /// engine, where a stray backslash would otherwise be read as an escape.
     #[must_use]
     pub fn violation(&self) -> Option<PathPatternViolation> {
@@ -233,7 +233,7 @@ fn is_dot_segment(segment: &str) -> bool {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PathSelector {
-    /// Globs a path has to match to be searched at all. Empty admits every visible file.
+    /// Globs a path has to match to be searched at all. Empty includes every visible file.
     #[serde(default)]
     pub include: Vec<PathPattern>,
     /// Globs that drop a path `include` already matched.

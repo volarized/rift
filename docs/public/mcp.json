@@ -6273,7 +6273,7 @@
       }
     },
     {
-      "description": "Searches indexed Rust declarations and source lines by lexical `query`, merged with\nfull-text matches from admitted `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the lexical tier's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate lexical matches against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed Rust declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the lexical tier's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate lexical matches against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "Cursor": {
@@ -6546,7 +6546,7 @@
               },
               "include": {
                 "default": [],
-                "description": "Globs a path has to match to be searched at all. Empty admits every visible file.",
+                "description": "Globs a path has to match to be searched at all. Empty includes every visible file.",
                 "items": {
                   "$ref": "#/$defs/PathPattern"
                 },

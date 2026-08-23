@@ -391,7 +391,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search runs on a lexical index; `pool_slots` and\n`busy_timeout` bound the `SQLite` connections behind it, `embedding`\nnames the model that adds dense ranking on top, and `text` admits\nnon-source text files into the lexical index.",
+      "description": "The `[search]` table. Search runs on a lexical index; `pool_slots` and\n`busy_timeout` bound the `SQLite` connections behind it, `embedding`\nnames the model that adds dense ranking on top, and `text` includes\nnon-source text files in the lexical index.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
@@ -473,7 +473,7 @@
         },
         "include": {
           "default": [],
-          "description": "Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.\nEmpty admits every file `exclude` and `.gitignore` leave standing.",
+          "description": "Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.\nEmpty includes every file `exclude` and `.gitignore` leave standing.",
           "items": {
             "$ref": "#/$defs/PathPattern"
           },
@@ -498,7 +498,7 @@
             "mdx",
             "txt"
           ],
-          "description": "File extensions, without the leading dot, admitted as text-file lexical units:\nlowercase ASCII alphanumeric only (so a leading dot is already excluded), at most\n16 bytes each, at most 32 entries, no duplicates.",
+          "description": "File extensions, without the leading dot, included as text-file lexical units:\nlowercase ASCII alphanumeric only (so a leading dot is already excluded), at most\n16 bytes each, at most 32 entries, no duplicates.",
           "items": {
             "type": "string"
           },

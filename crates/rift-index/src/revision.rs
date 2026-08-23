@@ -19,7 +19,7 @@ use rift_syntax::RustSyntaxProvider;
 use crate::glob::PathMatcher;
 use crate::workspace::{
     ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
-    WorkspaceIndexViolation, admitted_file, component, composition_error, has_source_extension,
+    WorkspaceIndexViolation, component, composition_error, has_source_extension, included_file,
     index_error_at, index_error_caused_by,
 };
 
@@ -29,7 +29,7 @@ pub(crate) struct RevisionFiles;
 impl WorkspaceIndex {
     /// Builds a read index over `revision`'s committed files, applying the
     /// same `[source]` include/exclude policy, provider-declared extension
-    /// admission, hard floor, and bounds as the workspace scan. The
+    /// inclusion, hard floor, and bounds as the workspace scan. The
     /// `.gitignore` chain is not consulted: every listed file is tracked,
     /// which is what ignoring would have prevented.
     ///
@@ -47,13 +47,13 @@ impl WorkspaceIndex {
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;
         let matcher = PathMatcher::build(&root, visibility.include(), visibility.exclude())?;
-        let admits = |path: &str| {
+        let includes = |path: &str| {
             has_source_extension(Path::new(path))
-                && hard_floor_admits(path)
-                && matcher.admits(&root.join(path))
+                && hard_floor_includes(path)
+                && matcher.includes(&root.join(path))
         };
         let listed = repository
-            .tree_files(revision, &admits, REVISION_TREE_ENTRIES_MAX)
+            .tree_files(revision, &includes, REVISION_TREE_ENTRIES_MAX)
             .map_err(history_error)?;
         let parser = RustSyntaxProvider::default();
         let mut workspace_bytes = 0_usize;
@@ -80,7 +80,7 @@ impl WorkspaceIndex {
                 )
             })?;
             let bytes = blob_bytes(repository, tree_file, limits)?;
-            files.push(admitted_file(
+            files.push(included_file(
                 project_path,
                 bytes,
                 &context_path,
@@ -97,7 +97,7 @@ impl WorkspaceIndex {
             Vec::new(),
             composition,
             limits,
-            rift_core::TextFileAdmission::default().chunk_bytes_max(),
+            rift_core::TextFileInclusion::default().chunk_bytes_max(),
         ))
     }
 }
@@ -122,7 +122,7 @@ fn history_error(error: rift_history::HistoryError) -> WorkspaceIndexError {
 
 /// Whether a committed path's first segment stays outside the hard floor
 /// every workspace applies: `.git`, `.rift`, and `target` are never indexed.
-fn hard_floor_admits(path: &str) -> bool {
+fn hard_floor_includes(path: &str) -> bool {
     let first_segment = path.split('/').next().unwrap_or(path);
     !WORKSPACE_IGNORED_DIRECTORIES.contains(&first_segment)
 }

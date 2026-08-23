@@ -655,7 +655,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         let changes = ChangeService::new(directory.path());
         Ok((directory, reads, changes))
@@ -1245,7 +1245,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         let changes = ChangeService::new(directory.path());
         let patch = [
@@ -1345,7 +1345,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         let changes = ChangeService::new(directory.path());
         let patch = [

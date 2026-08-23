@@ -23,7 +23,7 @@ pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
 pub const EXECUTION_TIMEOUT_MS_MAX: u64 = 86_400_000;
 /// Bytes one captured execution stream may keep, at most.
 pub const EXECUTION_OUTPUT_BYTES_MAX: u64 = 16 << 10;
-/// Evaluations admitted concurrently across the workspace, at most.
+/// Evaluations running concurrently across the workspace, at most.
 pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
 /// Entries `execution.allow` may hold, at most.
 pub const EXECUTION_ALLOW_ITEMS_MAX: usize = 64;
@@ -506,8 +506,8 @@ impl ExecutionConfiguration {
 
 /// The `[search]` table. Search runs on a lexical index; `pool_slots` and
 /// `busy_timeout` bound the `SQLite` connections behind it, `embedding`
-/// names the model that adds dense ranking on top, and `text` admits
-/// non-source text files into the lexical index.
+/// names the model that adds dense ranking on top, and `text` includes
+/// non-source text files in the lexical index.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
@@ -568,9 +568,9 @@ impl SearchConfiguration {
     }
 }
 
-/// `search.pool_slots` connections admitted, at least.
+/// `search.pool_slots` connections accepted, at least.
 pub const SEARCH_POOL_SLOTS_MIN: u64 = 1;
-/// `search.pool_slots` connections admitted, at most.
+/// `search.pool_slots` connections accepted, at most.
 pub const SEARCH_POOL_SLOTS_MAX: u64 = 16;
 /// `search.pool_slots` value used when the key is absent.
 const SEARCH_POOL_SLOTS_DEFAULT: u64 = 4;
@@ -594,8 +594,8 @@ fn embedding_violation(embedding: Option<&str>) -> Option<ConfigurationViolation
     let embedding = embedding?;
     let nonempty = !embedding.is_empty();
     let within_length = embedding.len() <= EMBEDDING_MODEL_BYTES_MAX;
-    let charset_admitted = embedding.chars().all(is_model_identifier_character);
-    let valid = nonempty && within_length && charset_admitted;
+    let charset_accepted = embedding.chars().all(is_model_identifier_character);
+    let valid = nonempty && within_length && charset_accepted;
     (!valid).then(|| ConfigurationViolation::EmbeddingModelInvalid {
         value: embedding.to_owned(),
     })
@@ -606,7 +606,7 @@ fn is_model_identifier_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
 }
 
-/// `search.text.extensions` entries admitted, at most.
+/// `search.text.extensions` entries accepted, at most.
 pub const TEXT_EXTENSIONS_MAX: usize = 32;
 /// Bytes one `search.text.extensions` entry may hold, at most.
 pub const TEXT_EXTENSION_BYTES_MAX: usize = 16;
@@ -617,7 +617,7 @@ pub const TEXT_CHUNK_BYTES_MAX: u64 = 16 << 20;
 /// Bytes one lexical chunk from a `search.text` file may hold, by default.
 pub const TEXT_CHUNK_BYTES_DEFAULT: u64 = 1 << 20;
 
-/// `search.text.extensions` admitted by default: prose formats with no dedicated syntax
+/// `search.text.extensions` included by default: prose formats with no dedicated syntax
 /// provider.
 const TEXT_EXTENSIONS_DEFAULT: [&str; 3] = ["md", "mdx", "txt"];
 
@@ -635,7 +635,7 @@ fn default_text_extensions() -> Vec<String> {
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_text_ranges)]
 pub struct TextSearchConfiguration {
-    /// File extensions, without the leading dot, admitted as text-file lexical units:
+    /// File extensions, without the leading dot, included as text-file lexical units:
     /// lowercase ASCII alphanumeric only (so a leading dot is already excluded), at most
     /// 16 bytes each, at most 32 entries, no duplicates.
     #[serde(default = "default_text_extensions")]
@@ -677,7 +677,7 @@ impl TextSearchConfiguration {
     }
 }
 
-/// Whether `extension` matches `search.text.extensions`'s admitted spelling: nonempty,
+/// Whether `extension` matches `search.text.extensions`'s accepted spelling: nonempty,
 /// lowercase ASCII alphanumeric only, at most [`TEXT_EXTENSION_BYTES_MAX`] bytes.
 fn is_text_extension(extension: &str) -> bool {
     !extension.is_empty()
@@ -843,9 +843,9 @@ pub enum ConfigurationViolation {
         field: &'static str,
         /// The configured value, in the key's base unit.
         value: u64,
-        /// The smallest admitted value.
+        /// The smallest accepted value.
         min: u64,
-        /// The largest admitted value.
+        /// The largest accepted value.
         max: u64,
     },
     /// An `execution.allow` entry is not `name` or `name:dialect`.
@@ -1273,9 +1273,11 @@ mod tests {
 
     #[test]
     fn test_values_round_trip_through_serde_in_canonical_spelling() {
-        let size: ByteSize = serde_json::from_value(json!("16kb")).expect("spelling must admit");
+        let size: ByteSize =
+            serde_json::from_value(json!("16kb")).expect("spelling must be accepted");
         assert_eq!(serde_json::to_value(size).expect("render"), json!("16kb"));
-        let duration: Duration = serde_json::from_value(json!("90s")).expect("spelling must admit");
+        let duration: Duration =
+            serde_json::from_value(json!("90s")).expect("spelling must be accepted");
         assert_eq!(
             serde_json::to_value(duration).expect("render"),
             json!("90s")
@@ -1392,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_bounds_admit_their_edges() {
+    fn test_execution_bounds_accept_their_edges() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.execution.max_code = ByteSize::from_bytes(EXECUTION_CODE_BYTES_MAX);
         configuration.execution.max_timeout = Duration::from_millis(EXECUTION_TIMEOUT_MS_MAX);
@@ -1459,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_language_selectors_admit_names_and_dialects() {
+    fn test_language_selectors_accept_names_and_dialects() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.execution.allow = vec!["python".to_owned(), "sql:postgresql".to_owned()];
         assert_eq!(configuration.validate(), Ok(()));
@@ -1537,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_text_defaults_admit_markdown_and_text_extensions() {
+    fn test_search_text_defaults_include_markdown_and_text_extensions() {
         let configuration = WorkspaceConfiguration::default();
         assert_eq!(
             configuration.search.text.extensions,
@@ -1569,7 +1571,7 @@ mod tests {
         assert_eq!(
             configuration.validate(),
             Ok(()),
-            "an extension at the exact byte bound must be admitted"
+            "an extension at the exact byte bound must be accepted"
         );
     }
 
@@ -1586,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_text_extensions_admit_the_cap_and_refuse_above_it() {
+    fn test_search_text_extensions_accept_the_cap_and_refuse_above_it() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.search.text.extensions = (0..TEXT_EXTENSIONS_MAX)
             .map(|index| format!("e{index}"))

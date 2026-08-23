@@ -357,7 +357,7 @@ mod tests {
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect_err("missing root must fail");
         let causes = error.wire_causes();

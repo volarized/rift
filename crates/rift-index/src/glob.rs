@@ -20,7 +20,7 @@ pub struct PathMatcher {
 }
 
 impl PathMatcher {
-    /// Compiles `include` and `exclude` glob lists rooted at `root`. Empty `include` admits
+    /// Compiles `include` and `exclude` glob lists rooted at `root`. Empty `include` includes
     /// every path; a path matching `exclude` is dropped even where `include` also matched it.
     ///
     /// # Errors
@@ -46,11 +46,11 @@ impl PathMatcher {
         })
     }
 
-    /// Whether `path` passes: admitted by `include` whenever configured, and not dropped by
+    /// Whether `path` passes: included whenever `include` is configured, and not dropped by
     /// `exclude`.
     #[must_use]
-    pub fn admits(&self, path: &Path) -> bool {
-        let admitted = match &self.include {
+    pub fn includes(&self, path: &Path) -> bool {
+        let included = match &self.include {
             Some(overrides) => matches(overrides, path),
             None => true,
         };
@@ -58,16 +58,16 @@ impl PathMatcher {
             Some(overrides) => matches(overrides, path),
             None => false,
         };
-        admitted && !dropped
+        included && !dropped
     }
 
-    /// Whether one directory can contain a path admitted by this matcher.
+    /// Whether one directory can contain a path this matcher includes.
     #[must_use]
-    pub fn may_admit_descendant(&self, path: &Path) -> bool {
+    pub fn may_include_descendant(&self, path: &Path) -> bool {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
         };
-        let admitted = self.include_prefixes.is_empty()
+        let included = self.include_prefixes.is_empty()
             || self.include_prefixes.iter().any(|prefix| {
                 prefix.as_os_str().is_empty()
                     || relative.starts_with(prefix)
@@ -77,7 +77,7 @@ impl PathMatcher {
             .excluded_subtree_prefixes
             .iter()
             .any(|prefix| relative.starts_with(prefix));
-        admitted && !dropped
+        included && !dropped
     }
 }
 
@@ -133,31 +133,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_empty_include_admits_every_path_and_exclude_drops_matches() {
+    fn test_empty_include_includes_every_path_and_exclude_drops_matches() {
         let root = Path::new("/workspace");
         let matcher =
             PathMatcher::build(root, &[], &["src/generated/**".to_owned()]).expect("valid globs");
-        assert!(matcher.admits(Path::new("/workspace/src/lib.rs")));
-        assert!(!matcher.admits(Path::new("/workspace/src/generated/gen.rs")));
+        assert!(matcher.includes(Path::new("/workspace/src/lib.rs")));
+        assert!(!matcher.includes(Path::new("/workspace/src/generated/gen.rs")));
     }
 
     #[test]
     fn test_include_narrows_and_star_does_not_cross_slash() {
         let root = Path::new("/workspace");
         let matcher = PathMatcher::build(root, &["src/*.rs".to_owned()], &[]).expect("valid glob");
-        assert!(matcher.admits(Path::new("/workspace/src/lib.rs")));
-        assert!(!matcher.admits(Path::new("/workspace/src/nested/deep.rs")));
+        assert!(matcher.includes(Path::new("/workspace/src/lib.rs")));
+        assert!(!matcher.includes(Path::new("/workspace/src/nested/deep.rs")));
     }
 
     #[test]
-    fn test_directory_admission_refuses_paths_outside_root() {
+    fn test_directory_inclusion_refuses_paths_outside_root() {
         let root = Path::new("/workspace");
         let matcher = PathMatcher::build(root, &["src/**".to_owned()], &[]).expect("valid glob");
-        assert!(!matcher.may_admit_descendant(Path::new("/elsewhere/src")));
+        assert!(!matcher.may_include_descendant(Path::new("/elsewhere/src")));
     }
 
     #[test]
-    fn test_directory_admission_tracks_possible_includes_and_excluded_subtrees() {
+    fn test_directory_inclusion_tracks_possible_includes_and_excluded_subtrees() {
         let root = Path::new("/workspace");
         let matcher = PathMatcher::build(
             root,
@@ -165,9 +165,9 @@ mod tests {
             &["src/generated/**".to_owned()],
         )
         .expect("valid globs");
-        assert!(matcher.may_admit_descendant(Path::new("/workspace/src")));
-        assert!(!matcher.may_admit_descendant(Path::new("/workspace/examples")));
-        assert!(!matcher.may_admit_descendant(Path::new("/workspace/src/generated")));
+        assert!(matcher.may_include_descendant(Path::new("/workspace/src")));
+        assert!(!matcher.may_include_descendant(Path::new("/workspace/examples")));
+        assert!(!matcher.may_include_descendant(Path::new("/workspace/src/generated")));
 
         let direct_only = PathMatcher::build(
             root,
@@ -175,23 +175,23 @@ mod tests {
             &["src/generated/*.rs".to_owned()],
         )
         .expect("valid direct-child exclusion");
-        assert!(direct_only.may_admit_descendant(Path::new("/workspace/src/generated")));
-        assert!(!direct_only.admits(Path::new("/workspace/src/generated/direct.rs")));
-        assert!(direct_only.admits(Path::new("/workspace/src/generated/nested/lib.rs")));
+        assert!(direct_only.may_include_descendant(Path::new("/workspace/src/generated")));
+        assert!(!direct_only.includes(Path::new("/workspace/src/generated/direct.rs")));
+        assert!(direct_only.includes(Path::new("/workspace/src/generated/nested/lib.rs")));
     }
 
     #[test]
-    fn test_directory_admission_normalizes_anchors_and_keeps_escapes_conservative() {
+    fn test_directory_inclusion_normalizes_anchors_and_keeps_escapes_conservative() {
         let root = Path::new("/workspace");
         let anchored =
             PathMatcher::build(root, &["/src/**".to_owned()], &[]).expect("valid anchored glob");
-        assert!(anchored.may_admit_descendant(Path::new("/workspace/src")));
-        assert!(!anchored.may_admit_descendant(Path::new("/workspace/examples")));
+        assert!(anchored.may_include_descendant(Path::new("/workspace/src")));
+        assert!(!anchored.may_include_descendant(Path::new("/workspace/examples")));
 
         for escaped in [r"\!generated/**", r"src/\[generated\]/**"] {
             let matcher =
                 PathMatcher::build(root, &[escaped.to_owned()], &[]).expect("valid escaped glob");
-            assert!(matcher.may_admit_descendant(Path::new("/workspace/elsewhere")));
+            assert!(matcher.may_include_descendant(Path::new("/workspace/elsewhere")));
         }
     }
 
@@ -200,7 +200,7 @@ mod tests {
         let root = Path::new("/workspace");
         let matcher =
             PathMatcher::build(root, &["src/**/*.rs".to_owned()], &[]).expect("valid glob");
-        assert!(matcher.admits(Path::new("/workspace/src/nested/deep.rs")));
+        assert!(matcher.includes(Path::new("/workspace/src/nested/deep.rs")));
     }
 
     #[test]
@@ -212,12 +212,12 @@ mod tests {
             &["src/generated/**".to_owned()],
         )
         .expect("valid globs");
-        assert!(matcher.admits(Path::new("/workspace/src/lib.rs")));
-        assert!(!matcher.admits(Path::new("/workspace/src/generated/gen.rs")));
+        assert!(matcher.includes(Path::new("/workspace/src/lib.rs")));
+        assert!(!matcher.includes(Path::new("/workspace/src/generated/gen.rs")));
     }
 
     #[test]
-    fn test_admits_matches_a_candidate_path_built_with_join() {
+    fn test_includes_matches_a_candidate_path_built_with_join() {
         // Patterns are always forward-slash; the candidate path is not. Building it with
         // `Path::join` instead of a forward-slash literal exercises the OS-native separator
         // `ignore::overrides::Override` sees on every platform, Windows included.
@@ -225,9 +225,9 @@ mod tests {
         let matcher =
             PathMatcher::build(root, &["src/**/*.rs".to_owned()], &[]).expect("valid glob");
         let candidate = root.join("src").join("nested").join("deep.rs");
-        assert!(matcher.admits(&candidate));
+        assert!(matcher.includes(&candidate));
         let excluded = root.join("other.rs");
-        assert!(!matcher.admits(&excluded));
+        assert!(!matcher.includes(&excluded));
     }
 
     #[test]

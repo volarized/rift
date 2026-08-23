@@ -893,7 +893,7 @@ pub enum RelationshipFacet {
     Binds,
 }
 
-/// Longest revision spelling the wire admits, in bytes; the admitted charset is ASCII, so
+/// Longest revision spelling the wire accepts, in bytes; the accepted charset is ASCII, so
 /// the schema's `{1,128}` repetition counts the same units.
 pub const REVISION_ID_BYTES_MAX: usize = 128;
 
@@ -908,7 +908,7 @@ pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] 
 impl RevisionId {
     /// Classifies this spelling against the charset and length its schema advertises.
     /// `schemars` regexes are declarative only — nothing enforces them at
-    /// deserialization — so every admission point calls this before the spelling
+    /// deserialization — so every acceptance point calls this before the spelling
     /// reaches revision resolution.
     #[must_use]
     pub fn violation(&self) -> Option<RevisionIdViolation> {
@@ -943,12 +943,12 @@ impl RevisionIdViolation {
 /// Classifies one revision spelling against the rules [`RevisionId`]'s schema advertises.
 /// Arms are ordered by precedence: the first matching rule names the violation.
 fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
-    let admitted =
+    let accepted =
         |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-');
     match value.as_bytes() {
         [] => Some(RevisionIdViolation::Empty),
         bytes if bytes.len() > REVISION_ID_BYTES_MAX => Some(RevisionIdViolation::TooLong),
-        bytes if !bytes.iter().all(admitted) => Some(RevisionIdViolation::CharsetForbidden),
+        bytes if !bytes.iter().all(accepted) => Some(RevisionIdViolation::CharsetForbidden),
         _ => None,
     }
 }
