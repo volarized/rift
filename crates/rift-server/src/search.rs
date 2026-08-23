@@ -96,9 +96,9 @@ impl ReadService {
         results.truncate(limit);
         Ok(SearchResult {
             coverage: complete_coverage(),
-            snapshot: self.snapshot().clone(),
             results,
             next_cursor: None,
+            warnings: self.warnings(),
         })
     }
 }
@@ -1332,9 +1332,10 @@ pub fn compute() -> i32 {
         let value = serde_json::to_value(service.search(&committed, &[])?)?;
         let results = value["results"].as_array().ok_or("results array")?;
         assert!(!results.is_empty(), "the committed declaration matches");
-        assert!(
-            value["snapshot"]["revision"].as_str().is_some(),
-            "a revision search's snapshot carries the resolved commit"
+        assert_eq!(
+            value["warnings"],
+            json!([]),
+            "a search served from one index warns nothing"
         );
         let drifted: SearchParams = serde_json::from_value(json!({"query": "drifted_probe"}))?;
         let drifted_value = serde_json::to_value(service.search(&drifted, &[])?)?;

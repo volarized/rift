@@ -329,18 +329,6 @@ pub struct FileId(
     pub String,
 );
 
-/// Whether derived state covers the tree and source-catalog revisions carried by the answer.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Freshness {
-    /// The derived state covers the answer's captured revisions.
-    Current,
-    /// The derived state lags behind the answer's captured revisions.
-    Stale,
-}
-
 /// One declaration a `get_symbol` lookup found.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -448,22 +436,8 @@ pub struct GetSymbolResult {
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required, transform = schema::nullable)]
     pub next_cursor: Option<Cursor>,
-    /// Tree and index revisions used for this result page.
-    pub snapshot: ReadSnapshot,
-}
-
-/// The immutable search-index revision used for an answer.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct IndexSnapshot {
-    /// SHA-256 identity of the index revision.
-    pub revision: Digest,
-    /// Tree revision indexed by this revision.
-    pub tree_revision: Digest,
-    /// Whether both indexed revisions equal the answer's captured revisions.
-    pub freshness: Freshness,
-    /// Source-catalog revision indexed by this revision.
-    pub source_revision: Digest,
+    /// Warnings attached to this result, empty when there is nothing to warn about.
+    pub warnings: Vec<ReadWarning>,
 }
 
 /// A language name and its optional dialect. The pair is the identity facts are filed under,
@@ -646,8 +620,8 @@ pub struct NodesResult {
     pub source: Vec<SourceExcerpt>,
     /// Completeness of the node facts used to build the listing.
     pub coverage: SemanticCoverage,
-    /// Tree revision and provider state used for this listing.
-    pub snapshot: ReadSnapshot,
+    /// Warnings attached to this result, empty when there is nothing to warn about.
+    pub warnings: Vec<ReadWarning>,
 }
 
 /// One package as its package manager identifies it.
@@ -728,24 +702,23 @@ pub struct ProjectionId(
     pub String,
 );
 
-/// Immutable state captured for one read. Every page produced from one cursor carries the
-/// same snapshot.
+/// One warning attached to a read result. The answer stands; the warning carries evidence
+/// of a condition the caller weighs before relying on it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReadSnapshot {
-    /// SHA-256 identity of the targeted tree when the read began. The digest covers visible
-    /// paths, entry kinds, executable bits, and contents.
-    pub tree_revision: Digest,
-    /// Search-index state used by the read, or null when the read did not use the index.
-    #[serde(default)]
-    pub index: Option<IndexSnapshot>,
-    /// Source-catalog revision captured for the read.
-    pub source_revision: Digest,
-    /// The version-control revision the read served, resolved to the full commit id the
-    /// repository records - so a branch answer stays attributable after the branch moves.
-    /// Null when the read served the current tree.
-    #[serde(default)]
-    pub revision: Option<RevisionId>,
+#[serde(tag = "code", deny_unknown_fields, rename_all = "snake_case")]
+pub enum ReadWarning {
+    /// The answer was computed from an index that lags the tree the read captured. Facts
+    /// derived from the index may miss the newest writes; the digests state which two
+    /// trees disagree.
+    StaleIndex {
+        /// Tree revision the published index covers.
+        index_tree_revision: Digest,
+        /// Tree revision the read captured.
+        captured_tree_revision: Digest,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
 }
 
 /// One named part of a node. A language marks these out inside a declaration, so an

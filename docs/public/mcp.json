@@ -503,21 +503,6 @@
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
           },
-          "Freshness": {
-            "description": "Whether derived state covers the tree and source-catalog revisions carried by the answer.",
-            "oneOf": [
-              {
-                "const": "current",
-                "description": "The derived state covers the answer's captured revisions.",
-                "type": "string"
-              },
-              {
-                "const": "stale",
-                "description": "The derived state lags behind the answer's captured revisions.",
-                "type": "string"
-              }
-            ]
-          },
           "GetSymbolHit": {
             "additionalProperties": false,
             "description": "One declaration a `get_symbol` lookup found.",
@@ -576,35 +561,6 @@
             },
             "required": [
               "symbol"
-            ],
-            "type": "object"
-          },
-          "IndexSnapshot": {
-            "additionalProperties": false,
-            "description": "The immutable search-index revision used for an answer.",
-            "properties": {
-              "freshness": {
-                "$ref": "#/$defs/Freshness",
-                "description": "Whether both indexed revisions equal the answer's captured revisions."
-              },
-              "revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the index revision."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision indexed by this revision."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Tree revision indexed by this revision."
-              }
-            },
-            "required": [
-              "revision",
-              "tree_revision",
-              "freshness",
-              "source_revision"
             ],
             "type": "object"
           },
@@ -936,48 +892,40 @@
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
           },
-          "ReadSnapshot": {
-            "additionalProperties": false,
-            "description": "Immutable state captured for one read. Every page produced from one cursor carries the\nsame snapshot.",
-            "properties": {
-              "index": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/IndexSnapshot"
+          "ReadWarning": {
+            "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree.",
+                "properties": {
+                  "captured_tree_revision": {
+                    "$ref": "#/$defs/Digest",
+                    "description": "Tree revision the read captured."
                   },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "description": "Search-index state used by the read, or null when the read did not use the index."
-              },
-              "revision": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/RevisionId"
+                  "code": {
+                    "const": "stale_index",
+                    "type": "string"
                   },
-                  {
-                    "type": "null"
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "index_tree_revision": {
+                    "$ref": "#/$defs/Digest",
+                    "description": "Tree revision the published index covers."
                   }
+                },
+                "required": [
+                  "code",
+                  "index_tree_revision",
+                  "captured_tree_revision",
+                  "detail"
                 ],
-                "default": null,
-                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records - so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision captured for the read."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the targeted tree when the read began. The digest covers visible\npaths, entry kinds, executable bits, and contents."
+                "type": "object"
               }
-            },
-            "required": [
-              "tree_revision",
-              "source_revision"
-            ],
-            "type": "object"
+            ]
           },
           "RegionRole": {
             "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
@@ -1934,16 +1882,19 @@
               "null"
             ]
           },
-          "snapshot": {
-            "$ref": "#/$defs/ReadSnapshot",
-            "description": "Tree and index revisions used for this result page."
+          "warnings": {
+            "description": "Warnings attached to this result, empty when there is nothing to warn about.",
+            "items": {
+              "$ref": "#/$defs/ReadWarning"
+            },
+            "type": "array"
           }
         },
         "required": [
           "hits",
           "coverage",
           "next_cursor",
-          "snapshot"
+          "warnings"
         ],
         "type": "object"
       }
@@ -3217,50 +3168,6 @@
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
           },
-          "Freshness": {
-            "description": "Whether derived state covers the tree and source-catalog revisions carried by the answer.",
-            "oneOf": [
-              {
-                "const": "current",
-                "description": "The derived state covers the answer's captured revisions.",
-                "type": "string"
-              },
-              {
-                "const": "stale",
-                "description": "The derived state lags behind the answer's captured revisions.",
-                "type": "string"
-              }
-            ]
-          },
-          "IndexSnapshot": {
-            "additionalProperties": false,
-            "description": "The immutable search-index revision used for an answer.",
-            "properties": {
-              "freshness": {
-                "$ref": "#/$defs/Freshness",
-                "description": "Whether both indexed revisions equal the answer's captured revisions."
-              },
-              "revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the index revision."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision indexed by this revision."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Tree revision indexed by this revision."
-              }
-            },
-            "required": [
-              "revision",
-              "tree_revision",
-              "freshness",
-              "source_revision"
-            ],
-            "type": "object"
-          },
           "Language": {
             "additionalProperties": false,
             "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
@@ -3493,48 +3400,40 @@
             ],
             "type": "object"
           },
-          "ReadSnapshot": {
-            "additionalProperties": false,
-            "description": "Immutable state captured for one read. Every page produced from one cursor carries the\nsame snapshot.",
-            "properties": {
-              "index": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/IndexSnapshot"
+          "ReadWarning": {
+            "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree.",
+                "properties": {
+                  "captured_tree_revision": {
+                    "$ref": "#/$defs/Digest",
+                    "description": "Tree revision the read captured."
                   },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "description": "Search-index state used by the read, or null when the read did not use the index."
-              },
-              "revision": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/RevisionId"
+                  "code": {
+                    "const": "stale_index",
+                    "type": "string"
                   },
-                  {
-                    "type": "null"
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "index_tree_revision": {
+                    "$ref": "#/$defs/Digest",
+                    "description": "Tree revision the published index covers."
                   }
+                },
+                "required": [
+                  "code",
+                  "index_tree_revision",
+                  "captured_tree_revision",
+                  "detail"
                 ],
-                "default": null,
-                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records - so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision captured for the read."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the targeted tree when the read began. The digest covers visible\npaths, entry kinds, executable bits, and contents."
+                "type": "object"
               }
-            },
-            "required": [
-              "tree_revision",
-              "source_revision"
-            ],
-            "type": "object"
+            ]
           },
           "RegionRole": {
             "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
@@ -3575,14 +3474,6 @@
                 "type": "string"
               }
             ]
-          },
-          "RevisionId": {
-            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
-            "examples": [
-              "main"
-            ],
-            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
-            "type": "string"
           },
           "SemanticCoverage": {
             "additionalProperties": {
@@ -3686,14 +3577,17 @@
             },
             "type": "array"
           },
-          "snapshot": {
-            "$ref": "#/$defs/ReadSnapshot",
-            "description": "Tree revision and provider state used for this listing."
-          },
           "source": {
             "description": "The source of each node, in the same order.",
             "items": {
               "$ref": "#/$defs/SourceExcerpt"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "description": "Warnings attached to this result, empty when there is nothing to warn about.",
+            "items": {
+              "$ref": "#/$defs/ReadWarning"
             },
             "type": "array"
           }
@@ -3702,7 +3596,7 @@
           "nodes",
           "source",
           "coverage",
-          "snapshot"
+          "warnings"
         ],
         "type": "object"
       }
@@ -8010,21 +7904,6 @@
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
           },
-          "Freshness": {
-            "description": "Whether derived state covers the tree and source-catalog revisions carried by the answer.",
-            "oneOf": [
-              {
-                "const": "current",
-                "description": "The derived state covers the answer's captured revisions.",
-                "type": "string"
-              },
-              {
-                "const": "stale",
-                "description": "The derived state lags behind the answer's captured revisions.",
-                "type": "string"
-              }
-            ]
-          },
           "GraphHop": {
             "additionalProperties": false,
             "description": "One auditable step in a search traversal. `relationship` retains source-node evidence and\nderivation; `direction` records how the walk followed it.",
@@ -8058,35 +7937,6 @@
                 "type": "string"
               }
             ]
-          },
-          "IndexSnapshot": {
-            "additionalProperties": false,
-            "description": "The immutable search-index revision used for an answer.",
-            "properties": {
-              "freshness": {
-                "$ref": "#/$defs/Freshness",
-                "description": "Whether both indexed revisions equal the answer's captured revisions."
-              },
-              "revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the index revision."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision indexed by this revision."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Tree revision indexed by this revision."
-              }
-            },
-            "required": [
-              "revision",
-              "tree_revision",
-              "freshness",
-              "source_revision"
-            ],
-            "type": "object"
           },
           "Language": {
             "additionalProperties": false,
@@ -8470,48 +8320,40 @@
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
           },
-          "ReadSnapshot": {
-            "additionalProperties": false,
-            "description": "Immutable state captured for one read. Every page produced from one cursor carries the\nsame snapshot.",
-            "properties": {
-              "index": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/IndexSnapshot"
+          "ReadWarning": {
+            "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree.",
+                "properties": {
+                  "captured_tree_revision": {
+                    "$ref": "#/$defs/Digest",
+                    "description": "Tree revision the read captured."
                   },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "description": "Search-index state used by the read, or null when the read did not use the index."
-              },
-              "revision": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/RevisionId"
+                  "code": {
+                    "const": "stale_index",
+                    "type": "string"
                   },
-                  {
-                    "type": "null"
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "index_tree_revision": {
+                    "$ref": "#/$defs/Digest",
+                    "description": "Tree revision the published index covers."
                   }
+                },
+                "required": [
+                  "code",
+                  "index_tree_revision",
+                  "captured_tree_revision",
+                  "detail"
                 ],
-                "default": null,
-                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records - so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
-              },
-              "source_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "Source-catalog revision captured for the read."
-              },
-              "tree_revision": {
-                "$ref": "#/$defs/Digest",
-                "description": "SHA-256 identity of the targeted tree when the read began. The digest covers visible\npaths, entry kinds, executable bits, and contents."
+                "type": "object"
               }
-            },
-            "required": [
-              "tree_revision",
-              "source_revision"
-            ],
-            "type": "object"
+            ]
           },
           "RegionRole": {
             "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
@@ -8784,14 +8626,6 @@
                 "type": "string"
               }
             ]
-          },
-          "RevisionId": {
-            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
-            "examples": [
-              "main"
-            ],
-            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
-            "type": "string"
           },
           "SearchHit": {
             "additionalProperties": false,
@@ -9852,16 +9686,19 @@
             },
             "type": "array"
           },
-          "snapshot": {
-            "$ref": "#/$defs/ReadSnapshot",
-            "description": "Tree and search-index revisions used for this result page."
+          "warnings": {
+            "description": "Warnings attached to this result, empty when there is nothing to warn about.",
+            "items": {
+              "$ref": "#/$defs/ReadWarning"
+            },
+            "type": "array"
           }
         },
         "required": [
-          "snapshot",
           "coverage",
           "results",
-          "next_cursor"
+          "next_cursor",
+          "warnings"
         ],
         "type": "object"
       }

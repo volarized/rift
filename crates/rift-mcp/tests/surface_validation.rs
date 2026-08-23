@@ -153,7 +153,7 @@ fn lexical_search_corpus() -> Vec<(&'static str, Value)> {
 }
 
 /// Revision-addressed requests, one per read tool: each answers from the
-/// fixture's committed baseline and proves the snapshot's revision echo.
+/// fixture's committed baseline.
 fn revision_read_corpus() -> Vec<(&'static str, Value)> {
     vec![
         ("get_symbol", json!({ "name": "beacon_one", "rev": "main" })),
@@ -278,11 +278,20 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 }
 
 /// Proves one tool result carries no oversized digest and no non-project source-unit
-/// resolver, and that every `search` hit names its project-relative path.
+/// resolver, that every `search` hit names its project-relative path, and that every
+/// read result carries empty `warnings`: the live server resolves one published
+/// workspace per request, so no request can observe a lagging index.
 fn assert_wire_hygiene(name: &str, structured: &Value) {
     let context = format!("{name} result");
     assert_no_bare_sha256_digest(structured, &context);
     assert_source_unit_ids_use_project_resolver(structured, &context);
+    if matches!(name, "get_symbol" | "search" | "nodes") {
+        assert_eq!(
+            structured["warnings"],
+            json!([]),
+            "a live {name} result must carry empty warnings: {structured:#}"
+        );
+    }
     if name == "search"
         && let Some(results) = structured["results"].as_array()
     {
@@ -371,31 +380,14 @@ async fn served_fixture() -> TestResult<(
 struct CorpusArms {
     null_cursor_pages: usize,
     present_cursor_pages: usize,
-    revision_snapshots: usize,
-    current_tree_snapshots: usize,
     applied_changes: usize,
     applied_with_findings: usize,
     refusal_reasons: BTreeSet<String>,
 }
 
 impl CorpusArms {
-    /// Records which snapshot-revision and change-status arms one structured
-    /// result proves.
-    fn observe(&mut self, name: &str, structured: &Value) {
-        match &structured["snapshot"]["revision"] {
-            Value::String(commit) => {
-                assert_eq!(
-                    commit.len(),
-                    40,
-                    "{name} snapshot revision must be the full commit id: {commit}"
-                );
-                self.revision_snapshots += 1;
-            }
-            Value::Null if structured.get("snapshot").is_some() => {
-                self.current_tree_snapshots += 1;
-            }
-            _ => {}
-        }
+    /// Records which change-status arms one structured result proves.
+    fn observe(&mut self, structured: &Value) {
         match structured["status"].as_str() {
             Some("applied") => {
                 self.applied_changes += 1;
@@ -423,13 +415,6 @@ impl CorpusArms {
              null_cursor_pages={}, present_cursor_pages={}",
             self.null_cursor_pages,
             self.present_cursor_pages
-        );
-        assert!(
-            self.revision_snapshots > 0 && self.current_tree_snapshots > 0,
-            "the corpus must prove both snapshot.revision arms against the schema: \
-             revision_snapshots={}, current_tree_snapshots={}",
-            self.revision_snapshots,
-            self.current_tree_snapshots
         );
         assert!(
             self.applied_changes >= 3 && self.applied_with_findings >= 1,
@@ -536,7 +521,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 .ok_or_else(|| format!("{name} must return structured content"))?;
             assert_validates(output_validator, &structured, &format!("{name} result"));
             assert_wire_hygiene(name, &structured);
-            arms.observe(name, &structured);
+            arms.observe(&structured);
             if structured.get("next_cursor").is_some() {
                 let mut continued = structured.clone();
                 continued["next_cursor"] = json!("b3BhcXVl");

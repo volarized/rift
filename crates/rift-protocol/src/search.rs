@@ -4,7 +4,7 @@
 //! paths keep resolving.
 
 use crate::read::{
-    Coverage, Cursor, DiagnosticContext, File, Node, ProjectPath, ProjectionId, ReadSnapshot,
+    Coverage, Cursor, DiagnosticContext, File, Node, ProjectPath, ProjectionId, ReadWarning,
     Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitSpan, Symbol, SymbolId,
 };
 use crate::schema;
@@ -536,13 +536,11 @@ pub enum SearchParamsTarget {
     All,
 }
 
-/// One page of search hits from one captured tree and index revision. `coverage` states
-/// whether an empty result proves that no indexed candidate matched.
+/// One page of search hits from one captured tree. `coverage` states whether an empty
+/// result proves that no indexed candidate matched.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchResult {
-    /// Tree and search-index revisions used for this result page.
-    pub snapshot: ReadSnapshot,
     /// Coverage of the indexed candidate set used for this search. An empty result proves
     /// no match only where this is complete.
     pub coverage: Coverage,
@@ -552,6 +550,8 @@ pub struct SearchResult {
     #[serde(deserialize_with = "crate::read::deserialize_required_option")]
     #[schemars(required, transform = schema::nullable)]
     pub next_cursor: Option<Cursor>,
+    /// Warnings attached to this result, empty when there is nothing to warn about.
+    pub warnings: Vec<ReadWarning>,
 }
 
 /// Default `max_hops` for a search traversal: one hop, because a second hop can multiply weak

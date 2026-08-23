@@ -14,10 +14,10 @@ use rift_index::{
 };
 use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
-    FactFamily, FileId, Freshness, GetSymbolHit, GetSymbolParams, GetSymbolResult, IndexSnapshot,
-    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProjectPath, ReadSnapshot,
-    RevisionId, SearchScope, SemanticCoverage, SourceExcerpt, SourceKind, SourceLocation,
-    SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    FactFamily, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult, Language, Node, NodeFacet,
+    NodeId, NodesParams, NodesResult, ProjectPath, ReadWarning, RevisionId, SearchScope,
+    SemanticCoverage, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan,
+    Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -217,7 +217,7 @@ pub type ReadError = Error<ReadFault>;
 #[derive(Debug)]
 pub struct ReadService {
     index: WorkspaceIndex,
-    snapshot: ReadSnapshot,
+    revisions: CapturedRevisions,
     /// The resolved commit this service serves, or null for the current tree.
     revision: Option<RevisionId>,
 }
@@ -249,13 +249,13 @@ impl ReadService {
                 span.record("outcome", "error");
                 ReadFault::index(source)
             })?;
-        let snapshot = captured_snapshot(&index, None);
+        let revisions = captured_revisions(&index);
         span.record("files_count", index.files().len());
-        span.record("tree_revision", snapshot.tree_revision.0.as_str());
+        span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
         Ok(Self {
             index,
-            snapshot,
+            revisions,
             revision: None,
         })
     }
@@ -284,12 +284,11 @@ impl ReadService {
         let resolved = repository.resolve(&rev.0).map_err(ReadFault::history)?;
         let index = WorkspaceIndex::at_revision(&repository, &resolved, limits, visibility)
             .map_err(ReadFault::index)?;
-        let revision = RevisionId(resolved.commit_id());
-        let snapshot = captured_snapshot(&index, Some(revision.clone()));
+        let revisions = captured_revisions(&index);
         Ok(Self {
             index,
-            snapshot,
-            revision: Some(revision),
+            revisions,
+            revision: Some(RevisionId(resolved.commit_id())),
         })
     }
 
@@ -298,9 +297,11 @@ impl ReadService {
         &self.index
     }
 
-    /// Returns the tree and index revisions captured for this snapshot.
-    pub(crate) const fn snapshot(&self) -> &ReadSnapshot {
-        &self.snapshot
+    /// Returns the warnings every answer from this service carries: one
+    /// `stale_index` when the published index lags the captured tree, none
+    /// when the two match.
+    pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
+        self.revisions.warnings()
     }
 
     /// Returns the resolved commit this service serves, or none for the
@@ -315,14 +316,13 @@ impl ReadService {
         self.index.fingerprint()
     }
 
-    /// Returns the tree revision this snapshot's wire answers report - the
-    /// same eight-hex-character string every `ReadSnapshot` in this
-    /// service's results carries. A lexical population stamps this exact
+    /// Returns the tree revision this service captured, in its
+    /// eight-hex-character wire form. A lexical population stamps this exact
     /// string, and a search request compares its query-time lexical
     /// revision against it, so the two never drift apart.
     #[must_use]
     pub fn tree_revision(&self) -> &str {
-        &self.snapshot.tree_revision.0
+        self.revisions.wire_tree_revision()
     }
 
     /// Derives this snapshot's lexical search units: one per indexed
@@ -380,7 +380,7 @@ impl ReadService {
             nodes,
             source,
             coverage: semantic_coverage(FactFamily::Nodes),
-            snapshot: self.snapshot.clone(),
+            warnings: self.warnings(),
         })
     }
 
@@ -419,7 +419,7 @@ impl ReadService {
             hits,
             coverage: complete_coverage(),
             next_cursor: None,
-            snapshot: self.snapshot.clone(),
+            warnings: self.warnings(),
         })
     }
 }
@@ -603,21 +603,57 @@ fn node_address(file: &IndexedFile, range: ByteRange) -> String {
     )
 }
 
-/// The snapshot one read service captures at build time: every revision
-/// field is the indexed tree's content digest, and `revision` carries the
-/// resolved commit for a revision-addressed service.
-fn captured_snapshot(index: &WorkspaceIndex, revision: Option<RevisionId>) -> ReadSnapshot {
-    let digest = wire_digest(&workspace_digest(index));
-    ReadSnapshot {
+/// Tree revisions captured when one read service is built, at full SHA-256
+/// length: the `stale_index` comparison runs over the full digests, and only
+/// the truncated wire form reaches a warning.
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedRevisions {
+    /// Full digest of the targeted tree when the read began.
+    tree_revision: String,
+    /// Full digest of the tree the published index covers.
+    index_tree_revision: String,
+}
+
+impl CapturedRevisions {
+    /// Warnings for an answer served from these revisions: one `stale_index`
+    /// when the published index lags the tree the read captured, none when
+    /// the two digests match.
+    pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
+        if self.index_tree_revision == self.tree_revision {
+            return Vec::new();
+        }
+        let index_tree_revision = wire_digest(&self.index_tree_revision);
+        let captured_tree_revision = wire_digest(&self.tree_revision);
+        let detail = format!(
+            "the answer was computed from an index at tree revision {} that lags the \
+             captured tree revision {}; resend the request after the server publishes a \
+             fresh snapshot",
+            index_tree_revision.0, captured_tree_revision.0,
+        );
+        vec![ReadWarning::StaleIndex {
+            index_tree_revision,
+            captured_tree_revision,
+            detail,
+        }]
+    }
+
+    /// The captured tree revision truncated to its wire form: the first
+    /// `DIGEST_WIRE_CHARS` lowercase hex characters.
+    pub(crate) fn wire_tree_revision(&self) -> &str {
+        &self.tree_revision[..DIGEST_WIRE_CHARS]
+    }
+}
+
+/// The revisions one read service captures at build time. The captured tree
+/// and the indexed tree both derive from the one index the service holds, so
+/// a service built here observes them equal; `CapturedRevisions::warnings`
+/// guards the comparison all the same, so an index resolved apart from its
+/// capture cannot lag silently.
+fn captured_revisions(index: &WorkspaceIndex) -> CapturedRevisions {
+    let digest = workspace_digest(index);
+    CapturedRevisions {
         tree_revision: digest.clone(),
-        index: Some(IndexSnapshot {
-            revision: digest.clone(),
-            tree_revision: digest.clone(),
-            freshness: Freshness::Current,
-            source_revision: digest.clone(),
-        }),
-        source_revision: digest,
-        revision,
+        index_tree_revision: digest,
     }
 }
 
@@ -882,25 +918,56 @@ pub fn compute() -> i32 {
                 .as_str()
                 .is_some_and(|id| id.starts_with("rift://node/rust/"))
         );
-        assert_eq!(
-            value["snapshot"]["tree_revision"].as_str().map(str::len),
-            Some(8)
-        );
+        assert_eq!(value["warnings"], json!([]));
         Ok(())
     }
 
     /// The wire `Digest` truncates to eight characters, but the internal identity computation
-    /// it truncates from keeps its full sixty-four-character SHA-256, unchanged from before
-    /// this release: freshness and any future identity comparison still work off the strong
-    /// hash, not the short wire witness.
+    /// it truncates from keeps its full sixty-four-character SHA-256: the `stale_index`
+    /// comparison and any future identity comparison work off the strong hash, not the short
+    /// wire witness.
     #[test]
     fn workspace_digest_keeps_its_full_hash_before_wire_truncation() -> TestResult {
         let (_directory, service) = fixture()?;
         let full = super::workspace_digest(service.index());
         assert_eq!(full.len(), 64);
-        let wire = &service.snapshot().tree_revision.0;
+        let wire = service.tree_revision();
         assert_eq!(wire.len(), 8);
-        assert!(full.starts_with(wire.as_str()));
+        assert!(full.starts_with(wire));
+        Ok(())
+    }
+
+    /// Equal index and capture digests warn nothing: the answer's index covers the tree the
+    /// read captured.
+    #[test]
+    fn captured_revisions_matching_digests_carry_no_warnings() {
+        let digest = "aa".repeat(32);
+        let revisions = super::CapturedRevisions {
+            tree_revision: digest.clone(),
+            index_tree_revision: digest,
+        };
+        assert_eq!(revisions.warnings(), Vec::new());
+    }
+
+    /// A lagging index emits one `stale_index` warning carrying both wire digests, so the
+    /// caller sees which two trees disagree.
+    #[test]
+    fn captured_revisions_lagging_index_emits_stale_index_with_both_digests() -> TestResult {
+        let revisions = super::CapturedRevisions {
+            tree_revision: "bb".repeat(32),
+            index_tree_revision: "aa".repeat(32),
+        };
+        let warnings = serde_json::to_value(revisions.warnings())?;
+        assert_eq!(warnings.as_array().map(Vec::len), Some(1));
+        let warning = &warnings[0];
+        assert_eq!(warning["code"], json!("stale_index"));
+        assert_eq!(warning["index_tree_revision"], json!("aaaaaaaa"));
+        assert_eq!(warning["captured_tree_revision"], json!("bbbbbbbb"));
+        let detail = warning["detail"].as_str().ok_or("detail must be prose")?;
+        assert!(
+            detail.contains("aaaaaaaa") && detail.contains("bbbbbbbb"),
+            "the detail must state both wire digests: {detail}"
+        );
         Ok(())
     }
 
@@ -1210,16 +1277,12 @@ pub fn compute() -> i32 {
             value["hits"][0]["source"]["text"], "pub fn beacon() {}",
             "the committed body answers, not the drifted working tree"
         );
-        let revision = value["snapshot"]["revision"]
-            .as_str()
-            .ok_or("a revision read's snapshot must carry the resolved commit")?;
-        assert_eq!(revision.len(), 40, "the echo is the full commit id");
-        assert!(revision.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(value["warnings"], json!([]));
         Ok(())
     }
 
     #[test]
-    fn revision_snapshot_differs_from_the_drifted_working_tree() -> TestResult {
+    fn revision_tree_digest_differs_from_the_drifted_working_tree() -> TestResult {
         let directory = committed_fixture()?;
         let at_head = revision_service(directory.path(), "main")?;
         let working = ReadService::build(
@@ -1229,14 +1292,14 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::default(),
         )?;
         assert_ne!(
-            at_head.snapshot().tree_revision,
-            working.snapshot().tree_revision,
+            at_head.tree_revision(),
+            working.tree_revision(),
             "drifted bytes must produce a different tree digest"
         );
         assert_eq!(
-            working.snapshot().revision,
+            working.revision(),
             None,
-            "a working-tree read carries no revision echo"
+            "a working-tree read serves no resolved commit"
         );
         Ok(())
     }
