@@ -632,6 +632,14 @@ pub(crate) fn build_workspace_candidate(
 /// Population failure is a warning, never a request failure: the search-time revision guard
 /// keeps served results honest whether or not this population landed, and the next
 /// successful rebuild repopulates from scratch regardless.
+///
+/// # Cancel safety
+///
+/// `replace_all` runs inside one `SQLite` transaction. Dropping this future before that
+/// transaction commits leaves the previously indexed units and tree-revision stamp fully
+/// intact — never partially overwritten. That stamp then no longer names the tree revision
+/// this call was populating for, so the search-time revision guard serves identifier-only
+/// results until the next successful publication repopulates the lexical tier.
 pub(crate) async fn populate_lexical(lexical: &LexicalSearchIndex, published: &PublishedWorkspace) {
     for (path, chunks) in published.reads.chunked_text_files() {
         tracing::warn!(
@@ -912,18 +920,22 @@ mod tests {
     use std::fs;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Barrier as ThreadBarrier};
+    use std::time::Duration;
 
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use rift_core::{SourceVisibility, TextFileAdmission};
-    use rift_index::{WorkspaceIndexLimits, WorkspaceSourcePolicy};
+    use rift_index::{
+        LexicalIndexLimits, LexicalSearchIndex, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    };
     use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
 
     use super::{
         ConfigurationFingerprint, ConfigurationState, IndexState, IndexValidation,
         PublishedWorkspace, RebuildOutcome, WorkspaceCandidate, build_workspace_candidate,
-        publish_rebuild, publish_rebuild_after, record_rebuild_failure, relevant_watch_event,
+        populate_lexical, publish_rebuild, publish_rebuild_after, record_rebuild_failure,
+        relevant_watch_event,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1613,6 +1625,157 @@ mod tests {
         .await
         .expect_err("a configuration that keeps moving must exhaust capture attempts");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn populate_lexical_persists_every_chunk_of_an_oversized_text_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        // The enforced minimum `max_chunk` against a several-kilobyte guide forces the file
+        // into more than one lexical chunk.
+        let rift_toml = directory.path().join("rift.toml");
+        fs::write(rift_toml, "[search.text]\nmax_chunk = \"1kb\"\n")?;
+        fs::write(directory.path().join("guide.md"), "word ".repeat(1000))?;
+        let published = stable_candidate(directory.path(), 0)?;
+
+        let chunked = published.reads.chunked_text_files();
+        let chunk_count = chunked
+            .iter()
+            .find(|(path, _)| path.as_str() == "guide.md")
+            .map(|(_, count)| *count)
+            .ok_or("guide.md must be reported as chunked before population runs")?;
+        assert!(
+            chunk_count > 1,
+            "the oversized guide must split into more than one chunk: {chunk_count}"
+        );
+
+        let units = published.reads.lexical_units();
+        let guide_units = units
+            .iter()
+            .filter(|unit| unit.path().as_str() == "guide.md")
+            .count();
+        assert!(
+            guide_units > 1,
+            "the oversized file must contribute more than one lexical unit: {guide_units}"
+        );
+
+        let lexical = LexicalSearchIndex::open(
+            &directory.path().join("lexical.db"),
+            LexicalIndexLimits::default(),
+        )
+        .await?;
+        populate_lexical(&lexical, &published).await;
+
+        let stamped = lexical.tree_revision().await?;
+        assert_eq!(
+            stamped.as_deref(),
+            Some(published.reads.tree_revision()),
+            "population must succeed and stamp the published tree revision, not merely warn"
+        );
+        for unit in &units {
+            let content = lexical.content(unit.identity()).await?;
+            assert!(
+                content.is_some(),
+                "every chunk unit must have been persisted: identity={}",
+                unit.identity()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_dispatches_superseded_when_epoch_moves_before_admission() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, invalidations) = IndexValidation::new();
+        let current = stable_candidate(directory.path(), 0)?;
+        let published = Arc::new(RwLock::new(IndexState {
+            current,
+            failure: None,
+        }));
+        let watcher = super::workspace_watcher(directory.path(), &validation)
+            .map_err(|error| format!("watcher must start: {error:?}"))?;
+
+        // One blocking slot, held by a placeholder so the supervisor's own rebuild for
+        // epoch 1 is forced to queue behind it — a deterministic gate between the
+        // supervisor capturing that epoch and `admit_rebuild` checking it, exactly where a
+        // second observation must land to supersede the rebuild.
+        let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel::<()>(0);
+        let held_blocking = blocking.clone();
+        let held = tokio::spawn(async move {
+            held_blocking
+                .run("held placeholder", move || {
+                    let _ = started_sender.send(());
+                    release_receiver
+                        .recv()
+                        .expect("test must release the held placeholder");
+                    Ok::<(), rift_server::ReadError>(())
+                })
+                .await
+        });
+        started_receiver
+            .await
+            .expect("held placeholder must occupy the one blocking slot");
+
+        let supervisor = tokio::spawn(super::run_index_supervisor(
+            watcher,
+            invalidations,
+            super::IndexSupervisorContext {
+                root: directory.path().to_path_buf(),
+                limits: WorkspaceIndexLimits::default(),
+                published: Arc::clone(&published),
+                change_lane: Arc::new(crate::server::ChangeLane::default()),
+                validation: Arc::clone(&validation),
+                blocking: blocking.clone(),
+                lexical: None,
+            },
+        ));
+
+        let first_epoch = validation
+            .observe()
+            .map_err(|error| format!("first observation must land: {error:?}"))?;
+        assert_eq!(first_epoch, 1);
+        // Gives the supervisor's debounce (50ms) real wall-clock time to elapse and its
+        // rebuild to reach and queue behind the held placeholder. The held slot — not this
+        // wait — is what guarantees the rebuild cannot be admitted until released; a
+        // slower scheduler just makes this wait less generous, never wrong.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Moves the epoch again with no invalidation signal, so no second rebuild cycle is
+        // ever triggered — only the already-queued rebuild for epoch 1 observes this move.
+        let moved = validation.observed_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(moved, 2);
+
+        release_sender
+            .send(())
+            .expect("held placeholder must accept release");
+        held.await??;
+
+        // A sentinel operation through the same one-slot executor only completes once the
+        // supervisor's own queued rebuild has acquired, run, and released that slot —
+        // proving its `admit_rebuild` check (and therefore the Superseded verdict) already
+        // landed, without hoping a fixed sleep was long enough.
+        blocking
+            .run("sentinel", || Ok::<(), rift_server::ReadError>(()))
+            .await?;
+
+        let state = published.read().await;
+        let (snapshot, failure) = state.snapshot();
+        assert_eq!(
+            snapshot.epoch, 0,
+            "a superseded rebuild must publish nothing"
+        );
+        assert!(
+            failure.is_none(),
+            "a superseded rebuild must not record a failure either"
+        );
+        drop(state);
+
+        validation.cancellation.cancel();
+        supervisor.await?;
         Ok(())
     }
 }
