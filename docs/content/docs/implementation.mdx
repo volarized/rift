@@ -139,8 +139,8 @@ because no filesystem watcher sees inside a served tree.
 
 `rift.toml` at the workspace root is admitted at startup and re-validated on change; its schema
 is exported beside the MCP surface as [`rift.schema.json`](https://volar.sh/rift/rift.schema.json),
-so editors validate the file as it is written. A quantity key spells its unit in the value —
-`timeout = "120s"`, never a `_ms` suffix in the key.
+so editors validate the file as it is written. A quantity value carries its unit:
+`timeout = "120s"`.
 
 A hook is a configured command the server runs inside the changed tree after a change lands,
 with a declared environment, bounded output, and a timeout. Its verdict attaches to the change
