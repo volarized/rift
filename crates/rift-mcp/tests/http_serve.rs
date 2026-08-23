@@ -253,3 +253,36 @@ async fn two_concurrent_clients_are_both_served() -> TestResult {
     shutdown.cancel();
     stopped_within_deadline(server).await
 }
+
+#[tokio::test]
+async fn foreign_host_and_origin_are_refused_at_the_boundary() -> TestResult {
+    let directory = workspace_with(None)?;
+    let (shutdown, server) = served(directory.path()).await?;
+    let http = reqwest::Client::new();
+
+    let forged_host = http
+        .post(stop_url(&server))
+        .header(reqwest::header::HOST, "rift.example:12345")
+        .bearer_auth(server.token())
+        .send()
+        .await?;
+    assert_eq!(forged_host.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let forged_origin = http
+        .post(stop_url(&server))
+        .header(reqwest::header::ORIGIN, "http://rift.example")
+        .bearer_auth(server.token())
+        .send()
+        .await?;
+    assert_eq!(forged_origin.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let loopback_origin = http
+        .post(stop_url(&server))
+        .header(reqwest::header::ORIGIN, "http://127.0.0.1:5500")
+        .bearer_auth(server.token())
+        .send()
+        .await?;
+    assert_eq!(loopback_origin.status(), reqwest::StatusCode::ACCEPTED);
+    shutdown.cancel();
+    stopped_within_deadline(server).await
+}

@@ -37,6 +37,8 @@ const TOKEN_ENTROPY_BYTES: usize = 32;
 const BEARER_SCHEME: &str = "Bearer";
 /// The scheme-plus-space prefix an accepted `Authorization` value carries.
 const BEARER_PREFIX: &str = "Bearer ";
+/// The `Host` spellings that name the loopback the server binds.
+const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "[::1]"];
 
 /// Failure while starting or running the Streamable-HTTP MCP transport.
 pub type HttpServeError = Error<HttpServeFault>;
@@ -316,6 +318,69 @@ fn authenticated_router(
         .route(STOP_PATH, post(stop_server))
         .with_state(stop.clone())
         .layer(middleware::from_fn_with_state(gate, authorize_request))
+        .layer(middleware::from_fn(guard_loopback_boundary))
+}
+
+/// Refuses requests whose `Host` or `Origin` reaches past the loopback.
+///
+/// A remote page can reach a loopback port through DNS rebinding — its own
+/// name resolving here — or issue a request carrying its own origin. The
+/// server accepts only a loopback `Host`, and only a loopback `Origin` when
+/// one is present; non-browser MCP clients omit `Origin` and pass. The
+/// guard runs before authentication on every route, so the boundary holds
+/// for the stop route as well as the MCP service.
+async fn guard_loopback_boundary(request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let host_accepted = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(host_is_loopback);
+    if !host_accepted {
+        return boundary_refusal("Host");
+    }
+    let origin_accepted = match headers.get(header::ORIGIN) {
+        None => true,
+        Some(value) => value.to_str().is_ok_and(origin_is_loopback),
+    };
+    if !origin_accepted {
+        return boundary_refusal("Origin");
+    }
+    next.run(request).await
+}
+
+/// The `400` refusal naming the header that reached past the loopback.
+fn boundary_refusal(header_name: &'static str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("{header_name} header does not name the loopback this server binds"),
+    )
+        .into_response()
+}
+
+/// Whether a `Host` value names the loopback, with or without a port.
+///
+/// A bracketed IPv6 host keeps its brackets; otherwise a trailing
+/// all-digit `:port` is cut before the comparison, and a non-numeric tail
+/// stays part of the name and fails it.
+fn host_is_loopback(host: &str) -> bool {
+    let name = match host.find(']') {
+        Some(bracket_end) => &host[..=bracket_end],
+        None => host
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+            .map_or(host, |(name, _)| name),
+    };
+    let name = name.to_ascii_lowercase();
+    LOOPBACK_HOSTS.contains(&name.as_str())
+}
+
+/// Whether an `Origin` value names a loopback `http` or `https` origin.
+fn origin_is_loopback(origin: &str) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let scheme_known = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    scheme_known && host_is_loopback(rest)
 }
 
 /// Requests the same shutdown an external cancel performs.
@@ -598,6 +663,79 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer")
         );
+    }
+
+    #[test]
+    fn loopback_hosts_are_accepted_with_and_without_ports() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:12345",
+            "localhost",
+            "localhost:80",
+            "LOCALHOST:13000",
+            "[::1]",
+            "[::1]:12000",
+        ] {
+            assert!(
+                super::host_is_loopback(host),
+                "host {host:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_hosts_are_refused() {
+        for host in [
+            "",
+            "rift.example",
+            "rift.example:12345",
+            "127.0.0.1.rift.example",
+            "localhost:port",
+            "[::2]:80",
+            "127.0.0.1:",
+        ] {
+            assert!(
+                !super::host_is_loopback(host),
+                "host {host:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_origins_are_accepted() {
+        for origin in [
+            "http://127.0.0.1:5500",
+            "https://localhost",
+            "HTTP://[::1]:13000",
+        ] {
+            assert!(
+                super::origin_is_loopback(origin),
+                "origin {origin:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_origins_are_refused() {
+        for origin in [
+            "",
+            "null",
+            "http://rift.example",
+            "https://rift.example:443",
+            "file://127.0.0.1",
+            "127.0.0.1",
+        ] {
+            assert!(
+                !super::origin_is_loopback(origin),
+                "origin {origin:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_refusal_names_the_header() {
+        let response = super::boundary_refusal("Origin");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test(start_paused = true)]
