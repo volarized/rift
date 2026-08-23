@@ -266,32 +266,14 @@ distinguish a compiler-resolved answer from a syntax fallback.
 
 <VersionBadge version="v0.0.8" languages={["Rust"]} />
 
-The server keeps an immutable in-memory index over the project's source. Tree-sitter extracts
+The server keeps an immutable index over the project's source. Tree-sitter extracts
 declarations and syntax nodes from the files admitted by the workspace's source policy; the
 badge above names the languages the index currently covers.
 
-The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories. The index
-stays in memory, so indexing writes no state into the workspace.
-
-At startup, the server starts a native filesystem watcher before it schedules the initial scan on
-a Tokio-managed blocking task. Filesystem traversal and parsing therefore do not occupy an async
-MCP worker.
-
-Blocking work shares a bounded pool of slots. When every slot is busy, a request waits in Tokio's
-semaphore queue; once the wait expires, the server returns `temporarily_unavailable`, so the client
-can retry without adding another blocking worker. The [`server` table](/docs/configuration#server)
-in `rift.toml` sets both bounds — four slots and a 30-second wait by default — and the server sizes
-the pool once at startup.
-
-Native watcher events and Rift-applied changes advance one workspace change counter and enter the
-same serialized rebuild lane. Before each current-tree read, the server reconciles watcher state
-against an exact fingerprint of the admitted workspace files, then waits until the published index
-counter matches it.
-
-From the implementation perspective, a rebuild constructs the read index and admitted configuration
-outside the async lock, then swaps the complete immutable value under its write lock. Each request
-clones the published value under a read lock and retains that capture through its result, so reads
-never combine state from two index revisions.
+The server watches the workspace and validates the published index against it before each
+current-tree read, so a read serves the tree as it stands and never combines state from two
+index revisions. The watcher, the rebuild lane, and the swap that keeps this true live on the
+[implementation](/docs/implementation#rift-server) page.
 
 The [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) reports the tree, source-catalog, and
 index revisions used for the answer. It reports the index as current only after request-time
@@ -299,24 +281,15 @@ reconciliation established that the published revision matches the workspace.
 
 <VersionBadge version="v0.0.9" languages={["Rust"]} />
 
-Each rebuild also derives a lexical unit for [`search`](/docs/protocol/mcp#tool-search): one per
-indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) admits, split into
-several units once a file crosses that table's chunk bound. Publication writes the whole set
-into a [SQLite](https://www.sqlite.org/) database at `.rift/db`, replacing its prior content and
-stamping it with the tree revision the publication just made current. That database is where
-Rift's own stores share space — the lexical index today, with later stores meant to join it —
-while the server lock, projections, and execution scratch stay separate files under `.rift`.
+Each rebuild also derives lexical units for [`search`](/docs/protocol/mcp#tool-search): one per
+indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) admits. The units
+persist in the workspace database at `.rift/db`, stamped with the tree revision that published
+them.
 
-An [FTS5](https://www.sqlite.org/fts5.html) virtual table inside that database serves content
-queries against those units. Alongside a unit's own spelling, Rift indexes its name split into
-words on case and separator boundaries, so a query for `get user name` also reaches a declaration
-spelled `getUserName`.
-
-A search request only trusts the lexical database when its stamped revision equals the snapshot
-the request is reading — the two disagree while a rebuild's population is still catching up, or
-after one failed outright. When they disagree, the request serves no lexical matches at all,
-falling back to identifier and source-line matching instead of returning a hit the tree has
-already moved past.
+A search request serves lexical matches only when that stamp equals the snapshot it reads — the
+two disagree while a rebuild is still catching up, or after one failed outright. When they
+disagree, the request serves no lexical matches at all, falling back to identifier and
+source-line matching instead of returning a hit the tree has already moved past.
 
 ### Search
 
@@ -331,11 +304,13 @@ as a declaration. Facts a semantic provider resolved arrive through the same mer
 the tool.
 
 Matching serves two query shapes. An identifier-shaped query — `ReadService`,
-`blocking_slots` — matches the declaration names it resembles, split the way code spells them.
-A prose query — `source extensions admitted` — ranks by
-[BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance in the FTS5 table the
-[Index](#index) section describes, over names, signatures, documentation, and content together,
-so concept-level recon does not depend on guessing the identifier first.
+`blocking_slots` — matches the declaration names it resembles. A prose query — `source
+extensions admitted` — ranks by [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance
+over names, signatures, documentation, and content together.
+
+Names are indexed both as spelled and split into words on case and separator boundaries, so
+`get user name` reaches a declaration spelled `getUserName`, and concept-level recon does not
+depend on guessing the identifier first.
 
 The same tool walks relationships when the starting symbol is known. A
 [`SearchTraversal`](/docs/protocol/reference#SearchTraversal) names that symbol and the
