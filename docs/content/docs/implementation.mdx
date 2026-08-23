@@ -6,15 +6,15 @@ title: Implementation
 
 import { FlatDiagram } from "@/components/flat-diagram";
 
-This page goes into how Rift is built. It's developer-oriented documentation — to use Rift,
-start from the [main documentation](/docs).
+This page goes into how Rift is built. It's developer-oriented — if you just want to use Rift,
+check the [main documentation](/docs).
 
 <FlatDiagram
-  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /mcp route over Streamable HTTP. The server, an Axum application on Tokio, admits rift.toml, mounts projections through Rift FS, and runs hooks on each change. Inside the providers-and-index box, provider compositions feed facts into the in-memory index, which publishes lexical units through Toasty over SQLite into .rift/db; the server queries both. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
+  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /api/mcp route over Streamable HTTP. The server, an Axum application on Tokio, admits rift.toml, mounts projections through Rift FS, and runs hooks on each change. Inside the providers-and-index box, provider compositions feed facts into the in-memory index, which publishes lexical units through Toasty over SQLite into .rift/db; the server queries both. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
-      mcp -- "Streamable HTTP /mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
+      mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
       toml["rift.toml"]:::config -- "admission" --> server
       server -- "mounts" --> fs["Rift FS<br/>NFS or FUSE"]:::rift
       fs -- "serves" --> proj[".rift/projections/<br/>my-feature-one"]:::store
@@ -43,40 +43,41 @@ start from the [main documentation](/docs).
 <VersionBadge version="planned" />
 
 Rift is delivered as one binary, installed as the [Install](/docs#install) section describes.
-`rift` carries every command, parsed by [clap](https://docs.rs/clap): utilities such as
-`rift update`, which replaces the binary in place, and the two that run the architecture —
-`rift mcp` and `rift server`.
+The CLI is implemented with [clap](https://docs.rs/clap), and Rift's two main capabilities are
+implemented as `rift mcp` and `rift server`.
 
 ### rift mcp
 
-`rift mcp` is the command an agent launches. It speaks MCP over stdio through
-[rmcp](https://github.com/modelcontextprotocol/rust-sdk) and forwards each request to the
-workspace's `rift server` over Streamable HTTP: a stdio-to-HTTP proxy, with no state of its
-own. It reads [`ServerLock`](/docs/protocol/reference#ServerLock) from `.rift/server.json` for
-the port and token, and starts the server first when no live one answers.
+`rift mcp` is an agent-compatible MCP stdio server. Under the hood it takes input from the
+agent over the stdio transport and forwards each request to the workspace's `rift server` over
+Streamable HTTP; the `rift mcp` process holds no state of its own, following MCP's protocol
+concepts. To reach the workspace's server it checks the server lock file —
+[`ServerLock`](/docs/protocol/reference#ServerLock) at `.rift/server.json` — and starts a
+server when the file is absent.
 
 ### rift server
 
 The server is an [Axum](https://docs.rs/axum) application on the [Tokio](https://tokio.rs)
-runtime. MCP clients use its `/mcp` route, which serves Streamable HTTP through rmcp's service
-layer; the rest of the router carries non-MCP surfaces such as the SCIP export.
+runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP through
+[rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; the rest of the
+routes are reserved for other surfaces, the SCIP export for example.
 
 Startup runs one cycle:
 
-1. Parse `rift.toml` and admit the workspace; an invalid file refuses every request until fixed.
-2. Win or lose the election: atomic creation of `.rift/server.json` picks one starter among
-   racing `rift mcp` processes, and losers connect to the winner.
-3. Bind a loopback port, mint the bearer token, and write both into the lock file.
+1. Parse `rift.toml` and admit the workspace; an invalid file keeps the server running but
+   refuses every request until fixed.
+2. Take the file lock on `.rift/server.json`, which picks one starter among racing `rift mcp`
+   processes.
+3. Bind a loopback port in the 12000–13000 range, mint the bearer token, and write both into
+   the lock file.
 4. Start the native filesystem watcher.
 5. Schedule the initial scan and parse on a Tokio-managed blocking task, so traversal and
    parsing never occupy an async MCP worker.
-6. Serve until thirty idle minutes pass, then remove the lock and exit.
+6. Serve until no request arrives for the idle timeout `rift.toml` sets, then stop.
 
-Blocking work shares a bounded pool of slots behind a Tokio semaphore. When every slot is busy a
-request waits in the queue; once the wait expires the server returns `temporarily_unavailable`,
-so the client retries without adding another blocking worker. The
-[`server` table](/docs/configuration#server) sets both bounds — four slots and a 30-second wait
-by default — and the server sizes the pool once at startup.
+Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
+queue, and a worker picks it up when one is free. The pool's bounds — `num_workers` and
+`worker_queue_timeout` — live on the [`server` table](/docs/configuration#server).
 
 The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories. The
 symbol index stays in memory as one immutable value: a rebuild constructs the next index and

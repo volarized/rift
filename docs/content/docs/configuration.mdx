@@ -29,18 +29,18 @@ changes, and index rebuilds:
 
 ```toml
 [server]
-blocking_slots = 4
-blocking_queue_timeout = "30s"
+num_workers = 4
+worker_queue_timeout = "30s"
 ```
 
 Each key is shown at its default:
 
-- `blocking_slots` caps blocking operations running at once, 1 to 64
-- `blocking_queue_timeout` bounds one request's wait for a free slot, 1ms to 1h — when it
+- `num_workers` caps the workers running blocking operations at once, 1 to 64
+- `worker_queue_timeout` bounds one request's wait for a free worker, 1ms to 1h — when it
   expires, the request fails with `temporarily_unavailable` and the client can retry without
   stacking another waiter
 
-The blocking pool exists before the first request, so the server sizes it once at startup: a
+The worker pool exists before the first request, so the server sizes it once at startup: a
 change to this table applies on the next start, while every other table applies to later
 requests as soon as the file validates.
 
