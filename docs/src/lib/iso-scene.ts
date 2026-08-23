@@ -308,7 +308,9 @@ export function buildScene(
   }
 
   for (const group of flow.groups) {
-    graph.setNode(group.id, {});
+    // Dagre sizes cluster nodes itself during layout; the zero seed only
+    // satisfies the label shape.
+    graph.setNode(group.id, { width: 0, height: 0 });
     for (const member of group.nodes) {
       graph.setParent(member, group.id);
     }
