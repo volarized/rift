@@ -6,38 +6,56 @@ title: Implementation
 
 import { FlatDiagram } from "@/components/flat-diagram";
 
-This page is developer documentation: how Rift is built, component by component. To use Rift
-rather than change it, start from the [main documentation](/docs); for what the components are
-and how they relate, read the [architecture](/docs/architecture) page first.
+This page goes into how Rift is built. It's developer-oriented documentation — to use Rift,
+start from the [main documentation](/docs).
 
 <FlatDiagram
-  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /mcp route over Streamable HTTP. The server, an Axum application on Tokio, admits rift.toml, persists stores through Toasty over SQLite at .rift/db, mounts projections through Rift FS, runs provider compositions that reach tree-sitter and language servers, and runs hooks on each change."
+  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /mcp route over Streamable HTTP. The server, an Axum application on Tokio, admits rift.toml, mounts projections through Rift FS, and runs hooks on each change. Inside the providers-and-index box, provider compositions feed facts into the in-memory index, which publishes lexical units through Toasty over SQLite into .rift/db; the server queries both. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
       mcp -- "Streamable HTTP /mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
       toml["rift.toml"]:::config -- "admission" --> server
-      server -- "Toasty over SQLite" --> db[".rift/db"]:::store
       server -- "mounts" --> fs["Rift FS<br/>NFS or FUSE"]:::rift
       fs -- "serves" --> proj[".rift/projections/<br/>my-feature-one"]:::store
-      server -- "compositions" --> providers["providers<br/>tree-sitter + engines"]:::provider
-      providers -- "LSP" --> ls["language server"]:::provider
+      subgraph indexing["providers and index"]
+        providers["providers<br/>tree-sitter + engines"]:::provider
+        memory["in-memory index<br/>symbols + nodes"]:::store
+        db[".rift/db<br/>lexical units + FTS5"]:::store
+        providers -- "facts" --> memory
+        memory -- "publish units<br/>Toasty over SQLite" --> db
+      end
+      server -- "compositions" --> providers
+      subgraph engine["LSP engine"]
+        adapter["engine adapter"]:::provider
+        ls["language server<br/>stdio child"]:::provider
+        adapter -- "plan request" --> ls
+        ls -- "edit plan" --> adapter
+      end
+      providers -- "resolve" --> adapter
+      adapter -. "edit proposals" .-> server
       server -- "on change" --> hooks["hooks"]:::hook
   `}
 />
 
-## rift mcp
+## The rift binary
 
-`rift mcp` is the CLI entry an agent launches — the `rift` binary, its commands parsed by
-[clap](https://docs.rs/clap). It speaks MCP over stdio through
+<VersionBadge version="planned" />
+
+Rift is delivered as one binary, installed as the [Install](/docs#install) section describes.
+`rift` carries every command, parsed by [clap](https://docs.rs/clap): utilities such as
+`rift update`, which replaces the binary in place, and the two that run the architecture —
+`rift mcp` and `rift server`.
+
+### rift mcp
+
+`rift mcp` is the command an agent launches. It speaks MCP over stdio through
 [rmcp](https://github.com/modelcontextprotocol/rust-sdk) and forwards each request to the
 workspace's `rift server` over Streamable HTTP: a stdio-to-HTTP proxy, with no state of its
 own. It reads [`ServerLock`](/docs/protocol/reference#ServerLock) from `.rift/server.json` for
 the port and token, and starts the server first when no live one answers.
 
-Today the one binary serves the tools in-process; the proxy split above is the planned shape.
-
-## rift server
+### rift server
 
 The server is an [Axum](https://docs.rs/axum) application on the [Tokio](https://tokio.rs)
 runtime. MCP clients use its `/mcp` route, which serves Streamable HTTP through rmcp's service
