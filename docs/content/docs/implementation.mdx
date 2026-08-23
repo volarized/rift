@@ -74,8 +74,9 @@ Startup runs one cycle:
 6. Serve until no request arrives for the idle timeout `rift.toml` sets, then stop.
 
 Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
-queue, and a worker picks it up when one is free. The pool's bounds — `num_workers` and
-`worker_queue_timeout` — live on the [`server` table](/docs/configuration#server).
+queue, and a worker picks it up when one is free. This behavior is configurable via the
+`num_workers` and `worker_queue_timeout` keys in the
+[`[server]` section](/docs/configuration#server).
 
 The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories. The
 symbol index stays in memory as one immutable value: a rebuild constructs the next index and
