@@ -13,7 +13,7 @@ use rmcp::model::ErrorCode;
 
 /// JSON-RPC error code every Rift operating failure travels under: the
 /// first code of the server-defined range (-32000 to -32099), which rmcp
-/// exports no constant for — its constants name only MCP-defined codes. The
+/// exports no constant for - its constants name only MCP-defined codes. The
 /// machine-readable classification is the [`wire::ErrorData`] in `data`.
 pub(crate) const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
 
@@ -105,7 +105,7 @@ pub(crate) fn stale_snapshot_diagnostic(error: &ReadError) -> rift_protocol::rea
 }
 
 /// Boundary view of a read failure: the projection a tool handler serves as
-/// the JSON-RPC error object the design documents — code `-32000`, the
+/// the JSON-RPC error object the design documents - code `-32000`, the
 /// rendered failure line as `message`, and the typed [`wire::ErrorData`] as
 /// `data`.
 pub(crate) trait WireFailure {

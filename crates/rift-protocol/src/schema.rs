@@ -303,7 +303,10 @@ pub fn declare_execution_ranges(schema: &mut Schema) {
 /// validation alone cannot compare `"30s"` against a ceiling, so the server
 /// enforces the bound at load and the schema carries it for readers.
 pub fn declare_server_ranges(schema: &mut Schema) {
-    use crate::configuration::{Duration, SERVER_QUEUE_TIMEOUT_MS_MAX, ServerConfiguration};
+    use crate::configuration::{
+        Duration, SERVER_IDLE_TIMEOUT_MS_MAX, SERVER_IDLE_TIMEOUT_MS_MIN,
+        SERVER_QUEUE_TIMEOUT_MS_MAX, ServerConfiguration,
+    };
     annotate_property(
         schema,
         property!(ServerConfiguration, worker_queue_timeout),
@@ -311,6 +314,26 @@ pub fn declare_server_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(1),
             &Duration::from_millis(SERVER_QUEUE_TIMEOUT_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, idle_timeout),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(SERVER_IDLE_TIMEOUT_MS_MIN),
+            &Duration::from_millis(SERVER_IDLE_TIMEOUT_MS_MAX),
+        ),
+    );
+    append(
+        schema,
+        Composition::All,
+        described(
+            "server.port and server.port_range are mutually exclusive",
+            not(requires(&[
+                property!(ServerConfiguration, port),
+                property!(ServerConfiguration, port_range),
+            ])),
         ),
     );
 }
@@ -535,8 +558,8 @@ pub fn require_query_filter_or_traversal(schema: &mut Schema) {
     );
 }
 
-/// A read names at most one alternate tree to serve from — a version-control
-/// `rev` or a materialized `projection`, never both — so the answer's origin
+/// A read names at most one alternate tree to serve from - a version-control
+/// `rev` or a materialized `projection`, never both - so the answer's origin
 /// is always a single tree.
 fn forbid_rev_with_projection(schema: &mut Schema, rev: &str, projection: &str) {
     append(schema, Composition::All, not(requires(&[rev, projection])));

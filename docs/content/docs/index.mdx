@@ -31,7 +31,7 @@ release tag.
 ## MCP configuration
 
 An MCP client launches `rift mcp` in the folder containing the codebase. Register it in the
-client's MCP configuration — for Claude Code, `.mcp.json` in the project root:
+client's MCP configuration - for Claude Code, `.mcp.json` in the project root:
 
 ```json
 {
@@ -75,7 +75,7 @@ reads aligned with filesystem changes.
 ## Changes
 
 The change tools edit the workspace. Each resolves its address against the served snapshot, proves its
-preconditions against the bytes on disk, and only then writes — atomically, behind one
+preconditions against the bytes on disk, and only then writes - atomically, behind one
 application lock, so two concurrent changes collide as a clean refusal rather than as
 interleaved bytes:
 

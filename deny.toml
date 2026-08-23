@@ -9,6 +9,7 @@ yanked = "deny"
 version = 2
 allow = [
   "Apache-2.0",
+  "BSD-3-Clause",
   "CC0-1.0",
   "ISC",
   "MIT",
@@ -25,11 +26,14 @@ allow-wildcard-paths = true
 # gix-pack's clru 0.6.3 still pins hashbrown 0.16 while indexmap is on 0.17.
 # notify 8.2.0 still pins windows-sys 0.60 while Tokio and rustix use 0.61.
 # gix's sha1 still pins cpufeatures 0.2 while uuid's rand stack uses 0.3.
+# hyper-util 0.1 and reqwest's hyper-tls still pin base64 0.22 while rmcp's
+# HTTP transports are on 0.23.
 skip = [
   { name = "syn", version = "2.0.119" },
   { name = "hashbrown", version = "0.16.1" },
   { name = "windows-sys", version = "0.60.2" },
   { name = "cpufeatures", version = "0.2.17" },
+  { name = "base64", version = "0.22.1" },
 ]
 
 [sources]

@@ -28,7 +28,7 @@ import { cn } from "@/lib/utils";
  * laid *into* the same plane as live DOM.
  *
  * That last part is the whole trick. A label here is not text drawn onto the
- * scene, and it is not text floating upright in front of it — it is a `<div>`
+ * scene, and it is not text floating upright in front of it - it is a `<div>`
  * parented to a group rotated into the ground plane, so three.js carries it
  * through the same projection as the slab it sits on. It comes out lying on
  * the plate like ink on a drawing board, and because it is still live DOM it
@@ -56,7 +56,7 @@ const CAMERA_DISTANCE = 600;
 
 /**
  * Ink weights. A slab is read from its drawn edges rather than any fill, per
- * the design system — the solid inside it is the page's own background, and it
+ * the design system - the solid inside it is the page's own background, and it
  * is there only to occlude.
  */
 const INK = {
@@ -116,7 +116,7 @@ function Caption({
         transform
         center
         distanceFactor={DISTANCE_FACTOR}
-        // Kept out of the page's own stacking order — a label belongs to the
+        // Kept out of the page's own stacking order - a label belongs to the
         // drawing, not on top of the nav.
         zIndexRange={[0, 0]}
         className="pointer-events-none select-none"
@@ -171,7 +171,7 @@ function Plate({
           it without ever reading as a filled shape. */}
       {/* A box sits on the floor, so its centre is half its height. A flat
           plate has no height to halve, and would land in the floor's own
-          plane — so it takes half the clearance the connectors use, which
+          plane - so it takes half the clearance the connectors use, which
           stacks it above the grid and below them. */}
       <mesh geometry={geometry.box} position={[0, thickness > 0 ? thickness / 2 : EPS / 2, 0]}>
         <meshBasicMaterial color={surface} />
@@ -219,7 +219,7 @@ function Connector({
   const run = useMemo(() => {
     // Expanded into pairs for `lineSegments` rather than drawn as one strip.
     // A hairline has no joins to lose, and it keeps the connectors on exactly
-    // the same material — and so exactly the same width — as the plate edges,
+    // the same material - and so exactly the same width - as the plate edges,
     // which a screen-space line would not.
     const points: number[] = [];
     for (let i = 0; i < connector.points.length - 1; i++) {
@@ -231,7 +231,7 @@ function Connector({
   }, [connector.points]);
 
   // A dash pattern needs distances along the run, and only the drawn object
-  // can work them out — the geometry alone does not know it is a line.
+  // can work them out - the geometry alone does not know it is a line.
   const dashed = useRef<THREE.LineSegments>(null);
   useEffect(() => {
     if (connector.style === "dotted") dashed.current?.computeLineDistances();
@@ -303,7 +303,7 @@ function Connector({
  *
  * It reaches `REACH` times the scene's own size in every direction rather than
  * stopping at the plates. The diagram is the thing standing *on* a surface, so
- * the surface has to be plainly bigger than it — and now that the scene can be
+ * the surface has to be plainly bigger than it - and now that the scene can be
  * panned and zoomed, a floor cut to the outline of the plates would end in
  * mid-air the moment anyone moved.
  *
@@ -416,7 +416,7 @@ function Frame({
     orthographic.up.set(0, 1, 0);
     orthographic.lookAt(centre);
     // r3f's orthographic frustum is the canvas in pixels, so zoom *is* pixels
-    // per world unit — fitting is one division.
+    // per world unit - fitting is one division.
     orthographic.zoom = Math.min(size.width / (span.width * PX), size.height / (span.height * PX));
     orthographic.updateProjectionMatrix();
 
@@ -483,7 +483,7 @@ export function IsoCanvas({
         {/*
           Driveable, but not free. The captions lie *in* the ground plane, so
           they are only legible from above it and from roughly the quadrant the
-          scene was composed for — swing past that and the text goes edge-on or
+          scene was composed for - swing past that and the text goes edge-on or
           mirrors. The limits keep the camera inside the range where the
           drawing still reads, and leave zoom and pan unbounded, which is what
           someone reading a dense diagram actually wants.

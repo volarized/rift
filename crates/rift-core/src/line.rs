@@ -3,7 +3,7 @@
 //! Rift's byte-fidelity policy: segmenting source text for reassembly or comparison always uses
 //! `split_inclusive('\n')` (or explicit byte slicing), never `str::lines()`. `str::lines()`
 //! strips a trailing `\r` from every CRLF line and drops whether the source ended with a
-//! newline at all — re-joining its output silently rewrites CRLF to LF and manufactures or
+//! newline at all - re-joining its output silently rewrites CRLF to LF and manufactures or
 //! removes a trailing newline the input never had or lost. Every site that reconstructs,
 //! stores, or diffs source bytes must keep the exact ending each line carried.
 

@@ -2,12 +2,12 @@
  * Which mermaid class puts which mark on a plate.
  *
  * Only the *names* live here. What a mark actually looks like is a React
- * component, and the renderer that holds those is a client component — so the
+ * component, and the renderer that holds those is a client component - so the
  * two halves have to meet on something that survives serialisation. A string
  * does; a component does not.
  *
- * A diagram picks its own marks in its own source — `agent1["agent 1"]:::agent`
- * — so nothing about a particular picture is wired in here either.
+ * A diagram picks its own marks in its own source - `agent1["agent 1"]:::agent`
+ * - so nothing about a particular picture is wired in here either.
  */
 export const MARK_NAMES = [
   "rift",

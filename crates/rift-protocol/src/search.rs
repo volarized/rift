@@ -172,8 +172,8 @@ pub struct PathPattern(
 
 impl PathPattern {
     /// Classifies this pattern against the forward-slash-only contract [`PathPattern`]
-    /// advertises. `schemars` regexes are declarative only — nothing enforces them at
-    /// runtime — so every acceptance point calls this before the pattern reaches a glob
+    /// advertises. `schemars` regexes are declarative only - nothing enforces them at
+    /// runtime - so every acceptance point calls this before the pattern reaches a glob
     /// engine, where a stray backslash would otherwise be read as an escape.
     #[must_use]
     pub fn violation(&self) -> Option<PathPatternViolation> {
@@ -269,7 +269,7 @@ pub struct RelationFilter {
     #[serde(default)]
     #[schemars(range(min = 1_u64))]
     pub min_depth: Option<u64>,
-    /// How many edges a traversal may cross. Only edges that compose carry a depth —
+    /// How many edges a traversal may cross. Only edges that compose carry a depth -
     /// `contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`,
     /// `mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing
     /// to walk, and Rift rejects it.
@@ -329,7 +329,7 @@ pub enum ResultOrder {
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::pair_span_with_line)]
 pub struct SearchHit {
-    /// What was found. A symbol, a node, or a file — whichever `target` allowed.
+    /// What was found. A symbol, a node, or a file - whichever `target` allowed.
     pub hit: SearchHitTarget,
     /// How well this hit matched. Scores are comparable across every page of one request
     /// and nowhere else.
@@ -451,7 +451,7 @@ pub enum SearchIntent {
 #[schemars(transform = schema::require_query_filter_or_traversal)]
 #[schemars(transform = schema::forbid_search_rev_with_projection)]
 pub struct SearchParams {
-    /// Which entity kinds may be returned — a kind selector, never the text to search for;
+    /// Which entity kinds may be returned - a kind selector, never the text to search for;
     /// that is `query`. Omitted, every kind may match. Type data is attached to the Symbol
     /// and Node records that bind it, and filters can search those attachments.
     #[serde(default = "default_search_params_target")]
@@ -461,13 +461,13 @@ pub struct SearchParams {
     #[serde(default = "default_search_params_order")]
     pub order: ResultOrder,
     /// Text to match against file contents, symbol names, and rendered signatures. Matching
-    /// is case-insensitive and identifier-aware — the query and the fields split on case
+    /// is case-insensitive and identifier-aware - the query and the fields split on case
     /// and underscore boundaries, so `loadConfig` finds `load_config`. Scoring is
     /// server-defined and stable for one cursor's life.
     #[serde(default)]
     pub query: Option<String>,
     /// A predicate over resolved fields and relationships. This is where provider knowledge
-    /// enters a search — implements this trait, called by that function, declared under
+    /// enters a search - implements this trait, called by that function, declared under
     /// `src/api`.
     #[serde(default)]
     pub filter: Option<Filter>,
@@ -491,7 +491,7 @@ pub struct SearchParams {
     /// The projection to search. Null searches the workspace tree.
     #[serde(default)]
     pub projection: Option<ProjectionId>,
-    /// The version-control revision to search — a branch, tag, or commit id as the
+    /// The version-control revision to search - a branch, tag, or commit id as the
     /// workspace's version control spells it. Null searches the current tree, and `rev`
     /// never combines with `projection`. The server refuses a revision search when the
     /// workspace has no version-control repository.

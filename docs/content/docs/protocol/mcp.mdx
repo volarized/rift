@@ -17,8 +17,8 @@ read dependencies across calls, so either identity can refer to server state cre
 A tool result rides MCP
 [`structuredContent`](https://modelcontextprotocol.io/specification/draft/server/tools#structured-content),
 typed by the tool's declared output schema, with the
-same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is such a result —
-[`ChangeResult`](/docs/protocol/reference#ChangeResult) saying refused, never `isError` —
+same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is such a result -
+[`ChangeResult`](/docs/protocol/reference#ChangeResult) saying refused, never `isError` -
 while [`ErrorData`](/docs/protocol/reference#ErrorData) travels as the
 [JSON-RPC error](https://www.jsonrpc.org/specification#error_object)
 object's `data`, under code `-32000`. The exported schema at
@@ -55,7 +55,7 @@ filesystem tools.
 
 <VersionBadge version="v0.0.7" languages={["Rust"]} />
 
-Every read also accepts `rev` — a branch, tag, or commit id, spelled the way git spells it:
+Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
 `main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
 git objects, with no checkout, and indexes that commit's tree under the same
 [`[source]`](/docs/configuration#source) policy and bounds as the working-tree scan. A revision
@@ -80,7 +80,7 @@ A workspace with no git repository refuses a revision read and names the remedy:
 ```json
 {
   "code": "capability_unavailable",
-  "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository — run `git init`, or omit `rev` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
+  "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `rev` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
   "retry": "operator_action",
   "phase": "read",
   "diagnostics": [],
@@ -103,8 +103,8 @@ symbols and attaches their version-control timeline and co-change coupling.
 <McpTool name="search" />
 
 `search` takes a lexical `query`, narrowed or extended by a `paths` selector. `include` and
-`exclude` glob the project-relative path — the same glob engine backs the workspace's
-[`[source]`](/docs/configuration#source) policy — narrowing the indexed candidates before
+`exclude` glob the project-relative path - the same glob engine backs the workspace's
+[`[source]`](/docs/configuration#source) policy - narrowing the indexed candidates before
 scoring. `force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
 index is parsed on demand and searched alongside the indexed hits, up to 256 matched files per
 request; a request whose `force_include` matches more than that refuses with `limit_exceeded`
@@ -249,7 +249,7 @@ This request names a `traversal`, which the server does not serve:
 
 `query` now also matches file contents and declaration sources through a full-text index,
 alongside the declaration names it already matched. A multi-word query matches a unit that
-carries any one of its terms, anywhere in its content — the terms no longer have to co-occur
+carries any one of its terms, anywhere in its content - the terms no longer have to co-occur
 on one source line, the way a plain-substring match required. A unit carrying more of the
 query's terms ranks above one carrying fewer.
 
@@ -383,8 +383,8 @@ first; a page requested after eviction or process restart returns `cursor_expire
 `replace_symbol` replaces one whole declaration addressed by symbol. The parser derives its
 span, so the caller supplies no offsets.
 
-That span reaches back over the declaration's attached outer attributes and doc comments —
-`#[derive(Debug)]` above a struct, the `///` lines above a function — so a replacement body also
+That span reaches back over the declaration's attached outer attributes and doc comments -
+`#[derive(Debug)]` above a struct, the `///` lines above a function - so a replacement body also
 replaces that documentation. A blank line between a comment and the declaration detaches it,
 matching rustdoc's own attachment rule.
 
@@ -411,7 +411,7 @@ with `anchor`, which always addresses an existing file.
 `patch` applies a unified diff following [`git apply`](https://git-scm.com/docs/git-apply)
 semantics: a hunk's context and deleted lines locate it, and its `@@` header's line numbers are
 only a hint. Resolution starts each hunk's search at its header position, corrected by the drift
-already found from earlier hunks in the same file, then widens outward — nearer positions first,
+already found from earlier hunks in the same file, then widens outward - nearer positions first,
 the earlier position breaking a tie.
 
 A `--- /dev/null` header creates the named file; a `+++ /dev/null` header deletes it. A hunk that
@@ -425,8 +425,8 @@ file line the search reached, and the context it expected against what stood the
 
 ### Change results
 
-All four change tools return the same `ChangeResult`. A request whose shape is wrong — an
-absolute path, a malformed patch header — fails as `invalid_request` before the server resolves
+All four change tools return the same `ChangeResult`. A request whose shape is wrong - an
+absolute path, a malformed patch header - fails as `invalid_request` before the server resolves
 anything.
 Otherwise the server resolves the whole operation before writing anything, and the result is one
 of two things.
@@ -475,7 +475,7 @@ that tree's changeset, along with its origin, changed paths, edits, effects, gua
 diagnostics, and its [`Advisory`](/docs/protocol/reference#Advisory) list. An advisory
 rides the result rather than waiting behind a separate read, because the result is the one
 payload the caller is guaranteed to look at: a checked advisory reports a verdict the emitter
-verified itself, and an open warning carries the instruction — the check to run — that settles
+verified itself, and an open warning carries the instruction - the check to run - that settles
 it.
 
 A change that names no `projection` writes the workspace tree, and there is nothing further to
@@ -526,12 +526,12 @@ before publishing.
 For every refusal, the server leaves both trees unchanged. Publication is serialized
 workspace-wide, so a `publish` that cannot take the workspace inside the call budget fails with
 `temporarily_unavailable` and is worth sending again once the holder finishes. On success the server
-writes every changed path, removes directories its deletions left empty — the workspace root
-excluded — rebuilds the pinned projection from the resulting workspace, advances its base
+writes every changed path, removes directories its deletions left empty - the workspace root
+excluded - rebuilds the pinned projection from the resulting workspace, advances its base
 revision, and clears its changeset and read dependencies.
 
 `projection_restore` goes the other way: it refreshes selected changed paths from the workspace
-and drops the changes that touched them. A change is dropped whole — naming one of its paths
+and drops the changes that touched them. A change is dropped whole - naming one of its paths
 restores every path it touched, because restoring one path of a change without the others would
 leave a change record that no longer describes the tree. Restored paths take their new conflict
 baseline from the current workspace; other paths retain their earlier baselines.
@@ -539,7 +539,7 @@ baseline from the current workspace; other paths retain their earlier baselines.
 ## Execution
 
 [`execute`](#tool-execute) evaluates a block of code in the targeted tree's execution copy. The
-copy persists between calls — a dependency one evaluation installs is still there for the next —
+copy persists between calls - a dependency one evaluation installs is still there for the next -
 and the server refreshes its visible files to match the targeted tree before each evaluation, so
 the code always runs against the tree as it stands.
 
@@ -561,14 +561,14 @@ A refusal is a normal tool result: the server understood the operation and decli
 tree. `ErrorData` reports request and infrastructure failures such as invalid input, an expired
 cursor, a crossed limit, a timeout, or a storage failure.
 
-Every one carries a `retry` directive, which is the field to branch on — it rides each error
+Every one carries a `retry` directive, which is the field to branch on - it rides each error
 instance rather than the code, because the same `storage_failure` can be transient once and
 permanent the next time:
 
-- `never` — the same bytes will fail the same way
-- `same_request` — it was transient: an index still filling, a tree with a filesystem
+- `never` - the same bytes will fail the same way
+- `same_request` - it was transient: an index still filling, a tree with a filesystem
   write in flight
-- `operator_action` — the workspace requires a local state or configuration change before retry
+- `operator_action` - the workspace requires a local state or configuration change before retry
 
 A `limit_exceeded` also carries which limit and by how much, so a request can be resized without
 parsing the message meant for a human.

@@ -1,12 +1,12 @@
 //! Validates and verifies the behaviour of every advertised tool on the MCP
 //! surface: each corpus request against the tool's advertised input schema,
 //! each structured result against its advertised output schema, and every
-//! sub-variant a result can take — the `next_cursor` string and `null` arms,
+//! sub-variant a result can take - the `next_cursor` string and `null` arms,
 //! cohesive cursor walkthroughs across pages, and so on. The walk follows any
 //! cursor a result returns, so live pagination joins the gate as soon as a
 //! read mints one. Every `ChangeResult` arm is proven the same way: applied
 //! (with and without parser findings), and refused for a failed
-//! precondition, an ambiguous target, and an unsupported file-level change —
+//! precondition, an ambiguous target, and an unsupported file-level change -
 //! plus a live witnessed `replace_node` that lands after the walk.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -472,7 +472,7 @@ fn tool_validators(
 }
 
 /// Most attempts one corpus request retries before giving up on acceptance.
-const ADMISSION_ATTEMPTS_MAX: usize = 8;
+const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
 
 /// Calls one tool, retrying the refusal the server advertises as
 /// `retry: same_request`: the workspace's own filesystem watcher can
@@ -483,7 +483,7 @@ async fn call_tool_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,
 ) -> TestResult<rmcp::model::CallToolResult> {
-    for _attempt in 0..ADMISSION_ATTEMPTS_MAX {
+    for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
         match client.call_tool(params.clone()).await {
             Ok(result) => return Ok(result),
             Err(rmcp::ServiceError::McpError(error))

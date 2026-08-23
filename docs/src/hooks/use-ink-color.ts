@@ -13,7 +13,7 @@ const FALLBACK: Ink = { color: "rgb(201, 201, 196)", onLight: false };
 
 /**
  * The design tokens are authored in oklch, and `getComputedStyle` hands those
- * back as `lab()` — a format three.js silently refuses. Painting one pixel and
+ * back as `lab()` - a format three.js silently refuses. Painting one pixel and
  * reading it back gets an exact sRGB triple out of any colour syntax the
  * browser accepts, without hard-coding a second copy of the palette.
  */
@@ -42,7 +42,7 @@ function resolve(css: string): Ink | null {
 
 /**
  * Resolves `currentColor` on an element and keeps it current across theme
- * flips. The design system's ink is a token, not a constant — light mode
+ * flips. The design system's ink is a token, not a constant - light mode
  * inverts it.
  */
 export function useInkColor(ref: RefObject<HTMLElement | null>) {

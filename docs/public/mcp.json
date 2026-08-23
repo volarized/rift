@@ -7,9 +7,6 @@
         "$defs": {
           "Cursor": {
             "description": "An opaque base64url string that continues a paginated answer from where the last page\nended. It binds the request, state, order, and page size that apply to that answer.\nPadding is omitted. A mismatch returns `cursor_invalid`. For a captured result set,\nprocess restart or eviction returns `cursor_expired`, and later writes do not change\nremaining pages.",
-            "examples": [
-              "eyJvZmZzZXQiOjV9"
-            ],
             "maxLength": 4096,
             "minLength": 1,
             "pattern": "^[A-Za-z0-9_-]+$",
@@ -31,9 +28,6 @@
               },
               "name": {
                 "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                "examples": [
-                  "rust"
-                ],
                 "maxLength": 64,
                 "pattern": "^[a-z][a-z0-9._-]*$",
                 "type": "string"
@@ -45,18 +39,12 @@
             "type": "object"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
-            "examples": [
-              "rift://projection/my-feature-one"
-            ],
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` - a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` - and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
             "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
-            "examples": [
-              "main"
-            ],
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
           },
@@ -91,20 +79,6 @@
                 "projection"
               ]
             }
-          }
-        ],
-        "examples": [
-          {
-            "cursor": null,
-            "include_body": true,
-            "include_history": false,
-            "language": {
-              "dialect": null,
-              "name": "rust"
-            },
-            "limit": 5,
-            "name": "ReadService",
-            "scope": "all"
           }
         ],
         "properties": {
@@ -151,7 +125,7 @@
             "type": "integer"
           },
           "name": {
-            "description": "The declaration name to look up — a name, not a free-text query; `search` takes\nthose. An exact symbol name ranks first, then prefix matches, then qualified-name\nsubstrings.",
+            "description": "The declaration name to look up - a name, not a free-text query; `search` takes\nthose. An exact symbol name ranks first, then prefix matches, then qualified-name\nsubstrings.",
             "maxLength": 4096,
             "minLength": 1,
             "type": "string"
@@ -178,7 +152,7 @@
               }
             ],
             "default": null,
-            "description": "The version-control revision to read — a branch, tag, or commit id as the\nworkspace's version control spells it. Null reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
+            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Null reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
           },
           "scope": {
             "$ref": "#/$defs/SearchScope",
@@ -189,7 +163,6 @@
         "required": [
           "name"
         ],
-        "rift:since": "v0.0.4",
         "type": "object"
       },
       "name": "get_symbol",
@@ -197,7 +170,7 @@
         "$defs": {
           "CoChange": {
             "additionalProperties": false,
-            "description": "Empirical coupling between two symbols: how often revisions that touched one touched the\nother. The relation is observed from history rather than resolved from source, so it\nreaches coupling no reference graph carries — two implementations of one concept with no\nedge between them.",
+            "description": "Empirical coupling between two symbols: how often revisions that touched one touched the\nother. The relation is observed from history rather than resolved from source, so it\nreaches coupling no reference graph carries - two implementations of one concept with no\nedge between them.",
             "properties": {
               "partner": {
                 "$ref": "#/$defs/SymbolId",
@@ -280,7 +253,7 @@
                     "type": "array"
                   },
                   "reason": {
-                    "description": "Why the answer stops short — a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
+                    "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
                     "maxLength": 4096,
                     "type": "string"
                   },
@@ -383,7 +356,7 @@
             ]
           },
           "CoverageScope": {
-            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
             "oneOf": [
               {
                 "additionalProperties": false,
@@ -426,7 +399,7 @@
             ]
           },
           "CoverageStateState": {
-            "description": "`unsupported` — no provider produces this family for the language. `not_applicable` — the\nfamily has no meaning for this language.",
+            "description": "`unsupported` - no provider produces this family for the language. `not_applicable` - the\nfamily has no meaning for this language.",
             "oneOf": [
               {
                 "const": "unsupported",
@@ -442,9 +415,6 @@
           },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
-            "examples": [
-              "3f9a1c2e"
-            ],
             "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
@@ -519,9 +489,6 @@
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
             "maxLength": 8192,
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
@@ -648,9 +615,6 @@
               },
               "name": {
                 "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                "examples": [
-                  "rust"
-                ],
                 "maxLength": 64,
                 "pattern": "^[a-z][a-z0-9._-]*$",
                 "type": "string"
@@ -721,7 +685,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The symbol written at this node. Absent where a node writes no symbol —\npunctuation, a keyword, a comment."
+                "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment."
               },
               "unit": {
                 "$ref": "#/$defs/FileId",
@@ -836,10 +800,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
-            "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-            ],
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "maxLength": 8192,
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
@@ -937,7 +898,7 @@
                 "type": "array"
               },
               "variadic": {
-                "description": "Whether it absorbs the arguments that follow — `*args`, `...rest`.",
+                "description": "Whether it absorbs the arguments that follow - `*args`, `...rest`.",
                 "type": "boolean"
               }
             },
@@ -952,10 +913,7 @@
             "type": "object"
           },
           "ProjectPath": {
-            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-            "examples": [
-              "src/lib.rs"
-            ],
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
@@ -1025,7 +983,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records — so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
+                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records - so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
               },
               "source_revision": {
                 "$ref": "#/$defs/Digest",
@@ -1084,9 +1042,6 @@
           },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
-            "examples": [
-              "main"
-            ],
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
           },
@@ -1129,7 +1084,7 @@
               },
               "receiver": {
                 "additionalProperties": false,
-                "description": "The implicit first parameter — `self`, `this`. Null for a free function, and for\nlanguages that have no such thing.",
+                "description": "The implicit first parameter - `self`, `this`. Null for a free function, and for\nlanguages that have no such thing.",
                 "properties": {
                   "default": {
                     "description": "The default value as written in the source. Null where there is none.",
@@ -1173,7 +1128,7 @@
                     "type": "array"
                   },
                   "variadic": {
-                    "description": "Whether it absorbs the arguments that follow — `*args`, `...rest`.",
+                    "description": "Whether it absorbs the arguments that follow - `*args`, `...rest`.",
                     "type": "boolean"
                   }
                 },
@@ -1363,7 +1318,7 @@
             ]
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding — for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
@@ -1402,7 +1357,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The symbol this one belongs to — the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
+                "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
               },
               "document_local": {
                 "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model.",
@@ -1469,7 +1424,7 @@
                 "type": "array"
               },
               "visibility": {
-                "description": "How widely the symbol is visible, in the language's own terms — `public`, `private`,\n`pub(crate)`. Null where the language has no such concept.",
+                "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Null where the language has no such concept.",
                 "type": [
                   "string",
                   "null"
@@ -1677,9 +1632,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -1933,7 +1885,7 @@
           },
           "TypeExpression": {
             "additionalProperties": false,
-            "description": "How a type is written in the source, plus the symbol that declares it when one does. A\ntype with a declaration resolves to that symbol; a structural type — `string | null`,\n`{ a: string }` — has the spelling and nothing to resolve to.",
+            "description": "How a type is written in the source, plus the symbol that declares it when one does. A\ntype with a declaration resolves to that symbol; a structural type - `string | null`,\n`{ a: string }` - has the spelling and nothing to resolve to.",
             "properties": {
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -1945,9 +1897,6 @@
               },
               "resolved": {
                 "description": "The symbol that declares this type, where one does. Null for a structural type,\nwhich has a spelling and nothing to open.",
-                "examples": [
-                  "rift://symbol/rust/rift_server.read.ReadService"
-                ],
                 "maxLength": 8192,
                 "minLength": 17,
                 "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -1986,9 +1935,6 @@
           },
           "next_cursor": {
             "description": "Cursor for the next page, or null after the final hit.",
-            "examples": [
-              "eyJvZmZzZXQiOjV9"
-            ],
             "maxLength": 4096,
             "minLength": 1,
             "pattern": "^[A-Za-z0-9_-]+$",
@@ -2031,19 +1977,13 @@
             ]
           },
           "ProjectPath": {
-            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-            "examples": [
-              "src/lib.rs"
-            ],
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -2079,14 +2019,6 @@
                 "create_missing"
               ]
             }
-          }
-        ],
-        "examples": [
-          {
-            "anchor": "rift://symbol/rust/rift_server.read.ReadService",
-            "body": "pub struct WriteService;",
-            "create_missing": false,
-            "position": "after"
           }
         ],
         "properties": {
@@ -2133,7 +2065,6 @@
           "position",
           "body"
         ],
-        "rift:since": "v0.0.6",
         "type": "object"
       },
       "name": "insert_symbol",
@@ -2141,9 +2072,6 @@
         "$defs": {
           "ChangeId": {
             "description": "Identity of one applied change, minted when the change lands.",
-            "examples": [
-              "chg_abcdefghijklmnopqrstuvwxyz"
-            ],
             "maxLength": 30,
             "minLength": 30,
             "pattern": "^chg_[a-z2-7]{26}$",
@@ -2225,7 +2153,7 @@
             ]
           },
           "CoverageScope": {
-            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
             "oneOf": [
               {
                 "additionalProperties": false,
@@ -2272,7 +2200,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -2302,9 +2230,6 @@
                   },
                   "name": {
                     "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
                     "maxLength": 64,
                     "pattern": "^[a-z][a-z0-9._-]*$",
                     "type": "string"
@@ -2404,10 +2329,10 @@
           },
           "DiagnosticRelated": {
             "additionalProperties": false,
-            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "description": "A second place the provider points at - the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
             "properties": {
               "message": {
-                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "description": "What to notice there - \"first defined here\", \"required by this bound\".",
                 "maxLength": 4096,
                 "type": "string"
               },
@@ -2514,9 +2439,6 @@
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
             "maxLength": 8192,
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
@@ -2581,10 +2503,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
-            "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-            ],
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "maxLength": 8192,
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
@@ -2777,10 +2696,7 @@
             ]
           },
           "ProjectPath": {
-            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-            "examples": [
-              "src/lib.rs"
-            ],
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
@@ -2851,9 +2767,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -2951,27 +2864,18 @@
       "input_schema": {
         "$defs": {
           "ProjectPath": {
-            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-            "examples": [
-              "src/lib.rs"
-            ],
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
-            "examples": [
-              "rift://projection/my-feature-one"
-            ],
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` - a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` - and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
             "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
-            "examples": [
-              "main"
-            ],
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
           }
@@ -2988,19 +2892,13 @@
             }
           }
         ],
-        "examples": [
-          {
-            "path": "src/lib.rs",
-            "position": 240
-          }
-        ],
         "properties": {
           "path": {
             "$ref": "#/$defs/ProjectPath",
             "description": "Project-relative file to inspect."
           },
           "position": {
-            "description": "UTF-8 byte offset the listed nodes must cover — one position, not a range; the nodes\nthemselves carry the spans.",
+            "description": "UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes\nthemselves carry the spans.",
             "format": "uint64",
             "maximum": 9007199254740991,
             "minimum": 0,
@@ -3028,14 +2926,13 @@
               }
             ],
             "default": null,
-            "description": "The version-control revision to read — a branch, tag, or commit id as the\nworkspace's version control spells it. Null reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
+            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Null reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
           }
         },
         "required": [
           "path",
           "position"
         ],
-        "rift:since": "v0.0.4",
         "type": "object"
       },
       "name": "nodes",
@@ -3091,7 +2988,7 @@
                     "type": "array"
                   },
                   "reason": {
-                    "description": "Why the answer stops short — a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
+                    "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
                     "maxLength": 4096,
                     "type": "string"
                   },
@@ -3194,7 +3091,7 @@
             ]
           },
           "CoverageScope": {
-            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
             "oneOf": [
               {
                 "additionalProperties": false,
@@ -3237,7 +3134,7 @@
             ]
           },
           "CoverageStateState": {
-            "description": "`unsupported` — no provider produces this family for the language. `not_applicable` — the\nfamily has no meaning for this language.",
+            "description": "`unsupported` - no provider produces this family for the language. `not_applicable` - the\nfamily has no meaning for this language.",
             "oneOf": [
               {
                 "const": "unsupported",
@@ -3253,9 +3150,6 @@
           },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
-            "examples": [
-              "3f9a1c2e"
-            ],
             "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
@@ -3296,9 +3190,6 @@
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
             "maxLength": 8192,
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
@@ -3364,9 +3255,6 @@
               },
               "name": {
                 "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                "examples": [
-                  "rust"
-                ],
                 "maxLength": 64,
                 "pattern": "^[a-z][a-z0-9._-]*$",
                 "type": "string"
@@ -3437,7 +3325,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The symbol written at this node. Absent where a node writes no symbol —\npunctuation, a keyword, a comment."
+                "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment."
               },
               "unit": {
                 "$ref": "#/$defs/FileId",
@@ -3552,10 +3440,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
-            "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-            ],
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "maxLength": 8192,
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
@@ -3645,7 +3530,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records — so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
+                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records - so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
               },
               "source_revision": {
                 "$ref": "#/$defs/Digest",
@@ -3704,9 +3589,6 @@
           },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
-            "examples": [
-              "main"
-            ],
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
           },
@@ -3737,7 +3619,7 @@
             "type": "object"
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding — for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
@@ -3764,9 +3646,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -3838,11 +3717,6 @@
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
-        "examples": [
-          {
-            "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub mod read;\n+pub mod search;\n"
-          }
-        ],
         "properties": {
           "patch": {
             "description": "A unified diff. Hunk context guards the change; header line numbers are hints,\nas with `git apply`. `/dev/null` headers create or delete files.",
@@ -3854,7 +3728,6 @@
         "required": [
           "patch"
         ],
-        "rift:since": "v0.0.6",
         "type": "object"
       },
       "name": "patch",
@@ -3862,9 +3735,6 @@
         "$defs": {
           "ChangeId": {
             "description": "Identity of one applied change, minted when the change lands.",
-            "examples": [
-              "chg_abcdefghijklmnopqrstuvwxyz"
-            ],
             "maxLength": 30,
             "minLength": 30,
             "pattern": "^chg_[a-z2-7]{26}$",
@@ -3946,7 +3816,7 @@
             ]
           },
           "CoverageScope": {
-            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
             "oneOf": [
               {
                 "additionalProperties": false,
@@ -3993,7 +3863,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -4023,9 +3893,6 @@
                   },
                   "name": {
                     "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
                     "maxLength": 64,
                     "pattern": "^[a-z][a-z0-9._-]*$",
                     "type": "string"
@@ -4125,10 +3992,10 @@
           },
           "DiagnosticRelated": {
             "additionalProperties": false,
-            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "description": "A second place the provider points at - the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
             "properties": {
               "message": {
-                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "description": "What to notice there - \"first defined here\", \"required by this bound\".",
                 "maxLength": 4096,
                 "type": "string"
               },
@@ -4235,9 +4102,6 @@
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
             "maxLength": 8192,
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
@@ -4302,10 +4166,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
-            "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-            ],
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "maxLength": 8192,
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
@@ -4498,10 +4359,7 @@
             ]
           },
           "ProjectPath": {
-            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-            "examples": [
-              "src/lib.rs"
-            ],
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
@@ -4572,9 +4430,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -4672,10 +4527,7 @@
       "input_schema": {
         "$defs": {
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
-            "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-            ],
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "maxLength": 8192,
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
@@ -4724,13 +4576,6 @@
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
-        "examples": [
-          {
-            "body": "self.index.search(query)",
-            "node": "rift://node/rust/lib.rs@220-268#3f9a1c2e",
-            "region": null
-          }
-        ],
         "properties": {
           "body": {
             "description": "The replacement source.",
@@ -4751,14 +4596,13 @@
               }
             ],
             "default": null,
-            "description": "Which named part of the node to replace. Null — the only value this release\nserves — replaces the node whole; a named region fails as\n`capability_unavailable`."
+            "description": "Which named part of the node to replace. Null - the only value this release\nserves - replaces the node whole; a named region fails as\n`capability_unavailable`."
           }
         },
         "required": [
           "node",
           "body"
         ],
-        "rift:since": "v0.0.4",
         "type": "object"
       },
       "name": "replace_node",
@@ -4766,9 +4610,6 @@
         "$defs": {
           "ChangeId": {
             "description": "Identity of one applied change, minted when the change lands.",
-            "examples": [
-              "chg_abcdefghijklmnopqrstuvwxyz"
-            ],
             "maxLength": 30,
             "minLength": 30,
             "pattern": "^chg_[a-z2-7]{26}$",
@@ -4850,7 +4691,7 @@
             ]
           },
           "CoverageScope": {
-            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
             "oneOf": [
               {
                 "additionalProperties": false,
@@ -4897,7 +4738,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -4927,9 +4768,6 @@
                   },
                   "name": {
                     "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
                     "maxLength": 64,
                     "pattern": "^[a-z][a-z0-9._-]*$",
                     "type": "string"
@@ -5029,10 +4867,10 @@
           },
           "DiagnosticRelated": {
             "additionalProperties": false,
-            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "description": "A second place the provider points at - the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
             "properties": {
               "message": {
-                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "description": "What to notice there - \"first defined here\", \"required by this bound\".",
                 "maxLength": 4096,
                 "type": "string"
               },
@@ -5139,9 +4977,6 @@
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
             "maxLength": 8192,
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
@@ -5206,10 +5041,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
-            "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-            ],
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "maxLength": 8192,
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
@@ -5402,10 +5234,7 @@
             ]
           },
           "ProjectPath": {
-            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-            "examples": [
-              "src/lib.rs"
-            ],
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
@@ -5476,9 +5305,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -5617,9 +5443,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -5628,13 +5451,6 @@
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
-        "examples": [
-          {
-            "body": "pub struct ReadService;",
-            "region": null,
-            "symbol": "rift://symbol/rust/rift_server.read.ReadService"
-          }
-        ],
         "properties": {
           "body": {
             "description": "The replacement source.",
@@ -5651,7 +5467,7 @@
               }
             ],
             "default": null,
-            "description": "Which part of the declaration to replace. Null — the only value this release\nserves — replaces the whole declaration; a named region fails as\n`capability_unavailable`."
+            "description": "Which part of the declaration to replace. Null - the only value this release\nserves - replaces the whole declaration; a named region fails as\n`capability_unavailable`."
           },
           "symbol": {
             "$ref": "#/$defs/SymbolId",
@@ -5662,7 +5478,6 @@
           "symbol",
           "body"
         ],
-        "rift:since": "v0.0.6",
         "type": "object"
       },
       "name": "replace_symbol",
@@ -5670,9 +5485,6 @@
         "$defs": {
           "ChangeId": {
             "description": "Identity of one applied change, minted when the change lands.",
-            "examples": [
-              "chg_abcdefghijklmnopqrstuvwxyz"
-            ],
             "maxLength": 30,
             "minLength": 30,
             "pattern": "^chg_[a-z2-7]{26}$",
@@ -5754,7 +5566,7 @@
             ]
           },
           "CoverageScope": {
-            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
             "oneOf": [
               {
                 "additionalProperties": false,
@@ -5801,7 +5613,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -5831,9 +5643,6 @@
                   },
                   "name": {
                     "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
                     "maxLength": 64,
                     "pattern": "^[a-z][a-z0-9._-]*$",
                     "type": "string"
@@ -5933,10 +5742,10 @@
           },
           "DiagnosticRelated": {
             "additionalProperties": false,
-            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "description": "A second place the provider points at - the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
             "properties": {
               "message": {
-                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "description": "What to notice there - \"first defined here\", \"required by this bound\".",
                 "maxLength": 4096,
                 "type": "string"
               },
@@ -6043,9 +5852,6 @@
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
             "maxLength": 8192,
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
@@ -6110,10 +5916,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
-            "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-            ],
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "maxLength": 8192,
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
@@ -6306,10 +6109,7 @@
             ]
           },
           "ProjectPath": {
-            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-            "examples": [
-              "src/lib.rs"
-            ],
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
@@ -6380,9 +6180,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -6481,9 +6278,6 @@
         "$defs": {
           "Cursor": {
             "description": "An opaque base64url string that continues a paginated answer from where the last page\nended. It binds the request, state, order, and page size that apply to that answer.\nPadding is omitted. A mismatch returns `cursor_invalid`. For a captured result set,\nprocess restart or eviction returns `cursor_expired`, and later writes do not change\nremaining pages.",
-            "examples": [
-              "eyJvZmZzZXQiOjV9"
-            ],
             "maxLength": 4096,
             "minLength": 1,
             "pattern": "^[A-Za-z0-9_-]+$",
@@ -6727,9 +6521,6 @@
           },
           "PathPattern": {
             "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
-            "examples": [
-              "src/**"
-            ],
             "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$",
             "type": "string"
           },
@@ -6765,10 +6556,7 @@
             "type": "object"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
-            "examples": [
-              "rift://projection/my-feature-one"
-            ],
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` - a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` - and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
             "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
@@ -6818,7 +6606,7 @@
               },
               "max_depth": {
                 "default": null,
-                "description": "How many edges a traversal may cross. Only edges that compose carry a depth —\n`contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`,\n`mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing\nto walk, and Rift rejects it.",
+                "description": "How many edges a traversal may cross. Only edges that compose carry a depth -\n`contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`,\n`mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing\nto walk, and Rift rejects it.",
                 "format": "uint64",
                 "maximum": 100,
                 "minimum": 1,
@@ -7074,9 +6862,6 @@
           },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
-            "examples": [
-              "main"
-            ],
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
           },
@@ -7236,9 +7021,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -7328,28 +7110,6 @@
             ]
           }
         ],
-        "examples": [
-          {
-            "cursor": null,
-            "filter": null,
-            "include": [
-              "source",
-              "signature"
-            ],
-            "limit": 20,
-            "order": "relevance",
-            "paths": {
-              "exclude": [],
-              "force_include": [],
-              "include": [
-                "crates/**"
-              ]
-            },
-            "query": "ReadService",
-            "scope": "project",
-            "target": "all"
-          }
-        ],
         "properties": {
           "cursor": {
             "anyOf": [
@@ -7373,7 +7133,7 @@
               }
             ],
             "default": null,
-            "description": "A predicate over resolved fields and relationships. This is where provider knowledge\nenters a search — implements this trait, called by that function, declared under\n`src/api`."
+            "description": "A predicate over resolved fields and relationships. This is where provider knowledge\nenters a search - implements this trait, called by that function, declared under\n`src/api`."
           },
           "include": {
             "default": null,
@@ -7428,7 +7188,7 @@
           },
           "query": {
             "default": null,
-            "description": "Text to match against file contents, symbol names, and rendered signatures. Matching\nis case-insensitive and identifier-aware — the query and the fields split on case\nand underscore boundaries, so `loadConfig` finds `load_config`. Scoring is\nserver-defined and stable for one cursor's life.",
+            "description": "Text to match against file contents, symbol names, and rendered signatures. Matching\nis case-insensitive and identifier-aware - the query and the fields split on case\nand underscore boundaries, so `loadConfig` finds `load_config`. Scoring is\nserver-defined and stable for one cursor's life.",
             "type": [
               "string",
               "null"
@@ -7444,7 +7204,7 @@
               }
             ],
             "default": null,
-            "description": "The version-control revision to search — a branch, tag, or commit id as the\nworkspace's version control spells it. Null searches the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision search when the\nworkspace has no version-control repository."
+            "description": "The version-control revision to search - a branch, tag, or commit id as the\nworkspace's version control spells it. Null searches the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision search when the\nworkspace has no version-control repository."
           },
           "scope": {
             "$ref": "#/$defs/SearchScope",
@@ -7454,7 +7214,7 @@
           "target": {
             "$ref": "#/$defs/SearchParamsTarget",
             "default": "all",
-            "description": "Which entity kinds may be returned — a kind selector, never the text to search for;\nthat is `query`. Omitted, every kind may match. Type data is attached to the Symbol\nand Node records that bind it, and filters can search those attachments."
+            "description": "Which entity kinds may be returned - a kind selector, never the text to search for;\nthat is `query`. Omitted, every kind may match. Type data is attached to the Symbol\nand Node records that bind it, and filters can search those attachments."
           },
           "traversal": {
             "anyOf": [
@@ -7469,7 +7229,6 @@
             "description": "A bounded relationship walk. It may stand alone or add graph hits to a lexical or\nfiltered search; duplicate symbols keep their shortest path."
           }
         },
-        "rift:since": "v0.0.6",
         "type": "object"
       },
       "name": "search",
@@ -7525,7 +7284,7 @@
                     "type": "array"
                   },
                   "reason": {
-                    "description": "Why the answer stops short — a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
+                    "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
                     "maxLength": 4096,
                     "type": "string"
                   },
@@ -7628,7 +7387,7 @@
             ]
           },
           "CoverageScope": {
-            "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
             "oneOf": [
               {
                 "additionalProperties": false,
@@ -7671,7 +7430,7 @@
             ]
           },
           "CoverageStateState": {
-            "description": "`unsupported` — no provider produces this family for the language. `not_applicable` — the\nfamily has no meaning for this language.",
+            "description": "`unsupported` - no provider produces this family for the language. `not_applicable` - the\nfamily has no meaning for this language.",
             "oneOf": [
               {
                 "const": "unsupported",
@@ -7690,7 +7449,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -7720,9 +7479,6 @@
                   },
                   "name": {
                     "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
                     "maxLength": 64,
                     "pattern": "^[a-z][a-z0-9._-]*$",
                     "type": "string"
@@ -7802,7 +7558,7 @@
           },
           "DiagnosticContext": {
             "additionalProperties": false,
-            "description": "One `Diagnostic` as an MCP answer carries it: the fact its emitter minted, plus what Rift\ncan add on top — where it lands in a line and column, and the source around it.",
+            "description": "One `Diagnostic` as an MCP answer carries it: the fact its emitter minted, plus what Rift\ncan add on top - where it lands in a line and column, and the source around it.",
             "properties": {
               "column": {
                 "description": "One-based column within that line, counted in UTF-8 bytes. Null for the same reason\nas `line`.",
@@ -7840,7 +7596,7 @@
                 ]
               },
               "line": {
-                "description": "One-based line the finding starts on. Null where the diagnostic has no span — a\nwhole-project error has nowhere to point.",
+                "description": "One-based line the finding starts on. Null where the diagnostic has no span - a\nwhole-project error has nowhere to point.",
                 "format": "uint64",
                 "minimum": 0,
                 "type": [
@@ -7904,10 +7660,10 @@
           },
           "DiagnosticRelated": {
             "additionalProperties": false,
-            "description": "A second place the provider points at — the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
+            "description": "A second place the provider points at - the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
             "properties": {
               "message": {
-                "description": "What to notice there — \"first defined here\", \"required by this bound\".",
+                "description": "What to notice there - \"first defined here\", \"required by this bound\".",
                 "maxLength": 4096,
                 "type": "string"
               },
@@ -7954,9 +7710,6 @@
           },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
-            "examples": [
-              "3f9a1c2e"
-            ],
             "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
@@ -8152,9 +7905,6 @@
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
             "maxLength": 8192,
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
@@ -8254,9 +8004,6 @@
               },
               "name": {
                 "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                "examples": [
-                  "rust"
-                ],
                 "maxLength": 64,
                 "pattern": "^[a-z][a-z0-9._-]*$",
                 "type": "string"
@@ -8381,7 +8128,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The symbol written at this node. Absent where a node writes no symbol —\npunctuation, a keyword, a comment."
+                "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment."
               },
               "unit": {
                 "$ref": "#/$defs/FileId",
@@ -8496,10 +8243,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness — the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
-            "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-            ],
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "maxLength": 8192,
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
@@ -8597,7 +8341,7 @@
                 "type": "array"
               },
               "variadic": {
-                "description": "Whether it absorbs the arguments that follow — `*args`, `...rest`.",
+                "description": "Whether it absorbs the arguments that follow - `*args`, `...rest`.",
                 "type": "boolean"
               }
             },
@@ -8612,10 +8356,7 @@
             "type": "object"
           },
           "ProjectPath": {
-            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-            "examples": [
-              "src/lib.rs"
-            ],
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "maxLength": 1000,
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
@@ -8685,7 +8426,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records — so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
+                "description": "The version-control revision the read served, resolved to the full commit id the\nrepository records - so a branch answer stays attributable after the branch moves.\nNull when the read served the current tree."
               },
               "source_revision": {
                 "$ref": "#/$defs/Digest",
@@ -8976,9 +8717,6 @@
           },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
-            "examples": [
-              "main"
-            ],
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
           },
@@ -9060,7 +8798,7 @@
               },
               "hit": {
                 "$ref": "#/$defs/SearchHitTarget",
-                "description": "What was found. A symbol, a node, or a file — whichever `target` allowed."
+                "description": "What was found. A symbol, a node, or a file - whichever `target` allowed."
               },
               "line": {
                 "default": null,
@@ -9274,7 +9012,7 @@
               },
               "receiver": {
                 "additionalProperties": false,
-                "description": "The implicit first parameter — `self`, `this`. Null for a free function, and for\nlanguages that have no such thing.",
+                "description": "The implicit first parameter - `self`, `this`. Null for a free function, and for\nlanguages that have no such thing.",
                 "properties": {
                   "default": {
                     "description": "The default value as written in the source. Null where there is none.",
@@ -9318,7 +9056,7 @@
                     "type": "array"
                   },
                   "variadic": {
-                    "description": "Whether it absorbs the arguments that follow — `*args`, `...rest`.",
+                    "description": "Whether it absorbs the arguments that follow - `*args`, `...rest`.",
                     "type": "boolean"
                   }
                 },
@@ -9508,7 +9246,7 @@
             "type": "object"
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding — for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
@@ -9547,7 +9285,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The symbol this one belongs to — the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
+                "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
               },
               "document_local": {
                 "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model.",
@@ -9614,7 +9352,7 @@
                 "type": "array"
               },
               "visibility": {
-                "description": "How widely the symbol is visible, in the language's own terms — `public`, `private`,\n`pub(crate)`. Null where the language has no such concept.",
+                "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Null where the language has no such concept.",
                 "type": [
                   "string",
                   "null"
@@ -9795,9 +9533,6 @@
           },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
-            "examples": [
-              "rift://symbol/rust/rift_server.read.ReadService"
-            ],
             "maxLength": 8192,
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -9977,7 +9712,7 @@
           },
           "TypeExpression": {
             "additionalProperties": false,
-            "description": "How a type is written in the source, plus the symbol that declares it when one does. A\ntype with a declaration resolves to that symbol; a structural type — `string | null`,\n`{ a: string }` — has the spelling and nothing to resolve to.",
+            "description": "How a type is written in the source, plus the symbol that declares it when one does. A\ntype with a declaration resolves to that symbol; a structural type - `string | null`,\n`{ a: string }` - has the spelling and nothing to resolve to.",
             "properties": {
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -9989,9 +9724,6 @@
               },
               "resolved": {
                 "description": "The symbol that declares this type, where one does. Null for a structural type,\nwhich has a spelling and nothing to open.",
-                "examples": [
-                  "rift://symbol/rust/rift_server.read.ReadService"
-                ],
                 "maxLength": 8192,
                 "minLength": 17,
                 "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
@@ -10023,9 +9755,6 @@
           },
           "next_cursor": {
             "description": "Cursor for the next page, or null after the final result.",
-            "examples": [
-              "eyJvZmZzZXQiOjV9"
-            ],
             "maxLength": 4096,
             "minLength": 1,
             "pattern": "^[A-Za-z0-9_-]+$",

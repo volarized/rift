@@ -8,7 +8,7 @@ import { type RefObject, useEffect, useRef } from "react";
  *
  * This is the page's one in-and-out mechanic. Anything driven by it composes
  * on the way in and comes apart again on the way out, rather than playing a
- * one-shot entrance and then sitting finished — scrolling back up undoes it.
+ * one-shot entrance and then sitting finished - scrolling back up undoes it.
  *
  * The value is handed back as a ref, not as state, because every consumer of
  * it reads on an animation frame. A render per scroll position would cost far
