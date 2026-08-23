@@ -12,6 +12,7 @@ allow = [
   "CC0-1.0",
   "ISC",
   "MIT",
+  "MIT-0",
   "Unicode-3.0",
   "Zlib",
 ]
@@ -23,10 +24,12 @@ allow-wildcard-paths = true
 # rmcp 3.1.3 enables tracing-attributes 0.1.31, whose proc macro still uses syn 2.
 # gix-pack's clru 0.6.3 still pins hashbrown 0.16 while indexmap is on 0.17.
 # notify 8.2.0 still pins windows-sys 0.60 while Tokio and rustix use 0.61.
+# gix's sha1 still pins cpufeatures 0.2 while uuid's rand stack uses 0.3.
 skip = [
   { name = "syn", version = "2.0.119" },
   { name = "hashbrown", version = "0.16.1" },
   { name = "windows-sys", version = "0.60.2" },
+  { name = "cpufeatures", version = "0.2.17" },
 ]
 
 [sources]
