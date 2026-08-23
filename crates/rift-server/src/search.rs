@@ -1517,16 +1517,12 @@ pub fn compute() -> i32 {
     )]
     fn text_file_lexical_matches_dedupe_to_one_hit_at_the_best_rank() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(
-            directory.path().join("guide.md"),
-            "intro\nsearch replace all units here\nend\n",
-        )?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
-        )?;
+        let content = "intro\nsearch replace all units here\nend\n";
+        fs::write(directory.path().join("guide.md"), content)?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_admission = rift_core::TextFileAdmission::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text_admission)?;
         let worse = LexicalMatch::new(
             "guide.md#0",
             rift_core::ProjectPath::new("guide.md")?,
@@ -1567,12 +1563,10 @@ pub fn compute() -> i32 {
     fn merge_file_hit_absorbs_a_second_match_at_the_same_path_and_line() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("guide.md"), "alpha units beta\n")?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
-        )?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_admission = rift_core::TextFileAdmission::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text_admission)?;
         let file = service
             .index()
             .text_files()
