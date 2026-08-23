@@ -5,7 +5,7 @@ use data_encoding::BASE32_NOPAD;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_PROVIDER_ID};
 use rift_core::{
-    Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileAdmission,
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileInclusion,
 };
 use rift_history::{HistoryError, Repository};
 use rift_index::{
@@ -235,7 +235,7 @@ impl ReadService {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-        text_admission: &TextFileAdmission,
+        text_inclusion: &TextFileInclusion,
     ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
             "index.build",
@@ -246,7 +246,7 @@ impl ReadService {
         );
         let _entered = span.enter();
         let index =
-            WorkspaceIndex::build(root, limits, visibility, text_admission).map_err(|source| {
+            WorkspaceIndex::build(root, limits, visibility, text_inclusion).map_err(|source| {
                 span.record("outcome", "error");
                 ReadFault::index(source)
             })?;
@@ -327,14 +327,14 @@ impl ReadService {
     }
 
     /// Derives this snapshot's lexical search units: one per indexed
-    /// symbol and admitted text file, chunked where a text file exceeds
+    /// symbol and included text file, chunked where a text file exceeds
     /// `[search.text].max_chunk`.
     #[must_use]
     pub fn lexical_units(&self) -> Vec<rift_index::LexicalUnit> {
         self.index.lexical_units()
     }
 
-    /// Returns each admitted text file split into more than one lexical
+    /// Returns each included text file split into more than one lexical
     /// chunk, paired with its chunk count, so a caller can warn about the
     /// split instead of it passing silently.
     #[must_use]
@@ -400,7 +400,7 @@ impl ReadService {
         if params.include_history {
             return Err(ReadFault::unsupported("symbol history"));
         }
-        let limit = admitted_limit(params.limit)?;
+        let limit = accepted_limit(params.limit)?;
         let hits = self
             .index
             .symbols(&params.name, limit)
@@ -425,9 +425,9 @@ impl ReadService {
     }
 }
 
-/// Admits a caller-supplied result limit: positive, and inside this
+/// Accepts a caller-supplied result limit: positive, and inside this
 /// platform's addressable range.
-pub(crate) fn admitted_limit(requested: u64) -> Result<usize, ReadError> {
+pub(crate) fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
     if requested == 0 {
         return Err(ReadFault::invalid("limit", "zero"));
     }
@@ -796,7 +796,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         Ok((directory, service))
     }
@@ -811,7 +811,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         Ok((directory, service))
     }
@@ -858,7 +858,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         Ok((directory, service))
     }
@@ -980,8 +980,7 @@ pub fn compute() -> i32 {
     #[test]
     fn unsupported_projection_and_history_are_rejected() -> TestResult {
         let (_directory, service) = fixture()?;
-        let projection =
-            ProjectionId("rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned());
+        let projection = ProjectionId("rift://projection/my-feature-one".to_owned());
         let nodes = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 0,
@@ -1027,7 +1026,7 @@ pub fn compute() -> i32 {
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )
         .expect_err("missing root must fail");
 
@@ -1259,7 +1258,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         assert_ne!(
             at_head.snapshot().tree_revision,
@@ -1345,7 +1344,7 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({
             "name": "Beacon",
             "rev": "main",
-            "projection": "rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "projection": "rift://projection/my-feature-one"
         }))?;
         let error = service
             .get_symbol(&params)
@@ -1357,9 +1356,7 @@ pub fn compute() -> i32 {
         let nodes = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 0,
-            projection: Some(ProjectionId(
-                "rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            )),
+            projection: Some(ProjectionId("rift://projection/my-feature-one".to_owned())),
             rev: Some(RevisionId("main".to_owned())),
         });
         assert!(matches!(

@@ -45,7 +45,7 @@ impl TextChunk {
 ///
 /// # Panics
 ///
-/// Asserts `chunk_bytes_max` is positive: every caller passes an already-admitted bound.
+/// Asserts `chunk_bytes_max` is positive: every caller passes an already-accepted bound.
 #[must_use]
 pub(crate) fn text_chunks(content: &str, chunk_bytes_max: usize) -> Vec<TextChunk> {
     assert!(

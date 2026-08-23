@@ -36,7 +36,7 @@ impl ByteRange {
     }
 }
 
-/// Rust source admitted to sans-I/O syntax analysis.
+/// Rust source accepted to sans-I/O syntax analysis.
 #[derive(Debug, Clone, Copy)]
 pub struct RustSource<'a> {
     /// Canonical project-relative path.
@@ -45,7 +45,7 @@ pub struct RustSource<'a> {
     pub text: &'a str,
 }
 
-/// Bounded Rust syntax admission limits.
+/// Bounded Rust syntax acceptance limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_field_names)]
 pub struct RustSyntaxLimits {
@@ -442,7 +442,7 @@ pub enum RustSyntaxViolation {
     PositionOverflow,
     /// Query is invalid for pinned Rust grammar.
     InvalidQuery,
-    /// Query produced more captures than admitted.
+    /// Query produced more captures than accepted.
     TooManyCaptures,
     /// Node kind is outside interpreted grammar vocabulary.
     UnknownNodeKind,
@@ -452,20 +452,20 @@ pub enum RustSyntaxViolation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RustSyntaxBound {
-    /// Admitted source bytes.
+    /// Accepted source bytes.
     SourceBytesMax,
-    /// Admitted syntax nodes.
+    /// Accepted syntax nodes.
     SyntaxNodesMax,
-    /// Admitted syntax depth.
+    /// Accepted syntax depth.
     SyntaxDepthMax,
-    /// Admitted query captures.
+    /// Accepted query captures.
     CapturesMax,
 }
 
 /// Failure kind behind one [`RustSyntaxError`].
 ///
 /// `path` is `None` when the failing source reached [`RustQuery::captures`],
-/// which admits raw text without a project path.
+/// which accepts raw text without a project path.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RustSyntaxFault {
     /// Limit was configured as zero.
@@ -530,7 +530,7 @@ pub enum RustSyntaxFault {
         /// Underlying Tree-sitter rejection.
         source: QueryError,
     },
-    /// Query produced more captures than admitted.
+    /// Query produced more captures than accepted.
     TooManyCaptures {
         /// Configured capture bound.
         captures_max: usize,
@@ -693,7 +693,7 @@ pub struct RustSyntaxProvider {
 
 impl RustSyntaxProvider {
     /// File extensions this provider parses, without their leading dot. The workspace walk
-    /// admits a file as source only when some shipped provider declares its extension.
+    /// includes a file as source only when some shipped provider declares its extension.
     pub const SOURCE_EXTENSIONS: &'static [&'static str] = &["rs"];
 
     /// Constructs provider with explicit bounds.
@@ -930,7 +930,7 @@ mod tests {
         assert!(!query.has_capture("rift.missing"));
         let captures = query
             .captures("fn first() {} fn second() {}", 2)
-            .expect("capture bound admits both functions");
+            .expect("capture bound accepts both functions");
         assert_eq!(captures.len(), 2);
         assert_eq!(captures[0].name, "rift.name");
         assert_eq!(

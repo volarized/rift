@@ -697,15 +697,17 @@ pub struct ProjectPath(
     pub String,
 );
 
-/// Identity of one projection, and the URI that resolves it. The server mints it when
-/// `projection_create` materializes the projection and retires it when `projection_remove`
-/// deletes the directory. A change request that omits its `projection` field applies to the
-/// workspace tree itself.
+/// Identity of one projection, and the URI that resolves it. The caller names the
+/// projection at `projection_create` — a directory-valid name of 1 to 64 lowercase
+/// letters, digits, and interior dashes, such as `my-feature-one` — and the URI carries
+/// that name. The name addresses the projection while it lives; `projection_remove`
+/// frees it, and a later projection reusing the name is a distinct projection. A change
+/// request that omits its `projection` field applies to the workspace tree itself.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ProjectionId(
-    #[schemars(regex(pattern = r"^rift://projection/prj_[a-z2-7]{26}$"))]
+    #[schemars(regex(pattern = r"^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"))]
     pub String,
 );
 
@@ -891,7 +893,7 @@ pub enum RelationshipFacet {
     Binds,
 }
 
-/// Longest revision spelling the wire admits, in bytes; the admitted charset is ASCII, so
+/// Longest revision spelling the wire accepts, in bytes; the accepted charset is ASCII, so
 /// the schema's `{1,128}` repetition counts the same units.
 pub const REVISION_ID_BYTES_MAX: usize = 128;
 
@@ -906,7 +908,7 @@ pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] 
 impl RevisionId {
     /// Classifies this spelling against the charset and length its schema advertises.
     /// `schemars` regexes are declarative only — nothing enforces them at
-    /// deserialization — so every admission point calls this before the spelling
+    /// deserialization — so every acceptance point calls this before the spelling
     /// reaches revision resolution.
     #[must_use]
     pub fn violation(&self) -> Option<RevisionIdViolation> {
@@ -941,12 +943,12 @@ impl RevisionIdViolation {
 /// Classifies one revision spelling against the rules [`RevisionId`]'s schema advertises.
 /// Arms are ordered by precedence: the first matching rule names the violation.
 fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
-    let admitted =
+    let accepted =
         |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-');
     match value.as_bytes() {
         [] => Some(RevisionIdViolation::Empty),
         bytes if bytes.len() > REVISION_ID_BYTES_MAX => Some(RevisionIdViolation::TooLong),
-        bytes if !bytes.iter().all(admitted) => Some(RevisionIdViolation::CharsetForbidden),
+        bytes if !bytes.iter().all(accepted) => Some(RevisionIdViolation::CharsetForbidden),
         _ => None,
     }
 }

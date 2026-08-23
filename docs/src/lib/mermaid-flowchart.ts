@@ -46,11 +46,21 @@ export type FlowEdge = {
   style: FlowLinkStyle;
 };
 
+/** A mermaid `subgraph`: a titled box drawn around the nodes it contains. */
+export type FlowGroup = {
+  id: string;
+  /** The subgraph's title, one entry per line. */
+  title: string[];
+  /** Ids of the leaf nodes inside. Nested subgraphs are not supported. */
+  nodes: string[];
+};
+
 export type FlowGraph = {
   direction: FlowDirection;
   /** In declaration order, which is also the order dagre sees them in. */
   nodes: FlowNode[];
   edges: FlowEdge[];
+  groups: FlowGroup[];
 };
 
 /**
@@ -70,6 +80,7 @@ type FlowchartDb = {
     /** `normal`, `thick`, `dotted`. */
     stroke?: string;
   }[];
+  getSubGraphs: () => { id: string; nodes: string[]; title?: string }[];
 };
 
 const DIRECTIONS = new Set<FlowDirection>(["TB", "BT", "LR", "RL"]);
@@ -84,7 +95,20 @@ function lines(text: string | undefined): string[] {
     .filter((line) => line.length > 0);
 }
 
-export async function parseFlowchart(source: string): Promise<FlowGraph> {
+// Mermaid's parsers write into one database per diagram type, shared across
+// `parse` calls, and the database is only read back after an await. Sibling
+// Server Components parse concurrently, so without ordering one diagram's
+// read can observe another diagram's parse. This queue holds each
+// parse-and-read pair together, one diagram at a time.
+let parseTurn: Promise<unknown> = Promise.resolve();
+
+export function parseFlowchart(source: string): Promise<FlowGraph> {
+  const turn = parseTurn.then(() => parseFlowchartNow(source));
+  parseTurn = turn.catch(() => undefined);
+  return turn;
+}
+
+async function parseFlowchartNow(source: string): Promise<FlowGraph> {
   const { type, db } = await parse(source);
 
   // `flowchart` and `graph` both land on `flowchart-v2`. Anything else parsed
@@ -118,5 +142,17 @@ export async function parseFlowchart(source: string): Promise<FlowGraph> {
     style: edge.stroke === "thick" || edge.stroke === "dotted" ? edge.stroke : "normal",
   }));
 
-  return { direction, nodes, edges };
+  // Subgraph member lists can name nested subgraphs; keeping only leaf ids is
+  // what "nested subgraphs are not supported" means in practice.
+  const vertexIds = new Set(nodes.map((node) => node.id));
+  const groups: FlowGroup[] = flow
+    .getSubGraphs()
+    .map((sub) => ({
+      id: sub.id,
+      title: lines(sub.title ?? sub.id),
+      nodes: sub.nodes.filter((id) => vertexIds.has(id)),
+    }))
+    .filter((group) => group.nodes.length > 0);
+
+  return { direction, nodes, edges, groups };
 }

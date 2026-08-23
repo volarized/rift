@@ -39,8 +39,8 @@
             "type": "object"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The server mints it when\n`projection_create` materializes the projection and retires it when `projection_remove`\ndeletes the directory. A change request that omits its `projection` field applies to the\nworkspace tree itself.",
-            "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
+            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
           "RevisionId": {
@@ -2870,8 +2870,8 @@
             "type": "string"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The server mints it when\n`projection_create` materializes the projection and retires it when `projection_remove`\ndeletes the directory. A change request that omits its `projection` field applies to the\nworkspace tree itself.",
-            "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
+            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
           "RevisionId": {
@@ -6273,7 +6273,7 @@
       }
     },
     {
-      "description": "Searches indexed Rust declarations and source lines by lexical `query`, merged with\nfull-text matches from admitted `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the lexical tier's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate lexical matches against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed Rust declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the lexical tier's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate lexical matches against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "Cursor": {
@@ -6546,7 +6546,7 @@
               },
               "include": {
                 "default": [],
-                "description": "Globs a path has to match to be searched at all. Empty admits every visible file.",
+                "description": "Globs a path has to match to be searched at all. Empty includes every visible file.",
                 "items": {
                   "$ref": "#/$defs/PathPattern"
                 },
@@ -6556,8 +6556,8 @@
             "type": "object"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The server mints it when\n`projection_create` materializes the projection and retires it when `projection_remove`\ndeletes the directory. A change request that omits its `projection` field applies to the\nworkspace tree itself.",
-            "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
+            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
           "RelationFilter": {

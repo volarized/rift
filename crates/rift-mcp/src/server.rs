@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
-use rift_core::{SourceVisibility, TextFileAdmission};
+use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::{
     LexicalIndexLimits, LexicalMatch, LexicalSearchIndex, WorkspaceFingerprint,
     WorkspaceIndexLimits, WorkspaceSourcePolicy,
@@ -14,7 +14,7 @@ use rift_protocol::change::{
     ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
-    CommandHook, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX, SERVER_BLOCKING_SLOTS_MAX,
+    CommandHook, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX, SERVER_NUM_WORKERS_MAX,
     SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
@@ -42,7 +42,7 @@ use crate::validation::{
 /// under-fill the final page whenever duplicates exist.
 const LEXICAL_OVERFETCH_FACTOR: u32 = 4;
 
-/// Bounded Tokio admission for blocking filesystem and parser work.
+/// Bounded Tokio acceptance for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockingExecutor {
     pub(crate) operations: Arc<Semaphore>,
@@ -50,17 +50,17 @@ pub(crate) struct BlockingExecutor {
 }
 
 impl BlockingExecutor {
-    /// Sizes the workspace's pool and queue wait from one admitted
+    /// Sizes the workspace's pool and queue wait from one accepted
     /// `[server]` table.
     pub(crate) fn for_configuration(server: &ServerConfiguration) -> Self {
-        // Admission bounds the value to 1..=SERVER_BLOCKING_SLOTS_MAX, so
+        // Acceptance bounds the value to 1..=SERVER_NUM_WORKERS_MAX, so
         // the clamp only guards the usize conversion.
-        let slots = usize::try_from(server.blocking_slots.min(SERVER_BLOCKING_SLOTS_MAX))
+        let workers = usize::try_from(server.num_workers.min(SERVER_NUM_WORKERS_MAX))
             .unwrap_or(1)
             .max(1);
         Self {
-            operations: Arc::new(Semaphore::new(slots)),
-            queue_timeout_ms: server.blocking_queue_timeout.milliseconds(),
+            operations: Arc::new(Semaphore::new(workers)),
+            queue_timeout_ms: server.worker_queue_timeout.milliseconds(),
         }
     }
 
@@ -81,7 +81,7 @@ impl BlockingExecutor {
         }
     }
 
-    /// Runs one blocking operation after queued, bounded admission.
+    /// Runs one blocking operation after queued, bounded acceptance.
     pub(crate) async fn run<Output>(
         &self,
         operation: &'static str,
@@ -109,20 +109,20 @@ impl BlockingExecutor {
 /// Serializes workspace mutations and snapshot publication.
 #[derive(Debug, Default)]
 pub(crate) struct ChangeLane {
-    admission: AsyncMutex<()>,
+    entry: AsyncMutex<()>,
 }
 
 impl ChangeLane {
-    /// Runs one operation after FIFO admission to the workspace lane.
+    /// Runs one operation after FIFO entry to the workspace lane.
     pub(crate) fn run<Output>(&self, operation: impl FnOnce() -> Output) -> Output {
-        let guard = self.admission.blocking_lock();
+        let guard = self.entry.blocking_lock();
         let output = operation();
         // Filesystem mutation and snapshot publication finish before release.
         drop(guard);
         output
     }
 
-    /// Verifies occupied admission, reports it, then uses the production lane.
+    /// Verifies occupied entry, reports it, then uses the production lane.
     #[cfg(test)]
     fn run_after_contention<Output>(
         &self,
@@ -130,7 +130,7 @@ impl ChangeLane {
         operation: impl FnOnce() -> Output,
     ) -> Output {
         assert!(
-            self.admission.try_lock().is_err(),
+            self.entry.try_lock().is_err(),
             "contention witness requires an occupied change lane"
         );
         on_contention();
@@ -138,11 +138,11 @@ impl ChangeLane {
     }
 }
 
-/// Sizes the lexical search index's connection pool and busy-wait budget from one admitted
+/// Sizes the lexical search index's connection pool and busy-wait budget from one accepted
 /// `[search]` table, keeping this release's fixed unit, query-term, and match-count bounds.
 fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
     let defaults = LexicalIndexLimits::default();
-    // Admission bounds pool_slots to 1..=SEARCH_POOL_SLOTS_MAX and busy_timeout to
+    // Acceptance bounds pool_slots to 1..=SEARCH_POOL_SLOTS_MAX and busy_timeout to
     // SEARCH_BUSY_TIMEOUT_MS_MIN..=SEARCH_BUSY_TIMEOUT_MS_MAX, so these clamps only guard the
     // narrowing conversion into the adapter's `u32` fields.
     let pool_slots = u32::try_from(search.pool_slots.min(SEARCH_POOL_SLOTS_MAX))
@@ -261,7 +261,7 @@ impl SerializedChange {
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl RiftMcp {
     /// Builds server from one direct-workspace snapshot, applying the
-    /// admitted `rift.toml`'s `[source]` policy to the initial index and its
+    /// accepted `rift.toml`'s `[source]` policy to the initial index and its
     /// `[server]` table to the blocking pool. While `rift.toml` is invalid,
     /// the initial index still builds under the default policies; every
     /// request then fails as `configuration_invalid` until the file is
@@ -273,15 +273,15 @@ impl RiftMcp {
     ///
     /// # Cancel safety
     ///
-    /// Dropping this future discards construction. An admitted blocking scan
+    /// Dropping this future discards construction. An accepted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
     pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
         let root = root.to_path_buf();
-        let admission_root = root.clone();
+        let configuration_root = root.clone();
         let startup_configuration =
-            tokio::task::spawn_blocking(move || ConfigurationState::admit(&admission_root))
+            tokio::task::spawn_blocking(move || ConfigurationState::accept(&configuration_root))
                 .await
-                .map_err(|error| ReadFault::task("configuration admission", error.to_string()))?;
+                .map_err(|error| ReadFault::task("configuration acceptance", error.to_string()))?;
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
         let (validation, invalidations) = IndexValidation::new();
@@ -363,7 +363,7 @@ impl RiftMcp {
     }
 
     /// Searches indexed Rust declarations and source lines by lexical `query`, merged with
-    /// full-text matches from admitted `[search.text]` files and declaration bodies. `rev`
+    /// full-text matches from included `[search.text]` files and declaration bodies. `rev`
     /// searches a version-control revision instead of the current tree. Use `get_symbol`
     /// when the declaration name is known.
     ///
@@ -502,7 +502,7 @@ impl RiftMcp {
 
     /// Runs one read against the tree the request names — the current
     /// snapshot, or a snapshot built at the request's version-control
-    /// revision — behind the admission gate every request passes.
+    /// revision — behind the acceptance gate every request passes.
     ///
     /// A revision snapshot is built per request from the workspace's git
     /// objects, under the same `[source]` policy and bounds as the current
@@ -519,7 +519,7 @@ impl RiftMcp {
         let Some(rev) = rev else {
             return self.current_tree_read(&published, operation).await;
         };
-        let configuration = published.configuration.admitted(wire::ErrorPhase::Read)?;
+        let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
         if !configuration.providers.history.enabled {
             return Err(ReadError::from(ReadFault::Unsupported {
                 capability: "revision reads (providers.history disabled)",
@@ -539,7 +539,7 @@ impl RiftMcp {
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
 
-    /// Runs one read against `published`'s current-tree snapshot, behind the admission
+    /// Runs one read against `published`'s current-tree snapshot, behind the acceptance
     /// gate every request passes. Shared by `read_at`'s current-tree path and `search`,
     /// which resolves `published` itself first so the lexical tier's revision check and
     /// the identifier read it merges into can never straddle two different snapshots.
@@ -551,7 +551,7 @@ impl RiftMcp {
     where
         Answer: Send + 'static,
     {
-        published.configuration.admitted(wire::ErrorPhase::Read)?;
+        published.configuration.accepted(wire::ErrorPhase::Read)?;
         let reads = Arc::clone(&published.reads);
         self.blocking
             .run("current workspace read", move || operation(&reads))
@@ -585,12 +585,12 @@ impl RiftMcp {
             let root = self.root.clone();
             let limits = self.limits;
             let visibility = current.configuration.source_visibility();
-            let text_admission = current.configuration.text_admission();
+            let text_inclusion = current.configuration.text_inclusion();
             let capture = self
                 .blocking
                 .run("workspace fingerprint", move || {
                     let fingerprint =
-                        WorkspaceFingerprint::capture(&root, limits, &visibility, &text_admission)
+                        WorkspaceFingerprint::capture(&root, limits, &visibility, &text_inclusion)
                             .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
                     Ok((fingerprint, configuration_fingerprint(&root)))
                 })
@@ -612,7 +612,7 @@ impl RiftMcp {
                 current.configuration.fingerprint == configuration_fingerprint;
             let epoch_matches = current.epoch == self.validation.observed_epoch();
             if fingerprint == current.fingerprint && configuration_matches && epoch_matches {
-                current.configuration.admitted(phase)?;
+                current.configuration.accepted(phase)?;
                 return Ok(current);
             }
             self.validation
@@ -665,7 +665,7 @@ impl RiftMcp {
     /// Hooks observe an already-applied change: their verdicts ride the
     /// result and never roll the change back. The snapshot is rebuilt after
     /// they ran, so reads also serve whatever a hook wrote into the tree,
-    /// under the `[source]` policy this call already admitted. A rebuild
+    /// under the `[source]` policy this call already accepted. A rebuild
     /// failure after a landed change rides the result as a diagnostic
     /// rather than failing the call: the write happened, and the caller
     /// must not be told otherwise.
@@ -725,11 +725,11 @@ impl RiftMcp {
         if current.epoch != validation.observed_epoch() {
             return Ok(SerializedChange::wire(Err(ReadFault::unavailable(
                 "workspace change",
-                "index changed before operation admission",
+                "index changed before operation acceptance",
             )
             .tool_error(wire::ErrorPhase::Change))));
         }
-        let configuration = match current.configuration.admitted(wire::ErrorPhase::Change) {
+        let configuration = match current.configuration.accepted(wire::ErrorPhase::Change) {
             Ok(configuration) => configuration,
             Err(error) => return Ok(SerializedChange::wire(Err(error))),
         };
@@ -775,8 +775,8 @@ impl RiftMcp {
         };
         Self::attach_hook_verdicts(root, &configuration.hooks, summary);
         let visibility = SourceVisibility::from(&configuration.source);
-        let text_admission = TextFileAdmission::from(&configuration.search);
-        let rebuilt = match ReadService::build(root, limits, &visibility, &text_admission) {
+        let text_inclusion = TextFileInclusion::from(&configuration.search);
+        let rebuilt = match ReadService::build(root, limits, &visibility, &text_inclusion) {
             Ok(rebuilt) => rebuilt,
             Err(error) => {
                 summary.diagnostics.push(stale_snapshot_diagnostic(&error));
@@ -785,7 +785,7 @@ impl RiftMcp {
         };
         let fingerprint = rebuilt.workspace_fingerprint().clone();
         let source_policy =
-            match WorkspaceSourcePolicy::build(root, limits, &visibility, &text_admission) {
+            match WorkspaceSourcePolicy::build(root, limits, &visibility, &text_inclusion) {
                 Ok(policy) => Arc::new(policy),
                 Err(error) => {
                     let error = ReadError::from(ReadFault::Index(error));
@@ -1081,7 +1081,7 @@ mod tests {
     async fn server_table_sizes_blocking_pool_and_queue_wait() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let configured = "[server]\nblocking_slots = 2\nblocking_queue_timeout = \"1250ms\"\n";
+        let configured = "[server]\nnum_workers = 2\nworker_queue_timeout = \"1250ms\"\n";
         fs::write(directory.path().join("rift.toml"), configured)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert_eq!(server.blocking.queue_timeout_ms, 1_250);
@@ -1095,11 +1095,11 @@ mod tests {
         let default_table = rift_protocol::configuration::ServerConfiguration::default();
         assert_eq!(
             server.blocking.queue_timeout_ms,
-            default_table.blocking_queue_timeout.milliseconds()
+            default_table.worker_queue_timeout.milliseconds()
         );
         assert_eq!(
             server.blocking.operations.available_permits() as u64,
-            default_table.blocking_slots
+            default_table.num_workers
         );
         Ok(())
     }
@@ -1110,13 +1110,13 @@ mod tests {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(
             directory.path().join("rift.toml"),
-            "[server]\nblocking_slots = 0\n",
+            "[server]\nnum_workers = 0\n",
         )?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let default_table = rift_protocol::configuration::ServerConfiguration::default();
         assert_eq!(
             server.blocking.operations.available_permits() as u64,
-            default_table.blocking_slots
+            default_table.num_workers
         );
         Ok(())
     }
@@ -1161,7 +1161,7 @@ mod tests {
         });
         contended_receiver
             .await
-            .expect("second operation must reach occupied admission");
+            .expect("second operation must reach occupied entry");
         assert!(
             !second_entered.load(Ordering::SeqCst),
             "second operation must not enter before first publication releases"
@@ -1216,7 +1216,7 @@ mod tests {
         });
         queued_ready_receiver
             .await
-            .expect("queued task must reach admission");
+            .expect("queued task must reach acceptance");
         assert!(
             !queued_started.load(Ordering::SeqCst),
             "queued work must not start before capacity returns"
@@ -1275,7 +1275,7 @@ mod tests {
         });
         queued_ready_receiver
             .await
-            .expect("timed operation must reach admission");
+            .expect("timed operation must reach acceptance");
         tokio::time::advance(Duration::from_millis(QUEUE_TIMEOUT_MS + 1)).await;
         let error = queued
             .await
@@ -1347,7 +1347,7 @@ mod tests {
         let error = executor
             .run("closed queue operation", || Ok(()))
             .await
-            .expect_err("closed semaphore must fail admission");
+            .expect_err("closed semaphore must fail acceptance");
         assert!(matches!(error.fault(), ReadFault::Task { .. }));
     }
 
@@ -1363,7 +1363,7 @@ mod tests {
             current: Arc::new(PublishedWorkspace {
                 reads: Arc::clone(&candidate.reads),
                 configuration: ConfigurationState {
-                    admitted: Err(Arc::new(configuration_error)),
+                    accepted: Err(Arc::new(configuration_error)),
                     fingerprint: configuration_fingerprint(directory.path()),
                 },
                 fingerprint: candidate.fingerprint.clone(),
@@ -1750,9 +1750,9 @@ mod tests {
 
     /// Calls one tool, retrying the refusals the server advertises as
     /// `retry: same_request`: a concurrent write may move the index between
-    /// snapshot and admission, and the wire contract answers with a bounded
+    /// snapshot and acceptance, and the wire contract answers with a bounded
     /// retry rather than a failure.
-    async fn call_until_admitted(
+    async fn call_until_accepted(
         peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
         params: CallToolRequestParams,
     ) -> TestResult<rmcp::model::CallToolResult> {
@@ -1785,7 +1785,7 @@ mod tests {
         let client = ().serve(client_transport).await?;
         let first_client = client.peer().clone();
         let second_client = client.peer().clone();
-        let first = call_until_admitted(
+        let first = call_until_accepted(
             &first_client,
             CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
                 "anchor": "rift://symbol/rust/lib.rs/beacon",
@@ -1793,7 +1793,7 @@ mod tests {
                 "body": "pub fn first_insert() {}"
             }))?),
         );
-        let second = call_until_admitted(
+        let second = call_until_accepted(
             &second_client,
             CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
                 "anchor": "rift://symbol/rust/lib.rs/beacon",
@@ -1980,7 +1980,7 @@ pub fn beacon() -> u64 {
         assert!(
             error
                 .message
-                .contains("index changed before operation admission"),
+                .contains("index changed before operation acceptance"),
             "unexpected refusal: {error:?}"
         );
         Ok(())
@@ -2093,13 +2093,13 @@ pub fn beacon() -> u64 {
         });
         let changes = ChangeService::new(directory.path());
         let root = directory.path().to_path_buf();
-        // `files_max=1` admits the workspace's single Rust source file for `ReadService::build`,
+        // `files_max=1` accepts the workspace's single Rust source file for `ReadService::build`,
         // which never counts `.gitignore` files. `WorkspaceSourcePolicy::build` re-walks for
         // `.gitignore` files specifically and counts each one against that same bound, so a
         // second `.gitignore` written by the change trips `TooManyFiles` there even though the
         // read-side rebuild already succeeded.
         let tight_limits = WorkspaceIndexLimits::new(1, 1_048_576, 10_485_760, 16, 5)
-            .expect("tight limits admit exactly one file");
+            .expect("tight limits accept exactly one file");
         let outcome = RiftMcp::change_serialized(
             directory.path(),
             tight_limits,
@@ -2153,7 +2153,7 @@ pub fn beacon() -> u64 {
     #[tokio::test]
     async fn recorded_rebuild_failure_serves_reads_the_typed_error() -> TestResult {
         let (_directory, server) = fixture().await?;
-        let lane_guard = server.change_lane.admission.lock().await;
+        let lane_guard = server.change_lane.entry.lock().await;
         let epoch = server
             .validation
             .observe()

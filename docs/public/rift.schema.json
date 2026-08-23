@@ -391,7 +391,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search runs on a lexical index; `pool_slots` and\n`busy_timeout` bound the `SQLite` connections behind it, `embedding`\nnames the model that adds dense ranking on top, and `text` admits\nnon-source text files into the lexical index.",
+      "description": "The `[search]` table. Search runs on a lexical index; `pool_slots` and\n`busy_timeout` bound the `SQLite` connections behind it, `embedding`\nnames the model that adds dense ranking on top, and `text` includes\nnon-source text files in the lexical index.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
@@ -436,24 +436,24 @@
     },
     "ServerConfiguration": {
       "additionalProperties": false,
-      "description": "The `[server]` table. Filesystem scans and parses run on a bounded\nblocking pool; this table sizes the pool and bounds the queue wait.\nThe server reads the table at startup, so a change applies on the\nnext start.",
+      "description": "The `[server]` table. Filesystem scans and parses run on a bounded\nworker pool; this table sets the worker count and bounds the queue\nwait. The server reads the table at startup, so a change applies on\nthe next start.",
       "properties": {
-        "blocking_queue_timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "30s",
-          "description": "Wall-clock bound one request waits for a blocking slot, 1ms to 1h.",
-          "rift:range": {
-            "max": "1h",
-            "min": "1ms"
-          }
-        },
-        "blocking_slots": {
+        "num_workers": {
           "default": 4,
-          "description": "Blocking filesystem and parser operations running at once, 1 to 64.",
+          "description": "Workers running blocking filesystem and parser operations at once, 1 to 64.",
           "format": "uint64",
           "maximum": 64,
           "minimum": 1,
           "type": "integer"
+        },
+        "worker_queue_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "Wall-clock bound one request waits for a free worker, 1ms to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1ms"
+          }
         }
       },
       "type": "object"
@@ -473,7 +473,7 @@
         },
         "include": {
           "default": [],
-          "description": "Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.\nEmpty admits every file `exclude` and `.gitignore` leave standing.",
+          "description": "Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.\nEmpty includes every file `exclude` and `.gitignore` leave standing.",
           "items": {
             "$ref": "#/$defs/PathPattern"
           },
@@ -498,7 +498,7 @@
             "mdx",
             "txt"
           ],
-          "description": "File extensions, without the leading dot, admitted as text-file lexical units:\nlowercase ASCII alphanumeric only (so a leading dot is already excluded), at most\n16 bytes each, at most 32 entries, no duplicates.",
+          "description": "File extensions, without the leading dot, included as text-file lexical units:\nlowercase ASCII alphanumeric only (so a leading dot is already excluded), at most\n16 bytes each, at most 32 entries, no duplicates.",
           "items": {
             "type": "string"
           },
@@ -571,10 +571,10 @@
     "server": {
       "$ref": "#/$defs/ServerConfiguration",
       "default": {
-        "blocking_queue_timeout": "30s",
-        "blocking_slots": 4
+        "num_workers": 4,
+        "worker_queue_timeout": "30s"
       },
-      "description": "The server's own blocking-work bounds: pool size and queue wait."
+      "description": "The server's own blocking-work bounds: worker count and queue wait."
     },
     "source": {
       "$ref": "#/$defs/SourceConfiguration",

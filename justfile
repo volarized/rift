@@ -26,6 +26,16 @@ audit:
     cargo audit
     cargo deny check
 
+clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git worktree list --porcelain | sed -n 's/^worktree //p' | while read -r tree; do
+        if [ -f "$tree/Cargo.toml" ]; then
+            echo "cleaning $tree"
+            cargo clean --manifest-path "$tree/Cargo.toml" || echo "skipped $tree: broken checkout"
+        fi
+    done
+
 coverage:
     cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 

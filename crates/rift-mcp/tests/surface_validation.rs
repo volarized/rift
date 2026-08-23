@@ -143,7 +143,7 @@ fn patch_corpus() -> Vec<(&'static str, Value)> {
 
 /// Search requests only the lexical search-index tier can fully answer: a multi-word
 /// prose query merging in hits identifier search alone would not surface, and a query
-/// that only `notes.md` (admitted by the default `[search.text]` extensions) answers,
+/// that only `notes.md` (included by the default `[search.text]` extensions) answers,
 /// since identifier search never reaches a non-source file.
 fn lexical_search_corpus() -> Vec<(&'static str, Value)> {
     vec![
@@ -340,7 +340,7 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("hidden.rs"),
         "pub fn phantom_signal() {}\n",
     )?;
-    // Admitted into the lexical search-index tier by the default `[search.text]`
+    // Included into the lexical search-index tier by the default `[search.text]`
     // extensions, so the corpus can prove a text-file search hit end to end.
     fs::write(
         directory.path().join("notes.md"),
@@ -471,15 +471,15 @@ fn tool_validators(
     Ok(validators)
 }
 
-/// Most attempts one corpus request retries before giving up on admission.
+/// Most attempts one corpus request retries before giving up on acceptance.
 const ADMISSION_ATTEMPTS_MAX: usize = 8;
 
 /// Calls one tool, retrying the refusal the server advertises as
 /// `retry: same_request`: the workspace's own filesystem watcher can
 /// observe a corpus change's write and move the index between one
-/// request's snapshot and its admission, and the wire contract answers
+/// request's snapshot and its acceptance, and the wire contract answers
 /// that race with a bounded retry rather than a failure.
-async fn call_tool_retrying_admission(
+async fn call_tool_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,
 ) -> TestResult<rmcp::model::CallToolResult> {
@@ -526,7 +526,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                  the fixture is too large or pagination never terminates"
             );
             assert_validates(input_validator, &request, &format!("{name} request"));
-            let result = call_tool_retrying_admission(
+            let result = call_tool_retrying_acceptance(
                 &client,
                 CallToolRequestParams::new(name).with_arguments(arguments(&request)?),
             )

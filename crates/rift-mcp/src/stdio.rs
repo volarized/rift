@@ -72,7 +72,7 @@ impl StdioServeError {
 ///
 /// # Cancel safety
 ///
-/// Dropping this future closes its owned MCP service. An admitted initial
+/// Dropping this future closes its owned MCP service. An accepted initial
 /// index scan still finishes in the bounded blocking executor.
 pub async fn serve_stdio(root: &Path) -> Result<(), StdioServeError> {
     tracing::info!(

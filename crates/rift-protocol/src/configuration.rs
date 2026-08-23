@@ -13,9 +13,9 @@ use crate::source::SourceConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
-/// Blocking operations the server may run at once, at most.
-pub const SERVER_BLOCKING_SLOTS_MAX: u64 = 64;
-/// Milliseconds one request may wait for a blocking slot, at most: one hour.
+/// Workers the server's blocking pool may hold, at most.
+pub const SERVER_NUM_WORKERS_MAX: u64 = 64;
+/// Milliseconds one request may wait for a free worker, at most: one hour.
 pub const SERVER_QUEUE_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
@@ -23,7 +23,7 @@ pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
 pub const EXECUTION_TIMEOUT_MS_MAX: u64 = 86_400_000;
 /// Bytes one captured execution stream may keep, at most.
 pub const EXECUTION_OUTPUT_BYTES_MAX: u64 = 16 << 10;
-/// Evaluations admitted concurrently across the workspace, at most.
+/// Evaluations running concurrently across the workspace, at most.
 pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
 /// Entries `execution.allow` may hold, at most.
 pub const EXECUTION_ALLOW_ITEMS_MAX: usize = 64;
@@ -297,7 +297,7 @@ fn split_magnitude<'text>(
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceConfiguration {
-    /// The server's own blocking-work bounds: pool size and queue wait.
+    /// The server's own blocking-work bounds: worker count and queue wait.
     pub server: ServerConfiguration,
     /// Bounds and switches for the built-in providers.
     pub providers: ProvidersConfiguration,
@@ -341,25 +341,25 @@ impl WorkspaceConfiguration {
 }
 
 /// The `[server]` table. Filesystem scans and parses run on a bounded
-/// blocking pool; this table sizes the pool and bounds the queue wait.
-/// The server reads the table at startup, so a change applies on the
-/// next start.
+/// worker pool; this table sets the worker count and bounds the queue
+/// wait. The server reads the table at startup, so a change applies on
+/// the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_server_ranges)]
 pub struct ServerConfiguration {
-    /// Blocking filesystem and parser operations running at once, 1 to 64.
+    /// Workers running blocking filesystem and parser operations at once, 1 to 64.
     #[schemars(range(min = 1, max = 64))]
-    pub blocking_slots: u64,
-    /// Wall-clock bound one request waits for a blocking slot, 1ms to 1h.
-    pub blocking_queue_timeout: Duration,
+    pub num_workers: u64,
+    /// Wall-clock bound one request waits for a free worker, 1ms to 1h.
+    pub worker_queue_timeout: Duration,
 }
 
 impl Default for ServerConfiguration {
     fn default() -> Self {
         Self {
-            blocking_slots: 4,
-            blocking_queue_timeout: Duration::from_millis(30_000),
+            num_workers: 4,
+            worker_queue_timeout: Duration::from_millis(30_000),
         }
     }
 }
@@ -369,14 +369,14 @@ impl ServerConfiguration {
     fn violation(&self) -> Option<ConfigurationViolation> {
         first_out_of_range([
             (
-                "server.blocking_slots",
-                self.blocking_slots,
+                "server.num_workers",
+                self.num_workers,
                 1,
-                SERVER_BLOCKING_SLOTS_MAX,
+                SERVER_NUM_WORKERS_MAX,
             ),
             (
-                "server.blocking_queue_timeout",
-                self.blocking_queue_timeout.milliseconds(),
+                "server.worker_queue_timeout",
+                self.worker_queue_timeout.milliseconds(),
                 1,
                 SERVER_QUEUE_TIMEOUT_MS_MAX,
             ),
@@ -506,8 +506,8 @@ impl ExecutionConfiguration {
 
 /// The `[search]` table. Search runs on a lexical index; `pool_slots` and
 /// `busy_timeout` bound the `SQLite` connections behind it, `embedding`
-/// names the model that adds dense ranking on top, and `text` admits
-/// non-source text files into the lexical index.
+/// names the model that adds dense ranking on top, and `text` includes
+/// non-source text files in the lexical index.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
@@ -568,9 +568,9 @@ impl SearchConfiguration {
     }
 }
 
-/// `search.pool_slots` connections admitted, at least.
+/// `search.pool_slots` connections accepted, at least.
 pub const SEARCH_POOL_SLOTS_MIN: u64 = 1;
-/// `search.pool_slots` connections admitted, at most.
+/// `search.pool_slots` connections accepted, at most.
 pub const SEARCH_POOL_SLOTS_MAX: u64 = 16;
 /// `search.pool_slots` value used when the key is absent.
 const SEARCH_POOL_SLOTS_DEFAULT: u64 = 4;
@@ -594,8 +594,8 @@ fn embedding_violation(embedding: Option<&str>) -> Option<ConfigurationViolation
     let embedding = embedding?;
     let nonempty = !embedding.is_empty();
     let within_length = embedding.len() <= EMBEDDING_MODEL_BYTES_MAX;
-    let charset_admitted = embedding.chars().all(is_model_identifier_character);
-    let valid = nonempty && within_length && charset_admitted;
+    let charset_accepted = embedding.chars().all(is_model_identifier_character);
+    let valid = nonempty && within_length && charset_accepted;
     (!valid).then(|| ConfigurationViolation::EmbeddingModelInvalid {
         value: embedding.to_owned(),
     })
@@ -606,7 +606,7 @@ fn is_model_identifier_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
 }
 
-/// `search.text.extensions` entries admitted, at most.
+/// `search.text.extensions` entries accepted, at most.
 pub const TEXT_EXTENSIONS_MAX: usize = 32;
 /// Bytes one `search.text.extensions` entry may hold, at most.
 pub const TEXT_EXTENSION_BYTES_MAX: usize = 16;
@@ -617,7 +617,7 @@ pub const TEXT_CHUNK_BYTES_MAX: u64 = 16 << 20;
 /// Bytes one lexical chunk from a `search.text` file may hold, by default.
 pub const TEXT_CHUNK_BYTES_DEFAULT: u64 = 1 << 20;
 
-/// `search.text.extensions` admitted by default: prose formats with no dedicated syntax
+/// `search.text.extensions` included by default: prose formats with no dedicated syntax
 /// provider.
 const TEXT_EXTENSIONS_DEFAULT: [&str; 3] = ["md", "mdx", "txt"];
 
@@ -635,7 +635,7 @@ fn default_text_extensions() -> Vec<String> {
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_text_ranges)]
 pub struct TextSearchConfiguration {
-    /// File extensions, without the leading dot, admitted as text-file lexical units:
+    /// File extensions, without the leading dot, included as text-file lexical units:
     /// lowercase ASCII alphanumeric only (so a leading dot is already excluded), at most
     /// 16 bytes each, at most 32 entries, no duplicates.
     #[serde(default = "default_text_extensions")]
@@ -677,7 +677,7 @@ impl TextSearchConfiguration {
     }
 }
 
-/// Whether `extension` matches `search.text.extensions`'s admitted spelling: nonempty,
+/// Whether `extension` matches `search.text.extensions`'s accepted spelling: nonempty,
 /// lowercase ASCII alphanumeric only, at most [`TEXT_EXTENSION_BYTES_MAX`] bytes.
 fn is_text_extension(extension: &str) -> bool {
     !extension.is_empty()
@@ -843,9 +843,9 @@ pub enum ConfigurationViolation {
         field: &'static str,
         /// The configured value, in the key's base unit.
         value: u64,
-        /// The smallest admitted value.
+        /// The smallest accepted value.
         min: u64,
-        /// The largest admitted value.
+        /// The largest accepted value.
         max: u64,
     },
     /// An `execution.allow` entry is not `name` or `name:dialect`.
@@ -1273,9 +1273,11 @@ mod tests {
 
     #[test]
     fn test_values_round_trip_through_serde_in_canonical_spelling() {
-        let size: ByteSize = serde_json::from_value(json!("16kb")).expect("spelling must admit");
+        let size: ByteSize =
+            serde_json::from_value(json!("16kb")).expect("spelling must be accepted");
         assert_eq!(serde_json::to_value(size).expect("render"), json!("16kb"));
-        let duration: Duration = serde_json::from_value(json!("90s")).expect("spelling must admit");
+        let duration: Duration =
+            serde_json::from_value(json!("90s")).expect("spelling must be accepted");
         assert_eq!(
             serde_json::to_value(duration).expect("render"),
             json!("90s")
@@ -1392,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_bounds_admit_their_edges() {
+    fn test_execution_bounds_accept_their_edges() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.execution.max_code = ByteSize::from_bytes(EXECUTION_CODE_BYTES_MAX);
         configuration.execution.max_timeout = Duration::from_millis(EXECUTION_TIMEOUT_MS_MAX);
@@ -1403,44 +1405,44 @@ mod tests {
     }
 
     #[test]
-    fn test_server_defaults_state_four_slots_and_thirty_seconds() {
+    fn test_server_defaults_state_four_workers_and_thirty_seconds() {
         let table = ServerConfiguration::default();
-        assert_eq!(table.blocking_slots, 4);
-        assert_eq!(table.blocking_queue_timeout, Duration::from_millis(30_000));
+        assert_eq!(table.num_workers, 4);
+        assert_eq!(table.worker_queue_timeout, Duration::from_millis(30_000));
         assert_eq!(WorkspaceConfiguration::default().validate(), Ok(()));
     }
 
     #[test]
     fn test_server_bounds_are_enforced() {
         let mut configuration = WorkspaceConfiguration::default();
-        for slots in [0, SERVER_BLOCKING_SLOTS_MAX + 1] {
-            configuration.server.blocking_slots = slots;
+        for workers in [0, SERVER_NUM_WORKERS_MAX + 1] {
+            configuration.server.num_workers = workers;
             assert!(
                 matches!(
                     configuration.validate(),
                     Err(ConfigurationViolation::LimitOutOfRange {
-                        field: "server.blocking_slots",
+                        field: "server.num_workers",
                         ..
                     })
                 ),
-                "blocking_slots {slots} must be refused"
+                "num_workers {workers} must be refused"
             );
         }
-        configuration.server.blocking_slots = SERVER_BLOCKING_SLOTS_MAX;
+        configuration.server.num_workers = SERVER_NUM_WORKERS_MAX;
         for timeout_ms in [0, SERVER_QUEUE_TIMEOUT_MS_MAX + 1] {
-            configuration.server.blocking_queue_timeout = Duration::from_millis(timeout_ms);
+            configuration.server.worker_queue_timeout = Duration::from_millis(timeout_ms);
             assert!(
                 matches!(
                     configuration.validate(),
                     Err(ConfigurationViolation::LimitOutOfRange {
-                        field: "server.blocking_queue_timeout",
+                        field: "server.worker_queue_timeout",
                         ..
                     })
                 ),
-                "blocking_queue_timeout {timeout_ms}ms must be refused"
+                "worker_queue_timeout {timeout_ms}ms must be refused"
             );
         }
-        configuration.server.blocking_queue_timeout =
+        configuration.server.worker_queue_timeout =
             Duration::from_millis(SERVER_QUEUE_TIMEOUT_MS_MAX);
         assert_eq!(configuration.validate(), Ok(()));
     }
@@ -1459,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_language_selectors_admit_names_and_dialects() {
+    fn test_language_selectors_accept_names_and_dialects() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.execution.allow = vec!["python".to_owned(), "sql:postgresql".to_owned()];
         assert_eq!(configuration.validate(), Ok(()));
@@ -1537,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_text_defaults_admit_markdown_and_text_extensions() {
+    fn test_search_text_defaults_include_markdown_and_text_extensions() {
         let configuration = WorkspaceConfiguration::default();
         assert_eq!(
             configuration.search.text.extensions,
@@ -1569,7 +1571,7 @@ mod tests {
         assert_eq!(
             configuration.validate(),
             Ok(()),
-            "an extension at the exact byte bound must be admitted"
+            "an extension at the exact byte bound must be accepted"
         );
     }
 
@@ -1586,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_text_extensions_admit_the_cap_and_refuse_above_it() {
+    fn test_search_text_extensions_accept_the_cap_and_refuse_above_it() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.search.text.extensions = (0..TEXT_EXTENSIONS_MAX)
             .map(|index| format!("e{index}"))
@@ -1995,14 +1997,14 @@ mod tests {
                 json!(EXECUTION_ALLOW_ITEMS_MAX),
             ),
             (
-                "blocking slots min",
-                &server["blocking_slots"]["minimum"],
+                "num workers min",
+                &server["num_workers"]["minimum"],
                 json!(1),
             ),
             (
-                "blocking slots max",
-                &server["blocking_slots"]["maximum"],
-                json!(SERVER_BLOCKING_SLOTS_MAX),
+                "num workers max",
+                &server["num_workers"]["maximum"],
+                json!(SERVER_NUM_WORKERS_MAX),
             ),
             (
                 "concurrent min",

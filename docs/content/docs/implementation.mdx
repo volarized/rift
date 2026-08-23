@@ -1,0 +1,170 @@
+---
+title: Implementation
+---
+
+import { FlatDiagram } from "@/components/flat-diagram";
+
+This page goes into how Rift is built. It's developer-oriented — if you just want to use Rift,
+check the [main documentation](/docs).
+
+<FlatDiagram
+  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /api/mcp route over Streamable HTTP. The server, an Axum application on Tokio, accepts rift.toml, mounts projections through Rift FS, and runs hooks on each change. Inside the providers-and-index box, provider compositions feed facts into the in-memory index, which publishes lexical units through Toasty over SQLite into .rift/db; the server queries both. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
+  chart={`
+    flowchart LR
+      agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
+      mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
+      toml["rift.toml"]:::config -- "acceptance" --> server
+      server -- "mounts" --> fs["Rift FS<br/>NFS or FUSE"]:::rift
+      fs -- "serves" --> proj[".rift/projections/<br/>my-feature-one"]:::store
+      subgraph indexing["providers and index"]
+        providers["providers<br/>tree-sitter + engines"]:::provider
+        memory["in-memory index<br/>symbols + nodes"]:::store
+        db[".rift/db<br/>lexical units + FTS5"]:::store
+        providers -- "facts" --> memory
+        memory -- "publish units<br/>Toasty over SQLite" --> db
+      end
+      server -- "compositions" --> providers
+      subgraph engine["LSP engine"]
+        adapter["engine adapter"]:::provider
+        ls["language server<br/>stdio child"]:::provider
+        adapter -- "plan request" --> ls
+        ls -- "edit plan" --> adapter
+      end
+      providers -- "resolve" --> adapter
+      adapter -. "edit proposals" .-> server
+      server -- "on change" --> hooks["hooks"]:::hook
+  `}
+/>
+
+## The rift binary
+
+<VersionBadge version="planned" />
+
+Rift is delivered as one binary, installed as the [Install](/docs#install) section describes.
+The CLI is implemented with [clap](https://docs.rs/clap), and Rift's two main capabilities are
+implemented as `rift mcp` and `rift server`.
+
+### rift mcp
+
+`rift mcp` is an agent-compatible MCP stdio server. Under the hood it takes input from the
+agent over the stdio transport and forwards each request to the workspace's `rift server` over
+Streamable HTTP; the `rift mcp` process holds no state of its own, following MCP's protocol
+concepts. To reach the workspace's server it checks the server lock file —
+[`ServerLock`](/docs/protocol/reference#ServerLock) at `.rift/server.json` — and starts a
+server when the file is absent.
+
+### rift server
+
+The server is an [Axum](https://docs.rs/axum) application on the [Tokio](https://tokio.rs)
+runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP through
+[rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; the rest of the
+routes are reserved for other surfaces, the SCIP export for example.
+
+Startup runs one cycle:
+
+1. Parse `rift.toml` and accept the workspace; an invalid file keeps the server running but
+   refuses every request until fixed.
+2. Take the file lock on `.rift/server.json`, which picks one starter among racing `rift mcp`
+   processes.
+3. Bind a loopback port in the 12000–13000 range, mint the bearer token, and write both into
+   the lock file.
+4. Start the native filesystem watcher.
+5. Schedule the initial scan and parse on a Tokio-managed blocking task, so traversal and
+   parsing never occupy an async MCP worker.
+6. Serve until no request arrives for the idle timeout `rift.toml` sets, then stop.
+
+Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
+queue, and a worker picks it up when one is free. This behavior is configurable via the
+`num_workers` and `worker_queue_timeout` keys in the
+[`[server]` section](/docs/configuration#server).
+
+The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories. The
+symbol index stays in memory as one immutable value: a rebuild constructs the next index and
+accepted configuration outside the async lock, then swaps the complete value under its write
+lock. Each request clones the published value under a read lock and retains that capture through
+its result, so reads never combine state from two index revisions.
+
+Watcher events and Rift-applied changes advance one workspace change counter and enter the same
+serialized rebuild lane. Before each current-tree read, the server reconciles watcher state
+against an exact fingerprint of the included workspace files, then waits until the published
+index counter matches it — the mechanism behind the freshness the
+[`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) reports.
+
+## Rift FS
+
+<VersionBadge version="planned" />
+
+Rift FS mounts each served tree through the host's native client: NFSv3 loopback via
+[nfsserve](https://github.com/xetdata/nfsserve) on macOS — an unprivileged mount, no kernel
+extension — and FUSE via [fuser](https://github.com/cberner/fuser) on Linux, unprivileged
+through `fusermount3`. A host where neither mounts falls back to a copy-backed tree with the
+same contract.
+
+The overlay holds a pinned lower layer and a per-tree upper store. The first write to a path
+detaches it into the store; a deletion leaves a whiteout; `.rift` is never served. Lower-layer
+reads go through a [foyer](https://github.com/foyer-rs/foyer) hybrid cache — hot 256 KiB
+segments in memory, warm segments on disk. Removal force-unmounts without waiting on processes
+still inside.
+
+## rift db
+
+<VersionBadge version="v0.0.9" languages={["Rust"]} />
+
+One [SQLite](https://www.sqlite.org/) database at `.rift/db` holds every store Rift persists
+for the workspace — today, the lexical index. The server lock, projection directories, and
+execution copies stay separate entries under `.rift`; the database carries stores that are
+rows, not trees. Access goes through [Toasty](https://github.com/tokio-rs/toasty) models; the
+full-text surface is raw SQL, because Toasty 0.10 has no typed virtual-table or `MATCH` API,
+and the raw boundary stays confined to the FTS table and its rows.
+
+Publication replaces the whole unit set and restamps the revision, so the store is never a
+partial mix of two trees.
+
+The lexical index's tables:
+
+- `lexical_units` — one row per indexed unit: a code symbol, or a text file split into chunks
+  past the [`[search.text]`](/docs/configuration#search) chunk bound.
+- `lexical_index_state` — stamps the set with the tree revision that published it; a search
+  request trusts the store only when that stamp equals the snapshot it reads.
+- `lexical_units_fts` — the [FTS5](https://www.sqlite.org/fts5.html) virtual table over `name`
+  and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25`
+  with per-column weights, comparable only within one search.
+
+Search is a layered configuration: the default is this full-text store alone, and naming a model
+in [`search.embedding`](/docs/configuration#search) adds a per-model vector store whose cosine
+similarity the server fuses into the lexical score — the layering the
+[architecture](/docs/architecture#search) page describes.
+
+## Language providers
+
+<VersionBadge version="planned" />
+
+A provider composition is a typed pipeline of named stages — source resolvers, fact providers,
+enrichers, transforms — connected through declared input and output flows, with keyed joins for
+revision-keyed history. The Rust builder inserts, replaces, branches, merges, and nests stages;
+Rift validates types, capabilities, and cycles at build, then owns scheduling, caching, and
+invalidation.
+
+Syntax providers wrap [tree-sitter](https://tree-sitter.github.io/tree-sitter/) grammars behind
+a Rift-owned adapter: grammar node kinds resolve to numeric ids once, and raw query and cursor
+APIs never leave the syntax crate.
+
+An LSP-backed language engine is a child process the server spawns in stdio mode — one per
+language and targeted tree, rooted at that tree's directory. Semantic facts and edit plans
+return through the provider contract, and the server notifies the engine of writes itself,
+because no filesystem watcher sees inside a served tree.
+
+## Hooks and configuration
+
+<VersionBadge version="v0.0.5" />
+
+`rift.toml` at the workspace root is accepted at startup and re-accepted on change; its schema
+is exported beside the MCP surface as [`rift.schema.json`](https://volar.sh/rift/rift.schema.json),
+so editors validate the file as it is written. A quantity value carries its unit:
+`timeout = "120s"`.
+
+A hook is a configured command the server runs inside the changed tree after a change lands,
+with a declared environment, bounded output, and a timeout. Its verdict attaches to the change
+as [`GuaranteeEvidence`](/docs/protocol/reference#GuaranteeEvidence) or an advisory, and a hook
+that fails or does not finish gates publication in a projection. Keys and defaults live on the
+[configuration](/docs/configuration) page.

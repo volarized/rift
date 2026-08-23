@@ -15,7 +15,7 @@ pub const SOURCE_PATTERNS_MAX: usize = 512;
 #[serde(default, deny_unknown_fields)]
 pub struct SourceConfiguration {
     /// Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.
-    /// Empty admits every file `exclude` and `.gitignore` leave standing.
+    /// Empty includes every file `exclude` and `.gitignore` leave standing.
     #[schemars(length(max = 512))]
     pub include: Vec<PathPattern>,
     /// Exact file paths or globs dropped from visibility, in [`PathPattern`] syntax. A match
@@ -82,7 +82,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_source_pattern_lists_admit_the_cap_and_refuse_above_it() {
+    fn test_source_pattern_lists_accept_the_cap_and_refuse_above_it() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.source.include = (0..SOURCE_PATTERNS_MAX)
             .map(|index| PathPattern(format!("src/{index}.rs")))

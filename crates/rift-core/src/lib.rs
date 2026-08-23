@@ -11,7 +11,7 @@ mod path;
 pub mod constants;
 pub mod line;
 
-pub use configuration::{SourceVisibility, TextFileAdmission};
+pub use configuration::{SourceVisibility, TextFileInclusion};
 pub use error::{
     CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, LimitEvidence,
     RetryDirective, RiftError, fault_label, render_failure,

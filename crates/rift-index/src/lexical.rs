@@ -25,9 +25,9 @@ use toasty_driver_sqlite::Sqlite;
 
 /// Default maximum indexed lexical units per index.
 const LEXICAL_UNITS_MAX_DEFAULT: u32 = 20_000;
-/// Default maximum content bytes admitted for one lexical unit (1 MiB).
+/// Default maximum content bytes accepted for one lexical unit (1 MiB).
 const LEXICAL_UNIT_BYTES_MAX_DEFAULT: u32 = 1_048_576;
-/// Default maximum distinct query terms admitted per search.
+/// Default maximum distinct query terms accepted per search.
 const LEXICAL_QUERY_TERMS_MAX_DEFAULT: u32 = 32;
 /// Default maximum search results returned per query.
 const LEXICAL_MATCHES_MAX_DEFAULT: u32 = 1_000;
@@ -36,7 +36,7 @@ const LEXICAL_POOL_SLOTS_DEFAULT: u32 = 4;
 /// Default busy-wait budget, in milliseconds, `SQLite` grants a connection
 /// before returning `SQLITE_BUSY`.
 const LEXICAL_BUSY_TIMEOUT_MS_DEFAULT: u32 = 1_000;
-/// Maximum UTF-8 bytes admitted for one unit's declaration name, matching
+/// Maximum UTF-8 bytes accepted for one unit's declaration name, matching
 /// the wire's symbol-name maximum.
 const UNIT_NAME_BYTES_MAX: usize = 4_096;
 
@@ -275,19 +275,19 @@ impl LexicalIndexLimits {
         }
     }
 
-    /// Returns maximum indexed units admitted per `replace_all`.
+    /// Returns maximum indexed units accepted per `replace_all`.
     #[must_use]
     pub const fn units_max(self) -> u32 {
         self.units_max
     }
 
-    /// Returns maximum content bytes admitted for one unit.
+    /// Returns maximum content bytes accepted for one unit.
     #[must_use]
     pub const fn unit_bytes_max(self) -> u32 {
         self.unit_bytes_max
     }
 
-    /// Returns maximum distinct query terms admitted per search.
+    /// Returns maximum distinct query terms accepted per search.
     #[must_use]
     pub const fn query_terms_max(self) -> u32 {
         self.query_terms_max
@@ -314,7 +314,7 @@ impl LexicalIndexLimits {
 }
 
 impl Default for LexicalIndexLimits {
-    /// Defaults admit 20,000 units, 1 MiB per unit, 32 distinct query terms,
+    /// Defaults accept 20,000 units, 1 MiB per unit, 32 distinct query terms,
     /// 1,000 returned matches, 4 pooled connections, and a 1,000ms busy
     /// timeout.
     fn default() -> Self {
@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lexical_index_limits_default_admits_documented_pool_and_timeout() {
+    fn test_lexical_index_limits_default_accepts_documented_pool_and_timeout() {
         let limits = LexicalIndexLimits::default();
         assert_eq!(limits.pool_slots(), 4);
         assert_eq!(limits.busy_timeout_ms(), 1_000);

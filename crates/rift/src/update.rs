@@ -560,7 +560,7 @@ fn download_too_large(bytes_max: u64) -> UpdateError {
     )
 }
 
-/// Read limit admitting one sentinel byte past `bytes_max` to detect oversized payloads.
+/// Read limit accepting one sentinel byte past `bytes_max` to detect oversized payloads.
 const fn bytes_max_with_sentinel(bytes_max: u64) -> u64 {
     bytes_max.saturating_add(1)
 }

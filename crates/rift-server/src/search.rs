@@ -18,7 +18,7 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, RustSymbol};
 
 use crate::read::{
-    ReadError, ReadFault, ReadService, admitted_limit, complete_coverage, excerpt, file_id,
+    ReadError, ReadFault, ReadService, accepted_limit, complete_coverage, excerpt, file_id,
     project_path, rust_language, source_span, validate_common, wire_symbol,
 };
 
@@ -49,7 +49,7 @@ impl ReadService {
         if query.is_empty() {
             return Err(ReadFault::invalid("query", "empty"));
         }
-        let limit = admitted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
+        let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
         let root = self.index().root();
         let selector = params.paths.as_ref();
         let matcher = path_matcher(root, selector)?;
@@ -177,9 +177,9 @@ fn pattern_strings(patterns: &[PathPattern]) -> Vec<String> {
     patterns.iter().map(|pattern| pattern.0.clone()).collect()
 }
 
-/// Whether `path` (project-relative) passes `matcher`, absent a matcher admitting every path.
-fn admits(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> bool {
-    matcher.is_none_or(|matcher| matcher.admits(&root.join(path.as_str())))
+/// Whether `path` (project-relative) passes `matcher`, absent a matcher including every path.
+fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> bool {
+    matcher.is_none_or(|matcher| matcher.includes(&root.join(path.as_str())))
 }
 
 /// Symbol and lexical hits from the index, filtered by `matcher` and collected up to
@@ -202,7 +202,7 @@ fn collect_indexed_hits(
             .symbols(query, fetch_limit)
             .map_err(ReadFault::index)?
         {
-            if !admits(matcher, root, matched.file.path()) {
+            if !includes(matcher, root, matched.file.path()) {
                 continue;
             }
             results.push(symbol_search_hit(matched));
@@ -218,7 +218,7 @@ fn collect_indexed_hits(
             .source_matches(query, fetch_limit)
             .map_err(ReadFault::index)?
         {
-            if !admits(matcher, root, file.path()) {
+            if !includes(matcher, root, file.path()) {
                 continue;
             }
             results.push(file_search_hit(file, line, text));
@@ -594,7 +594,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         Ok((directory, service))
     }
@@ -639,7 +639,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         Ok((directory, service))
     }
@@ -665,7 +665,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         Ok((directory, service))
     }
@@ -698,7 +698,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &visibility,
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         Ok((directory, service))
     }
@@ -1272,7 +1272,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileAdmission::default(),
+            &rift_core::TextFileInclusion::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "extra",
@@ -1484,7 +1484,7 @@ pub fn compute() -> i32 {
 
     #[test]
     fn collect_lexical_hits_skips_a_text_file_path_the_index_no_longer_carries() -> TestResult {
-        // `fixture()` admits `README.md` as its only text file, so `guide.md` is a path the
+        // `fixture()` includes `README.md` as its only text file, so `guide.md` is a path the
         // index never carried.
         let (_directory, service) = fixture()?;
         let vanished = LexicalMatch::new(
@@ -1521,8 +1521,8 @@ pub fn compute() -> i32 {
         fs::write(directory.path().join("guide.md"), content)?;
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
-        let text_admission = rift_core::TextFileAdmission::default();
-        let service = ReadService::build(directory.path(), limits, &visibility, &text_admission)?;
+        let text_inclusion = rift_core::TextFileInclusion::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text_inclusion)?;
         let worse = LexicalMatch::new(
             "guide.md#0",
             rift_core::ProjectPath::new("guide.md")?,
@@ -1565,8 +1565,8 @@ pub fn compute() -> i32 {
         fs::write(directory.path().join("guide.md"), "alpha units beta\n")?;
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
-        let text_admission = rift_core::TextFileAdmission::default();
-        let service = ReadService::build(directory.path(), limits, &visibility, &text_admission)?;
+        let text_inclusion = rift_core::TextFileInclusion::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text_inclusion)?;
         let file = service
             .index()
             .text_files()

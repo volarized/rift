@@ -69,7 +69,7 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
             json!({
                 "name": "beacon",
                 "rev": "main",
-                "projection": "rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "projection": "rift://projection/my-feature-one"
             }),
         ),
     ];

@@ -35,7 +35,7 @@ impl SourceVisibility {
         }
     }
 
-    /// Patterns a file must match to stay visible; empty admits every file.
+    /// Patterns a file must match to stay visible; empty includes every file.
     #[must_use]
     pub fn include(&self) -> &[String] {
         &self.include
@@ -55,7 +55,7 @@ impl SourceVisibility {
 }
 
 impl Default for SourceVisibility {
-    /// Every file admitted, none excluded, `.gitignore` respected.
+    /// Every file included, none excluded, `.gitignore` respected.
     fn default() -> Self {
         Self::new(Vec::new(), Vec::new(), true)
     }
@@ -74,16 +74,16 @@ impl From<&SourceConfiguration> for SourceVisibility {
     }
 }
 
-/// Which non-source text files the lexical index admits: the resolved `[search.text]`
+/// Which non-source text files the lexical index includes: the resolved `[search.text]`
 /// policy, independent of the wire model it was read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextFileAdmission {
+pub struct TextFileInclusion {
     extensions: Vec<String>,
     chunk_bytes_max: u64,
 }
 
-impl TextFileAdmission {
-    /// Builds one text-admission policy from its extension list and chunk bound.
+impl TextFileInclusion {
+    /// Builds one text-inclusion policy from its extension list and chunk bound.
     #[must_use]
     pub const fn new(extensions: Vec<String>, chunk_bytes_max: u64) -> Self {
         Self {
@@ -92,43 +92,43 @@ impl TextFileAdmission {
         }
     }
 
-    /// Extensions, without the leading dot, admitted as text-file lexical units.
+    /// Extensions, without the leading dot, included as text-file lexical units.
     #[must_use]
     pub fn extensions(&self) -> &[String] {
         &self.extensions
     }
 
-    /// Bytes one lexical chunk derived from an admitted text file may hold.
+    /// Bytes one lexical chunk derived from an included text file may hold.
     #[must_use]
     pub const fn chunk_bytes_max(&self) -> u64 {
         self.chunk_bytes_max
     }
 
-    /// Whether `path`'s extension is one this policy admits. The comparison is
-    /// case-insensitive against the configured lowercase spellings — `README.MD` is admitted
+    /// Whether `path`'s extension is one this policy includes. The comparison is
+    /// case-insensitive against the configured lowercase spellings — `README.MD` is included
     /// by `extensions = ["md"]`, matching how case-insensitive filesystems already present
-    /// extensions to callers — while configuration admission still refuses any entry that is
+    /// extensions to callers — while configuration acceptance still refuses any entry that is
     /// not itself lowercase.
     #[must_use]
-    pub fn admits(&self, path: &std::path::Path) -> bool {
+    pub fn includes(&self, path: &std::path::Path) -> bool {
         path.extension()
             .and_then(std::ffi::OsStr::to_str)
             .is_some_and(|extension| {
                 self.extensions
                     .iter()
-                    .any(|admitted| admitted.eq_ignore_ascii_case(extension))
+                    .any(|included| included.eq_ignore_ascii_case(extension))
             })
     }
 }
 
-impl Default for TextFileAdmission {
-    /// Every default `[search.text]` extension admitted, at the default chunk bound.
+impl Default for TextFileInclusion {
+    /// Every default `[search.text]` extension included, at the default chunk bound.
     fn default() -> Self {
         Self::from(&SearchConfiguration::default())
     }
 }
 
-impl From<&SearchConfiguration> for TextFileAdmission {
+impl From<&SearchConfiguration> for TextFileInclusion {
     fn from(search: &SearchConfiguration) -> Self {
         Self::new(
             search.text.extensions.clone(),
@@ -187,36 +187,36 @@ mod tests {
     }
 
     #[test]
-    fn test_text_file_admission_converts_from_wire_search_configuration() {
+    fn test_text_file_inclusion_converts_from_wire_search_configuration() {
         let mut search = rift_protocol::configuration::SearchConfiguration::default();
         search.text.extensions = vec!["md".to_owned(), "rst".to_owned()];
         search.text.max_chunk = ByteSize::from_bytes(2 << 20);
-        let admission = TextFileAdmission::from(&search);
-        assert_eq!(admission.extensions(), ["md", "rst"]);
-        assert_eq!(admission.chunk_bytes_max(), 2 << 20);
+        let inclusion = TextFileInclusion::from(&search);
+        assert_eq!(inclusion.extensions(), ["md", "rst"]);
+        assert_eq!(inclusion.chunk_bytes_max(), 2 << 20);
     }
 
     #[test]
-    fn test_text_file_admission_default_matches_default_search_configuration() {
-        let admission = TextFileAdmission::default();
-        assert_eq!(admission.extensions(), ["md", "mdx", "txt"]);
-        assert_eq!(admission.chunk_bytes_max(), 1 << 20);
+    fn test_text_file_inclusion_default_matches_default_search_configuration() {
+        let inclusion = TextFileInclusion::default();
+        assert_eq!(inclusion.extensions(), ["md", "mdx", "txt"]);
+        assert_eq!(inclusion.chunk_bytes_max(), 1 << 20);
         assert_eq!(
-            admission,
-            TextFileAdmission::from(&rift_protocol::configuration::SearchConfiguration::default())
+            inclusion,
+            TextFileInclusion::from(&rift_protocol::configuration::SearchConfiguration::default())
         );
     }
 
     #[test]
-    fn test_text_file_admission_admits_a_configured_extension_case_insensitively() {
-        let admission = TextFileAdmission::new(vec!["md".to_owned()], 1_024);
-        assert!(admission.admits(std::path::Path::new("docs/readme.md")));
+    fn test_text_file_inclusion_includes_a_configured_extension_case_insensitively() {
+        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 1_024);
+        assert!(inclusion.includes(std::path::Path::new("docs/readme.md")));
         assert!(
-            admission.admits(std::path::Path::new("docs/README.MD")),
-            "a mixed-case filesystem extension must still be admitted"
+            inclusion.includes(std::path::Path::new("docs/README.MD")),
+            "a mixed-case filesystem extension must still be included"
         );
-        assert!(!admission.admits(std::path::Path::new("docs/readme.txt")));
-        assert!(!admission.admits(std::path::Path::new("docs/no-extension")));
+        assert!(!inclusion.includes(std::path::Path::new("docs/readme.txt")));
+        assert!(!inclusion.includes(std::path::Path::new("docs/no-extension")));
     }
 
     #[test]
@@ -229,13 +229,13 @@ mod tests {
             Err(ConfigurationViolation::TextExtensionInvalid {
                 extension: "MD".to_owned(),
             }),
-            "config-side admission must still refuse an uppercase extension entry, even though \
+            "config-side acceptance must still refuse an uppercase extension entry, even though \
              the runtime path-matching predicate is case-insensitive"
         );
     }
 
     #[test]
-    fn test_source_visibility_default_admits_everything_and_respects_gitignore() {
+    fn test_source_visibility_default_includes_everything_and_respects_gitignore() {
         let visibility = SourceVisibility::default();
         assert!(visibility.include().is_empty());
         assert!(visibility.exclude().is_empty());

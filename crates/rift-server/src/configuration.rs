@@ -2,7 +2,7 @@
 //!
 //! The file's shape and bounds are the protocol's
 //! [`WorkspaceConfiguration`]; this module owns the filesystem half: reading
-//! the file, refusing one the model cannot admit, and treating a missing
+//! the file, refusing one the model cannot accept, and treating a missing
 //! file as the default configuration.
 
 use std::path::Path;
@@ -16,7 +16,7 @@ use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguratio
 pub const CONFIGURATION_FILE_BYTES_MAX: u64 = 256 << 10;
 
 /// One configuration failure: why the workspace's `rift.toml` cannot be
-/// admitted.
+/// accepted.
 #[derive(Debug)]
 pub enum ConfigurationFault {
     /// The file exists but its bytes could not be read.
@@ -30,7 +30,7 @@ pub enum ConfigurationFault {
     Oversized {
         /// The file's size in bytes.
         bytes: u64,
-        /// The admitted maximum in bytes.
+        /// The accepted maximum in bytes.
         bytes_max: u64,
     },
     /// The file is not the documented TOML shape: a syntax error, an
@@ -98,13 +98,13 @@ pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, Configu
             }));
         }
     };
-    admit_configuration(&raw)
+    accept_configuration(&raw)
 }
 
-/// Admits one configuration text: size bound, shape, then value bounds.
+/// Accepts one configuration text: size bound, shape, then value bounds.
 /// Split from the read so every refusal path is testable without a
 /// filesystem.
-fn admit_configuration(raw: &str) -> Result<WorkspaceConfiguration, ConfigurationError> {
+fn accept_configuration(raw: &str) -> Result<WorkspaceConfiguration, ConfigurationError> {
     let bytes = raw.len() as u64;
     if bytes > CONFIGURATION_FILE_BYTES_MAX {
         return Err(Error::new(ConfigurationFault::Oversized {
@@ -157,12 +157,12 @@ determinism = "deterministic"
     fn test_missing_file_is_the_default_configuration() {
         let directory = tempfile::tempdir().expect("tempdir");
         let configuration =
-            load_configuration(directory.path()).expect("a missing file must admit defaults");
+            load_configuration(directory.path()).expect("a missing file must accept defaults");
         assert_eq!(configuration, WorkspaceConfiguration::default());
     }
 
     #[test]
-    fn test_documented_example_file_is_admitted() {
+    fn test_documented_example_file_is_accepted() {
         let directory = tempfile::tempdir().expect("tempdir");
         let contents = format!(
             r#"
@@ -184,7 +184,7 @@ embedding = "potion-retrieval-32M"
         );
         write_configuration(&directory, &contents);
         let configuration =
-            load_configuration(directory.path()).expect("the documented example must be admitted");
+            load_configuration(directory.path()).expect("the documented example must be accepted");
         assert_eq!(configuration.execution.allow, ["python"]);
         assert_eq!(
             configuration.execution.max_code,
@@ -203,13 +203,13 @@ embedding = "potion-retrieval-32M"
         assert_eq!(hook.determinism, Determinism::Deterministic);
     }
 
-    /// The repository's own `rift.toml`, exercised so the committed file admits cleanly
+    /// The repository's own `rift.toml`, exercised so the committed file accepts cleanly
     /// under the exact model this module validates against.
     #[test]
-    fn test_repository_rift_toml_admits_cleanly() {
+    fn test_repository_rift_toml_accepts_cleanly() {
         let raw = include_str!("../../../rift.toml");
         let configuration =
-            admit_configuration(raw).expect("the repository's rift.toml must admit cleanly");
+            accept_configuration(raw).expect("the repository's rift.toml must accept cleanly");
         assert!(configuration.source.include.is_empty());
         let excluded: Vec<&str> = configuration
             .source
@@ -230,7 +230,7 @@ embedding = "potion-retrieval-32M"
 
     #[test]
     fn test_unknown_key_is_refused_as_malformed() {
-        let error = admit_configuration("[execution]\nmax_codes = \"16kb\"\n")
+        let error = accept_configuration("[execution]\nmax_codes = \"16kb\"\n")
             .expect_err("an unknown key must refuse the file");
         assert!(matches!(
             error.fault(),
@@ -249,7 +249,7 @@ embedding = "potion-retrieval-32M"
     #[test]
     fn test_toml_syntax_error_is_refused_as_malformed() {
         let error =
-            admit_configuration("[execution\n").expect_err("a syntax error must refuse the file");
+            accept_configuration("[execution\n").expect_err("a syntax error must refuse the file");
         assert!(matches!(
             error.fault(),
             ConfigurationFault::Malformed { .. }
@@ -259,7 +259,7 @@ embedding = "potion-retrieval-32M"
     #[test]
     fn test_hook_missing_required_key_is_refused() {
         let trimmed = DOCUMENTED_HOOK.replace("environment = {}\n", "");
-        let error = admit_configuration(&trimmed)
+        let error = accept_configuration(&trimmed)
             .expect_err("a hook without environment must refuse the file");
         assert!(
             error.to_string().contains("environment"),
@@ -271,7 +271,7 @@ embedding = "potion-retrieval-32M"
     fn test_out_of_bounds_value_is_refused_with_field_evidence() {
         let broken = DOCUMENTED_HOOK.replace(r#"timeout = "120s""#, r#"timeout = "0ms""#);
         let error =
-            admit_configuration(&broken).expect_err("a zero hook timeout must refuse the file");
+            accept_configuration(&broken).expect_err("a zero hook timeout must refuse the file");
         assert!(matches!(error.fault(), ConfigurationFault::Invalid(_)));
         let message = error.to_string();
         assert!(
@@ -283,7 +283,7 @@ embedding = "potion-retrieval-32M"
     #[test]
     fn test_absolute_hook_executable_is_refused() {
         let broken = DOCUMENTED_HOOK.replace("program = \"cargo\"", "program = \"/bin/cargo\"");
-        let error = admit_configuration(&broken)
+        let error = accept_configuration(&broken)
             .expect_err("an absolute executable path must refuse the file");
         assert!(
             error.to_string().contains("/bin/cargo"),
@@ -295,7 +295,8 @@ embedding = "potion-retrieval-32M"
     fn test_oversized_file_is_refused_before_parsing() {
         let oversized = "# padding\n".repeat(1 << 15);
         assert!(oversized.len() as u64 > CONFIGURATION_FILE_BYTES_MAX);
-        let error = admit_configuration(&oversized).expect_err("an oversized file must be refused");
+        let error =
+            accept_configuration(&oversized).expect_err("an oversized file must be refused");
         assert!(matches!(
             error.fault(),
             ConfigurationFault::Oversized { .. }
@@ -303,7 +304,7 @@ embedding = "potion-retrieval-32M"
         let message = error.to_string();
         assert!(
             message.contains("bytes") && message.contains("bytes_max 262144"),
-            "the refusal must name the size and the admitted maximum: {message}"
+            "the refusal must name the size and the accepted maximum: {message}"
         );
     }
 
