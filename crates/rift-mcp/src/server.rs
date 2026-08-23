@@ -366,38 +366,48 @@ impl RiftMcp {
     /// full-text matches from admitted `[search.text]` files and declaration bodies. `rev`
     /// searches a version-control revision instead of the current tree. Use `get_symbol`
     /// when the declaration name is known.
+    ///
+    /// For a current-tree search, the published workspace is resolved exactly once and
+    /// threaded through both the lexical tier's revision check and the executed
+    /// `ReadService::search` call: a concurrent rebuild between two separate resolutions
+    /// could otherwise validate lexical matches against one snapshot and merge them into
+    /// results computed from another.
     #[tool]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        let rev = params.rev.clone();
-        let lexical_matches = self.lexical_search_matches(&params).await?;
-        self.read_at(rev, move |reads| reads.search(&params, &lexical_matches))
+        let Some(rev) = params.rev.clone() else {
+            let published = self.published_workspace(wire::ErrorPhase::Read).await?;
+            let lexical_matches = self.lexical_search_matches(&params, &published).await?;
+            return self
+                .current_tree_read(&published, move |reads| {
+                    reads.search(&params, &lexical_matches)
+                })
+                .await;
+        };
+        // The lexical tier only ever holds the current tree, so a revision-addressed
+        // search never consults it.
+        self.read_at(Some(rev), move |reads| reads.search(&params, &[]))
             .await
     }
 
-    /// Runs the lexical search-index tier for one search request against the currently
-    /// published workspace, when the tier is available and its stamped tree revision still
-    /// matches what is published. A revision mismatch or an absent handle answers with no
+    /// Runs the lexical search-index tier for one search request against `published` —
+    /// the exact snapshot the caller also runs `ReadService::search` against, never a
+    /// separately resolved one — when the tier is available and its stamped tree revision
+    /// still matches `published`'s. A revision mismatch or an absent handle answers with no
     /// lexical matches, so identifier search proceeds alone rather than serving a possibly
-    /// stale tier — a request naming `rev` never consults this tier, since the tier only
-    /// ever holds the current tree. A query-term limit the adapter refuses surfaces as this
-    /// request's own `limit_exceeded` error, never a silent degrade.
+    /// stale tier. A query-term limit the adapter refuses surfaces as this request's own
+    /// `limit_exceeded` error, never a silent degrade.
     async fn lexical_search_matches(
         &self,
         params: &SearchParams,
+        published: &PublishedWorkspace,
     ) -> Result<Vec<LexicalMatch>, ErrorData> {
-        if params.rev.is_some() {
-            return Ok(Vec::new());
-        }
         let Some(lexical) = self.lexical.as_ref() else {
             return Ok(Vec::new());
         };
         let Some(query) = params.query.as_deref().filter(|query| !query.is_empty()) else {
-            return Ok(Vec::new());
-        };
-        let Ok(published) = self.published_workspace(wire::ErrorPhase::Read).await else {
             return Ok(Vec::new());
         };
         let Ok(current_revision) = lexical.tree_revision().await else {
@@ -406,9 +416,15 @@ impl RiftMcp {
         if current_revision.as_deref() != Some(published.reads.tree_revision()) {
             return Ok(Vec::new());
         }
+        // The enforced ceiling identifier search itself would refuse past (`results_max`),
+        // so the lexical tier never overfetches beyond what a merge could ever keep; this
+        // also keeps the later `u32` conversion within range without needing its
+        // saturating fallback in practice.
+        let results_max = u64::try_from(self.limits.results_max()).unwrap_or(u64::MAX);
         let requested_limit = params
             .limit
-            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64);
+            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64)
+            .min(results_max);
         let fetch_limit =
             u32::try_from(requested_limit.saturating_mul(u64::from(LEXICAL_OVERFETCH_FACTOR)))
                 .unwrap_or(u32::MAX);
@@ -500,21 +516,15 @@ impl RiftMcp {
         Answer: Send + 'static,
     {
         let published = self.published_workspace(wire::ErrorPhase::Read).await?;
-        let configuration = published.configuration.admitted(wire::ErrorPhase::Read)?;
-        let read_error = |error: ReadError| error.tool_error(wire::ErrorPhase::Read);
         let Some(rev) = rev else {
-            let reads = Arc::clone(&published.reads);
-            return self
-                .blocking
-                .run("current workspace read", move || operation(&reads))
-                .await
-                .map(Json)
-                .map_err(read_error);
+            return self.current_tree_read(&published, operation).await;
         };
+        let configuration = published.configuration.admitted(wire::ErrorPhase::Read)?;
         if !configuration.providers.history.enabled {
-            return Err(read_error(ReadError::from(ReadFault::Unsupported {
+            return Err(ReadError::from(ReadFault::Unsupported {
                 capability: "revision reads (providers.history disabled)",
-            })));
+            })
+            .tool_error(wire::ErrorPhase::Read));
         }
         let visibility = SourceVisibility::from(&configuration.source);
         let root = self.root.clone();
@@ -526,7 +536,28 @@ impl RiftMcp {
             })
             .await
             .map(Json)
-            .map_err(read_error)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// Runs one read against `published`'s current-tree snapshot, behind the admission
+    /// gate every request passes. Shared by `read_at`'s current-tree path and `search`,
+    /// which resolves `published` itself first so the lexical tier's revision check and
+    /// the identifier read it merges into can never straddle two different snapshots.
+    async fn current_tree_read<Answer>(
+        &self,
+        published: &Arc<PublishedWorkspace>,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+    ) -> Result<Json<Answer>, ErrorData>
+    where
+        Answer: Send + 'static,
+    {
+        published.configuration.admitted(wire::ErrorPhase::Read)?;
+        let reads = Arc::clone(&published.reads);
+        self.blocking
+            .run("current workspace read", move || operation(&reads))
+            .await
+            .map(Json)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
 
     /// Returns one atomically published index and configuration policy.
@@ -841,7 +872,7 @@ mod tests {
 
     use rift_index::WorkspaceIndexLimits;
 
-    use rift_protocol::read::GetSymbolResult;
+    use rift_protocol::read::{GetSymbolResult, SearchParams, SearchResult};
     use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault};
 
     use rmcp::ServiceError;
@@ -869,6 +900,15 @@ mod tests {
             .expect("test symbol parameters must deserialize");
         server
             .get_symbol(Parameters(params))
+            .await
+            .map(|result| result.0)
+    }
+
+    async fn run_search(server: &RiftMcp, query: &str) -> Result<SearchResult, rmcp::ErrorData> {
+        let params: SearchParams = serde_json::from_value(json!({"query": query}))
+            .expect("test search parameters must deserialize");
+        server
+            .search(Parameters(params))
             .await
             .map(|result| result.0)
     }
@@ -1893,6 +1933,23 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn client_search_query_term_limit_carries_typed_limit_evidence() -> TestResult {
+        // One more distinct term than the lexical adapter's default `query_terms_max`.
+        let terms: Vec<String> = (0..33).map(|index| format!("term{index}")).collect();
+        let query = terms.join(" ");
+        let data = failing_call(&json!({ "query": query }), "search").await?;
+        assert_eq!(data.code, ErrorCode(-32000));
+        let wire = data.data.ok_or("wire error data must be present")?;
+        assert_eq!(wire["code"], json!("limit_exceeded"));
+        assert_eq!(
+            wire["limit"],
+            json!({ "field": "query_terms_max", "limit": 32, "required": 33 }),
+            "the query-term-limit refusal must carry typed wire evidence: {wire:#}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn serialized_change_refuses_when_index_already_moved() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -2160,6 +2217,68 @@ pub fn beacon() -> u64 {
             .await
             .map_err(|error| format!("traced read must serve: {error:?}"))?;
         assert_eq!(result.hits.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_disables_lexical_tier_when_rift_state_path_is_a_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        // A regular file already occupies `.rift`, so `create_dir_all` cannot make the
+        // state directory the lexical database needs.
+        fs::write(directory.path().join(".rift"), b"not a directory")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert!(
+            server.lexical.is_none(),
+            "a blocked state directory must degrade to no lexical tier, not fail startup"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_disables_lexical_tier_when_database_path_is_a_directory() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        // A directory at the database path fails the initial open; `remove_file` cannot
+        // remove a directory, so the recreate-once retry also fails against it unchanged —
+        // this is also the deterministic way to drive the recreate-once arm itself.
+        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert!(
+            server.lexical.is_none(),
+            "a database path occupied by a directory must exhaust the recreate-once retry \
+             and still leave the server running without the lexical tier"
+        );
+
+        // With no lexical tier, identifier search still serves results rather than failing.
+        let result = run_search(&server, "beacon").await?;
+        assert!(
+            !result.results.is_empty(),
+            "identifier search must still serve results without the lexical tier"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn search_times_out_while_publication_is_stalled_like_every_other_read() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        // Advance the observed epoch without an invalidation signal, so no rebuild ever
+        // publishes a matching snapshot and the read must wait. `search` resolves the
+        // published workspace exactly once (the TOCTOU fix in this review round), so a
+        // stalled publication fails the whole request the same way every other current-tree
+        // tool does, rather than merely degrading the lexical tier: `lexical_search_matches`
+        // is never even reached with a snapshot to validate against.
+        server
+            .validation
+            .observed_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let error = run_search(&server, "beacon")
+            .await
+            .expect_err("a stalled publication must miss the freshness deadline");
+        assert!(
+            error.message.contains("index freshness deadline elapsed"),
+            "unexpected refusal: {error:?}"
+        );
         Ok(())
     }
 }

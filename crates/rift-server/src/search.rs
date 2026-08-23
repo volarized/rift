@@ -569,14 +569,15 @@ mod tests {
     use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
     use rift_index::{LexicalMatch, LexicalUnitKind, WorkspaceIndexLimits};
     use rift_protocol::read::{
-        FileContent, FileId, MatchedField, SearchParams, SearchParamsTarget,
+        ExactKind, Extensions, FileContent, FileId, MatchedField, Node, NodeId, SearchParams,
+        SearchParamsTarget, TextRange,
     };
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
         ByteRange, File, ReadFault, ReadService, SearchHit, SearchHitTarget, SymbolMatchRank,
-        symbol_match_score,
+        rust_language, symbol_match_score,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1482,6 +1483,33 @@ pub fn compute() -> i32 {
     }
 
     #[test]
+    fn collect_lexical_hits_skips_a_text_file_path_the_index_no_longer_carries() -> TestResult {
+        // `fixture()` admits `README.md` as its only text file, so `guide.md` is a path the
+        // index never carried.
+        let (_directory, service) = fixture()?;
+        let vanished = LexicalMatch::new(
+            "guide.md",
+            rift_core::ProjectPath::new("guide.md")?,
+            LexicalUnitKind::TextFile,
+            Some("guide".to_owned()),
+            -5.0,
+        );
+        let mut results = Vec::new();
+        super::collect_lexical_hits(
+            service.index(),
+            "Beacon",
+            SearchParamsTarget::All,
+            &[vanished],
+            &mut results,
+        );
+        assert!(
+            results.is_empty(),
+            "a text-file path absent from the index must be skipped silently: {results:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[expect(
         clippy::float_cmp,
         reason = "the winning score is `lexical_score` applied to the exact literal rank the \
@@ -1527,6 +1555,75 @@ pub fn compute() -> i32 {
             "chunk matches for the same file must collapse to one hit: {results:#?}"
         );
         assert_eq!(results[0].score, super::lexical_score(-9.0));
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the winning score is an exact literal the test supplies, not a measurement \
+                  subject to rounding drift"
+    )]
+    fn merge_file_hit_absorbs_a_second_match_at_the_same_path_and_line() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("guide.md"), "alpha units beta\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
+        )?;
+        let file = service
+            .index()
+            .text_files()
+            .first()
+            .ok_or("fixture text file must be indexed")?;
+        let range = ByteRange { start: 0, end: 17 };
+        let mut results = Vec::new();
+
+        super::merge_file_hit(
+            &mut results,
+            file,
+            1,
+            range,
+            "alpha units beta".to_owned(),
+            0.4,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 0.4);
+        assert_eq!(results[0].matched_by, vec![MatchedField::Content]);
+
+        super::merge_file_hit(
+            &mut results,
+            file,
+            1,
+            range,
+            "alpha units beta".to_owned(),
+            0.9,
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "a second match at the same path and line must not duplicate the hit"
+        );
+        assert_eq!(results[0].score, 0.9, "the higher score must win");
+        assert_eq!(
+            results[0].matched_by,
+            vec![MatchedField::Content],
+            "matched_by must union without duplicating an already-present field"
+        );
+
+        // A lower-scoring third match must not pull the absorbed score back down.
+        super::merge_file_hit(
+            &mut results,
+            file,
+            1,
+            range,
+            "alpha units beta".to_owned(),
+            0.1,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 0.9);
         Ok(())
     }
 
@@ -1622,5 +1719,53 @@ pub fn compute() -> i32 {
         super::order_by_relevance(&mut second_arrival);
         let reordered_ids: Vec<&str> = second_arrival.iter().map(super::hit_identity).collect();
         assert_eq!(reordered_ids, ordered_ids);
+    }
+
+    fn node_hit_stub(id: &str, score: f64) -> SearchHit {
+        SearchHit {
+            hit: SearchHitTarget::Node {
+                node: Node {
+                    id: NodeId(id.to_owned()),
+                    symbol: None,
+                    unit: FileId("rift://file/lib.rs".to_owned()),
+                    language: rust_language(),
+                    kind: ExactKind("rust.function_item".to_owned()),
+                    facets: Vec::new(),
+                    range: TextRange { start: 0, end: 1 },
+                    regions: Vec::new(),
+                    parent: None,
+                    extensions: Extensions(std::collections::BTreeMap::new()),
+                },
+            },
+            score,
+            matched_by: vec![MatchedField::Content],
+            relationships: None,
+            source: None,
+            diagnostics: None,
+            span: None,
+            line: None,
+            path: None,
+            traversal_path: None,
+            distance: None,
+        }
+    }
+
+    /// `hit_identity`'s `Node` arm never runs through the live `search` path — a `target:
+    /// "node"` request is refused before any hit is ever built — so this proves the arm
+    /// directly: a `Node` hit tied in score with a `File` hit still breaks the tie on the
+    /// node's own wire id, exactly as the `File` and `Symbol` arms already do.
+    #[test]
+    fn hit_identity_uses_the_node_id_as_tiebreak() {
+        let mut results = vec![
+            file_hit_stub("rift://file/z.rs", 0.5),
+            node_hit_stub("rift://node/rust/lib.rs@0-1#00000000", 0.5),
+        ];
+        super::order_by_relevance(&mut results);
+        let ids: Vec<&str> = results.iter().map(super::hit_identity).collect();
+        // "rift://file/..." sorts before "rift://node/..." lexicographically ('f' < 'n').
+        assert_eq!(
+            ids,
+            ["rift://file/z.rs", "rift://node/rust/lib.rs@0-1#00000000",]
+        );
     }
 }
