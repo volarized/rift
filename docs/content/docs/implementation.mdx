@@ -38,7 +38,7 @@ check the [main documentation](/docs).
 
 ## The rift binary
 
-<VersionBadge version="planned" />
+<VersionBadge version="v0.0.11" />
 
 Rift is delivered as one binary, installed as the [Install](/docs#install) section describes.
 The CLI is implemented with [clap](https://docs.rs/clap), and Rift's two main capabilities are
@@ -51,27 +51,34 @@ agent over the stdio transport and forwards each request to the workspace's `rif
 Streamable HTTP; the `rift mcp` process holds no state of its own, following MCP's protocol
 concepts. To reach the workspace's server it checks the server lock file —
 [`ServerLock`](/docs/protocol/reference#ServerLock) at `.rift/server.json` — and starts a
-server when the file is absent.
+server when no live one stands behind it.
 
 ### rift server
 
 The server is an [Axum](https://docs.rs/axum) application on the [Tokio](https://tokio.rs)
 runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP through
-[rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; the rest of the
-routes are reserved for other surfaces, the SCIP export for example.
+[rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; `/api/stop` serves
+`rift server stop`, and the rest of the routes are reserved for other surfaces, the SCIP
+export for example.
 
 Startup runs one cycle:
 
 1. Parse `rift.toml` and accept the workspace; an invalid file keeps the server running but
    refuses every request until fixed.
-2. Take the file lock on `.rift/server.json`, which picks one starter among racing `rift mcp`
-   processes.
+2. Take the exclusive file lock on `.rift/server.lock`, which picks one starter among racing
+   `rift mcp` processes.
 3. Bind a loopback port in the 12000–13000 range, mint the bearer token, and write both into
-   the lock file.
+   `.rift/server.json`.
 4. Start the native filesystem watcher.
 5. Schedule the initial scan and parse on a Tokio-managed blocking task, so traversal and
    parsing never occupy an async MCP worker.
-6. Serve until no request arrives for the idle timeout `rift.toml` sets, then stop.
+6. Serve until no request arrives for the [`idle_timeout`](/docs/configuration#server) span
+   `rift.toml` sets, then stop.
+
+`rift server start` runs that cycle detached and waits for the lock document to appear;
+`rift server stop` sends the authorized stop request and waits for the election to release;
+`rift server restart` chains the two. `--foreground` keeps the cycle in the calling process,
+where Ctrl-C stops it.
 
 Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
 queue, and a worker picks it up when one is free. This behavior is configurable via the

@@ -31,6 +31,7 @@ changes, and index rebuilds:
 [server]
 num_workers = 4
 worker_queue_timeout = "30s"
+idle_timeout = "30m"
 ```
 
 Each key is shown at its default:
@@ -39,6 +40,8 @@ Each key is shown at its default:
 - `worker_queue_timeout` bounds one request's wait for a free worker, 1ms to 1h — when it
   expires, the request fails with `temporarily_unavailable` and the client can retry without
   stacking another waiter
+- `idle_timeout` stops the server after that long with no served request, 1s to 1d; the next
+  `rift mcp` or `rift server start` brings it back
 
 The worker pool exists before the first request, so the server sizes it once at startup: a
 change to this table applies on the next start, while every other table applies to later

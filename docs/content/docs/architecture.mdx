@@ -60,25 +60,28 @@ formatters, linters, and test runners, which check each change after it lands.
 
 ## Server lifecycle
 
+<VersionBadge version="v0.0.11" />
+
 When the server starts, it writes a special `.rift/server.json` file following the
 [`ServerLock`](/docs/protocol/reference#ServerLock) model. For example:
 
 ```json
 {
-  "port": 52341,
+  "port": 12345,
+  "token": "Zk3mQ8xW1vY5uT9rN2bH7cJ4dL6fP0sA8gE5iK2oM7q",
   "pid": 4242,
-  "token": "wJq3vJ9pXf2mB7kD8sLnR4tYhA6cE1uZ",
-  "workspace": "/Users/alice/projects/charming-aurora"
+  "version": "0.0.11"
 }
 ```
 
-When no lock file exists, `rift mcp` starts a server. Atomic creation of the file elects one
-process if several `rift mcp` processes start together. The winner binds a port and prepares the
-file; the remaining `rift mcp` processes connect to it.
+When no live server stands behind the file, `rift mcp` starts one. An exclusive file lock
+elects one starter if several processes race; the winner binds a port and publishes the file,
+and the rest connect to it.
 
-A reader that cannot reach the endpoint checks the token-authenticated health response and owning
-process before removing the file. Checking both avoids treating a reused process id as the old
-server.
+A reader that cannot reach the recorded port treats the file as stale. The election lock
+releases with its holder, so a stale file never has a live server behind it, and the next
+starter replaces the file. The server also stops itself once no request arrives for the
+configured idle span, and `rift server stop` ends it sooner.
 
 To enforce a cross-process boundary between OS users, the server persists a token in
 `.rift/server.json`, which only the file's owner can read. Each request must present this token.
