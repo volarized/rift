@@ -67,7 +67,9 @@ Startup runs one cycle:
    refuses every request until fixed.
 2. Take the exclusive file lock on `.rift/server.lock`, which picks one starter among racing
    `rift mcp` processes.
-3. Bind a loopback port in the 12000-13000 range, mint the bearer token, and write both into
+3. Bind the first free loopback port of the accepted
+   [`[server]` selection](/docs/configuration#server) - the pinned `port`, the configured
+   `port_range`, or the default 12000-13000 range - mint the bearer token, and write both into
    `.rift/server.json`.
 4. Start the native filesystem watcher.
 5. Schedule the initial scan and parse on a Tokio-managed blocking task, so traversal and

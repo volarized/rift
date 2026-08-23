@@ -42,6 +42,9 @@ Each key is shown at its default:
   stacking another waiter
 - `idle_timeout` stops the server after that long with no served request, 1s to 1d; the next
   `rift mcp` or `rift server start` brings it back
+- `port` pins the exact loopback port, 1024 or above; omitted, the server picks the first free
+  port from `port_range` - `port_range = { min = 12000, max = 13000 }` is the default - and the
+  two keys exclude each other
 
 The worker pool exists before the first request, so the server sizes it once at startup: a
 change to this table applies on the next start, while every other table applies to later
