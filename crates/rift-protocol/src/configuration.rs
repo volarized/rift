@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::lock::{SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN};
 use crate::read::{CoverageScope, ProjectPath};
 use crate::source::SourceConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -348,9 +349,9 @@ impl WorkspaceConfiguration {
 
 /// The `[server]` table. Filesystem scans and parses run on a bounded
 /// worker pool; this table sets the worker count, bounds the queue wait,
-/// and sets how long the server serves with no request before it stops.
-/// The server reads the table at startup, so a change applies on the next
-/// start.
+/// sets how long the server serves with no request before it stops, and
+/// selects the loopback port. The server reads the table at startup, so a
+/// change applies on the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_server_ranges)]
@@ -362,6 +363,14 @@ pub struct ServerConfiguration {
     pub worker_queue_timeout: Duration,
     /// Wall-clock span with no served request that stops the server, 1s to 1d.
     pub idle_timeout: Duration,
+    /// The exact loopback port the server binds, 1024 or above. Excludes
+    /// `port_range`; omitted, the server picks from `port_range` or the
+    /// default serving range.
+    #[schemars(range(min = 1_024))]
+    pub port: Option<u16>,
+    /// The loopback range the server picks its port from. Excludes `port`;
+    /// omitted, the default serving range applies.
+    pub port_range: Option<PortRange>,
 }
 
 impl Default for ServerConfiguration {
@@ -370,8 +379,23 @@ impl Default for ServerConfiguration {
             num_workers: 4,
             worker_queue_timeout: Duration::from_millis(30_000),
             idle_timeout: Duration::from_millis(1_800_000),
+            port: None,
+            port_range: None,
         }
     }
+}
+
+/// The `server.port_range` table: the inclusive loopback range the server
+/// picks the first free port from.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortRange {
+    /// The lowest port the server may bind, 1024 or above.
+    #[schemars(range(min = 1_024))]
+    pub min: u16,
+    /// The highest port the server may bind, at or above `min`.
+    #[schemars(range(min = 1_024))]
+    pub max: u16,
 }
 
 impl ServerConfiguration {
@@ -397,6 +421,60 @@ impl ServerConfiguration {
                 SERVER_IDLE_TIMEOUT_MS_MAX,
             ),
         ])
+        .or_else(|| self.port_violation())
+    }
+
+    /// The port-selection contracts, checked after the numeric rows.
+    fn port_violation(&self) -> Option<ConfigurationViolation> {
+        match (self.port, self.port_range) {
+            (Some(_), Some(_)) => Some(ConfigurationViolation::PortSelectionConflict),
+            (Some(port), None) => first_out_of_range([(
+                "server.port",
+                u64::from(port),
+                u64::from(SERVER_PORT_FLOOR),
+                u64::from(u16::MAX),
+            )]),
+            (None, Some(range)) => range.violation(),
+            (None, None) => None,
+        }
+    }
+
+    /// The inclusive port range binding selects from: the pinned `port`,
+    /// the configured `port_range`, or the default serving range.
+    #[must_use]
+    pub fn serving_ports(&self) -> std::ops::RangeInclusive<u16> {
+        match (self.port, self.port_range) {
+            (Some(port), _) => port..=port,
+            (None, Some(range)) => range.min..=range.max,
+            (None, None) => SERVER_PORT_MIN..=SERVER_PORT_MAX,
+        }
+    }
+}
+
+impl PortRange {
+    /// The range's bounds: both ends selectable, and the range running
+    /// forward.
+    fn violation(self) -> Option<ConfigurationViolation> {
+        first_out_of_range([
+            (
+                "server.port_range.min",
+                u64::from(self.min),
+                u64::from(SERVER_PORT_FLOOR),
+                u64::from(u16::MAX),
+            ),
+            (
+                "server.port_range.max",
+                u64::from(self.max),
+                u64::from(SERVER_PORT_FLOOR),
+                u64::from(u16::MAX),
+            ),
+        ])
+        .or_else(|| {
+            (self.max < self.min).then_some(ConfigurationViolation::PortRangeInverted {
+                min: self.min,
+                max: self.max,
+            })
+        })
     }
 }
 
@@ -925,6 +1003,16 @@ pub enum ConfigurationViolation {
         /// The rejected pattern.
         pattern: String,
     },
+    /// `server.port` and `server.port_range` are both set, so the file
+    /// selects the port twice.
+    PortSelectionConflict,
+    /// `server.port_range` runs backwards: `max` sits below `min`.
+    PortRangeInverted {
+        /// The configured lower end.
+        min: u16,
+        /// The configured upper end, below `min`.
+        max: u16,
+    },
 }
 
 impl ConfigurationViolation {
@@ -963,6 +1051,12 @@ impl ConfigurationViolation {
             }
             Self::PathPatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
+            }
+            Self::PortSelectionConflict => {
+                vec![("fields", "server.port, server.port_range".to_owned())]
+            }
+            Self::PortRangeInverted { min, max } => {
+                vec![("min", min.to_string()), ("max", max.to_string())]
             }
         }
     }
@@ -1485,6 +1579,97 @@ mod tests {
                 "idle_timeout {timeout_ms}ms must be accepted"
             );
         }
+    }
+
+    #[test]
+    fn test_port_selection_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.server.port = Some(SERVER_PORT_FLOOR - 1);
+        assert!(
+            matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "server.port",
+                    ..
+                })
+            ),
+            "a pinned port below the floor must be refused"
+        );
+        configuration.server.port = Some(SERVER_PORT_FLOOR);
+        assert_eq!(configuration.validate(), Ok(()));
+
+        configuration.server.port_range = Some(PortRange {
+            min: 11_000,
+            max: 12_000,
+        });
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::PortSelectionConflict),
+            "a pinned port and a range together must be refused"
+        );
+
+        configuration.server.port = None;
+        assert_eq!(configuration.validate(), Ok(()));
+        configuration.server.port_range = Some(PortRange {
+            min: SERVER_PORT_FLOOR - 1,
+            max: 12_000,
+        });
+        assert!(
+            matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "server.port_range.min",
+                    ..
+                })
+            ),
+            "a range starting below the floor must be refused"
+        );
+        configuration.server.port_range = Some(PortRange {
+            min: 12_000,
+            max: 11_000,
+        });
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::PortRangeInverted {
+                min: 12_000,
+                max: 11_000,
+            }),
+            "a backwards range must be refused"
+        );
+    }
+
+    #[test]
+    fn test_serving_ports_resolve_pin_range_and_default() {
+        let mut table = ServerConfiguration::default();
+        assert_eq!(table.serving_ports(), SERVER_PORT_MIN..=SERVER_PORT_MAX);
+        table.port_range = Some(PortRange {
+            min: 11_000,
+            max: 12_000,
+        });
+        assert_eq!(table.serving_ports(), 11_000..=12_000);
+        table.port = Some(11_500);
+        assert_eq!(
+            table.serving_ports(),
+            11_500..=11_500,
+            "a pinned port narrows the selection to itself"
+        );
+    }
+
+    #[test]
+    fn test_port_violations_carry_their_evidence() {
+        let conflict = ConfigurationViolation::PortSelectionConflict;
+        assert_eq!(
+            conflict.evidence(),
+            vec![("fields", "server.port, server.port_range".to_owned())]
+        );
+        let inverted = ConfigurationViolation::PortRangeInverted {
+            min: 12_000,
+            max: 11_000,
+        };
+        assert_eq!(
+            inverted.evidence(),
+            vec![("min", "12000".to_owned()), ("max", "11000".to_owned())]
+        );
     }
 
     #[test]

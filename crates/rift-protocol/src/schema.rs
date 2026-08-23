@@ -325,6 +325,17 @@ pub fn declare_server_ranges(schema: &mut Schema) {
             &Duration::from_millis(SERVER_IDLE_TIMEOUT_MS_MAX),
         ),
     );
+    append(
+        schema,
+        Composition::All,
+        described(
+            "server.port and server.port_range are mutually exclusive",
+            not(requires(&[
+                property!(ServerConfiguration, port),
+                property!(ServerConfiguration, port_range),
+            ])),
+        ),
+    );
 }
 
 /// A [`SearchConfiguration`](crate::configuration::SearchConfiguration) states its
