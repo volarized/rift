@@ -26,7 +26,7 @@ impl ReadService {
     /// Searches Rust declarations and source lines, optionally narrowed or extended by
     /// `params.paths`, merged with `lexical_matches` from the caller's lexical search-index
     /// tier. `lexical_matches` is empty when that tier is unavailable or its stamped
-    /// revision no longer matches what is published — the caller decides that, this method
+    /// revision no longer matches what is published - the caller decides that, this method
     /// only merges what it is handed.
     ///
     /// # Errors
@@ -183,7 +183,7 @@ fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> b
 }
 
 /// Symbol and lexical hits from the index, filtered by `matcher` and collected up to
-/// `fetch_limit` — never cut short at the smaller `limit` — because [`order_by_relevance`]
+/// `fetch_limit` - never cut short at the smaller `limit` - because [`order_by_relevance`]
 /// sorts this whole pool before the final page is cut down to `limit`; stopping collection
 /// at `limit` could drop a later, higher-scoring candidate (a file hit scores 1.0 flat, so
 /// this matters whenever a lower-scoring symbol substring match would otherwise fill the
@@ -230,8 +230,8 @@ fn collect_indexed_hits(
     Ok(())
 }
 
-/// Reaches files `selector.force_include` names outside the index — bypassing `[source]`
-/// policy and `.gitignore`, never the hard floor — parses them on demand, and searches them
+/// Reaches files `selector.force_include` names outside the index - bypassing `[source]`
+/// policy and `.gitignore`, never the hard floor - parses them on demand, and searches them
 /// with the same scoring pipeline as indexed hits, appending up to `limit` total results.
 /// Bounded to [`FORCE_INCLUDE_FILES_MAX`] matched files; a crossed bound refuses the search.
 fn collect_force_include_hits(
@@ -671,7 +671,7 @@ pub fn compute() -> i32 {
     }
 
     /// One indexed file, one hidden by `.gitignore`, one hidden by `[source].exclude`, and one
-    /// under the hard floor (`.git/`) — the fixture `force_include` tests reach into.
+    /// under the hard floor (`.git/`) - the fixture `force_include` tests reach into.
     fn force_include_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join(".gitignore"), "gitignored.rs\n")?;
@@ -1158,7 +1158,7 @@ pub fn compute() -> i32 {
     fn search_paths_scoped_results_form_stable_prefix_across_limits() -> TestResult {
         // Cursor-based pagination is not served yet: `validate_common` refuses any request
         // that supplies one. Stability is proven the way the implementation guarantees it
-        // instead — `paths` filtering happens before the page is cut to `limit`, so the top
+        // instead - `paths` filtering happens before the page is cut to `limit`, so the top
         // hit of a `paths`-scoped search does not move as `limit` grows.
         let (_directory, service) = multi_file_fixture()?;
         let narrow: SearchParams = serde_json::from_value(json!({
@@ -1744,8 +1744,8 @@ pub fn compute() -> i32 {
         }
     }
 
-    /// `hit_identity`'s `Node` arm never runs through the live `search` path — a `target:
-    /// "node"` request is refused before any hit is ever built — so this proves the arm
+    /// `hit_identity`'s `Node` arm never runs through the live `search` path - a `target:
+    /// "node"` request is refused before any hit is ever built - so this proves the arm
     /// directly: a `Node` hit tied in score with a `File` hit still breaks the tie on the
     /// node's own wire id, exactly as the `File` and `Symbol` arms already do.
     #[test]

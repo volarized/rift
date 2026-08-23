@@ -3,7 +3,7 @@
 //! `start` spawns a detached `rift server start --foreground` and waits for
 //! its published lock document; `stop` asks the recorded server to shut
 //! down over its own stop route; `restart` chains the two. Every wait is a
-//! bounded poll over [`rift_mcp::probe`] — the election module itself never
+//! bounded poll over [`rift_mcp::probe`] - the election module itself never
 //! polls.
 
 use std::fmt;

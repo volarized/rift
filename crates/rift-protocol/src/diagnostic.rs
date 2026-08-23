@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct Diagnostic {
     /// How much it matters.
     pub severity: Severity,
-    /// The provider's own identifier for this finding — `TS2345`, `E0308`. Null where the
+    /// The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the
     /// provider issues none.
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required, transform = schema::nullable)]
@@ -78,7 +78,7 @@ impl DiagnosticCode {
 }
 
 /// One `Diagnostic` as an MCP answer carries it: the fact its emitter minted, plus what Rift
-/// can add on top — where it lands in a line and column, and the source around it.
+/// can add on top - where it lands in a line and column, and the source around it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticContext {
@@ -86,7 +86,7 @@ pub struct DiagnosticContext {
     pub source: DiagnosticContextSource,
     /// The finding itself, exactly as its emitter minted it.
     pub diagnostic: Diagnostic,
-    /// One-based line the finding starts on. Null where the diagnostic has no span — a
+    /// One-based line the finding starts on. Null where the diagnostic has no span - a
     /// whole-project error has nowhere to point.
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required, transform = schema::nullable)]
@@ -132,13 +132,13 @@ pub enum DiagnosticContinuation {
     Unknown,
 }
 
-/// A second place the provider points at — the earlier declaration a redefinition conflicts
+/// A second place the provider points at - the earlier declaration a redefinition conflicts
 /// with, the bound that failed. It carries a message and a location, and never a severity of
 /// its own, because it is part of one finding.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticRelated {
-    /// What to notice there — "first defined here", "required by this bound".
+    /// What to notice there - "first defined here", "required by this bound".
     #[schemars(length(max = 4096))]
     pub message: String,
     /// Where to look.

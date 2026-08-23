@@ -3,8 +3,8 @@
 //! `rift mcp` serves agents over stdio while the workspace's state lives in
 //! one `rift server` process. Every request forwards to that server: the
 //! proxy adopts a recorded server when the lock document names a live one,
-//! starts a detached server when the workspace has none, and reconnects —
-//! single-flight, one retry per request — when the server it held goes
+//! starts a detached server when the workspace has none, and reconnects -
+//! single-flight, one retry per request - when the server it held goes
 //! away, so an agent session survives server restarts.
 
 use std::path::Path;
@@ -78,7 +78,7 @@ impl Fault for ProxyFault {
 /// workspace's elected server.
 ///
 /// Serving starts immediately: a background warmup attempts the first
-/// upstream connect — starting a server when the workspace has none — and
+/// upstream connect - starting a server when the workspace has none - and
 /// each request that arrives earlier waits on the same single-flight
 /// connect. Stdout carries protocol frames only; diagnostics go to
 /// tracing/stderr, and the upstream bearer token appears in neither.
@@ -145,7 +145,7 @@ fn quit_reason_result(reason: QuitReason) -> Result<(), ProxyServeError> {
 
 /// Attempts the first upstream connect before any request needs it.
 ///
-/// Best effort: a workspace that cannot produce a server yet only logs —
+/// Best effort: a workspace that cannot produce a server yet only logs -
 /// the agent session still starts, and each request surfaces its own
 /// refusal until the server comes up.
 ///
@@ -206,7 +206,7 @@ impl RiftProxy {
     ///
     /// `observed` is the generation whose connection failed the caller's
     /// previous attempt, or `None` on a first attempt. The slot's mutex is
-    /// held only to clone the peer out or to connect — never across a
+    /// held only to clone the peer out or to connect - never across a
     /// forward. Connecting under the mutex is the single-flight guarantee:
     /// concurrent requests that lost the same upstream wait here instead of
     /// each starting a server, and the double check under the lock reuses a
@@ -333,7 +333,7 @@ async fn connect_upstream(root: &Path) -> Result<RunningService<RoleClient, ()>,
     if let Some(running) = adopt_serving(root).await {
         return Ok(running);
     }
-    // A lost spawn race is fine — another process started the server and
+    // A lost spawn race is fine - another process started the server and
     // the poll below adopts it. A spawn that cannot launch is reported, and
     // the poll still gives a concurrently started server its chance.
     if let Err(error) = spawn_detached_server(root) {
@@ -429,7 +429,7 @@ fn version_mismatch(lock_version: &str, binary_version: &str) -> bool {
 
 /// Warns when the serving server was built at another release.
 ///
-/// The mismatch is served anyway — MCP negotiates itself — but the warning
+/// The mismatch is served anyway - MCP negotiates itself - but the warning
 /// gives the operator the stale-binary diagnosis when behavior looks off.
 fn warn_version_skew(lock: &ServerLock) {
     let binary_version = env!("CARGO_PKG_VERSION");

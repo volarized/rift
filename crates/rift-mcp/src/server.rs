@@ -303,7 +303,7 @@ impl RiftMcp {
         let published = initial_workspace(&root, limits, &validation, &blocking).await?;
         // The lexical database lives under the workspace's own `.rift` directory, so it
         // opens only once the workspace root itself is proven real by a successful initial
-        // scan — never before, or a missing root would be silently fabricated by creating
+        // scan - never before, or a missing root would be silently fabricated by creating
         // `.rift` under it.
         let lexical_limits = lexical_index_limits(&startup_configuration.search_configuration());
         let lexical = open_lexical_index(&root, lexical_limits).await;
@@ -408,9 +408,9 @@ impl RiftMcp {
             .await
     }
 
-    /// Runs the lexical search-index tier for one search request against `published` —
+    /// Runs the lexical search-index tier for one search request against `published` -
     /// the exact snapshot the caller also runs `ReadService::search` against, never a
-    /// separately resolved one — when the tier is available and its stamped tree revision
+    /// separately resolved one - when the tier is available and its stamped tree revision
     /// still matches `published`'s. A revision mismatch or an absent handle answers with no
     /// lexical matches, so identifier search proceeds alone rather than serving a possibly
     /// stale tier. A query-term limit the adapter refuses surfaces as this request's own
@@ -516,9 +516,9 @@ impl RiftMcp {
             .await
     }
 
-    /// Runs one read against the tree the request names — the current
+    /// Runs one read against the tree the request names - the current
     /// snapshot, or a snapshot built at the request's version-control
-    /// revision — behind the acceptance gate every request passes.
+    /// revision - behind the acceptance gate every request passes.
     ///
     /// A revision snapshot is built per request from the workspace's git
     /// objects, under the same `[source]` policy and bounds as the current
@@ -725,7 +725,7 @@ impl RiftMcp {
     }
 
     /// One already-serialized change's outcome: the wire result, and the freshly published
-    /// workspace exactly when this change's own rebuild published a new snapshot — absent
+    /// workspace exactly when this change's own rebuild published a new snapshot - absent
     /// for a refusal, and for a landed change whose rebuild only appended a diagnostic.
     fn change_serialized(
         root: &Path,
@@ -2283,7 +2283,7 @@ pub fn beacon() -> u64 {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A directory at the database path fails the initial open; `remove_file` cannot
-        // remove a directory, so the recreate-once retry also fails against it unchanged —
+        // remove a directory, so the recreate-once retry also fails against it unchanged -
         // this is also the deterministic way to drive the recreate-once arm itself.
         fs::create_dir_all(directory.path().join(".rift/db"))?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;

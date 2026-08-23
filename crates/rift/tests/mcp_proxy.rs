@@ -32,8 +32,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// [`PRESENCE_POLL_INTERVAL`].
 const GONE_POLL_ATTEMPT_COUNT: u32 = 100;
 /// Bound on one proxied round trip that may include a server election. A
-/// refusal can wait out two start windows — the warmup's and the request's
-/// own — before it surfaces.
+/// refusal can wait out two start windows - the warmup's and the request's
+/// own - before it surfaces.
 const PROXIED_CALL_MAX: Duration = Duration::from_mins(1);
 
 /// The seven tools the workspace server advertises, in served order.

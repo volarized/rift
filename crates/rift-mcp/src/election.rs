@@ -164,7 +164,7 @@ impl ElectionGuard {
     ///
     /// The document is validated, staged in a temp file inside `.rift`, and
     /// renamed over `server.json`, so a concurrent [`probe`] reads either
-    /// the previous complete document or this one — never a partial write.
+    /// the previous complete document or this one - never a partial write.
     /// Only the election holder can call this, which keeps `server.json`
     /// single-writer by construction.
     ///
@@ -265,7 +265,7 @@ pub enum StaleReason {
 ///
 /// A [`ServerPresence::Serving`] answer requires both halves: the document
 /// reads and validates, and a non-blocking shared lock on the election file
-/// fails — proof a live process holds the exclusive lock. A shared lock
+/// fails - proof a live process holds the exclusive lock. A shared lock
 /// that succeeds is released immediately. The probe itself never waits and
 /// never polls; callers that need to wait poll this function.
 #[must_use]
@@ -362,7 +362,7 @@ fn served_document(port: u16, token: &str) -> ServerLock {
 /// Claims the election, starts the HTTP transport, then publishes the lock
 /// document, in that order, so a published document always names a bound
 /// listener. When publishing fails the just-started server is shut down
-/// again — bounded by `UNPUBLISHED_SHUTDOWN_DEADLINE` — before the error
+/// again - bounded by `UNPUBLISHED_SHUTDOWN_DEADLINE` - before the error
 /// returns, so no unreachable serving loop survives.
 ///
 /// # Errors

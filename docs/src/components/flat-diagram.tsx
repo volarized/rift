@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 /**
  * A mermaid flowchart, drawn flat.
  *
- * Same pipeline as `IsoDiagram` — mermaid parse, dagre layout — but the scene
+ * Same pipeline as `IsoDiagram` - mermaid parse, dagre layout - but the scene
  * is rendered as plain SVG in the page's own plane instead of being stood up
  * under the isometric camera. The layout module already works on a flat ground
  * plane (the camera is what makes its sibling isometric), so this renderer maps

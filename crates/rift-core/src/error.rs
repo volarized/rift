@@ -347,8 +347,8 @@ pub fn render_failure(descriptor: ErrorDescriptor, context: &[ErrorContext]) -> 
 /// A failure kind that resolves to one registry identity and carries its own
 /// typed evidence.
 ///
-/// Domain crates implement this on their kind enums — including violation
-/// enums, which are just fault kinds — and expose [`Error`] over them, so
+/// Domain crates implement this on their kind enums - including violation
+/// enums, which are just fault kinds - and expose [`Error`] over them, so
 /// classification, rendering, and source exposure follow one rule everywhere.
 pub trait Fault: fmt::Debug {
     /// The registry identity this kind classifies as.

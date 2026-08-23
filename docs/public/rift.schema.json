@@ -22,7 +22,7 @@
     },
     "CommandHook": {
       "additionalProperties": false,
-      "description": "One `[[hooks]]` block: an executable Rift starts directly — no shell —\ninside the changed tree each time a change applies. Every key is\nrequired; the schema carries no defaults.",
+      "description": "One `[[hooks]]` block: an executable Rift starts directly - no shell -\ninside the changed tree each time a change applies. Every key is\nrequired; the schema carries no defaults.",
       "properties": {
         "arguments": {
           "description": "The program's literal arguments, in order. May be empty.",
@@ -137,7 +137,7 @@
       ]
     },
     "CoverageScope": {
-      "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+      "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -354,7 +354,7 @@
       ]
     },
     "HookType": {
-      "description": "How a hook runs; `command` — an executable started directly, without a\nshell — is the only type.",
+      "description": "How a hook runs; `command` - an executable started directly, without a\nshell - is the only type.",
       "oneOf": [
         {
           "const": "command",
@@ -369,7 +369,7 @@
       "type": "string"
     },
     "ProjectPath": {
-      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
       "maxLength": 1000,
       "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
       "type": "string"

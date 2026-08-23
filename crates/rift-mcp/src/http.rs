@@ -115,9 +115,9 @@ impl HttpServeFault {
 
 /// Serves the workspace at `root` over authenticated loopback Streamable HTTP.
 ///
-/// The workspace builds exactly as stdio serving does — an invalid
+/// The workspace builds exactly as stdio serving does - an invalid
 /// `rift.toml` still serves, refusing each request as
-/// `configuration_invalid` under default policies — then a bearer token is
+/// `configuration_invalid` under default policies - then a bearer token is
 /// minted and the first free port in the loopback serving range is bound.
 /// The returned handle's listener is already accepting. Serving ends when
 /// `shutdown` cancels, an authorized `POST /api/stop` arrives, or the
@@ -204,8 +204,8 @@ impl HttpServer {
 
     /// Waits until the server stopped and its index supervisor shut down.
     ///
-    /// Resolves after the serve loop ended — through the external shutdown
-    /// token, an authorized `POST /api/stop`, or the idle timeout — and the
+    /// Resolves after the serve loop ended - through the external shutdown
+    /// token, an authorized `POST /api/stop`, or the idle timeout - and the
     /// workspace index supervisor finished within its shutdown deadline.
     ///
     /// # Errors
@@ -323,8 +323,8 @@ fn authenticated_router(
 
 /// Refuses requests whose `Host` or `Origin` reaches past the loopback.
 ///
-/// A remote page can reach a loopback port through DNS rebinding — its own
-/// name resolving here — or issue a request carrying its own origin. The
+/// A remote page can reach a loopback port through DNS rebinding - its own
+/// name resolving here - or issue a request carrying its own origin. The
 /// server accepts only a loopback `Host`, and only a loopback `Origin` when
 /// one is present; non-browser MCP clients omit `Origin` and pass. The
 /// guard runs before authentication on every route, so the boundary holds
@@ -424,7 +424,7 @@ async fn authorize_request(
 ///
 /// Equal-length comparison touches every byte, so a refusal's timing does
 /// not reveal how much of the token matched. The earlier returns reveal
-/// only the request's own shape — a missing scheme or a wrong length —
+/// only the request's own shape - a missing scheme or a wrong length -
 /// never a token byte.
 fn bearer_authorized(authorization: Option<&str>, token: &str) -> bool {
     let Some(presented) = authorization.and_then(|value| value.strip_prefix(BEARER_PREFIX)) else {

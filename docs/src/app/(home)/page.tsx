@@ -15,7 +15,7 @@ const WIDE = "mx-auto w-full max-w-280 px-6 sm:px-7";
 const HERO = "min-h-[80svh]";
 const SCREEN = "min-h-[60svh]";
 
-/** Inter 300 at display size — one statement per section, never more. */
+/** Inter 300 at display size - one statement per section, never more. */
 function Statement({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <p
@@ -29,7 +29,7 @@ function Statement({ children, className }: { children: React.ReactNode; classNa
   );
 }
 
-/** Inter 300, 18/1.6 — body copy. */
+/** Inter 300, 18/1.6 - body copy. */
 function Body({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <p
@@ -65,7 +65,7 @@ function Section({
 
 /**
  * One object per point: the provider stack is the solid taken apart, the other
- * two are attractors — a reversible system and a dynamo that swaps between two
+ * two are attractors - a reversible system and a dynamo that swaps between two
  * states.
  */
 const DIFFERENCES: {
@@ -89,7 +89,7 @@ const DIFFERENCES: {
     title: "Reversible filesystem projections",
     body: "Rift will let agents collect changes in a pinned projection, inspect them, then publish them into the workspace.",
     line: "shimizu",
-    // The butterfly stands in the x–z plane; turn it to face the camera.
+    // The butterfly stands in the x - z plane; turn it to face the camera.
     tilt: 1.5,
   },
   {
@@ -107,7 +107,7 @@ const DIFFERENCES: {
 export default function HomePage() {
   return (
     <main className="flex flex-1 flex-col">
-      {/* 1 — hero, standing on a warped ground plane */}
+      {/* 1 - hero, standing on a warped ground plane */}
       <section className={cn("relative flex items-center overflow-hidden", HERO)}>
         <div
           className={cn(
@@ -136,12 +136,12 @@ export default function HomePage() {
         </div>
       </section>
 
-      {/* 2 — the claim, over a soft Lorenz attractor */}
+      {/* 2 - the claim, over a soft Lorenz attractor */}
       <Section wide className="md:grid-cols-[auto_1fr] md:items-center">
         <LineObject
           kind="lorenz"
           reveal
-          // The butterfly lies in the x–z plane; stand it up to face the camera.
+          // The butterfly lies in the x - z plane; stand it up to face the camera.
           tilt={1.48}
           fit={0.8}
           opacity={0.15}
@@ -155,7 +155,7 @@ export default function HomePage() {
         </div>
       </Section>
 
-      {/* 4 — the design position, one point per screen, each against the same
+      {/* 4 - the design position, one point per screen, each against the same
           sphere taken apart on a different plane */}
       {DIFFERENCES.map((item, index) => (
         <Section key={item.title} wide className="md:grid-cols-2 md:items-center text-base">
@@ -196,7 +196,7 @@ export default function HomePage() {
         </Section>
       ))}
 
-      {/* 7 — the two ways out, against the Aizawa attractor drawn on by the
+      {/* 7 - the two ways out, against the Aizawa attractor drawn on by the
           scroll and unpicked again on the way back up */}
       <Section wide tall className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
@@ -220,7 +220,7 @@ export default function HomePage() {
           </div>
         </div>
 
-        {/* The disk lies in x–y with the tube down z: face it near-on, so the
+        {/* The disk lies in x - y with the tube down z: face it near-on, so the
             trace reads as a vortex rather than a smear. */}
         <LineObject
           kind="aizawa"

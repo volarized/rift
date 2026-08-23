@@ -16,7 +16,7 @@ export function baseOptions(): BaseLayoutProps {
     nav: {
       title: (
         // Baseline-aligned, so the mark's apex sits on the wordmark's baseline
-        // and its top edge on the cap line — the two read as one object rather
+        // and its top edge on the cap line - the two read as one object rather
         // than an icon parked next to some text. The stroke is heavy because it
         // is in viewBox units: at this size 1 unit is ~0.13px, so the hairline
         // that suits the hero disappears here.

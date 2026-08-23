@@ -11,7 +11,7 @@ import { cn } from "@/lib/utils";
  * The reference page is 200 definitions long and the protocol pages are not
  * much shorter, so getting back to the top of one is otherwise a scroll with no
  * end in sight. fumadocs ships no such control, and the TOC's own links only go
- * to headings — the page title is not one.
+ * to headings - the page title is not one.
  *
  * It appears once the page has moved a viewport's worth, because a button that
  * scrolls to the top while you are already at the top is a button that does

@@ -206,7 +206,7 @@ pub(crate) enum ConfigurationFingerprint {
 }
 
 /// The current `rift.toml` file state, or null when the file is absent or
-/// unreadable — either way the next acceptance decides what that means.
+/// unreadable - either way the next acceptance decides what that means.
 pub(crate) fn configuration_fingerprint(root: &Path) -> ConfigurationFingerprint {
     let path = root.join(WORKSPACE_CONFIGURATION_FILE);
     let Ok(metadata) = std::fs::metadata(&path) else {
@@ -626,7 +626,7 @@ pub(crate) fn build_workspace_candidate(
 
 /// Derives `published`'s lexical units and replaces the lexical search database's whole
 /// content with them, stamped with the same tree revision `published`'s wire answers
-/// report — the exact string a search request compares its query-time lexical revision
+/// report - the exact string a search request compares its query-time lexical revision
 /// against before trusting that tier's matches.
 ///
 /// Population failure is a warning, never a request failure: the search-time revision guard
@@ -637,7 +637,7 @@ pub(crate) fn build_workspace_candidate(
 ///
 /// `replace_all` runs inside one `SQLite` transaction. Dropping this future before that
 /// transaction commits leaves the previously indexed units and tree-revision stamp fully
-/// intact — never partially overwritten. That stamp then no longer names the tree revision
+/// intact - never partially overwritten. That stamp then no longer names the tree revision
 /// this call was populating for, so the search-time revision guard serves identifier-only
 /// results until the next successful publication repopulates the lexical tier.
 pub(crate) async fn populate_lexical(lexical: &LexicalSearchIndex, published: &PublishedWorkspace) {
@@ -1703,7 +1703,7 @@ mod tests {
             .map_err(|error| format!("watcher must start: {error:?}"))?;
 
         // One blocking slot, held by a placeholder so the supervisor's own rebuild for
-        // epoch 1 is forced to queue behind it — a deterministic gate between the
+        // epoch 1 is forced to queue behind it - a deterministic gate between the
         // supervisor capturing that epoch and `accept_rebuild` checking it, exactly where a
         // second observation must land to supersede the rebuild.
         let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
@@ -1744,13 +1744,13 @@ mod tests {
             .map_err(|error| format!("first observation must land: {error:?}"))?;
         assert_eq!(first_epoch, 1);
         // Gives the supervisor's debounce (50ms) real wall-clock time to elapse and its
-        // rebuild to reach and queue behind the held placeholder. The held slot — not this
-        // wait — is what guarantees the rebuild cannot be accepted until released; a
+        // rebuild to reach and queue behind the held placeholder. The held slot - not this
+        // wait - is what guarantees the rebuild cannot be accepted until released; a
         // slower scheduler just makes this wait less generous, never wrong.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Moves the epoch again with no invalidation signal, so no second rebuild cycle is
-        // ever triggered — only the already-queued rebuild for epoch 1 observes this move.
+        // ever triggered - only the already-queued rebuild for epoch 1 observes this move.
         let moved = validation.observed_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         assert_eq!(moved, 2);
 
@@ -1760,7 +1760,7 @@ mod tests {
         held.await??;
 
         // A sentinel operation through the same one-slot executor only completes once the
-        // supervisor's own queued rebuild has acquired, run, and released that slot —
+        // supervisor's own queued rebuild has acquired, run, and released that slot -
         // proving its `accept_rebuild` check (and therefore the Superseded verdict) already
         // landed, without hoping a fixed sleep was long enough.
         blocking

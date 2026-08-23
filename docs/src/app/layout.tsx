@@ -18,7 +18,7 @@ const inter = Inter({
   variable: "--font-inter",
 });
 
-const TITLE = "rift — agentic development toolkit";
+const TITLE = "rift - agentic development toolkit";
 const DESCRIPTION = "Agentic development toolkit for reading, discovering and editing codebases.";
 
 // Next does not apply next.config `basePath` to metadata URLs, so every one of
@@ -31,7 +31,7 @@ const CARD = { url: `${BASE_PATH}/og.png`, width: 1280, height: 640, alt: TITLE 
 export const metadata: Metadata = {
   // Scrapers need absolute URLs; this is what the relative ones resolve against.
   metadataBase: new URL("https://volar.sh"),
-  title: { default: TITLE, template: "%s — rift" },
+  title: { default: TITLE, template: "%s - rift" },
   description: DESCRIPTION,
   icons: { icon: `${BASE_PATH}/logo.svg` },
   openGraph: {
@@ -58,7 +58,7 @@ export default function Layout({ children }: LayoutProps<"/">) {
           `type: "static"` because `output: "export"` has no server to answer a
           search request: app/api/search pre-renders the Orama index to a file
           and the client downloads it once and queries it in the browser.
-          `api` is the download URL, and it needs the basePath spelled out —
+          `api` is the download URL, and it needs the basePath spelled out -
           it defaults to a bare "/api/search", which 404s under /rift.
         */}
         <RootProvider
