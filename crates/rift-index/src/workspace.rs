@@ -1392,12 +1392,11 @@ fn push_text_lexical_units(
     let mut previous_offset: Option<u64> = None;
     for (index, chunk) in chunks.iter().enumerate() {
         if let Some(previous) = previous_offset {
+            let current = chunk.byte_offset();
+            let path = file.path().as_str();
             assert!(
-                chunk.byte_offset() > previous,
-                "chunk offsets must strictly increase: previous={previous}, \
-                 current={}, path={}",
-                chunk.byte_offset(),
-                file.path().as_str(),
+                current > previous,
+                "chunk offsets must increase: previous={previous}, current={current}, path={path}"
             );
         }
         previous_offset = Some(chunk.byte_offset());

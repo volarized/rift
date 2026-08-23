@@ -1670,15 +1670,12 @@ pub fn beacon() -> u64 {
             &validation,
             &changes,
             move |_, _| {
-                fs::create_dir_all(root.join("nested")).map_err(|error| {
-                    ReadFault::task("test gitignore directory", error.to_string())
-                })?;
-                fs::write(root.join(".gitignore"), "").map_err(|error| {
-                    ReadFault::task("test root gitignore write", error.to_string())
-                })?;
-                fs::write(root.join("nested/.gitignore"), "").map_err(|error| {
-                    ReadFault::task("test nested gitignore write", error.to_string())
-                })?;
+                let nested = root.join("nested");
+                let root_gitignore = root.join(".gitignore");
+                let nested_gitignore = root.join("nested/.gitignore");
+                fs::create_dir_all(&nested).expect("nested directory scaffold must write");
+                fs::write(&root_gitignore, "").expect("root gitignore scaffold must write");
+                fs::write(&nested_gitignore, "").expect("nested gitignore scaffold must write");
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
                         id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
@@ -1694,10 +1691,10 @@ pub fn beacon() -> u64 {
             panic!("the applied change must survive a failed source-policy rebuild");
         };
         assert_eq!(summary.diagnostics.len(), 1);
+        let diagnostic = &summary.diagnostics[0];
         assert!(
-            summary.diagnostics[0].message.contains("too_many_files"),
-            "diagnostic must name the source-policy rebuild failure: {:?}",
-            summary.diagnostics[0]
+            diagnostic.message.contains("too_many_files"),
+            "diagnostic must name the source-policy rebuild failure: {diagnostic:?}"
         );
         Ok(())
     }
