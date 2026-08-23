@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use data_encoding::BASE32_NOPAD;
 use rift_core::ProjectPath as CoreProjectPath;
-use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS};
+use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileInclusion,
 };
@@ -711,8 +710,7 @@ pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
 /// wire constructor for a witness or a `Digest`. A 64-character digest reaching the wire is a
 /// defect this stays the single choke point against.
 pub(crate) fn digest_hex8(source: &str) -> String {
-    let fingerprint = Sha256::digest(source.as_bytes());
-    format!("{fingerprint:x}")[..DIGEST_WIRE_CHARS].to_owned()
+    digest_wire_hex(&Sha256::digest(source.as_bytes()))
 }
 
 /// Truncates an already-hashed full-length hex digest to its wire form. `full` keeps
@@ -722,15 +720,10 @@ fn wire_digest(full: &str) -> Digest {
     Digest(full[..DIGEST_WIRE_CHARS].to_owned())
 }
 
-/// Renders the leading `OPAQUE_ID_DIGEST_CHARS` base32 characters of one digest, minting an
-/// opaque `chg_`-style identity.
-///
-/// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with `O`, `I`, `B`, and
-/// `g`; opaque identities use its lowercase form.
-pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
-    let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
-    encoded.truncate(OPAQUE_ID_DIGEST_CHARS);
-    encoded
+/// Renders one already-computed SHA-256 digest in the `DIGEST_WIRE_CHARS` wire form, the
+/// truncation behind [`digest_hex8`] and the minted `ChangeId`.
+pub(crate) fn digest_wire_hex(digest: &sha2::digest::Output<Sha256>) -> String {
+    format!("{digest:x}")[..DIGEST_WIRE_CHARS].to_owned()
 }
 
 /// Finds the symbol a witnessed syntax node belongs to.
@@ -1234,8 +1227,8 @@ pub fn compute() -> i32 {
             .find(|node| node["kind"] == "rust.impl_item")
             .ok_or("fixture must witness the impl_item node")?;
         assert!(
-            impl_node["symbol"].is_null(),
-            "impl_item is not itself a declared symbol"
+            impl_node.get("symbol").is_none(),
+            "impl_item is not itself a declared symbol, so the member stays off the wire"
         );
         Ok(())
     }

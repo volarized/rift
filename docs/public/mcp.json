@@ -10,7 +10,6 @@
             "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
             "properties": {
               "dialect": {
-                "default": null,
                 "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
                 "maxLength": 64,
                 "pattern": "^[a-z][a-z0-9._-]*$",
@@ -88,7 +87,6 @@
             "include_body": true,
             "include_history": true,
             "language": {
-              "dialect": null,
               "name": "rust"
             },
             "limit": 5,
@@ -123,8 +121,7 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "Narrows the answer to one language. Null searches every served language."
+            "description": "Narrows the answer to one language. Omitted searches every served language."
           },
           "limit": {
             "default": 5,
@@ -156,8 +153,7 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "The projection to read. Null reads the workspace tree."
+            "description": "The projection to read. Omitted reads the workspace tree."
           },
           "rev": {
             "anyOf": [
@@ -168,8 +164,7 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Null reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
+            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
           },
           "scope": {
             "$ref": "#/$defs/SearchScope",
@@ -313,7 +308,6 @@
             "description": "One declaration a `get_symbol` lookup found.",
             "properties": {
               "co_changes": {
-                "default": null,
                 "description": "Symbols that historically change with this one, strongest coupling first, present\nwhen the request asked for history.",
                 "items": {
                   "$ref": "#/$defs/CoChange"
@@ -332,7 +326,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The symbol's timeline, present when the request asked for history."
               },
               "node": {
@@ -344,8 +337,7 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
-                "description": "The declaration node, whose identity `replace_symbol` can act on. Null when source\nis unavailable or outside the project."
+                "description": "The declaration node, whose identity `replace_symbol` can act on. Absent when\nsource is unavailable or outside the project."
               },
               "source": {
                 "anyOf": [
@@ -356,8 +348,7 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
-                "description": "The declaration source when the request asked for bodies and the provider can read\nit. Null for source-less declarations."
+                "description": "The declaration source when the request asked for bodies and the provider can read\nit. Absent for source-less declarations."
               },
               "symbol": {
                 "$ref": "#/$defs/Symbol",
@@ -374,7 +365,6 @@
             "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
             "properties": {
               "dialect": {
-                "default": null,
                 "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
                 "maxLength": 64,
                 "pattern": "^[a-z][a-z0-9._-]*$",
@@ -434,7 +424,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The region this one is nested inside. Absent at the top level of a unit."
               },
               "range": {
@@ -457,7 +446,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment."
               },
               "unit": {
@@ -658,7 +646,7 @@
             "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list.",
             "properties": {
               "default": {
-                "description": "The default value as written in the source. Null where there is none.",
+                "description": "The default value as written in the source. Absent where there is none.",
                 "type": [
                   "string",
                   "null"
@@ -669,7 +657,7 @@
                 "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem."
               },
               "name": {
-                "description": "What the parameter is called. Null where the language allows an unnamed one, as a\npositional parameter in a function type.",
+                "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
                 "type": [
                   "string",
                   "null"
@@ -684,7 +672,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "Where this parameter is written in the source."
               },
               "optional": {
@@ -704,11 +691,9 @@
               }
             },
             "required": [
-              "name",
               "types",
               "optional",
               "variadic",
-              "default",
               "extensions"
             ],
             "type": "object"
@@ -843,67 +828,15 @@
                 "type": "array"
               },
               "receiver": {
-                "additionalProperties": false,
-                "description": "The implicit first parameter - `self`, `this`. Null for a free function, and for\nlanguages that have no such thing.",
-                "properties": {
-                  "default": {
-                    "description": "The default value as written in the source. Null where there is none.",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Parameter"
                   },
-                  "extensions": {
-                    "$ref": "#/$defs/Extensions",
-                    "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem."
-                  },
-                  "name": {
-                    "description": "What the parameter is called. Null where the language allows an unnamed one, as a\npositional parameter in a function type.",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "node": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/NodeId"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "description": "Where this parameter is written in the source."
-                  },
-                  "optional": {
-                    "description": "Whether a call may leave it out.",
-                    "type": "boolean"
-                  },
-                  "types": {
-                    "description": "What it accepts. An array because a declared type and an inferred one are separate\nbindings.",
-                    "items": {
-                      "$ref": "#/$defs/TypeBinding"
-                    },
-                    "type": "array"
-                  },
-                  "variadic": {
-                    "description": "Whether it absorbs the arguments that follow - `*args`, `...rest`.",
-                    "type": "boolean"
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "name",
-                  "types",
-                  "optional",
-                  "variadic",
-                  "default",
-                  "extensions"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
               },
               "returns": {
                 "description": "What the call yields. An array because a language may return several values, and\nbecause a declared and an inferred return are separate bindings.",
@@ -931,7 +864,6 @@
               "display",
               "links",
               "language",
-              "receiver",
               "parameters",
               "returns",
               "type_parameters",
@@ -1019,8 +951,7 @@
                         "type": "null"
                       }
                     ],
-                    "default": null,
-                    "description": "Local package that owns the source, or null when no package manifest assigns\none."
+                    "description": "Local package that owns the source, or absent when no package manifest assigns\none."
                   }
                 },
                 "required": [
@@ -1116,7 +1047,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
               },
               "document_local": {
@@ -1184,7 +1114,7 @@
                 "type": "array"
               },
               "visibility": {
-                "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Null where the language has no such concept.",
+                "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
                 "type": [
                   "string",
                   "null"
@@ -1199,7 +1129,6 @@
               "facets",
               "origin",
               "modifiers",
-              "visibility",
               "types",
               "signatures",
               "documentation",
@@ -1408,8 +1337,7 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
-                "description": "Source ownership. Null exactly when `source_kind` is `synthetic`."
+                "description": "Source ownership. Absent exactly when `source_kind` is `synthetic`."
               },
               "source_kind": {
                 "$ref": "#/$defs/SourceKind",
@@ -1424,8 +1352,7 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
-                "description": "Source-catalog unit containing the declaration. Null when source is unavailable or\nthe declaration is synthetic."
+                "description": "Source-catalog unit containing the declaration. Absent when source is unavailable\nor the declaration is synthetic."
               }
             },
             "required": [
@@ -1450,7 +1377,6 @@
                 "description": "The revision that touched the symbol."
               },
               "summary": {
-                "default": null,
                 "description": "The revision's own first summary line, where the version control records one.",
                 "maxLength": 4096,
                 "type": [
@@ -1654,17 +1580,15 @@
                 "description": "The language the spelling is in, and so which provider produced it."
               },
               "resolved": {
-                "description": "The symbol that declares this type, where one does. Null for a structural type,\nwhich has a spelling and nothing to open.",
-                "examples": [
-                  "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ],
-                "maxLength": 8192,
-                "minLength": 17,
-                "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "description": "The symbol that declares this type, where one does. Absent for a structural type,\nwhich has a spelling and nothing to open."
               },
               "source": {
                 "description": "The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.",
@@ -1674,7 +1598,6 @@
             "required": [
               "language",
               "source",
-              "resolved",
               "extensions"
             ],
             "type": "object"
@@ -1722,7 +1645,6 @@
                   "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
                   "kind": "rust.function_item",
                   "language": {
-                    "dialect": null,
                     "name": "rust"
                   },
                   "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
@@ -1760,7 +1682,6 @@
                   "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
                 },
                 "symbol": {
-                  "container": null,
                   "document_local": false,
                   "documentation": [
                     {
@@ -1777,15 +1698,13 @@
                   "id": "rift://symbol/rust/src/config.rs/load_config",
                   "kind": "rust.function",
                   "language": {
-                    "dialect": null,
                     "name": "rust"
                   },
                   "modifiers": [],
                   "name": "load_config",
                   "origin": {
                     "location": {
-                      "kind": "project",
-                      "package": null
+                      "kind": "project"
                     },
                     "source_kind": "authored",
                     "unit": "rift://source/project/src/config.rs"
@@ -1796,7 +1715,6 @@
                       "effects": [],
                       "extensions": {},
                       "language": {
-                        "dialect": null,
                         "name": "rust"
                       },
                       "links": [
@@ -1810,10 +1728,8 @@
                       ],
                       "parameters": [
                         {
-                          "default": null,
                           "extensions": {},
                           "name": "path",
-                          "node": null,
                           "optional": false,
                           "types": [
                             {
@@ -1822,10 +1738,8 @@
                               "type": {
                                 "extensions": {},
                                 "language": {
-                                  "dialect": null,
                                   "name": "rust"
                                 },
-                                "resolved": null,
                                 "source": "&Path"
                               }
                             }
@@ -1833,7 +1747,6 @@
                           "variadic": false
                         }
                       ],
-                      "receiver": null,
                       "returns": [
                         {
                           "origin": "declared",
@@ -1841,10 +1754,8 @@
                           "type": {
                             "extensions": {},
                             "language": {
-                              "dialect": null,
                               "name": "rust"
                             },
-                            "resolved": null,
                             "source": "Result<Config, ConfigError>"
                           }
                         }
@@ -1860,10 +1771,8 @@
                       "type": {
                         "extensions": {},
                         "language": {
-                          "dialect": null,
                           "name": "rust"
                         },
-                        "resolved": null,
                         "source": "Result<Config, ConfigError>"
                       }
                     }
@@ -1995,7 +1904,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "The existing declaration the new one lands beside."
           },
           "body": {
@@ -2017,7 +1925,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "The file the content lands in, created first when `create_missing` is set and\nit does not exist."
           },
           "position": {
@@ -2036,13 +1943,11 @@
       "output_schema": {
         "$defs": {
           "ChangeId": {
-            "description": "Identity of one applied change, minted when the change lands.",
+            "description": "Identity of one applied change, minted when the change lands: the first eight\nlowercase hex characters of the SHA-256 of the change's content, the same wire form\n`Digest` uses.",
             "examples": [
-              "chg_abcdefghijklmnopqrstuvwxyz"
+              "d54ffb22"
             ],
-            "maxLength": 30,
-            "minLength": 30,
-            "pattern": "^chg_[a-z2-7]{26}$",
+            "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
           "ChangeSummary": {
@@ -2168,7 +2073,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Absent where\nthe provider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -2183,36 +2088,15 @@
                 "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
               },
               "language": {
-                "additionalProperties": false,
-                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
-                "properties": {
-                  "dialect": {
-                    "default": null,
-                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Language"
                   },
-                  "name": {
-                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": "string"
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "name"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "The language whose provider produced this. Absent for a finding Rift itself\nraised."
               },
               "message": {
                 "description": "What the provider said, in its own words.",
@@ -2235,26 +2119,15 @@
                 "description": "How much it matters."
               },
               "span": {
-                "additionalProperties": false,
-                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
-                "properties": {
-                  "range": {
-                    "$ref": "#/$defs/TextRange",
-                    "description": "The bytes, as offsets into that file."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SourceSpan"
                   },
-                  "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "Which file the offsets are into."
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "unit",
-                  "range"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
                 "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
@@ -2266,15 +2139,12 @@
             },
             "required": [
               "severity",
-              "code",
               "message",
-              "span",
               "related",
               "tags",
               "reliability",
               "continuation",
-              "extensions",
-              "language"
+              "extensions"
             ],
             "type": "object"
           },
@@ -2475,6 +2345,34 @@
                 "type": "string"
               }
             ]
+          },
+          "Language": {
+            "additionalProperties": false,
+            "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
+            "properties": {
+              "dialect": {
+                "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                "examples": [
+                  "rust"
+                ],
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
           },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
@@ -2791,12 +2689,10 @@
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
                   "extensions": {},
-                  "language": null,
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
                   "related": [],
                   "reliability": "reliable",
                   "severity": "error",
-                  "span": null,
                   "tags": []
                 }
               ],
@@ -2824,7 +2720,7 @@
                   }
                 }
               ],
-              "id": "chg_d54ffb226255dd4fcc32a72f65",
+              "id": "d54ffb22",
               "paths": [
                 "src/config.rs"
               ]
@@ -2988,8 +2884,7 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "The projection to read. Null reads the workspace tree."
+            "description": "The projection to read. Omitted reads the workspace tree."
           },
           "rev": {
             "anyOf": [
@@ -3000,8 +2895,7 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Null reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
+            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
           }
         },
         "required": [
@@ -3072,7 +2966,6 @@
             "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
             "properties": {
               "dialect": {
-                "default": null,
                 "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
                 "maxLength": 64,
                 "pattern": "^[a-z][a-z0-9._-]*$",
@@ -3132,7 +3025,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The region this one is nested inside. Absent at the top level of a unit."
               },
               "range": {
@@ -3155,7 +3047,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment."
               },
               "unit": {
@@ -3466,16 +3357,13 @@
                 "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
                 "kind": "rust.source_file",
                 "language": {
-                  "dialect": null,
                   "name": "rust"
                 },
-                "parent": null,
                 "range": {
                   "end": 356,
                   "start": 0
                 },
                 "regions": [],
-                "symbol": null,
                 "unit": "rift://file/src/config.rs"
               },
               {
@@ -3487,7 +3375,6 @@
                 "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
                 "kind": "rust.function_item",
                 "language": {
-                  "dialect": null,
                   "name": "rust"
                 },
                 "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
@@ -3520,7 +3407,6 @@
                 "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
                 "kind": "rust.block",
                 "language": {
-                  "dialect": null,
                   "name": "rust"
                 },
                 "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36",
@@ -3529,7 +3415,6 @@
                   "start": 281
                 },
                 "regions": [],
-                "symbol": null,
                 "unit": "rift://file/src/config.rs"
               },
               {
@@ -3540,7 +3425,6 @@
                 "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
                 "kind": "rust.call_expression",
                 "language": {
-                  "dialect": null,
                   "name": "rust"
                 },
                 "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8",
@@ -3549,7 +3433,6 @@
                   "start": 334
                 },
                 "regions": [],
-                "symbol": null,
                 "unit": "rift://file/src/config.rs"
               },
               {
@@ -3558,7 +3441,6 @@
                 "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
                 "kind": "rust.identifier",
                 "language": {
-                  "dialect": null,
                   "name": "rust"
                 },
                 "parent": "rift://node/rust/src/config.rs@334-353#4df4426e",
@@ -3567,7 +3449,6 @@
                   "start": 334
                 },
                 "regions": [],
-                "symbol": null,
                 "unit": "rift://file/src/config.rs"
               }
             ],
@@ -3685,13 +3566,11 @@
       "output_schema": {
         "$defs": {
           "ChangeId": {
-            "description": "Identity of one applied change, minted when the change lands.",
+            "description": "Identity of one applied change, minted when the change lands: the first eight\nlowercase hex characters of the SHA-256 of the change's content, the same wire form\n`Digest` uses.",
             "examples": [
-              "chg_abcdefghijklmnopqrstuvwxyz"
+              "d54ffb22"
             ],
-            "maxLength": 30,
-            "minLength": 30,
-            "pattern": "^chg_[a-z2-7]{26}$",
+            "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
           "ChangeSummary": {
@@ -3817,7 +3696,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Absent where\nthe provider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -3832,36 +3711,15 @@
                 "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
               },
               "language": {
-                "additionalProperties": false,
-                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
-                "properties": {
-                  "dialect": {
-                    "default": null,
-                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Language"
                   },
-                  "name": {
-                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": "string"
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "name"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "The language whose provider produced this. Absent for a finding Rift itself\nraised."
               },
               "message": {
                 "description": "What the provider said, in its own words.",
@@ -3884,26 +3742,15 @@
                 "description": "How much it matters."
               },
               "span": {
-                "additionalProperties": false,
-                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
-                "properties": {
-                  "range": {
-                    "$ref": "#/$defs/TextRange",
-                    "description": "The bytes, as offsets into that file."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SourceSpan"
                   },
-                  "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "Which file the offsets are into."
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "unit",
-                  "range"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
                 "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
@@ -3915,15 +3762,12 @@
             },
             "required": [
               "severity",
-              "code",
               "message",
-              "span",
               "related",
               "tags",
               "reliability",
               "continuation",
-              "extensions",
-              "language"
+              "extensions"
             ],
             "type": "object"
           },
@@ -4124,6 +3968,34 @@
                 "type": "string"
               }
             ]
+          },
+          "Language": {
+            "additionalProperties": false,
+            "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
+            "properties": {
+              "dialect": {
+                "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                "examples": [
+                  "rust"
+                ],
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
           },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
@@ -4440,12 +4312,10 @@
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
                   "extensions": {},
-                  "language": null,
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
                   "related": [],
                   "reliability": "reliable",
                   "severity": "error",
-                  "span": null,
                   "tags": []
                 }
               ],
@@ -4473,7 +4343,7 @@
                   }
                 }
               ],
-              "id": "chg_d54ffb226255dd4fcc32a72f65",
+              "id": "d54ffb22",
               "paths": [
                 "src/config.rs"
               ]
@@ -4628,8 +4498,7 @@
         "examples": [
           {
             "body": "parse_config(text.trim())",
-            "node": "rift://node/rust/src/config.rs@334-353#4df4426e",
-            "region": null
+            "node": "rift://node/rust/src/config.rs@334-353#4df4426e"
           }
         ],
         "properties": {
@@ -4651,8 +4520,7 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "Which named part of the node to replace. Null - the only value this release\nserves - replaces the node whole; a named region fails as\n`capability_unavailable`."
+            "description": "Which named part of the node to replace. Omitted - the only form this release\nserves - replaces the node whole; a named region fails as\n`capability_unavailable`."
           }
         },
         "required": [
@@ -4666,13 +4534,11 @@
       "output_schema": {
         "$defs": {
           "ChangeId": {
-            "description": "Identity of one applied change, minted when the change lands.",
+            "description": "Identity of one applied change, minted when the change lands: the first eight\nlowercase hex characters of the SHA-256 of the change's content, the same wire form\n`Digest` uses.",
             "examples": [
-              "chg_abcdefghijklmnopqrstuvwxyz"
+              "d54ffb22"
             ],
-            "maxLength": 30,
-            "minLength": 30,
-            "pattern": "^chg_[a-z2-7]{26}$",
+            "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
           "ChangeSummary": {
@@ -4798,7 +4664,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Absent where\nthe provider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -4813,36 +4679,15 @@
                 "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
               },
               "language": {
-                "additionalProperties": false,
-                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
-                "properties": {
-                  "dialect": {
-                    "default": null,
-                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Language"
                   },
-                  "name": {
-                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": "string"
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "name"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "The language whose provider produced this. Absent for a finding Rift itself\nraised."
               },
               "message": {
                 "description": "What the provider said, in its own words.",
@@ -4865,26 +4710,15 @@
                 "description": "How much it matters."
               },
               "span": {
-                "additionalProperties": false,
-                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
-                "properties": {
-                  "range": {
-                    "$ref": "#/$defs/TextRange",
-                    "description": "The bytes, as offsets into that file."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SourceSpan"
                   },
-                  "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "Which file the offsets are into."
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "unit",
-                  "range"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
                 "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
@@ -4896,15 +4730,12 @@
             },
             "required": [
               "severity",
-              "code",
               "message",
-              "span",
               "related",
               "tags",
               "reliability",
               "continuation",
-              "extensions",
-              "language"
+              "extensions"
             ],
             "type": "object"
           },
@@ -5105,6 +4936,34 @@
                 "type": "string"
               }
             ]
+          },
+          "Language": {
+            "additionalProperties": false,
+            "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
+            "properties": {
+              "dialect": {
+                "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                "examples": [
+                  "rust"
+                ],
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
           },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
@@ -5421,12 +5280,10 @@
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
                   "extensions": {},
-                  "language": null,
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
                   "related": [],
                   "reliability": "reliable",
                   "severity": "error",
-                  "span": null,
                   "tags": []
                 }
               ],
@@ -5454,7 +5311,7 @@
                   }
                 }
               ],
-              "id": "chg_d54ffb226255dd4fcc32a72f65",
+              "id": "d54ffb22",
               "paths": [
                 "src/config.rs"
               ]
@@ -5609,7 +5466,6 @@
         "examples": [
           {
             "body": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}",
-            "region": null,
             "symbol": "rift://symbol/rust/src/config.rs/load_config"
           }
         ],
@@ -5628,8 +5484,7 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "Which part of the declaration to replace. Null - the only value this release\nserves - replaces the whole declaration; a named region fails as\n`capability_unavailable`."
+            "description": "Which part of the declaration to replace. Omitted - the only form this release\nserves - replaces the whole declaration; a named region fails as\n`capability_unavailable`."
           },
           "symbol": {
             "$ref": "#/$defs/SymbolId",
@@ -5647,13 +5502,11 @@
       "output_schema": {
         "$defs": {
           "ChangeId": {
-            "description": "Identity of one applied change, minted when the change lands.",
+            "description": "Identity of one applied change, minted when the change lands: the first eight\nlowercase hex characters of the SHA-256 of the change's content, the same wire form\n`Digest` uses.",
             "examples": [
-              "chg_abcdefghijklmnopqrstuvwxyz"
+              "d54ffb22"
             ],
-            "maxLength": 30,
-            "minLength": 30,
-            "pattern": "^chg_[a-z2-7]{26}$",
+            "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
           "ChangeSummary": {
@@ -5779,7 +5632,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Absent where\nthe provider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -5794,36 +5647,15 @@
                 "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
               },
               "language": {
-                "additionalProperties": false,
-                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
-                "properties": {
-                  "dialect": {
-                    "default": null,
-                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Language"
                   },
-                  "name": {
-                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": "string"
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "name"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "The language whose provider produced this. Absent for a finding Rift itself\nraised."
               },
               "message": {
                 "description": "What the provider said, in its own words.",
@@ -5846,26 +5678,15 @@
                 "description": "How much it matters."
               },
               "span": {
-                "additionalProperties": false,
-                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
-                "properties": {
-                  "range": {
-                    "$ref": "#/$defs/TextRange",
-                    "description": "The bytes, as offsets into that file."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SourceSpan"
                   },
-                  "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "Which file the offsets are into."
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "unit",
-                  "range"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
                 "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
@@ -5877,15 +5698,12 @@
             },
             "required": [
               "severity",
-              "code",
               "message",
-              "span",
               "related",
               "tags",
               "reliability",
               "continuation",
-              "extensions",
-              "language"
+              "extensions"
             ],
             "type": "object"
           },
@@ -6086,6 +5904,34 @@
                 "type": "string"
               }
             ]
+          },
+          "Language": {
+            "additionalProperties": false,
+            "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
+            "properties": {
+              "dialect": {
+                "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
+                "examples": [
+                  "rust"
+                ],
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9._-]*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
           },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
@@ -6402,12 +6248,10 @@
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
                   "extensions": {},
-                  "language": null,
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
                   "related": [],
                   "reliability": "reliable",
                   "severity": "error",
-                  "span": null,
                   "tags": []
                 }
               ],
@@ -6435,7 +6279,7 @@
                   }
                 }
               ],
-              "id": "chg_d54ffb226255dd4fcc32a72f65",
+              "id": "d54ffb22",
               "paths": [
                 "src/config.rs"
               ]
@@ -6566,11 +6410,9 @@
                 "description": "How the operand is compared against the field. What a comparison means follows the\nfield's type, so ordering ops apply only where the values are ordered. An array field\nsuch as `facets` takes `contains`, `in` and `exists`; the rest have no meaning\nagainst a list and Rift rejects them."
               },
               "value": {
-                "default": null,
                 "description": "The operand, for every op except `in` and `exists`."
               },
               "values": {
-                "default": null,
                 "description": "The operands for `in`.",
                 "items": true,
                 "type": [
@@ -6840,7 +6682,6 @@
                 "description": "Which way the edge runs, seen from the entity being filtered."
               },
               "facet": {
-                "default": null,
                 "description": "Portable relationship facets. Any listed facet matches.",
                 "items": {
                   "$ref": "#/$defs/RelationshipFacet"
@@ -6851,7 +6692,6 @@
                 ]
               },
               "kind": {
-                "default": null,
                 "description": "Exact relationship kinds a provider emits. Any listed kind matches.",
                 "items": {
                   "type": "string"
@@ -6862,7 +6702,6 @@
                 ]
               },
               "max_depth": {
-                "default": null,
                 "description": "How many edges a traversal may cross. Only edges that compose carry a depth -\n`contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`,\n`mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing\nto walk, and Rift rejects it.",
                 "format": "uint64",
                 "maximum": 100,
@@ -6873,7 +6712,6 @@
                 ]
               },
               "min_depth": {
-                "default": null,
                 "description": "How many edges to walk before a hit counts. Above 1 this asks about indirect\nneighbours and skips the direct ones.",
                 "format": "uint64",
                 "minimum": 1,
@@ -6891,7 +6729,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "Whether a match needs such an edge, or needs there to be none."
               },
               "target": {
@@ -6903,7 +6740,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "What has to be true of the entity at the other end. Nesting a filter here is how\n\"callers that are tests\" becomes one query."
               }
             },
@@ -7233,11 +7069,9 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "Direction to walk. Omitted selects incoming for `find_tests` and `edit_ripple`,\noutgoing for `trace`, and both for `review_context`."
               },
               "facets": {
-                "default": null,
                 "description": "Portable relationship facets eligible for expansion. Omitted selects `tests` for\n`find_tests` and `calls` for every other intent; an empty list is `invalid_request`.",
                 "items": {
                   "$ref": "#/$defs/RelationshipFacet"
@@ -7375,7 +7209,6 @@
         ],
         "examples": [
           {
-            "filter": null,
             "include": [
               "source",
               "signature"
@@ -7448,11 +7281,9 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "A predicate over resolved fields and relationships. This is where provider knowledge\nenters a search - implements this trait, called by that function, declared under\n`src/api`."
           },
           "include": {
-            "default": null,
             "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so the\ncaller requests only what it will read.",
             "items": {
               "$ref": "#/$defs/SearchInclude"
@@ -7463,7 +7294,6 @@
             ]
           },
           "limit": {
-            "default": null,
             "description": "Most hits to return in one page. `max_page_items` from the workspace resource caps\nit, and fewer may come back.",
             "format": "uint64",
             "maximum": 10000,
@@ -7494,7 +7324,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "Files eligible for the search, selected by project-relative globs. Omitted selects\nevery visible file."
           },
           "projection": {
@@ -7506,11 +7335,9 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "The projection to search. Null searches the workspace tree."
+            "description": "The projection to search. Omitted searches the workspace tree."
           },
           "query": {
-            "default": null,
             "description": "Text to match against file contents, symbol names, and rendered signatures. Matching\nis case-insensitive and identifier-aware - the query and the fields split on case\nand underscore boundaries, so `loadConfig` finds `load_config`. Scoring is\nserver-defined and comparable within one answer.",
             "type": [
               "string",
@@ -7526,8 +7353,7 @@
                 "type": "null"
               }
             ],
-            "default": null,
-            "description": "The version-control revision to search - a branch, tag, or commit id as the\nworkspace's version control spells it. Null searches the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision search when the\nworkspace has no version-control repository."
+            "description": "The version-control revision to search - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted searches the current tree, and\n`rev` never combines with `projection`. The server refuses a revision search when\nthe workspace has no version-control repository."
           },
           "scope": {
             "$ref": "#/$defs/SearchScope",
@@ -7548,7 +7374,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "A bounded relationship walk. It may stand alone or add graph hits to a lexical or\nfiltered search; duplicate symbols keep their shortest path."
           }
         },
@@ -7563,7 +7388,7 @@
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
             "properties": {
               "code": {
-                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the\nprovider issues none.",
+                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Absent where\nthe provider issues none.",
                 "type": [
                   "string",
                   "null"
@@ -7578,36 +7403,15 @@
                 "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
               },
               "language": {
-                "additionalProperties": false,
-                "description": "The language whose provider produced this. Null for a finding Rift itself raised.",
-                "properties": {
-                  "dialect": {
-                    "default": null,
-                    "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Language"
                   },
-                  "name": {
-                    "description": "The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and\n`typescript` cannot split one language into two identity spaces.",
-                    "examples": [
-                      "rust"
-                    ],
-                    "maxLength": 64,
-                    "pattern": "^[a-z][a-z0-9._-]*$",
-                    "type": "string"
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "name"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "The language whose provider produced this. Absent for a finding Rift itself\nraised."
               },
               "message": {
                 "description": "What the provider said, in its own words.",
@@ -7630,26 +7434,15 @@
                 "description": "How much it matters."
               },
               "span": {
-                "additionalProperties": false,
-                "description": "Where it applies. Null for a finding about the file as a whole, or about the build.",
-                "properties": {
-                  "range": {
-                    "$ref": "#/$defs/TextRange",
-                    "description": "The bytes, as offsets into that file."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SourceSpan"
                   },
-                  "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "Which file the offsets are into."
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "unit",
-                  "range"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
                 "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
@@ -7661,15 +7454,12 @@
             },
             "required": [
               "severity",
-              "code",
               "message",
-              "span",
               "related",
               "tags",
               "reliability",
               "continuation",
-              "extensions",
-              "language"
+              "extensions"
             ],
             "type": "object"
           },
@@ -7678,7 +7468,7 @@
             "description": "One `Diagnostic` as an MCP answer carries it: the fact its emitter minted, plus what Rift\ncan add on top - where it lands in a line and column, and the source around it.",
             "properties": {
               "column": {
-                "description": "One-based column within that line, counted in UTF-8 bytes. Null for the same reason\nas `line`.",
+                "description": "One-based column within that line, counted in UTF-8 bytes. Absent for the same\nreason as `line`.",
                 "format": "uint64",
                 "minimum": 0,
                 "type": [
@@ -7691,29 +7481,18 @@
                 "description": "The finding itself, exactly as its emitter minted it."
               },
               "excerpt": {
-                "additionalProperties": false,
-                "description": "The source the finding points at. Null where there is no span to copy from.",
-                "properties": {
-                  "span": {
-                    "$ref": "#/$defs/SourceUnitSpan",
-                    "description": "The source unit and byte range the text was taken from."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SourceExcerpt"
                   },
-                  "text": {
-                    "description": "The source bytes returned by the request.",
-                    "type": "string"
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "span",
-                  "text"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "The source the finding points at. Absent where there is no span to copy from."
               },
               "line": {
-                "description": "One-based line the finding starts on. Null where the diagnostic has no span - a\nwhole-project error has nowhere to point.",
+                "description": "One-based line the finding starts on. Absent where the diagnostic has no span - a\nwhole-project error has nowhere to point.",
                 "format": "uint64",
                 "minimum": 0,
                 "type": [
@@ -7728,10 +7507,7 @@
             },
             "required": [
               "source",
-              "diagnostic",
-              "line",
-              "column",
-              "excerpt"
+              "diagnostic"
             ],
             "type": "object"
           },
@@ -8072,7 +7848,6 @@
             "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
             "properties": {
               "dialect": {
-                "default": null,
                 "description": "A dialect whose syntax or semantics differ within the language, such as\n`postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.",
                 "maxLength": 64,
                 "pattern": "^[a-z][a-z0-9._-]*$",
@@ -8186,7 +7961,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The region this one is nested inside. Absent at the top level of a unit."
               },
               "range": {
@@ -8209,7 +7983,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment."
               },
               "unit": {
@@ -8410,7 +8183,7 @@
             "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list.",
             "properties": {
               "default": {
-                "description": "The default value as written in the source. Null where there is none.",
+                "description": "The default value as written in the source. Absent where there is none.",
                 "type": [
                   "string",
                   "null"
@@ -8421,7 +8194,7 @@
                 "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem."
               },
               "name": {
-                "description": "What the parameter is called. Null where the language allows an unnamed one, as a\npositional parameter in a function type.",
+                "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
                 "type": [
                   "string",
                   "null"
@@ -8436,7 +8209,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "Where this parameter is written in the source."
               },
               "optional": {
@@ -8456,11 +8228,9 @@
               }
             },
             "required": [
-              "name",
               "types",
               "optional",
               "variadic",
-              "default",
               "extensions"
             ],
             "type": "object"
@@ -8554,7 +8324,6 @@
             "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read.",
             "properties": {
               "confidence": {
-                "default": null,
                 "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
                 "format": "double",
                 "maximum": 1,
@@ -8836,7 +8605,6 @@
             "description": "One search hit. Its file, node, or symbol payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
             "properties": {
               "diagnostics": {
-                "default": null,
                 "description": "What providers reported here, requested with `include: [\"diagnostics\"]`.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticContext"
@@ -8847,7 +8615,6 @@
                 ]
               },
               "distance": {
-                "default": null,
                 "description": "Number of edges in `traversal_path`. It is present exactly when `traversal_path` is\npresent and equals its length.",
                 "format": "uint64",
                 "maximum": 2,
@@ -8862,8 +8629,7 @@
                 "description": "What was found. A symbol, a node, or a file - whichever `target` allowed."
               },
               "line": {
-                "default": null,
-                "description": "The 1-based source line where the hit begins, or null with `span`.",
+                "description": "The 1-based source line where the hit begins, or absent with `span`.",
                 "format": "uint64",
                 "minimum": 1,
                 "type": [
@@ -8887,11 +8653,9 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
-                "description": "Project-relative path of the hit, where the location is a project path. Null for a\nhit whose only location is a dependency or standard-library source unit."
+                "description": "Project-relative path of the hit, where the location is a project path. Absent for\na hit whose only location is a dependency or standard-library source unit."
               },
               "relationships": {
-                "default": null,
                 "description": "Edges from this hit, requested with `include: [\"relationships\"]`.",
                 "items": {
                   "$ref": "#/$defs/Relationship"
@@ -8907,7 +8671,6 @@
                 "type": "number"
               },
               "source": {
-                "default": null,
                 "description": "The source text around the hit, requested with `include: [\"source\"]`. Covers the\nhit's `span`; a caller that needs the range already has it there.",
                 "type": [
                   "string",
@@ -8923,11 +8686,9 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
-                "description": "Where the hit is written in the source catalog. Null for a symbol whose source is\nunavailable or synthetic."
+                "description": "Where the hit is written in the source catalog. Absent for a symbol whose source\nis unavailable or synthetic."
               },
               "traversal_path": {
-                "default": null,
                 "description": "Shortest relationship path from `traversal.seed` to this hit. Present whenever the\ntraversal reached the hit, including a hit also matched lexically.",
                 "items": {
                   "$ref": "#/$defs/GraphHop"
@@ -9072,67 +8833,15 @@
                 "type": "array"
               },
               "receiver": {
-                "additionalProperties": false,
-                "description": "The implicit first parameter - `self`, `this`. Null for a free function, and for\nlanguages that have no such thing.",
-                "properties": {
-                  "default": {
-                    "description": "The default value as written in the source. Null where there is none.",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Parameter"
                   },
-                  "extensions": {
-                    "$ref": "#/$defs/Extensions",
-                    "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem."
-                  },
-                  "name": {
-                    "description": "What the parameter is called. Null where the language allows an unnamed one, as a\npositional parameter in a function type.",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "node": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/NodeId"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "description": "Where this parameter is written in the source."
-                  },
-                  "optional": {
-                    "description": "Whether a call may leave it out.",
-                    "type": "boolean"
-                  },
-                  "types": {
-                    "description": "What it accepts. An array because a declared type and an inferred one are separate\nbindings.",
-                    "items": {
-                      "$ref": "#/$defs/TypeBinding"
-                    },
-                    "type": "array"
-                  },
-                  "variadic": {
-                    "description": "Whether it absorbs the arguments that follow - `*args`, `...rest`.",
-                    "type": "boolean"
+                  {
+                    "type": "null"
                   }
-                },
-                "required": [
-                  "name",
-                  "types",
-                  "optional",
-                  "variadic",
-                  "default",
-                  "extensions"
                 ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
               },
               "returns": {
                 "description": "What the call yields. An array because a language may return several values, and\nbecause a declared and an inferred return are separate bindings.",
@@ -9160,7 +8869,6 @@
               "display",
               "links",
               "language",
-              "receiver",
               "parameters",
               "returns",
               "type_parameters",
@@ -9186,6 +8894,25 @@
             "required": [
               "range",
               "symbol"
+            ],
+            "type": "object"
+          },
+          "SourceExcerpt": {
+            "additionalProperties": false,
+            "description": "A copy of source from the catalog. The unit may belong to the project, a dependency, or\nthe standard library; the excerpt preserves bytes as they were when the answer was\nproduced.",
+            "properties": {
+              "span": {
+                "$ref": "#/$defs/SourceUnitSpan",
+                "description": "The source unit and byte range the text was taken from."
+              },
+              "text": {
+                "description": "The source bytes returned by the request.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "span",
+              "text"
             ],
             "type": "object"
           },
@@ -9229,8 +8956,7 @@
                         "type": "null"
                       }
                     ],
-                    "default": null,
-                    "description": "Local package that owns the source, or null when no package manifest assigns\none."
+                    "description": "Local package that owns the source, or absent when no package manifest assigns\none."
                   }
                 },
                 "required": [
@@ -9345,7 +9071,6 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
               },
               "document_local": {
@@ -9413,7 +9138,7 @@
                 "type": "array"
               },
               "visibility": {
-                "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Null where the language has no such concept.",
+                "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
                 "type": [
                   "string",
                   "null"
@@ -9428,7 +9153,6 @@
               "facets",
               "origin",
               "modifiers",
-              "visibility",
               "types",
               "signatures",
               "documentation",
@@ -9615,8 +9339,7 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
-                "description": "Source ownership. Null exactly when `source_kind` is `synthetic`."
+                "description": "Source ownership. Absent exactly when `source_kind` is `synthetic`."
               },
               "source_kind": {
                 "$ref": "#/$defs/SourceKind",
@@ -9631,8 +9354,7 @@
                     "type": "null"
                   }
                 ],
-                "default": null,
-                "description": "Source-catalog unit containing the declaration. Null when source is unavailable or\nthe declaration is synthetic."
+                "description": "Source-catalog unit containing the declaration. Absent when source is unavailable\nor the declaration is synthetic."
               }
             },
             "required": [
@@ -9787,17 +9509,15 @@
                 "description": "The language the spelling is in, and so which provider produced it."
               },
               "resolved": {
-                "description": "The symbol that declares this type, where one does. Null for a structural type,\nwhich has a spelling and nothing to open.",
-                "examples": [
-                  "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ],
-                "maxLength": 8192,
-                "minLength": 17,
-                "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "description": "The symbol that declares this type, where one does. Absent for a structural type,\nwhich has a spelling and nothing to open."
               },
               "source": {
                 "description": "The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.",
@@ -9807,7 +9527,6 @@
             "required": [
               "language",
               "source",
-              "resolved",
               "extensions"
             ],
             "type": "object"
@@ -9823,11 +9542,8 @@
             },
             "results": [
               {
-                "diagnostics": null,
-                "distance": null,
                 "hit": {
                   "symbol": {
-                    "container": null,
                     "document_local": false,
                     "documentation": [
                       {
@@ -9844,15 +9560,13 @@
                     "id": "rift://symbol/rust/src/config.rs/load_config",
                     "kind": "rust.function",
                     "language": {
-                      "dialect": null,
                       "name": "rust"
                     },
                     "modifiers": [],
                     "name": "load_config",
                     "origin": {
                       "location": {
-                        "kind": "project",
-                        "package": null
+                        "kind": "project"
                       },
                       "source_kind": "authored",
                       "unit": "rift://source/project/src/config.rs"
@@ -9863,7 +9577,6 @@
                         "effects": [],
                         "extensions": {},
                         "language": {
-                          "dialect": null,
                           "name": "rust"
                         },
                         "links": [
@@ -9877,10 +9590,8 @@
                         ],
                         "parameters": [
                           {
-                            "default": null,
                             "extensions": {},
                             "name": "path",
-                            "node": null,
                             "optional": false,
                             "types": [
                               {
@@ -9889,10 +9600,8 @@
                                 "type": {
                                   "extensions": {},
                                   "language": {
-                                    "dialect": null,
                                     "name": "rust"
                                   },
-                                  "resolved": null,
                                   "source": "&Path"
                                 }
                               }
@@ -9900,7 +9609,6 @@
                             "variadic": false
                           }
                         ],
-                        "receiver": null,
                         "returns": [
                           {
                             "origin": "declared",
@@ -9908,10 +9616,8 @@
                             "type": {
                               "extensions": {},
                               "language": {
-                                "dialect": null,
                                 "name": "rust"
                               },
-                              "resolved": null,
                               "source": "Result<Config, ConfigError>"
                             }
                           }
@@ -9927,10 +9633,8 @@
                         "type": {
                           "extensions": {},
                           "language": {
-                            "dialect": null,
                             "name": "rust"
                           },
-                          "resolved": null,
                           "source": "Result<Config, ConfigError>"
                         }
                       }
@@ -9944,7 +9648,6 @@
                   "name"
                 ],
                 "path": "src/config.rs",
-                "relationships": null,
                 "score": 0.9,
                 "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
                 "span": {
@@ -9953,12 +9656,9 @@
                     "start": 162
                   },
                   "unit": "rift://source/project/src/config.rs"
-                },
-                "traversal_path": null
+                }
               },
               {
-                "diagnostics": null,
-                "distance": null,
                 "hit": {
                   "file": {
                     "content": {
@@ -9969,7 +9669,6 @@
                     "id": "rift://file/src/lib.rs",
                     "languages": [
                       {
-                        "dialect": null,
                         "name": "rust"
                       }
                     ],
@@ -9983,7 +9682,6 @@
                   "content"
                 ],
                 "path": "src/lib.rs",
-                "relationships": null,
                 "score": 1.0,
                 "source": "    let config = load_config(&arguments.path)?;",
                 "span": {
@@ -9992,8 +9690,7 @@
                     "start": 121
                   },
                   "unit": "rift://source/project/src/lib.rs"
-                },
-                "traversal_path": null
+                }
               }
             ],
             "warnings": []

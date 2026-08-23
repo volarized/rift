@@ -2861,7 +2861,6 @@ dependencies = [
 name = "rift-server"
 version = "0.0.12"
 dependencies = [
- "data-encoding",
  "diffy",
  "percent-encoding",
  "rift-core",

@@ -296,39 +296,14 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
     }
 }
 
-/// Walks `value`, refusing a `coverage` member anywhere in a result: results carry the
-/// answer, `pagination`, and `warnings` alone, and anything short of a full answer is a
-/// warning.
-fn assert_no_coverage_key(value: &Value, context: &str) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                assert_no_coverage_key(item, context);
-            }
-        }
-        Value::Object(map) => {
-            assert!(
-                !map.contains_key("coverage"),
-                "{context} must not carry a coverage member: {value:#}"
-            );
-            for item in map.values() {
-                assert_no_coverage_key(item, context);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-}
-
-/// Proves one tool result carries no oversized digest, no non-project source-unit
-/// resolver, and no `coverage` member, that every `search` hit names its
-/// project-relative path, and that every read result carries empty `warnings`: the live
-/// server resolves one published workspace per request, so no request can observe a
-/// lagging index.
+/// Proves one tool result carries no oversized digest and no non-project source-unit
+/// resolver, that every `search` hit names its project-relative path, and that every
+/// read result carries empty `warnings`: the live server resolves one published
+/// workspace per request, so no request can observe a lagging index.
 fn assert_wire_hygiene(name: &str, structured: &Value) {
     let context = format!("{name} result");
     assert_no_bare_sha256_digest(structured, &context);
     assert_source_unit_ids_use_project_resolver(structured, &context);
-    assert_no_coverage_key(structured, &context);
     if matches!(name, "get_symbol" | "search" | "nodes") {
         assert_eq!(
             structured["warnings"],

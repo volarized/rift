@@ -3,10 +3,7 @@
 //! re-exported from `read` so existing `rift_protocol::read::Diagnostic`-style paths keep
 //! resolving.
 
-use crate::read::{
-    Extensions, Language, Severity, SourceExcerpt, SourceSpan, deserialize_required_option,
-};
-use crate::schema;
+use crate::read::{Extensions, Language, Severity, SourceExcerpt, SourceSpan};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -17,17 +14,16 @@ use serde::{Deserialize, Serialize};
 pub struct Diagnostic {
     /// How much it matters.
     pub severity: Severity,
-    /// The provider's own identifier for this finding - `TS2345`, `E0308`. Null where the
-    /// provider issues none.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// The provider's own identifier for this finding - `TS2345`, `E0308`. Absent where
+    /// the provider issues none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// What the provider said, in its own words.
     #[schemars(length(max = 4096))]
     pub message: String,
-    /// Where it applies. Null for a finding about the file as a whole, or about the build.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// Where it applies. Absent for a finding about the file as a whole, or about the
+    /// build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
     /// Other places the provider pointed at while explaining this one.
     pub related: Vec<DiagnosticRelated>,
@@ -42,9 +38,9 @@ pub struct Diagnostic {
     /// Diagnostic fields the model has no place for, namespaced by the provider that
     /// emitted them.
     pub extensions: Extensions,
-    /// The language whose provider produced this. Null for a finding Rift itself raised.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// The language whose provider produced this. Absent for a finding Rift itself
+    /// raised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<Language>,
 }
 
@@ -86,19 +82,16 @@ pub struct DiagnosticContext {
     pub source: DiagnosticContextSource,
     /// The finding itself, exactly as its emitter minted it.
     pub diagnostic: Diagnostic,
-    /// One-based line the finding starts on. Null where the diagnostic has no span - a
+    /// One-based line the finding starts on. Absent where the diagnostic has no span - a
     /// whole-project error has nowhere to point.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u64>,
-    /// One-based column within that line, counted in UTF-8 bytes. Null for the same reason
-    /// as `line`.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// One-based column within that line, counted in UTF-8 bytes. Absent for the same
+    /// reason as `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column: Option<u64>,
-    /// The source the finding points at. Null where there is no span to copy from.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// The source the finding points at. Absent where there is no span to copy from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<SourceExcerpt>,
 }
 

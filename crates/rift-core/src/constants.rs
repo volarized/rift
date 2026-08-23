@@ -66,9 +66,6 @@ pub const SHA256_HEX_LENGTH: usize = 64;
 /// hashing stays internal to identity computation; a wire `Digest` truncates
 /// to this width at the boundary.
 pub const DIGEST_WIRE_CHARS: usize = 8;
-/// Base32 characters kept from a SHA-256 digest minting an opaque `chg_`-style
-/// identity.
-pub const OPAQUE_ID_DIGEST_CHARS: usize = 26;
 /// GitHub API endpoint naming the latest official Rift release.
 pub const RELEASE_API_URL: &str = "https://api.github.com/repos/volarized/rift/releases/latest";
 /// Base URL below which official Rift release assets are downloaded.

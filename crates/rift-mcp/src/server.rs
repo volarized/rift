@@ -2046,7 +2046,7 @@ pub fn beacon() -> u64 {
             |_, _| {
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
-                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        id: ChangeId("0123abcd".to_owned()),
                         paths: Vec::new(),
                         edits: Vec::new(),
                         diagnostics: Vec::new(),
@@ -2094,7 +2094,7 @@ pub fn beacon() -> u64 {
                 })?;
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
-                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        id: ChangeId("0123abcd".to_owned()),
                         paths: Vec::new(),
                         edits: Vec::new(),
                         diagnostics: Vec::new(),
@@ -2153,7 +2153,7 @@ pub fn beacon() -> u64 {
                 fs::write(&nested_gitignore, "").expect("nested gitignore scaffold must write");
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
-                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        id: ChangeId("0123abcd".to_owned()),
                         paths: Vec::new(),
                         edits: Vec::new(),
                         diagnostics: Vec::new(),

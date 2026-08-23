@@ -30,10 +30,6 @@ use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id, node_
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
 
-/// Byte length of the hashed material a change identity keeps: 16 bytes
-/// encode to the 26 base32 characters the `chg_` pattern requires.
-const CHANGE_ID_BYTES: usize = 16;
-
 /// Serialized change application against one workspace tree.
 #[derive(Debug)]
 pub struct ChangeService {
@@ -464,10 +460,7 @@ impl ChangeService {
         let digest = identity.finalize();
         Ok(ChangeResult::Applied {
             summary: ChangeSummary {
-                id: ChangeId(format!(
-                    "chg_{}",
-                    crate::read::digest_prefix_base32(&digest[..CHANGE_ID_BYTES])
-                )),
+                id: ChangeId(crate::read::digest_wire_hex(&digest)),
                 paths,
                 edits,
                 diagnostics,
@@ -728,10 +721,7 @@ fn decoded(encoded: &str) -> Option<String> {
 /// Mints the identity of one landed change from its path and result bytes.
 fn change_id(path: &str, next_source: &str) -> ChangeId {
     let digest = Sha256::digest(format!("{path}\u{0}{next_source}").as_bytes());
-    ChangeId(format!(
-        "chg_{}",
-        crate::read::digest_prefix_base32(&digest[..CHANGE_ID_BYTES])
-    ))
+    ChangeId(crate::read::digest_wire_hex(&digest))
 }
 
 /// Re-parses the changed file and reports parser findings, bounded.
@@ -857,8 +847,13 @@ mod tests {
         assert_eq!(summary.edits.len(), 1);
         assert!(summary.diagnostics.is_empty(), "clean body parses cleanly");
         assert!(
-            summary.id.0.starts_with("chg_") && summary.id.0.len() == 30,
-            "change id must match its pattern: {}",
+            summary.id.0.len() == 8
+                && summary
+                    .id
+                    .0
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "change id must be eight lowercase hex characters: {}",
             summary.id.0
         );
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;

@@ -6,7 +6,7 @@
 
 use crate::schema;
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 // Search-specific models (`SearchParams`, `PathSelector`, the filter tree, and their
@@ -25,14 +25,6 @@ pub use crate::diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticContext, DiagnosticContextSource, DiagnosticContinuation,
     DiagnosticRelated, DiagnosticReliability, DiagnosticTag,
 };
-
-pub(crate) fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
-}
 
 /// Empirical coupling between two symbols: how often revisions that touched one touched the
 /// other. The relation is observed from history rather than resolved from source, so it
@@ -229,20 +221,20 @@ pub struct FileId(
 pub struct GetSymbolHit {
     /// The declaration that matched.
     pub symbol: Symbol,
-    /// The declaration node, whose identity `replace_symbol` can act on. Null when source
-    /// is unavailable or outside the project.
-    #[serde(default)]
+    /// The declaration node, whose identity `replace_symbol` can act on. Absent when
+    /// source is unavailable or outside the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<Node>,
     /// The declaration source when the request asked for bodies and the provider can read
-    /// it. Null for source-less declarations.
-    #[serde(default)]
+    /// it. Absent for source-less declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceExcerpt>,
     /// The symbol's timeline, present when the request asked for history.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<SymbolHistory>,
     /// Symbols that historically change with this one, strongest coupling first, present
     /// when the request asked for history.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub co_changes: Option<Vec<CoChange>>,
 }
 
@@ -255,8 +247,7 @@ pub struct GetSymbolHit {
     {
         "name": "ReadService",
         "language": {
-            "name": "rust",
-            "dialect": null
+            "name": "rust"
         },
         "include_body": true,
         "include_history": true,
@@ -278,8 +269,8 @@ pub struct GetSymbolParams {
     /// substrings.
     #[schemars(length(min = 1, max = 4096))]
     pub name: String,
-    /// Narrows the answer to one language. Null searches every served language.
-    #[serde(default)]
+    /// Narrows the answer to one language. Omitted searches every served language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<Language>,
     /// Whether each hit carries its declaration source.
     #[serde(default = "default_get_symbol_params_include_body")]
@@ -298,14 +289,14 @@ pub struct GetSymbolParams {
     /// `page_index` and the true `total_pages`.
     #[serde(default = "default_get_symbol_params_page_index")]
     pub page_index: u64,
-    /// The projection to read. Null reads the workspace tree.
-    #[serde(default)]
+    /// The projection to read. Omitted reads the workspace tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<ProjectionId>,
     /// The version-control revision to read - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Null reads the current tree, and `rev`
+    /// workspace's version control spells it. Omitted reads the current tree, and `rev`
     /// never combines with `projection`. The server refuses a revision read when the
     /// workspace has no version-control repository.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
     /// Source locations eligible for matches. All is the default because a known name may
     /// identify a dependency or standard-library declaration.
@@ -343,8 +334,7 @@ fn default_get_symbol_params_scope() -> SearchScope {
                 "symbol": {
                     "id": "rift://symbol/rust/src/config.rs/load_config",
                     "language": {
-                        "name": "rust",
-                        "dialect": null
+                        "name": "rust"
                     },
                     "name": "load_config",
                     "kind": "rust.function",
@@ -355,13 +345,11 @@ fn default_get_symbol_params_scope() -> SearchScope {
                     ],
                     "origin": {
                         "location": {
-                            "kind": "project",
-                            "package": null
+                            "kind": "project"
                         },
                         "source_kind": "authored",
                         "unit": "rift://source/project/src/config.rs"
                     },
-                    "container": null,
                     "modifiers": [],
                     "visibility": "pub",
                     "types": [
@@ -370,11 +358,9 @@ fn default_get_symbol_params_scope() -> SearchScope {
                             "origin": "declared",
                             "type": {
                                 "language": {
-                                    "name": "rust",
-                                    "dialect": null
+                                    "name": "rust"
                                 },
                                 "source": "Result<Config, ConfigError>",
-                                "resolved": null,
                                 "extensions": {}
                             }
                         }
@@ -392,32 +378,26 @@ fn default_get_symbol_params_scope() -> SearchScope {
                                 }
                             ],
                             "language": {
-                                "name": "rust",
-                                "dialect": null
+                                "name": "rust"
                             },
-                            "receiver": null,
                             "parameters": [
                                 {
                                     "name": "path",
-                                    "node": null,
                                     "types": [
                                         {
                                             "role": "parameter",
                                             "origin": "declared",
                                             "type": {
                                                 "language": {
-                                                    "name": "rust",
-                                                    "dialect": null
+                                                    "name": "rust"
                                                 },
                                                 "source": "&Path",
-                                                "resolved": null,
                                                 "extensions": {}
                                             }
                                         }
                                     ],
                                     "optional": false,
                                     "variadic": false,
-                                    "default": null,
                                     "extensions": {}
                                 }
                             ],
@@ -427,11 +407,9 @@ fn default_get_symbol_params_scope() -> SearchScope {
                                     "origin": "declared",
                                     "type": {
                                         "language": {
-                                            "name": "rust",
-                                            "dialect": null
+                                            "name": "rust"
                                         },
                                         "source": "Result<Config, ConfigError>",
-                                        "resolved": null,
                                         "extensions": {}
                                     }
                                 }
@@ -456,8 +434,7 @@ fn default_get_symbol_params_scope() -> SearchScope {
                     "symbol": "rift://symbol/rust/src/config.rs/load_config",
                     "unit": "rift://file/src/config.rs",
                     "language": {
-                        "name": "rust",
-                        "dialect": null
+                        "name": "rust"
                     },
                     "kind": "rust.function_item",
                     "facets": [
@@ -555,7 +532,7 @@ pub struct Language {
     pub name: String,
     /// A dialect whose syntax or semantics differ within the language, such as
     /// `postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
     #[schemars(regex(pattern = r"^[a-z][a-z0-9._-]*$"))]
     pub dialect: Option<String>,
@@ -583,7 +560,7 @@ pub struct Node {
     pub id: NodeId,
     /// The symbol written at this node. Absent where a node writes no symbol -
     /// punctuation, a keyword, a comment.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<SymbolId>,
     /// The file the node is written in.
     pub unit: FileId,
@@ -602,7 +579,7 @@ pub struct Node {
     /// the documentation above it.
     pub regions: Vec<NodeRegion>,
     /// The region this one is nested inside. Absent at the top level of a unit.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<NodeId>,
     /// Syntax facts the model has no field for, namespaced by the provider that emitted
     /// them.
@@ -702,14 +679,14 @@ pub struct NodesParams {
     /// themselves carry the spans.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub position: u64,
-    /// The projection to read. Null reads the workspace tree.
-    #[serde(default)]
+    /// The projection to read. Omitted reads the workspace tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<ProjectionId>,
     /// The version-control revision to read - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Null reads the current tree, and `rev`
+    /// workspace's version control spells it. Omitted reads the current tree, and `rev`
     /// never combines with `projection`. The server refuses a revision read when the
     /// workspace has no version-control repository.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
 }
 
@@ -722,11 +699,9 @@ pub struct NodesParams {
         "nodes": [
             {
                 "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
-                "symbol": null,
                 "unit": "rift://file/src/config.rs",
                 "language": {
-                    "name": "rust",
-                    "dialect": null
+                    "name": "rust"
                 },
                 "kind": "rust.source_file",
                 "facets": [],
@@ -735,7 +710,6 @@ pub struct NodesParams {
                     "end": 356
                 },
                 "regions": [],
-                "parent": null,
                 "extensions": {}
             },
             {
@@ -743,8 +717,7 @@ pub struct NodesParams {
                 "symbol": "rift://symbol/rust/src/config.rs/load_config",
                 "unit": "rift://file/src/config.rs",
                 "language": {
-                    "name": "rust",
-                    "dialect": null
+                    "name": "rust"
                 },
                 "kind": "rust.function_item",
                 "facets": [
@@ -776,11 +749,9 @@ pub struct NodesParams {
             },
             {
                 "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
-                "symbol": null,
                 "unit": "rift://file/src/config.rs",
                 "language": {
-                    "name": "rust",
-                    "dialect": null
+                    "name": "rust"
                 },
                 "kind": "rust.block",
                 "facets": [],
@@ -794,11 +765,9 @@ pub struct NodesParams {
             },
             {
                 "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
-                "symbol": null,
                 "unit": "rift://file/src/config.rs",
                 "language": {
-                    "name": "rust",
-                    "dialect": null
+                    "name": "rust"
                 },
                 "kind": "rust.call_expression",
                 "facets": [
@@ -814,11 +783,9 @@ pub struct NodesParams {
             },
             {
                 "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
-                "symbol": null,
                 "unit": "rift://file/src/config.rs",
                 "language": {
-                    "name": "rust",
-                    "dialect": null
+                    "name": "rust"
                 },
                 "kind": "rust.identifier",
                 "facets": [],
@@ -932,13 +899,12 @@ pub struct Pagination {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Parameter {
-    /// What the parameter is called. Null where the language allows an unnamed one, as a
-    /// positional parameter in a function type.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// What the parameter is called. Absent where the language allows an unnamed one, as
+    /// a positional parameter in a function type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Where this parameter is written in the source.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeId>,
     /// What it accepts. An array because a declared type and an inferred one are separate
     /// bindings.
@@ -947,9 +913,8 @@ pub struct Parameter {
     pub optional: bool,
     /// Whether it absorbs the arguments that follow - `*args`, `...rest`.
     pub variadic: bool,
-    /// The default value as written in the source. Null where there is none.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// The default value as written in the source. Absent where there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     /// Parameter facts the model has no field for, namespaced by the provider that emitted
     /// them.
@@ -1054,7 +1019,7 @@ pub struct Relationship {
     pub derivation: RelationshipDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
     /// derivation.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 1))]
     pub confidence: Option<f64>,
     /// Edge facts the model has no field for, namespaced by the provider that emitted them.
@@ -1252,10 +1217,9 @@ pub struct Signature {
     pub links: Vec<SignatureLink>,
     /// The language whose syntax `display` is written in.
     pub language: Language,
-    /// The implicit first parameter - `self`, `this`. Null for a free function, and for
+    /// The implicit first parameter - `self`, `this`. Absent for a free function, and for
     /// languages that have no such thing.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<Parameter>,
     /// Declared parameters, in source order.
     pub parameters: Vec<Parameter>,
@@ -1319,9 +1283,9 @@ pub enum SourceKind {
 pub enum SourceLocation {
     /// Source owned by the current workspace.
     Project {
-        /// Local package that owns the source, or null when no package manifest assigns
+        /// Local package that owns the source, or absent when no package manifest assigns
         /// one.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         package: Option<PackageIdentity>,
     },
     /// Source owned by one resolved dependency.
@@ -1398,14 +1362,13 @@ pub struct Symbol {
     /// a function. Ownership is not lexical: a Go method is written beside its type and a
     /// Rust method inside an `impl` block, and both name the type here. Absent at the top
     /// level.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<SymbolId>,
     /// Language keywords qualifying the declaration: `export`, `async`, `const`.
     pub modifiers: Vec<String>,
     /// How widely the symbol is visible, in the language's own terms - `public`, `private`,
-    /// `pub(crate)`. Null where the language has no such concept.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// `pub(crate)`. Absent where the language has no such concept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
     /// The types this symbol carries, each tagged with the role it plays: a return type, a
     /// field type, a bound.
@@ -1528,14 +1491,14 @@ pub struct SymbolId(
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolOrigin {
-    /// Source ownership. Null exactly when `source_kind` is `synthetic`.
-    #[serde(default)]
+    /// Source ownership. Absent exactly when `source_kind` is `synthetic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<SourceLocation>,
     /// Whether the declaration is authored, generated, or synthetic.
     pub source_kind: SourceKind,
-    /// Source-catalog unit containing the declaration. Null when source is unavailable or
-    /// the declaration is synthetic.
-    #[serde(default)]
+    /// Source-catalog unit containing the declaration. Absent when source is unavailable
+    /// or the declaration is synthetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<SourceUnitId>,
 }
 
@@ -1555,7 +1518,7 @@ pub struct SymbolVersion {
     #[schemars(length(max = 64))]
     pub timestamp: String,
     /// The revision's own first summary line, where the version control records one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
     pub summary: Option<String>,
 }
@@ -1666,10 +1629,9 @@ pub struct TypeExpression {
     pub language: Language,
     /// The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
     pub source: String,
-    /// The symbol that declares this type, where one does. Null for a structural type,
+    /// The symbol that declares this type, where one does. Absent for a structural type,
     /// which has a spelling and nothing to open.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<SymbolId>,
     /// Type facts the model has no field for, namespaced by the provider that emitted them.
     pub extensions: Extensions,
