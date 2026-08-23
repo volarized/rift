@@ -15,7 +15,11 @@ axum.workspace = true
 data-encoding.workspace = true
 getrandom.workspace = true
 notify.workspace = true
-rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+] }
 rift-core.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
@@ -31,7 +35,6 @@ tracing.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
-rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 jsonschema.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
