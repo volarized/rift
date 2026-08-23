@@ -10,6 +10,7 @@ pub mod change;
 pub mod configuration;
 pub mod diagnostic;
 pub mod error;
+pub mod lock;
 pub mod read;
 pub mod schema;
 pub mod search;
