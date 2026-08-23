@@ -698,8 +698,8 @@ arguments = ["checked"]
 changed_paths = "append"
 working_directory = ""
 environment = {}
-timeout_ms = 30000
-output_limit_bytes = 4096
+timeout = "30s"
+output_limit = "4kb"
 guarantees = [
     { kind = "behavior_checked", scope = { kind = "reach", reach = "project" }, detail = "echo ran over the changed paths" },
 ]
@@ -714,8 +714,8 @@ arguments = []
 changed_paths = "none"
 working_directory = ""
 environment = {}
-timeout_ms = 30000
-output_limit_bytes = 4096
+timeout = "30s"
+output_limit = "4kb"
 guarantees = []
 determinism = "deterministic"
 "#,

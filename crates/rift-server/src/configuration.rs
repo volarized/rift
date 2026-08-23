@@ -139,8 +139,8 @@ arguments = ["test"]
 changed_paths = "none"
 working_directory = ""
 environment = {}
-timeout_ms = 120000
-output_limit_bytes = 4096
+timeout = "120s"
+output_limit = "4kb"
 guarantees = []
 determinism = "deterministic"
 "#;
@@ -269,13 +269,13 @@ embedding = "potion-retrieval-32M"
 
     #[test]
     fn test_out_of_bounds_value_is_refused_with_field_evidence() {
-        let broken = DOCUMENTED_HOOK.replace("timeout_ms = 120000", "timeout_ms = 0");
+        let broken = DOCUMENTED_HOOK.replace(r#"timeout = "120s""#, r#"timeout = "0ms""#);
         let error =
             admit_configuration(&broken).expect_err("a zero hook timeout must refuse the file");
         assert!(matches!(error.fault(), ConfigurationFault::Invalid(_)));
         let message = error.to_string();
         assert!(
-            message.contains("hooks.timeout_ms") && message.contains("1..=3600000"),
+            message.contains("hooks.timeout") && message.contains("1..=3600000"),
             "the refusal must name the field and its range: {message}"
         );
     }
