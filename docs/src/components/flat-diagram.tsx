@@ -1,18 +1,18 @@
+import { DiagramFullscreen } from "@/components/diagram-fullscreen";
 import { buildScene, type IsoMetrics } from "@/lib/iso-scene";
 import { parseFlowchart } from "@/lib/mermaid-flowchart";
-import { cn } from "@/lib/utils";
 
 /**
- * A mermaid flowchart, drawn flat.
+ * A mermaid flowchart, drawn flat. The one diagram renderer the docs use.
  *
- * Same pipeline as `IsoDiagram` - mermaid parse, dagre layout - but the scene
- * is rendered as plain SVG in the page's own plane instead of being stood up
- * under the isometric camera. The layout module already works on a flat ground
- * plane (the camera is what makes its sibling isometric), so this renderer maps
- * `x` across the page and `z` down it and draws.
+ * Mermaid parse, dagre layout, then plain SVG in the page's own plane: the
+ * layout module works on a flat ground plane, so this renderer maps `x`
+ * across the page and `z` down it and draws.
  *
- * A Server Component like its sibling: the layout runs once during the build
- * and the page carries only the finished SVG.
+ * A Server Component: the layout runs once during the build and the page
+ * carries only the finished SVG. `DiagramFullscreen` is the Client Component
+ * around it - a click opens the same SVG in a fullscreen dialog with pan and
+ * zoom.
  */
 export type FlatDiagramProps = {
   /** A mermaid flowchart definition. The graph, and only the graph. */
@@ -25,8 +25,8 @@ export type FlatDiagramProps = {
 };
 
 /**
- * Flat drawings need less separation than projected ones: nothing is
- * foreshortened, so the isometric defaults read as sparse on the page.
+ * The layout module's default separation reads as sparse on the page, where
+ * nothing is foreshortened, so these pull the nodes closer.
  */
 const FLAT_METRICS: Partial<IsoMetrics> = {
   minDepth: 46,
@@ -37,7 +37,7 @@ const FLAT_METRICS: Partial<IsoMetrics> = {
 /** Clearance kept around the drawing inside the viewBox. */
 const FRAME_PADDING = 10;
 
-/** Ink opacities, matched to the isometric renderer's edge-first look. */
+/** Ink opacities. Edges carry the drawing; the only fill is the page's own background. */
 const INK = { plate: 0.55, connector: 0.45, label: 0.9, note: 0.6, group: 0.3 };
 
 export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagramProps) {
@@ -51,7 +51,7 @@ export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagra
   const { label, note } = scene.metrics;
 
   return (
-    <figure className={cn("my-8 min-w-0", className)}>
+    <DiagramFullscreen className={className}>
       <svg
         viewBox={`${x0} ${y0} ${width} ${height}`}
         role="img"
@@ -154,6 +154,6 @@ export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagra
           ) : null,
         )}
       </svg>
-    </figure>
+    </DiagramFullscreen>
   );
 }

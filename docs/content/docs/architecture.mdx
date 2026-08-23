@@ -4,7 +4,7 @@ title: Architecture
 
 <VersionBadge version="planned" />
 
-import { IsoDiagram } from "@/components/iso-diagram";
+import { FlatDiagram } from "@/components/flat-diagram";
 
 Rift works as a toolkit for agents such as Claude Code and Codex - practically any agentic
 appliance that supports MCP.
@@ -31,7 +31,7 @@ The server also owns edits. Its change tools resolve targets against provider fa
 files. [Hooks](/docs/configuration#hooks) extend this pipeline with configured tools such as
 formatters, linters, and test runners, which check each change after it lands.
 
-<IsoDiagram
+<FlatDiagram
   alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers analyze it, and their facts feed an embedded search index. Semantic providers delegate resolution to language engines - an embedded library, a language server, or a SCIP index - which read the targeted tree and answer with facts and edit plans. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
   chart={`
     flowchart LR
@@ -518,7 +518,7 @@ lands. A batch indexer needs a tree that holds still: a projection is already pi
 workspace target the server pins an internal tree through [Rift FS](#rift-fs) - that tree feeds
 the indexer and is never a projection the agent has to manage.
 
-<IsoDiagram
+<FlatDiagram
   alt="An agent asks the rift server for a rename, here targeting a projection the agent created. The server requests an edit plan from the language engine - a language server or a SCIP index - which reads the projection directory. The server compiles the plan into witnessed edits, applies them to the projection as one change, and publish carries the result into the workspace tree. A workspace-targeted plan lands in the workspace tree directly."
   chart={`
     flowchart LR
@@ -584,7 +584,7 @@ Each served tree holds one contract:
 - Removal is immediate. A process still running inside gets I/O errors; the tree is never
   half-deleted under it.
 
-<IsoDiagram
+<FlatDiagram
   alt="Rift FS serves the workspace tree's pinned base as projection directories and the execution copy. External tools read and write a projection directory; Rift FS routes every access through the rift server, which observes each write, reindexes exactly the changed paths, and notifies a language server rooted in the projection."
   chart={`
     flowchart LR
