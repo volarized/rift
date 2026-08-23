@@ -306,7 +306,7 @@ pub fn declare_server_ranges(schema: &mut Schema) {
     use crate::configuration::{Duration, SERVER_QUEUE_TIMEOUT_MS_MAX, ServerConfiguration};
     annotate_property(
         schema,
-        property!(ServerConfiguration, blocking_queue_timeout),
+        property!(ServerConfiguration, worker_queue_timeout),
         RIFT_RANGE,
         range(
             &Duration::from_millis(1),
@@ -754,9 +754,9 @@ mod tests {
         let schema = serde_json::to_value(schema_for!(crate::configuration::ServerConfiguration))
             .expect("schema");
         assert_eq!(
-            schema["properties"]["blocking_queue_timeout"][RIFT_RANGE],
+            schema["properties"]["worker_queue_timeout"][RIFT_RANGE],
             json!({ "min": "1ms", "max": "1h" }),
-            "blocking_queue_timeout must state its admitted range"
+            "worker_queue_timeout must state its admitted range"
         );
     }
 

@@ -13,9 +13,9 @@ use crate::source::SourceConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
-/// Blocking operations the server may run at once, at most.
-pub const SERVER_BLOCKING_SLOTS_MAX: u64 = 64;
-/// Milliseconds one request may wait for a blocking slot, at most: one hour.
+/// Workers the server's blocking pool may hold, at most.
+pub const SERVER_NUM_WORKERS_MAX: u64 = 64;
+/// Milliseconds one request may wait for a free worker, at most: one hour.
 pub const SERVER_QUEUE_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
@@ -297,7 +297,7 @@ fn split_magnitude<'text>(
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceConfiguration {
-    /// The server's own blocking-work bounds: pool size and queue wait.
+    /// The server's own blocking-work bounds: worker count and queue wait.
     pub server: ServerConfiguration,
     /// Bounds and switches for the built-in providers.
     pub providers: ProvidersConfiguration,
@@ -341,25 +341,25 @@ impl WorkspaceConfiguration {
 }
 
 /// The `[server]` table. Filesystem scans and parses run on a bounded
-/// blocking pool; this table sizes the pool and bounds the queue wait.
-/// The server reads the table at startup, so a change applies on the
-/// next start.
+/// worker pool; this table sets the worker count and bounds the queue
+/// wait. The server reads the table at startup, so a change applies on
+/// the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_server_ranges)]
 pub struct ServerConfiguration {
-    /// Blocking filesystem and parser operations running at once, 1 to 64.
+    /// Workers running blocking filesystem and parser operations at once, 1 to 64.
     #[schemars(range(min = 1, max = 64))]
-    pub blocking_slots: u64,
-    /// Wall-clock bound one request waits for a blocking slot, 1ms to 1h.
-    pub blocking_queue_timeout: Duration,
+    pub num_workers: u64,
+    /// Wall-clock bound one request waits for a free worker, 1ms to 1h.
+    pub worker_queue_timeout: Duration,
 }
 
 impl Default for ServerConfiguration {
     fn default() -> Self {
         Self {
-            blocking_slots: 4,
-            blocking_queue_timeout: Duration::from_millis(30_000),
+            num_workers: 4,
+            worker_queue_timeout: Duration::from_millis(30_000),
         }
     }
 }
@@ -369,14 +369,14 @@ impl ServerConfiguration {
     fn violation(&self) -> Option<ConfigurationViolation> {
         first_out_of_range([
             (
-                "server.blocking_slots",
-                self.blocking_slots,
+                "server.num_workers",
+                self.num_workers,
                 1,
-                SERVER_BLOCKING_SLOTS_MAX,
+                SERVER_NUM_WORKERS_MAX,
             ),
             (
-                "server.blocking_queue_timeout",
-                self.blocking_queue_timeout.milliseconds(),
+                "server.worker_queue_timeout",
+                self.worker_queue_timeout.milliseconds(),
                 1,
                 SERVER_QUEUE_TIMEOUT_MS_MAX,
             ),
@@ -1403,44 +1403,44 @@ mod tests {
     }
 
     #[test]
-    fn test_server_defaults_state_four_slots_and_thirty_seconds() {
+    fn test_server_defaults_state_four_workers_and_thirty_seconds() {
         let table = ServerConfiguration::default();
-        assert_eq!(table.blocking_slots, 4);
-        assert_eq!(table.blocking_queue_timeout, Duration::from_millis(30_000));
+        assert_eq!(table.num_workers, 4);
+        assert_eq!(table.worker_queue_timeout, Duration::from_millis(30_000));
         assert_eq!(WorkspaceConfiguration::default().validate(), Ok(()));
     }
 
     #[test]
     fn test_server_bounds_are_enforced() {
         let mut configuration = WorkspaceConfiguration::default();
-        for slots in [0, SERVER_BLOCKING_SLOTS_MAX + 1] {
-            configuration.server.blocking_slots = slots;
+        for workers in [0, SERVER_NUM_WORKERS_MAX + 1] {
+            configuration.server.num_workers = workers;
             assert!(
                 matches!(
                     configuration.validate(),
                     Err(ConfigurationViolation::LimitOutOfRange {
-                        field: "server.blocking_slots",
+                        field: "server.num_workers",
                         ..
                     })
                 ),
-                "blocking_slots {slots} must be refused"
+                "num_workers {workers} must be refused"
             );
         }
-        configuration.server.blocking_slots = SERVER_BLOCKING_SLOTS_MAX;
+        configuration.server.num_workers = SERVER_NUM_WORKERS_MAX;
         for timeout_ms in [0, SERVER_QUEUE_TIMEOUT_MS_MAX + 1] {
-            configuration.server.blocking_queue_timeout = Duration::from_millis(timeout_ms);
+            configuration.server.worker_queue_timeout = Duration::from_millis(timeout_ms);
             assert!(
                 matches!(
                     configuration.validate(),
                     Err(ConfigurationViolation::LimitOutOfRange {
-                        field: "server.blocking_queue_timeout",
+                        field: "server.worker_queue_timeout",
                         ..
                     })
                 ),
-                "blocking_queue_timeout {timeout_ms}ms must be refused"
+                "worker_queue_timeout {timeout_ms}ms must be refused"
             );
         }
-        configuration.server.blocking_queue_timeout =
+        configuration.server.worker_queue_timeout =
             Duration::from_millis(SERVER_QUEUE_TIMEOUT_MS_MAX);
         assert_eq!(configuration.validate(), Ok(()));
     }
@@ -1995,14 +1995,14 @@ mod tests {
                 json!(EXECUTION_ALLOW_ITEMS_MAX),
             ),
             (
-                "blocking slots min",
-                &server["blocking_slots"]["minimum"],
+                "num workers min",
+                &server["num_workers"]["minimum"],
                 json!(1),
             ),
             (
-                "blocking slots max",
-                &server["blocking_slots"]["maximum"],
-                json!(SERVER_BLOCKING_SLOTS_MAX),
+                "num workers max",
+                &server["num_workers"]["maximum"],
+                json!(SERVER_NUM_WORKERS_MAX),
             ),
             (
                 "concurrent min",

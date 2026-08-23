@@ -14,7 +14,7 @@ use rift_protocol::change::{
     ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
-    CommandHook, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX, SERVER_BLOCKING_SLOTS_MAX,
+    CommandHook, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX, SERVER_NUM_WORKERS_MAX,
     SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
@@ -53,14 +53,14 @@ impl BlockingExecutor {
     /// Sizes the workspace's pool and queue wait from one admitted
     /// `[server]` table.
     pub(crate) fn for_configuration(server: &ServerConfiguration) -> Self {
-        // Admission bounds the value to 1..=SERVER_BLOCKING_SLOTS_MAX, so
+        // Admission bounds the value to 1..=SERVER_NUM_WORKERS_MAX, so
         // the clamp only guards the usize conversion.
-        let slots = usize::try_from(server.blocking_slots.min(SERVER_BLOCKING_SLOTS_MAX))
+        let workers = usize::try_from(server.num_workers.min(SERVER_NUM_WORKERS_MAX))
             .unwrap_or(1)
             .max(1);
         Self {
-            operations: Arc::new(Semaphore::new(slots)),
-            queue_timeout_ms: server.blocking_queue_timeout.milliseconds(),
+            operations: Arc::new(Semaphore::new(workers)),
+            queue_timeout_ms: server.worker_queue_timeout.milliseconds(),
         }
     }
 
@@ -1081,7 +1081,7 @@ mod tests {
     async fn server_table_sizes_blocking_pool_and_queue_wait() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let configured = "[server]\nblocking_slots = 2\nblocking_queue_timeout = \"1250ms\"\n";
+        let configured = "[server]\nnum_workers = 2\nworker_queue_timeout = \"1250ms\"\n";
         fs::write(directory.path().join("rift.toml"), configured)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert_eq!(server.blocking.queue_timeout_ms, 1_250);
@@ -1095,11 +1095,11 @@ mod tests {
         let default_table = rift_protocol::configuration::ServerConfiguration::default();
         assert_eq!(
             server.blocking.queue_timeout_ms,
-            default_table.blocking_queue_timeout.milliseconds()
+            default_table.worker_queue_timeout.milliseconds()
         );
         assert_eq!(
             server.blocking.operations.available_permits() as u64,
-            default_table.blocking_slots
+            default_table.num_workers
         );
         Ok(())
     }
@@ -1110,13 +1110,13 @@ mod tests {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(
             directory.path().join("rift.toml"),
-            "[server]\nblocking_slots = 0\n",
+            "[server]\nnum_workers = 0\n",
         )?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let default_table = rift_protocol::configuration::ServerConfiguration::default();
         assert_eq!(
             server.blocking.operations.available_permits() as u64,
-            default_table.blocking_slots
+            default_table.num_workers
         );
         Ok(())
     }
