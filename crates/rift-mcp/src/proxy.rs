@@ -362,7 +362,7 @@ async fn adopt_serving(root: &Path) -> Option<RunningService<RoleClient, ()>> {
         return None;
     };
     warn_version_skew(&lock);
-    match connect_recorded(&lock).await {
+    match connect_recorded(&lock, UPSTREAM_CONNECT_TIMEOUT).await {
         Ok(running) => {
             tracing::info!(
                 component = "mcp",
@@ -373,9 +373,10 @@ async fn adopt_serving(root: &Path) -> Option<RunningService<RoleClient, ()>> {
             Some(running)
         }
         Err(failure) => {
+            let detail = failure.detail();
             tracing::debug!(
                 component = "mcp",
-                detail = %failure.detail(),
+                %detail,
                 "recorded server did not answer; treating the lock as stale"
             );
             None
@@ -404,9 +405,12 @@ impl ConnectAttemptFailure {
 }
 
 /// Connects and initializes against one recorded server, bounded by
-/// [`UPSTREAM_CONNECT_TIMEOUT`].
+/// `timeout`.
+///
+/// The caller passes [`UPSTREAM_CONNECT_TIMEOUT`].
 async fn connect_recorded(
     lock: &ServerLock,
+    timeout: Duration,
 ) -> Result<RunningService<RoleClient, ()>, ConnectAttemptFailure> {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!(
@@ -415,7 +419,7 @@ async fn connect_recorded(
         ))
         .auth_header(lock.token.clone()),
     );
-    match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, ().serve(transport)).await {
+    match tokio::time::timeout(timeout, ().serve(transport)).await {
         Ok(Ok(running)) => Ok(running),
         Ok(Err(error)) => Err(ConnectAttemptFailure::Initialize(Box::new(error))),
         Err(_elapsed) => Err(ConnectAttemptFailure::TimedOut),
@@ -545,18 +549,25 @@ impl ServerHandler for RiftProxy {
 #[cfg(test)]
 mod tests {
     use std::any::TypeId;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
 
+    use rift_protocol::lock::{SERVER_TOKEN_LENGTH, ServerLock};
     use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerPeerInfo};
-    use rmcp::service::QuitReason;
+    use rmcp::service::{QuitReason, RoleClient, RunningService, serve_directly};
     use rmcp::transport::DynamicTransportError;
     use rmcp::{ErrorData, ServiceError};
     use serde_json::json;
 
     use super::{
-        ProxyFault, RiftProxy, fallback_info, forwarded_error, mirrored_info, quit_reason_result,
-        reuse_current, serve_connection, transport_failed, upstream_unavailable, version_mismatch,
+        ConnectAttemptFailure, ProxyFault, RiftProxy, Upstream, adopt_serving, connect_recorded,
+        fallback_info, forwarded_error, mirrored_info, quit_reason_result, reuse_current,
+        serve_connection, transport_failed, upstream_unavailable, version_mismatch,
     };
+    use crate::election::claim;
     use rift_core::Error;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     fn transport_send_failure() -> ServiceError {
         ServiceError::TransportSend(DynamicTransportError::from_parts(
@@ -564,6 +575,23 @@ mod tests {
             TypeId::of::<()>(),
             Box::new(std::io::Error::other("connection refused")),
         ))
+    }
+
+    fn recorded_lock(port: u16) -> ServerLock {
+        ServerLock {
+            port,
+            token: "a".repeat(SERVER_TOKEN_LENGTH),
+            pid: 4_242,
+            version: "0.0.11".to_owned(),
+        }
+    }
+
+    /// An upstream connection built without a handshake: its transport is a
+    /// duplex pipe whose other half the caller keeps alive.
+    fn direct_upstream() -> (RunningService<RoleClient, ()>, tokio::io::DuplexStream) {
+        let (kept_alive, transport) = tokio::io::duplex(1024);
+        let running: RunningService<RoleClient, ()> = serve_directly((), transport, None);
+        (running, kept_alive)
     }
 
     #[test]
@@ -726,7 +754,107 @@ mod tests {
             "temporarily_unavailable",
             "an initialization failure must classify as transient"
         );
+        let rendered_initialize = initialize.to_string();
+        assert!(
+            rendered_initialize.contains("MCP initialization failed"),
+            "{rendered_initialize}"
+        );
         assert!(std::error::Error::source(&initialize).is_some());
+    }
+
+    #[tokio::test]
+    async fn forward_maps_a_non_transport_failure_without_retry() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let proxy = RiftProxy::new(directory.path());
+        let (running, _upstream_alive) = direct_upstream();
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let refusal = proxy
+            .forward((), |_peer, ()| async {
+                Err::<(), _>(ServiceError::UnexpectedResponse)
+            })
+            .await
+            .expect_err("a non-transport failure must refuse without retry");
+        assert!(
+            refusal.message.contains("forwarded request"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_skips_an_upstream_without_negotiated_info() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let proxy = RiftProxy::new(directory.path());
+        let (running, _upstream_alive) = direct_upstream();
+        proxy.mirror_advertised(&running);
+        assert!(
+            proxy.lock_advertised().is_none(),
+            "an upstream without negotiated info must not be mirrored"
+        );
+    }
+
+    #[test]
+    fn poisoned_advertised_lock_still_serves_info() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let proxy = RiftProxy::new(directory.path());
+        let poisoner = proxy.clone();
+        std::thread::spawn(move || {
+            let _guard = poisoner
+                .advertised
+                .lock()
+                .expect("the first lock of a fresh proxy must succeed");
+            panic!("poison the advertised lock");
+        })
+        .join()
+        .expect_err("the poisoning thread must end by panic");
+        assert!(
+            proxy.advertised.lock().is_err(),
+            "the lock must be poisoned for the recovery arm to matter"
+        );
+        assert_eq!(proxy.advertised_info().server_info.name, "rift");
+        *proxy.lock_advertised() = Some(fallback_info().with_instructions("recovered"));
+        assert_eq!(
+            proxy.advertised_info().instructions.as_deref(),
+            Some("recovered")
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_treats_an_unanswering_recorded_server_as_stale() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        let port = {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            listener.local_addr()?.port()
+        };
+        guard.publish(&recorded_lock(port))?;
+        assert!(
+            adopt_serving(directory.path()).await.is_none(),
+            "a recorded server that answers nothing must be treated as stale"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_attempt_times_out_against_a_silent_server() -> TestResult {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let lock = recorded_lock(listener.local_addr()?.port());
+        let failure = connect_recorded(&lock, Duration::from_millis(50))
+            .await
+            .expect_err("a server that accepts and answers nothing must time out");
+        assert!(
+            matches!(failure, ConnectAttemptFailure::TimedOut),
+            "{failure:?}"
+        );
+        drop(listener);
+        Ok(())
     }
 
     #[tokio::test]
