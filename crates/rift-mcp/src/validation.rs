@@ -1630,6 +1630,11 @@ mod tests {
 
     #[tokio::test]
     async fn populate_lexical_persists_every_chunk_of_an_oversized_text_file() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // The enforced minimum `max_chunk` against a several-kilobyte guide forces the file
