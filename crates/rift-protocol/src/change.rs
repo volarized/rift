@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ChangeId(
+    #[schemars(example = &"chg_abcdefghijklmnopqrstuvwxyz")]
     #[schemars(length(min = 30, max = 30))]
     #[schemars(regex(pattern = r"^chg_[a-z2-7]{26}$"))]
     pub String,
@@ -268,6 +269,12 @@ impl ChangeResult {
 /// and doc comments.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
+#[schemars(extend("examples" = [{
+    "symbol": "rift://symbol/rust/rift_server.read.ReadService",
+    "region": null,
+    "body": "pub struct ReadService;"
+}]))]
 pub struct ReplaceSymbolParams {
     /// The declaration to replace.
     pub symbol: SymbolId,
@@ -286,6 +293,13 @@ pub struct ReplaceSymbolParams {
 /// beside the whole declaration, attached outer attributes and doc comments included.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
+#[schemars(extend("examples" = [{
+    "anchor": "rift://symbol/rust/rift_server.read.ReadService",
+    "position": "after",
+    "body": "pub struct WriteService;",
+    "create_missing": false
+}]))]
 #[schemars(transform = schema::insert_symbol_addresses_one_target)]
 pub struct InsertSymbolParams {
     /// The existing declaration the new one lands beside.
@@ -310,6 +324,12 @@ pub struct InsertSymbolParams {
 /// recomputes the witness before writing and refuses when the bytes drifted.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.4"))]
+#[schemars(extend("examples" = [{
+    "node": "rift://node/rust/lib.rs@220-268#3f9a1c2e",
+    "region": null,
+    "body": "self.index.search(query)"
+}]))]
 pub struct ReplaceNodeParams {
     /// The node to replace, witness included.
     pub node: NodeId,
@@ -326,6 +346,10 @@ pub struct ReplaceNodeParams {
 /// Applies unified-diff hunks to workspace files atomically.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
+#[schemars(extend("examples" = [{
+    "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub mod read;\n+pub mod search;\n"
+}]))]
 pub struct PatchParams {
     /// A unified diff. Hunk context guards the change; header line numbers are hints,
     /// as with `git apply`. `/dev/null` headers create or delete files.

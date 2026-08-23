@@ -163,6 +163,7 @@ pub enum MatchedField {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct PathPattern(
+    #[schemars(example = &"src/**")]
     #[schemars(regex(
         pattern = r"^(?!/)(?!\.\.?(/|$))(?!.*(/\.\.?)(/|$))[^\\\u0000-\u001F\u007F]+$"
     ))]
@@ -430,6 +431,22 @@ pub enum SearchIntent {
 /// narrows project-only searches.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
+#[schemars(extend("examples" = [{
+    "target": "all",
+    "order": "relevance",
+    "query": "ReadService",
+    "filter": null,
+    "paths": {
+        "include": ["crates/**"],
+        "exclude": [],
+        "force_include": []
+    },
+    "include": ["source", "signature"],
+    "limit": 20,
+    "cursor": null,
+    "scope": "project"
+}]))]
 #[schemars(transform = schema::restrict_traversal_and_paths)]
 #[schemars(transform = schema::require_query_filter_or_traversal)]
 #[schemars(transform = schema::forbid_search_rev_with_projection)]

@@ -174,6 +174,7 @@ pub enum CoverageStateState {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct Cursor(
+    #[schemars(example = &"eyJvZmZzZXQiOjV9")]
     #[schemars(length(min = 1, max = 4096))]
     #[schemars(regex(pattern = r"^[A-Za-z0-9_-]+$"))]
     pub String,
@@ -185,7 +186,11 @@ pub struct Cursor(
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct Digest(#[schemars(regex(pattern = r"^[0-9a-f]{8}$"))] pub String);
+pub struct Digest(
+    #[schemars(example = &"3f9a1c2e")]
+    #[schemars(regex(pattern = r"^[0-9a-f]{8}$"))]
+    pub String,
+);
 
 /// One block of documentation attached to a declaration, in the markup it was written in.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -324,6 +329,7 @@ pub enum FileContent {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct FileId(
+    #[schemars(example = &"rift://file/src/lib.rs")]
     #[schemars(length(min = 13, max = 8192))]
     #[schemars(regex(
         pattern = r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$"
@@ -371,6 +377,16 @@ pub struct GetSymbolHit {
 /// a search followed by paging through the file.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.4"))]
+#[schemars(extend("examples" = [{
+    "name": "ReadService",
+    "language": { "name": "rust", "dialect": null },
+    "include_body": true,
+    "include_history": false,
+    "limit": 5,
+    "cursor": null,
+    "scope": "all"
+}]))]
 #[schemars(transform = schema::forbid_get_symbol_rev_with_projection)]
 pub struct GetSymbolParams {
     /// The declaration name to look up — a name, not a free-text query; `search` takes
@@ -467,6 +483,7 @@ pub struct Language {
     /// `typescript` cannot split one language into two identity spaces.
     #[schemars(length(max = 64))]
     #[schemars(regex(pattern = r"^[a-z][a-z0-9._-]*$"))]
+    #[schemars(example = &"rust")]
     pub name: String,
     /// A dialect whose syntax or semantics differ within the language, such as
     /// `postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.
@@ -579,6 +596,7 @@ pub enum NodeFacet {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct NodeId(
+    #[schemars(example = &"rift://node/rust/lib.rs@220-268#3f9a1c2e")]
     #[schemars(length(min = 27, max = 8192))]
     #[schemars(regex(
         pattern = r"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\d+-\d+#[0-9a-f]{8}$"
@@ -600,6 +618,11 @@ pub struct NodeRegion {
 /// address for an edit smaller than a declaration, such as one call expression.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.4"))]
+#[schemars(extend("examples" = [{
+    "path": "src/lib.rs",
+    "position": 240
+}]))]
 #[schemars(transform = schema::forbid_nodes_rev_with_projection)]
 pub struct NodesParams {
     /// Project-relative file to inspect.
@@ -690,6 +713,7 @@ pub struct Parameter {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ProjectPath(
+    #[schemars(example = &"src/lib.rs")]
     #[schemars(length(max = 1000))]
     #[schemars(regex(
         pattern = r"^(?:$|(?!\.rift(?:/|$))(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)[^\\\u0000-\u001F\u007F/]+(?:/[^\\\u0000-\u001F\u007F/]+)*)$"
@@ -707,6 +731,7 @@ pub struct ProjectPath(
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ProjectionId(
+    #[schemars(example = &"rift://projection/my-feature-one")]
     #[schemars(regex(pattern = r"^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"))]
     pub String,
 );
@@ -903,7 +928,11 @@ pub const REVISION_ID_BYTES_MAX: usize = 128;
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] pub String);
+pub struct RevisionId(
+    #[schemars(example = &"main")]
+    #[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))]
+    pub String,
+);
 
 impl RevisionId {
     /// Classifies this spelling against the charset and length its schema advertises.
@@ -1270,6 +1299,7 @@ pub struct SymbolHistory {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct SymbolId(
+    #[schemars(example = &"rift://symbol/rust/rift_server.read.ReadService")]
     #[schemars(length(min = 17, max = 8192))]
     #[schemars(regex(
         pattern = r"^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$"
