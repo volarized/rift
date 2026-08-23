@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use rift_core::SourceVisibility;
+use rift_core::{SourceVisibility, TextFileAdmission};
 use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
@@ -386,11 +386,13 @@ impl RiftMcp {
             let root = self.root.clone();
             let limits = self.limits;
             let visibility = current.configuration.source_visibility();
+            let text_admission = current.configuration.text_admission();
             let capture = self
                 .blocking
                 .run("workspace fingerprint", move || {
-                    let fingerprint = WorkspaceFingerprint::capture(&root, limits, &visibility)
-                        .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+                    let fingerprint =
+                        WorkspaceFingerprint::capture(&root, limits, &visibility, &text_admission)
+                            .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
                     Ok((fingerprint, configuration_fingerprint(&root)))
                 })
                 .instrument(tracing::debug_span!(
@@ -536,18 +538,23 @@ impl RiftMcp {
             };
             Self::attach_hook_verdicts(root, &configuration.hooks, summary);
             let visibility = SourceVisibility::from(&configuration.source);
-            match ReadService::build(root, limits, &visibility) {
+            let text_admission = TextFileAdmission::from(&configuration.search);
+            match ReadService::build(root, limits, &visibility, &text_admission) {
                 Ok(rebuilt) => {
                     let fingerprint = rebuilt.workspace_fingerprint().clone();
-                    let source_policy =
-                        match WorkspaceSourcePolicy::build(root, limits, &visibility) {
-                            Ok(policy) => Arc::new(policy),
-                            Err(error) => {
-                                let error = ReadError::from(ReadFault::Index(error));
-                                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                                return Ok(Ok(Json(result)));
-                            }
-                        };
+                    let source_policy = match WorkspaceSourcePolicy::build(
+                        root,
+                        limits,
+                        &visibility,
+                        &text_admission,
+                    ) {
+                        Ok(policy) => Arc::new(policy),
+                        Err(error) => {
+                            let error = ReadError::from(ReadFault::Index(error));
+                            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                            return Ok(Ok(Json(result)));
+                        }
+                    };
                     if current.configuration.fingerprint != configuration_fingerprint(root) {
                         let error = ReadFault::unavailable(
                             "workspace change",
@@ -1632,6 +1639,62 @@ pub fn beacon() -> u64 {
                 .contains("configuration changed during snapshot rebuild"),
             "diagnostic must name the moved configuration: {:?}",
             summary.diagnostics[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applied_change_that_breaks_the_source_policy_rebuild_reports_stale_snapshot() -> TestResult {
+        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new();
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let root = directory.path().to_path_buf();
+        // `files_max=1` admits the workspace's single Rust source file for `ReadService::build`,
+        // which never counts `.gitignore` files. `WorkspaceSourcePolicy::build` re-walks for
+        // `.gitignore` files specifically and counts each one against that same bound, so a
+        // second `.gitignore` written by the change trips `TooManyFiles` there even though the
+        // read-side rebuild already succeeded.
+        let tight_limits = WorkspaceIndexLimits::new(1, 1_048_576, 10_485_760, 16, 5)
+            .expect("tight limits admit exactly one file");
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            tight_limits,
+            &published,
+            &validation,
+            &changes,
+            move |_, _| {
+                let nested = root.join("nested");
+                let root_gitignore = root.join(".gitignore");
+                let nested_gitignore = root.join("nested/.gitignore");
+                fs::create_dir_all(&nested).expect("nested directory scaffold must write");
+                fs::write(&root_gitignore, "").expect("root gitignore scaffold must write");
+                fs::write(&nested_gitignore, "").expect("nested gitignore scaffold must write");
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        paths: Vec::new(),
+                        edits: Vec::new(),
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome else {
+            panic!("the applied change must survive a failed source-policy rebuild");
+        };
+        assert_eq!(summary.diagnostics.len(), 1);
+        let diagnostic = &summary.diagnostics[0];
+        assert!(
+            diagnostic.message.contains("too_many_files"),
+            "diagnostic must name the source-policy rebuild failure: {diagnostic:?}"
         );
         Ok(())
     }

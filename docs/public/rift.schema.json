@@ -389,7 +389,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search runs on a lexical index with nothing to\nconfigure; `embedding` names the model that adds dense ranking on top.",
+      "description": "The `[search]` table. Search runs on a lexical index with nothing to\nconfigure; `embedding` names the model that adds dense ranking on top,\nand `text` admits non-source text files into that lexical index.",
       "properties": {
         "embedding": {
           "description": "The embedding model identifier. Vectors are stored per model, so\nchanging the value rebuilds the dense index; absent keeps search\nlexical.",
@@ -399,6 +399,18 @@
             "string",
             "null"
           ]
+        },
+        "text": {
+          "$ref": "#/$defs/TextSearchConfiguration",
+          "default": {
+            "extensions": [
+              "md",
+              "mdx",
+              "txt"
+            ],
+            "max_chunk": "1mb"
+          },
+          "description": "Which non-source text files join the lexical index alongside code\nsymbols."
         }
       },
       "type": "object"
@@ -456,6 +468,35 @@
         }
       },
       "type": "object"
+    },
+    "TextSearchConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[search.text]` table: which non-source text files join the lexical index, as one\nunit each, or as several size-bounded chunks when a file exceeds `max_chunk`.",
+      "properties": {
+        "extensions": {
+          "default": [
+            "md",
+            "mdx",
+            "txt"
+          ],
+          "description": "File extensions, without the leading dot, admitted as text-file lexical units:\nlowercase ASCII alphanumeric only (so a leading dot is already excluded), at most\n16 bytes each, at most 32 entries, no duplicates.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "max_chunk": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1mb",
+          "description": "Bytes one lexical chunk may hold, 1kb to 16mb. A text file larger than this is\nindexed as several chunks of at most this size; an operator who wants a file out of\nthe index excludes it in `[source]` or drops its extension from `extensions`.",
+          "rift:range": {
+            "max": "16mb",
+            "min": "1kb"
+          }
+        }
+      },
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -494,7 +535,16 @@
     },
     "search": {
       "$ref": "#/$defs/SearchConfiguration",
-      "default": {},
+      "default": {
+        "text": {
+          "extensions": [
+            "md",
+            "mdx",
+            "txt"
+          ],
+          "max_chunk": "1mb"
+        }
+      },
       "description": "The embedding model that adds dense ranking to lexical search."
     },
     "server": {

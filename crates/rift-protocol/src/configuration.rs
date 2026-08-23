@@ -504,7 +504,8 @@ impl ExecutionConfiguration {
 }
 
 /// The `[search]` table. Search runs on a lexical index with nothing to
-/// configure; `embedding` names the model that adds dense ranking on top.
+/// configure; `embedding` names the model that adds dense ranking on top,
+/// and `text` admits non-source text files into that lexical index.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchConfiguration {
@@ -514,25 +515,133 @@ pub struct SearchConfiguration {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 128))]
     pub embedding: Option<String>,
+    /// Which non-source text files join the lexical index alongside code
+    /// symbols.
+    pub text: TextSearchConfiguration,
 }
 
 impl SearchConfiguration {
-    /// The model-identifier rules, one named clause each.
+    /// The model-identifier rule, then the `[search.text]` table's bounds, in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        let embedding = self.embedding.as_deref()?;
-        let nonempty = !embedding.is_empty();
-        let within_length = embedding.len() <= EMBEDDING_MODEL_BYTES_MAX;
-        let charset_admitted = embedding.chars().all(is_model_identifier_character);
-        let valid = nonempty && within_length && charset_admitted;
-        (!valid).then(|| ConfigurationViolation::EmbeddingModelInvalid {
-            value: embedding.to_owned(),
-        })
+        embedding_violation(self.embedding.as_deref()).or_else(|| self.text.violation())
     }
+}
+
+/// Whether `embedding` is a valid model identifier, when present.
+fn embedding_violation(embedding: Option<&str>) -> Option<ConfigurationViolation> {
+    let embedding = embedding?;
+    let nonempty = !embedding.is_empty();
+    let within_length = embedding.len() <= EMBEDDING_MODEL_BYTES_MAX;
+    let charset_admitted = embedding.chars().all(is_model_identifier_character);
+    let valid = nonempty && within_length && charset_admitted;
+    (!valid).then(|| ConfigurationViolation::EmbeddingModelInvalid {
+        value: embedding.to_owned(),
+    })
 }
 
 /// Whether `character` may appear in an embedding model identifier.
 fn is_model_identifier_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
+}
+
+/// `search.text.extensions` entries admitted, at most.
+pub const TEXT_EXTENSIONS_MAX: usize = 32;
+/// Bytes one `search.text.extensions` entry may hold, at most.
+pub const TEXT_EXTENSION_BYTES_MAX: usize = 16;
+/// Bytes one lexical chunk from a `search.text` file may hold, at least.
+pub const TEXT_CHUNK_BYTES_MIN: u64 = 1 << 10;
+/// Bytes one lexical chunk from a `search.text` file may hold, at most.
+pub const TEXT_CHUNK_BYTES_MAX: u64 = 16 << 20;
+/// Bytes one lexical chunk from a `search.text` file may hold, by default.
+pub const TEXT_CHUNK_BYTES_DEFAULT: u64 = 1 << 20;
+
+/// `search.text.extensions` admitted by default: prose formats with no dedicated syntax
+/// provider.
+const TEXT_EXTENSIONS_DEFAULT: [&str; 3] = ["md", "mdx", "txt"];
+
+fn default_text_extensions() -> Vec<String> {
+    TEXT_EXTENSIONS_DEFAULT
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `[search.text]` table: which non-source text files join the lexical index, as one
+/// unit each, or as several size-bounded chunks when a file exceeds `max_chunk`.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_text_ranges)]
+pub struct TextSearchConfiguration {
+    /// File extensions, without the leading dot, admitted as text-file lexical units:
+    /// lowercase ASCII alphanumeric only (so a leading dot is already excluded), at most
+    /// 16 bytes each, at most 32 entries, no duplicates.
+    #[serde(default = "default_text_extensions")]
+    #[schemars(length(max = 32))]
+    pub extensions: Vec<String>,
+    /// Bytes one lexical chunk may hold, 1kb to 16mb. A text file larger than this is
+    /// indexed as several chunks of at most this size; an operator who wants a file out of
+    /// the index excludes it in `[source]` or drops its extension from `extensions`.
+    pub max_chunk: ByteSize,
+}
+
+impl Default for TextSearchConfiguration {
+    fn default() -> Self {
+        Self {
+            extensions: default_text_extensions(),
+            max_chunk: ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT),
+        }
+    }
+}
+
+impl TextSearchConfiguration {
+    /// The table's numeric bounds, then the extension-list rules, in key order.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([
+            (
+                "search.text.extensions",
+                self.extensions.len() as u64,
+                0,
+                TEXT_EXTENSIONS_MAX as u64,
+            ),
+            (
+                "search.text.max_chunk",
+                self.max_chunk.bytes(),
+                TEXT_CHUNK_BYTES_MIN,
+                TEXT_CHUNK_BYTES_MAX,
+            ),
+        ])
+        .or_else(|| text_extensions_violation(&self.extensions))
+    }
+}
+
+/// Whether `extension` matches `search.text.extensions`'s admitted spelling: nonempty,
+/// lowercase ASCII alphanumeric only, at most [`TEXT_EXTENSION_BYTES_MAX`] bytes.
+fn is_text_extension(extension: &str) -> bool {
+    !extension.is_empty()
+        && extension.len() <= TEXT_EXTENSION_BYTES_MAX
+        && extension
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// The first `search.text.extensions` entry breaking its charset/length contract, or the
+/// first duplicate, entries in list order.
+fn text_extensions_violation(extensions: &[String]) -> Option<ConfigurationViolation> {
+    let mut seen = std::collections::BTreeSet::new();
+    for extension in extensions {
+        if !is_text_extension(extension) {
+            return Some(ConfigurationViolation::TextExtensionInvalid {
+                extension: extension.clone(),
+            });
+        }
+        if !seen.insert(extension.as_str()) {
+            return Some(ConfigurationViolation::TextExtensionDuplicate {
+                extension: extension.clone(),
+            });
+        }
+    }
+    None
 }
 
 /// One `[[hooks]]` block: an executable Rift starts directly — no shell —
@@ -688,6 +797,17 @@ pub enum ConfigurationViolation {
         /// The rejected value.
         value: String,
     },
+    /// A `search.text.extensions` entry is empty, uses forbidden characters, or exceeds
+    /// [`TEXT_EXTENSION_BYTES_MAX`] bytes.
+    TextExtensionInvalid {
+        /// The rejected entry.
+        extension: String,
+    },
+    /// Two `search.text.extensions` entries name the same extension.
+    TextExtensionDuplicate {
+        /// The extension both entries claim.
+        extension: String,
+    },
     /// Two hooks share one id, so their results could not be told apart.
     HookIdDuplicate {
         /// The id both hooks claim.
@@ -750,6 +870,10 @@ impl ConfigurationViolation {
                 vec![("selector", selector.clone())]
             }
             Self::EmbeddingModelInvalid { value } => vec![("value", value.clone())],
+            Self::TextExtensionInvalid { extension }
+            | Self::TextExtensionDuplicate { extension } => {
+                vec![("extension", extension.clone())]
+            }
             Self::HookIdDuplicate { id } | Self::HookIdInvalid { id } => {
                 vec![("id", id.clone())]
             }
@@ -1126,6 +1250,7 @@ mod tests {
             json!({ "providers": { "unknown": {} } }),
             json!({ "providers": { "history": { "unknown": 1 } } }),
             json!({ "search": { "unknown": "x" } }),
+            json!({ "search": { "text": { "unknown": "x" } } }),
             json!({ "source": { "unknown": "x" } }),
         ];
         for case in cases {
@@ -1291,6 +1416,126 @@ mod tests {
             configuration.validate(),
             Err(ConfigurationViolation::EmbeddingModelInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn test_search_text_defaults_admit_markdown_and_text_extensions() {
+        let configuration = WorkspaceConfiguration::default();
+        assert_eq!(
+            configuration.search.text.extensions,
+            vec!["md".to_owned(), "mdx".to_owned(), "txt".to_owned()]
+        );
+        assert_eq!(
+            configuration.search.text.max_chunk,
+            ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT)
+        );
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_search_text_extension_charset_and_length_are_checked() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for entry in ["", ".md", "MD", "md-x", "m d", "n".repeat(17).as_str()] {
+            configuration.search.text.extensions = vec![entry.to_owned()];
+            let violation = configuration
+                .validate()
+                .expect_err(&format!("{entry:?} must be refused"));
+            assert_eq!(
+                violation,
+                ConfigurationViolation::TextExtensionInvalid {
+                    extension: entry.to_owned(),
+                }
+            );
+        }
+        configuration.search.text.extensions = vec!["n".repeat(16)];
+        assert_eq!(
+            configuration.validate(),
+            Ok(()),
+            "an extension at the exact byte bound must be admitted"
+        );
+    }
+
+    #[test]
+    fn test_search_text_extension_duplicates_are_refused() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.text.extensions = vec!["md".to_owned(), "md".to_owned()];
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::TextExtensionDuplicate {
+                extension: "md".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_search_text_extensions_admit_the_cap_and_refuse_above_it() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.text.extensions = (0..TEXT_EXTENSIONS_MAX)
+            .map(|index| format!("e{index}"))
+            .collect();
+        assert_eq!(configuration.validate(), Ok(()));
+
+        configuration
+            .search
+            .text
+            .extensions
+            .push("overflow".to_owned());
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "search.text.extensions",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_search_text_max_chunk_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.text.max_chunk = ByteSize::from_bytes(TEXT_CHUNK_BYTES_MIN);
+        assert_eq!(configuration.validate(), Ok(()));
+        configuration.search.text.max_chunk = ByteSize::from_bytes(TEXT_CHUNK_BYTES_MAX);
+        assert_eq!(configuration.validate(), Ok(()));
+
+        configuration.search.text.max_chunk = ByteSize::from_bytes(TEXT_CHUNK_BYTES_MIN - 1);
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "search.text.max_chunk",
+                ..
+            })
+        ));
+        configuration.search.text.max_chunk = ByteSize::from_bytes(TEXT_CHUNK_BYTES_MAX + 1);
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "search.text.max_chunk",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_search_table_parses_text_keys_from_a_full_configuration() {
+        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
+            "search": {
+                "embedding": "potion-retrieval-32M",
+                "text": {
+                    "extensions": ["md", "rst"],
+                    "max_chunk": "2mb",
+                },
+            }
+        }))
+        .expect("a full [search] table with text keys must parse");
+        assert_eq!(
+            configuration.search.text.extensions,
+            vec!["md".to_owned(), "rst".to_owned()]
+        );
+        assert_eq!(
+            configuration.search.text.max_chunk,
+            ByteSize::from_bytes(2 << 20)
+        );
+        assert_eq!(configuration.validate(), Ok(()));
     }
 
     /// One way to break a hook bound, and the check its refusal must pass.
@@ -1537,6 +1782,18 @@ mod tests {
                     ("pattern", "src\\lib.rs".to_owned()),
                 ],
             ),
+            (
+                ConfigurationViolation::TextExtensionInvalid {
+                    extension: ".md".to_owned(),
+                },
+                vec![("extension", ".md".to_owned())],
+            ),
+            (
+                ConfigurationViolation::TextExtensionDuplicate {
+                    extension: "md".to_owned(),
+                },
+                vec![("extension", "md".to_owned())],
+            ),
         ];
         for (violation, expected) in cases {
             assert_eq!(violation.evidence(), expected, "{violation:?}");
@@ -1605,6 +1862,7 @@ mod tests {
         let history = &definitions["HistoryConfiguration"]["properties"];
         let search = &definitions["SearchConfiguration"]["properties"];
         let source = &definitions["SourceConfiguration"]["properties"];
+        let text = &definitions["TextSearchConfiguration"]["properties"];
         let cases = [
             (
                 "hooks max",
@@ -1661,6 +1919,16 @@ mod tests {
                 "source exclude max",
                 &source["exclude"]["maxItems"],
                 json!(SOURCE_PATTERNS_MAX),
+            ),
+            (
+                "text extensions max",
+                &text["extensions"]["maxItems"],
+                json!(TEXT_EXTENSIONS_MAX),
+            ),
+            (
+                "text extensions default",
+                &text["extensions"]["default"],
+                json!(["md", "mdx", "txt"]),
             ),
         ];
         assert_schema_bounds(&cases);

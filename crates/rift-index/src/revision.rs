@@ -89,7 +89,16 @@ impl WorkspaceIndex {
                 &mut workspace_bytes,
             )?);
         }
-        Ok(Self::from_parts(root, files, composition, limits))
+        // Revision reads serve committed source only: text files join the workspace scan,
+        // not a revision tree, so this list stays empty and the chunk bound is unused.
+        Ok(Self::from_parts(
+            root,
+            files,
+            Vec::new(),
+            composition,
+            limits,
+            rift_core::TextFileAdmission::default().chunk_bytes_max(),
+        ))
     }
 }
 

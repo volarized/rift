@@ -9,7 +9,7 @@
 //! `rift-protocol`, so the workspace's `[source]` table is translated into
 //! this plain value here, beside the wire type it comes from.
 
-use rift_protocol::configuration::{ConfigurationViolation, UnitParseError};
+use rift_protocol::configuration::{ConfigurationViolation, SearchConfiguration, UnitParseError};
 use rift_protocol::source::SourceConfiguration;
 
 use crate::error::{ErrorContext, ErrorName, Fault, fault_label};
@@ -74,6 +74,69 @@ impl From<&SourceConfiguration> for SourceVisibility {
     }
 }
 
+/// Which non-source text files the lexical index admits: the resolved `[search.text]`
+/// policy, independent of the wire model it was read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextFileAdmission {
+    extensions: Vec<String>,
+    chunk_bytes_max: u64,
+}
+
+impl TextFileAdmission {
+    /// Builds one text-admission policy from its extension list and chunk bound.
+    #[must_use]
+    pub const fn new(extensions: Vec<String>, chunk_bytes_max: u64) -> Self {
+        Self {
+            extensions,
+            chunk_bytes_max,
+        }
+    }
+
+    /// Extensions, without the leading dot, admitted as text-file lexical units.
+    #[must_use]
+    pub fn extensions(&self) -> &[String] {
+        &self.extensions
+    }
+
+    /// Bytes one lexical chunk derived from an admitted text file may hold.
+    #[must_use]
+    pub const fn chunk_bytes_max(&self) -> u64 {
+        self.chunk_bytes_max
+    }
+
+    /// Whether `path`'s extension is one this policy admits. The comparison is
+    /// case-insensitive against the configured lowercase spellings — `README.MD` is admitted
+    /// by `extensions = ["md"]`, matching how case-insensitive filesystems already present
+    /// extensions to callers — while configuration admission still refuses any entry that is
+    /// not itself lowercase.
+    #[must_use]
+    pub fn admits(&self, path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| {
+                self.extensions
+                    .iter()
+                    .any(|admitted| admitted.eq_ignore_ascii_case(extension))
+            })
+    }
+}
+
+impl Default for TextFileAdmission {
+    /// Every default `[search.text]` extension admitted, at the default chunk bound.
+    fn default() -> Self {
+        Self::from(&SearchConfiguration::default())
+    }
+}
+
+impl From<&SearchConfiguration> for TextFileAdmission {
+    fn from(search: &SearchConfiguration) -> Self {
+        Self::new(
+            search.text.extensions.clone(),
+            search.text.max_chunk.bytes(),
+        )
+    }
+}
+
 impl Fault for UnitParseError {
     fn name(&self) -> ErrorName {
         ErrorName::Wire(ErrorCode::ConfigurationInvalid)
@@ -121,6 +184,54 @@ mod tests {
         assert_eq!(visibility.include(), ["src/**"]);
         assert_eq!(visibility.exclude(), ["src/generated/**"]);
         assert!(!visibility.respect_gitignore());
+    }
+
+    #[test]
+    fn test_text_file_admission_converts_from_wire_search_configuration() {
+        let mut search = rift_protocol::configuration::SearchConfiguration::default();
+        search.text.extensions = vec!["md".to_owned(), "rst".to_owned()];
+        search.text.max_chunk = ByteSize::from_bytes(2 << 20);
+        let admission = TextFileAdmission::from(&search);
+        assert_eq!(admission.extensions(), ["md", "rst"]);
+        assert_eq!(admission.chunk_bytes_max(), 2 << 20);
+    }
+
+    #[test]
+    fn test_text_file_admission_default_matches_default_search_configuration() {
+        let admission = TextFileAdmission::default();
+        assert_eq!(admission.extensions(), ["md", "mdx", "txt"]);
+        assert_eq!(admission.chunk_bytes_max(), 1 << 20);
+        assert_eq!(
+            admission,
+            TextFileAdmission::from(&rift_protocol::configuration::SearchConfiguration::default())
+        );
+    }
+
+    #[test]
+    fn test_text_file_admission_admits_a_configured_extension_case_insensitively() {
+        let admission = TextFileAdmission::new(vec!["md".to_owned()], 1_024);
+        assert!(admission.admits(std::path::Path::new("docs/readme.md")));
+        assert!(
+            admission.admits(std::path::Path::new("docs/README.MD")),
+            "a mixed-case filesystem extension must still be admitted"
+        );
+        assert!(!admission.admits(std::path::Path::new("docs/readme.txt")));
+        assert!(!admission.admits(std::path::Path::new("docs/no-extension")));
+    }
+
+    #[test]
+    fn test_text_extension_configuration_still_refuses_uppercase_entries() {
+        use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.text.extensions = vec!["MD".to_owned()];
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::TextExtensionInvalid {
+                extension: "MD".to_owned(),
+            }),
+            "config-side admission must still refuse an uppercase extension entry, even though \
+             the runtime path-matching predicate is case-insensitive"
+        );
     }
 
     #[test]

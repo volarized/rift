@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
-use rift_core::SourceVisibility;
 use rift_core::constants::{WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES};
+use rift_core::{SourceVisibility, TextFileAdmission};
 use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
 use rift_protocol::configuration::{ServerConfiguration, WorkspaceConfiguration};
 use rift_protocol::error as wire;
@@ -166,6 +166,15 @@ impl ConfigurationState {
         self.admitted.as_ref().map_or_else(
             |_| SourceVisibility::default(),
             |configuration| SourceVisibility::from(&configuration.source),
+        )
+    }
+
+    /// The `[search.text]` admission from the last admission, or the default admission while
+    /// `rift.toml` is invalid.
+    pub(crate) fn text_admission(&self) -> TextFileAdmission {
+        self.admitted.as_ref().map_or_else(
+            |_| TextFileAdmission::default(),
+            |configuration| TextFileAdmission::from(&configuration.search),
         )
     }
 }
@@ -584,8 +593,9 @@ pub(crate) fn build_workspace_candidate(
 ) -> Result<WorkspaceCandidate, ReadError> {
     let configuration = ConfigurationState::admit(root);
     let visibility = configuration.source_visibility();
-    let reads = ReadService::build(root, limits, &visibility)?;
-    let source_policy = WorkspaceSourcePolicy::build(root, limits, &visibility)
+    let text_admission = configuration.text_admission();
+    let reads = ReadService::build(root, limits, &visibility, &text_admission)?;
+    let source_policy = WorkspaceSourcePolicy::build(root, limits, &visibility, &text_admission)
         .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
     if configuration.fingerprint != configuration_fingerprint(root) {
         return Ok(WorkspaceCandidate::ConfigurationChanged);
@@ -847,7 +857,7 @@ mod tests {
 
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
-    use rift_core::SourceVisibility;
+    use rift_core::{SourceVisibility, TextFileAdmission};
     use rift_index::{WorkspaceIndexLimits, WorkspaceSourcePolicy};
     use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
@@ -966,6 +976,7 @@ mod tests {
             &watched_root,
             WorkspaceIndexLimits::default(),
             &visibility,
+            &TextFileAdmission::default(),
         )?;
         let (validation, _invalidations) = IndexValidation::new();
         validation.install_source_policy(Arc::new(policy));
@@ -976,6 +987,15 @@ mod tests {
             &validation,
             &event(EventKind::Modify(ModifyKind::Any), "src/lib.rs")
         ));
+        assert!(
+            relevant_watch_event(
+                &watched_root,
+                &validation,
+                &event(EventKind::Modify(ModifyKind::Any), "src/guide.md")
+            ),
+            "an external edit to an admitted [search.text] extension must trigger a rebuild, \
+             the same as a source file"
+        );
         assert!(!relevant_watch_event(
             &watched_root,
             &validation,
