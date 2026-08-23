@@ -9,23 +9,16 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use rift_core::{CliCode, Error, ErrorContext, ErrorName, Fault};
-use rift_mcp::{ElectionError, ElectionFault, ServerPresence, probe, read_serving, serve_elected};
+use rift_mcp::{
+    ElectionError, ElectionFault, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
+    ServerPresence, probe, read_serving, serve_elected, spawn_detached_server,
+};
 use rift_protocol::lock::ServerLock;
 use tokio_util::sync::CancellationToken;
 
-/// Pause between presence probes while waiting on a start or stop.
-const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Longest wait for a spawned server to publish its lock document.
-///
-/// The start poll runs `START_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 150
-/// bounded iterations.
-const START_WAIT_MAX: Duration = Duration::from_secs(15);
-/// Probe attempts one start waits: `START_WAIT_MAX` over the interval.
-const START_POLL_ATTEMPT_COUNT: u32 = 150;
 /// Longest wait for an asked server to leave the serving state.
 ///
 /// The stop poll runs `STOP_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 100
@@ -35,29 +28,6 @@ const STOP_WAIT_MAX: Duration = Duration::from_secs(10);
 const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 /// Bound on the whole stop request: connect, send, and read the answer.
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Keeps a detached child completely off this process's terminal and
-/// process group (unix half).
-#[cfg(unix)]
-fn detach(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-    command.process_group(0);
-}
-
-/// `CreateProcess` flag detaching the child from the parent console.
-#[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x8;
-/// `CreateProcess` flag giving the child its own signal group.
-#[cfg(windows)]
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
-
-/// Keeps a detached child completely off this process's console and
-/// process group (windows half).
-#[cfg(windows)]
-fn detach(command: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-}
 
 /// Failure while running one `rift server` command.
 pub(super) type ServerCommandError = Error<ServerCommandFault>;
@@ -258,29 +228,9 @@ async fn start_detached(root: &Path) -> Result<ServerOutcome, ServerCommandError
             pid: lock.pid,
         });
     }
-    spawn_detached_server()?;
+    spawn_detached_server(root)
+        .map_err(|source| Error::new(ServerCommandFault::SpawnFailed { source }))?;
     await_serving(root, START_POLL_ATTEMPT_COUNT).await
-}
-
-/// Spawns `rift server start --foreground` fully detached.
-///
-/// The child inherits this process's environment and working directory —
-/// it serves the same workspace this command was run in — with stdin,
-/// stdout, and stderr all null and its own process group, so it survives
-/// this process's exit and its terminal. The child handle is dropped
-/// unawaited: this process exits within the start wait, handing the child
-/// to the init process.
-fn spawn_detached_server() -> Result<(), ServerCommandError> {
-    let spawn_failed = |source: io::Error| Error::new(ServerCommandFault::SpawnFailed { source });
-    let program = std::env::current_exe().map_err(spawn_failed)?;
-    let mut command = Command::new(program);
-    command
-        .args(["server", "start", "--foreground"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    detach(&mut command);
-    command.spawn().map(drop).map_err(spawn_failed)
 }
 
 /// Polls until the workspace serves, bounded by `attempt_count` probes.

@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Serve Rust workspace reads and edits over stdio MCP.
+    /// Serve agents over stdio MCP by proxying this workspace's rift server.
     Mcp,
     /// Manage this workspace's HTTP MCP server.
     Server {
@@ -81,7 +81,7 @@ fn initialize_tracing() {
 
 #[derive(Debug)]
 enum CliError {
-    Mcp(rift_mcp::StdioServeError),
+    Mcp(rift_mcp::ProxyServeError),
     Server(server::ServerCommandError),
     Update(update::UpdateError),
 }
@@ -137,7 +137,7 @@ async fn run(cli: Cli) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {
         None => Ok(None),
         Some(CliCommand::Mcp) => {
-            rift_mcp::serve_stdio(Path::new("."))
+            rift_mcp::serve_proxy(Path::new("."))
                 .await
                 .map_err(CliError::Mcp)?;
             Ok(None)
@@ -182,8 +182,11 @@ mod tests {
 
     #[test]
     fn mcp_cli_error_preserves_message_and_source() {
-        let error = CliError::Mcp(rift_mcp::StdioServeError::UnexpectedQuit);
-        assert_eq!(error.to_string(), "MCP service ended unexpectedly");
+        let error = CliError::Mcp(rift_core::Error::new(rift_mcp::ProxyFault::UnexpectedQuit));
+        assert!(
+            error.to_string().contains("MCP service ended unexpectedly"),
+            "{error}"
+        );
         assert!(error.source().is_some());
     }
 
@@ -204,7 +207,7 @@ mod tests {
         assert!(!update_code.is_empty());
         assert_eq!(CliError::Update(update).descriptor().code(), update_code);
 
-        let mcp = rift_mcp::StdioServeError::UnexpectedQuit;
+        let mcp = rift_core::Error::new(rift_mcp::ProxyFault::UnexpectedQuit);
         let mcp_code = mcp.descriptor().code();
         assert!(!mcp_code.is_empty());
         assert_eq!(CliError::Mcp(mcp).descriptor().code(), mcp_code);
