@@ -1710,22 +1710,37 @@ mod tests {
             .ok_or("patch must return structured content")?;
         assert_eq!(structured["status"], json!("applied"));
 
-        let search = client
-            .call_tool(
-                CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": "replacing legacy unit"}))?),
-            )
-            .await?;
-        let structured = search
-            .structured_content
-            .ok_or("search must return structured content")?;
-        let results = structured["results"]
-            .as_array()
-            .ok_or("results must be an array")?;
+        // The change's own writes wake the watcher, whose rebuild republishes a newer
+        // revision; until the supervisor repopulates, the revision guard serves
+        // identifier-only results. Retry within a bound instead of asserting the first
+        // answer, because that degraded window is advertised behavior.
+        let repopulation_attempts_max = 50;
+        let mut lexical_hit_observed = false;
+        let mut last_answer = json!(null);
+        for _ in 0..repopulation_attempts_max {
+            let search = client
+                .call_tool(
+                    CallToolRequestParams::new("search")
+                        .with_arguments(arguments(&json!({"query": "replacing legacy unit"}))?),
+                )
+                .await?;
+            let structured = search
+                .structured_content
+                .ok_or("search must return structured content")?;
+            let results = structured["results"]
+                .as_array()
+                .ok_or("results must be an array")?;
+            if results.iter().any(|hit| hit["path"] == json!("notes.md")) {
+                lexical_hit_observed = true;
+                break;
+            }
+            last_answer = structured;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(
-            results.iter().any(|hit| hit["path"] == json!("notes.md")),
+            lexical_hit_observed,
             "the change-applied rebuild must repopulate the lexical tier with the new file: \
-             {structured:#}"
+             {last_answer:#}"
         );
 
         client.cancel().await?;
