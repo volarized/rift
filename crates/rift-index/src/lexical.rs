@@ -915,10 +915,11 @@ impl LexicalSearchIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation, LexicalSearchIndex,
-        LexicalUnit, LexicalUnitKind, UNIT_NAME_BYTES_MAX, checked_byte_length,
-        decode_lexical_match, identifier_expansion, lexical_error, lexical_error_at,
-        lexical_error_caused_by, match_expression, require_pragma_row, validate_lexical_batch,
+        LexicalIndexFault, LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation,
+        LexicalSearchIndex, LexicalUnit, LexicalUnitKind, LexicalUnitRecord, UNIT_NAME_BYTES_MAX,
+        checked_byte_length, decode_lexical_match, identifier_expansion, lexical_error,
+        lexical_error_at, lexical_error_caused_by, match_expression, require_pragma_row,
+        validate_lexical_batch,
     };
     use rift_core::{ErrorCode, ErrorName, ProjectPath};
     use toasty::stmt::Value;
@@ -1201,6 +1202,31 @@ mod tests {
     #[should_panic(expected = "content byte length must fit i64 once bounded by unit_bytes_max")]
     fn test_checked_byte_length_usize_max_panics_on_i64_overflow() {
         let _ = checked_byte_length(usize::MAX);
+    }
+
+    #[test]
+    fn test_lexical_unit_record_debug_formats_declared_fields() {
+        let record = LexicalUnitRecord {
+            identity: "crate::a".to_owned(),
+            path: "src/a.rs".to_owned(),
+            kind: "symbol".to_owned(),
+            name: Some("a".to_owned()),
+            byte_length: 4,
+            content: "body".to_owned(),
+        };
+        let formatted = format!("{record:?}");
+        assert!(formatted.contains("crate::a"));
+        assert!(formatted.contains("src/a.rs"));
+    }
+
+    #[test]
+    fn test_lexical_index_state_record_debug_formats_declared_fields() {
+        let record = LexicalIndexStateRecord {
+            id: 1,
+            tree_revision: "deadbeef".to_owned(),
+        };
+        let formatted = format!("{record:?}");
+        assert!(formatted.contains("deadbeef"));
     }
 
     #[test]
