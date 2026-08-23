@@ -5,9 +5,25 @@ format:
 
 generate:
     cargo run -q -p rift-mcp --bin rift-schema-export -- docs
+    printf '$ rift --help\n' > docs/public/cli-help.txt
+    cargo run -q -p rift -- --help >> docs/public/cli-help.txt
+    printf '\n$ rift server --help\n' >> docs/public/cli-help.txt
+    cargo run -q -p rift -- server --help >> docs/public/cli-help.txt
 
 generate-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo run -q -p rift-mcp --bin rift-schema-export -- --check docs
+    fresh="$(mktemp)"
+    trap 'rm -f "$fresh"' EXIT
+    printf '$ rift --help\n' > "$fresh"
+    cargo run -q -p rift -- --help >> "$fresh"
+    printf '\n$ rift server --help\n' >> "$fresh"
+    cargo run -q -p rift -- server --help >> "$fresh"
+    cmp -s docs/public/cli-help.txt "$fresh" || {
+        echo "error: \`docs/public/cli-help.txt\` does not match the CLI help; regenerate it with \`just generate\`" >&2
+        exit 1
+    }
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null

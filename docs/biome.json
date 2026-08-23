@@ -14,7 +14,8 @@
       "!**/bun.lock",
       "!public/schemas",
       "!public/rift.schema.json",
-      "!public/mcp.json"
+      "!public/mcp.json",
+      "!public/cli-help.txt"
     ]
   },
   "formatter": {
