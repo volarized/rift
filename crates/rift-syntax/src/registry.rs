@@ -1,0 +1,238 @@
+//! The shipped syntax providers, selected by extension or language.
+//!
+//! A new language joins the workspace by adding its provider module, its
+//! grammar dependency, and one entry in this module's shipped provider
+//! list; the walk's extension gate and the default per-file byte bound
+//! derive from the registry, so nothing else changes.
+
+use std::sync::OnceLock;
+
+use rift_protocol::read::Language;
+
+use crate::provider::SyntaxProvider;
+use crate::rust::RustSyntaxProvider;
+
+/// Every provider this build ships, in registration order.
+fn build_registry() -> Vec<Box<dyn SyntaxProvider>> {
+    vec![Box::new(RustSyntaxProvider::default())]
+}
+
+/// The shipped providers and the facts derived from them once, at first use.
+struct SyntaxRegistry {
+    providers: Vec<Box<dyn SyntaxProvider>>,
+    extensions: Vec<&'static str>,
+    file_bytes_max_default: usize,
+}
+
+impl SyntaxRegistry {
+    /// Assembles one registry, proving the provider set's invariants.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the provider set is empty or two providers claim one
+    /// extension: both are programmer errors in the shipped provider list,
+    /// not reachable operating states.
+    fn assemble(providers: Vec<Box<dyn SyntaxProvider>>) -> Self {
+        assert!(
+            !providers.is_empty(),
+            "the syntax registry must ship at least one provider"
+        );
+        let mut extensions: Vec<&'static str> = Vec::new();
+        for provider in &providers {
+            for extension in provider.extensions() {
+                assert!(
+                    !extensions.contains(extension),
+                    "syntax providers must claim distinct extensions: \
+                     extension={extension}, language={}",
+                    provider.language().name,
+                );
+                extensions.push(extension);
+            }
+        }
+        let file_bytes_max_default = providers
+            .iter()
+            .map(|provider| provider.source_bytes_max())
+            .max()
+            .unwrap_or_else(|| {
+                unreachable!("a non-empty provider set must have a maximum source byte bound")
+            });
+        Self {
+            providers,
+            extensions,
+            file_bytes_max_default,
+        }
+    }
+}
+
+/// Returns the process-wide registry, assembling it once.
+fn registry() -> &'static SyntaxRegistry {
+    static REGISTRY: OnceLock<SyntaxRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| SyntaxRegistry::assemble(build_registry()))
+}
+
+/// Every shipped provider, in registration order.
+pub fn providers() -> impl Iterator<Item = &'static dyn SyntaxProvider> {
+    registry().providers.iter().map(Box::as_ref)
+}
+
+/// The provider claiming `extension` (without its leading dot); `None` when
+/// no shipped grammar parses it.
+#[must_use]
+pub fn provider_for_extension(extension: &str) -> Option<&'static dyn SyntaxProvider> {
+    providers().find(|provider| provider.extensions().contains(&extension))
+}
+
+/// The provider filing facts under `language`; `None` when no shipped
+/// grammar serves it.
+#[must_use]
+pub fn provider_for_language(language: &Language) -> Option<&'static dyn SyntaxProvider> {
+    providers().find(|provider| provider.language() == language)
+}
+
+/// File extensions some shipped provider parses: the union of every
+/// provider's declared extensions. The workspace walk includes a file as
+/// source exactly when its extension is listed here.
+#[must_use]
+pub fn source_file_extensions() -> &'static [&'static str] {
+    &registry().extensions
+}
+
+/// The largest per-source byte bound any shipped provider accepts by
+/// default. The workspace's default per-file bound derives from it, so no
+/// provider's default is unreachable under the scan.
+#[must_use]
+pub fn file_bytes_max_default() -> usize {
+    registry().file_bytes_max_default
+}
+
+#[cfg(test)]
+mod tests {
+    use rift_core::ProjectPath;
+    use rift_protocol::read::{Language, NodeFacet};
+
+    use super::*;
+    use crate::document::SyntaxDocument;
+    use crate::failure::SyntaxError;
+    use crate::provider::SyntaxSource;
+
+    fn rust() -> Language {
+        Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        }
+    }
+
+    #[test]
+    fn test_provider_for_extension_serves_rust_and_refuses_unclaimed() {
+        let provider = provider_for_extension("rs").expect("the rust provider claims rs");
+        assert_eq!(provider.language(), &rust());
+        assert!(provider_for_extension("py").is_none());
+    }
+
+    #[test]
+    fn test_provider_for_language_serves_rust_and_refuses_unserved() {
+        let provider = provider_for_language(&rust()).expect("the rust provider serves rust");
+        assert_eq!(provider.extensions(), ["rs"]);
+        let unserved = Language {
+            name: "python".to_owned(),
+            dialect: None,
+        };
+        assert!(provider_for_language(&unserved).is_none());
+    }
+
+    #[test]
+    fn test_source_file_extensions_union_lists_every_declared_extension() {
+        assert_eq!(source_file_extensions(), ["rs"]);
+    }
+
+    #[test]
+    fn test_file_bytes_max_default_is_the_largest_declared_provider_bound() {
+        assert_eq!(
+            file_bytes_max_default(),
+            RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
+        );
+    }
+
+    #[test]
+    fn test_registry_analyzes_through_the_trait_object() {
+        let path = ProjectPath::new("src/lib.rs").expect("valid fixture path");
+        let provider = provider_for_extension("rs").expect("the rust provider claims rs");
+        let document = provider
+            .analyze(SyntaxSource {
+                path: &path,
+                text: "pub fn beacon() {}",
+            })
+            .expect("fixture must parse");
+        assert_eq!(document.language(), &rust());
+        assert_eq!(document.symbols()[0].name, "beacon");
+    }
+
+    #[test]
+    #[should_panic(expected = "syntax providers must claim distinct extensions")]
+    fn test_assemble_refuses_two_providers_claiming_one_extension() {
+        SyntaxRegistry::assemble(vec![
+            Box::new(RustSyntaxProvider::default()),
+            Box::new(RustSyntaxProvider::default()),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "the syntax registry must ship at least one provider")]
+    fn test_assemble_refuses_an_empty_provider_set() {
+        SyntaxRegistry::assemble(Vec::new());
+    }
+
+    /// A provider proving nothing rust-specific leaks into the registry
+    /// invariants: distinct extensions assemble beside the rust provider.
+    #[derive(Debug)]
+    struct StubProvider {
+        language: Language,
+    }
+
+    impl SyntaxProvider for StubProvider {
+        fn language(&self) -> &Language {
+            &self.language
+        }
+
+        fn extensions(&self) -> &'static [&'static str] {
+            &["stub"]
+        }
+
+        fn source_bytes_max(&self) -> usize {
+            1
+        }
+
+        fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+            Ok(SyntaxDocument::new(
+                self.language.clone(),
+                source.path.clone(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ))
+        }
+
+        fn node_facets(&self, _kind: &str) -> Vec<NodeFacet> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn test_assemble_accepts_distinct_extensions_and_takes_the_larger_byte_bound() {
+        let stub = StubProvider {
+            language: Language {
+                name: "stub".to_owned(),
+                dialect: None,
+            },
+        };
+        let assembled = SyntaxRegistry::assemble(vec![
+            Box::new(RustSyntaxProvider::default()),
+            Box::new(stub),
+        ]);
+        assert_eq!(assembled.extensions, ["rs", "stub"]);
+        assert_eq!(
+            assembled.file_bytes_max_default,
+            RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
+        );
+    }
+}

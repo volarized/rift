@@ -15,9 +15,9 @@ use rift_protocol::read::{
     Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
     Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination, ProjectPath,
     ReadWarning, RevisionId, SearchScope, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
-    SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    SourceUnitSpan, Symbol, SymbolId, SymbolOrigin, TextRange,
 };
-use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
+use rift_syntax::{ByteRange, SyntaxNode, SyntaxSymbol};
 use sha2::{Digest as _, Sha256};
 
 /// One read-service failure: what was asked, and why it cannot be served.
@@ -480,7 +480,7 @@ pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>
     (window, pagination)
 }
 
-fn wire_node(file: &IndexedFile, node: &RustNode) -> Node {
+fn wire_node(file: &IndexedFile, node: &SyntaxNode) -> Node {
     Node {
         id: node_id(file, node),
         symbol: symbol_for_range(file, node.range).map(|symbol| symbol_id(file, symbol)),
@@ -508,7 +508,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
             symbol: Some(symbol_id(matched.file, matched.symbol)),
             unit: file_id(matched.file.path()),
             language: rust_language(),
-            kind: ExactKind(symbol_kind(matched.symbol.kind).to_owned()),
+            kind: ExactKind(format!("rust.{}", matched.symbol.kind)),
             facets: vec![NodeFacet::Declaration, NodeFacet::Definition],
             range: text_range(matched.symbol.range),
             regions: Vec::new(),
@@ -525,24 +525,21 @@ pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
         id: symbol_id(matched.file, symbol),
         language: rust_language(),
         name: symbol.name.clone(),
-        kind: ExactKind(symbol_kind(symbol.kind).to_owned()),
-        facets: symbol_facets(symbol.kind, &symbol.visibility),
+        kind: ExactKind(format!("rust.{}", symbol.kind)),
+        facets: symbol.facets.clone(),
         origin: SymbolOrigin {
             location: Some(SourceLocation::Project { package: None }),
             source_kind: SourceKind::Authored,
             unit: Some(source_unit_id(matched.file.path())),
         },
-        container: symbol
-            .qualified_name
-            .rsplit_once("::")
-            .map(|(container, _)| {
-                SymbolId(rift_core::rust_symbol_identity(
-                    matched.file.path().as_str(),
-                    container,
-                ))
-            }),
+        container: symbol.container.as_ref().map(|container| {
+            SymbolId(rift_core::rust_symbol_identity(
+                matched.file.path().as_str(),
+                container,
+            ))
+        }),
         modifiers: Vec::new(),
-        visibility: Some(authored_visibility(&symbol.visibility)),
+        visibility: symbol.visibility.clone(),
         types: Vec::new(),
         signatures: Vec::new(),
         documentation: Vec::new(),
@@ -607,14 +604,14 @@ pub(crate) fn project_path(path: &CoreProjectPath) -> ProjectPath {
     ProjectPath(path.as_str().to_owned())
 }
 
-fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
+fn symbol_id(file: &IndexedFile, symbol: &SyntaxSymbol) -> SymbolId {
     SymbolId(rift_core::rust_symbol_identity(
         file.path().as_str(),
         &symbol.qualified_name,
     ))
 }
 
-fn node_id(file: &IndexedFile, node: &RustNode) -> NodeId {
+fn node_id(file: &IndexedFile, node: &SyntaxNode) -> NodeId {
     NodeId(node_address(file, node.range))
 }
 
@@ -732,14 +729,14 @@ pub(crate) fn digest_wire_hex(digest: &sha2::digest::Output<Sha256>) -> String {
 /// declaration, including attached docs and attributes) for most nodes, but
 /// the item node itself only spans its own bytes, so it matches on
 /// `item_range` instead.
-fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&RustSymbol> {
+fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&SyntaxSymbol> {
     file.syntax()
         .symbols()
         .iter()
         .find(|symbol| symbol.range == range || symbol.item_range == range)
 }
 
-fn node_facets(node: &RustNode) -> Vec<NodeFacet> {
+fn node_facets(node: &SyntaxNode) -> Vec<NodeFacet> {
     let mut facets = Vec::new();
     if node.kind.ends_with("_item") || node.kind.ends_with("_declaration") {
         facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
@@ -754,45 +751,6 @@ fn node_facets(node: &RustNode) -> Vec<NodeFacet> {
         facets.push(NodeFacet::Comment);
     }
     facets
-}
-
-fn symbol_kind(kind: RustSymbolKind) -> &'static str {
-    match kind {
-        RustSymbolKind::Function => "rust.function",
-        RustSymbolKind::Struct => "rust.struct",
-        RustSymbolKind::Enum => "rust.enum",
-        RustSymbolKind::Trait => "rust.trait",
-        RustSymbolKind::TypeAlias => "rust.type_alias",
-        RustSymbolKind::Constant => "rust.constant",
-        RustSymbolKind::Static => "rust.static",
-        RustSymbolKind::Module => "rust.module",
-        RustSymbolKind::Macro => "rust.macro",
-    }
-}
-
-fn symbol_facets(kind: RustSymbolKind, visibility: &RustVisibility) -> Vec<SymbolFacet> {
-    let mut facets = match kind {
-        RustSymbolKind::Function => vec![SymbolFacet::Value, SymbolFacet::Callable],
-        RustSymbolKind::Struct | RustSymbolKind::Enum | RustSymbolKind::Trait => {
-            vec![SymbolFacet::Type]
-        }
-        RustSymbolKind::TypeAlias => vec![SymbolFacet::Type, SymbolFacet::Alias],
-        RustSymbolKind::Module => vec![SymbolFacet::Namespace, SymbolFacet::Module],
-        RustSymbolKind::Macro => vec![SymbolFacet::Macro],
-        RustSymbolKind::Constant | RustSymbolKind::Static => vec![SymbolFacet::Value],
-    };
-    if visibility == &RustVisibility::Public {
-        facets.push(SymbolFacet::Public);
-    }
-    facets
-}
-
-fn authored_visibility(visibility: &RustVisibility) -> String {
-    match visibility {
-        RustVisibility::Private => "private".into(),
-        RustVisibility::Public => "pub".into(),
-        RustVisibility::Restricted(authored) => authored.clone(),
-    }
 }
 
 #[cfg(test)]
@@ -1001,6 +959,43 @@ pub fn compute() -> i32 {
         assert_eq!(
             value["pagination"],
             json!({ "page_index": 0, "total_pages": 1 })
+        );
+        Ok(())
+    }
+
+    /// Pins the serialized symbol and node shape: the document's generic
+    /// kind, facet, visibility, and container fields must serve the exact
+    /// bytes the per-kind helpers served before them.
+    #[test]
+    fn symbol_and_node_wire_shape_is_unchanged() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "signal", "include_body": true}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+
+        let symbol = &value["hits"][0]["symbol"];
+        assert_eq!(symbol["language"], json!({ "name": "rust" }));
+        assert_eq!(symbol["kind"], json!("rust.function"));
+        assert_eq!(symbol["facets"], json!(["value", "callable", "public"]));
+        assert_eq!(symbol["visibility"], json!("pub"));
+        assert_eq!(
+            symbol["container"],
+            json!("rift://symbol/rust/src/lib.rs/Beacon")
+        );
+
+        let node = &value["hits"][0]["node"];
+        assert_eq!(node["language"], json!({ "name": "rust" }));
+        assert_eq!(node["kind"], json!("rust.function_item"));
+        assert_eq!(node["facets"], json!(["declaration", "definition"]));
+
+        let top_level: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
+        let top_value = serde_json::to_value(service.get_symbol(&top_level)?)?;
+        let beacon = &top_value["hits"][0]["symbol"];
+        assert_eq!(beacon["kind"], json!("rust.struct"));
+        assert_eq!(beacon["facets"], json!(["type", "public"]));
+        assert!(
+            beacon.get("container").is_none(),
+            "a top-level declaration serves no container"
         );
         Ok(())
     }

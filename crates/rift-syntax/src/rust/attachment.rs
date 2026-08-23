@@ -75,7 +75,7 @@ impl AttachmentKinds {
 /// Returns the process-wide resolved [`AttachmentKinds`], computing it once.
 fn attachment_kinds() -> &'static AttachmentKinds {
     static KINDS: OnceLock<AttachmentKinds> = OnceLock::new();
-    KINDS.get_or_init(|| AttachmentKinds::resolve(&super::rust_language()))
+    KINDS.get_or_init(|| AttachmentKinds::resolve(&super::rust_grammar()))
 }
 
 /// Returns the byte offset where `node`'s whole declaration starts.
@@ -145,16 +145,18 @@ fn gap_permits_attachment(previous_text: &str, gap: &str) -> bool {
 mod tests {
     use rift_core::ProjectPath;
 
-    use super::super::{RustSource, RustSymbol, RustSyntaxProvider};
+    use super::super::RustSyntaxProvider;
     use super::gap_permits_attachment;
+    use crate::document::SyntaxSymbol;
+    use crate::provider::{SyntaxProvider as _, SyntaxSource};
 
     fn path() -> ProjectPath {
         ProjectPath::new("src/lib.rs").expect("valid fixture path")
     }
 
-    fn symbols(text: &str) -> Vec<RustSymbol> {
+    fn symbols(text: &str) -> Vec<SyntaxSymbol> {
         RustSyntaxProvider::default()
-            .analyze(RustSource {
+            .analyze(SyntaxSource {
                 path: &path(),
                 text,
             })
@@ -163,13 +165,13 @@ mod tests {
             .to_vec()
     }
 
-    fn span_text<'a>(text: &'a str, symbol: &RustSymbol) -> &'a str {
+    fn span_text<'a>(text: &'a str, symbol: &SyntaxSymbol) -> &'a str {
         let start = usize::try_from(symbol.range.start).expect("fixture span fits usize");
         let end = usize::try_from(symbol.range.end).expect("fixture span fits usize");
         &text[start..end]
     }
 
-    fn item_span_text<'a>(text: &'a str, symbol: &RustSymbol) -> &'a str {
+    fn item_span_text<'a>(text: &'a str, symbol: &SyntaxSymbol) -> &'a str {
         let start = usize::try_from(symbol.item_range.start).expect("fixture span fits usize");
         let end = usize::try_from(symbol.item_range.end).expect("fixture span fits usize");
         &text[start..end]

@@ -46,8 +46,6 @@ pub const STAGE_NAME_BYTES_MAX: usize = 64;
 pub const STAGE_NAME_PUNCTUATION: &[u8] = b"-";
 /// Default maximum Rust files indexed from one workspace.
 pub const WORKSPACE_FILES_MAX_DEFAULT: usize = 20_000;
-/// Shared default maximum bytes accepted from one Rust source.
-pub const RUST_SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
 /// Default maximum aggregate Rust source bytes indexed from one workspace.
 pub const WORKSPACE_BYTES_MAX_DEFAULT: usize = 128 * 1_024 * 1_024;
 /// Default maximum directory depth scanned from one workspace.

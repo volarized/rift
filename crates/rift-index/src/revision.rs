@@ -14,13 +14,12 @@ use rift_core::{CompositionId, ProjectPath, SourceVisibility};
 use rift_history::{REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile};
 use rift_provider::CompositionBuilder;
 use rift_provider::ProviderComposition;
-use rift_syntax::RustSyntaxProvider;
 
 use crate::glob::PathMatcher;
 use crate::workspace::{
     ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
     WorkspaceIndexViolation, component, composition_error, has_source_extension, included_file,
-    index_error_at, index_error_caused_by,
+    index_error_at, index_error_caused_by, syntax_provider_for,
 };
 
 #[derive(Debug)]
@@ -55,7 +54,6 @@ impl WorkspaceIndex {
         let listed = repository
             .tree_files(revision, &includes, REVISION_TREE_ENTRIES_MAX)
             .map_err(history_error)?;
-        let parser = RustSyntaxProvider::default();
         let mut workspace_bytes = 0_usize;
         let mut files = Vec::with_capacity(listed.len().min(limits.files_max()));
         for tree_file in &listed {
@@ -84,7 +82,7 @@ impl WorkspaceIndex {
                 project_path,
                 bytes,
                 &context_path,
-                &parser,
+                syntax_provider_for(&context_path),
                 limits,
                 &mut workspace_bytes,
             )?);

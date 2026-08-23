@@ -21,7 +21,7 @@ use rift_protocol::read::{
     Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Severity,
     SourceSpan, TextRange,
 };
-use rift_syntax::{ByteRange, RustSource, RustSyntaxLimits, RustSyntaxProvider};
+use rift_syntax::{ByteRange, RustSyntaxProvider, SyntaxProvider, SyntaxSource};
 use sha2::{Digest as _, Sha256};
 
 use crate::patch::{self, FileRewrite, RewriteKind};
@@ -731,8 +731,8 @@ fn change_id(path: &str, next_source: &str) -> ChangeId {
 /// `unit` names the changed file even when it has no prior index entry, as
 /// for a file a patch just created.
 fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Vec<Diagnostic> {
-    let provider = RustSyntaxProvider::new(RustSyntaxLimits::default());
-    let parsed = provider.analyze(RustSource { path, text: source });
+    let provider = RustSyntaxProvider::default();
+    let parsed = provider.analyze(SyntaxSource { path, text: source });
     match parsed {
         Err(error) => vec![change_diagnostic(
             unit,
@@ -790,7 +790,6 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use rift_core::SourceVisibility;
-    use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
         ChangeResult, InsertPosition, InsertSymbolParams, OperationPreconditionKind,
@@ -1560,7 +1559,7 @@ mod tests {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         let body = format!(
             "pub fn beacon() {{}}\n// {}",
-            "x".repeat(RUST_SOURCE_BYTES_MAX_DEFAULT)
+            "x".repeat(rift_syntax::RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT)
         );
         let result = changes.replace_symbol(
             &reads,
@@ -1580,7 +1579,7 @@ mod tests {
             summary.diagnostics[0].message
         );
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert!(written.len() > RUST_SOURCE_BYTES_MAX_DEFAULT);
+        assert!(written.len() > rift_syntax::RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT);
         Ok(())
     }
 
