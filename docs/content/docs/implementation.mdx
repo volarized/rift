@@ -79,8 +79,9 @@ Startup runs one cycle:
 
 `rift server start` runs that cycle detached and waits for the lock document to appear;
 `rift server stop` sends the authorized stop request and waits for the election to release;
-`rift server restart` chains the two. `--foreground` keeps the cycle in the calling process,
-where Ctrl-C stops it.
+`rift server restart` chains the two. `rift server status` reports the workspace's current
+state - a serving server with its address, a stale `.rift/server.json`, or no server - and
+changes nothing. `--foreground` keeps the cycle in the calling process, where Ctrl-C stops it.
 
 Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
 queue, and a worker picks it up when one is free. This behavior is configurable via the

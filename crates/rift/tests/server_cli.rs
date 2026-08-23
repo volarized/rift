@@ -1,4 +1,4 @@
-//! Real-binary contract of `rift server start|stop|restart`.
+//! Real-binary contract of `rift server start|stop|restart|status`.
 //!
 //! Every test drives the compiled `rift` binary against a throwaway
 //! workspace fixture. The tests serialize on one mutex: the servers share
@@ -399,5 +399,64 @@ fn stop_without_a_server_reports_and_discards_stale_state() -> TestResult {
         !document_path(root).exists(),
         "a stale document is discarded best effort"
     );
+    Ok(())
+}
+
+#[test]
+fn status_reports_absent_stale_and_serving_states() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let absent = rift(root, &["server", "status"])?;
+    require_success(&absent, "status without any lock state")?;
+    assert!(
+        stdout_of(&absent).contains("no rift server is running for this workspace"),
+        "{:?}",
+        stdout_of(&absent)
+    );
+
+    fs::create_dir_all(root.join(".rift"))?;
+    let stale = ServerLock {
+        port: 12_345,
+        token: "a".repeat(SERVER_TOKEN_LENGTH),
+        pid: 1,
+        version: "0.0.1".to_owned(),
+    };
+    fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
+    let stale_status = rift(root, &["server", "status"])?;
+    require_success(&stale_status, "status over a stale document")?;
+    let stale_stdout = stdout_of(&stale_status);
+    assert!(
+        stale_stdout.contains("found a stale .rift/server.json"),
+        "{stale_stdout:?}"
+    );
+    assert!(
+        stale_stdout.contains("no process holds the election lock"),
+        "{stale_stdout:?}"
+    );
+    assert!(
+        document_path(root).exists(),
+        "status never discards the stale document"
+    );
+
+    let started = rift(root, &["server", "start"])?;
+    require_success(&started, "start before the serving status")?;
+    let (port, pid) = listening_facts(&stdout_of(&started))?;
+    let document: ServerLock = serde_json::from_slice(&fs::read(document_path(root))?)?;
+    let serving_status = rift(root, &["server", "status"])?;
+    require_success(&serving_status, "status while serving")?;
+    let serving_stdout = stdout_of(&serving_status);
+    assert!(
+        serving_stdout.contains(&format!(
+            "rift server listening on 127.0.0.1:{port} (pid {pid}, v{version})",
+            version = document.version
+        )),
+        "{serving_stdout:?}"
+    );
+
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop after the serving status")?;
     Ok(())
 }
