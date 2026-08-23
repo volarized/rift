@@ -11,7 +11,7 @@ import { cn } from "@/lib/utils";
  * is subdivided, and every subdivision point is joined to its mirror on the
  * next side, so the straight strings envelope a parabola.
  *
- * One component for every placement — nav, hero, anywhere else. Placements
+ * One component for every placement - nav, hero, anywhere else. Placements
  * differ only by props, because line weight is not scale-invariant: the mesh
  * that reads as a drawing at 440px silts up into a blob at 22px.
  */
@@ -22,7 +22,7 @@ export type LogoProps = Omit<React.ComponentProps<"svg">, "children"> & {
    */
   stitches?: number;
   /**
-   * Stroke weight for the strings, in viewBox units — the viewBox is 100 wide,
+   * Stroke weight for the strings, in viewBox units - the viewBox is 100 wide,
    * so 0.25 is a quarter of one percent of the mark. It scales with the mark
    * rather than being pinned to a device pixel, so small placements need a much
    * larger number to land on the same drawn thickness: a 224px mark wants ~0.24,
@@ -30,7 +30,7 @@ export type LogoProps = Omit<React.ComponentProps<"svg">, "children"> & {
    */
   strokeWidth?: number;
   /**
-   * Stroke weight for the three outer sides. Defaults to `strokeWidth * 1.7` —
+   * Stroke weight for the three outer sides. Defaults to `strokeWidth * 1.7` -
    * the outline is the silhouette, and it reads as mush if it carries the same
    * weight as the mesh behind it.
    */
@@ -52,8 +52,8 @@ export type LogoProps = Omit<React.ComponentProps<"svg">, "children"> & {
 const VIEW_W = 100;
 
 /**
- * Slack around the mark's own bounds, so the outline's stroke — which straddles
- * the boundary and is fattened by a round cap — is not clipped by the viewport.
+ * Slack around the mark's own bounds, so the outline's stroke - which straddles
+ * the boundary and is fattened by a round cap - is not clipped by the viewport.
  */
 const PAD = 2;
 
@@ -63,8 +63,8 @@ type Segment = {
   from: Point;
   to: Point;
   /**
-   * Seconds after `delay` before this string starts drawing, and — scaled to
-   * 0..1 — its place in the scroll-driven stagger.
+   * Seconds after `delay` before this string starts drawing, and - scaled to
+   * 0..1 - its place in the scroll-driven stagger.
    */
   offset: number;
   /** One of the three outer sides, rather than a string across the interior. */
@@ -86,7 +86,7 @@ const SCALE = VIEW_W / 2 / Math.max(...VERTICES.map((v) => Math.abs(v.x)));
 
 /**
  * The viewBox tracks the mark's own bounds rather than a square, so the
- * element's height *is* the drawn height — a placement can then be sized
+ * element's height *is* the drawn height - a placement can then be sized
  * against a cap height and actually land on it.
  */
 const VIEW_H = (Y_TOP - Math.min(...VERTICES.map((v) => v.y))) * SCALE;

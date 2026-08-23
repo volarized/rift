@@ -36,7 +36,7 @@ where
 
 /// Empirical coupling between two symbols: how often revisions that touched one touched the
 /// other. The relation is observed from history rather than resolved from source, so it
-/// reaches coupling no reference graph carries — two implementations of one concept with no
+/// reaches coupling no reference graph carries - two implementations of one concept with no
 /// edge between them.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -92,7 +92,7 @@ pub enum Coverage {
         state: CoveragePartialState,
         /// What the claim covers.
         scope: CoverageScope,
-        /// Why the answer stops short — a limit hit, a file that would not parse, a page
+        /// Why the answer stops short - a limit hit, a file that would not parse, a page
         /// boundary. Prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         reason: String,
@@ -135,7 +135,7 @@ pub enum CoverageReach {
     All,
 }
 
-/// What a completeness statement covers — everything the request asked for, one file, or a
+/// What a completeness statement covers - everything the request asked for, one file, or a
 /// standing scope the answer holds over.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
@@ -152,7 +152,7 @@ pub enum CoverageScope {
     },
 }
 
-/// `unsupported` — no provider produces this family for the language. `not_applicable` — the
+/// `unsupported` - no provider produces this family for the language. `not_applicable` - the
 /// family has no meaning for this language.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -373,7 +373,7 @@ pub struct GetSymbolHit {
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::forbid_get_symbol_rev_with_projection)]
 pub struct GetSymbolParams {
-    /// The declaration name to look up — a name, not a free-text query; `search` takes
+    /// The declaration name to look up - a name, not a free-text query; `search` takes
     /// those. An exact symbol name ranks first, then prefix matches, then qualified-name
     /// substrings.
     #[schemars(length(min = 1, max = 4096))]
@@ -399,7 +399,7 @@ pub struct GetSymbolParams {
     /// The projection to read. Null reads the workspace tree.
     #[serde(default)]
     pub projection: Option<ProjectionId>,
-    /// The version-control revision to read — a branch, tag, or commit id as the
+    /// The version-control revision to read - a branch, tag, or commit id as the
     /// workspace's version control spells it. Null reads the current tree, and `rev`
     /// never combines with `projection`. The server refuses a revision read when the
     /// workspace has no version-control repository.
@@ -496,7 +496,7 @@ pub struct LanguageRegion {
 pub struct Node {
     /// Unique identifier of this source region, and the URI that resolves it.
     pub id: NodeId,
-    /// The symbol written at this node. Absent where a node writes no symbol —
+    /// The symbol written at this node. Absent where a node writes no symbol -
     /// punctuation, a keyword, a comment.
     #[serde(default)]
     pub symbol: Option<SymbolId>,
@@ -570,7 +570,7 @@ pub enum NodeFacet {
 }
 
 /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-/// targets; the fragment after `#` is its witness — the first eight lowercase hex characters
+/// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
 /// of the SHA-256 of the node's source bytes. Resolution recomputes the witness before
 /// acting on the address and refuses with a failed `source_unchanged` precondition when the
 /// bytes have drifted, so an address read from a stale listing cannot splice into the wrong
@@ -605,14 +605,14 @@ pub struct NodesParams {
     /// Project-relative file to inspect.
     #[schemars(length(min = 1))]
     pub path: ProjectPath,
-    /// UTF-8 byte offset the listed nodes must cover — one position, not a range; the nodes
+    /// UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes
     /// themselves carry the spans.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub position: u64,
     /// The projection to read. Null reads the workspace tree.
     #[serde(default)]
     pub projection: Option<ProjectionId>,
-    /// The version-control revision to read — a branch, tag, or commit id as the
+    /// The version-control revision to read - a branch, tag, or commit id as the
     /// workspace's version control spells it. Null reads the current tree, and `rev`
     /// never combines with `projection`. The server refuses a revision read when the
     /// workspace has no version-control repository.
@@ -669,7 +669,7 @@ pub struct Parameter {
     pub types: Vec<TypeBinding>,
     /// Whether a call may leave it out.
     pub optional: bool,
-    /// Whether it absorbs the arguments that follow — `*args`, `...rest`.
+    /// Whether it absorbs the arguments that follow - `*args`, `...rest`.
     pub variadic: bool,
     /// The default value as written in the source. Null where there is none.
     #[serde(deserialize_with = "deserialize_required_option")]
@@ -680,7 +680,7 @@ pub struct Parameter {
     pub extensions: Extensions,
 }
 
-/// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift
+/// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
 /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
 /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
 /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
@@ -698,8 +698,8 @@ pub struct ProjectPath(
 );
 
 /// Identity of one projection, and the URI that resolves it. The caller names the
-/// projection at `projection_create` — a directory-valid name of 1 to 64 lowercase
-/// letters, digits, and interior dashes, such as `my-feature-one` — and the URI carries
+/// projection at `projection_create` - a directory-valid name of 1 to 64 lowercase
+/// letters, digits, and interior dashes, such as `my-feature-one` - and the URI carries
 /// that name. The name addresses the projection while it lives; `projection_remove`
 /// frees it, and a later projection reusing the name is a distinct projection. A change
 /// request that omits its `projection` field applies to the workspace tree itself.
@@ -751,7 +751,7 @@ pub struct ReadSnapshot {
     /// Source-catalog revision captured for the read.
     pub source_revision: Digest,
     /// The version-control revision the read served, resolved to the full commit id the
-    /// repository records — so a branch answer stays attributable after the branch moves.
+    /// repository records - so a branch answer stays attributable after the branch moves.
     /// Null when the read served the current tree.
     #[serde(default)]
     pub revision: Option<RevisionId>,
@@ -907,8 +907,8 @@ pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] 
 
 impl RevisionId {
     /// Classifies this spelling against the charset and length its schema advertises.
-    /// `schemars` regexes are declarative only — nothing enforces them at
-    /// deserialization — so every acceptance point calls this before the spelling
+    /// `schemars` regexes are declarative only - nothing enforces them at
+    /// deserialization - so every acceptance point calls this before the spelling
     /// reaches revision resolution.
     #[must_use]
     pub fn violation(&self) -> Option<RevisionIdViolation> {
@@ -1003,7 +1003,7 @@ pub struct Signature {
     pub links: Vec<SignatureLink>,
     /// The language whose syntax `display` is written in.
     pub language: Language,
-    /// The implicit first parameter — `self`, `this`. Null for a free function, and for
+    /// The implicit first parameter - `self`, `this`. Null for a free function, and for
     /// languages that have no such thing.
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required, transform = schema::nullable)]
@@ -1097,7 +1097,7 @@ pub struct SourceSpan {
 }
 
 /// Stable identity of one source unit in the source catalog: a resolver identity, then that
-/// resolver's canonical unit key in canonical percent-encoding — for the project resolver, the
+/// resolver's canonical unit key in canonical percent-encoding - for the project resolver, the
 /// project-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its
 /// resolver's canonical human-readable key; digests appear on the wire only as short witnesses
 /// where byte-identity is required.
@@ -1145,7 +1145,7 @@ pub struct Symbol {
     /// Where the declaration belongs, how it was produced, and its source unit when
     /// readable.
     pub origin: SymbolOrigin,
-    /// The symbol this one belongs to — the class that owns a method, the module that owns
+    /// The symbol this one belongs to - the class that owns a method, the module that owns
     /// a function. Ownership is not lexical: a Go method is written beside its type and a
     /// Rust method inside an `impl` block, and both name the type here. Absent at the top
     /// level.
@@ -1153,7 +1153,7 @@ pub struct Symbol {
     pub container: Option<SymbolId>,
     /// Language keywords qualifying the declaration: `export`, `async`, `const`.
     pub modifiers: Vec<String>,
-    /// How widely the symbol is visible, in the language's own terms — `public`, `private`,
+    /// How widely the symbol is visible, in the language's own terms - `public`, `private`,
     /// `pub(crate)`. Null where the language has no such concept.
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required, transform = schema::nullable)]
@@ -1411,8 +1411,8 @@ pub enum TypeBindingRole {
 }
 
 /// How a type is written in the source, plus the symbol that declares it when one does. A
-/// type with a declaration resolves to that symbol; a structural type — `string | null`,
-/// `{ a: string }` — has the spelling and nothing to resolve to.
+/// type with a declaration resolves to that symbol; a structural type - `string | null`,
+/// `{ a: string }` - has the spelling and nothing to resolve to.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypeExpression {

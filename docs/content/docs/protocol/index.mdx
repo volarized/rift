@@ -6,10 +6,10 @@ title: Protocol
 
 Rift publishes one generated contract through these definitions:
 
-- [Core model](/docs/protocol/core) — source discovery, identities, provider facts, and
+- [Core model](/docs/protocol/core) - source discovery, identities, provider facts, and
   changes shared by protocol surfaces
-- [MCP](/docs/protocol/mcp) — the tools and resources an agent calls
-- [SCIP](/docs/protocol/scip) — a read-only export for tools that consume SCIP indexes
+- [MCP](/docs/protocol/mcp) - the tools and resources an agent calls
+- [SCIP](/docs/protocol/scip) - a read-only export for tools that consume SCIP indexes
 
 The Rust models in `crates/rift-protocol` are the source of truth. The served tool surface is
 exported as JSON Schema at [`mcp.json`](https://volar.sh/rift/mcp.json), and the
@@ -18,8 +18,8 @@ exported as JSON Schema at [`mcp.json`](https://volar.sh/rift/mcp.json), and the
 ## How a request finds its target
 
 An agent's `rift mcp` reads the workspace's
-[`ServerLock`](/docs/protocol/reference#ServerLock) — or starts the server that writes
-it — and forwards MCP to the endpoint it names. Calls do not open connection-scoped sessions.
+[`ServerLock`](/docs/protocol/reference#ServerLock) - or starts the server that writes
+it - and forwards MCP to the endpoint it names. Calls do not open connection-scoped sessions.
 Each call names a [projection](/docs/protocol/mcp#projections), or the workspace tree by
 omitting one, and carries any witnessed address it uses.
 

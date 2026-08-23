@@ -219,12 +219,21 @@ async fn open_lexical_index(
 
 /// Rust workspace MCP server: reads serve an immutable snapshot, changes
 /// write the workspace and swap in a fresh snapshot.
-#[derive(Debug)]
+///
+/// Clones share every piece of server state. The HTTP transport clones one
+/// server per request, so index-supervisor cancellation keys off the last
+/// clone's drop, never each clone's.
+#[derive(Clone, Debug)]
 pub struct RiftMcp {
     root: PathBuf,
     limits: WorkspaceIndexLimits,
     published: Arc<RwLock<IndexState>>,
     validation: Arc<IndexValidation>,
+    /// Cancels the index supervisor when the last clone drops. The
+    /// supervisor task and the watcher hold [`IndexValidation`] directly,
+    /// never this guard, so the guard's drop is what ends them.
+    #[expect(dead_code, reason = "held for its cancel-on-last-drop effect")]
+    supervisor_cancellation: Arc<tokio_util::sync::DropGuard>,
     changes: Arc<ChangeService>,
     change_lane: Arc<ChangeLane>,
     blocking: BlockingExecutor,
@@ -232,12 +241,6 @@ pub struct RiftMcp {
     /// startup; `search` then serves identifier matching alone.
     lexical: Option<Arc<LexicalSearchIndex>>,
     tool_router: ToolRouter<Self>,
-}
-
-impl Drop for RiftMcp {
-    fn drop(&mut self) {
-        self.validation.cancellation.cancel();
-    }
 }
 
 /// One already-serialized change's outcome, threaded out of the blocking executor so the
@@ -300,7 +303,7 @@ impl RiftMcp {
         let published = initial_workspace(&root, limits, &validation, &blocking).await?;
         // The lexical database lives under the workspace's own `.rift` directory, so it
         // opens only once the workspace root itself is proven real by a successful initial
-        // scan — never before, or a missing root would be silently fabricated by creating
+        // scan - never before, or a missing root would be silently fabricated by creating
         // `.rift` under it.
         let lexical_limits = lexical_index_limits(&startup_configuration.search_configuration());
         let lexical = open_lexical_index(&root, lexical_limits).await;
@@ -328,11 +331,13 @@ impl RiftMcp {
         let mut task = validation.task.lock().await;
         *task = Some(supervisor_task);
         drop(task);
+        let supervisor_cancellation = Arc::new(validation.cancellation.clone().drop_guard());
         Ok(Self {
             root: root.clone(),
             limits,
             published,
             validation,
+            supervisor_cancellation,
             changes: Arc::new(ChangeService::new(&root)),
             change_lane,
             blocking,
@@ -346,6 +351,17 @@ impl RiftMcp {
         IndexSupervisor {
             validation: Arc::clone(&self.validation),
         }
+    }
+
+    /// The `[server]` table from the currently published acceptance, or the
+    /// default table while `rift.toml` is invalid.
+    pub(crate) async fn server_configuration(&self) -> ServerConfiguration {
+        self.published
+            .read()
+            .await
+            .current
+            .configuration
+            .server_configuration()
     }
 
     /// Finds Rust declarations and their source by exact symbol name. Each hit
@@ -392,9 +408,9 @@ impl RiftMcp {
             .await
     }
 
-    /// Runs the lexical search-index tier for one search request against `published` —
+    /// Runs the lexical search-index tier for one search request against `published` -
     /// the exact snapshot the caller also runs `ReadService::search` against, never a
-    /// separately resolved one — when the tier is available and its stamped tree revision
+    /// separately resolved one - when the tier is available and its stamped tree revision
     /// still matches `published`'s. A revision mismatch or an absent handle answers with no
     /// lexical matches, so identifier search proceeds alone rather than serving a possibly
     /// stale tier. A query-term limit the adapter refuses surfaces as this request's own
@@ -500,9 +516,9 @@ impl RiftMcp {
             .await
     }
 
-    /// Runs one read against the tree the request names — the current
+    /// Runs one read against the tree the request names - the current
     /// snapshot, or a snapshot built at the request's version-control
-    /// revision — behind the acceptance gate every request passes.
+    /// revision - behind the acceptance gate every request passes.
     ///
     /// A revision snapshot is built per request from the workspace's git
     /// objects, under the same `[source]` policy and bounds as the current
@@ -709,7 +725,7 @@ impl RiftMcp {
     }
 
     /// One already-serialized change's outcome: the wire result, and the freshly published
-    /// workspace exactly when this change's own rebuild published a new snapshot — absent
+    /// workspace exactly when this change's own rebuild published a new snapshot - absent
     /// for a refusal, and for a landed change whose rebuild only appended a diagnostic.
     fn change_serialized(
         root: &Path,
@@ -929,6 +945,25 @@ mod tests {
                 Err("fixture configuration must remain stable".into())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn supervisor_cancellation_keys_off_the_last_clone() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let validation = Arc::clone(&server.validation);
+        let cloned = server.clone();
+        drop(server);
+        assert!(
+            !validation.cancellation.is_cancelled(),
+            "the supervisor must keep running while a clone still serves"
+        );
+        drop(cloned);
+        assert!(
+            validation.cancellation.is_cancelled(),
+            "dropping the last clone must cancel the supervisor"
+        );
+        drop(directory);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1756,8 +1791,8 @@ mod tests {
         peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
         params: CallToolRequestParams,
     ) -> TestResult<rmcp::model::CallToolResult> {
-        const ADMISSION_ATTEMPTS_MAX: usize = 8;
-        for _attempt in 0..ADMISSION_ATTEMPTS_MAX {
+        const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
+        for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
             match peer.call_tool(params.clone()).await {
                 Ok(result) => return Ok(result),
                 Err(ServiceError::McpError(error))
@@ -2248,7 +2283,7 @@ pub fn beacon() -> u64 {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A directory at the database path fails the initial open; `remove_file` cannot
-        // remove a directory, so the recreate-once retry also fails against it unchanged —
+        // remove a directory, so the recreate-once retry also fails against it unchanged -
         // this is also the deterministic way to drive the recreate-once arm itself.
         fs::create_dir_all(directory.path().join(".rift/db"))?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;

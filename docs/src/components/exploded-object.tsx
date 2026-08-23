@@ -12,9 +12,9 @@ import { cn } from "@/lib/utils";
  * Wireframe solids taken apart, and put back together, by the scroll.
  *
  * Each object is built as a set of pieces, every one carrying the direction it
- * travels when the assembly opens. A piece is real geometry — the sphere's
+ * travels when the assembly opens. A piece is real geometry - the sphere's
  * shell is genuinely cut at the plane, the torus genuinely severed between
- * sectors — so the section faces the drawing shows are the faces that would
+ * sectors - so the section faces the drawing shows are the faces that would
  * actually be there.
  *
  * The opening is not a scroll animation that plays once. It tracks how close
@@ -34,7 +34,7 @@ type Piece = {
   direction: [number, number, number];
   /**
    * Where the piece's middle sits on the cut axis. Set on a slice, which holds
-   * its place and thins about that middle instead of travelling — the gaps
+   * its place and thins about that middle instead of travelling - the gaps
    * open between the slices without the solid ever moving or changing size.
    */
   pivot?: number;
@@ -53,7 +53,7 @@ const push = (out: number[], a: THREE.Vector3, b: THREE.Vector3) => {
 };
 
 /* -------------------------------------------------------------------------
- * Sphere — whole for three quarters of its width, then sectioned: ten thin
+ * Sphere - whole for three quarters of its width, then sectioned: ten thin
  * slices and the cap, drawn off the body along the axis they were cut on.
  * ---------------------------------------------------------------------- */
 
@@ -63,7 +63,7 @@ type Seg = [THREE.Vector3, THREE.Vector3];
 /** One axis, and only one: the slices part sideways, never crosswise. */
 const AXIS = new THREE.Vector3(1, 0, 0);
 
-/** Where the body ends — three quarters of the way across the diameter. */
+/** Where the body ends - three quarters of the way across the diameter. */
 const SPLIT = 0.5;
 /** Where the cap begins. Past this the shell closes and stops being a slice. */
 const CAP_AT = 0.93;
@@ -188,7 +188,7 @@ function sphereAssembly(): Assembly {
   };
 }
 
-/** Concentric rings on a plane — how a section face is drawn. */
+/** Concentric rings on a plane - how a section face is drawn. */
 function disc(centre: THREE.Vector3, normal: THREE.Vector3, radius: number, rings: number): Seg[] {
   // Any vector off the normal will do to start the basis the disc is drawn in.
   const helper = Math.abs(normal.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
@@ -216,7 +216,7 @@ function disc(centre: THREE.Vector3, normal: THREE.Vector3, radius: number, ring
 }
 
 /* -------------------------------------------------------------------------
- * Torus — a ring severed into sectors that open outwards like a cut band.
+ * Torus - a ring severed into sectors that open outwards like a cut band.
  * ---------------------------------------------------------------------- */
 
 function torusAssembly(): Assembly {
@@ -283,7 +283,7 @@ function torusAssembly(): Assembly {
 }
 
 /* -------------------------------------------------------------------------
- * Geodesic — an icosahedral shell whose twenty patches bloom outwards.
+ * Geodesic - an icosahedral shell whose twenty patches bloom outwards.
  * ---------------------------------------------------------------------- */
 
 function geodesicAssembly(): Assembly {
@@ -555,7 +555,7 @@ export function ExplodedObject({
   separation?: number;
   /** How much of its width a slice gives up at the centre of the screen. */
   thin?: number;
-  /** X rotation. The solid is held at it — nothing here turns. */
+  /** X rotation. The solid is held at it - nothing here turns. */
   tilt?: number;
   /** Y rotation, so the cut faces are seen at an angle rather than edge-on. */
   yaw?: number;

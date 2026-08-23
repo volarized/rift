@@ -118,7 +118,7 @@ function ParticlesEffect({
 
           return (
             <motion.div
-              // biome-ignore lint/suspicious/noArrayIndexKey: fixed-length ring of `count` particles, positioned by index and never reordered or filtered — the index IS the identity
+              // biome-ignore lint/suspicious/noArrayIndexKey: fixed-length ring of `count` particles, positioned by index and never reordered or filtered - the index IS the identity
               key={i}
               style={{ ...containerStyle, ...style }}
               initial={{ scale: 0, opacity: 0 }}

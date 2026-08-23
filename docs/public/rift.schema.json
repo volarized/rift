@@ -22,7 +22,7 @@
     },
     "CommandHook": {
       "additionalProperties": false,
-      "description": "One `[[hooks]]` block: an executable Rift starts directly — no shell —\ninside the changed tree each time a change applies. Every key is\nrequired; the schema carries no defaults.",
+      "description": "One `[[hooks]]` block: an executable Rift starts directly - no shell -\ninside the changed tree each time a change applies. Every key is\nrequired; the schema carries no defaults.",
       "properties": {
         "arguments": {
           "description": "The program's literal arguments, in order. May be empty.",
@@ -137,7 +137,7 @@
       ]
     },
     "CoverageScope": {
-      "description": "What a completeness statement covers — everything the request asked for, one file, or a\nstanding scope the answer holds over.",
+      "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -354,7 +354,7 @@
       ]
     },
     "HookType": {
-      "description": "How a hook runs; `command` — an executable started directly, without a\nshell — is the only type.",
+      "description": "How a hook runs; `command` - an executable started directly, without a\nshell - is the only type.",
       "oneOf": [
         {
           "const": "command",
@@ -368,8 +368,33 @@
       "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$",
       "type": "string"
     },
+    "PortRange": {
+      "additionalProperties": false,
+      "description": "The `server.port_range` table: the inclusive loopback range the server\npicks the first free port from.",
+      "properties": {
+        "max": {
+          "description": "The highest port the server may bind, at or above `min`.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "min": {
+          "description": "The lowest port the server may bind, 1024 or above.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1024,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "type": "object"
+    },
     "ProjectPath": {
-      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC — Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
       "maxLength": 1000,
       "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
       "type": "string"
@@ -436,8 +461,28 @@
     },
     "ServerConfiguration": {
       "additionalProperties": false,
-      "description": "The `[server]` table. Filesystem scans and parses run on a bounded\nworker pool; this table sets the worker count and bounds the queue\nwait. The server reads the table at startup, so a change applies on\nthe next start.",
+      "allOf": [
+        {
+          "description": "server.port and server.port_range are mutually exclusive",
+          "not": {
+            "required": [
+              "port",
+              "port_range"
+            ]
+          }
+        }
+      ],
+      "description": "The `[server]` table. Filesystem scans and parses run on a bounded\nworker pool; this table sets the worker count, bounds the queue wait,\nsets how long the server serves with no request before it stops, and\nselects the loopback port. The server reads the table at startup, so a\nchange applies on the next start.",
       "properties": {
+        "idle_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30m",
+          "description": "Wall-clock span with no served request that stops the server, 1s to 1d.",
+          "rift:range": {
+            "max": "1d",
+            "min": "1s"
+          }
+        },
         "num_workers": {
           "default": 4,
           "description": "Workers running blocking filesystem and parser operations at once, 1 to 64.",
@@ -445,6 +490,29 @@
           "maximum": 64,
           "minimum": 1,
           "type": "integer"
+        },
+        "port": {
+          "default": null,
+          "description": "The exact loopback port the server binds, 1024 or above. Excludes\n`port_range`; omitted, the server picks from `port_range` or the\ndefault serving range.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1024,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "port_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The loopback range the server picks its port from. Excludes `port`;\nomitted, the default serving range applies."
         },
         "worker_queue_timeout": {
           "$ref": "#/$defs/Duration",
@@ -571,7 +639,10 @@
     "server": {
       "$ref": "#/$defs/ServerConfiguration",
       "default": {
+        "idle_timeout": "30m",
         "num_workers": 4,
+        "port": null,
+        "port_range": null,
         "worker_queue_timeout": "30s"
       },
       "description": "The server's own blocking-work bounds: worker count and queue wait."

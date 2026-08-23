@@ -78,14 +78,14 @@ impl Fault for HistoryFault {
                 ErrorContext::new("workspace", root.display().to_string()),
                 ErrorContext::new(
                     "requires",
-                    "a git repository — run `git init`, or omit `rev` to read the current tree",
+                    "a git repository - run `git init`, or omit `rev` to read the current tree",
                 ),
             ],
             Self::RevisionUnknown { rev } => vec![
                 ErrorContext::new("rev", rev.clone()),
                 ErrorContext::new(
                     "requires",
-                    "a revision the repository resolves — a branch, tag, or commit id",
+                    "a revision the repository resolves - a branch, tag, or commit id",
                 ),
             ],
             Self::RevisionNotCommit { rev, kind } => vec![
@@ -125,7 +125,7 @@ pub struct ResolvedRevision {
 }
 
 impl ResolvedRevision {
-    /// The full lowercase hex commit id — the durable spelling the
+    /// The full lowercase hex commit id - the durable spelling the
     /// repository records for this revision.
     #[must_use]
     pub fn commit_id(&self) -> String {
@@ -200,7 +200,7 @@ impl Repository {
         &self.root
     }
 
-    /// Resolves one revision spelling — a branch, tag, or commit id — to
+    /// Resolves one revision spelling - a branch, tag, or commit id - to
     /// the commit it names.
     ///
     /// # Errors
@@ -233,8 +233,8 @@ impl Repository {
     /// whose workspace-relative path passes `includes`, sorted by path.
     ///
     /// Symbolic links and submodules are never listed. The traversal counts
-    /// every visited tree entry against `entries_max` — callers pass
-    /// [`REVISION_TREE_ENTRIES_MAX`] — stops descending once the budget is
+    /// every visited tree entry against `entries_max` - callers pass
+    /// [`REVISION_TREE_ENTRIES_MAX`] - stops descending once the budget is
     /// spent, and refuses the listing rather than truncating it.
     ///
     /// # Errors
@@ -319,8 +319,8 @@ impl Repository {
 }
 
 /// The bytes of `filepath` below the workspace prefix, or `None` for a path
-/// outside the workspace. An empty prefix — the workspace at the repository
-/// root — keeps every path.
+/// outside the workspace. An empty prefix - the workspace at the repository
+/// root - keeps every path.
 fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if prefix.is_empty() {
         return Some(filepath);
@@ -455,7 +455,7 @@ mod tests {
             error.to_string(),
             format!(
                 "no configured provider serves this request: workspace {}, \
-                 requires a git repository — run `git init`, or omit `rev` to \
+                 requires a git repository - run `git init`, or omit `rev` to \
                  read the current tree; adjust the request to a served \
                  capability, or configure a provider that serves it",
                 canonical.display()
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "the requested resource does not exist in the current snapshot: \
-             rev feature/absent, requires a revision the repository resolves — \
+             rev feature/absent, requires a revision the repository resolves - \
              a branch, tag, or commit id; search or list first, then retry \
              with an identity that answer returned"
         );

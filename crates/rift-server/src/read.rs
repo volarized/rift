@@ -316,7 +316,7 @@ impl ReadService {
         self.index.fingerprint()
     }
 
-    /// Returns the tree revision this snapshot's wire answers report — the
+    /// Returns the tree revision this snapshot's wire answers report - the
     /// same eight-hex-character string every `ReadSnapshot` in this
     /// service's results carries. A lexical population stamps this exact
     /// string, and a search request compares its query-time lexical
@@ -646,7 +646,7 @@ pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
     digest_hex8(source.get(start..end).unwrap_or_default())
 }
 
-/// First `DIGEST_WIRE_CHARS` lowercase hex characters of the SHA-256 of `source` — the sole
+/// First `DIGEST_WIRE_CHARS` lowercase hex characters of the SHA-256 of `source` - the sole
 /// wire constructor for a witness or a `Digest`. A 64-character digest reaching the wire is a
 /// defect this stays the single choke point against.
 pub(crate) fn digest_hex8(source: &str) -> String {
@@ -673,7 +673,7 @@ pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
 }
 
 /// Complete coverage for a request served in full from `snapshot`, carrying the real
-/// revisions the answer used — never a fabricated digest.
+/// revisions the answer used - never a fabricated digest.
 pub(crate) fn complete_coverage(snapshot: &ReadSnapshot) -> Coverage {
     let revision = snapshot.index.as_ref().map_or_else(
         || snapshot.tree_revision.clone(),
@@ -1306,7 +1306,7 @@ pub fn compute() -> i32 {
             error.to_string(),
             format!(
                 "no configured provider serves this request: workspace {}, \
-                 requires a git repository — run `git init`, or omit `rev` to \
+                 requires a git repository - run `git init`, or omit `rev` to \
                  read the current tree; adjust the request to a served \
                  capability, or configure a provider that serves it",
                 canonical.display()

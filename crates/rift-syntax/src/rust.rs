@@ -835,7 +835,7 @@ fn declaration_name(node: Node<'_>, text: &str) -> Option<(String, RustSymbolKin
 }
 
 /// A declaration's span, extended over its attached outer attributes and
-/// outer doc comments so the whole declaration — not just the item node —
+/// outer doc comments so the whole declaration - not just the item node -
 /// is what `replace_symbol` and `insert_symbol` act on.
 fn symbol_range(
     node: Node<'_>,

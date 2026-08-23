@@ -35,7 +35,7 @@ fn command(root: &Path) -> Command {
 ///
 /// # Panics
 ///
-/// Panics when git cannot run or exits nonzero — a fixture that cannot be
+/// Panics when git cannot run or exits nonzero - a fixture that cannot be
 /// built fails the test that needs it.
 pub fn git(root: &Path, arguments: &[&str]) {
     let status = command(root)
@@ -94,7 +94,7 @@ pub fn commit_all(root: &Path, message: &str) {
 /// Commits one blob at a raw byte path, reachable as the ref `branch`.
 ///
 /// The tree is built through git plumbing, so the path never touches the
-/// host filesystem — the way a spelling the platform forbids, or bytes that
+/// host filesystem - the way a spelling the platform forbids, or bytes that
 /// are not UTF-8, still become a committed tree entry.
 ///
 /// # Panics

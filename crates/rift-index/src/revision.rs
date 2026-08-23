@@ -5,7 +5,7 @@
 //! committed file bytes, and the same syntax and index steps derive facts
 //! from them, so a revision index answers every query the workspace index
 //! answers. A future language joins revision reads the same way it joins
-//! the scan — by its provider's declared extensions and a syntax step.
+//! the scan - by its provider's declared extensions and a syntax step.
 
 use std::path::{Path, PathBuf};
 
@@ -127,7 +127,7 @@ fn hard_floor_includes(path: &str) -> bool {
     !WORKSPACE_IGNORED_DIRECTORIES.contains(&first_segment)
 }
 
-/// The number of directories above a workspace-relative file path — the
+/// The number of directories above a workspace-relative file path - the
 /// depth the directory walk would have descended to reach it.
 fn directory_depth(path: &str) -> usize {
     path.matches('/').count()

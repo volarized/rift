@@ -1,13 +1,24 @@
 //! Model Context Protocol transport boundary.
 
+mod election;
 mod failure;
+mod http;
+mod proxy;
 pub mod schema;
 mod server;
-mod stdio;
+mod spawn;
 mod validation;
 
+pub use election::{
+    ElectedServer, ElectionError, ElectionFault, ElectionGuard, ServerPresence, StaleReason, claim,
+    probe, read_serving, serve_elected,
+};
+pub use http::{HttpServeError, HttpServeFault, HttpServer, serve_http};
+pub use proxy::{ProxyFault, ProxyServeError, serve_proxy};
 pub use server::RiftMcp;
-pub use stdio::{StdioServeError, serve_stdio};
+pub use spawn::{
+    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, spawn_detached_server,
+};
 
 /// Compile-time marker for MCP-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

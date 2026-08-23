@@ -105,9 +105,9 @@ impl TextFileInclusion {
     }
 
     /// Whether `path`'s extension is one this policy includes. The comparison is
-    /// case-insensitive against the configured lowercase spellings — `README.MD` is included
+    /// case-insensitive against the configured lowercase spellings - `README.MD` is included
     /// by `extensions = ["md"]`, matching how case-insensitive filesystems already present
-    /// extensions to callers — while configuration acceptance still refuses any entry that is
+    /// extensions to callers - while configuration acceptance still refuses any entry that is
     /// not itself lowercase.
     #[must_use]
     pub fn includes(&self, path: &std::path::Path) -> bool {

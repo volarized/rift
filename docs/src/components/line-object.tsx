@@ -9,7 +9,7 @@ import { useViewportBloom } from "@/hooks/use-viewport-bloom";
 import { cn } from "@/lib/utils";
 
 /**
- * Line objects — the design system's only graphic. Strange attractors, wireframe
+ * Line objects - the design system's only graphic. Strange attractors, wireframe
  * topologies and lofted sweeps, drawn as continuous three.js hairlines in ink
  * over the void. No glow, no bloom, no fill, no colour. One object per section.
  */
@@ -50,7 +50,7 @@ function integrate(
   const lines: Polyline[] = [];
 
   for (let s = 0; s < strands; s++) {
-    // Deterministic fan — golden-angle offsets, so no two seeds share a
+    // Deterministic fan - golden-angle offsets, so no two seeds share a
     // direction and the build stays identical between renders.
     const angle = s * 0.6180339887 * TAU;
     const offset = spread * s;
@@ -121,7 +121,7 @@ function build(kind: LineObjectKind): Polyline[] {
   }
 
   if (kind === "tsucs1") {
-    // Three-Scroll Unified Chaotic System, type 1. Fast dynamics — the step
+    // Three-Scroll Unified Chaotic System, type 1. Fast dynamics - the step
     // has to stay small or Euler walks straight off the attractor.
     const a = 40,
       c = 0.833,
@@ -280,7 +280,7 @@ function build(kind: LineObjectKind): Polyline[] {
   }
 
   if (kind === "triangle") {
-    // Nested triangles spiralling inward — the mark, extruded.
+    // Nested triangles spiralling inward - the mark, extruded.
     const rings = 54;
     const lines: Polyline[] = [];
     for (let i = 0; i < rings; i++) {
@@ -298,7 +298,7 @@ function build(kind: LineObjectKind): Polyline[] {
     return lines;
   }
 
-  // loft — a rippled profile swept and twisted down a taper.
+  // loft - a rippled profile swept and twisted down a taper.
   const rings = 46;
   const segments = 150;
   const lines: Polyline[] = [];
@@ -462,7 +462,7 @@ export function LineObject({
   tilt?: number;
   /** Y rotation. Only read under `reveal`, where the object is held still. */
   yaw?: number;
-  /** Z rotation — the in-plane spin. Only read under `reveal`. */
+  /** Z rotation - the in-plane spin. Only read under `reveal`. */
   spin?: number;
   /** Above 1 pulls the camera in. */
   fit?: number;
@@ -501,7 +501,7 @@ export function LineObject({
     return () => observer.disconnect();
   }, []);
 
-  // Frame the bounding sphere, then bias per shape — as the design does.
+  // Frame the bounding sphere, then bias per shape - as the design does.
   const distance = useMemo(() => {
     const { radius } = geometryFor(kind);
     return (
@@ -517,8 +517,8 @@ export function LineObject({
         flat
         dpr={[1, 2]}
         gl={{ antialias: true, alpha: true }}
-        // The attractors are built at their own scale — some are a couple of
-        // units across, some are seventy — so the clip planes are set off the
+        // The attractors are built at their own scale - some are a couple of
+        // units across, some are seventy - so the clip planes are set off the
         // camera's own distance rather than fixed.
         camera={{
           fov: FOV,

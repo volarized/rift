@@ -47,11 +47,11 @@ server **MUST** terminate it with `ABORTED`.
 
 The first event carries one `Header` with:
 
-- `projection` — selected projection, or absent for the workspace tree
-- `metadata` — projected `scip.Index.metadata`, including the exported directory as
+- `projection` - selected projection, or absent for the workspace tree
+- `metadata` - projected `scip.Index.metadata`, including the exported directory as
   `project_root`
-- `coverage` — weakest per-file semantic coverage for each language and fact family
-- `omissions` — populated Rift data absent from the SCIP mapping
+- `coverage` - weakest per-file semantic coverage for each language and fact family
+- `omissions` - populated Rift data absent from the SCIP mapping
 
 Coverage describes what providers established. Omissions describe what the mapping then dropped,
 so an empty relationship list is distinguishable from unavailable analysis.

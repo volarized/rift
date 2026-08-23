@@ -45,7 +45,7 @@ function ThemeTogglerButton({
 
   // `useTheme` has nothing to report during SSR, so the icon picked on the
   // server is whatever the fallback branch yields and the client picks the
-  // real one — a hydration mismatch. Hold a neutral placeholder of the same
+  // real one - a hydration mismatch. Hold a neutral placeholder of the same
   // size until mount, so both renders agree and the button never reflows.
   const [mounted, setMounted] = React.useState(false);
   React.useEffect(() => setMounted(true), []);
