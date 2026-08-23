@@ -553,7 +553,7 @@ impl SearchConfiguration {
                     (
                         "search.pool_slots",
                         self.pool_slots,
-                        1,
+                        SEARCH_POOL_SLOTS_MIN,
                         SEARCH_POOL_SLOTS_MAX,
                     ),
                     (
@@ -567,6 +567,8 @@ impl SearchConfiguration {
     }
 }
 
+/// `search.pool_slots` connections admitted, at least.
+pub const SEARCH_POOL_SLOTS_MIN: u64 = 1;
 /// `search.pool_slots` connections admitted, at most.
 pub const SEARCH_POOL_SLOTS_MAX: u64 = 16;
 /// `search.pool_slots` value used when the key is absent.
@@ -1485,7 +1487,7 @@ mod tests {
     #[test]
     fn test_search_pool_slots_bounds_are_enforced() {
         let mut configuration = WorkspaceConfiguration::default();
-        for slots in [0, SEARCH_POOL_SLOTS_MAX + 1] {
+        for slots in [SEARCH_POOL_SLOTS_MIN - 1, SEARCH_POOL_SLOTS_MAX + 1] {
             configuration.search.pool_slots = slots;
             assert!(
                 matches!(
@@ -1498,7 +1500,7 @@ mod tests {
                 "pool_slots {slots} must be refused"
             );
         }
-        for slots in [1, SEARCH_POOL_SLOTS_MAX] {
+        for slots in [SEARCH_POOL_SLOTS_MIN, SEARCH_POOL_SLOTS_MAX] {
             configuration.search.pool_slots = slots;
             assert_eq!(configuration.validate(), Ok(()));
         }
@@ -2021,7 +2023,11 @@ mod tests {
                 &search["embedding"]["maxLength"],
                 json!(EMBEDDING_MODEL_BYTES_MAX),
             ),
-            ("pool slots min", &search["pool_slots"]["minimum"], json!(1)),
+            (
+                "pool slots min",
+                &search["pool_slots"]["minimum"],
+                json!(SEARCH_POOL_SLOTS_MIN),
+            ),
             (
                 "pool slots max",
                 &search["pool_slots"]["maximum"],

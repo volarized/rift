@@ -13,8 +13,8 @@ pub mod line;
 
 pub use configuration::{SourceVisibility, TextFileAdmission};
 pub use error::{
-    CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, RetryDirective,
-    RiftError, fault_label, render_failure,
+    CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, LimitEvidence,
+    RetryDirective, RiftError, fault_label, render_failure,
 };
 pub use identity::{
     CompositionId, CompositionRevision, CursorId, IdError, IdFault, IndexRevision, ModelId,

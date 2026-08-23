@@ -137,7 +137,7 @@ impl<K: Fault> WireFailure for rift_core::Error<K> {
             retry: descriptor.retry(),
             phase,
             diagnostics: Vec::new(),
-            limit: None,
+            limit: self.fault().limit_evidence(),
             causes: self.wire_causes(),
         }
     }
