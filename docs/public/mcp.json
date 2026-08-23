@@ -39,8 +39,8 @@
             "type": "object"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The server mints it when\n`projection_create` materializes the projection and retires it when `projection_remove`\ndeletes the directory. A change request that omits its `projection` field applies to the\nworkspace tree itself.",
-            "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
+            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
           "RevisionId": {
@@ -2870,8 +2870,8 @@
             "type": "string"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The server mints it when\n`projection_create` materializes the projection and retires it when `projection_remove`\ndeletes the directory. A change request that omits its `projection` field applies to the\nworkspace tree itself.",
-            "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
+            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
           "RevisionId": {
@@ -6556,8 +6556,8 @@
             "type": "object"
           },
           "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The server mints it when\n`projection_create` materializes the projection and retires it when `projection_remove`\ndeletes the directory. A change request that omits its `projection` field applies to the\nworkspace tree itself.",
-            "pattern": "^rift://projection/prj_[a-z2-7]{26}$",
+            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` — a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` — and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
+            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
             "type": "string"
           },
           "RelationFilter": {

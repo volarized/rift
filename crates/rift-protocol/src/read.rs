@@ -697,15 +697,17 @@ pub struct ProjectPath(
     pub String,
 );
 
-/// Identity of one projection, and the URI that resolves it. The server mints it when
-/// `projection_create` materializes the projection and retires it when `projection_remove`
-/// deletes the directory. A change request that omits its `projection` field applies to the
-/// workspace tree itself.
+/// Identity of one projection, and the URI that resolves it. The caller names the
+/// projection at `projection_create` — a directory-valid name of 1 to 64 lowercase
+/// letters, digits, and interior dashes, such as `my-feature-one` — and the URI carries
+/// that name. The name addresses the projection while it lives; `projection_remove`
+/// frees it, and a later projection reusing the name is a distinct projection. A change
+/// request that omits its `projection` field applies to the workspace tree itself.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ProjectionId(
-    #[schemars(regex(pattern = r"^rift://projection/prj_[a-z2-7]{26}$"))]
+    #[schemars(regex(pattern = r"^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"))]
     pub String,
 );
 

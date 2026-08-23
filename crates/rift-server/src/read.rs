@@ -975,8 +975,7 @@ pub fn compute() -> i32 {
     #[test]
     fn unsupported_projection_and_history_are_rejected() -> TestResult {
         let (_directory, service) = fixture()?;
-        let projection =
-            ProjectionId("rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned());
+        let projection = ProjectionId("rift://projection/my-feature-one".to_owned());
         let nodes = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 0,
@@ -1338,7 +1337,7 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({
             "name": "Beacon",
             "rev": "main",
-            "projection": "rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "projection": "rift://projection/my-feature-one"
         }))?;
         let error = service
             .get_symbol(&params)
@@ -1350,9 +1349,7 @@ pub fn compute() -> i32 {
         let nodes = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 0,
-            projection: Some(ProjectionId(
-                "rift://projection/prj_aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            )),
+            projection: Some(ProjectionId("rift://projection/my-feature-one".to_owned())),
             rev: Some(RevisionId("main".to_owned())),
         });
         assert!(matches!(
