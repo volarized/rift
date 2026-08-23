@@ -6,10 +6,9 @@ title: Implementation
 
 import { FlatDiagram } from "@/components/flat-diagram";
 
-This page names how each Rift component is built: the binary or crate, the libraries behind
-it, and the state it owns. What the components are and how they relate is the
-[architecture](/docs/architecture) page's subject; this page is the map a contributor starts
-from, one fact at a time.
+This page is developer documentation: how Rift is built, component by component. To use Rift
+rather than change it, start from the [main documentation](/docs); for what the components are
+and how they relate, read the [architecture](/docs/architecture) page first.
 
 <FlatDiagram
   alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /mcp route over Streamable HTTP. The server, an Axum application on Tokio, admits rift.toml, persists stores through Toasty over SQLite at .rift/db, mounts projections through Rift FS, runs provider compositions that reach tree-sitter and language servers, and runs hooks on each change."
