@@ -92,9 +92,7 @@ An unknown revision refuses with `resource_not_found`, and
 [`[providers.history]`](/docs/configuration#providers) owns the capability: `enabled = false`
 refuses every revision read.
 
-### get_symbol [#tool-get_symbol]
-
-<VersionBadge version="v0.0.4" languages={["Rust"]} />
+<McpTool name="get_symbol" />
 
 `get_symbol` is the read to start from when the name is known. Its default `scope: "all"` searches
 project, dependency, standard-library, and external declarations. A hit includes source when its
@@ -102,9 +100,7 @@ resolver supplied readable bytes; synthetic and source-less dependency declarati
 their signatures, documentation, types, and relationships. `include_history` applies to project
 symbols and attaches their version-control timeline and co-change coupling.
 
-### search [#tool-search]
-
-<VersionBadge version="v0.0.6" languages={["Rust"]} />
+<McpTool name="search" />
 
 `search` takes a lexical `query`, narrowed or extended by a `paths` selector. `include` and
 `exclude` glob the project-relative path — the same glob engine backs the workspace's
@@ -341,9 +337,7 @@ one of those files returns as a `file` hit, tagged the same way:
 `score` stays a server-defined ranking value, comparable across every page of one request and
 nowhere else.
 
-### nodes [#tool-nodes]
-
-<VersionBadge version="v0.0.4" languages={["Rust"]} />
+<McpTool name="nodes" />
 
 `nodes` lists the syntax regions covering one position, outermost first. Each identity carries
 the witness a later
@@ -384,9 +378,7 @@ first; a page requested after eviction or process restart returns `cursor_expire
 
 ## Changes
 
-### replace_symbol [#tool-replace_symbol]
-
-<VersionBadge version="v0.0.6" languages={["Rust"]} />
+<McpTool name="replace_symbol" />
 
 `replace_symbol` replaces one whole declaration addressed by symbol. The parser derives its
 span, so the caller supplies no offsets.
@@ -396,9 +388,7 @@ That span reaches back over the declaration's attached outer attributes and doc 
 replaces that documentation. A blank line between a comment and the declaration detaches it,
 matching rustdoc's own attachment rule.
 
-### insert_symbol [#tool-insert_symbol]
-
-<VersionBadge version="v0.0.6" languages={["Rust"]} />
+<McpTool name="insert_symbol" />
 
 `insert_symbol` inserts a new declaration before or after an existing one, addressed by its
 anchor symbol, or content at a file target addressed by `file`. The parser derives the anchor's
@@ -411,16 +401,12 @@ or end.
 it, resolution refuses and names the missing target. `create_missing` is invalid together
 with `anchor`, which always addresses an existing file.
 
-### replace_node [#tool-replace_node]
-
-<VersionBadge version="v0.0.4" languages={["Rust"]} />
+<McpTool name="replace_node" />
 
 `replace_node` reaches below a declaration through a witnessed node address from
 [`nodes`](#tool-nodes).
 
-### patch [#tool-patch]
-
-<VersionBadge version="v0.0.6" languages={["Rust"]} />
+<McpTool name="patch" />
 
 `patch` applies a unified diff following [`git apply`](https://git-scm.com/docs/git-apply)
 semantics: a hunk's context and deleted lines locate it, and its `@@` header's line numbers are
