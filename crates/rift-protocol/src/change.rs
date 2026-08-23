@@ -12,13 +12,15 @@ use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Identity of one applied change, minted when the change lands.
+/// Identity of one applied change, minted when the change lands: the first eight
+/// lowercase hex characters of the SHA-256 of the change's content, the same wire form
+/// `Digest` uses.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ChangeId(
-    #[schemars(length(min = 30, max = 30))]
-    #[schemars(regex(pattern = r"^chg_[a-z2-7]{26}$"))]
+    #[schemars(example = &"d54ffb22")]
+    #[schemars(regex(pattern = r"^[0-9a-f]{8}$"))]
     pub String,
 );
 
@@ -229,6 +231,81 @@ pub struct ChangeSummary {
 /// unchanged.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "status", deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "status": "applied",
+        "summary": {
+            "id": "d54ffb22",
+            "paths": [
+                "src/config.rs"
+            ],
+            "edits": [
+                {
+                    "kind": "replace",
+                    "span": {
+                        "unit": "rift://file/src/config.rs",
+                        "range": {
+                            "start": 162,
+                            "end": 355
+                        }
+                    },
+                    "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                }
+            ],
+            "diagnostics": [
+                {
+                    "severity": "error",
+                    "code": "rift.hook.failed",
+                    "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
+                    "related": [],
+                    "tags": [],
+                    "reliability": "reliable",
+                    "continuation": "unknown",
+                    "extensions": {}
+                }
+            ],
+            "guarantees": [
+                {
+                    "kind": "behavior_checked",
+                    "scope": {
+                        "kind": "reach",
+                        "reach": "project"
+                    },
+                    "hook": "tests",
+                    "detail": "cargo test passes on the changed tree"
+                }
+            ]
+        }
+    },
+    {
+        "status": "refused",
+        "reason": "unmet_precondition",
+        "preconditions": [
+            {
+                "kind": "source_unchanged",
+                "status": "failed",
+                "addresses": [
+                    {
+                        "kind": "node",
+                        "node": "rift://node/rust/src/config.rs@334-353#dd8aec0a"
+                    }
+                ],
+                "paths": [
+                    "src/config.rs"
+                ],
+                "expected": {
+                    "kind": "boolean",
+                    "value": true
+                },
+                "observed": {
+                    "kind": "boolean",
+                    "value": false
+                }
+            }
+        ],
+        "diagnostics": []
+    }
+]))]
 pub enum ChangeResult {
     #[serde(rename = "applied")]
     /// The operation resolved to edits and Rift wrote them into the targeted tree.
@@ -268,13 +345,20 @@ impl ChangeResult {
 /// and doc comments.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
+#[schemars(extend("examples" = [
+    {
+        "symbol": "rift://symbol/rust/src/config.rs/load_config",
+        "body": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+    }
+]))]
 pub struct ReplaceSymbolParams {
     /// The declaration to replace.
     pub symbol: SymbolId,
-    /// Which part of the declaration to replace. Null - the only value this release
+    /// Which part of the declaration to replace. Omitted - the only form this release
     /// serves - replaces the whole declaration; a named region fails as
     /// `capability_unavailable`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionRole>,
     /// The replacement source.
     #[schemars(length(max = 1_048_576))]
@@ -286,14 +370,23 @@ pub struct ReplaceSymbolParams {
 /// beside the whole declaration, attached outer attributes and doc comments included.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
+#[schemars(extend("examples" = [
+    {
+        "anchor": "rift://symbol/rust/src/config.rs/load_config",
+        "position": "after",
+        "body": "/// Renders the default configuration for a fresh workspace.\npub fn default_config() -> Config {\n    Config { root: std::path::PathBuf::from(\".\") }\n}",
+        "create_missing": false
+    }
+]))]
 #[schemars(transform = schema::insert_symbol_addresses_one_target)]
 pub struct InsertSymbolParams {
     /// The existing declaration the new one lands beside.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<SymbolId>,
     /// The file the content lands in, created first when `create_missing` is set and
     /// it does not exist.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<ProjectPath>,
     /// Which side of the anchor or file target receives the new content.
     pub position: InsertPosition,
@@ -310,13 +403,20 @@ pub struct InsertSymbolParams {
 /// recomputes the witness before writing and refuses when the bytes drifted.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.4"))]
+#[schemars(extend("examples" = [
+    {
+        "node": "rift://node/rust/src/config.rs@334-353#4df4426e",
+        "body": "parse_config(text.trim())"
+    }
+]))]
 pub struct ReplaceNodeParams {
     /// The node to replace, witness included.
     pub node: NodeId,
-    /// Which named part of the node to replace. Null - the only value this release
+    /// Which named part of the node to replace. Omitted - the only form this release
     /// serves - replaces the node whole; a named region fails as
     /// `capability_unavailable`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionRole>,
     /// The replacement source.
     #[schemars(length(max = 1_048_576))]
@@ -326,6 +426,12 @@ pub struct ReplaceNodeParams {
 /// Applies unified-diff hunks to workspace files atomically.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
+#[schemars(extend("examples" = [
+    {
+        "patch": "--- a/src/config.rs\n+++ b/src/config.rs\n@@ -11,4 +11,4 @@\n pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n     let text = std::fs::read_to_string(path)?;\n-    parse_config(&text)\n+    parse_config(text.trim())\n }\n"
+    }
+]))]
 pub struct PatchParams {
     /// A unified diff. Hunk context guards the change; header line numbers are hints,
     /// as with `git apply`. `/dev/null` headers create or delete files.
@@ -336,14 +442,25 @@ pub struct PatchParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::read::{FileId, TextRange};
+    use crate::read::{Digest, FileId, TextRange};
+    use schemars::schema_for;
     use serde_json::json;
+
+    /// `ChangeId` and `Digest` share one eight-character wire form; this pins the two
+    /// generated patterns to each other.
+    #[test]
+    fn change_id_schema_pattern_equals_the_digest_pattern() {
+        let change_id = serde_json::to_value(schema_for!(ChangeId)).expect("change id schema");
+        let digest = serde_json::to_value(schema_for!(Digest)).expect("digest schema");
+        assert_eq!(change_id["pattern"], digest["pattern"]);
+        assert_eq!(change_id["pattern"], json!(r"^[0-9a-f]{8}$"));
+    }
 
     #[test]
     fn change_result_applied_round_trips_through_json() {
         let result = ChangeResult::Applied {
             summary: ChangeSummary {
-                id: ChangeId("chg_bbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+                id: ChangeId("0123abcd".to_owned()),
                 paths: vec![ProjectPath("src/lib.rs".to_owned())],
                 edits: vec![Edit::Replace {
                     span: SourceSpan {
@@ -417,7 +534,7 @@ mod tests {
         let result = serde_json::from_value::<ReplaceSymbolParams>(json!({
             "symbol": "rift://symbol/rust/foo",
             "body": "fn foo() {}",
-            "projection": null
+            "projection": "rift://projection/my-feature-one"
         }));
         assert!(result.is_err());
     }

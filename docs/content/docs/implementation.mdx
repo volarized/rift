@@ -46,10 +46,10 @@ implemented as `rift mcp` and `rift server`.
 
 ### rift mcp
 
-`rift mcp` is an agent-compatible MCP stdio server. Under the hood it takes input from the
+`rift mcp` is the MCP stdio server an agent launches. Under the hood it takes input from the
 agent over the stdio transport and forwards each request to the workspace's `rift server` over
-Streamable HTTP; the `rift mcp` process holds no state of its own, following MCP's protocol
-concepts. To reach the workspace's server it checks the server lock file -
+Streamable HTTP; the process holds no state of its own - state lives in the `rift server`. To
+reach the workspace's server it checks the server lock file -
 [`ServerLock`](/docs/protocol/reference#ServerLock) at `.rift/server.json` - and starts a
 server when no live one stands behind it.
 
@@ -68,27 +68,29 @@ Startup runs one cycle:
 2. Take the exclusive file lock on `.rift/server.lock`, which picks one starter among racing
    `rift mcp` processes.
 3. Bind the first free loopback port of the accepted
-   [`[server]` selection](/docs/configuration#server) - the pinned `port`, the configured
-   `port_range`, or the default 12000-13000 range - mint the bearer token, and write both into
-   `.rift/server.json`.
+   [`[server]` selection](/docs/configuration#server) - the pinned `port` or the configured
+   `port_range` - mint the bearer token, and write both into `.rift/server.json`.
 4. Start the native filesystem watcher.
 5. Schedule the initial scan and parse on a Tokio-managed blocking task, so traversal and
    parsing never occupy an async MCP worker.
 6. Serve until no request arrives for the [`idle_timeout`](/docs/configuration#server) span
    `rift.toml` sets, then stop.
 
-`rift server start` runs that cycle detached and waits for the lock document to appear;
+`rift server start` runs that cycle detached and waits for `.rift/server.json` to appear;
 `rift server stop` sends the authorized stop request and waits for the election to release;
-`rift server restart` chains the two. `--foreground` keeps the cycle in the calling process,
-where Ctrl-C stops it.
+`rift server restart` chains the two. `rift server status` reports the workspace's current
+state - a serving server with its port, pid, and version, a stale `.rift/server.json` with the
+reason it went stale, or no server - and changes nothing. `--foreground` keeps the cycle in the
+calling process, where Ctrl-C stops it.
 
 Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
 queue, and a worker picks it up when one is free. This behavior is configurable via the
 `num_workers` and `worker_queue_timeout` keys in the
 [`[server]` section](/docs/configuration#server).
 
-The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories. The
-symbol index stays in memory as one immutable value: a rebuild constructs the next index and
+The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories.
+
+The symbol index stays in memory as one immutable value: a rebuild constructs the next index and
 accepted configuration outside the async lock, then swaps the complete value under its write
 lock. Each request clones the published value under a read lock and retains that capture through
 its result, so reads never combine state from two index revisions.
@@ -96,8 +98,8 @@ its result, so reads never combine state from two index revisions.
 Watcher events and Rift-applied changes advance one workspace change counter and enter the same
 serialized rebuild lane. Before each current-tree read, the server reconciles watcher state
 against an exact fingerprint of the included workspace files, then waits until the published
-index counter matches it - the mechanism behind the freshness the
-[`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) reports.
+index counter matches it; when the index still lags, the result carries a `stale_index` entry
+in `warnings` with the two tree revision digests.
 
 ## Rift FS
 
@@ -110,10 +112,11 @@ through `fusermount3`. A host where neither mounts falls back to a copy-backed t
 same contract.
 
 The overlay holds a pinned lower layer and a per-tree upper store. The first write to a path
-detaches it into the store; a deletion leaves a whiteout; `.rift` is never served. Lower-layer
-reads go through a [foyer](https://github.com/foyer-rs/foyer) hybrid cache - hot 256 KiB
-segments in memory, warm segments on disk. Removal force-unmounts without waiting on processes
-still inside.
+detaches it into the store; a deletion leaves a whiteout; `.rift` is never served.
+
+Lower-layer reads go through a [foyer](https://github.com/foyer-rs/foyer) hybrid cache - hot
+256 KiB segments in memory, warm segments on disk. Removal force-unmounts without waiting on
+processes still inside.
 
 ## rift db
 
@@ -134,7 +137,7 @@ The lexical index's tables:
 - `lexical_units` - one row per indexed unit: a code symbol, or a text file split into chunks
   past the [`[search.text]`](/docs/configuration#search) chunk bound.
 - `lexical_index_state` - stamps the set with the tree revision that published it; a search
-  request trusts the store only when that stamp equals the snapshot it reads.
+  request trusts the store only when that stamp equals the tree revision the read captured.
 - `lexical_units_fts` - the [FTS5](https://www.sqlite.org/fts5.html) virtual table over `name`
   and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25`
   with per-column weights, comparable only within one search.
@@ -175,5 +178,5 @@ so editors validate the file as it is written. A quantity value carries its unit
 A hook is a configured command the server runs inside the changed tree after a change lands,
 with a declared environment, bounded output, and a timeout. Its verdict attaches to the change
 as [`GuaranteeEvidence`](/docs/protocol/reference#GuaranteeEvidence) or an advisory, and a hook
-that fails or does not finish gates publication in a projection. Keys and defaults live on the
-[configuration](/docs/configuration) page.
+that fails or does not finish gates publication in a projection. The
+[configuration](/docs/configuration) page states the keys and defaults.

@@ -18,8 +18,8 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, RustSymbol};
 
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, complete_coverage, excerpt, file_id,
-    project_path, rust_language, source_span, validate_common, wire_symbol,
+    ReadError, ReadFault, ReadService, accepted_limit, excerpt, file_id, page, project_path,
+    rust_language, source_span, validate_common, wire_symbol,
 };
 
 impl ReadService {
@@ -31,7 +31,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for deferred filters, traversal, cursors, projections, scopes, an
+    /// Returns [`ReadError`] for deferred filters, traversal, projections, scopes, an
     /// invalid `paths` glob, or a `force_include` bound crossed.
     pub fn search(
         &self,
@@ -53,15 +53,11 @@ impl ReadService {
         let root = self.index().root();
         let selector = params.paths.as_ref();
         let matcher = path_matcher(root, selector)?;
-        // Filtering happens before the page is truncated to `limit`, so a `paths`-narrowed
-        // search still returns the true top-`limit` hits within the selected files rather than
-        // an under-filled page: the candidate pool is fetched up to the index's own bound, then
-        // filtered, then cut down to what the caller asked for.
-        let fetch_limit = if matcher.is_some() {
-            self.index().results_max()
-        } else {
-            limit
-        };
+        // The whole candidate pool is collected up to the index's own `results_max` bound -
+        // bounded work whatever the page size - then ordered by relevance, so
+        // `pagination.total_pages` counts the full result set and every page is one window
+        // of the same ordering.
+        let fetch_limit = self.index().results_max();
 
         let mut results = Vec::new();
         collect_indexed_hits(
@@ -73,7 +69,7 @@ impl ReadService {
             fetch_limit,
             &mut results,
         )?;
-        if results.len() < limit
+        if results.len() < fetch_limit
             && let Some(selector) = selector
         {
             collect_force_include_hits(
@@ -81,7 +77,7 @@ impl ReadService {
                 selector,
                 query,
                 params.target,
-                limit,
+                fetch_limit,
                 &mut results,
             )?;
         }
@@ -93,13 +89,11 @@ impl ReadService {
             &mut results,
         );
         order_by_relevance(&mut results);
-        results.truncate(limit);
-        let snapshot = self.snapshot().clone();
+        let (results, pagination) = page(results, params.page_index, limit);
         Ok(SearchResult {
-            coverage: complete_coverage(&snapshot),
-            snapshot,
             results,
-            next_cursor: None,
+            pagination,
+            warnings: self.warnings(),
         })
     }
 }
@@ -116,7 +110,6 @@ fn force_include_requested(params: &SearchParams) -> bool {
 
 fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     validate_common(
-        params.cursor.is_some(),
         params.projection.is_some(),
         params.rev.is_some(),
         params.scope,
@@ -183,11 +176,10 @@ fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> b
 }
 
 /// Symbol and lexical hits from the index, filtered by `matcher` and collected up to
-/// `fetch_limit` - never cut short at the smaller `limit` - because [`order_by_relevance`]
-/// sorts this whole pool before the final page is cut down to `limit`; stopping collection
-/// at `limit` could drop a later, higher-scoring candidate (a file hit scores 1.0 flat, so
-/// this matters whenever a lower-scoring symbol substring match would otherwise fill the
-/// page first).
+/// `fetch_limit` - the index's `results_max` bound, never the smaller page size - because
+/// [`order_by_relevance`] sorts this whole pool before one page is cut out of it: stopping
+/// collection at the page size could drop a later, higher-scoring candidate, and the page
+/// count states the full result set.
 fn collect_indexed_hits(
     index: &WorkspaceIndex,
     matcher: Option<&PathMatcher>,
@@ -232,14 +224,15 @@ fn collect_indexed_hits(
 
 /// Reaches files `selector.force_include` names outside the index - bypassing `[source]`
 /// policy and `.gitignore`, never the hard floor - parses them on demand, and searches them
-/// with the same scoring pipeline as indexed hits, appending up to `limit` total results.
+/// with the same scoring pipeline as indexed hits, appending up to `fetch_limit` total
+/// results: the full collection bound the pool pages under, never one page's size.
 /// Bounded to [`FORCE_INCLUDE_FILES_MAX`] matched files; a crossed bound refuses the search.
 fn collect_force_include_hits(
     index: &WorkspaceIndex,
     selector: &PathSelector,
     query: &str,
     target: SearchParamsTarget,
-    limit: usize,
+    fetch_limit: usize,
     results: &mut Vec<SearchHit>,
 ) -> Result<(), ReadError> {
     if selector.force_include.is_empty() {
@@ -252,14 +245,15 @@ fn collect_force_include_hits(
         )
         .map_err(ReadFault::index)?;
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
-        for matched in rift_index::symbol_matches(&extra, query, limit - results.len()) {
+        for matched in rift_index::symbol_matches(&extra, query, fetch_limit - results.len()) {
             results.push(symbol_search_hit(matched));
         }
     }
-    if results.len() < limit && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
+    if results.len() < fetch_limit
+        && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
     {
         for (file, line, text) in
-            rift_index::source_line_matches(&extra, query, limit - results.len())
+            rift_index::source_line_matches(&extra, query, fetch_limit - results.len())
         {
             results.push(file_search_hit(file, line, text));
         }
@@ -714,16 +708,22 @@ pub fn compute() -> i32 {
         let results = value["results"].as_array().ok_or("results must be array")?;
 
         assert_eq!(results.len(), 3);
-        // "Beacon" ties three ways at rank/score: the struct symbol and its own declaration
-        // line both score 1.0, so the identity tie-break (`rift://file/...` sorts before
-        // `rift://symbol/...`) puts the file hit first; the `signal` method's substring
-        // match on the qualified name `Beacon::signal` scores lower and sorts last.
+        // The pool holds four candidates: both matching source lines and the struct symbol
+        // score 1.0, and the identity tie-break (`rift://file/...` sorts before
+        // `rift://symbol/...`) puts the file hits first; the `signal` method's substring
+        // match on the qualified name `Beacon::signal` scores lower and lands on the next
+        // page.
+        assert_eq!(
+            value["pagination"],
+            json!({ "page_index": 0, "total_pages": 2 })
+        );
         assert_eq!(results[0]["hit"]["target"], "file");
         assert_eq!(results[0]["score"], 1.0);
         assert_eq!(results[0]["path"], json!("src/lib.rs"));
-        assert_eq!(results[1]["hit"]["target"], "symbol");
+        assert_eq!(results[1]["hit"]["target"], "file");
         assert_eq!(results[1]["score"], 1.0);
         assert_eq!(results[2]["hit"]["target"], "symbol");
+        assert_eq!(results[2]["score"], 1.0);
         assert!(
             results[2]["path"]
                 .as_str()
@@ -784,22 +784,6 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `complete_coverage` used to fill every origin revision with an all-zero digest; the
-    /// search answer now carries the snapshot's real revisions.
-    #[test]
-    fn search_result_origins_carry_the_snapshots_real_revisions() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon"}))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let snapshot_tree = value["snapshot"]["tree_revision"].clone();
-        let snapshot_source = value["snapshot"]["source_revision"].clone();
-        let origin = &value["coverage"]["origins"][0];
-        assert_eq!(origin["tree_revision"], snapshot_tree);
-        assert_eq!(origin["source_revision"], snapshot_source);
-        assert_ne!(origin["tree_revision"], json!("00000000"));
-        Ok(())
-    }
-
     #[test]
     fn symbol_scores_preserve_semantic_rank() {
         let scores = [
@@ -812,18 +796,8 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_rejects_cursor_and_node_target() -> TestResult {
+    fn search_rejects_node_target() -> TestResult {
         let (_directory, service) = fixture()?;
-        let cursor: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "cursor": "page-two"}))?;
-        assert!(matches!(
-            service
-                .search(&cursor, &[])
-                .expect_err("cursor reads must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-
         let node_target: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "target": "node"}))?;
         assert!(matches!(
@@ -871,21 +845,21 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// Collection is bounded by `results_max` whatever the page size, so a `limit` above
+    /// that bound simply serves the whole bounded result set as one page.
     #[test]
-    fn search_target_file_propagates_oversized_result_limit() -> TestResult {
+    fn search_limit_above_the_result_bound_serves_the_whole_set_on_one_page() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
             "target": "file",
             "limit": READ_RESULTS_MAX_DEFAULT as u64 + 1
         }))?;
-        assert!(matches!(
-            service
-                .search(&params, &[])
-                .expect_err("oversized file-target limit must fail")
-                .fault(),
-            ReadFault::Index(_)
-        ));
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert!(!results.is_empty());
+        assert_eq!(value["pagination"]["page_index"], json!(0));
+        assert_eq!(value["pagination"]["total_pages"], json!(1));
         Ok(())
     }
 
@@ -1156,10 +1130,8 @@ pub fn compute() -> i32 {
 
     #[test]
     fn search_paths_scoped_results_form_stable_prefix_across_limits() -> TestResult {
-        // Cursor-based pagination is not served yet: `validate_common` refuses any request
-        // that supplies one. Stability is proven the way the implementation guarantees it
-        // instead - `paths` filtering happens before the page is cut to `limit`, so the top
-        // hit of a `paths`-scoped search does not move as `limit` grows.
+        // `paths` filtering happens before one page is cut out of the ordered pool, so the
+        // top hit of a `paths`-scoped search does not move as `limit` grows.
         let (_directory, service) = multi_file_fixture()?;
         let narrow: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
@@ -1174,6 +1146,52 @@ pub fn compute() -> i32 {
         let narrow_value = serde_json::to_value(service.search(&narrow, &[])?)?;
         let wide_value = serde_json::to_value(service.search(&wide, &[])?)?;
         assert_eq!(narrow_value["results"][0], wide_value["results"][0]);
+        Ok(())
+    }
+
+    #[test]
+    fn search_pages_partition_the_ordered_pool_without_overlap() -> TestResult {
+        let (_directory, service) = multi_file_fixture()?;
+        let mut seen = Vec::new();
+        for page_index in 0..3_u64 {
+            let request = json!({
+                "query": "beacon",
+                "target": "symbol",
+                "limit": 1,
+                "page_index": page_index
+            });
+            let params: SearchParams = serde_json::from_value(request)?;
+            let value = serde_json::to_value(service.search(&params, &[])?)?;
+            assert_eq!(
+                value["pagination"],
+                json!({ "page_index": page_index, "total_pages": 3 })
+            );
+            let id = value["results"][0]["hit"]["symbol"]["id"]
+                .as_str()
+                .ok_or("every page must carry one symbol hit")?
+                .to_owned();
+            assert!(!seen.contains(&id), "pages must not overlap: {id}");
+            seen.push(id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn search_page_past_the_end_is_empty_with_the_true_page_count() -> TestResult {
+        let (_directory, service) = multi_file_fixture()?;
+        let request = json!({
+            "query": "beacon",
+            "target": "symbol",
+            "limit": 1,
+            "page_index": 30
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        assert_eq!(value["results"], json!([]));
+        assert_eq!(
+            value["pagination"],
+            json!({ "page_index": 30, "total_pages": 3 })
+        );
         Ok(())
     }
 
@@ -1335,9 +1353,10 @@ pub fn compute() -> i32 {
         let value = serde_json::to_value(service.search(&committed, &[])?)?;
         let results = value["results"].as_array().ok_or("results array")?;
         assert!(!results.is_empty(), "the committed declaration matches");
-        assert!(
-            value["snapshot"]["revision"].as_str().is_some(),
-            "a revision search's snapshot carries the resolved commit"
+        assert_eq!(
+            value["warnings"],
+            json!([]),
+            "a search served from one index warns nothing"
         );
         let drifted: SearchParams = serde_json::from_value(json!({"query": "drifted_probe"}))?;
         let drifted_value = serde_json::to_value(service.search(&drifted, &[])?)?;

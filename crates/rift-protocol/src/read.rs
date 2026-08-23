@@ -6,7 +6,7 @@
 
 use crate::schema;
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 // Search-specific models (`SearchParams`, `PathSelector`, the filter tree, and their
@@ -26,14 +26,6 @@ pub use crate::diagnostic::{
     DiagnosticRelated, DiagnosticReliability, DiagnosticTag,
 };
 
-pub(crate) fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
-}
-
 /// Empirical coupling between two symbols: how often revisions that touched one touched the
 /// other. The relation is observed from history rather than resolved from source, so it
 /// reaches coupling no reference graph carries - two implementations of one concept with no
@@ -52,71 +44,6 @@ pub struct CoChange {
     /// `together`.
     #[schemars(range(min = 1_u64, max = 9_007_199_254_740_991_u64))]
     pub touches: u64,
-}
-
-/// State tag carried by a complete coverage claim.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CoverageCompleteState {
-    /// Everything in scope is present.
-    Complete,
-}
-
-/// State tag carried by a partial coverage claim.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CoveragePartialState {
-    /// Some of what is in scope is missing.
-    Partial,
-}
-
-/// How much of one fact family or indexed result an answer covers. Absence proves that no
-/// matching fact exists only where the state is `complete`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(untagged, deny_unknown_fields)]
-pub enum Coverage {
-    /// Everything in scope is here, so a fact that is missing is a fact that does not exist.
-    Complete {
-        /// State tag `complete`.
-        state: CoverageCompleteState,
-        /// What the claim covers.
-        scope: CoverageScope,
-        /// Provider revisions that contributed this family, in merge precedence order. Empty
-        /// only when Rift establishes coverage without a provider.
-        origins: Vec<ProviderOrigin>,
-    },
-    /// Some of what is in scope is missing. `reason` is required here because a caller that
-    /// reads absence as proof would be wrong.
-    Partial {
-        /// State tag `partial`.
-        state: CoveragePartialState,
-        /// What the claim covers.
-        scope: CoverageScope,
-        /// Why the answer stops short - a limit hit, a file that would not parse, a page
-        /// boundary. Prose for a reader; nothing keys on it.
-        #[schemars(length(max = 4096))]
-        reason: String,
-        /// How to ask for the rest, where there is a way to.
-        #[serde(default)]
-        #[schemars(length(max = 4096))]
-        continuation: Option<String>,
-        /// Provider revisions that contributed available facts, in merge precedence order.
-        origins: Vec<ProviderOrigin>,
-    },
-    /// The family was never produced at all, so there is nothing here to be complete about.
-    State {
-        /// State tag: `unsupported` or `not_applicable`.
-        state: CoverageStateState,
-        /// What the claim covers.
-        scope: CoverageScope,
-        /// Which of the two this is, in words: the feature no provider has, or the concept
-        /// the language lacks.
-        #[schemars(length(max = 4096))]
-        reason: String,
-        /// Provider revisions consulted before reaching this state. Empty for `unsupported`
-        /// and `not_applicable`.
-        origins: Vec<ProviderOrigin>,
-    },
 }
 
 /// How far the claim reaches.
@@ -152,40 +79,17 @@ pub enum CoverageScope {
     },
 }
 
-/// `unsupported` - no provider produces this family for the language. `not_applicable` - the
-/// family has no meaning for this language.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CoverageStateState {
-    /// No provider produces this family for the language.
-    Unsupported,
-    /// The family has no meaning for this language.
-    NotApplicable,
-}
-
-/// An opaque base64url string that continues a paginated answer from where the last page
-/// ended. It binds the request, state, order, and page size that apply to that answer.
-/// Padding is omitted. A mismatch returns `cursor_invalid`. For a captured result set,
-/// process restart or eviction returns `cursor_expired`, and later writes do not change
-/// remaining pages.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct Cursor(
-    #[schemars(length(min = 1, max = 4096))]
-    #[schemars(regex(pattern = r"^[A-Za-z0-9_-]+$"))]
-    pub String,
-);
-
 /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
 /// uses. The full digest is computed and compared internally; only this short form ever
 /// reaches the wire.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct Digest(#[schemars(regex(pattern = r"^[0-9a-f]{8}$"))] pub String);
+pub struct Digest(
+    #[schemars(example = &"3f9a1c2e")]
+    #[schemars(regex(pattern = r"^[0-9a-f]{8}$"))]
+    pub String,
+);
 
 /// One block of documentation attached to a declaration, in the markup it was written in.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -248,27 +152,6 @@ pub struct ExtensionValue {
 #[schemars(transparent)]
 pub struct Extensions(pub BTreeMap<ExtensionKey, ExtensionValue>);
 
-/// One kind of fact a provider can emit. Coverage, streaming, and invalidation use the
-/// family as their unit.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum FactFamily {
-    /// Declaration records a provider resolved.
-    Symbols,
-    /// Concrete syntax trees over file bytes.
-    Nodes,
-    /// Directed edges between symbols.
-    Relationships,
-    /// Type bindings attached to declarations.
-    Types,
-    /// Findings providers produced from source.
-    Diagnostics,
-    /// Version-control timelines of symbols.
-    History,
-}
-
 /// One file and the languages that read it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -324,6 +207,7 @@ pub enum FileContent {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct FileId(
+    #[schemars(example = &"rift://file/src/lib.rs")]
     #[schemars(length(min = 13, max = 8192))]
     #[schemars(regex(
         pattern = r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$"
@@ -331,39 +215,26 @@ pub struct FileId(
     pub String,
 );
 
-/// Whether derived state covers the tree and source-catalog revisions carried by the answer.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Freshness {
-    /// The derived state covers the answer's captured revisions.
-    Current,
-    /// The derived state lags behind the answer's captured revisions.
-    Stale,
-}
-
 /// One declaration a `get_symbol` lookup found.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetSymbolHit {
     /// The declaration that matched.
     pub symbol: Symbol,
-    /// The declaration node, whose identity `replace_symbol` can act on. Null when source
-    /// is unavailable or outside the project.
-    #[serde(default)]
+    /// The declaration node, whose identity `replace_symbol` can act on. Absent when
+    /// source is unavailable or outside the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<Node>,
     /// The declaration source when the request asked for bodies and the provider can read
-    /// it. Null for source-less declarations.
-    #[serde(default)]
+    /// it. Absent for source-less declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceExcerpt>,
-    /// The symbol's timeline, present when the request asked for history. Its coverage says
-    /// how far back the walk reached.
-    #[serde(default)]
+    /// The symbol's timeline, present when the request asked for history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<SymbolHistory>,
     /// Symbols that historically change with this one, strongest coupling first, present
     /// when the request asked for history.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub co_changes: Option<Vec<CoChange>>,
 }
 
@@ -371,6 +242,26 @@ pub struct GetSymbolHit {
 /// a search followed by paging through the file.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.4"))]
+#[schemars(extend("examples" = [
+    {
+        "name": "ReadService",
+        "language": {
+            "name": "rust"
+        },
+        "include_body": true,
+        "include_history": true,
+        "limit": 5,
+        "page_index": 0,
+        "scope": "all"
+    },
+    {
+        "name": "Deserialize",
+        "scope": "dependencies",
+        "limit": 10,
+        "page_index": 1
+    }
+]))]
 #[schemars(transform = schema::forbid_get_symbol_rev_with_projection)]
 pub struct GetSymbolParams {
     /// The declaration name to look up - a name, not a free-text query; `search` takes
@@ -378,8 +269,8 @@ pub struct GetSymbolParams {
     /// substrings.
     #[schemars(length(min = 1, max = 4096))]
     pub name: String,
-    /// Narrows the answer to one language. Null searches every served language.
-    #[serde(default)]
+    /// Narrows the answer to one language. Omitted searches every served language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<Language>,
     /// Whether each hit carries its declaration source.
     #[serde(default = "default_get_symbol_params_include_body")]
@@ -393,17 +284,19 @@ pub struct GetSymbolParams {
     #[serde(default = "default_get_symbol_params_limit")]
     #[schemars(range(min = 1_u64, max = 10_000_u64))]
     pub limit: u64,
-    /// Continues a previous lookup where its last page ended.
-    #[serde(default)]
-    pub cursor: Option<Cursor>,
-    /// The projection to read. Null reads the workspace tree.
-    #[serde(default)]
+    /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
+    /// the last page returns an empty page whose `pagination` carries the requested
+    /// `page_index` and the true `total_pages`.
+    #[serde(default = "default_get_symbol_params_page_index")]
+    pub page_index: u64,
+    /// The projection to read. Omitted reads the workspace tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<ProjectionId>,
     /// The version-control revision to read - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Null reads the current tree, and `rev`
+    /// workspace's version control spells it. Omitted reads the current tree, and `rev`
     /// never combines with `projection`. The server refuses a revision read when the
     /// workspace has no version-control repository.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
     /// Source locations eligible for matches. All is the default because a known name may
     /// identify a dependency or standard-library declaration.
@@ -423,6 +316,10 @@ fn default_get_symbol_params_limit() -> u64 {
     5
 }
 
+fn default_get_symbol_params_page_index() -> u64 {
+    PAGE_INDEX_DEFAULT
+}
+
 fn default_get_symbol_params_scope() -> SearchScope {
     SearchScope::All
 }
@@ -430,32 +327,196 @@ fn default_get_symbol_params_scope() -> SearchScope {
 /// One page of declarations matching a name.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "hits": [
+            {
+                "symbol": {
+                    "id": "rift://symbol/rust/src/config.rs/load_config",
+                    "language": {
+                        "name": "rust"
+                    },
+                    "name": "load_config",
+                    "kind": "rust.function",
+                    "facets": [
+                        "value",
+                        "callable",
+                        "public"
+                    ],
+                    "origin": {
+                        "location": {
+                            "kind": "project"
+                        },
+                        "source_kind": "authored",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    "modifiers": [],
+                    "visibility": "pub",
+                    "types": [
+                        {
+                            "role": "return",
+                            "origin": "declared",
+                            "type": {
+                                "language": {
+                                    "name": "rust"
+                                },
+                                "source": "Result<Config, ConfigError>",
+                                "extensions": {}
+                            }
+                        }
+                    ],
+                    "signatures": [
+                        {
+                            "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+                            "links": [
+                                {
+                                    "range": {
+                                        "start": 42,
+                                        "end": 48
+                                    },
+                                    "symbol": "rift://symbol/rust/src/config.rs/Config"
+                                }
+                            ],
+                            "language": {
+                                "name": "rust"
+                            },
+                            "parameters": [
+                                {
+                                    "name": "path",
+                                    "types": [
+                                        {
+                                            "role": "parameter",
+                                            "origin": "declared",
+                                            "type": {
+                                                "language": {
+                                                    "name": "rust"
+                                                },
+                                                "source": "&Path",
+                                                "extensions": {}
+                                            }
+                                        }
+                                    ],
+                                    "optional": false,
+                                    "variadic": false,
+                                    "extensions": {}
+                                }
+                            ],
+                            "returns": [
+                                {
+                                    "role": "return",
+                                    "origin": "declared",
+                                    "type": {
+                                        "language": {
+                                            "name": "rust"
+                                        },
+                                        "source": "Result<Config, ConfigError>",
+                                        "extensions": {}
+                                    }
+                                }
+                            ],
+                            "type_parameters": [],
+                            "throws": [],
+                            "effects": [],
+                            "extensions": {}
+                        }
+                    ],
+                    "documentation": [
+                        {
+                            "format": "markdown",
+                            "text": "Loads the workspace configuration from `rift.toml`."
+                        }
+                    ],
+                    "extensions": {},
+                    "document_local": false
+                },
+                "node": {
+                    "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                    "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                    "unit": "rift://file/src/config.rs",
+                    "language": {
+                        "name": "rust"
+                    },
+                    "kind": "rust.function_item",
+                    "facets": [
+                        "declaration",
+                        "definition"
+                    ],
+                    "range": {
+                        "start": 218,
+                        "end": 355
+                    },
+                    "regions": [
+                        {
+                            "role": "name",
+                            "range": {
+                                "start": 225,
+                                "end": 236
+                            }
+                        },
+                        {
+                            "role": "body",
+                            "range": {
+                                "start": 281,
+                                "end": 355
+                            }
+                        }
+                    ],
+                    "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                    "extensions": {}
+                },
+                "source": {
+                    "span": {
+                        "unit": "rift://source/project/src/config.rs",
+                        "range": {
+                            "start": 162,
+                            "end": 355
+                        }
+                    },
+                    "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+                },
+                "history": {
+                    "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                    "versions": [
+                        {
+                            "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
+                            "path": "src/config.rs",
+                            "kind": "signature_changed",
+                            "timestamp": "2026-08-21T14:03:22Z",
+                            "summary": "Return ConfigError from load_config"
+                        },
+                        {
+                            "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
+                            "path": "src/config.rs",
+                            "kind": "introduced",
+                            "timestamp": "2026-08-17T09:41:05Z",
+                            "summary": "Add workspace configuration loading"
+                        }
+                    ]
+                },
+                "co_changes": [
+                    {
+                        "subject": "rift://symbol/rust/src/config.rs/load_config",
+                        "partner": "rift://symbol/rust/src/error.rs/ConfigError",
+                        "together": 4,
+                        "touches": 9
+                    }
+                ]
+            }
+        ],
+        "pagination": {
+            "page_index": 0,
+            "total_pages": 1
+        },
+        "warnings": []
+    }
+]))]
 pub struct GetSymbolResult {
     /// The declarations on this page, best match first.
     pub hits: Vec<GetSymbolHit>,
-    /// Coverage of the symbol index used for this lookup. An empty result proves absence
-    /// only where this is complete.
-    pub coverage: Coverage,
-    /// Cursor for the next page, or null after the final hit.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
-    pub next_cursor: Option<Cursor>,
-    /// Tree and index revisions used for this result page.
-    pub snapshot: ReadSnapshot,
-}
-
-/// The immutable search-index revision used for an answer.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct IndexSnapshot {
-    /// SHA-256 identity of the index revision.
-    pub revision: Digest,
-    /// Tree revision indexed by this revision.
-    pub tree_revision: Digest,
-    /// Whether both indexed revisions equal the answer's captured revisions.
-    pub freshness: Freshness,
-    /// Source-catalog revision indexed by this revision.
-    pub source_revision: Digest,
+    /// Where this page sits in the full result set under the request's `limit`.
+    pub pagination: Pagination,
+    /// Warnings attached to this result, empty when there is nothing to warn about.
+    pub warnings: Vec<ReadWarning>,
 }
 
 /// A language name and its optional dialect. The pair is the identity facts are filed under,
@@ -467,10 +528,11 @@ pub struct Language {
     /// `typescript` cannot split one language into two identity spaces.
     #[schemars(length(max = 64))]
     #[schemars(regex(pattern = r"^[a-z][a-z0-9._-]*$"))]
+    #[schemars(example = &"rust")]
     pub name: String,
     /// A dialect whose syntax or semantics differ within the language, such as
     /// `postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
     #[schemars(regex(pattern = r"^[a-z][a-z0-9._-]*$"))]
     pub dialect: Option<String>,
@@ -498,7 +560,7 @@ pub struct Node {
     pub id: NodeId,
     /// The symbol written at this node. Absent where a node writes no symbol -
     /// punctuation, a keyword, a comment.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<SymbolId>,
     /// The file the node is written in.
     pub unit: FileId,
@@ -517,7 +579,7 @@ pub struct Node {
     /// the documentation above it.
     pub regions: Vec<NodeRegion>,
     /// The region this one is nested inside. Absent at the top level of a unit.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<NodeId>,
     /// Syntax facts the model has no field for, namespaced by the provider that emitted
     /// them.
@@ -579,6 +641,7 @@ pub enum NodeFacet {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct NodeId(
+    #[schemars(example = &"rift://node/rust/lib.rs@220-268#3f9a1c2e")]
     #[schemars(length(min = 27, max = 8192))]
     #[schemars(regex(
         pattern = r"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\d+-\d+#[0-9a-f]{8}$"
@@ -600,6 +663,13 @@ pub struct NodeRegion {
 /// address for an edit smaller than a declaration, such as one call expression.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.4"))]
+#[schemars(extend("examples" = [
+    {
+        "path": "src/config.rs",
+        "position": 338
+    }
+]))]
 #[schemars(transform = schema::forbid_nodes_rev_with_projection)]
 pub struct NodesParams {
     /// Project-relative file to inspect.
@@ -609,14 +679,14 @@ pub struct NodesParams {
     /// themselves carry the spans.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub position: u64,
-    /// The projection to read. Null reads the workspace tree.
-    #[serde(default)]
+    /// The projection to read. Omitted reads the workspace tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<ProjectionId>,
     /// The version-control revision to read - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Null reads the current tree, and `rev`
+    /// workspace's version control spells it. Omitted reads the current tree, and `rev`
     /// never combines with `projection`. The server refuses a revision read when the
     /// workspace has no version-control repository.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
 }
 
@@ -624,15 +694,172 @@ pub struct NodesParams {
 /// from this listing refuses cleanly once the bytes drift.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "nodes": [
+            {
+                "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust"
+                },
+                "kind": "rust.source_file",
+                "facets": [],
+                "range": {
+                    "start": 0,
+                    "end": 356
+                },
+                "regions": [],
+                "extensions": {}
+            },
+            {
+                "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust"
+                },
+                "kind": "rust.function_item",
+                "facets": [
+                    "declaration",
+                    "definition"
+                ],
+                "range": {
+                    "start": 218,
+                    "end": 355
+                },
+                "regions": [
+                    {
+                        "role": "name",
+                        "range": {
+                            "start": 225,
+                            "end": 236
+                        }
+                    },
+                    {
+                        "role": "body",
+                        "range": {
+                            "start": 281,
+                            "end": 355
+                        }
+                    }
+                ],
+                "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                "extensions": {}
+            },
+            {
+                "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust"
+                },
+                "kind": "rust.block",
+                "facets": [],
+                "range": {
+                    "start": 281,
+                    "end": 355
+                },
+                "regions": [],
+                "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                "extensions": {}
+            },
+            {
+                "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust"
+                },
+                "kind": "rust.call_expression",
+                "facets": [
+                    "expression"
+                ],
+                "range": {
+                    "start": 334,
+                    "end": 353
+                },
+                "regions": [],
+                "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+                "extensions": {}
+            },
+            {
+                "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust"
+                },
+                "kind": "rust.identifier",
+                "facets": [],
+                "range": {
+                    "start": 334,
+                    "end": 346
+                },
+                "regions": [],
+                "parent": "rift://node/rust/src/config.rs@334-353#4df4426e",
+                "extensions": {}
+            }
+        ],
+        "source": [
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 0,
+                        "end": 356
+                    }
+                },
+                "text": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
+            },
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 218,
+                        "end": 355
+                    }
+                },
+                "text": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+            },
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 281,
+                        "end": 355
+                    }
+                },
+                "text": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+            },
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 334,
+                        "end": 353
+                    }
+                },
+                "text": "parse_config(&text)"
+            },
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 334,
+                        "end": 346
+                    }
+                },
+                "text": "parse_config"
+            }
+        ],
+        "warnings": []
+    }
+]))]
 pub struct NodesResult {
     /// Nodes covering the position, outermost first.
     pub nodes: Vec<Node>,
     /// The source of each node, in the same order.
     pub source: Vec<SourceExcerpt>,
-    /// Completeness of the node facts used to build the listing.
-    pub coverage: SemanticCoverage,
-    /// Tree revision and provider state used for this listing.
-    pub snapshot: ReadSnapshot,
+    /// Warnings attached to this result, empty when there is nothing to warn about.
+    pub warnings: Vec<ReadWarning>,
 }
 
 /// One package as its package manager identifies it.
@@ -650,19 +877,34 @@ pub struct PackageIdentity {
     pub version: String,
 }
 
+/// Default `page_index` for a paginated request: the first page.
+pub const PAGE_INDEX_DEFAULT: u64 = 0;
+
+/// Where one page sits in the full result set the request's `limit` divides.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pagination {
+    /// The zero-based page this answer serves.
+    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub page_index: u64,
+    /// The page count of the full result set under the request's `limit`, computed within
+    /// the server's result bound. Zero when the result set is empty.
+    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub total_pages: u64,
+}
+
 /// One parameter of a `Signature`: what it is called, the types bound to it, and how a call
 /// may pass it. A receiver is one of these too, held in its own field because it has no
 /// position in the parameter list.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Parameter {
-    /// What the parameter is called. Null where the language allows an unnamed one, as a
-    /// positional parameter in a function type.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// What the parameter is called. Absent where the language allows an unnamed one, as
+    /// a positional parameter in a function type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Where this parameter is written in the source.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeId>,
     /// What it accepts. An array because a declared type and an inferred one are separate
     /// bindings.
@@ -671,9 +913,8 @@ pub struct Parameter {
     pub optional: bool,
     /// Whether it absorbs the arguments that follow - `*args`, `...rest`.
     pub variadic: bool,
-    /// The default value as written in the source. Null where there is none.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// The default value as written in the source. Absent where there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     /// Parameter facts the model has no field for, namespaced by the provider that emitted
     /// them.
@@ -690,6 +931,7 @@ pub struct Parameter {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ProjectPath(
+    #[schemars(example = &"src/lib.rs")]
     #[schemars(length(max = 1000))]
     #[schemars(regex(
         pattern = r"^(?:$|(?!\.rift(?:/|$))(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)[^\\\u0000-\u001F\u007F/]+(?:/[^\\\u0000-\u001F\u007F/]+)*)$"
@@ -707,54 +949,28 @@ pub struct ProjectPath(
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ProjectionId(
+    #[schemars(example = &"rift://projection/my-feature-one")]
     #[schemars(regex(pattern = r"^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"))]
     pub String,
 );
 
-/// Stable identity of one provider implementation. The identity remains unchanged across
-/// provider restarts and fact revisions, so callers can compare origins from separate
-/// answers.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct ProviderId(#[schemars(regex(pattern = r"^[a-z][a-z0-9_.-]{0,127}$"))] pub String);
-
-/// The immutable provider state used for one fact-family answer. A provider publishes a new
-/// `revision` only after it has finished deriving facts from one workspace tree and source
-/// catalog revision.
+/// One warning attached to a read result. The answer stands; the warning carries evidence
+/// of a condition the caller weighs before relying on it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderOrigin {
-    /// Stable identity of the provider that contributed facts.
-    pub provider: ProviderId,
-    /// SHA-256 identity of the immutable provider fact revision.
-    pub revision: Digest,
-    /// Tree revision from which the provider derived this fact revision.
-    pub tree_revision: Digest,
-    /// Whether both input revisions equal the answer's captured revisions.
-    pub freshness: Freshness,
-    /// Source-catalog revision from which the provider derived these facts.
-    pub source_revision: Digest,
-}
-
-/// Immutable state captured for one read. Every page produced from one cursor carries the
-/// same snapshot.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReadSnapshot {
-    /// SHA-256 identity of the targeted tree when the read began. The digest covers visible
-    /// paths, entry kinds, executable bits, and contents.
-    pub tree_revision: Digest,
-    /// Search-index state used by the read, or null when the read did not use the index.
-    #[serde(default)]
-    pub index: Option<IndexSnapshot>,
-    /// Source-catalog revision captured for the read.
-    pub source_revision: Digest,
-    /// The version-control revision the read served, resolved to the full commit id the
-    /// repository records - so a branch answer stays attributable after the branch moves.
-    /// Null when the read served the current tree.
-    #[serde(default)]
-    pub revision: Option<RevisionId>,
+#[serde(tag = "code", deny_unknown_fields, rename_all = "snake_case")]
+pub enum ReadWarning {
+    /// The answer was computed from an index that lags the tree the read captured. Facts
+    /// derived from the index may miss the newest writes; the digests state which two
+    /// trees disagree.
+    StaleIndex {
+        /// Tree revision the published index covers.
+        index_tree_revision: Digest,
+        /// Tree revision the read captured.
+        captured_tree_revision: Digest,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
 }
 
 /// One named part of a node. A language marks these out inside a declaration, so an
@@ -803,7 +1019,7 @@ pub struct Relationship {
     pub derivation: RelationshipDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
     /// derivation.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 1))]
     pub confidence: Option<f64>,
     /// Edge facts the model has no field for, namespaced by the provider that emitted them.
@@ -903,7 +1119,11 @@ pub const REVISION_ID_BYTES_MAX: usize = 128;
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct RevisionId(#[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))] pub String);
+pub struct RevisionId(
+    #[schemars(example = &"main")]
+    #[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))]
+    pub String,
+);
 
 impl RevisionId {
     /// Classifies this spelling against the charset and length its schema advertises.
@@ -967,12 +1187,6 @@ pub enum SearchScope {
     All,
 }
 
-/// Coverage for every fact family. Absence is authoritative only where state is complete.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct SemanticCoverage(pub BTreeMap<FactFamily, Coverage>);
-
 /// How much a `Diagnostic` matters, in the provider's own judgement. Providers map their
 /// toolchain's own levels onto these four, so a caller can drop everything below `warning`
 /// without knowing which language produced it.
@@ -1003,10 +1217,9 @@ pub struct Signature {
     pub links: Vec<SignatureLink>,
     /// The language whose syntax `display` is written in.
     pub language: Language,
-    /// The implicit first parameter - `self`, `this`. Null for a free function, and for
+    /// The implicit first parameter - `self`, `this`. Absent for a free function, and for
     /// languages that have no such thing.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<Parameter>,
     /// Declared parameters, in source order.
     pub parameters: Vec<Parameter>,
@@ -1070,9 +1283,9 @@ pub enum SourceKind {
 pub enum SourceLocation {
     /// Source owned by the current workspace.
     Project {
-        /// Local package that owns the source, or null when no package manifest assigns
+        /// Local package that owns the source, or absent when no package manifest assigns
         /// one.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         package: Option<PackageIdentity>,
     },
     /// Source owned by one resolved dependency.
@@ -1149,14 +1362,13 @@ pub struct Symbol {
     /// a function. Ownership is not lexical: a Go method is written beside its type and a
     /// Rust method inside an `impl` block, and both name the type here. Absent at the top
     /// level.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<SymbolId>,
     /// Language keywords qualifying the declaration: `export`, `async`, `const`.
     pub modifiers: Vec<String>,
     /// How widely the symbol is visible, in the language's own terms - `public`, `private`,
-    /// `pub(crate)`. Null where the language has no such concept.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    /// `pub(crate)`. Absent where the language has no such concept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
     /// The types this symbol carries, each tagged with the role it plays: a return type, a
     /// field type, a bound.
@@ -1246,8 +1458,7 @@ pub enum SymbolFacet {
 }
 
 /// One symbol's timeline across the workspace's version-control history, newest revision
-/// first. The walk is bounded by the configured history depth, so `coverage` says whether
-/// the timeline reaches the symbol's introduction.
+/// first. The walk is bounded by the configured history depth.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
@@ -1255,9 +1466,6 @@ pub struct SymbolHistory {
     pub symbol: SymbolId,
     /// Revisions that touched the symbol, newest first.
     pub versions: Vec<SymbolVersion>,
-    /// How far back the walk reached. Partial means the configured depth ended before the
-    /// symbol's introduction, so an absent `introduced` version proves nothing.
-    pub coverage: Coverage,
 }
 
 /// Identity of one symbol. The name after the language is the provider's stable qualified
@@ -1270,6 +1478,7 @@ pub struct SymbolHistory {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct SymbolId(
+    #[schemars(example = &"rift://symbol/rust/crates/rift-server/src/read.rs/ReadService")]
     #[schemars(length(min = 17, max = 8192))]
     #[schemars(regex(
         pattern = r"^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$"
@@ -1282,14 +1491,14 @@ pub struct SymbolId(
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolOrigin {
-    /// Source ownership. Null exactly when `source_kind` is `synthetic`.
-    #[serde(default)]
+    /// Source ownership. Absent exactly when `source_kind` is `synthetic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<SourceLocation>,
     /// Whether the declaration is authored, generated, or synthetic.
     pub source_kind: SourceKind,
-    /// Source-catalog unit containing the declaration. Null when source is unavailable or
-    /// the declaration is synthetic.
-    #[serde(default)]
+    /// Source-catalog unit containing the declaration. Absent when source is unavailable
+    /// or the declaration is synthetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<SourceUnitId>,
 }
 
@@ -1309,7 +1518,7 @@ pub struct SymbolVersion {
     #[schemars(length(max = 64))]
     pub timestamp: String,
     /// The revision's own first summary line, where the version control records one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
     pub summary: Option<String>,
 }
@@ -1420,10 +1629,9 @@ pub struct TypeExpression {
     pub language: Language,
     /// The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
     pub source: String,
-    /// The symbol that declares this type, where one does. Null for a structural type,
+    /// The symbol that declares this type, where one does. Absent for a structural type,
     /// which has a spelling and nothing to open.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<SymbolId>,
     /// Type facts the model has no field for, namespaced by the provider that emitted them.
     pub extensions: Extensions,
@@ -1431,9 +1639,24 @@ pub struct TypeExpression {
 
 #[cfg(test)]
 mod tests {
-    use super::{Digest, REVISION_ID_BYTES_MAX, RevisionId, RevisionIdViolation, SourceUnitId};
+    use super::{
+        Digest, GetSymbolParams, PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX, RevisionId,
+        RevisionIdViolation, SourceUnitId,
+    };
     use schemars::schema_for;
     use serde_json::json;
+
+    /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
+    /// from the schema; this pins the advertised default to the constant the field's
+    /// default function returns.
+    #[test]
+    fn get_symbol_params_schema_page_index_default_equals_the_enforced_constant() {
+        let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
+        assert_eq!(
+            schema["properties"]["page_index"]["default"],
+            json!(PAGE_INDEX_DEFAULT)
+        );
+    }
 
     #[test]
     fn revision_id_schema_pattern_states_the_enforced_length_bound() {

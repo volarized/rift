@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use data_encoding::BASE32_NOPAD;
 use rift_core::ProjectPath as CoreProjectPath;
-use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_PROVIDER_ID};
+use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileInclusion,
 };
@@ -13,12 +12,10 @@ use rift_index::{
     WorkspaceIndexLimits,
 };
 use rift_protocol::read::{
-    Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
-    FactFamily, FileId, Freshness, GetSymbolHit, GetSymbolParams, GetSymbolResult, IndexSnapshot,
-    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, ProjectPath, ProviderId,
-    ProviderOrigin, ReadSnapshot, RevisionId, SearchScope, SemanticCoverage, SourceExcerpt,
-    SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TextRange,
+    Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
+    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination, ProjectPath,
+    ReadWarning, RevisionId, SearchScope, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
+    SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -218,7 +215,7 @@ pub type ReadError = Error<ReadFault>;
 #[derive(Debug)]
 pub struct ReadService {
     index: WorkspaceIndex,
-    snapshot: ReadSnapshot,
+    revisions: CapturedRevisions,
     /// The resolved commit this service serves, or null for the current tree.
     revision: Option<RevisionId>,
 }
@@ -250,13 +247,13 @@ impl ReadService {
                 span.record("outcome", "error");
                 ReadFault::index(source)
             })?;
-        let snapshot = captured_snapshot(&index, None);
+        let revisions = captured_revisions(&index);
         span.record("files_count", index.files().len());
-        span.record("tree_revision", snapshot.tree_revision.0.as_str());
+        span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
         Ok(Self {
             index,
-            snapshot,
+            revisions,
             revision: None,
         })
     }
@@ -285,12 +282,11 @@ impl ReadService {
         let resolved = repository.resolve(&rev.0).map_err(ReadFault::history)?;
         let index = WorkspaceIndex::at_revision(&repository, &resolved, limits, visibility)
             .map_err(ReadFault::index)?;
-        let revision = RevisionId(resolved.commit_id());
-        let snapshot = captured_snapshot(&index, Some(revision.clone()));
+        let revisions = captured_revisions(&index);
         Ok(Self {
             index,
-            snapshot,
-            revision: Some(revision),
+            revisions,
+            revision: Some(RevisionId(resolved.commit_id())),
         })
     }
 
@@ -299,9 +295,11 @@ impl ReadService {
         &self.index
     }
 
-    /// Returns the tree and index revisions captured for this snapshot.
-    pub(crate) const fn snapshot(&self) -> &ReadSnapshot {
-        &self.snapshot
+    /// Returns the warnings every answer from this service carries: one
+    /// `stale_index` when the published index lags the captured tree, none
+    /// when the two match.
+    pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
+        self.revisions.warnings()
     }
 
     /// Returns the resolved commit this service serves, or none for the
@@ -316,14 +314,13 @@ impl ReadService {
         self.index.fingerprint()
     }
 
-    /// Returns the tree revision this snapshot's wire answers report - the
-    /// same eight-hex-character string every `ReadSnapshot` in this
-    /// service's results carries. A lexical population stamps this exact
+    /// Returns the tree revision this service captured, in its
+    /// eight-hex-character wire form. A lexical population stamps this exact
     /// string, and a search request compares its query-time lexical
     /// revision against it, so the two never drift apart.
     #[must_use]
     pub fn tree_revision(&self) -> &str {
-        &self.snapshot.tree_revision.0
+        self.revisions.wire_tree_revision()
     }
 
     /// Derives this snapshot's lexical search units: one per indexed
@@ -351,7 +348,6 @@ impl ReadService {
     /// Returns [`ReadError`] for projections, invalid paths, or missing files.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
         validate_common(
-            false,
             params.projection.is_some(),
             params.rev.is_some(),
             SearchScope::Project,
@@ -380,8 +376,7 @@ impl ReadService {
         Ok(NodesResult {
             nodes,
             source,
-            coverage: semantic_coverage(FactFamily::Nodes, &self.snapshot),
-            snapshot: self.snapshot.clone(),
+            warnings: self.warnings(),
         })
     }
 
@@ -389,10 +384,9 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for unsupported history, cursor, projection, or scope.
+    /// Returns [`ReadError`] for unsupported history, projection, or scope.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
         validate_common(
-            params.cursor.is_some(),
             params.projection.is_some(),
             params.rev.is_some(),
             params.scope,
@@ -401,10 +395,14 @@ impl ReadService {
             return Err(ReadFault::unsupported("symbol history"));
         }
         let limit = accepted_limit(params.limit)?;
-        let hits = self
+        // The whole ranked match set is collected up to the index's own `results_max`
+        // bound, so `pagination.total_pages` counts the full result set the pages divide.
+        let matches = self
             .index
-            .symbols(&params.name, limit)
-            .map_err(ReadFault::index)?
+            .symbols(&params.name, self.index.results_max())
+            .map_err(ReadFault::index)?;
+        let (window, pagination) = page(matches, params.page_index, limit);
+        let hits = window
             .into_iter()
             .map(|matched| GetSymbolHit {
                 symbol: wire_symbol(matched),
@@ -418,9 +416,8 @@ impl ReadService {
             .collect();
         Ok(GetSymbolResult {
             hits,
-            coverage: complete_coverage(&self.snapshot),
-            next_cursor: None,
-            snapshot: self.snapshot.clone(),
+            pagination,
+            warnings: self.warnings(),
         })
     }
 }
@@ -436,7 +433,6 @@ pub(crate) fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
 }
 
 pub(crate) fn validate_common(
-    cursor: bool,
     projection: bool,
     rev: bool,
     scope: SearchScope,
@@ -447,13 +443,41 @@ pub(crate) fn validate_common(
             "combines with projection; a read serves one tree",
         ));
     }
-    if cursor || projection {
-        return Err(ReadFault::unsupported("cursor and projection reads"));
+    if projection {
+        return Err(ReadFault::unsupported("projection reads"));
     }
     if scope == SearchScope::Dependencies {
         return Err(ReadFault::unsupported("dependency reads"));
     }
     Ok(())
+}
+
+/// Cuts one page out of a fully collected result set and states where the page sits.
+///
+/// Work is bounded upstream: every caller collects at most the index's `results_max`
+/// results before paging. `limit` is positive - `accepted_limit` refuses zero - so
+/// `total_pages` is `results.len().div_ceil(limit)`, zero for an empty set. A
+/// `page_index` past the last page yields an empty page carrying the requested index
+/// and the true page count.
+pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
+    assert!(
+        limit > 0,
+        "page limit must be positive after acceptance: limit={limit}"
+    );
+    let total = results.len();
+    let total_pages = u64::try_from(total.div_ceil(limit)).unwrap_or(u64::MAX);
+    let pagination = Pagination {
+        page_index,
+        total_pages,
+    };
+    let start = usize::try_from(page_index)
+        .ok()
+        .and_then(|index| index.checked_mul(limit));
+    let window = match start {
+        Some(start) if start < total => results.into_iter().skip(start).take(limit).collect(),
+        _ => Vec::new(),
+    };
+    (window, pagination)
 }
 
 fn wire_node(file: &IndexedFile, node: &RustNode) -> Node {
@@ -604,21 +628,57 @@ fn node_address(file: &IndexedFile, range: ByteRange) -> String {
     )
 }
 
-/// The snapshot one read service captures at build time: every revision
-/// field is the indexed tree's content digest, and `revision` carries the
-/// resolved commit for a revision-addressed service.
-fn captured_snapshot(index: &WorkspaceIndex, revision: Option<RevisionId>) -> ReadSnapshot {
-    let digest = wire_digest(&workspace_digest(index));
-    ReadSnapshot {
+/// Tree revisions captured when one read service is built, at full SHA-256
+/// length: the `stale_index` comparison runs over the full digests, and only
+/// the truncated wire form reaches a warning.
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedRevisions {
+    /// Full digest of the targeted tree when the read began.
+    tree_revision: String,
+    /// Full digest of the tree the published index covers.
+    index_tree_revision: String,
+}
+
+impl CapturedRevisions {
+    /// Warnings for an answer served from these revisions: one `stale_index`
+    /// when the published index lags the tree the read captured, none when
+    /// the two digests match.
+    pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
+        if self.index_tree_revision == self.tree_revision {
+            return Vec::new();
+        }
+        let index_tree_revision = wire_digest(&self.index_tree_revision);
+        let captured_tree_revision = wire_digest(&self.tree_revision);
+        let detail = format!(
+            "the answer was computed from an index at tree revision {} that lags the \
+             captured tree revision {}; resend the request after the server publishes a \
+             fresh snapshot",
+            index_tree_revision.0, captured_tree_revision.0,
+        );
+        vec![ReadWarning::StaleIndex {
+            index_tree_revision,
+            captured_tree_revision,
+            detail,
+        }]
+    }
+
+    /// The captured tree revision truncated to its wire form: the first
+    /// `DIGEST_WIRE_CHARS` lowercase hex characters.
+    pub(crate) fn wire_tree_revision(&self) -> &str {
+        &self.tree_revision[..DIGEST_WIRE_CHARS]
+    }
+}
+
+/// The revisions one read service captures at build time. The captured tree
+/// and the indexed tree both derive from the one index the service holds, so
+/// a service built here observes them equal; `CapturedRevisions::warnings`
+/// guards the comparison all the same, so an index resolved apart from its
+/// capture cannot lag silently.
+fn captured_revisions(index: &WorkspaceIndex) -> CapturedRevisions {
+    let digest = workspace_digest(index);
+    CapturedRevisions {
         tree_revision: digest.clone(),
-        index: Some(IndexSnapshot {
-            revision: digest.clone(),
-            tree_revision: digest.clone(),
-            freshness: Freshness::Current,
-            source_revision: digest.clone(),
-        }),
-        source_revision: digest,
-        revision,
+        index_tree_revision: digest,
     }
 }
 
@@ -650,8 +710,7 @@ pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
 /// wire constructor for a witness or a `Digest`. A 64-character digest reaching the wire is a
 /// defect this stays the single choke point against.
 pub(crate) fn digest_hex8(source: &str) -> String {
-    let fingerprint = Sha256::digest(source.as_bytes());
-    format!("{fingerprint:x}")[..DIGEST_WIRE_CHARS].to_owned()
+    digest_wire_hex(&Sha256::digest(source.as_bytes()))
 }
 
 /// Truncates an already-hashed full-length hex digest to its wire form. `full` keeps
@@ -661,41 +720,10 @@ fn wire_digest(full: &str) -> Digest {
     Digest(full[..DIGEST_WIRE_CHARS].to_owned())
 }
 
-/// Renders the leading `OPAQUE_ID_DIGEST_CHARS` base32 characters of one digest, minting an
-/// opaque `chg_`-style identity.
-///
-/// RFC 4648 base32 omits `0`, `1`, `8`, and `9` to avoid confusion with `O`, `I`, `B`, and
-/// `g`; opaque identities use its lowercase form.
-pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
-    let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
-    encoded.truncate(OPAQUE_ID_DIGEST_CHARS);
-    encoded
-}
-
-/// Complete coverage for a request served in full from `snapshot`, carrying the real
-/// revisions the answer used - never a fabricated digest.
-pub(crate) fn complete_coverage(snapshot: &ReadSnapshot) -> Coverage {
-    let revision = snapshot.index.as_ref().map_or_else(
-        || snapshot.tree_revision.clone(),
-        |index| index.revision.clone(),
-    );
-    Coverage::Complete {
-        state: CoverageCompleteState::Complete,
-        scope: CoverageScope::Reach {
-            reach: CoverageReach::Request,
-        },
-        origins: vec![ProviderOrigin {
-            provider: ProviderId(RUST_READ_PROVIDER_ID.to_owned()),
-            revision,
-            tree_revision: snapshot.tree_revision.clone(),
-            freshness: Freshness::Current,
-            source_revision: snapshot.source_revision.clone(),
-        }],
-    }
-}
-
-fn semantic_coverage(family: FactFamily, snapshot: &ReadSnapshot) -> SemanticCoverage {
-    SemanticCoverage(BTreeMap::from([(family, complete_coverage(snapshot))]))
+/// Renders one already-computed SHA-256 digest in the `DIGEST_WIRE_CHARS` wire form, the
+/// truncation behind [`digest_hex8`] and the minted `ChangeId`.
+pub(crate) fn digest_wire_hex(digest: &sha2::digest::Output<Sha256>) -> String {
+    format!("{digest:x}")[..DIGEST_WIRE_CHARS].to_owned()
 }
 
 /// Finds the symbol a witnessed syntax node belongs to.
@@ -774,10 +802,9 @@ mod tests {
 
     use rift_core::SourceVisibility;
     use rift_protocol::read::{
-        Digest, GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, ReadSnapshot,
-        RevisionId,
+        GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, RevisionId,
     };
-    use serde_json::{Value, json};
+    use serde_json::json;
     use tempfile::TempDir;
 
     use super::{ReadFault, ReadService, WorkspaceIndexLimits};
@@ -895,25 +922,56 @@ pub fn compute() -> i32 {
                 .as_str()
                 .is_some_and(|id| id.starts_with("rift://node/rust/"))
         );
-        assert_eq!(
-            value["snapshot"]["tree_revision"].as_str().map(str::len),
-            Some(8)
-        );
+        assert_eq!(value["warnings"], json!([]));
         Ok(())
     }
 
     /// The wire `Digest` truncates to eight characters, but the internal identity computation
-    /// it truncates from keeps its full sixty-four-character SHA-256, unchanged from before
-    /// this release: freshness and any future identity comparison still work off the strong
-    /// hash, not the short wire witness.
+    /// it truncates from keeps its full sixty-four-character SHA-256: the `stale_index`
+    /// comparison and any future identity comparison work off the strong hash, not the short
+    /// wire witness.
     #[test]
     fn workspace_digest_keeps_its_full_hash_before_wire_truncation() -> TestResult {
         let (_directory, service) = fixture()?;
         let full = super::workspace_digest(service.index());
         assert_eq!(full.len(), 64);
-        let wire = &service.snapshot().tree_revision.0;
+        let wire = service.tree_revision();
         assert_eq!(wire.len(), 8);
-        assert!(full.starts_with(wire.as_str()));
+        assert!(full.starts_with(wire));
+        Ok(())
+    }
+
+    /// Equal index and capture digests warn nothing: the answer's index covers the tree the
+    /// read captured.
+    #[test]
+    fn captured_revisions_matching_digests_carry_no_warnings() {
+        let digest = "aa".repeat(32);
+        let revisions = super::CapturedRevisions {
+            tree_revision: digest.clone(),
+            index_tree_revision: digest,
+        };
+        assert_eq!(revisions.warnings(), Vec::new());
+    }
+
+    /// A lagging index emits one `stale_index` warning carrying both wire digests, so the
+    /// caller sees which two trees disagree.
+    #[test]
+    fn captured_revisions_lagging_index_emits_stale_index_with_both_digests() -> TestResult {
+        let revisions = super::CapturedRevisions {
+            tree_revision: "bb".repeat(32),
+            index_tree_revision: "aa".repeat(32),
+        };
+        let warnings = serde_json::to_value(revisions.warnings())?;
+        assert_eq!(warnings.as_array().map(Vec::len), Some(1));
+        let warning = &warnings[0];
+        assert_eq!(warning["code"], json!("stale_index"));
+        assert_eq!(warning["index_tree_revision"], json!("aaaaaaaa"));
+        assert_eq!(warning["captured_tree_revision"], json!("bbbbbbbb"));
+        let detail = warning["detail"].as_str().ok_or("detail must be prose")?;
+        assert!(
+            detail.contains("aaaaaaaa") && detail.contains("bbbbbbbb"),
+            "the detail must state both wire digests: {detail}"
+        );
         Ok(())
     }
 
@@ -940,40 +998,10 @@ pub fn compute() -> i32 {
             value["hits"][0]["symbol"]["origin"]["unit"],
             json!("rift://source/project/src/lib.rs")
         );
-        assert_eq!(value["next_cursor"], Value::Null);
-        Ok(())
-    }
-
-    /// `complete_coverage` fills its `ProviderOrigin` from the snapshot the answer actually
-    /// used; a fabricated all-zero digest here would be a defect.
-    #[test]
-    fn get_symbol_coverage_origins_carry_the_snapshots_real_revisions() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
-        let value = serde_json::to_value(service.get_symbol(&params)?)?;
-        let snapshot_tree = value["snapshot"]["tree_revision"].clone();
-        let snapshot_source = value["snapshot"]["source_revision"].clone();
-        let origin = &value["coverage"]["origins"][0];
-        assert_eq!(origin["tree_revision"], snapshot_tree);
-        assert_eq!(origin["source_revision"], snapshot_source);
-        assert_ne!(origin["tree_revision"], json!("00000000"));
-        Ok(())
-    }
-
-    /// `complete_coverage` falls back to `tree_revision` when the read consulted no index,
-    /// instead of unwrapping the absent `IndexSnapshot`.
-    #[test]
-    fn complete_coverage_falls_back_to_tree_revision_without_an_index_snapshot() -> TestResult {
-        let snapshot = ReadSnapshot {
-            tree_revision: Digest("deadbeef".to_owned()),
-            index: None,
-            source_revision: Digest("cafef00d".to_owned()),
-            revision: None,
-        };
-        let value = serde_json::to_value(super::complete_coverage(&snapshot))?;
-        assert_eq!(value["origins"][0]["revision"], json!("deadbeef"));
-        assert_eq!(value["origins"][0]["tree_revision"], json!("deadbeef"));
-        assert_eq!(value["origins"][0]["source_revision"], json!("cafef00d"));
+        assert_eq!(
+            value["pagination"],
+            json!({ "page_index": 0, "total_pages": 1 })
+        );
         Ok(())
     }
 
@@ -1199,8 +1227,8 @@ pub fn compute() -> i32 {
             .find(|node| node["kind"] == "rust.impl_item")
             .ok_or("fixture must witness the impl_item node")?;
         assert!(
-            impl_node["symbol"].is_null(),
-            "impl_item is not itself a declared symbol"
+            impl_node.get("symbol").is_none(),
+            "impl_item is not itself a declared symbol, so the member stays off the wire"
         );
         Ok(())
     }
@@ -1242,16 +1270,12 @@ pub fn compute() -> i32 {
             value["hits"][0]["source"]["text"], "pub fn beacon() {}",
             "the committed body answers, not the drifted working tree"
         );
-        let revision = value["snapshot"]["revision"]
-            .as_str()
-            .ok_or("a revision read's snapshot must carry the resolved commit")?;
-        assert_eq!(revision.len(), 40, "the echo is the full commit id");
-        assert!(revision.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(value["warnings"], json!([]));
         Ok(())
     }
 
     #[test]
-    fn revision_snapshot_differs_from_the_drifted_working_tree() -> TestResult {
+    fn revision_tree_digest_differs_from_the_drifted_working_tree() -> TestResult {
         let directory = committed_fixture()?;
         let at_head = revision_service(directory.path(), "main")?;
         let working = ReadService::build(
@@ -1261,14 +1285,14 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::default(),
         )?;
         assert_ne!(
-            at_head.snapshot().tree_revision,
-            working.snapshot().tree_revision,
+            at_head.tree_revision(),
+            working.tree_revision(),
             "drifted bytes must produce a different tree digest"
         );
         assert_eq!(
-            working.snapshot().revision,
+            working.revision(),
             None,
-            "a working-tree read carries no revision echo"
+            "a working-tree read serves no resolved commit"
         );
         Ok(())
     }
@@ -1334,6 +1358,92 @@ pub fn compute() -> i32 {
             "the request does not match the documented form: field rev, \
              violation charset_forbidden; correct the reported field and \
              resend the request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn page_of_an_empty_set_reports_zero_total_pages() {
+        let (window, pagination) = super::page(Vec::<u8>::new(), 0, 5);
+        assert_eq!(window, Vec::<u8>::new());
+        assert_eq!(pagination.page_index, 0);
+        assert_eq!(pagination.total_pages, 0);
+    }
+
+    #[test]
+    fn page_zero_serves_the_first_window_by_default() {
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5], 0, 2);
+        assert_eq!(window, vec![1, 2]);
+        assert_eq!(pagination.page_index, 0);
+        assert_eq!(pagination.total_pages, 3);
+    }
+
+    #[test]
+    fn page_count_is_exact_for_a_set_that_divides_evenly() {
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6], 1, 3);
+        assert_eq!(window, vec![4, 5, 6]);
+        assert_eq!(pagination.total_pages, 2);
+    }
+
+    #[test]
+    fn page_count_rounds_up_and_the_last_page_carries_the_remainder() {
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6, 7], 2, 3);
+        assert_eq!(window, vec![7]);
+        assert_eq!(pagination.total_pages, 3);
+    }
+
+    #[test]
+    fn page_past_the_end_is_empty_and_keeps_the_true_page_count() {
+        let (window, pagination) = super::page(vec![1, 2, 3], 9, 2);
+        assert_eq!(window, Vec::<i32>::new());
+        assert_eq!(pagination.page_index, 9);
+        assert_eq!(pagination.total_pages, 2);
+    }
+
+    /// The window offset is `page_index * limit` at checked boundaries: an index whose
+    /// offset cannot be represented is past every collectable page, never a panic.
+    #[test]
+    fn page_index_beyond_arithmetic_range_is_an_empty_page() {
+        let (window, pagination) = super::page(vec![1, 2, 3], u64::MAX, usize::MAX);
+        assert_eq!(window, Vec::<i32>::new());
+        assert_eq!(pagination.page_index, u64::MAX);
+        assert_eq!(pagination.total_pages, 1);
+    }
+
+    #[test]
+    fn get_symbol_pages_walk_the_full_match_set_without_overlap() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let first: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon", "limit": 1}))?;
+        let first_value = serde_json::to_value(service.get_symbol(&first)?)?;
+        assert_eq!(
+            first_value["pagination"],
+            json!({ "page_index": 0, "total_pages": 2 })
+        );
+        let second: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "limit": 1, "page_index": 1}))?;
+        let second_value = serde_json::to_value(service.get_symbol(&second)?)?;
+        assert_eq!(
+            second_value["pagination"],
+            json!({ "page_index": 1, "total_pages": 2 })
+        );
+        assert_eq!(second_value["hits"].as_array().map(Vec::len), Some(1));
+        assert_ne!(
+            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            "consecutive pages must serve distinct declarations"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_symbol_page_past_the_end_is_empty_with_the_true_page_count() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "limit": 1, "page_index": 40}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        assert_eq!(value["hits"], json!([]));
+        assert_eq!(
+            value["pagination"],
+            json!({ "page_index": 40, "total_pages": 2 })
         );
         Ok(())
     }

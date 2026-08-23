@@ -32,13 +32,16 @@ Invoke the downloaded script block with `-Version` to install an exact release:
 & ([scriptblock]::Create((irm https://volar.sh/rift/install.ps1))) -Version v0.0.2
 ```
 
-Installers select native x86-64 or Arm64 archive, verify release checksum, and install under current
-user account. Without a version argument or `RIFT_VERSION`, each installer resolves latest release.
+The installers select the native x86-64 or Arm64 archive, verify the release checksum, and
+install under the current user account. Without a version argument or `RIFT_VERSION`, each
+installer resolves the latest release.
 
 ## MCP
 
-Run `rift mcp` from a Rust codebase. Rift exposes `search`, `get_symbol`, and `nodes` over stdio
-MCP. Later reads include edits made through Rift or another filesystem tool, such as a formatter.
+Run `rift mcp` from a Rust codebase. Rift exposes structured reads (`search`, `get_symbol`,
+`nodes`) and precondition-guarded changes (`replace_symbol`, `insert_symbol`, `replace_node`,
+`patch`) over stdio MCP. Later reads include edits made through Rift or another filesystem tool,
+such as a formatter.
 
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration
 uses `rift` as command and `["mcp"]` as arguments.
@@ -49,8 +52,8 @@ uses `rift` as command and `["mcp"]` as arguments.
 rift update
 ```
 
-The command downloads latest checksummed native release, validates its version, and atomically
-replaces current executable.
+The command downloads the latest checksummed native release, validates its version, and
+atomically replaces the current executable.
 
 ## Protocol development
 
@@ -66,8 +69,8 @@ just generate-check
 
 ## Rust development
 
-Rust uses toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `cargo-audit`,
-`cargo-deny`, and `cargo-llvm-cov`, then run same gates as CI from repository root:
+Rust uses the toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `cargo-audit`,
+`cargo-deny`, and `cargo-llvm-cov`, then run the same gates as CI from the repository root:
 
 | Command | Gate |
 | --- | --- |
@@ -83,17 +86,18 @@ Rust uses toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `carg
 | `just installer-test` | Offline curl and irm installer contract |
 | `just rust-gate` | Every gate above |
 
-GitHub Actions runs each target separately so failed gate remains visible by name.
+GitHub Actions runs each target separately, so a failed gate stays visible by name.
 
-Install pre-commit hook with `uvx pre-commit install`. It runs `just rust-gate`, including same
-coverage and Cargo policy checks enforced by CI.
+Install the pre-commit hook with `uvx pre-commit install`. It runs `just rust-gate`, including
+the same coverage and Cargo policy checks CI enforces.
 
 ## Rift releases
 
-Pushing a `vX.Y.Z` tag on a commit from `main` starts one Rift release pipeline. Tag version must
-match workspace version. Release environment approval gates publication after native binaries and
-current documentation pass their validation gates.
+Pushing a `vX.Y.Z` tag on a commit from `main` starts one Rift release pipeline. The tag version
+must match the workspace version. Release environment approval gates publication after native
+binaries and current documentation pass their validation gates.
 
-Each release contains checksummed, provenance-attested archives for Linux, macOS, and Windows on
-x86-64 and Arm64. Unix archives contain `rift`; Windows archives contain `rift.exe`. After release
-publication, same pipeline deploys latest documentation and installers to `volar.sh/rift`.
+Each release contains checksummed archives with GitHub artifact attestations for Linux, macOS,
+and Windows on x86-64 and Arm64. Unix archives contain `rift`; Windows archives contain
+`rift.exe`. After release publication, the same pipeline deploys the latest documentation and
+installers to `volar.sh/rift`.

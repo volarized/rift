@@ -1474,7 +1474,10 @@ mod tests {
             .structured_content
             .ok_or("get_symbol must return structured content")?;
         assert_eq!(structured["hits"][0]["symbol"]["name"], "beacon");
-        assert_eq!(structured["next_cursor"], serde_json::Value::Null);
+        assert_eq!(
+            structured["pagination"],
+            json!({ "page_index": 0, "total_pages": 1 })
+        );
 
         let search = client
             .call_tool(
@@ -2043,7 +2046,7 @@ pub fn beacon() -> u64 {
             |_, _| {
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
-                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        id: ChangeId("0123abcd".to_owned()),
                         paths: Vec::new(),
                         edits: Vec::new(),
                         diagnostics: Vec::new(),
@@ -2091,7 +2094,7 @@ pub fn beacon() -> u64 {
                 })?;
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
-                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        id: ChangeId("0123abcd".to_owned()),
                         paths: Vec::new(),
                         edits: Vec::new(),
                         diagnostics: Vec::new(),
@@ -2150,7 +2153,7 @@ pub fn beacon() -> u64 {
                 fs::write(&nested_gitignore, "").expect("nested gitignore scaffold must write");
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
-                        id: ChangeId("chg_abcdefghijklmnopqrstuvwxyz".to_owned()),
+                        id: ChangeId("0123abcd".to_owned()),
                         paths: Vec::new(),
                         edits: Vec::new(),
                         diagnostics: Vec::new(),

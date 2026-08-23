@@ -124,16 +124,6 @@ const fn wire_guidance(code: ErrorCode) -> (&'static str, RetryDirective, &'stat
             RetryDirective::Never,
             "request the declaration without its body, or read a source-backed unit",
         ),
-        ErrorCode::CursorInvalid => (
-            "the cursor does not continue the request it was sent with",
-            RetryDirective::Never,
-            "page with the cursor exactly as returned, on the request that minted it",
-        ),
-        ErrorCode::CursorExpired => (
-            "the cursor's captured results are no longer retained",
-            RetryDirective::Never,
-            "restart the request from its first page",
-        ),
         ErrorCode::Cancelled => (
             "the request was cancelled before it completed",
             RetryDirective::SameRequest,
@@ -571,11 +561,11 @@ mod tests {
 
     #[test]
     fn rendered_failure_without_context_keeps_explanation_and_action() {
-        let rendered = render_failure(ErrorName::Wire(ErrorCode::CursorExpired).descriptor(), &[]);
+        let rendered = render_failure(ErrorName::Wire(ErrorCode::Cancelled).descriptor(), &[]);
         assert_eq!(
             rendered,
-            "the cursor's captured results are no longer retained; \
-             restart the request from its first page"
+            "the request was cancelled before it completed; \
+             resend the request if the result is still needed"
         );
     }
 

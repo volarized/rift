@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
 /// Stable failure class for one request. `ErrorData.retry` carries the
-/// instance-specific retry decision; unsupported coverage and edit refusal
-/// use typed domain results instead.
+/// instance-specific retry decision; edit refusal uses typed domain
+/// results instead.
 #[derive(
     Clone,
     Copy,
@@ -40,12 +40,6 @@ pub enum ErrorCode {
     ResourceNotFound,
     /// The entry is known but its bytes cannot be read.
     ContentUnavailable,
-    /// The cursor is malformed, or it was minted for a different request, order or page
-    /// size.
-    CursorInvalid,
-    /// The cursor is valid, but its captured result page set left the process-local cache
-    /// through eviction or process restart.
-    CursorExpired,
     /// The caller cancelled, or the connection closed before the request finished.
     Cancelled,
     /// A request, response, or capture crossed an advertised limit. `limit` identifies the
@@ -95,7 +89,7 @@ pub enum RetryDirective {
 pub enum ErrorPhase {
     /// Reading workspace or provider data.
     Read,
-    /// Turning an address or a cursor into the concrete thing it names at a state.
+    /// Turning an address into the concrete thing it names at a state.
     Resolve,
     /// Checking a proposed change against the state it was pinned to.
     Check,
@@ -245,8 +239,6 @@ mod tests {
             (ErrorCode::PermissionDenied, "permission_denied"),
             (ErrorCode::ResourceNotFound, "resource_not_found"),
             (ErrorCode::ContentUnavailable, "content_unavailable"),
-            (ErrorCode::CursorInvalid, "cursor_invalid"),
-            (ErrorCode::CursorExpired, "cursor_expired"),
             (ErrorCode::Cancelled, "cancelled"),
             (ErrorCode::LimitExceeded, "limit_exceeded"),
             (ErrorCode::StorageFailure, "storage_failure"),

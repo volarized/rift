@@ -1,11 +1,11 @@
 //! Validates and verifies the behaviour of every advertised tool on the MCP
 //! surface: each corpus request against the tool's advertised input schema,
 //! each structured result against its advertised output schema, and every
-//! sub-variant a result can take - the `next_cursor` string and `null` arms,
-//! cohesive cursor walkthroughs across pages, and so on. The walk follows any
-//! cursor a result returns, so live pagination joins the gate as soon as a
-//! read mints one. Every `ChangeResult` arm is proven the same way: applied
-//! (with and without parser findings), and refused for a failed
+//! sub-variant a result can take. The walk follows a paginated result page
+//! by page - `page_index` climbing under the result's own `total_pages` -
+//! so a live multi-page answer and the empty page past the end are both
+//! proven against the schema. Every `ChangeResult` arm is proven the same
+//! way: applied (with and without parser findings), and refused for a failed
 //! precondition, an ambiguous target, and an unsupported file-level change -
 //! plus a live witnessed `replace_node` that lands after the walk.
 
@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// Most cursor pages one corpus request may walk before the gate fails.
+/// Most pages one corpus request may walk before the gate fails.
 const FOLLOWED_PAGES_MAX: usize = 16;
 
 /// Sample validation corpus with various scenarios: one request per
@@ -37,6 +37,14 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("search", json!({ "query": "beacon" })),
         ("search", json!({ "query": "beacon", "limit": 1 })),
+        (
+            "search",
+            json!({ "query": "beacon", "limit": 1, "page_index": 100 }),
+        ),
+        (
+            "get_symbol",
+            json!({ "name": "beacon", "limit": 1, "page_index": 50 }),
+        ),
         (
             "search",
             json!({ "query": "beacon", "paths": { "include": ["lib.rs"] } }),
@@ -153,7 +161,7 @@ fn lexical_search_corpus() -> Vec<(&'static str, Value)> {
 }
 
 /// Revision-addressed requests, one per read tool: each answers from the
-/// fixture's committed baseline and proves the snapshot's revision echo.
+/// fixture's committed baseline.
 fn revision_read_corpus() -> Vec<(&'static str, Value)> {
     vec![
         ("get_symbol", json!({ "name": "beacon_one", "rev": "main" })),
@@ -237,6 +245,17 @@ fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
         .ok_or_else(|| "tool arguments must be an object".into())
 }
 
+/// The result rows a paginated answer pages: search hits or symbol hits. None for a tool
+/// whose result carries no pagination.
+fn paged_rows<'result>(name: &str, structured: &'result Value) -> Option<&'result [Value]> {
+    let rows = match name {
+        "search" => "results",
+        "get_symbol" => "hits",
+        _ => return None,
+    };
+    structured[rows].as_array().map(Vec::as_slice)
+}
+
 fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     let failures: Vec<String> = validator
         .iter_errors(instance)
@@ -278,11 +297,20 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 }
 
 /// Proves one tool result carries no oversized digest and no non-project source-unit
-/// resolver, and that every `search` hit names its project-relative path.
+/// resolver, that every `search` hit names its project-relative path, and that every
+/// read result carries empty `warnings`: the live server resolves one published
+/// workspace per request, so no request can observe a lagging index.
 fn assert_wire_hygiene(name: &str, structured: &Value) {
     let context = format!("{name} result");
     assert_no_bare_sha256_digest(structured, &context);
     assert_source_unit_ids_use_project_resolver(structured, &context);
+    if matches!(name, "get_symbol" | "search" | "nodes") {
+        assert_eq!(
+            structured["warnings"],
+            json!([]),
+            "a live {name} result must carry empty warnings: {structured:#}"
+        );
+    }
     if name == "search"
         && let Some(results) = structured["results"].as_array()
     {
@@ -369,33 +397,16 @@ async fn served_fixture() -> TestResult<(
 /// one was never produced.
 #[derive(Default)]
 struct CorpusArms {
-    null_cursor_pages: usize,
-    present_cursor_pages: usize,
-    revision_snapshots: usize,
-    current_tree_snapshots: usize,
+    multi_page_results: usize,
+    past_end_pages: usize,
     applied_changes: usize,
     applied_with_findings: usize,
     refusal_reasons: BTreeSet<String>,
 }
 
 impl CorpusArms {
-    /// Records which snapshot-revision and change-status arms one structured
-    /// result proves.
-    fn observe(&mut self, name: &str, structured: &Value) {
-        match &structured["snapshot"]["revision"] {
-            Value::String(commit) => {
-                assert_eq!(
-                    commit.len(),
-                    40,
-                    "{name} snapshot revision must be the full commit id: {commit}"
-                );
-                self.revision_snapshots += 1;
-            }
-            Value::Null if structured.get("snapshot").is_some() => {
-                self.current_tree_snapshots += 1;
-            }
-            _ => {}
-        }
+    /// Records which change-status arms one structured result proves.
+    fn observe(&mut self, structured: &Value) {
         match structured["status"].as_str() {
             Some("applied") => {
                 self.applied_changes += 1;
@@ -418,18 +429,11 @@ impl CorpusArms {
     /// Fails the walk unless every tracked arm was produced live.
     fn assert_proven(&self) {
         assert!(
-            self.null_cursor_pages > 0 && self.present_cursor_pages > 0,
-            "the corpus must prove both next_cursor arms against the schema: \
-             null_cursor_pages={}, present_cursor_pages={}",
-            self.null_cursor_pages,
-            self.present_cursor_pages
-        );
-        assert!(
-            self.revision_snapshots > 0 && self.current_tree_snapshots > 0,
-            "the corpus must prove both snapshot.revision arms against the schema: \
-             revision_snapshots={}, current_tree_snapshots={}",
-            self.revision_snapshots,
-            self.current_tree_snapshots
+            self.multi_page_results > 0 && self.past_end_pages > 0,
+            "the corpus must prove a multi-page result set and an empty page past the end: \
+             multi_page_results={}, past_end_pages={}",
+            self.multi_page_results,
+            self.past_end_pages
         );
         assert!(
             self.applied_changes >= 3 && self.applied_with_findings >= 1,
@@ -522,8 +526,8 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
         loop {
             assert!(
                 followed_pages <= FOLLOWED_PAGES_MAX,
-                "cursor walk for {name} exceeded {FOLLOWED_PAGES_MAX} pages: \
-                 the fixture is too large or pagination never terminates"
+                "page walk for {name} exceeded {FOLLOWED_PAGES_MAX} pages: \
+                 the fixture is too large or the page count never converges"
             );
             assert_validates(input_validator, &request, &format!("{name} request"));
             let result = call_tool_retrying_acceptance(
@@ -536,35 +540,87 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 .ok_or_else(|| format!("{name} must return structured content"))?;
             assert_validates(output_validator, &structured, &format!("{name} result"));
             assert_wire_hygiene(name, &structured);
-            arms.observe(name, &structured);
-            if structured.get("next_cursor").is_some() {
-                let mut continued = structured.clone();
-                continued["next_cursor"] = json!("b3BhcXVl");
-                assert_validates(
-                    output_validator,
-                    &continued,
-                    &format!("{name} result with a present cursor"),
+            arms.observe(&structured);
+            let Some(pagination) = structured.get("pagination") else {
+                break;
+            };
+            let page_index = pagination["page_index"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} pagination.page_index must be an integer"));
+            let total_pages = pagination["total_pages"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} pagination.total_pages must be an integer"));
+            let requested_page = request
+                .get("page_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            assert_eq!(
+                page_index, requested_page,
+                "{name} must answer the page the request asked for"
+            );
+            if total_pages > 1 {
+                arms.multi_page_results += 1;
+            }
+            if page_index >= total_pages {
+                let rows =
+                    paged_rows(name, &structured).ok_or_else(|| format!("{name} result rows"))?;
+                assert!(
+                    rows.is_empty(),
+                    "{name} page {page_index} past total_pages {total_pages} must be empty: \
+                     {structured:#}"
                 );
-                arms.present_cursor_pages += 1;
+                arms.past_end_pages += 1;
+                break;
             }
-            match &structured["next_cursor"] {
-                Value::String(cursor) => {
-                    arms.present_cursor_pages += 1;
-                    followed_pages += 1;
-                    request["cursor"] = json!(cursor);
-                }
-                Value::Null => {
-                    arms.null_cursor_pages += 1;
-                    break;
-                }
-                other => panic!("{name} next_cursor must be a string or null, got {other}"),
+            if page_index + 1 >= total_pages {
+                break;
             }
+            followed_pages += 1;
+            request["page_index"] = json!(page_index + 1);
         }
     }
     arms.assert_proven();
 
     client.cancel().await?;
     server_task.await?;
+    Ok(())
+}
+
+/// Every advertised tool carries at least one authored request example and
+/// one authored result example, and each example validates against the
+/// schema that carries it. The examples ride the exported document into the
+/// docs, so a drifted example is a contract defect the same way a drifted
+/// schema is - and a future tool cannot ship exampleless.
+#[test]
+fn every_tool_example_validates_against_its_advertised_schemas() -> TestResult {
+    let document: Value = serde_json::from_str(&rift_mcp::schema::schema_document())?;
+    let tools = document["tools"]
+        .as_array()
+        .ok_or("the exported document must list tools")?;
+    assert!(!tools.is_empty(), "the exported document must list tools");
+    for tool in tools {
+        let name = tool["name"]
+            .as_str()
+            .ok_or("every exported tool must carry a name")?;
+        for plane in ["input_schema", "output_schema"] {
+            let schema = &tool[plane];
+            let examples = schema["examples"]
+                .as_array()
+                .unwrap_or_else(|| panic!("tool {name} must carry at least one {plane} example"));
+            assert!(
+                !examples.is_empty(),
+                "tool {name} must carry at least one {plane} example"
+            );
+            let validator = jsonschema::validator_for(schema)?;
+            for (index, example) in examples.iter().enumerate() {
+                assert_validates(
+                    &validator,
+                    example,
+                    &format!("{name} {plane} example {index}"),
+                );
+            }
+        }
+    }
     Ok(())
 }
 

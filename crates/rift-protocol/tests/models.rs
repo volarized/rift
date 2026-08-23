@@ -1,5 +1,5 @@
 //! Behavior of the model logic this crate itself owns: documented wire
-//! defaults, required-but-nullable fields, and the cross-field schema
+//! defaults, optional-field omission, and the cross-field schema
 //! constraints. Serialization of the derived shapes is exercised by the MCP
 //! server tests, not re-proven here.
 
@@ -45,29 +45,27 @@ fn search_traversal_fills_documented_hop_and_node_bounds() -> TestResult {
 }
 
 #[test]
-fn diagnostic_accepts_null_code_and_span_but_not_their_absence() -> TestResult {
-    let with_nulls = json!({
+fn diagnostic_omits_absent_code_span_and_language() -> TestResult {
+    let minimal = json!({
         "severity": "error",
-        "code": null,
         "message": "mismatched types",
-        "span": null,
         "related": [],
         "tags": [],
         "reliability": "reliable",
         "continuation": "unknown",
-        "extensions": {},
-        "language": null
+        "extensions": {}
     });
-    let diagnostic: Diagnostic = serde_json::from_value(with_nulls.clone())?;
+    let diagnostic: Diagnostic = serde_json::from_value(minimal.clone())?;
     assert_eq!(diagnostic.severity, Severity::Error);
     assert_eq!(diagnostic.code, None);
+    assert_eq!(diagnostic.span, None);
+    assert_eq!(diagnostic.language, None);
     assert_eq!(diagnostic.reliability, DiagnosticReliability::Reliable);
-
-    let mut without_code = with_nulls;
-    without_code.as_object_mut().expect("object").remove("code");
-    let refused = serde_json::from_value::<Diagnostic>(without_code)
-        .expect_err("a diagnostic without a code field must be refused");
-    assert!(refused.to_string().contains("code"));
+    assert_eq!(
+        serde_json::to_value(&diagnostic)?,
+        minimal,
+        "absent optional members must stay off the wire"
+    );
     Ok(())
 }
 

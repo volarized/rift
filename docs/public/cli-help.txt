@@ -1,0 +1,29 @@
+$ rift --help
+agentic development toolkit
+
+Usage: rift [COMMAND]
+
+Commands:
+  mcp     Serve agents over stdio MCP by proxying this workspace's rift server
+  server  Manage this workspace's HTTP MCP server
+  update  Replace current Rift binary with latest official release
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+$ rift server --help
+Manage this workspace's HTTP MCP server
+
+Usage: rift server <COMMAND>
+
+Commands:
+  start    Start this workspace's server, detached unless --foreground
+  stop     Stop this workspace's server
+  restart  Stop this workspace's server, then start a fresh detached one
+  status   Report whether this workspace's server is serving
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help

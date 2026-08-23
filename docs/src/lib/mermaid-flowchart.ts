@@ -114,7 +114,7 @@ async function parseFlowchartNow(source: string): Promise<FlowGraph> {
   // `flowchart` and `graph` both land on `flowchart-v2`. Anything else parsed
   // fine but has a database this renderer cannot read.
   if (!type.startsWith("flowchart")) {
-    throw new Error(`IsoDiagram expects a mermaid flowchart, got "${type}"`);
+    throw new Error(`FlatDiagram expects a mermaid flowchart, got "${type}"`);
   }
 
   const flow = db as FlowchartDb;

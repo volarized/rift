@@ -5,9 +5,6 @@
 //! keywords are spelled once in the private `keyword` module, model property
 //! names are proven against the model structs by the `property!` macro, and
 //! wire values come from serializing the model enums themselves.
-//! [`nullable`] is the field-level
-//! rule: it restores the `null` arm that `#[schemars(required)]` removes
-//! from an `Option` field.
 
 use crate::read::{SearchHit, SearchParams, SearchParamsTarget, SearchScope};
 use schemars::Schema;
@@ -28,9 +25,6 @@ mod keyword {
     pub(super) const REQUIRED: &str = "required";
     pub(super) const CONST: &str = "const";
     pub(super) const ENUM: &str = "enum";
-    pub(super) const TYPE: &str = "type";
-    pub(super) const NULL: &str = "null";
-    pub(super) const REFERENCE: &str = "$ref";
     pub(super) const DESCRIPTION: &str = "description";
     pub(super) const MAX_ITEMS: &str = "maxItems";
 }
@@ -191,54 +185,6 @@ fn described(description: &str, mut clause: Value) -> Value {
 fn wire<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value)
         .unwrap_or_else(|error| unreachable!("wire models serialize to JSON values: {error}"))
-}
-
-/// Restores the `null` arm that `#[schemars(required)]` removes from an
-/// `Option` field's schema.
-///
-/// The attribute keeps the field in `required` by generating the inner
-/// type's schema, and that schema alone rejects the `null` the server
-/// serializes for `None`. Every required-but-nullable field pairs the two:
-/// `#[schemars(required, transform = schema::nullable)]`.
-pub fn nullable(schema: &mut Schema) {
-    let object = schema.ensure_object();
-    match object.get_mut(keyword::TYPE) {
-        Some(Value::String(name)) => {
-            let name = std::mem::take(name);
-            object.insert(keyword::TYPE.to_owned(), json!([name, keyword::NULL]));
-        }
-        Some(Value::Array(names)) => {
-            if !names.iter().any(|name| name == keyword::NULL) {
-                names.push(json!(keyword::NULL));
-            }
-        }
-        _ => nullable_without_type(object),
-    }
-}
-
-/// Extends a schema that names no `type`: a reference, an enumeration, or a
-/// composition-only object gains an explicit `null` arm.
-fn nullable_without_type(object: &mut Map<String, Value>) {
-    let null_arm = json!({ keyword::TYPE: keyword::NULL });
-    if let Some(reference) = object.remove(keyword::REFERENCE) {
-        object.insert(
-            keyword::ANY_OF.to_owned(),
-            json!([{ keyword::REFERENCE: reference }, null_arm]),
-        );
-        return;
-    }
-    if let Some(Value::Array(values)) = object.get_mut(keyword::ENUM) {
-        if !values.iter().any(Value::is_null) {
-            values.push(Value::Null);
-        }
-        return;
-    }
-    let description = object.remove(keyword::DESCRIPTION);
-    let inner = std::mem::take(object);
-    if let Some(description) = description {
-        object.insert(keyword::DESCRIPTION.to_owned(), description);
-    }
-    object.insert(keyword::ANY_OF.to_owned(), json!([inner, null_arm]));
 }
 
 /// A `rift:range` value: the smallest and largest accepted spelling, both
@@ -627,73 +573,6 @@ mod tests {
 
     fn schema_from(value: Value) -> Schema {
         Schema::try_from(value).expect("test schema literal must be a valid schema object")
-    }
-
-    #[test]
-    fn test_nullable_scalar_type_becomes_type_array() {
-        let mut schema = schema_from(json!({ "type": "string", "minLength": 1 }));
-        nullable(&mut schema);
-        assert_eq!(
-            schema.as_value(),
-            &json!({ "type": ["string", "null"], "minLength": 1 })
-        );
-    }
-
-    #[test]
-    fn test_nullable_type_array_gains_null_once() {
-        let mut schema = schema_from(json!({ "type": ["string", "integer"] }));
-        nullable(&mut schema);
-        nullable(&mut schema);
-        assert_eq!(
-            schema.as_value(),
-            &json!({ "type": ["string", "integer", "null"] })
-        );
-    }
-
-    #[test]
-    fn test_nullable_reference_gains_any_of_null_arm() {
-        let mut schema = schema_from(json!({
-            "$ref": "#/$defs/Cursor",
-            "description": "Cursor for the next page."
-        }));
-        nullable(&mut schema);
-        assert_eq!(
-            schema.as_value(),
-            &json!({
-                "description": "Cursor for the next page.",
-                "anyOf": [{ "$ref": "#/$defs/Cursor" }, { "type": "null" }]
-            })
-        );
-    }
-
-    #[test]
-    fn test_nullable_enum_gains_null_value_once() {
-        let mut schema = schema_from(json!({ "enum": ["authored", "generated"] }));
-        nullable(&mut schema);
-        nullable(&mut schema);
-        assert_eq!(
-            schema.as_value(),
-            &json!({ "enum": ["authored", "generated", null] })
-        );
-    }
-
-    #[test]
-    fn test_nullable_composition_only_schema_is_wrapped_keeping_description() {
-        let mut schema = schema_from(json!({
-            "description": "One of two shapes.",
-            "oneOf": [{ "required": ["span"] }, { "required": ["line"] }]
-        }));
-        nullable(&mut schema);
-        assert_eq!(
-            schema.as_value(),
-            &json!({
-                "description": "One of two shapes.",
-                "anyOf": [
-                    { "oneOf": [{ "required": ["span"] }, { "required": ["line"] }] },
-                    { "type": "null" }
-                ]
-            })
-        );
     }
 
     #[test]

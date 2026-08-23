@@ -10,16 +10,14 @@ import type { FlowGraph, FlowLinkStyle } from "@/lib/mermaid-flowchart";
  *   1. *Where things go* is dagre's problem - the same layered layout mermaid
  *      itself runs for a flowchart. It works on a plane and knows nothing about
  *      how that plane is going to be looked at.
- *   2. *What things look like* belongs to the renderer, which stands the plane
- *      up in three.js under an orthographic camera on the isometric diagonal.
+ *   2. *What things look like* belongs to the renderer. `FlatDiagram` maps
+ *      the ground plane's `x` across the page and `z` down it and draws SVG.
  *
- * Nothing here projects anything. The scene comes out flat and the camera does
- * the rest - which is what lets the renderer lay live DOM into the same plane
- * as the geometry and have the two agree exactly.
+ * Nothing here projects anything. The scene comes out flat and the renderer
+ * decides how the plane is drawn.
  *
  * Sizes are in CSS pixels, because every size in the diagram is ultimately set
- * by a font size and a label's advance width is only knowable in pixels. The
- * renderer maps pixels to world units with a single constant.
+ * by a font size and a label's advance width is only knowable in pixels.
  *
  * `@dagrejs/dagre` is a devDependency on purpose: this module is imported by a
  * React Server Component, so it runs once during the build and the layout is

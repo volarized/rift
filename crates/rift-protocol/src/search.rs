@@ -4,8 +4,9 @@
 //! paths keep resolving.
 
 use crate::read::{
-    Coverage, Cursor, DiagnosticContext, File, Node, ProjectPath, ProjectionId, ReadSnapshot,
-    Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitSpan, Symbol, SymbolId,
+    DiagnosticContext, File, Node, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ProjectionId,
+    ReadWarning, Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitSpan, Symbol,
+    SymbolId,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -40,10 +41,10 @@ pub struct FieldFilter {
     /// against a list and Rift rejects them.
     pub op: FieldFilterOp,
     /// The operand, for every op except `in` and `exists`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<serde_json::Value>,
     /// The operands for `in`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<serde_json::Value>>,
 }
 
@@ -163,6 +164,7 @@ pub enum MatchedField {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct PathPattern(
+    #[schemars(example = &"src/**")]
     #[schemars(regex(
         pattern = r"^(?!/)(?!\.\.?(/|$))(?!.*(/\.\.?)(/|$))[^\\\u0000-\u001F\u007F]+$"
     ))]
@@ -252,31 +254,31 @@ pub struct PathSelector {
 #[schemars(transform = schema::require_kind_or_facet)]
 pub struct RelationFilter {
     /// Exact relationship kinds a provider emits. Any listed kind matches.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<Vec<String>>,
     /// Portable relationship facets. Any listed facet matches.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facet: Option<Vec<RelationshipFacet>>,
     /// Which way the edge runs, seen from the entity being filtered.
     pub direction: RelationFilterDirection,
     /// What has to be true of the entity at the other end. Nesting a filter here is how
     /// "callers that are tests" becomes one query.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<Box<Filter>>,
     /// How many edges to walk before a hit counts. Above 1 this asks about indirect
     /// neighbours and skips the direct ones.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64))]
     pub min_depth: Option<u64>,
     /// How many edges a traversal may cross. Only edges that compose carry a depth -
     /// `contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`,
     /// `mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing
     /// to walk, and Rift rejects it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64, max = 100_u64))]
     pub max_depth: Option<u64>,
     /// Whether a match needs such an edge, or needs there to be none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantifier: Option<RelationFilterQuantifier>,
 }
 
@@ -306,9 +308,8 @@ pub enum RelationFilterQuantifier {
     NotExists,
 }
 
-/// The total order a paginated answer comes back in, named in the request so a cursor can be
-/// bound to it. Every order ends in the result's own identity, so two results that tie never
-/// swap places between pages.
+/// The total order a paginated answer comes back in. Every order ends in the result's own
+/// identity, so two results that tie never swap places between pages.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -330,41 +331,41 @@ pub enum ResultOrder {
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file - whichever `target` allowed.
     pub hit: SearchHitTarget,
-    /// How well this hit matched. Scores are comparable across every page of one request
-    /// and nowhere else.
+    /// How well this hit matched. Scores are comparable within one answer and nowhere
+    /// else.
     pub score: f64,
     /// Which indexed fields produced the match.
     pub matched_by: Vec<MatchedField>,
     /// Edges from this hit, requested with `include: ["relationships"]`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationships: Option<Vec<Relationship>>,
     /// The source text around the hit, requested with `include: ["source"]`. Covers the
     /// hit's `span`; a caller that needs the range already has it there.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// What providers reported here, requested with `include: ["diagnostics"]`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Vec<DiagnosticContext>>,
-    /// Where the hit is written in the source catalog. Null for a symbol whose source is
-    /// unavailable or synthetic.
-    #[serde(default)]
+    /// Where the hit is written in the source catalog. Absent for a symbol whose source
+    /// is unavailable or synthetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceUnitSpan>,
-    /// The 1-based source line where the hit begins, or null with `span`.
-    #[serde(default)]
+    /// The 1-based source line where the hit begins, or absent with `span`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64))]
     pub line: Option<u64>,
-    /// Project-relative path of the hit, where the location is a project path. Null for a
-    /// hit whose only location is a dependency or standard-library source unit.
-    #[serde(default)]
+    /// Project-relative path of the hit, where the location is a project path. Absent for
+    /// a hit whose only location is a dependency or standard-library source unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<ProjectPath>,
     /// Shortest relationship path from `traversal.seed` to this hit. Present whenever the
     /// traversal reached the hit, including a hit also matched lexically.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 2))]
     pub traversal_path: Option<Vec<GraphHop>>,
     /// Number of edges in `traversal_path`. It is present exactly when `traversal_path` is
     /// present and equals its length.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64, max = 2_u64))]
     pub distance: Option<u64>,
 }
@@ -430,6 +431,71 @@ pub enum SearchIntent {
 /// narrows project-only searches.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
+#[schemars(extend("examples" = [
+    {
+        "target": "all",
+        "order": "relevance",
+        "query": "load_config",
+        "paths": {
+            "include": [
+                "src/**"
+            ],
+            "exclude": [],
+            "force_include": []
+        },
+        "include": [
+            "source",
+            "signature"
+        ],
+        "limit": 20,
+        "page_index": 0,
+        "scope": "project"
+    },
+    {
+        "target": "symbol",
+        "filter": {
+            "kind": "all",
+            "all": [
+                {
+                    "kind": "field",
+                    "field": {
+                        "field": "facets",
+                        "op": "contains",
+                        "value": "callable"
+                    }
+                },
+                {
+                    "kind": "relation",
+                    "relation": {
+                        "direction": "incoming",
+                        "facet": [
+                            "calls"
+                        ],
+                        "target": {
+                            "kind": "field",
+                            "field": {
+                                "field": "facets",
+                                "op": "contains",
+                                "value": "test"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        "limit": 10
+    },
+    {
+        "target": "symbol",
+        "traversal": {
+            "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+            "intent": "find_tests",
+            "max_nodes": 50
+        },
+        "limit": 25
+    }
+]))]
 #[schemars(transform = schema::restrict_traversal_and_paths)]
 #[schemars(transform = schema::require_query_filter_or_traversal)]
 #[schemars(transform = schema::forbid_search_rev_with_projection)]
@@ -439,50 +505,50 @@ pub struct SearchParams {
     /// and Node records that bind it, and filters can search those attachments.
     #[serde(default = "default_search_params_target")]
     pub target: SearchParamsTarget,
-    /// Which total order the page comes back in. The cursor is bound to it, so it cannot
-    /// change between pages of one query. Omitted, relevance.
+    /// Which total order the page comes back in. Omitted, relevance.
     #[serde(default = "default_search_params_order")]
     pub order: ResultOrder,
     /// Text to match against file contents, symbol names, and rendered signatures. Matching
     /// is case-insensitive and identifier-aware - the query and the fields split on case
     /// and underscore boundaries, so `loadConfig` finds `load_config`. Scoring is
-    /// server-defined and stable for one cursor's life.
-    #[serde(default)]
+    /// server-defined and comparable within one answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     /// A predicate over resolved fields and relationships. This is where provider knowledge
     /// enters a search - implements this trait, called by that function, declared under
     /// `src/api`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
     /// Files eligible for the search, selected by project-relative globs. Omitted selects
     /// every visible file.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<PathSelector>,
     /// Extra payload to attach to every hit. Each entry costs a lookup per hit, so the
     /// caller requests only what it will read.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<SearchInclude>>,
     /// Most hits to return in one page. `max_page_items` from the workspace resource caps
     /// it, and fewer may come back.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64, max = 10_000_u64))]
     pub limit: Option<u64>,
-    /// Continues a previous search where its last page ended. Omit it for the first page;
-    /// everything else in the request has to match what the cursor was minted for.
-    #[serde(default)]
-    pub cursor: Option<Cursor>,
-    /// The projection to search. Null searches the workspace tree.
-    #[serde(default)]
+    /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
+    /// the last page returns an empty page whose `pagination` carries the requested
+    /// `page_index` and the true `total_pages`.
+    #[serde(default = "default_search_params_page_index")]
+    pub page_index: u64,
+    /// The projection to search. Omitted searches the workspace tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<ProjectionId>,
     /// The version-control revision to search - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Null searches the current tree, and `rev`
-    /// never combines with `projection`. The server refuses a revision search when the
-    /// workspace has no version-control repository.
-    #[serde(default)]
+    /// workspace's version control spells it. Omitted searches the current tree, and
+    /// `rev` never combines with `projection`. The server refuses a revision search when
+    /// the workspace has no version-control repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
     /// A bounded relationship walk. It may stand alone or add graph hits to a lexical or
     /// filtered search; duplicate symbols keep their shortest path.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traversal: Option<SearchTraversal>,
     /// Source locations eligible for results. Project is the default; select dependencies
     /// or all when the answer may live outside the workspace.
@@ -496,6 +562,10 @@ fn default_search_params_target() -> SearchParamsTarget {
 
 fn default_search_params_order() -> ResultOrder {
     ResultOrder::Relevance
+}
+
+fn default_search_params_page_index() -> u64 {
+    PAGE_INDEX_DEFAULT
 }
 
 fn default_search_params_scope() -> SearchScope {
@@ -519,22 +589,178 @@ pub enum SearchParamsTarget {
     All,
 }
 
-/// One page of search hits from one captured tree and index revision. `coverage` states
-/// whether an empty result proves that no indexed candidate matched.
+/// One page of search hits from one captured tree.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "results": [
+            {
+                "hit": {
+                    "target": "symbol",
+                    "symbol": {
+                        "id": "rift://symbol/rust/src/config.rs/load_config",
+                        "language": {
+                            "name": "rust"
+                        },
+                        "name": "load_config",
+                        "kind": "rust.function",
+                        "facets": [
+                            "value",
+                            "callable",
+                            "public"
+                        ],
+                        "origin": {
+                            "location": {
+                                "kind": "project"
+                            },
+                            "source_kind": "authored",
+                            "unit": "rift://source/project/src/config.rs"
+                        },
+                        "modifiers": [],
+                        "visibility": "pub",
+                        "types": [
+                            {
+                                "role": "return",
+                                "origin": "declared",
+                                "type": {
+                                    "language": {
+                                        "name": "rust"
+                                    },
+                                    "source": "Result<Config, ConfigError>",
+                                    "extensions": {}
+                                }
+                            }
+                        ],
+                        "signatures": [
+                            {
+                                "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+                                "links": [
+                                    {
+                                        "range": {
+                                            "start": 42,
+                                            "end": 48
+                                        },
+                                        "symbol": "rift://symbol/rust/src/config.rs/Config"
+                                    }
+                                ],
+                                "language": {
+                                    "name": "rust"
+                                },
+                                "parameters": [
+                                    {
+                                        "name": "path",
+                                        "types": [
+                                            {
+                                                "role": "parameter",
+                                                "origin": "declared",
+                                                "type": {
+                                                    "language": {
+                                                        "name": "rust"
+                                                    },
+                                                    "source": "&Path",
+                                                    "extensions": {}
+                                                }
+                                            }
+                                        ],
+                                        "optional": false,
+                                        "variadic": false,
+                                        "extensions": {}
+                                    }
+                                ],
+                                "returns": [
+                                    {
+                                        "role": "return",
+                                        "origin": "declared",
+                                        "type": {
+                                            "language": {
+                                                "name": "rust"
+                                            },
+                                            "source": "Result<Config, ConfigError>",
+                                            "extensions": {}
+                                        }
+                                    }
+                                ],
+                                "type_parameters": [],
+                                "throws": [],
+                                "effects": [],
+                                "extensions": {}
+                            }
+                        ],
+                        "documentation": [
+                            {
+                                "format": "markdown",
+                                "text": "Loads the workspace configuration from `rift.toml`."
+                            }
+                        ],
+                        "extensions": {},
+                        "document_local": false
+                    }
+                },
+                "score": 0.9,
+                "matched_by": [
+                    "name"
+                ],
+                "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 162,
+                        "end": 355
+                    }
+                },
+                "line": 10,
+                "path": "src/config.rs"
+            },
+            {
+                "hit": {
+                    "target": "file",
+                    "file": {
+                        "id": "rift://file/src/lib.rs",
+                        "content": {
+                            "kind": "regular",
+                            "size": 241,
+                            "executable": false
+                        },
+                        "languages": [
+                            {
+                                "name": "rust"
+                            }
+                        ],
+                        "regions": [],
+                        "semantic": true
+                    }
+                },
+                "score": 1.0,
+                "matched_by": [
+                    "content"
+                ],
+                "source": "    let config = load_config(&arguments.path)?;",
+                "span": {
+                    "unit": "rift://source/project/src/lib.rs",
+                    "range": {
+                        "start": 121,
+                        "end": 168
+                    }
+                },
+                "line": 7,
+                "path": "src/lib.rs"
+            }
+        ],
+        "pagination": {
+            "page_index": 0,
+            "total_pages": 3
+        },
+        "warnings": []
+    }
+]))]
 pub struct SearchResult {
-    /// Tree and search-index revisions used for this result page.
-    pub snapshot: ReadSnapshot,
-    /// Coverage of the indexed candidate set used for this search. An empty result proves
-    /// no match only where this is complete.
-    pub coverage: Coverage,
     /// The hits on this page, in the order the request asked for.
     pub results: Vec<SearchHit>,
-    /// Cursor for the next page, or null after the final result.
-    #[serde(deserialize_with = "crate::read::deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
-    pub next_cursor: Option<Cursor>,
+    /// Where this page sits in the full result set under the request's `limit`.
+    pub pagination: Pagination,
+    /// Warnings attached to this result, empty when there is nothing to warn about.
+    pub warnings: Vec<ReadWarning>,
 }
 
 /// Default `max_hops` for a search traversal: one hop, because a second hop can multiply weak
@@ -555,11 +781,11 @@ pub struct SearchTraversal {
     pub intent: SearchIntent,
     /// Direction to walk. Omitted selects incoming for `find_tests` and `edit_ripple`,
     /// outgoing for `trace`, and both for `review_context`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<TraversalDirection>,
     /// Portable relationship facets eligible for expansion. Omitted selects `tests` for
     /// `find_tests` and `calls` for every other intent; an empty list is `invalid_request`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub facets: Option<Vec<RelationshipFacet>>,
     /// Maximum path length from `seed`. The server accepts 1 or 2; one hop is the default
@@ -599,10 +825,22 @@ pub enum TraversalDirection {
 #[cfg(test)]
 mod tests {
     use super::{
-        PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_HOPS_DEFAULT,
-        SEARCH_TRAVERSAL_NODES_DEFAULT, SearchTraversal,
+        PAGE_INDEX_DEFAULT, PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_HOPS_DEFAULT,
+        SEARCH_TRAVERSAL_NODES_DEFAULT, SearchParams, SearchTraversal,
     };
     use serde_json::json;
+
+    /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
+    /// from the schema; this pins the advertised default to the constant the field's
+    /// default function returns.
+    #[test]
+    fn search_params_schema_page_index_default_equals_the_enforced_constant() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
+        assert_eq!(
+            schema["properties"]["page_index"]["default"],
+            json!(PAGE_INDEX_DEFAULT)
+        );
+    }
 
     #[test]
     fn path_pattern_violation_classifies_every_schema_rule() {

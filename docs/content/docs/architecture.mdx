@@ -2,9 +2,7 @@
 title: Architecture
 ---
 
-<VersionBadge version="planned" />
-
-import { IsoDiagram } from "@/components/iso-diagram";
+import { FlatDiagram } from "@/components/flat-diagram";
 
 Rift works as a toolkit for agents such as Claude Code and Codex - practically any agentic
 appliance that supports MCP.
@@ -19,7 +17,7 @@ forwards every request to one `rift server` running locally for the workspace. T
 communicate over [Streamable
 HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports).
 
-The `rift server` coordinates source discovery, language providers, and editing tools. Source
+The `rift server` coordinates source discovery, providers, and editing tools. Source
 resolvers identify project files, dependencies, and generated code. Providers analyze that source
 and produce facts such as symbols, syntax nodes, relationships, and diagnostics.
 
@@ -31,7 +29,7 @@ The server also owns edits. Its change tools resolve targets against provider fa
 files. [Hooks](/docs/configuration#hooks) extend this pipeline with configured tools such as
 formatters, linters, and test runners, which check each change after it lands.
 
-<IsoDiagram
+<FlatDiagram
   alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers analyze it, and their facts feed an embedded search index. Semantic providers delegate resolution to language engines - an embedded library, a language server, or a SCIP index - which read the targeted tree and answer with facts and edit plans. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
   chart={`
     flowchart LR
@@ -62,8 +60,9 @@ formatters, linters, and test runners, which check each change after it lands.
 
 <VersionBadge version="v0.0.11" />
 
-When the server starts, it writes a special `.rift/server.json` file following the
-[`ServerLock`](/docs/protocol/reference#ServerLock) model. For example:
+When the server starts, it writes `.rift/server.json` following the
+[`ServerLock`](/docs/protocol/reference#ServerLock) model. The file gives each `rift mcp`
+process the port and token it needs to reach that server. For example:
 
 ```json
 {
@@ -80,13 +79,12 @@ and the rest connect to it.
 
 A reader that cannot reach the recorded port treats the file as stale. The election lock
 releases with its holder, so a stale file never has a live server behind it, and the next
-starter replaces the file. The server also stops itself once no request arrives for the
-configured idle span, and `rift server stop` ends it sooner.
+starter replaces the file.
 
 To enforce a cross-process boundary between OS users, the server persists a token in
-`.rift/server.json`, which only the file's owner can read. Each request must present this token.
-Processes running as the same OS user can read the same token and are not separated by this
-boundary.
+`.rift/server.json`, which only the file's owner can read. Every request carries this token,
+and the server rejects one without it. Processes running as the same OS user can read the same
+token and are not separated by this boundary.
 
 A browser introduces another route to a localhost port: a remote page can issue requests through
 DNS rebinding or a forged origin. The HTTP server therefore accepts only the literal loopback
@@ -103,38 +101,44 @@ None of those short-lived processes can hold the things that are expensive and s
 index, projections, and execution copy - so a long-lived server holds them and every `rift mcp`
 reaches the same one.
 
-And why HTTP rather than a socket? `rift mcp` needs a rendezvous either way, while an HTTP-capable
-agent can connect to the port without `rift mcp`.
+And why HTTP rather than a socket? Either way `rift mcp` has to find the running server, and
+HTTP lets an HTTP-capable agent connect to the port without `rift mcp`.
 </Callout>
 
 On startup the server reads `rift.toml` from the workspace root and accepts the workspace. The
-file decides:
+configuration allows you to describe:
 
 - which languages may execute agent-written code
 - which embedding model, if any, ranks search
 - which hooks run on every change
 
-An edit to the file takes effect for later requests once it is accepted again; a change to
-`rift.toml` made in a projection carries a `configuration` confirmation into
-[`publish`](/docs/protocol/mcp#tool-publish), because publishing it changes which hooks
-and limits the server runs with. An invalid file keeps the workspace unusable until you fix it.
+An edit to the file takes effect for later requests once the server accepts it again. An
+invalid file keeps the workspace unusable until you fix it.
 
-The server exits after thirty minutes without a request. It removes its lock file on the way
-out, and the next `rift mcp` starts a fresh one the usual way. Projections, changesets, and
-execution copies live under `.rift` and survive the exit.
+The server stops itself once no request arrives for the
+[`idle_timeout`](/docs/configuration#server) span, and `rift server stop` ends it sooner. It
+removes its lock file on the way out, and the next `rift mcp` starts a fresh one. Projections,
+changesets, and execution copies live under `.rift` and survive the exit.
+
+`rift server status` reports which of these states the workspace is in - a serving server with
+its port, pid, and version, a stale `.rift/server.json`, or no server - and changes nothing.
 
 ## Source discovery
 
 Before Rift analyzes code, source resolvers discover what belongs to the project and what its
-toolchain already resolved. The built-in project resolver catalogs workspace files. Language and
-package-manager resolvers inspect manifests, lockfiles, installed packages, standard libraries,
-and generated-source registries. They do not download dependencies or change the environment.
+toolchain already resolved. The built-in project resolver catalogs workspace files.
+
+Language and package-manager resolvers inspect manifests, lockfiles, installed packages,
+standard libraries, and generated-source registries. They do not download dependencies or change
+the environment.
 
 Each readable file becomes a [`SourceUnit`](/docs/protocol/reference#SourceUnit) in the
 source catalog. Its `location` says whether it belongs to the project, a dependency, the standard
 library, or an external source. Its `source_kind` separately says whether a human authored it or a
-tool generated it. Generated project code and generated dependency code therefore keep both facts.
-Declarations invented by a language tool have `source_kind: "synthetic"` and no source unit.
+tool generated it.
+
+Generated project code and generated dependency code therefore keep both facts. Declarations
+invented by a language tool have `source_kind: "synthetic"` and no source unit.
 
 A resolver publishes a new catalog revision when its inputs change: workspace files, manifests,
 lockfiles, toolchains, installed packages, or generated-source metadata. Fact providers consume
@@ -143,19 +147,18 @@ which package owns it or which generator produced it.
 
 ## Providers
 
-Providers analyze cataloged source at different depths. Each answer carries per-family
-[coverage](/docs/protocol/reference#Coverage), which names the provider revisions that
-contributed, the tree and source-catalog revisions each one analyzed, their freshness, and how far
-the combined result reaches.
+Providers analyze cataloged source at different depths. An answer carries the facts the serving
+providers resolved. A condition the caller must weigh before relying on the answer - a stale
+index, an absent capability - arrives as a typed entry in the result's `warnings`.
 
 ### Syntax
 
 Rift ships syntax providers based on
 [tree-sitter](https://tree-sitter.github.io/tree-sitter/) by default. They parse readable project,
 dependency, and generated units into declarations, syntax structure, and parse diagnostics. Project
-declarations also receive witnessed node addresses that edit tools can target.
+declarations also receive node addresses that edit tools can target.
 
-Changed paths invalidate their syntax facts and search-index entries for those paths.
+The server invalidates a changed path's syntax facts and search-index entries.
 
 ### Semantics
 
@@ -180,17 +183,18 @@ shapes:
 
 The provider contract is the same in front of every shape, so a language can swap engines -
 or use one engine for facts and another for [edit plans](#semantic-edits) - without changing any
-tool an agent calls. A missing engine degrades rather than breaks: when rust-analyzer is not
-installed, the semantic family reports `unavailable` coverage and syntax facts still answer.
+tool an agent calls. A missing engine degrades the answer: when rust-analyzer is not installed,
+the answer carries no semantic facts and syntax still answers.
 
-The Python provider composition supplies ty with the source catalog and tree-sitter facts. Ty maps
+The Python provider supplies ty with the source catalog and tree-sitter facts. Ty maps
 resolved facts back to the same declarations and concrete source ranges, while syntax remains the
 fallback where semantic analysis has no answer.
 
 Semantic providers can also expose dependency, standard-library, and synthetic declarations when
-their language engine knows them without readable source. The contract describes `types` and
-`relationships` when a provider resolves them. Providers may invalidate dependent facts, such as
-callers after a signature changes.
+their language engine knows them without readable source. Answers carry `types` and
+`relationships` when a provider resolves them.
+
+A provider may invalidate dependent facts, such as callers after a signature changes.
 
 ### History
 
@@ -208,14 +212,15 @@ introduced, body changed, signature changed, moved - that survives renames and f
 Co-change is observed rather than resolved, so it reaches coupling no reference graph
 carries - two implementations of one concept that never mention each other. The walk is
 bounded by [`providers.history.max_revisions`](/docs/configuration#providers),
-and a workspace without version control reports the family `not_applicable`.
+and a workspace without version control serves no history facts.
 
 ### Custom
 
 Custom integrations implement a [source resolver](/docs/protocol/core#source-discovery), a
 [fact provider](/docs/protocol/core#semantic-facts), or both. The contracts stay separate even
-when one language engine implements both capabilities. A family with no serving provider reports
-`unsupported` coverage, which keeps an empty answer distinct from a complete answer with no facts.
+when one language engine implements both capabilities. A family with no serving provider surfaces
+as a typed entry in `warnings`, which keeps an empty answer distinct from a complete answer with
+no facts.
 
 One integration can connect several cooperating pieces through a **provider composition**. Like a
 [scikit-learn pipeline](https://scikit-learn.org/stable/modules/compose.html), the composition gives
@@ -250,37 +255,37 @@ composition.
 The workspace resource assigns each provider a stable
 [`ProviderId`](/docs/protocol/reference#ProviderId) and reports its lifecycle state. A
 provider derives a new immutable fact revision from one tree revision, then publishes the
-revision atomically. While it catches up after a change, requests may use its previous revision;
-the coverage entry marks those facts `stale`. A provider with no usable revision reports
-`unavailable`, and the affected family reports partial coverage.
+revision atomically.
+
+While a provider catches up after a change, requests may serve its previous revision, and the
+result carries a `stale_index` entry in `warnings` naming the two tree revision digests. A
+provider with no usable revision contributes nothing, and the result's `warnings` say so.
 
 A read captures one tree revision, one index revision where it searches, and the provider
-revisions it uses. Later writes create new revisions; they do not alter the captured result or
-later cursor pages.
+revisions it uses. Later writes create new revisions; they do not alter the captured result. A
+request addresses one page with `page_index`, and a page past the end returns an empty page
+with the true `total_pages`.
 
-Providers merge by the order reported for their language in
-[`LanguageSupport.providers`](/docs/protocol/reference#LanguageSupport). The first provider
-that supplies a scalar fact wins that field. Multi-valued facts, including relationships and
-diagnostics, are unioned by canonical identity, and each retained fact keeps its evidence.
-Coverage lists every revision that contributed in the same precedence order, so a consumer can
-distinguish a compiler-resolved answer from a syntax fallback.
+Providers merge in the order the server reports for their language through
+[`rift://workspace`](/docs/protocol/mcp#resource-workspace). The first provider that supplies a
+scalar fact wins that field; the server unions multi-valued facts, including relationships and
+diagnostics, by canonical identity, and each retained fact keeps its evidence.
 
 ## Index
 
 <VersionBadge version="v0.0.8" languages={["Rust"]} />
 
 The server keeps an immutable index over the project's source. Tree-sitter extracts
-declarations and syntax nodes from the files the workspace's source policy includes; the
-badge above names the languages the index currently covers.
+declarations and syntax nodes from the files the workspace's source policy includes.
 
 The server watches the workspace and validates the published index against it before each
 current-tree read, so a read serves the tree as it stands and never combines state from two
-index revisions. The watcher, the rebuild lane, and the swap that keeps this true live on the
-[implementation](/docs/implementation#rift-server) page.
+index revisions. The [implementation](/docs/implementation#rift-server) page describes the
+watcher, the rebuild lane, and the swap that keep this true.
 
-The [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) reports the tree, source-catalog, and
-index revisions used for the answer. It reports the index as current only after request-time
-reconciliation established that the published revision matches the workspace.
+When the published index lags the tree a read captured, the result says so: a `stale_index`
+entry in `warnings` carries the digests of the tree revision the index covers and the revision
+the read captured, so the caller knows the answer may miss the newest writes.
 
 <VersionBadge version="v0.0.9" languages={["Rust"]} />
 
@@ -289,10 +294,11 @@ indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) i
 persist in the workspace database at `.rift/db`, stamped with the tree revision that published
 them.
 
-A search request serves lexical matches only when that stamp equals the snapshot it reads - the
-two disagree while a rebuild is still catching up, or after one failed outright. When they
-disagree, the request serves no lexical matches at all, falling back to identifier and
-source-line matching instead of returning a hit the tree has already moved past.
+A search request serves lexical matches only when that stamp equals the tree revision the read
+captured - the two disagree while a rebuild is still catching up, or after one failed outright.
+When they disagree, the request falls back to identifier and source-line matching instead of
+returning a hit the tree has already moved past, and a `stale_index` entry in `warnings` reports
+the disagreeing revisions.
 
 ### Search
 
@@ -311,9 +317,9 @@ Matching serves two query shapes. An identifier-shaped query - `ReadService`,
 extensions included` - ranks by [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance
 over names, signatures, documentation, and content together.
 
-Names are indexed both as spelled and split into words on case and separator boundaries, so
-`get user name` reaches a declaration spelled `getUserName`, and concept-level recon does not
-depend on guessing the identifier first.
+The server indexes names both as spelled and split into words on case and separator boundaries,
+so `get user name` reaches a declaration spelled `getUserName`, and a concept-level search does
+not depend on guessing the identifier first.
 
 The same tool walks relationships when the starting symbol is known. A
 [`SearchTraversal`](/docs/protocol/reference#SearchTraversal) names that symbol and the
@@ -322,10 +328,9 @@ task selects an edge direction and relationship facets unless the caller supplie
 
 The walk stops after one edge by default and accepts at most two. It also stops after
 `max_nodes`, so a common utility cannot pull its whole transitive caller graph into one answer.
+
 Each graph hit carries the shortest path from the seed, including every relationship's
-source-node evidence, derivation, and the direction Rift followed it. Result coverage names the
-provider revisions used for the answer, so a caller can distinguish syntax-derived paths from
-resolved facts.
+source-node evidence, derivation, and the direction Rift followed it.
 
 Search is lexical by default. Naming an embedding model in
 [`search.embedding`](/docs/configuration#search) adds dense ranking on top: the server
@@ -339,10 +344,11 @@ configured model rebuilds the dense index rather than mixing spaces.
 known. The answer carries the declaration's body inline, so reading a function takes one call
 rather than a search followed by a file read.
 
-Asking for history attaches the symbol's timeline and co-change partners to the same answer. One
-read tells the agent what the code is and how it has changed.
+Asking for history attaches the symbol's timeline and co-change partners to the same answer.
 
 ## Changes
+
+<VersionBadge version="v0.0.4" languages={["Rust"]} />
 
 By default, a change lands in your working tree - the same files your editor and your terminal
 see. Your agent's harness already runs its shell commands and its tests in that checkout;
@@ -363,18 +369,21 @@ anything. If resolution produced no bytes to write, that's a refusal and the tre
 the address was ambiguous, the witness failed. If it produced edits, the change lands, is
 recorded in the tree's changeset, and comes back carrying everything Rift learned about it.
 
-What rides on the result is the part that changes agent behavior. Each applied change carries
-its diagnostics - the syntax provider re-parses what changed - the verdicts of the workspace's
-[hooks](/docs/configuration#hooks), run inside the changed tree, and its
-[`Advisory`](/docs/protocol/reference#Advisory) list: concerns a provider or hook attached
-to exactly this change.
+What rides on the result is the part that changes agent behavior. Each applied change carries:
+
+- its diagnostics - the syntax provider re-parses what changed
+- the verdicts of the workspace's [hooks](/docs/configuration#hooks), run inside the changed tree
+- its [`Advisory`](/docs/protocol/reference#Advisory) list: concerns a provider or hook attached
+  to exactly this change
 
 An advisory the emitter could verify itself arrives already checked, and an open warning
 carries the concrete instruction that settles it - the check to run before trusting the
-change. A checked advisory never carries warning severity, because a verdict must
-not absolve what it did not check.
+change. A checked advisory never carries warning severity, because a warning marks a check
+still to run.
 
 ## Projections
+
+<VersionBadge version="planned" />
 
 Sometimes you don't want the agent writing into your files at all - a refactor you want to
 review whole, or several agents working the same workspace without treading on each other. A
@@ -410,10 +419,10 @@ That's deliberate: plenty of what a developer runs can't be handed a protocol - 
 and the [projection resource](/docs/protocol/mcp#resource-projection) hands out its path.
 
 A write into the directory lands in the projection alone: Rift FS detaches the written path into
-the projection's own store, and the workspace file is never touched. The path stays put until
+the projection's own store, and the workspace file is never touched. The path remains until
 [`projection_remove`](/docs/protocol/mcp#tool-projection_remove) deletes the directory -
 without waiting for whatever still runs inside it, because a lock there would let one abandoned
-`cargo watch` wedge cleanup forever.
+`cargo watch` block cleanup forever.
 
 Rift change tools record their edits as they apply. An ordinary process can bypass those tools by
 writing into the projection directory - and because Rift FS is that directory, the server
@@ -424,8 +433,8 @@ The server groups the observed delta into a
 records the exact changed `paths`, reruns providers and hooks, and attaches an `external`
 confirmation. A copy-backed projection reaches the same summary by comparison: the server checks
 the directory against its manifest before each projection read and publication. Binary files and
-new symlinks stay publishable even though their bytes have no portable `Edit` representation;
-their paths remain the authoritative scope.
+new symlinks stay publishable even though their bytes have no portable
+[`Edit`](/docs/protocol/reference#Edit) representation; the change identifies them by path alone.
 
 That reconciliation can discover a change during `publish`. In that case publication returns
 the newly minted change id in `unaccepted` and writes nothing. The caller reads
@@ -442,9 +451,12 @@ change. The change remains inspectable in the projection, but `publish` refuses 
 accepts it by change id. Deletions and hooks that fail or do not finish produce the same gate,
 because publication is the step that writes the workspace.
 
+A change to `rift.toml` made in a projection carries a `configuration` confirmation into
+`publish`, because publishing it changes which hooks and limits the server runs with.
+
 `publish` also compares each changed path's workspace entry with the manifest entry from which
-that projection path started. A different entry returns in `conflicts`, and nothing is written.
-Publication is serialized workspace-wide; on success Rift writes every changed path, rebuilds
+that projection path started. A different entry returns in `conflicts`, and the server writes
+nothing. Publication is serialized workspace-wide; on success Rift writes every changed path, rebuilds
 the projection from the resulting workspace tree, advances its base revision, and empties its
 changeset and read set.
 
@@ -468,15 +480,20 @@ returning its result.
 During `publish`, the server compares each read dependency that is not also a changed path with
 the current workspace file. A mismatch returns a
 [`DependencyConflict`](/docs/protocol/reference#DependencyConflict) in
-`dependency_conflicts`, and nothing is written. The caller can reread and revise the projection,
-or copy that exact conflict into `accept_dependencies`. The server recomputes the current digest
-while holding the workspace publication lock, so another workspace edit invalidates the copied
-acceptance.
+`dependency_conflicts`, and the server writes nothing.
 
-The read set covers files returned through projection-scoped Rift reads. An empty `search` result
-names no file to record, and a process reading the projection directory bypasses Rift entirely.
-`rift://fs` reads the workspace tree and therefore does not add projection dependencies. Those
-cases require a fresh read when the task depends on absence or on bytes obtained outside Rift.
+The caller can reread and revise the projection, or copy that exact conflict into
+`accept_dependencies`. The server recomputes the current digest while holding the workspace
+publication lock, so another workspace edit invalidates the copied acceptance.
+
+The read set covers files returned through projection-scoped Rift reads. These reads stay
+outside it:
+
+- an empty `search` result names no file to record
+- a process reading the projection directory bypasses Rift entirely
+- `rift://fs` reads the workspace tree, so it adds no projection dependencies
+
+When the task depends on absence or on bytes obtained outside Rift, take a fresh read.
 
 [`projection_restore`](/docs/protocol/mcp#tool-projection_restore) goes the other way,
 refreshing selected changed paths from the current workspace and dropping whole changes that
@@ -485,9 +502,11 @@ other paths retain their original baselines.
 
 Projections outlive the agent that made them. After a server restart,
 [`projection_list`](/docs/protocol/mcp#tool-projection_list) returns the same pinned base.
-`projection_remove` is the operation that deletes the directory and any unpublished work.
+`projection_remove` deletes the directory and any unpublished work.
 
 ## Semantic edits
+
+<VersionBadge version="planned" />
 
 Threading a new parameter through twenty call sites is one decision followed by twenty mechanical
 edits. The change tools address one declaration per call, so that decision costs the agent a read
@@ -518,7 +537,7 @@ lands. A batch indexer needs a tree that holds still: a projection is already pi
 workspace target the server pins an internal tree through [Rift FS](#rift-fs) - that tree feeds
 the indexer and is never a projection the agent has to manage.
 
-<IsoDiagram
+<FlatDiagram
   alt="An agent asks the rift server for a rename, here targeting a projection the agent created. The server requests an edit plan from the language engine - a language server or a SCIP index - which reads the projection directory. The server compiles the plan into witnessed edits, applies them to the projection as one change, and publish carries the result into the workspace tree. A workspace-targeted plan lands in the workspace tree directly."
   chart={`
     flowchart LR
@@ -532,23 +551,26 @@ the indexer and is never a projection the agent has to manage.
 />
 
 An engine can miss sites - a name built at runtime, an occurrence in a doc comment or a template
-no resolver parses. After a plan applies, the server sweeps the projection for surviving
+no resolver parses. After a plan applies, the server sweeps the targeted tree for surviving
 occurrences of the replaced name, and each finding becomes an open warning
-[`Advisory`](/docs/protocol/reference#Advisory) on the change. On a workspace-targeted plan those
-warnings ride the result for the caller to act on, like any direct write's advisories. In a
-projection an open warning mints a
+[`Advisory`](/docs/protocol/reference#Advisory) on the change.
+
+On a workspace-targeted plan those warnings ride the result for the caller to act on, like any
+direct write's advisories. In a projection an open warning mints a
 [`ConfirmationRequirement`](/docs/protocol/reference#ConfirmationRequirement), so
 [`publish`](/docs/protocol/mcp#tool-publish) refuses the rename until someone has looked at what
 the engine left behind.
 
 The engine's whole job is the plan. Everything after it - witnessing, atomic application, the
-publish gate - the server already owned before engines existed, so swapping a language's engine,
+publish gate - is the write path the server already owns, so swapping a language's engine,
 a live language server for a cached SCIP index or the reverse, is a provider change invisible
 above the provider contract. A custom integration contributes a plan source the way it
 contributes facts: implement the [fact provider](/docs/protocol/core#semantic-facts) contract,
 and the composition routes the language to it.
 
 ## Execution
+
+<VersionBadge version="planned" />
 
 [`execute`](/docs/protocol/mcp#tool-execute) evaluates a block of agent-written code in
 the targeted tree's **execution copy** - a directory under `.rift/exec` the server keeps beside
@@ -564,9 +586,11 @@ visible file with the targeted tree's version; the server never synchronizes cop
 The execution copy does not sandbox code. The runtime uses the server's OS permissions, so an
 absolute path can reach outside the copy, including the workspace.
 
-`rift.toml` decides [which languages may execute at all](/docs/configuration#execution).
+`rift.toml` decides [which languages may execute](/docs/configuration#execution).
 
 ## Rift FS
+
+<VersionBadge version="planned" />
 
 Projection directories, execution copies, and the pinned trees batch engines index share one
 requirement: a real directory that is not the workspace. **Rift FS** is the filesystem layer that
@@ -584,7 +608,7 @@ Each served tree holds one contract:
 - Removal is immediate. A process still running inside gets I/O errors; the tree is never
   half-deleted under it.
 
-<IsoDiagram
+<FlatDiagram
   alt="Rift FS serves the workspace tree's pinned base as projection directories and the execution copy. External tools read and write a projection directory; Rift FS routes every access through the rift server, which observes each write, reindexes exactly the changed paths, and notifies a language server rooted in the projection."
   chart={`
     flowchart LR
@@ -610,5 +634,5 @@ nothing in the workspace index. The trees meet only at
 [`publish`](/docs/protocol/mcp#tool-publish), which stays serialized workspace-wide.
 
 Observation also covers the one thing a served tree cannot do: deliver filesystem-watcher
-events. A live language server rooted at a projection is notified by the server instead, which
+events. The server notifies a live language server rooted at a projection instead, since it
 knows every write - the plans it applied and each external one.

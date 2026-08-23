@@ -1,28 +1,40 @@
 ---
 title: Rift
-description: Install Rift, connect its MCP server, and read Rust workspaces.
+description: Install Rift, connect its MCP server, and read a workspace.
 ---
 
-<VersionBadge version="v0.0.8" />
+<VersionBadge version="v0.0.12" languages={["Rust"]} />
 
 Rift is an agentic development toolkit for reading, discovering, and editing codebases.
 
-Rift gives [MCP](https://modelcontextprotocol.io/specification/2026-07-28) agents structured reads
-and precise, precondition-guarded edits over Rust code in the current folder.
+Rift provides [MCP](https://modelcontextprotocol.io/specification/2026-07-28) agents structured
+reads and edits for various programming languages in the project workspace.
+
+<Callout type="info">
+Currently, only Rust is supported, but more languages will be added in upcoming releases.
+</Callout>
 
 ## Install
 
-Linux and macOS:
+<PlatformTabs>
+
+<Tab value="Linux and macOS">
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash
 ```
 
-Windows PowerShell:
+</Tab>
+
+<Tab value="Windows PowerShell">
 
 ```powershell
 irm https://volar.sh/rift/install.ps1 | iex
 ```
+
+</Tab>
+
+</PlatformTabs>
 
 The installer downloads the latest verified release for your platform and installs it for the
 current user. To install a specific version, set the `RIFT_VERSION` environment variable to its
@@ -44,19 +56,19 @@ client's MCP configuration - for Claude Code, `.mcp.json` in the project root:
 }
 ```
 
-## Read Rust code
+## Reads
 
-Rift reads the Rust files in the folder where the MCP client launches `rift mcp`. Later calls
+Rift reads the source files in the folder where the MCP client launches `rift mcp`. Later calls
 include edits made through Rift, your editor, a formatter, or another process.
 
 ### Search
 
 When you know what the code does but not its name, ask your agent to search for it:
 
-> Use Rift to find where workspace file fingerprints are calculated.
+> Use Rift to find all information about server startup.
 
-The agent calls [`search`](/docs/protocol/mcp#tool-search), which returns matching declarations and
-source lines with their paths.
+The agent calls [`search`](/docs/protocol/mcp#tool-search) with the query `server startup`, which
+returns matching declarations and source lines with their paths.
 
 ### Retrieve symbol
 
@@ -72,24 +84,25 @@ The [MCP reference](/docs/protocol/mcp#reads) defines request fields and result 
 integrations. The [index architecture](/docs/architecture#index) explains how Rift keeps those
 reads aligned with filesystem changes.
 
-## Changes
+## Edits
 
-The change tools edit the workspace. Each resolves its address against the served snapshot, proves its
-preconditions against the bytes on disk, and only then writes - atomically, behind one
+The change tools edit the workspace. Each resolves its address against the published index, proves
+its preconditions against the bytes on disk, and only then writes - atomically, behind one
 application lock, so two concurrent changes collide as a clean refusal rather than as
 interleaved bytes:
 
-- `replace_symbol` rewrites one declaration addressed by symbol; the parser derives the span.
-- `insert_symbol` lands a new declaration before or after its anchor, or content at a file
-  target; `create_missing` creates a missing file target first.
-- `replace_node` replaces one syntax node through a witnessed address from `nodes`; a stale
-  witness refuses with the expected and observed values.
-- `patch` applies unified-diff hunks, several files in one change; a context mismatch refuses
-  and the tree stays untouched.
+- [`replace_symbol`](/docs/protocol/mcp#tool-replace_symbol) rewrites one declaration addressed by
+  symbol; the parser derives the span.
+- [`insert_symbol`](/docs/protocol/mcp#tool-insert_symbol) lands a new declaration before or after
+  its anchor, or content at a file target; `create_missing` creates a missing file target first.
+- [`replace_node`](/docs/protocol/mcp#tool-replace_node) replaces one syntax node through a
+  witnessed address from `nodes`; a stale witness refuses with the expected and observed values.
+- [`patch`](/docs/protocol/mcp#tool-patch) applies unified-diff hunks, several files in one
+  change; a context mismatch refuses and the tree stays untouched.
 
 A change that cannot land returns a refusal naming the failed precondition, and the tree is
-untouched. An applied change re-parses what it touched and reports parser findings on the
-result. Every failure carries a stable error code and a suggested action.
+untouched. After a change applies, the server re-parses what it touched and reports parser
+findings on the result. Every failure carries a stable error code and a suggested action.
 
 ## Update
 
@@ -97,26 +110,12 @@ result. Every failure carries a stable error code and a suggested action.
 rift update
 ```
 
-The command downloads the latest checksummed native release into a temporary staging directory,
-validates its version, then replaces the current executable. Unix uses a same-folder atomic rename;
-Windows keeps a rollback binary until replacement starts.
+The command downloads the latest verified release for your platform and replaces the current
+executable.
 
 ## CLI
 
-```text
-agentic development toolkit
-
-Usage: rift [COMMAND]
-
-Commands:
-  mcp     Serve Rust workspace reads and edits over stdio MCP
-  update  Replace current Rift binary with latest official release
-  help    Print this message or the help of the given subcommand(s)
-
-Options:
-  -h, --help     Print help
-  -V, --version  Print version
-```
+<CliHelp />
 
 ## Planned pages
 

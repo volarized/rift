@@ -276,5 +276,30 @@ fn schema_document_is_deterministic_and_sorted_by_name() -> TestResult {
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "tools must be sorted by name");
+
+    for tool in tools {
+        let name = tool["name"].as_str().ok_or("tool name must be a string")?;
+        let input_schema = &tool["input_schema"];
+        let since = input_schema["rift:since"]
+            .as_str()
+            .ok_or("every tool input model must declare rift:since")?;
+        assert!(
+            since.starts_with('v'),
+            "tool version must use release spelling: name={name}, since={since}"
+        );
+        let example = input_schema["examples"]
+            .as_array()
+            .and_then(|examples| examples.first())
+            .ok_or("every tool input model must declare an example")?;
+        let validator = jsonschema::validator_for(input_schema)?;
+        let failures: Vec<String> = validator
+            .iter_errors(example)
+            .map(|failure| failure.to_string())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "tool input example must validate: name={name}, failures={failures:#?}"
+        );
+    }
     Ok(())
 }

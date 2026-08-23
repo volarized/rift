@@ -2,9 +2,9 @@
 //!
 //! `start` spawns a detached `rift server start --foreground` and waits for
 //! its published lock document; `stop` asks the recorded server to shut
-//! down over its own stop route; `restart` chains the two. Every wait is a
-//! bounded poll over [`rift_mcp::probe`] - the election module itself never
-//! polls.
+//! down over its own stop route; `restart` chains the two; `status` prints
+//! one probe's classification and changes nothing. Every wait is a bounded
+//! poll over [`rift_mcp::probe`] - the election module itself never polls.
 
 use std::fmt;
 use std::io;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use rift_core::{CliCode, Error, ErrorContext, ErrorName, Fault};
 use rift_mcp::{
     ElectionError, ElectionFault, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
-    ServerPresence, probe, read_serving, serve_elected, spawn_detached_server,
+    ServerPresence, StaleReason, probe, read_serving, serve_elected, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
 use tokio_util::sync::CancellationToken;
@@ -140,6 +140,8 @@ pub(super) enum ServerCommand {
     Stop,
     /// Stop this workspace's server, then start a fresh detached one.
     Restart,
+    /// Report whether this workspace's server is serving.
+    Status,
 }
 
 /// Where a started server runs.
@@ -172,6 +174,16 @@ pub(super) enum ServerOutcome {
     Stopped,
     /// No server was serving the workspace.
     NotRunning,
+    /// A probe found the workspace's server serving at the contained
+    /// address, built at the contained version.
+    Serving {
+        port: u16,
+        pid: u32,
+        version: String,
+    },
+    /// Lock state exists but names no live server; the next starter
+    /// replaces it. Carries the probe's reason as one phrase.
+    Stale { reason: &'static str },
 }
 
 impl fmt::Display for ServerOutcome {
@@ -189,6 +201,14 @@ impl fmt::Display for ServerOutcome {
             ),
             Self::Stopped => formatter.write_str("rift server stopped"),
             Self::NotRunning => formatter.write_str("no rift server is running for this workspace"),
+            Self::Serving { port, pid, version } => write!(
+                formatter,
+                "rift server listening on 127.0.0.1:{port} (pid {pid}, v{version})"
+            ),
+            Self::Stale { reason } => write!(
+                formatter,
+                "found a stale .rift/server.json ({reason}); the next rift mcp or rift server start replaces it"
+            ),
         }
     }
 }
@@ -214,6 +234,36 @@ pub(super) async fn run(
         },
         ServerCommand::Stop => stop(root).await.map(Some),
         ServerCommand::Restart => restart(root).await.map(Some),
+        ServerCommand::Status => Ok(Some(status(root))),
+    }
+}
+
+/// Reports the workspace's lock state without changing it.
+///
+/// One probe, no HTTP request, no mutation: a stale document stays in
+/// place for the next `rift mcp` or `rift server start` to replace.
+fn status(root: &Path) -> ServerOutcome {
+    match probe(root) {
+        ServerPresence::Serving(lock) => ServerOutcome::Serving {
+            port: lock.port,
+            pid: lock.pid,
+            version: lock.version,
+        },
+        ServerPresence::Stale(reason) => ServerOutcome::Stale {
+            reason: stale_reason_phrase(&reason),
+        },
+        ServerPresence::Absent => ServerOutcome::NotRunning,
+    }
+}
+
+/// The probe's stale classification as one operator-facing phrase.
+fn stale_reason_phrase(reason: &StaleReason) -> &'static str {
+    match reason {
+        StaleReason::DocumentUnreadable => "the document could not be read",
+        StaleReason::DocumentMalformed => "the document is malformed",
+        StaleReason::DocumentInvalid(_) => "the document breaks the lock contract",
+        StaleReason::ElectionUnheld => "no process holds the election lock",
+        StaleReason::ElectionUnobservable => "the election lock state could not be observed",
     }
 }
 
@@ -413,11 +463,12 @@ mod tests {
 
     use super::{
         PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
-        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StartMode, await_serving, await_stopped,
-        discard_stale_document, foreground_refused, holder_evidence, start_mode, stop,
+        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, await_serving,
+        await_stopped, discard_stale_document, foreground_refused, holder_evidence,
+        stale_reason_phrase, start_mode, status, stop,
     };
     use rift_core::Error;
-    use rift_protocol::lock::ServerLock;
+    use rift_protocol::lock::{ServerLock, ServerLockViolation};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -491,6 +542,93 @@ mod tests {
             ServerOutcome::NotRunning.to_string(),
             "no rift server is running for this workspace"
         );
+        assert_eq!(
+            ServerOutcome::Serving {
+                port: 12_345,
+                pid: 42,
+                version: "0.0.11".to_owned(),
+            }
+            .to_string(),
+            "rift server listening on 127.0.0.1:12345 (pid 42, v0.0.11)"
+        );
+        assert_eq!(
+            ServerOutcome::Stale {
+                reason: "no process holds the election lock"
+            }
+            .to_string(),
+            "found a stale .rift/server.json (no process holds the election lock); \
+             the next rift mcp or rift server start replaces it"
+        );
+    }
+
+    #[test]
+    fn stale_reason_phrases_name_each_classification() {
+        let cases = [
+            (
+                StaleReason::DocumentUnreadable,
+                "the document could not be read",
+            ),
+            (StaleReason::DocumentMalformed, "the document is malformed"),
+            (
+                StaleReason::DocumentInvalid(ServerLockViolation::ProcessIdZero),
+                "the document breaks the lock contract",
+            ),
+            (
+                StaleReason::ElectionUnheld,
+                "no process holds the election lock",
+            ),
+            (
+                StaleReason::ElectionUnobservable,
+                "the election lock state could not be observed",
+            ),
+        ];
+        for (reason, phrase) in cases {
+            assert_eq!(stale_reason_phrase(&reason), phrase, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn status_reports_a_serving_holder() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        guard.publish(&holder())?;
+        assert_eq!(
+            status(directory.path()),
+            ServerOutcome::Serving {
+                port: 12_345,
+                pid: 4_242,
+                version: "0.0.11".to_owned(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_reports_a_stale_document_and_keeps_it() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory
+            .path()
+            .join(rift_core::constants::RIFT_STATE_DIRECTORY);
+        std::fs::create_dir_all(&state_directory)?;
+        let document_path = state_directory.join(rift_protocol::lock::SERVER_LOCK_FILE_NAME);
+        std::fs::write(&document_path, serde_json::to_vec(&holder())?)?;
+        assert_eq!(
+            status(directory.path()),
+            ServerOutcome::Stale {
+                reason: "no process holds the election lock"
+            }
+        );
+        assert!(
+            document_path.exists(),
+            "status never discards the stale document"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_reports_an_empty_workspace_as_not_running() {
+        let directory = tempfile::tempdir().expect("workspace fixture must build");
+        assert_eq!(status(directory.path()), ServerOutcome::NotRunning);
     }
 
     #[test]

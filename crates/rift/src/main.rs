@@ -290,6 +290,14 @@ mod tests {
                 command: super::server::ServerCommand::Restart
             })
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["rift", "server", "status"])
+                .expect("status must parse")
+                .command,
+            Some(CliCommand::Server {
+                command: super::server::ServerCommand::Status
+            })
+        ));
         assert!(
             Cli::try_parse_from(["rift", "server"]).is_err(),
             "server without a subcommand must fail"
