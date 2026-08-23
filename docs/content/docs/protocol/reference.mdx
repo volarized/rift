@@ -4,11 +4,8 @@ title: Reference
 
 <VersionBadge version="v0.0.5" languages={["Rust"]} />
 
-The planned reference is generated, not authored: every type on these pages is defined by the
-Rust wire models in `crates/rift-protocol/src`, and the schema document the server exports is
-what a reference page renders. The shipped surface's export lives at
-[`mcp.json`](https://volar.sh/rift/mcp.json).
-
-Until the planned surface ships, type links from these pages name definitions in that export
-where they exist, and the design prose on the [core](/docs/protocol/core) and
-[MCP](/docs/protocol/mcp) pages where they do not.
+Every type this documentation links is defined by the Rust wire models in
+`crates/rift-protocol/src`. The server's export at
+[`mcp.json`](https://volar.sh/rift/mcp.json) carries each served tool's input and output
+schemas, with every `$defs` entry those schemas use; a type link from the protocol pages names
+its definition there.

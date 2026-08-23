@@ -19,24 +19,26 @@ exported as JSON Schema at [`mcp.json`](https://volar.sh/rift/mcp.json), and the
 
 An agent's `rift mcp` reads the workspace's
 [`ServerLock`](/docs/protocol/reference#ServerLock) - or starts the server that writes
-it - and forwards MCP to the endpoint it names. Calls do not open connection-scoped sessions.
-Each call names a [projection](/docs/protocol/mcp#projections), or the workspace tree by
-omitting one, and carries any witnessed address it uses.
+it - and forwards MCP requests to the endpoint it names. Calls do not open connection-scoped
+sessions. Each call names a [projection](/docs/protocol/mcp#projections), or the workspace
+tree by omitting one, and carries any witnessed address it uses.
 
-Cursors refer to process-local captured results. Projections retain changes and read dependencies
-across calls.
+The server retains no capture between calls: a paged read names its page by `page_index`, and
+each page is computed from the request. A projection retains its changes and recorded read
+dependencies across calls.
 
-Node addresses carry content witnesses, so a stale write refuses before replacing moved bytes.
+Node addresses carry content witnesses, so the server refuses a stale write before replacing
+moved bytes.
 When two projections change the same workspace path,
 [`publish`](/docs/protocol/mcp#tool-publish) checks directly by comparing the paths it's
 about to write.
 
 ## Versioning
 
-Rift uses [MCP's protocol versioning](https://modelcontextprotocol.io/specification/draft/basic/versioning)
+Rift uses [MCP's protocol versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
 without adding another version field. The MCP client carries standard MCP version metadata; Rift
 tool arguments contain only arguments declared by each tool's input schema.
 
-The server advertises its current tool and resource schemas through MCP. Dated snapshots under
-`protocol/versions` freeze released Rift contracts for implementers and generated clients; callers
-do not select a snapshot on each request.
+The server advertises its current tool and resource schemas through MCP. A release freezes its
+exported contract for implementers and generated clients; callers do not select a snapshot on
+each request.
