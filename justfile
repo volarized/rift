@@ -10,6 +10,7 @@ generate-check:
     cargo run -q -p rift-mcp --bin rift-schema-export -- --check docs
 
 check:
+    cargo metadata --locked --format-version 1 > /dev/null
     cargo check --workspace --all-targets --all-features
     uv run --script scripts/check_rust_architecture.py
 
