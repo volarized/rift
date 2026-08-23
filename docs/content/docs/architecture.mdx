@@ -333,9 +333,9 @@ the tool.
 Matching serves two query shapes. An identifier-shaped query — `ReadService`,
 `blocking_slots` — matches the declaration names it resembles, split the way code spells them.
 A prose query — `source extensions admitted` — ranks by
-[BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance in the embedded full-text
-index, over names, signatures, documentation, and content together, so concept-level recon does
-not depend on guessing the identifier first.
+[BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance in the FTS5 table the
+[Index](#index) section describes, over names, signatures, documentation, and content together,
+so concept-level recon does not depend on guessing the identifier first.
 
 The same tool walks relationships when the starting symbol is known. A
 [`SearchTraversal`](/docs/protocol/reference#SearchTraversal) names that symbol and the
