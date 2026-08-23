@@ -259,7 +259,7 @@ async fn start_detached(root: &Path) -> Result<ServerOutcome, ServerCommandError
         });
     }
     spawn_detached_server()?;
-    await_serving(root).await
+    await_serving(root, START_POLL_ATTEMPT_COUNT).await
 }
 
 /// Spawns `rift server start --foreground` fully detached.
@@ -283,9 +283,15 @@ fn spawn_detached_server() -> Result<(), ServerCommandError> {
     command.spawn().map(drop).map_err(spawn_failed)
 }
 
-/// Polls until the workspace serves, bounded by [`START_WAIT_MAX`].
-async fn await_serving(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
-    for _ in 0..START_POLL_ATTEMPT_COUNT {
+/// Polls until the workspace serves, bounded by `attempt_count` probes.
+///
+/// The caller passes [`START_POLL_ATTEMPT_COUNT`], which derives from
+/// [`START_WAIT_MAX`] over the poll interval.
+async fn await_serving(
+    root: &Path,
+    attempt_count: u32,
+) -> Result<ServerOutcome, ServerCommandError> {
+    for _ in 0..attempt_count {
         if let Some(lock) = read_serving(root) {
             return Ok(ServerOutcome::Listening {
                 port: lock.port,
@@ -357,7 +363,7 @@ async fn stop(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
     };
     match request_stop(&lock).await? {
         StopAnswer::Accepted => {
-            await_stopped(root, lock).await?;
+            await_stopped(root, lock, STOP_POLL_ATTEMPT_COUNT).await?;
             Ok(ServerOutcome::Stopped)
         }
         StopAnswer::NothingListening => Ok(ServerOutcome::Stopped),
@@ -400,9 +406,17 @@ async fn request_stop(lock: &ServerLock) -> Result<StopAnswer, ServerCommandErro
     }
 }
 
-/// Polls until the workspace stops serving, bounded by [`STOP_WAIT_MAX`].
-async fn await_stopped(root: &Path, holder: ServerLock) -> Result<(), ServerCommandError> {
-    for _ in 0..STOP_POLL_ATTEMPT_COUNT {
+/// Polls until the workspace stops serving, bounded by `attempt_count`
+/// probes.
+///
+/// The caller passes [`STOP_POLL_ATTEMPT_COUNT`], which derives from
+/// [`STOP_WAIT_MAX`] over the poll interval.
+async fn await_stopped(
+    root: &Path,
+    holder: ServerLock,
+    attempt_count: u32,
+) -> Result<(), ServerCommandError> {
+    for _ in 0..attempt_count {
         if !matches!(probe(root), ServerPresence::Serving(_)) {
             return Ok(());
         }
@@ -444,12 +458,18 @@ pub(super) fn error_for_test() -> ServerCommandError {
 
 #[cfg(test)]
 mod tests {
+    use std::future::IntoFuture as _;
+    use std::net::Ipv4Addr;
+
     use super::{
         PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
-        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StartMode, holder_evidence, start_mode,
+        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StartMode, await_serving, await_stopped,
+        discard_stale_document, foreground_refused, holder_evidence, start_mode, stop,
     };
     use rift_core::Error;
     use rift_protocol::lock::ServerLock;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     fn holder() -> ServerLock {
         ServerLock {
@@ -458,6 +478,26 @@ mod tests {
             pid: 4_242,
             version: "0.0.11".to_owned(),
         }
+    }
+
+    /// A holder document naming `port`, for tests that answer on it.
+    fn holder_on(port: u16) -> ServerLock {
+        ServerLock { port, ..holder() }
+    }
+
+    /// A reqwest failure built without any request leaving the process.
+    fn request_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("an invalid url must fail the request build")
+    }
+
+    /// A loopback port nothing listens on: bound to learn the number, then
+    /// released.
+    fn dead_port() -> TestResult<u16> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        Ok(listener.local_addr()?.port())
     }
 
     #[test]
@@ -595,5 +635,148 @@ mod tests {
         assert_eq!(known[1].value(), "4242");
         let unknown = holder_evidence(None);
         assert_eq!(unknown.len(), 1);
+    }
+
+    #[test]
+    fn election_fault_forwards_identity_evidence_and_source() {
+        let election = Error::new(rift_mcp::ElectionFault::AlreadyServing);
+        let expected_code = election.descriptor().code();
+        let expected_context = election.context();
+        let error = Error::new(ServerCommandFault::Election(election));
+        assert_eq!(error.descriptor().code(), expected_code);
+        assert_eq!(error.context(), expected_context);
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the wrapped election failure must stay on the source chain"
+        );
+    }
+
+    #[test]
+    fn spawn_failure_names_its_operation() {
+        let rendered = Error::new(ServerCommandFault::SpawnFailed {
+            source: std::io::Error::other("fixture"),
+        })
+        .to_string();
+        assert!(rendered.contains("spawn detached server"), "{rendered}");
+    }
+
+    #[test]
+    fn stop_request_failure_names_its_operation_and_keeps_its_source() {
+        let error = Error::new(ServerCommandFault::StopRequestFailed {
+            source: request_error(),
+        });
+        assert_eq!(error.descriptor().code(), "server_stop_failed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("stop request"), "{rendered}");
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the request failure must stay on the source chain"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_serving_times_out_against_an_empty_workspace() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let error = await_serving(directory.path(), 1)
+            .await
+            .expect_err("a workspace nobody serves must time the wait out");
+        assert!(matches!(error.fault(), ServerCommandFault::StartTimedOut));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_stopped_times_out_while_the_holder_keeps_serving() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        let document = holder();
+        guard.publish(&document)?;
+        let error = await_stopped(directory.path(), document, 1)
+            .await
+            .expect_err("a still-serving holder must time the wait out");
+        assert!(
+            matches!(error.fault(), ServerCommandFault::StopTimedOut { .. }),
+            "the timeout must carry the holder: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foreground_refusal_maps_election_failures() {
+        let directory = tempfile::tempdir().expect("workspace fixture must build");
+        let already = foreground_refused(
+            directory.path(),
+            Error::new(rift_mcp::ElectionFault::AlreadyServing),
+        );
+        assert!(matches!(
+            already.fault(),
+            ServerCommandFault::AlreadyServing { holder: None }
+        ));
+        let storage = Error::new(rift_mcp::ElectionFault::Storage {
+            operation: "open election file",
+            path: directory.path().join(".rift").join("server.lock"),
+            source: std::io::Error::other("disk gone"),
+        });
+        let passed = foreground_refused(directory.path(), storage);
+        assert!(matches!(passed.fault(), ServerCommandFault::Election(_)));
+        assert_eq!(passed.descriptor().code(), "storage_failure");
+    }
+
+    #[tokio::test]
+    async fn stop_treats_a_dead_recorded_port_as_stopped() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        guard.publish(&holder_on(dead_port()?))?;
+        let outcome = stop(directory.path()).await?;
+        assert_eq!(outcome, ServerOutcome::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_reports_a_refusing_server() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        let refuser = axum::Router::new().route(
+            "/api/stop",
+            axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let serving = tokio::spawn(axum::serve(listener, refuser).into_future());
+        guard.publish(&holder_on(port))?;
+        let error = stop(directory.path())
+            .await
+            .expect_err("a refusing server must fail the stop");
+        serving.abort();
+        assert!(
+            matches!(
+                error.fault(),
+                ServerCommandFault::StopRefused { status }
+                    if *status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            ),
+            "the refusal must carry the answered status: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discard_stale_document_tolerates_a_missing_document() {
+        let directory = tempfile::tempdir().expect("workspace fixture must build");
+        discard_stale_document(directory.path());
+    }
+
+    #[test]
+    fn discard_stale_document_reports_an_unremovable_document() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let document_path = directory
+            .path()
+            .join(rift_core::constants::RIFT_STATE_DIRECTORY)
+            .join(rift_protocol::lock::SERVER_LOCK_FILE_NAME);
+        std::fs::create_dir_all(&document_path)?;
+        discard_stale_document(directory.path());
+        assert!(
+            document_path.exists(),
+            "a directory survives the best-effort removal"
+        );
+        Ok(())
     }
 }

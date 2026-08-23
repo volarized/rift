@@ -2740,6 +2740,7 @@ dependencies = [
 name = "rift"
 version = "0.0.9"
 dependencies = [
+ "axum",
  "clap",
  "flate2",
  "fs4",

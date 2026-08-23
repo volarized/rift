@@ -211,6 +211,15 @@ mod tests {
     }
 
     #[test]
+    fn update_outcome_prints_through_the_cli_outcome() {
+        let outcome = super::CliOutcome::Update(super::update::UpdateOutcome::Current(
+            semver::Version::new(0, 0, 11),
+        ));
+        let rendered = outcome.to_string();
+        assert!(rendered.contains("latest version"), "{rendered}");
+    }
+
+    #[test]
     fn help_identifies_executable_and_mcp_command() {
         let mut command = cli_command();
         command.build();

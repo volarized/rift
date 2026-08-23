@@ -459,13 +459,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use rift_core::{Error, Fault};
     use rift_protocol::lock::{
         SERVER_LOCK_FILE_NAME, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock,
     };
+    use tokio_util::sync::CancellationToken;
+
+    use crate::http::HttpServeFault;
 
     use super::{
         ElectionFault, SERVER_ELECTION_FILE_NAME, ServerPresence, StaleReason, claim, probe,
-        read_serving, served_document,
+        read_serving, serve_elected, serve_http, served_document, shut_down_unpublished,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -724,5 +728,212 @@ mod tests {
             std::error::Error::source(&storage).is_some(),
             "storage faults keep their io source"
         );
+    }
+
+    #[test]
+    fn already_serving_fault_carries_no_evidence_and_no_source() {
+        let fault = ElectionFault::AlreadyServing;
+        assert!(fault.context().is_empty());
+        assert!(Fault::source(&fault).is_none());
+    }
+
+    #[test]
+    fn document_invalid_fault_carries_the_violation_evidence() {
+        let mut document = valid_document();
+        document.pid = 0;
+        let violation = document
+            .validate()
+            .expect_err("a zero pid must break the contract");
+        let fault = ElectionFault::DocumentInvalid(violation);
+        let context = fault.context();
+        assert!(
+            context.iter().any(|entry| entry.key() == "pid"),
+            "the violation's evidence must surface: {context:?}"
+        );
+        assert!(Fault::source(&fault).is_none());
+    }
+
+    #[test]
+    fn serve_fault_forwards_name_evidence_and_source() {
+        let transport = Error::new(HttpServeFault::Serve {
+            operation: "http serve loop",
+            source: Box::new(std::io::Error::other("socket gone")),
+        });
+        let expected_code = transport.descriptor().code();
+        let expected_context = transport.context();
+        let error = ElectionFault::serve(transport);
+        assert_eq!(error.descriptor().code(), expected_code);
+        assert_eq!(error.context(), expected_context);
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the wrapped transport failure must stay on the source chain"
+        );
+    }
+
+    #[test]
+    fn claim_refuses_when_a_file_obstructs_the_state_directory() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join(".rift"), b"a file in the way")?;
+        let error = claim(directory.path()).expect_err("a file at .rift must refuse the claim");
+        assert!(
+            matches!(
+                error.fault(),
+                ElectionFault::Storage {
+                    operation: "create state directory",
+                    ..
+                }
+            ),
+            "the refusal must name the directory creation: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_reports_a_staging_failure() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        let state_directory = directory.path().join(".rift");
+        let saved = fs::metadata(&state_directory)?.permissions();
+        fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o500))?;
+        let outcome = guard.publish(&valid_document());
+        fs::set_permissions(&state_directory, saved)?;
+        let error = outcome.expect_err("a read-only state directory must fail the staging");
+        assert!(
+            matches!(
+                error.fault(),
+                ElectionFault::Storage {
+                    operation: "stage lock document",
+                    ..
+                }
+            ),
+            "the refusal must name the staging: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publish_reports_a_persist_failure_over_an_obstructed_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        fs::create_dir_all(document_path(directory.path()))?;
+        let error = guard
+            .publish(&valid_document())
+            .expect_err("a directory at the document path must fail the rename");
+        assert!(
+            matches!(
+                error.fault(),
+                ElectionFault::Storage {
+                    operation: "publish lock document",
+                    ..
+                }
+            ),
+            "the refusal must name the publish rename: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retire_reports_an_unremovable_document() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        fs::create_dir_all(document_path(directory.path()))?;
+        guard.retire();
+        assert!(
+            document_path(directory.path()).exists(),
+            "a directory survives the best-effort removal"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_classifies_an_unreadable_document_as_stale() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let path = document_path(directory.path());
+        fs::create_dir_all(path.parent().ok_or("document path must have a parent")?)?;
+        fs::write(&path, serde_json::to_vec(&valid_document())?)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))?;
+        let presence = probe(directory.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        assert!(
+            matches!(
+                presence,
+                ServerPresence::Stale(StaleReason::DocumentUnreadable)
+            ),
+            "an unreadable document must classify as stale: {presence:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_classifies_an_unopenable_election_file_as_unobservable() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let path = document_path(directory.path());
+        fs::create_dir_all(path.parent().ok_or("document path must have a parent")?)?;
+        fs::write(&path, serde_json::to_vec(&valid_document())?)?;
+        let election_path = directory
+            .path()
+            .join(".rift")
+            .join(SERVER_ELECTION_FILE_NAME);
+        fs::write(&election_path, b"")?;
+        fs::set_permissions(&election_path, fs::Permissions::from_mode(0o200))?;
+        let presence = probe(directory.path());
+        fs::set_permissions(&election_path, fs::Permissions::from_mode(0o600))?;
+        assert!(
+            matches!(
+                presence,
+                ServerPresence::Stale(StaleReason::ElectionUnobservable)
+            ),
+            "an unopenable election file must classify as unobservable: {presence:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shut_down_unpublished_returns_the_fabricated_failure() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let shutdown = CancellationToken::new();
+        let serving_stop = shutdown.child_token();
+        let server = serve_http(directory.path(), serving_stop.clone()).await?;
+        let failure = Error::new(ElectionFault::AlreadyServing);
+        let returned = shut_down_unpublished(server, &serving_stop, failure).await;
+        assert!(
+            matches!(returned.fault(), ElectionFault::AlreadyServing),
+            "the fabricated failure must come back unchanged: {returned:?}"
+        );
+        assert!(
+            serving_stop.is_cancelled(),
+            "the unpublished server's token must be cancelled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serve_elected_shuts_down_when_the_publish_fails() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(document_path(directory.path()))?;
+        let shutdown = CancellationToken::new();
+        let error = serve_elected(directory.path(), shutdown)
+            .await
+            .expect_err("publishing over a directory must fail the election");
+        assert!(
+            matches!(
+                error.fault(),
+                ElectionFault::Storage {
+                    operation: "publish lock document",
+                    ..
+                }
+            ),
+            "the publish failure must surface: {error:?}"
+        );
+        Ok(())
     }
 }
