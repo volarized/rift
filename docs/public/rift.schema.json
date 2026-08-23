@@ -566,7 +566,7 @@
           "max_chunk": "1mb"
         }
       },
-      "description": "The embedding model that adds dense ranking to lexical search."
+      "description": "The lexical search index: which non-source files join it, the `SQLite` bounds behind\nit, and the embedding model that adds dense ranking on top."
     },
     "server": {
       "$ref": "#/$defs/ServerConfiguration",

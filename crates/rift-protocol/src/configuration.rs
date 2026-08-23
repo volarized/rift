@@ -303,7 +303,8 @@ pub struct WorkspaceConfiguration {
     pub providers: ProvidersConfiguration,
     /// Enablement and limits for caller-provided code.
     pub execution: ExecutionConfiguration,
-    /// The embedding model that adds dense ranking to lexical search.
+    /// The lexical search index: which non-source files join it, the `SQLite` bounds behind
+    /// it, and the embedding model that adds dense ranking on top.
     pub search: SearchConfiguration,
     /// Which files below the workspace root the index and reads consider visible.
     pub source: SourceConfiguration,

@@ -247,6 +247,100 @@ This request names a `traversal`, which the server does not serve:
 }
 ```
 
+### Full-text search [#search-fulltext]
+
+<VersionBadge version="v0.0.9" languages={["Rust"]} />
+
+`query` now also matches file contents and declaration sources through a full-text index,
+alongside the declaration names it already matched. A multi-word query matches a unit that
+carries any one of its terms, anywhere in its content — the terms no longer have to co-occur
+on one source line, the way a plain-substring match required. A unit carrying more of the
+query's terms ranks above one carrying fewer.
+
+A symbol whose only match sits in its declaration, not its name, still returns as a `symbol`
+hit, tagged `matched_by: ["content"]`:
+
+**Request:**
+
+```json
+{ "query": "literal minted" }
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/rust/crates/rift-core/src/identity.rs/encode_path",
+      "language": { "name": "rust" },
+      "name": "encode_path",
+      "kind": "rust.function",
+      "facets": ["value", "callable", "public"],
+      "origin": {
+        "location": { "kind": "project", "package": null },
+        "source_kind": "authored",
+        "unit": "rift://source/project/crates/rift-core/src/identity.rs"
+      },
+      "container": null,
+      "modifiers": [],
+      "visibility": "pub",
+      "types": [],
+      "signatures": [],
+      "documentation": [],
+      "extensions": {},
+      "document_local": false
+    }
+  },
+  "score": 0.31,
+  "matched_by": ["content"],
+  "span": {
+    "unit": "rift://source/project/crates/rift-core/src/identity.rs",
+    "range": { "start": 1496, "end": 1925 }
+  },
+  "line": 43,
+  "path": "crates/rift-core/src/identity.rs"
+}
+```
+
+Every file [`[search.text]`](/docs/configuration#search) admits joins the same index. A hit on
+one of those files returns as a `file` hit, tagged the same way:
+
+**Request:**
+
+```json
+{ "query": "install checksum", "target": "file" }
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "file",
+    "file": {
+      "id": "rift://file/README.md",
+      "content": { "kind": "regular", "size": 3550, "executable": false },
+      "languages": [],
+      "regions": [],
+      "semantic": false
+    }
+  },
+  "score": 0.51,
+  "matched_by": ["content"],
+  "span": {
+    "unit": "rift://source/project/README.md",
+    "range": { "start": 822, "end": 922 }
+  },
+  "line": 35,
+  "path": "README.md"
+}
+```
+
+`score` stays a server-defined ranking value, comparable across every page of one request and
+nowhere else.
+
 ### nodes [#tool-nodes]
 
 <VersionBadge version="v0.0.4" languages={["Rust"]} />
