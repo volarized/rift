@@ -220,7 +220,7 @@ impl HttpServer {
     /// Dropping this future detaches the serving tasks; a shutdown already
     /// triggered still completes in the background.
     pub async fn stopped(self) -> Result<(), HttpServeError> {
-        let serve_outcome = self.serving.await;
+        let serve_result = classify_serve_outcome(self.serving.await);
         // The serve loop can end on its own I/O error, where nothing has
         // cancelled the token yet; cancelling here unblocks the idle watch
         // on every path.
@@ -231,21 +231,35 @@ impl HttpServer {
             .shutdown()
             .await
             .map_err(HttpServeFault::workspace);
-        let stopped_cleanly = supervisor_outcome.is_ok() && matches!(serve_outcome, Ok(Ok(())));
+        let outcome = stop_outcome_label(supervisor_outcome.is_ok() && serve_result.is_ok());
         tracing::info!(
             component = "mcp",
             transport = "http",
-            outcome = if stopped_cleanly { "ok" } else { "error" },
+            outcome,
             "MCP server stopped"
         );
         supervisor_outcome?;
-        match serve_outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(HttpServeFault::serve("http serve loop", error)),
-            Err(error) => return Err(HttpServeFault::serve("http serve task", error)),
-        }
+        serve_result?;
         idle_outcome.map_err(|error| HttpServeFault::serve("idle watch task", error))
     }
+}
+
+/// Maps the joined serve loop outcome onto the transport failure taxonomy:
+/// the loop's own I/O failure names the serve loop, a panicked or aborted
+/// serving task names the task.
+fn classify_serve_outcome(
+    outcome: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
+) -> Result<(), HttpServeError> {
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(HttpServeFault::serve("http serve loop", error)),
+        Err(error) => Err(HttpServeFault::serve("http serve task", error)),
+    }
+}
+
+/// The stop log's outcome field for whether every part shut down cleanly.
+fn stop_outcome_label(stopped_cleanly: bool) -> &'static str {
+    if stopped_cleanly { "ok" } else { "error" }
 }
 
 /// Mints one bearer token: 32 random bytes as unpadded base64url.
@@ -528,9 +542,11 @@ mod tests {
     use rift_server::ReadFault;
     use tokio_util::sync::CancellationToken;
 
+    use tokio::time::Instant;
+
     use super::{
-        HttpServeFault, IdleTracker, bearer_authorized, bind_first_free, mint_token, unauthorized,
-        watch_idle,
+        HttpServeFault, IdleTracker, bearer_authorized, bind_first_free, classify_serve_outcome,
+        mint_token, stop_outcome_label, unauthorized, watch_idle,
     };
 
     #[test]
@@ -624,6 +640,85 @@ mod tests {
         assert!(rendered.contains("http serve loop"), "{rendered}");
         let source = std::error::Error::source(&error).expect("source must be exposed");
         assert_eq!(source.to_string(), "socket gone");
+    }
+
+    #[test]
+    fn workspace_fault_forwards_the_read_context() {
+        let expected = ReadFault::unavailable("probe", "detail").context();
+        assert!(
+            !expected.is_empty(),
+            "the read failure must carry evidence for the forwarding to matter"
+        );
+        let error = HttpServeFault::workspace(ReadFault::unavailable("probe", "detail"));
+        assert_eq!(error.context(), expected);
+    }
+
+    #[test]
+    fn ports_exhausted_carries_no_source() {
+        let error = bind_first_free(4..=6, |_| {
+            Err::<u16, _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+        })
+        .expect_err("an all-busy range must refuse");
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "an exhausted range has no underlying failure to expose"
+        );
+    }
+
+    #[test]
+    fn clean_serve_outcome_classifies_as_success() {
+        assert!(classify_serve_outcome(Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn serve_loop_failure_names_the_loop() {
+        let error = classify_serve_outcome(Ok(Err(std::io::Error::other("socket gone"))))
+            .expect_err("a serve loop failure must classify as an error");
+        let rendered = error.to_string();
+        assert!(rendered.contains("http serve loop"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn aborted_serve_task_names_the_task() {
+        let handle = tokio::spawn(std::future::pending::<Result<(), std::io::Error>>());
+        handle.abort();
+        let outcome = handle.await;
+        let error = classify_serve_outcome(outcome)
+            .expect_err("an aborted serving task must classify as an error");
+        let rendered = error.to_string();
+        assert!(rendered.contains("http serve task"), "{rendered}");
+    }
+
+    #[test]
+    fn stop_outcome_label_names_both_outcomes() {
+        assert_eq!(stop_outcome_label(true), "ok");
+        assert_eq!(stop_outcome_label(false), "error");
+    }
+
+    #[test]
+    fn poisoned_activity_lock_still_tracks_activity() {
+        let idle = Arc::new(IdleTracker::new());
+        let poisoner = Arc::clone(&idle);
+        std::thread::spawn(move || {
+            let _guard = poisoner
+                .last_activity
+                .lock()
+                .expect("the first lock of a fresh tracker must succeed");
+            panic!("poison the activity lock");
+        })
+        .join()
+        .expect_err("the poisoning thread must end by panic");
+        assert!(
+            idle.last_activity.lock().is_err(),
+            "the lock must be poisoned for the recovery arm to matter"
+        );
+        let before = Instant::now();
+        idle.touch();
+        let deadline = idle.idle_deadline(Duration::from_secs(5));
+        assert!(
+            deadline >= before + Duration::from_secs(5),
+            "a recovered tracker must keep tracking touches"
+        );
     }
 
     #[test]
