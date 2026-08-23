@@ -272,6 +272,30 @@ mod tests {
     }
 
     #[test]
+    fn every_violation_carries_its_evidence() {
+        let port = ServerLockViolation::PortOutOfRange {
+            port: 80,
+            min: SERVER_PORT_FLOOR,
+            max: u16::MAX,
+        };
+        assert_eq!(
+            port.evidence(),
+            vec![
+                ("port", "80".to_owned()),
+                ("range", format!("{SERVER_PORT_FLOOR}..={}", u16::MAX)),
+            ]
+        );
+        assert_eq!(
+            ServerLockViolation::ProcessIdZero.evidence(),
+            vec![("pid", "0".to_owned())]
+        );
+        let version = ServerLockViolation::VersionMalformed {
+            version: "v1".to_owned(),
+        };
+        assert_eq!(version.evidence(), vec![("version", "v1".to_owned())]);
+    }
+
+    #[test]
     fn lock_round_trips_through_json() {
         let lock = valid_lock();
         let text = serde_json::to_string(&lock).expect("lock must serialize");
