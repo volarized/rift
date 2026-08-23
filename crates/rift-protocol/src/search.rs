@@ -4,9 +4,9 @@
 //! paths keep resolving.
 
 use crate::read::{
-    Coverage, DiagnosticContext, File, Node, PAGE_INDEX_DEFAULT, Pagination, ProjectPath,
-    ProjectionId, ReadWarning, Relationship, RelationshipFacet, RevisionId, SearchScope,
-    SourceUnitSpan, Symbol, SymbolId,
+    DiagnosticContext, File, Node, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ProjectionId,
+    ReadWarning, Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitSpan, Symbol,
+    SymbolId,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -590,19 +590,11 @@ pub enum SearchParamsTarget {
     All,
 }
 
-/// One page of search hits from one captured tree. `coverage` states whether an empty
-/// result proves that no indexed candidate matched.
+/// One page of search hits from one captured tree.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("examples" = [
     {
-        "coverage": {
-            "state": "complete",
-            "scope": {
-                "kind": "reach",
-                "reach": "request"
-            }
-        },
         "results": [
             {
                 "hit": {
@@ -786,9 +778,6 @@ pub enum SearchParamsTarget {
     }
 ]))]
 pub struct SearchResult {
-    /// Coverage of the indexed candidate set used for this search. An empty result proves
-    /// no match only where this is complete.
-    pub coverage: Coverage,
     /// The hits on this page, in the order the request asked for.
     pub results: Vec<SearchHit>,
     /// Where this page sits in the full result set under the request's `limit`.

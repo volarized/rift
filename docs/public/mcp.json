@@ -221,192 +221,6 @@
             ],
             "type": "object"
           },
-          "Coverage": {
-            "anyOf": [
-              {
-                "additionalProperties": false,
-                "description": "Everything in scope is here, so a fact that is missing is a fact that does not exist.",
-                "properties": {
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoverageCompleteState",
-                    "description": "State tag `complete`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "Some of what is in scope is missing. `reason` is required here because a caller that\nreads absence as proof would be wrong.",
-                "properties": {
-                  "continuation": {
-                    "default": null,
-                    "description": "How to ask for the rest, where there is a way to.",
-                    "maxLength": 4096,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "reason": {
-                    "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
-                    "maxLength": 4096,
-                    "type": "string"
-                  },
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoveragePartialState",
-                    "description": "State tag `partial`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope",
-                  "reason"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "The family was never produced at all, so there is nothing here to be complete about.",
-                "properties": {
-                  "reason": {
-                    "description": "Which of the two this is, in words: the feature no provider has, or the concept\nthe language lacks.",
-                    "maxLength": 4096,
-                    "type": "string"
-                  },
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoverageStateState",
-                    "description": "State tag: `unsupported` or `not_applicable`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope",
-                  "reason"
-                ],
-                "type": "object"
-              }
-            ],
-            "description": "How much of one fact family or indexed result an answer covers. Absence proves that no\nmatching fact exists only where the state is `complete`."
-          },
-          "CoverageCompleteState": {
-            "description": "State tag carried by a complete coverage claim.",
-            "oneOf": [
-              {
-                "const": "complete",
-                "description": "Everything in scope is present.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoveragePartialState": {
-            "description": "State tag carried by a partial coverage claim.",
-            "oneOf": [
-              {
-                "const": "partial",
-                "description": "Some of what is in scope is missing.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoverageReach": {
-            "description": "How far the claim reaches.",
-            "oneOf": [
-              {
-                "const": "request",
-                "description": "Only what this request touched.",
-                "type": "string"
-              },
-              {
-                "const": "project",
-                "description": "Every visible file of the workspace.",
-                "type": "string"
-              },
-              {
-                "const": "dependencies",
-                "description": "The workspace's resolved dependencies.",
-                "type": "string"
-              },
-              {
-                "const": "all",
-                "description": "The workspace, its dependencies, and the standard library together.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoverageScope": {
-            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "A standing scope identified by its name.",
-                "properties": {
-                  "kind": {
-                    "const": "reach",
-                    "type": "string"
-                  },
-                  "reach": {
-                    "$ref": "#/$defs/CoverageReach",
-                    "description": "How far the claim reaches."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "reach"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
-                "properties": {
-                  "kind": {
-                    "const": "unit",
-                    "type": "string"
-                  },
-                  "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "The file the claim is about."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "unit"
-                ],
-                "type": "object"
-              }
-            ]
-          },
-          "CoverageStateState": {
-            "description": "`unsupported` - no provider produces this family for the language. `not_applicable` - the\nfamily has no meaning for this language.",
-            "oneOf": [
-              {
-                "const": "unsupported",
-                "description": "No provider produces this family for the language.",
-                "type": "string"
-              },
-              {
-                "const": "not_applicable",
-                "description": "The family has no meaning for this language.",
-                "type": "string"
-              }
-            ]
-          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -519,7 +333,7 @@
                   }
                 ],
                 "default": null,
-                "description": "The symbol's timeline, present when the request asked for history. Its coverage says\nhow far back the walk reached."
+                "description": "The symbol's timeline, present when the request asked for history."
               },
               "node": {
                 "anyOf": [
@@ -1551,12 +1365,8 @@
           },
           "SymbolHistory": {
             "additionalProperties": false,
-            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk is bounded by the configured history depth, so `coverage` says whether\nthe timeline reaches the symbol's introduction.",
+            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk is bounded by the configured history depth.",
             "properties": {
-              "coverage": {
-                "$ref": "#/$defs/Coverage",
-                "description": "How far back the walk reached. Partial means the configured depth ended before the\nsymbol's introduction, so an absent `introduced` version proves nothing."
-              },
               "symbol": {
                 "$ref": "#/$defs/SymbolId",
                 "description": "The symbol the timeline is for."
@@ -1571,8 +1381,7 @@
             },
             "required": [
               "symbol",
-              "versions",
-              "coverage"
+              "versions"
             ],
             "type": "object"
           },
@@ -1875,13 +1684,6 @@
         "additionalProperties": false,
         "examples": [
           {
-            "coverage": {
-              "scope": {
-                "kind": "reach",
-                "reach": "request"
-              },
-              "state": "complete"
-            },
             "hits": [
               {
                 "co_changes": [
@@ -1893,13 +1695,6 @@
                   }
                 ],
                 "history": {
-                  "coverage": {
-                    "scope": {
-                      "kind": "reach",
-                      "reach": "request"
-                    },
-                    "state": "complete"
-                  },
                   "symbol": "rift://symbol/rust/src/config.rs/load_config",
                   "versions": [
                     {
@@ -2085,10 +1880,6 @@
           }
         ],
         "properties": {
-          "coverage": {
-            "$ref": "#/$defs/Coverage",
-            "description": "Coverage of the symbol index used for this lookup. An empty result proves absence\nonly where this is complete."
-          },
           "hits": {
             "description": "The declarations on this page, best match first.",
             "items": {
@@ -2110,7 +1901,6 @@
         },
         "required": [
           "hits",
-          "coverage",
           "pagination",
           "warnings"
         ],
@@ -3224,192 +3014,6 @@
       "name": "nodes",
       "output_schema": {
         "$defs": {
-          "Coverage": {
-            "anyOf": [
-              {
-                "additionalProperties": false,
-                "description": "Everything in scope is here, so a fact that is missing is a fact that does not exist.",
-                "properties": {
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoverageCompleteState",
-                    "description": "State tag `complete`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "Some of what is in scope is missing. `reason` is required here because a caller that\nreads absence as proof would be wrong.",
-                "properties": {
-                  "continuation": {
-                    "default": null,
-                    "description": "How to ask for the rest, where there is a way to.",
-                    "maxLength": 4096,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "reason": {
-                    "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
-                    "maxLength": 4096,
-                    "type": "string"
-                  },
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoveragePartialState",
-                    "description": "State tag `partial`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope",
-                  "reason"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "The family was never produced at all, so there is nothing here to be complete about.",
-                "properties": {
-                  "reason": {
-                    "description": "Which of the two this is, in words: the feature no provider has, or the concept\nthe language lacks.",
-                    "maxLength": 4096,
-                    "type": "string"
-                  },
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoverageStateState",
-                    "description": "State tag: `unsupported` or `not_applicable`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope",
-                  "reason"
-                ],
-                "type": "object"
-              }
-            ],
-            "description": "How much of one fact family or indexed result an answer covers. Absence proves that no\nmatching fact exists only where the state is `complete`."
-          },
-          "CoverageCompleteState": {
-            "description": "State tag carried by a complete coverage claim.",
-            "oneOf": [
-              {
-                "const": "complete",
-                "description": "Everything in scope is present.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoveragePartialState": {
-            "description": "State tag carried by a partial coverage claim.",
-            "oneOf": [
-              {
-                "const": "partial",
-                "description": "Some of what is in scope is missing.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoverageReach": {
-            "description": "How far the claim reaches.",
-            "oneOf": [
-              {
-                "const": "request",
-                "description": "Only what this request touched.",
-                "type": "string"
-              },
-              {
-                "const": "project",
-                "description": "Every visible file of the workspace.",
-                "type": "string"
-              },
-              {
-                "const": "dependencies",
-                "description": "The workspace's resolved dependencies.",
-                "type": "string"
-              },
-              {
-                "const": "all",
-                "description": "The workspace, its dependencies, and the standard library together.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoverageScope": {
-            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "A standing scope identified by its name.",
-                "properties": {
-                  "kind": {
-                    "const": "reach",
-                    "type": "string"
-                  },
-                  "reach": {
-                    "$ref": "#/$defs/CoverageReach",
-                    "description": "How far the claim reaches."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "reach"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
-                "properties": {
-                  "kind": {
-                    "const": "unit",
-                    "type": "string"
-                  },
-                  "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "The file the claim is about."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "unit"
-                ],
-                "type": "object"
-              }
-            ]
-          },
-          "CoverageStateState": {
-            "description": "`unsupported` - no provider produces this family for the language. `not_applicable` - the\nfamily has no meaning for this language.",
-            "oneOf": [
-              {
-                "const": "unsupported",
-                "description": "No provider produces this family for the language.",
-                "type": "string"
-              },
-              {
-                "const": "not_applicable",
-                "description": "The family has no meaning for this language.",
-                "type": "string"
-              }
-            ]
-          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -3770,13 +3374,6 @@
               }
             ]
           },
-          "SemanticCoverage": {
-            "additionalProperties": {
-              "$ref": "#/$defs/Coverage"
-            },
-            "description": "Coverage for every fact family. Absence is authoritative only where state is complete.",
-            "type": "object"
-          },
           "SourceExcerpt": {
             "additionalProperties": false,
             "description": "A copy of source from the catalog. The unit may belong to the project, a dependency, or\nthe standard library; the excerpt preserves bytes as they were when the answer was\nproduced.",
@@ -3862,15 +3459,6 @@
         "additionalProperties": false,
         "examples": [
           {
-            "coverage": {
-              "nodes": {
-                "scope": {
-                  "kind": "reach",
-                  "reach": "request"
-                },
-                "state": "complete"
-              }
-            },
             "nodes": [
               {
                 "extensions": {},
@@ -4039,10 +3627,6 @@
           }
         ],
         "properties": {
-          "coverage": {
-            "$ref": "#/$defs/SemanticCoverage",
-            "description": "Completeness of the node facts used to build the listing."
-          },
           "nodes": {
             "description": "Nodes covering the position, outermost first.",
             "items": {
@@ -4068,7 +3652,6 @@
         "required": [
           "nodes",
           "source",
-          "coverage",
           "warnings"
         ],
         "type": "object"
@@ -7975,192 +7558,6 @@
       "name": "search",
       "output_schema": {
         "$defs": {
-          "Coverage": {
-            "anyOf": [
-              {
-                "additionalProperties": false,
-                "description": "Everything in scope is here, so a fact that is missing is a fact that does not exist.",
-                "properties": {
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoverageCompleteState",
-                    "description": "State tag `complete`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "Some of what is in scope is missing. `reason` is required here because a caller that\nreads absence as proof would be wrong.",
-                "properties": {
-                  "continuation": {
-                    "default": null,
-                    "description": "How to ask for the rest, where there is a way to.",
-                    "maxLength": 4096,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "reason": {
-                    "description": "Why the answer stops short - a limit hit, a file that would not parse, a page\nboundary. Prose for a reader; nothing keys on it.",
-                    "maxLength": 4096,
-                    "type": "string"
-                  },
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoveragePartialState",
-                    "description": "State tag `partial`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope",
-                  "reason"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "The family was never produced at all, so there is nothing here to be complete about.",
-                "properties": {
-                  "reason": {
-                    "description": "Which of the two this is, in words: the feature no provider has, or the concept\nthe language lacks.",
-                    "maxLength": 4096,
-                    "type": "string"
-                  },
-                  "scope": {
-                    "$ref": "#/$defs/CoverageScope",
-                    "description": "What the claim covers."
-                  },
-                  "state": {
-                    "$ref": "#/$defs/CoverageStateState",
-                    "description": "State tag: `unsupported` or `not_applicable`."
-                  }
-                },
-                "required": [
-                  "state",
-                  "scope",
-                  "reason"
-                ],
-                "type": "object"
-              }
-            ],
-            "description": "How much of one fact family or indexed result an answer covers. Absence proves that no\nmatching fact exists only where the state is `complete`."
-          },
-          "CoverageCompleteState": {
-            "description": "State tag carried by a complete coverage claim.",
-            "oneOf": [
-              {
-                "const": "complete",
-                "description": "Everything in scope is present.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoveragePartialState": {
-            "description": "State tag carried by a partial coverage claim.",
-            "oneOf": [
-              {
-                "const": "partial",
-                "description": "Some of what is in scope is missing.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoverageReach": {
-            "description": "How far the claim reaches.",
-            "oneOf": [
-              {
-                "const": "request",
-                "description": "Only what this request touched.",
-                "type": "string"
-              },
-              {
-                "const": "project",
-                "description": "Every visible file of the workspace.",
-                "type": "string"
-              },
-              {
-                "const": "dependencies",
-                "description": "The workspace's resolved dependencies.",
-                "type": "string"
-              },
-              {
-                "const": "all",
-                "description": "The workspace, its dependencies, and the standard library together.",
-                "type": "string"
-              }
-            ]
-          },
-          "CoverageScope": {
-            "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "A standing scope identified by its name.",
-                "properties": {
-                  "kind": {
-                    "const": "reach",
-                    "type": "string"
-                  },
-                  "reach": {
-                    "$ref": "#/$defs/CoverageReach",
-                    "description": "How far the claim reaches."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "reach"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
-                "properties": {
-                  "kind": {
-                    "const": "unit",
-                    "type": "string"
-                  },
-                  "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "The file the claim is about."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "unit"
-                ],
-                "type": "object"
-              }
-            ]
-          },
-          "CoverageStateState": {
-            "description": "`unsupported` - no provider produces this family for the language. `not_applicable` - the\nfamily has no meaning for this language.",
-            "oneOf": [
-              {
-                "const": "unsupported",
-                "description": "No provider produces this family for the language.",
-                "type": "string"
-              },
-              {
-                "const": "not_applicable",
-                "description": "The family has no meaning for this language.",
-                "type": "string"
-              }
-            ]
-          },
           "Diagnostic": {
             "additionalProperties": false,
             "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
@@ -10420,13 +9817,6 @@
         "additionalProperties": false,
         "examples": [
           {
-            "coverage": {
-              "scope": {
-                "kind": "reach",
-                "reach": "request"
-              },
-              "state": "complete"
-            },
             "pagination": {
               "page_index": 0,
               "total_pages": 3
@@ -10610,10 +10000,6 @@
           }
         ],
         "properties": {
-          "coverage": {
-            "$ref": "#/$defs/Coverage",
-            "description": "Coverage of the indexed candidate set used for this search. An empty result proves\nno match only where this is complete."
-          },
           "pagination": {
             "$ref": "#/$defs/Pagination",
             "description": "Where this page sits in the full result set under the request's `limit`."
@@ -10634,7 +10020,6 @@
           }
         },
         "required": [
-          "coverage",
           "results",
           "pagination",
           "warnings"

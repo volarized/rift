@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
 /// Stable failure class for one request. `ErrorData.retry` carries the
-/// instance-specific retry decision; unsupported coverage and edit refusal
-/// use typed domain results instead.
+/// instance-specific retry decision; edit refusal uses typed domain
+/// results instead.
 #[derive(
     Clone,
     Copy,

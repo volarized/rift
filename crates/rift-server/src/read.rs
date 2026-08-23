@@ -13,10 +13,9 @@ use rift_index::{
     WorkspaceIndexLimits,
 };
 use rift_protocol::read::{
-    Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
-    FactFamily, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult, Language, Node, NodeFacet,
-    NodeId, NodesParams, NodesResult, Pagination, ProjectPath, ReadWarning, RevisionId,
-    SearchScope, SemanticCoverage, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
+    Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
+    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination, ProjectPath,
+    ReadWarning, RevisionId, SearchScope, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
     SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
@@ -378,7 +377,6 @@ impl ReadService {
         Ok(NodesResult {
             nodes,
             source,
-            coverage: semantic_coverage(FactFamily::Nodes),
             warnings: self.warnings(),
         })
     }
@@ -419,7 +417,6 @@ impl ReadService {
             .collect();
         Ok(GetSymbolResult {
             hits,
-            coverage: complete_coverage(),
             pagination,
             warnings: self.warnings(),
         })
@@ -736,21 +733,6 @@ pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
     encoded
 }
 
-/// Complete coverage for a request served in full: everything in scope is present, so a
-/// missing fact is a fact that does not exist.
-pub(crate) fn complete_coverage() -> Coverage {
-    Coverage::Complete {
-        state: CoverageCompleteState::Complete,
-        scope: CoverageScope::Reach {
-            reach: CoverageReach::Request,
-        },
-    }
-}
-
-fn semantic_coverage(family: FactFamily) -> SemanticCoverage {
-    SemanticCoverage(BTreeMap::from([(family, complete_coverage())]))
-}
-
 /// Finds the symbol a witnessed syntax node belongs to.
 ///
 /// A node's range matches a symbol's declaration range (the whole
@@ -1026,20 +1008,6 @@ pub fn compute() -> i32 {
         assert_eq!(
             value["pagination"],
             json!({ "page_index": 0, "total_pages": 1 })
-        );
-        Ok(())
-    }
-
-    /// A `get_symbol` answer served in full claims complete coverage over the request.
-    #[test]
-    fn get_symbol_coverage_claims_complete_for_the_request() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
-        let value = serde_json::to_value(service.get_symbol(&params)?)?;
-        assert_eq!(value["coverage"]["state"], json!("complete"));
-        assert_eq!(
-            value["coverage"]["scope"],
-            json!({"kind": "reach", "reach": "request"})
         );
         Ok(())
     }

@@ -54,63 +54,6 @@ pub struct CoChange {
     pub touches: u64,
 }
 
-/// State tag carried by a complete coverage claim.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CoverageCompleteState {
-    /// Everything in scope is present.
-    Complete,
-}
-
-/// State tag carried by a partial coverage claim.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CoveragePartialState {
-    /// Some of what is in scope is missing.
-    Partial,
-}
-
-/// How much of one fact family or indexed result an answer covers. Absence proves that no
-/// matching fact exists only where the state is `complete`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(untagged, deny_unknown_fields)]
-pub enum Coverage {
-    /// Everything in scope is here, so a fact that is missing is a fact that does not exist.
-    Complete {
-        /// State tag `complete`.
-        state: CoverageCompleteState,
-        /// What the claim covers.
-        scope: CoverageScope,
-    },
-    /// Some of what is in scope is missing. `reason` is required here because a caller that
-    /// reads absence as proof would be wrong.
-    Partial {
-        /// State tag `partial`.
-        state: CoveragePartialState,
-        /// What the claim covers.
-        scope: CoverageScope,
-        /// Why the answer stops short - a limit hit, a file that would not parse, a page
-        /// boundary. Prose for a reader; nothing keys on it.
-        #[schemars(length(max = 4096))]
-        reason: String,
-        /// How to ask for the rest, where there is a way to.
-        #[serde(default)]
-        #[schemars(length(max = 4096))]
-        continuation: Option<String>,
-    },
-    /// The family was never produced at all, so there is nothing here to be complete about.
-    State {
-        /// State tag: `unsupported` or `not_applicable`.
-        state: CoverageStateState,
-        /// What the claim covers.
-        scope: CoverageScope,
-        /// Which of the two this is, in words: the feature no provider has, or the concept
-        /// the language lacks.
-        #[schemars(length(max = 4096))]
-        reason: String,
-    },
-}
-
 /// How far the claim reaches.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -142,19 +85,6 @@ pub enum CoverageScope {
         /// The file the claim is about.
         unit: FileId,
     },
-}
-
-/// `unsupported` - no provider produces this family for the language. `not_applicable` - the
-/// family has no meaning for this language.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CoverageStateState {
-    /// No provider produces this family for the language.
-    Unsupported,
-    /// The family has no meaning for this language.
-    NotApplicable,
 }
 
 /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
@@ -229,27 +159,6 @@ pub struct ExtensionValue {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct Extensions(pub BTreeMap<ExtensionKey, ExtensionValue>);
-
-/// One kind of fact a provider can emit. Coverage, streaming, and invalidation use the
-/// family as their unit.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum FactFamily {
-    /// Declaration records a provider resolved.
-    Symbols,
-    /// Concrete syntax trees over file bytes.
-    Nodes,
-    /// Directed edges between symbols.
-    Relationships,
-    /// Type bindings attached to declarations.
-    Types,
-    /// Findings providers produced from source.
-    Diagnostics,
-    /// Version-control timelines of symbols.
-    History,
-}
 
 /// One file and the languages that read it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -328,8 +237,7 @@ pub struct GetSymbolHit {
     /// it. Null for source-less declarations.
     #[serde(default)]
     pub source: Option<SourceExcerpt>,
-    /// The symbol's timeline, present when the request asked for history. Its coverage says
-    /// how far back the walk reached.
+    /// The symbol's timeline, present when the request asked for history.
     #[serde(default)]
     pub history: Option<SymbolHistory>,
     /// Symbols that historically change with this one, strongest coupling first, present
@@ -606,14 +514,7 @@ fn default_get_symbol_params_scope() -> SearchScope {
                             "timestamp": "2026-08-17T09:41:05Z",
                             "summary": "Add workspace configuration loading"
                         }
-                    ],
-                    "coverage": {
-                        "state": "complete",
-                        "scope": {
-                            "kind": "reach",
-                            "reach": "request"
-                        }
-                    }
+                    ]
                 },
                 "co_changes": [
                     {
@@ -625,13 +526,6 @@ fn default_get_symbol_params_scope() -> SearchScope {
                 ]
             }
         ],
-        "coverage": {
-            "state": "complete",
-            "scope": {
-                "kind": "reach",
-                "reach": "request"
-            }
-        },
         "pagination": {
             "page_index": 0,
             "total_pages": 1
@@ -642,9 +536,6 @@ fn default_get_symbol_params_scope() -> SearchScope {
 pub struct GetSymbolResult {
     /// The declarations on this page, best match first.
     pub hits: Vec<GetSymbolHit>,
-    /// Coverage of the symbol index used for this lookup. An empty result proves absence
-    /// only where this is complete.
-    pub coverage: Coverage,
     /// Where this page sits in the full result set under the request's `limit`.
     pub pagination: Pagination,
     /// Warnings attached to this result, empty when there is nothing to warn about.
@@ -992,15 +883,6 @@ pub struct NodesParams {
                 "text": "parse_config"
             }
         ],
-        "coverage": {
-            "nodes": {
-                "state": "complete",
-                "scope": {
-                    "kind": "reach",
-                    "reach": "request"
-                }
-            }
-        },
         "warnings": []
     }
 ]))]
@@ -1009,8 +891,6 @@ pub struct NodesResult {
     pub nodes: Vec<Node>,
     /// The source of each node, in the same order.
     pub source: Vec<SourceExcerpt>,
-    /// Completeness of the node facts used to build the listing.
-    pub coverage: SemanticCoverage,
     /// Warnings attached to this result, empty when there is nothing to warn about.
     pub warnings: Vec<ReadWarning>,
 }
@@ -1342,12 +1222,6 @@ pub enum SearchScope {
     All,
 }
 
-/// Coverage for every fact family. Absence is authoritative only where state is complete.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct SemanticCoverage(pub BTreeMap<FactFamily, Coverage>);
-
 /// How much a `Diagnostic` matters, in the provider's own judgement. Providers map their
 /// toolchain's own levels onto these four, so a caller can drop everything below `warning`
 /// without knowing which language produced it.
@@ -1621,8 +1495,7 @@ pub enum SymbolFacet {
 }
 
 /// One symbol's timeline across the workspace's version-control history, newest revision
-/// first. The walk is bounded by the configured history depth, so `coverage` says whether
-/// the timeline reaches the symbol's introduction.
+/// first. The walk is bounded by the configured history depth.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
@@ -1630,9 +1503,6 @@ pub struct SymbolHistory {
     pub symbol: SymbolId,
     /// Revisions that touched the symbol, newest first.
     pub versions: Vec<SymbolVersion>,
-    /// How far back the walk reached. Partial means the configured depth ended before the
-    /// symbol's introduction, so an absent `introduced` version proves nothing.
-    pub coverage: Coverage,
 }
 
 /// Identity of one symbol. The name after the language is the provider's stable qualified

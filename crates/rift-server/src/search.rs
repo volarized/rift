@@ -18,8 +18,8 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, RustSymbol};
 
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, complete_coverage, excerpt, file_id, page,
-    project_path, rust_language, source_span, validate_common, wire_symbol,
+    ReadError, ReadFault, ReadService, accepted_limit, excerpt, file_id, page, project_path,
+    rust_language, source_span, validate_common, wire_symbol,
 };
 
 impl ReadService {
@@ -91,7 +91,6 @@ impl ReadService {
         order_by_relevance(&mut results);
         let (results, pagination) = page(results, params.page_index, limit);
         Ok(SearchResult {
-            coverage: complete_coverage(),
             results,
             pagination,
             warnings: self.warnings(),
@@ -782,20 +781,6 @@ pub fn compute() -> i32 {
         );
         assert_eq!(hit["source"], json!("pub struct Beacon;"));
         assert_eq!(hit["span"]["range"]["start"], 0);
-        Ok(())
-    }
-
-    /// A search answer served in full claims complete coverage over the request.
-    #[test]
-    fn search_result_coverage_claims_complete_for_the_request() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon"}))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        assert_eq!(value["coverage"]["state"], json!("complete"));
-        assert_eq!(
-            value["coverage"]["scope"],
-            json!({"kind": "reach", "reach": "request"})
-        );
         Ok(())
     }
 
