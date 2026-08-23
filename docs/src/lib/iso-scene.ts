@@ -7,14 +7,14 @@ import type { FlowGraph, FlowLinkStyle } from "@/lib/mermaid-flowchart";
  *
  * Two halves, and the split is the whole idea.
  *
- *   1. *Where things go* is dagre's problem — the same layered layout mermaid
+ *   1. *Where things go* is dagre's problem - the same layered layout mermaid
  *      itself runs for a flowchart. It works on a plane and knows nothing about
  *      how that plane is going to be looked at.
  *   2. *What things look like* belongs to the renderer, which stands the plane
  *      up in three.js under an orthographic camera on the isometric diagonal.
  *
  * Nothing here projects anything. The scene comes out flat and the camera does
- * the rest — which is what lets the renderer lay live DOM into the same plane
+ * the rest - which is what lets the renderer lay live DOM into the same plane
  * as the geometry and have the two agree exactly.
  *
  * Sizes are in CSS pixels, because every size in the diagram is ultimately set
@@ -51,7 +51,7 @@ export type IsoMetrics = {
    * The least depth a plate may have, across the flow.
    *
    * A caption is usually one line, so sizing a plate to it alone would give a
-   * ribbon — and a ribbon seen at 30° is a sliver. This is what keeps a plate
+   * ribbon - and a ribbon seen at 30° is a sliver. This is what keeps a plate
    * reading as a slab.
    */
   minDepth: number;
@@ -153,7 +153,7 @@ export type IsoScene = {
  * An orthographic camera on the (1,1,1) diagonal projects a ground-plane point
  * to `RIGHT·(x − z)` across the page and `−RISE·(x + z)` down it, and a height
  * `y` to `LIFT·y` up it. That is the whole of the projection, and the only
- * reason this module knows it is `frameSpan` — a caller has to reserve the
+ * reason this module knows it is `frameSpan` - a caller has to reserve the
  * right amount of page before three.js has drawn anything.
  */
 const RIGHT = Math.SQRT1_2;
@@ -162,7 +162,7 @@ const LIFT = Math.sqrt(2 / 3);
 
 /**
  * How much page the scene needs, in CSS pixels, before it is scaled to fit.
- * Only the *ratio* matters to a caller — it fixes the box the drawing sits in
+ * Only the *ratio* matters to a caller - it fixes the box the drawing sits in
  * so the page does not reflow when the canvas comes up.
  */
 export function frameSpan(scene: IsoScene): { width: number; height: number } {
@@ -172,7 +172,7 @@ export function frameSpan(scene: IsoScene): { width: number; height: number } {
 
 /**
  * Label metrics without a DOM to measure in. Every label in the diagram is set
- * in one monospaced family, so its advance width is a constant — which is the
+ * in one monospaced family, so its advance width is a constant - which is the
  * whole reason the design's display face can be relied on here.
  */
 function textWidth(lines: string[], size: number): number {
@@ -186,7 +186,7 @@ function textHeight(lines: string[], size: number): number {
 /**
  * The caption's own footprint, icon included. Because the caption ends up lying
  * *in* the ground plane rather than upright over it, this is simply a rectangle
- * — the plate is sized to it directly, with no allowance for a projection to
+ * - the plate is sized to it directly, with no allowance for a projection to
  * eat into. That is most of why the plates are so much tighter than they were
  * when the text stood up.
  */
@@ -268,7 +268,7 @@ type Tile = { x0: number; x1: number; z0: number; z1: number };
 /**
  * @param markFor The mark a node carries, or null. The scene has to know before
  *   it can size the plate, and only the renderer holds the registry of what a
- *   mark actually looks like — so it is asked for the name alone. A name is
+ *   mark actually looks like - so it is asked for the name alone. A name is
  *   also all that will survive the trip to a client component.
  */
 export function buildScene(
@@ -292,7 +292,7 @@ export function buildScene(
   graph.setDefaultEdgeLabel(() => ({}));
 
   // A node's label and mark after the fallback, kept for the second pass below
-  // — dagre is told sizes, not content, and hands back only coordinates.
+  // - dagre is told sizes, not content, and hands back only coordinates.
   const content = new Map<string, { label: string[]; mark: string | null }>();
 
   for (const node of flow.nodes) {
@@ -336,13 +336,13 @@ export function buildScene(
   });
 
   // Dagre's newer "optimal order" pass re-sorts a rank whenever it can do so
-  // without adding a crossing — which, on a graph with no crossings to remove,
+  // without adding a crossing - which, on a graph with no crossings to remove,
   // means it reverses ranks for free and the author's declaration order is
   // lost. In a diagram that is not a free choice: `agent 1` has to come out
   // above `agent 2`. The classic median-and-transpose ordering keeps it.
   //
   // `useDynamic: false` because dagre 3.x otherwise caches the previous layout
-  // in module state to stabilize incremental relayouts of one graph — and
+  // in module state to stabilize incremental relayouts of one graph - and
   // feeds it into the next layout's acyclic phase. Laying out a *different*
   // graph next (three diagrams on one page) inherits that state, the rank
   // phase silently no-ops, and `initOrder` crashes on rank `null`.
@@ -401,7 +401,7 @@ export function buildScene(
     ];
   });
 
-  // A group's box is the union of its members' footprints — dagre's compound
+  // A group's box is the union of its members' footprints - dagre's compound
   // pass keeps the members contiguous but reports the cluster's own box
   // unreliably, so the box is derived from what was actually placed. Breathing
   // room on every side, plus a band along the top for the title to sit in.

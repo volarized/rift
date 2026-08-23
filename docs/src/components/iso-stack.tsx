@@ -16,7 +16,7 @@ import { cn } from "@/lib/utils";
  * side, each entry lighting up as its plate arrives.
  *
  * The plates are real geometry under an orthographic camera on the isometric
- * diagonal, so nothing here projects by hand — three does the drawing and
+ * diagonal, so nothing here projects by hand - three does the drawing and
  * react-spring does the moving.
  */
 export type IsoLayer = {
@@ -105,7 +105,7 @@ function motifGeometry(index: number) {
 
 /**
  * A ruled field over the whole top face, under the motif. Nothing to read on
- * its own — it just gives the plate a surface, so the solid reads as drawn
+ * its own - it just gives the plate a surface, so the solid reads as drawn
  * rather than as a slab with a diagram on it.
  */
 const RULES = 22;
@@ -242,8 +242,8 @@ export function IsoStack({
     <div ref={scene} className={cn(still ? "" : "h-[300vh]", className)}>
       <div
         className={cn(
-          // One column on mobile — heading and rail first, scene taking
-          // whatever height is left — and two side by side from md up.
+          // One column on mobile - heading and rail first, scene taking
+          // whatever height is left - and two side by side from md up.
           "relative flex flex-col gap-6 md:grid md:grid-cols-2 md:items-start md:gap-14",
           still ? "py-16" : "sticky top-14 h-[calc(100svh-3.5rem)] py-8 md:py-10",
         )}

@@ -24,21 +24,27 @@ workspace.
 
 <VersionBadge version="v0.0.8" />
 
-`server` bounds the server's own blocking work — the filesystem scans and parses behind reads,
+`server` bounds the server's own blocking work - the filesystem scans and parses behind reads,
 changes, and index rebuilds:
 
 ```toml
 [server]
 num_workers = 4
 worker_queue_timeout = "30s"
+idle_timeout = "30m"
 ```
 
 Each key is shown at its default:
 
 - `num_workers` caps the workers running blocking operations at once, 1 to 64
-- `worker_queue_timeout` bounds one request's wait for a free worker, 1ms to 1h — when it
+- `worker_queue_timeout` bounds one request's wait for a free worker, 1ms to 1h - when it
   expires, the request fails with `temporarily_unavailable` and the client can retry without
   stacking another waiter
+- `idle_timeout` stops the server after that long with no served request, 1s to 1d; the next
+  `rift mcp` or `rift server start` brings it back
+- `port` pins the exact loopback port, 1024 or above; omitted, the server picks the first free
+  port from `port_range` - `port_range = { min = 12000, max = 13000 }` is the default - and the
+  two keys exclude each other
 
 The worker pool exists before the first request, so the server sizes it once at startup: a
 change to this table applies on the next start, while every other table applies to later
@@ -61,7 +67,7 @@ respect_gitignore = true
 
 Empty `include` includes every file `exclude` and `.gitignore` leave standing; a match in `exclude`
 drops a file even when `include` also matches it. `respect_gitignore`, on by default, applies the
-workspace's own `.gitignore` files, root and nested — global and parent-directory ignore sources
+workspace's own `.gitignore` files, root and nested - global and parent-directory ignore sources
 are never read.
 
 `.git`, `.rift`, and `target` stay invisible under every `source` setting. This hard floor sits
@@ -93,18 +99,18 @@ max_concurrent = 2
 Every key below `allow` is shown at its default:
 
 - `max_code` bounds one submitted block, 1b to 32kb
-- `max_timeout` bounds one evaluation, 1ms to 1d — the evaluation only: refreshing the
+- `max_timeout` bounds one evaluation, 1ms to 1d - the evaluation only: refreshing the
   execution copy is extra, and a refresh that outruns the same bound fails the call with
   `deadline_exceeded`
 - `max_output` bounds each captured stream separately, up to 16kb, so a program that floods
   stdout gets a prefix and a byte count rather than a hung request
 - `max_concurrent` caps evaluations running at once across the whole workspace, 1 to 64
 
-The schema states each range as `rift:range` on the key, and the server enforces it at load —
+The schema states each range as `rift:range` on the key, and the server enforces it at load -
 schema validation alone can't compare `"16kb"` against a ceiling.
 
 Durations take `ms`, `s`, `m`, `h`, or `d`; byte sizes take `b`, `kb`, `mb`, `gb`, or
-`tb` — binary units, so `1kb` is 1024 bytes.
+`tb` - binary units, so `1kb` is 1024 bytes.
 
 A runtime has to serve the language as well. Listing a language under `allow` does nothing when
 no runtime serves it. The [`rift://workspace`](/docs/protocol/mcp#resource-workspace)
@@ -123,8 +129,8 @@ enabled = true
 max_revisions = 500
 ```
 
-`enabled = false` turns the history provider off: the server refuses a revision-addressed read —
-`rev` on [`get_symbol`](/docs/protocol/mcp#tool-get_symbol), `search`, or `nodes` — with
+`enabled = false` turns the history provider off: the server refuses a revision-addressed read -
+`rev` on [`get_symbol`](/docs/protocol/mcp#tool-get_symbol), `search`, or `nodes` - with
 `capability_unavailable`. A workspace without version control cannot serve those reads whatever
 this table says.
 
@@ -161,7 +167,7 @@ busy_timeout = "1s"
 Each key is shown at its default:
 
 - `extensions` names which file extensions, without the leading dot, join the index alongside
-  source files — `md`, `mdx`, and `txt` by default, prose formats with no syntax provider of
+  source files - `md`, `mdx`, and `txt` by default, prose formats with no syntax provider of
   their own
 - `max_chunk` bounds how large a file may grow before it's split into several indexed chunks,
   1kb to 16mb; an operator who wants a file out of the index entirely excludes it in
@@ -180,7 +186,7 @@ embedding = "potion-retrieval-32M"
 ```
 
 With `embedding` set, the server embeds indexed declarations and fuses cosine similarity into
-the lexical score. Vectors are stored per model — two models' vectors aren't comparable — so
+the lexical score. Vectors are stored per model - two models' vectors aren't comparable - so
 changing the value rebuilds the dense index. Leaving the table out keeps search lexical.
 
 ## Hooks
@@ -188,8 +194,8 @@ changing the value rebuilds the dense index. Leaving the table out keeps search 
 <VersionBadge version="v0.0.5" />
 
 `hooks` adds your own checks, run in your workspace each time a change applies. A hook's
-`type` selects how it runs; `command` — an executable Rift starts directly, without a
-shell — is the only type:
+`type` selects how it runs; `command` - an executable Rift starts directly, without a
+shell - is the only type:
 
 ```toml
 [[hooks]]
@@ -209,19 +215,19 @@ determinism = "deterministic"
 
 The keys that shape how the command runs:
 
-- `id` — unique within the list, labels the result
-- `program` — refuses an absolute path; a bare name resolves through the `PATH` of the
-  environment the command runs with — the server's, with `environment` applied on top — and a
+- `id` - unique within the list, labels the result
+- `program` - refuses an absolute path; a bare name resolves through the `PATH` of the
+  environment the command runs with - the server's, with `environment` applied on top - and a
   relative one below `working_directory`, which is itself relative to the workspace root; its
   empty value selects the root
-- `arguments` — the program's literal arguments, in order; may be empty
-- `changed_paths` — `"append"` adds the changed project paths after `arguments` in byte order,
+- `arguments` - the program's literal arguments, in order; may be empty
+- `changed_paths` - `"append"` adds the changed project paths after `arguments` in byte order,
   for a linter that takes files; `"none"` leaves the command alone
 
-A hook runs the tree it checks — `cargo test` compiles the very change it's checking — so
+A hook runs the tree it checks - `cargo test` compiles the very change it's checking - so
 a configured hook executes the agent's change each time one applies.
 
-Every key in the block is required — the schema carries no defaults, so a missing `environment`
+Every key in the block is required - the schema carries no defaults, so a missing `environment`
 fails the file with `configuration_invalid`. The list holds at most 32 hooks.
 
 Two keys carry bounds: `timeout`, when Rift kills the process, takes `"1ms"` to `"1h"`, and
@@ -237,7 +243,7 @@ same answer twice.
 
 A hook that exits nonzero, overruns `timeout`, or fails to launch contributes an error
 finding under the code `rift.hook.failed`, naming what ended the run and quoting each non-empty
-stream with its size. The change itself stays applied — hooks observe a change that has already
+stream with its size. The change itself stays applied - hooks observe a change that has already
 landed, so their verdicts ride the result instead of rolling it back.
 
 A command starts from the environment the server inherited, with `environment` values added on
@@ -245,6 +251,6 @@ top. Store secrets outside the committed `rift.toml` and inject them into the se
 Every configured hook inherits that environment and can read those secrets.
 
 <Callout type="warn">
-A hook can write into the tree it checks — a formatter run as a hook edits your files directly,
+A hook can write into the tree it checks - a formatter run as a hook edits your files directly,
 and reads after the change serve what it wrote.
 </Callout>

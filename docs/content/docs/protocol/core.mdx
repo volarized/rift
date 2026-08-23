@@ -30,14 +30,14 @@ and dependency conflicts remain visible only in the publication result. The chan
 ## Paths and files
 
 [`ProjectPath`](/docs/protocol/reference#ProjectPath) is a normalized UTF-8 path relative
-to the workspace root. It uses `/`, contains no `.` or `..` component, and cannot name `.rift` —
+to the workspace root. It uses `/`, contains no `.` or `..` component, and cannot name `.rift` -
 projections and the server lock live under there, and a path that could address it would let a
 change reach the server's own state. Normalized means Unicode NFC: the server normalizes what it emits and
 accepts, then compares byte-for-byte, and on a case-insensitive filesystem a create or rename
 whose destination case-folds onto a different existing path refuses with `destination_legal`.
 
-Every identifier that embeds a path — [`FileId`](/docs/protocol/reference#FileId), a node
-id, the [`rift://fs`](/docs/protocol/mcp#resource-fs) form — carries a `ProjectPath` in
+Every identifier that embeds a path - [`FileId`](/docs/protocol/reference#FileId), a node
+id, the [`rift://fs`](/docs/protocol/mcp#resource-fs) form - carries a `ProjectPath` in
 canonical percent-encoding, and the server re-validates it after decoding. The generated schema
 patterns do not carry those exclusions, so the server re-validates each decoded value.
 
@@ -48,10 +48,10 @@ path, visible or not.
 
 Each variant carries what a consumer can act on:
 
-- a regular file — its size and executable bit
-- a symlink — its target, as base64, because the server never follows it and cannot assume the bytes
+- a regular file - its size and executable bit
+- a symlink - its target, as base64, because the server never follows it and cannot assume the bytes
   are text
-- a directory — only its path, so an empty one is still listed once something creates it
+- a directory - only its path, so an empty one is still listed once something creates it
 
 A symlink is listed and never followed, in every traversal:
 
@@ -78,7 +78,7 @@ A [`NodeId`](/docs/protocol/reference#NodeId) is positional and witnessed:
 rift://node/python/pkg/util.py@1204-1266#3f9a1c2e
 ```
 
-The byte range names where the node stands; the fragment is the **witness** — the first eight
+The byte range names where the node stands; the fragment is the **witness** - the first eight
 hex characters of the SHA-256 of the node's source bytes, minted when a listing returned the
 identity. Resolution recomputes the witness before acting on the address, so an identity read
 before the file changed refuses with a failed `source_unchanged` precondition rather than
@@ -117,7 +117,7 @@ to its inputs. A synthetic declaration has no source unit.
 
 An id is two parts: the resolver identity (`pypi`), then that resolver's own human-readable key
 for the unit (`pydantic/main.py`). `digest` is the short form every content digest takes on the
-wire — the first eight hex characters of a SHA-256, the same convention `NodeId`'s witness uses;
+wire - the first eight hex characters of a SHA-256, the same convention `NodeId`'s witness uses;
 the full digest is computed and compared internally and never travels whole.
 
 [`SourceResolverSummary`](/docs/protocol/reference#SourceResolverSummary) reports each resolver's
@@ -158,7 +158,7 @@ when their provider cannot return source bytes.
 
 The `history` family is resolved from the workspace's version-control history rather than from
 the current tree. A [`SymbolHistory`](/docs/protocol/reference#SymbolHistory) is one
-symbol's timeline — each [`SymbolVersion`](/docs/protocol/reference#SymbolVersion) names
+symbol's timeline - each [`SymbolVersion`](/docs/protocol/reference#SymbolVersion) names
 the [`RevisionId`](/docs/protocol/reference#RevisionId) that touched it and what the
 revision did: introduced it, changed its body, changed its signature, moved it, removed it.
 
@@ -168,7 +168,7 @@ language includes a module path in its qualified name; the timeline still record
 
 A [`CoChange`](/docs/protocol/reference#CoChange) records empirical coupling: of the
 walked revisions that touched `subject`, how many also touched `partner`. The relation is
-observed rather than resolved, so it reaches coupling no reference graph carries — two
+observed rather than resolved, so it reaches coupling no reference graph carries - two
 implementations of one concept with no edge between them. The walk is bounded by the configured
 history depth, and `SymbolHistory.coverage` says whether it reached the symbol's introduction.
 
@@ -189,13 +189,13 @@ hook established.
 When resolution yields no edits, the server returns a refusal and leaves the targeted tree unchanged:
 `ambiguous_target`, `unmet_precondition`, `unsupported`, and the rest of
 [`RefusalReason`](/docs/protocol/reference#RefusalReason). When it yields edits, the
-change lands carrying its [`Advisory`](/docs/protocol/reference#Advisory) list — the
+change lands carrying its [`Advisory`](/docs/protocol/reference#Advisory) list - the
 concerns providers and hooks attached to exactly this change. A checked advisory is a verdict
 the emitter verified itself; an open warning carries the instruction that settles it.
 
 In a projection, edits nothing will vouch for also carry a
 [`ConfirmationRequirement`](/docs/protocol/reference#ConfirmationRequirement) per
-problem — an open warning advisory, a hook that failed or didn't finish, a deletion — and
+problem - an open warning advisory, a hook that failed or didn't finish, a deletion - and
 `publish` is where those get settled. A change applied directly to the workspace has no
 publication to gate, so its confirmations list stays empty and its advisories are the caller's
 to act on.

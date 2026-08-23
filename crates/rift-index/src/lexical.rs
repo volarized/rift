@@ -193,7 +193,7 @@ pub struct LexicalMatch {
 impl LexicalMatch {
     /// Constructs one lexical match directly. Production code only ever builds these from
     /// a live [`LexicalSearchIndex::search`]; this constructor exists for callers that
-    /// merge or resolve matches from a search result they already hold — most notably
+    /// merge or resolve matches from a search result they already hold - most notably
     /// tests exercising that merge without a live database.
     #[must_use]
     pub fn new(
@@ -364,7 +364,7 @@ struct LimitBreach {
 }
 
 /// One lexical indexing failure: its violation, the offending path when
-/// known, the underlying cause, and — for a limit violation — the typed
+/// known, the underlying cause, and - for a limit violation - the typed
 /// bound it crossed.
 #[derive(Debug)]
 pub struct LexicalIndexFault {

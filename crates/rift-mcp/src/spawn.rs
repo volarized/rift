@@ -48,8 +48,8 @@ fn detach(command: &mut Command) {
 /// Spawns `rift server start --foreground` for `root`, fully detached.
 ///
 /// The child runs this same binary with `root` as its working directory and
-/// inherits this process's environment — it serves the workspace the caller
-/// addressed — with stdin, stdout, and stderr all null and its own process
+/// inherits this process's environment - it serves the workspace the caller
+/// addressed - with stdin, stdout, and stderr all null and its own process
 /// group, so it survives the caller's exit and its terminal. The child
 /// handle is dropped unawaited: callers poll the published lock document
 /// instead, and an exited child is reaped by the init process.

@@ -800,7 +800,7 @@ fn text_extensions_violation(extensions: &[String]) -> Option<ConfigurationViola
     None
 }
 
-/// One `[[hooks]]` block: an executable Rift starts directly — no shell —
+/// One `[[hooks]]` block: an executable Rift starts directly - no shell -
 /// inside the changed tree each time a change applies. Every key is
 /// required; the schema carries no defaults.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -844,8 +844,8 @@ pub struct CommandHook {
     pub determinism: Determinism,
 }
 
-/// How a hook runs; `command` — an executable started directly, without a
-/// shell — is the only type.
+/// How a hook runs; `command` - an executable started directly, without a
+/// shell - is the only type.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]

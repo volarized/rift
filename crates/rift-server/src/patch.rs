@@ -4,8 +4,8 @@
 //! Header line numbers are a hint, not a requirement: context and deleted
 //! lines must match exactly, but the position they match at may drift from
 //! the header. Each hunk's search starts at its header position corrected
-//! by the drift already discovered from earlier hunks in the same file —
-//! the running delta `git apply` itself carries forward — then widens
+//! by the drift already discovered from earlier hunks in the same file -
+//! the running delta `git apply` itself carries forward - then widens
 //! outward, nearer positions first and the earlier position on a tie.
 //! `/dev/null` headers create or delete a file; renames and copies stay
 //! unsupported.
@@ -66,7 +66,7 @@ pub(crate) struct FileRewrite {
 /// opens a segment: hunk body lines never start with `---` at column zero,
 /// because context lines carry a leading space and removals a single `-`.
 ///
-/// Hunk body bytes pass through untouched — a CRLF patch keeps its `\r`
+/// Hunk body bytes pass through untouched - a CRLF patch keeps its `\r`
 /// so its context matches a CRLF source, and an ending mismatch surfaces
 /// as hunk-context drift, never a silent rewrite. Only structural lines
 /// shed a CRLF ending, because the diff parser rejects `\r` in headers.
@@ -101,8 +101,8 @@ fn normalize_segment(raw: &str) -> String {
     segment
 }
 
-/// Appends one diff line to its segment. A structural line — the `--- ` and
-/// `+++ ` file headers and `@@` hunk headers — sheds a CRLF ending down to
+/// Appends one diff line to its segment. A structural line - the `--- ` and
+/// `+++ ` file headers and `@@` hunk headers - sheds a CRLF ending down to
 /// bare `\n`, because the diff parser rejects `\r` there; body lines keep
 /// their exact bytes, CRLF included, so hunk content matches the stored
 /// source byte-for-byte.
@@ -330,7 +330,7 @@ fn resolve_delete(
 
 /// One line of the file image a patch's hunks apply against: bytes still
 /// from the original file, or bytes a previous hunk in this same run
-/// already wrote. A later hunk never matches into a `Patched` line — that
+/// already wrote. A later hunk never matches into a `Patched` line - that
 /// would apply on top of text this same patch just introduced.
 #[derive(Clone, Copy)]
 enum ImageLine<'a> {
@@ -758,7 +758,7 @@ mod tests {
     fn apply_segment_skips_a_position_a_prior_hunk_already_patched_even_on_a_tie() -> TestResult {
         // "a" appears at both line 1 and line 3; the first hunk patches line
         // 1 to "MARK". The second hunk's anchor sits equidistant from the
-        // now-patched line 1 and the untouched line 3 — the backward
+        // now-patched line 1 and the untouched line 3 - the backward
         // position is tried first per the tie-break rule, but it must be
         // rejected for being already patched, landing on line 3 instead.
         let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+MARK\n@@ -2 +2 @@\n-a\n+ZULU\n";

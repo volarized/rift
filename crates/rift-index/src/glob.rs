@@ -1,6 +1,6 @@
 //! Shared project-relative glob matching: one compiled matcher, reused by workspace-visibility
 //! loading (the `[source]` table) and by search's `paths` selector, so both apply identical
-//! glob semantics — `*` never crosses `/`, `**` does, character classes work the same way.
+//! glob semantics - `*` never crosses `/`, `**` does, character classes work the same way.
 
 use std::path::{Path, PathBuf};
 

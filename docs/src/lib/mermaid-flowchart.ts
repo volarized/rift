@@ -6,14 +6,14 @@ import { parse } from "mermaid-parser-bundle";
  *
  * The point of authoring diagrams in mermaid is that the *graph* stays text:
  * nodes, edges and edge labels, editable in place, with no hand-placed
- * coordinates anywhere. What we do not want is mermaid's renderer — it draws a
+ * coordinates anywhere. What we do not want is mermaid's renderer - it draws a
  * flat SVG we would then have to skew, and a skewed glyph is not a glyph any
  * more. So mermaid is the input language and stops there; positions come from
  * dagre (see `iso-scene.ts`) and the drawing is ours.
  *
  * `mermaid` itself cannot be the dependency here. This module is imported by a
  * React Server Component and runs during `next build`, where there is no DOM,
- * and mermaid reaches for `DOMPurify` — and therefore `window` — before it will
+ * and mermaid reaches for `DOMPurify` - and therefore `window` - before it will
  * parse a single line. `mermaid-parser-bundle` is mermaid's parsers with the
  * renderer stripped out: the same jison grammar, no d3, no DOM, no
  * dependencies. So the grammar is still mermaid's, not ours.
@@ -29,7 +29,7 @@ export type FlowNode = {
   /** The label, one entry per line. */
   label: string[];
   /**
-   * Mermaid classes, in declaration order — from either `a:::agent` or
+   * Mermaid classes, in declaration order - from either `a:::agent` or
    * `class a agent`. The renderer reads these to pick a node's icon, so this
    * is how a diagram says "this one is an agent".
    */
@@ -65,7 +65,7 @@ export type FlowGraph = {
 
 /**
  * The slice of mermaid's flowchart database we read. The bundle deliberately
- * types `db` as `unknown` — the shape differs per diagram type — so the
+ * types `db` as `unknown` - the shape differs per diagram type - so the
  * contract is restated here rather than pulled in wholesale.
  */
 type FlowchartDb = {

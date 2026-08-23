@@ -1,6 +1,6 @@
 # Rift
 
-[![Rift — agentic development toolkit for codebases](docs/public/og.png)](https://volar.sh/rift/)
+[![Rift - agentic development toolkit for codebases](docs/public/og.png)](https://volar.sh/rift/)
 
 Rift is an agentic development toolkit for reading, discovering, and editing codebases.
 
@@ -56,7 +56,7 @@ replaces current executable.
 
 The protocol models are Rust types in `crates/rift-protocol/src`, and the MCP server in
 `crates/rift-mcp` serves tools built from them. The document at `docs/public/mcp.json` is the
-served tool surface — names, descriptions, and JSON Schemas serialized from the same tool router
+served tool surface - names, descriptions, and JSON Schemas serialized from the same tool router
 the server runs. Regenerate and verify the export with:
 
 ```sh

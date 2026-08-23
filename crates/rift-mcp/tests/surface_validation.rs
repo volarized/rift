@@ -1,12 +1,12 @@
 //! Validates and verifies the behaviour of every advertised tool on the MCP
 //! surface: each corpus request against the tool's advertised input schema,
 //! each structured result against its advertised output schema, and every
-//! sub-variant a result can take — the `next_cursor` string and `null` arms,
+//! sub-variant a result can take - the `next_cursor` string and `null` arms,
 //! cohesive cursor walkthroughs across pages, and so on. The walk follows any
 //! cursor a result returns, so live pagination joins the gate as soon as a
 //! read mints one. Every `ChangeResult` arm is proven the same way: applied
 //! (with and without parser findings), and refused for a failed
-//! precondition, an ambiguous target, and an unsupported file-level change —
+//! precondition, an ambiguous target, and an unsupported file-level change -
 //! plus a live witnessed `replace_node` that lands after the walk.
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -3,7 +3,7 @@
 import { type RefObject, useEffect, useState } from "react";
 
 /**
- * How far the viewport has travelled through a tall element, 0 to 1 — the
+ * How far the viewport has travelled through a tall element, 0 to 1 - the
  * driver for a sticky scene that plays as you scroll past it.
  *
  * Reads are batched onto one animation frame, and the value is quantised to a

@@ -554,7 +554,7 @@ impl WorkspaceIndex {
         })
     }
 
-    /// Assembles an index from files another source already accepted — the
+    /// Assembles an index from files another source already accepted - the
     /// revision build, whose bytes come from git objects instead of a
     /// directory walk. Revision reads carry no text files: `text_chunk_bytes_max` is kept
     /// only so a future revision-text feature can reuse this constructor unchanged.
@@ -597,7 +597,7 @@ impl WorkspaceIndex {
     }
 
     /// Derives lexical search units from this index: one unit per indexed symbol, carrying
-    /// its declaration source, and one or more units per included text file — one whole unit
+    /// its declaration source, and one or more units per included text file - one whole unit
     /// when the file is within `[search.text].max_chunk`, one unit per chunk otherwise. A
     /// chunked file's units share its real path and share an identity built from that path
     /// plus the chunk index, so a hit still maps back to the file it came from.
@@ -694,7 +694,7 @@ impl WorkspaceIndex {
     }
 
     /// Walks the workspace on demand for `.rs` files matching `force_include`'s globs that are
-    /// not already indexed, ignoring `[source]` policy and `.gitignore` — only the hard floor
+    /// not already indexed, ignoring `[source]` policy and `.gitignore` - only the hard floor
     /// (`.git`, `.rift`, `target`, symlinks) stays unreachable. Each match is parsed with the
     /// same syntax provider and per-file byte bound as the index, and the walk stops as soon
     /// as it would exceed `files_max`.
@@ -909,8 +909,8 @@ fn classify_path(path: &Path, text_inclusion: &TextFileInclusion) -> Option<Path
 /// Source and included text paths visible below `root`: the hard floor (`.git`, `.rift`,
 /// `target`, symlinks) is always applied, `visibility.respect_gitignore()` then layers the
 /// workspace's own `.gitignore` chain, and `visibility.include()`/`.exclude()` narrow or drop
-/// candidate files. A path is classified by extension first — source wins over text when an
-/// extension is included by both — and the same visibility policy then applies to whichever
+/// candidate files. A path is classified by extension first - source wins over text when an
+/// extension is included by both - and the same visibility policy then applies to whichever
 /// class it landed in, so a text file reaches the same `.gitignore` and `[source]` policy a
 /// source file does.
 ///
@@ -999,7 +999,7 @@ fn build_gitignore(
 /// Hashes one already-discovered source and text path set without parsing syntax. Source
 /// paths enforce [`WorkspaceIndexLimits::file_bytes_max`] per file, matching the bound the
 /// index build applies; text paths carry no per-file bound, matching
-/// [`included_text_file`] — both classes still count against the shared aggregate
+/// [`included_text_file`] - both classes still count against the shared aggregate
 /// `workspace_bytes_max`.
 fn fingerprint_paths(
     root: &Path,
@@ -1254,7 +1254,7 @@ fn read_text_file(
 }
 
 /// Includes one text file's bytes in an index: unlike [`included_file`], there is no
-/// per-file byte bound — a text file joins the lexical index whole, however large, and
+/// per-file byte bound - a text file joins the lexical index whole, however large, and
 /// [`WorkspaceIndex::lexical_units`] splits an oversized one into chunks rather than the
 /// index refusing it. The aggregate `workspace_bytes_max` bound still applies, and UTF-8
 /// validity is still required, matching a source file's `InvalidSource` refusal.

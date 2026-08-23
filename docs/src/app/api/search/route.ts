@@ -6,7 +6,7 @@ import { source } from "@/lib/source";
 // runs in the browser.
 //
 // The client side is wired in RootProvider (src/app/layout.tsx) with
-// `type: "static"` and an explicit `api` — the default is a bare
+// `type: "static"` and an explicit `api` - the default is a bare
 // "/api/search", which does NOT pick up next.config basePath and so 404s
 // under /rift.
 //

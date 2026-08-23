@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 /**
  * Entry reveal: opacity 0 to 1 plus a 16px rise as the section comes into
  * view. Content is visible by default at the end of the spring, and skipped
- * entirely under reduced motion — motion never gates reading.
+ * entirely under reduced motion - motion never gates reading.
  */
 export function Reveal({
   className,

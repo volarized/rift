@@ -558,8 +558,8 @@ pub fn require_query_filter_or_traversal(schema: &mut Schema) {
     );
 }
 
-/// A read names at most one alternate tree to serve from — a version-control
-/// `rev` or a materialized `projection`, never both — so the answer's origin
+/// A read names at most one alternate tree to serve from - a version-control
+/// `rev` or a materialized `projection`, never both - so the answer's origin
 /// is always a single tree.
 fn forbid_rev_with_projection(schema: &mut Schema, rev: &str, projection: &str) {
     append(schema, Composition::All, not(requires(&[rev, projection])));

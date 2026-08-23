@@ -1,6 +1,6 @@
 //! Runs the workspace's configured hooks after a change applies.
 //!
-//! Each hook is an executable started directly — no shell — inside the
+//! Each hook is an executable started directly - no shell - inside the
 //! changed tree, its streams captured up to the configured prefix, its
 //! wall-clock bounded by `timeout`. A command starts from the environment
 //! the server inherited, with the hook's `environment` entries laid on top.

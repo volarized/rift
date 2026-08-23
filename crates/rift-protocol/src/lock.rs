@@ -34,7 +34,7 @@ pub const SERVER_VERSION_PATTERN: &str =
 ///
 /// A reader that validates the file holds everything needed to issue a
 /// request: the port and the bearer token. The `pid` and `version` fields
-/// carry diagnostics — which process serves, built at which release.
+/// carry diagnostics - which process serves, built at which release.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerLock {

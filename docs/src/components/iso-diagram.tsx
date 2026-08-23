@@ -14,7 +14,7 @@ import { cn } from "@/lib/utils";
  *     happen here, which means they happen once during the build: neither
  *     library is ever sent to a browser, and the page carries only the finished
  *     coordinates. That matters because `next.config.mjs` sets
- *     `output: "export"` — there is no runtime to lay a graph out on.
+ *     `output: "export"` - there is no runtime to lay a graph out on.
  *   - `IsoCanvas` is a Client Component, because the drawing is react-three-
  *     fiber. It receives the scene as plain JSON and never re-runs the layout.
  *

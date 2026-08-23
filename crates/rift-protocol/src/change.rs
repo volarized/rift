@@ -271,8 +271,8 @@ impl ChangeResult {
 pub struct ReplaceSymbolParams {
     /// The declaration to replace.
     pub symbol: SymbolId,
-    /// Which part of the declaration to replace. Null — the only value this release
-    /// serves — replaces the whole declaration; a named region fails as
+    /// Which part of the declaration to replace. Null - the only value this release
+    /// serves - replaces the whole declaration; a named region fails as
     /// `capability_unavailable`.
     #[serde(default)]
     pub region: Option<RegionRole>,
@@ -313,8 +313,8 @@ pub struct InsertSymbolParams {
 pub struct ReplaceNodeParams {
     /// The node to replace, witness included.
     pub node: NodeId,
-    /// Which named part of the node to replace. Null — the only value this release
-    /// serves — replaces the node whole; a named region fails as
+    /// Which named part of the node to replace. Null - the only value this release
+    /// serves - replaces the node whole; a named region fails as
     /// `capability_unavailable`.
     #[serde(default)]
     pub region: Option<RegionRole>,

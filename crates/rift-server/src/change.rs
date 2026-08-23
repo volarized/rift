@@ -203,7 +203,7 @@ impl ChangeService {
     /// end for `after`, one blank line from what was already there. A missing
     /// file is created, parent directories included, only when `create_missing`
     /// is set; otherwise resolution refuses, naming the missing target. The body
-    /// lands verbatim — no parser involvement — so any project-relative path is
+    /// lands verbatim - no parser involvement - so any project-relative path is
     /// a legal target.
     fn insert_at_file(
         &self,
@@ -736,7 +736,7 @@ fn change_id(path: &str, next_source: &str) -> ChangeId {
 
 /// Re-parses the changed file and reports parser findings, bounded.
 ///
-/// A change that breaks the syntax still lands — the tree is the caller's —
+/// A change that breaks the syntax still lands - the tree is the caller's -
 /// but the result says so instead of leaving the discovery to the next read.
 /// `unit` names the changed file even when it has no prior index entry, as
 /// for a file a patch just created.

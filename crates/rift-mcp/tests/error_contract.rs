@@ -153,7 +153,7 @@ async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
     assert_eq!(wire["retry"], json!("operator_action"));
     let message = wire["message"].as_str().ok_or("message must be a string")?;
     assert!(
-        message.contains("requires a git repository — run `git init`, or omit `rev`"),
+        message.contains("requires a git repository - run `git init`, or omit `rev`"),
         "the refusal must name the remedy: {message}"
     );
     Ok(())
