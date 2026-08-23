@@ -302,6 +302,20 @@ reconciliation established that the published revision matches the workspace.
 [`search`](/docs/protocol/mcp#tool-search) is for reads where the exact name isn't known.
 It ranks symbol names, signatures, documentation, and file content from the index.
 
+What the index holds is what the providers produced. Syntax providers contribute each
+declaration's name, signature, and documentation; the lexical tier adds file content — source
+and plain text alike — so a hit can land in a comment, a configuration key, or a README as well
+as a declaration. Facts a semantic provider resolved arrive through the same merge the
+[Providers](#providers) section describes, so a richer engine deepens results without changing
+the tool.
+
+Matching serves two query shapes. An identifier-shaped query — `ReadService`,
+`blocking_slots` — matches the declaration names it resembles, split the way code spells them.
+A prose query — `source extensions admitted` — ranks by
+[BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance in the embedded full-text
+index, over names, signatures, documentation, and content together, so concept-level recon does
+not depend on guessing the identifier first.
+
 The same tool walks relationships when the starting symbol is known. A
 [`SearchTraversal`](/docs/protocol/reference#SearchTraversal) names that symbol and the
 task: trace dependencies, find tests, estimate an edit's ripple, or collect review context. The
@@ -434,6 +448,17 @@ that projection path started. A different entry returns in `conflicts`, and noth
 Publication is serialized workspace-wide; on success Rift writes every changed path, rebuilds
 the projection from the resulting workspace tree, advances its base revision, and empties its
 changeset and read set.
+
+A projection's base does not have to be the workspace.
+[`projection_create`](/docs/protocol/mcp#tool-projection_create) can pin a child from another
+projection's current state: an orchestrator holds one projection for a large task, and each
+subagent branches its own from it. The child publishes into its parent through the same gate —
+per-path baselines, conflicts as refusals — serialized per target tree, and every chain ends at
+the workspace.
+
+There is no direct merge between sibling projections. Two siblings meet through their shared
+parent: each publishes into it, and the second publish sees the first one's writes as changed
+baselines and reports exactly the paths that collided.
 
 A projection read can depend on a file the change never touches. When `get_symbol` returns a
 declaration, `search` returns a hit, or `nodes` reads a file, the server records that file's path
