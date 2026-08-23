@@ -289,22 +289,22 @@ function JsonNode({
   );
 }
 
-function JsonShape({
-  fullscreen = false,
-  label,
-  schema,
-}: {
-  fullscreen?: boolean;
-  label: "input" | "output";
-  schema: JsonSchema;
-}) {
-  const value = exampleFromSchema(schema, schema);
+function PayloadTree({ schema, value }: { schema: JsonSchema; value: JsonValue }) {
   const resolved = structuralSchema(schema, schema);
+
+  if (typeof value !== "object" || value === null) {
+    return (
+      <div className="min-w-max whitespace-nowrap px-2 py-3 font-mono text-[0.75rem] sm:text-[0.8125rem]">
+        <div className="leading-6 text-foreground/75">{primitiveText(value)}</div>
+      </div>
+    );
+  }
+
+  const array = Array.isArray(value);
   const entries = Array.isArray(value)
     ? value.map((item, index) => [String(index), item] as const)
     : Object.entries(value as Record<string, JsonValue>);
-  const array = Array.isArray(value);
-  const payload = (
+  return (
     <div className="min-w-max whitespace-nowrap px-2 py-3 font-mono text-[0.75rem] sm:text-[0.8125rem]">
       <div className="leading-6 text-muted-foreground">{array ? "[" : "{"}</div>
       {entries.map(([name, entryValue], index) => {
@@ -324,6 +324,37 @@ function JsonShape({
       })}
       <div className="leading-6 text-muted-foreground">{array ? "]" : "}"}</div>
     </div>
+  );
+}
+
+function JsonShape({
+  fullscreen = false,
+  label,
+  schema,
+}: {
+  fullscreen?: boolean;
+  label: "input" | "output";
+  schema: JsonSchema;
+}) {
+  const authored =
+    Array.isArray(schema.examples) && schema.examples.length > 0 ? schema.examples : undefined;
+  const exampleLabel = label === "input" ? "Request" : "Response";
+  const payload = authored ? (
+    <div>
+      {authored.map((example, index) => (
+        <div
+          key={JSON.stringify(example)}
+          className={index > 0 ? "min-w-max border-t border-border" : "min-w-max"}
+        >
+          <div className="px-2 pt-3 font-sans text-xs font-semibold text-foreground">
+            {authored.length > 1 ? `${exampleLabel} ${index + 1}:` : `${exampleLabel}:`}
+          </div>
+          <PayloadTree schema={schema} value={example} />
+        </div>
+      ))}
+    </div>
+  ) : (
+    <PayloadTree schema={schema} value={exampleFromSchema(schema, schema)} />
   );
 
   return (
