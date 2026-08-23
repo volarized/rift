@@ -297,6 +297,27 @@ The [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) reports the tree, so
 index revisions used for the answer. It reports the index as current only after request-time
 reconciliation established that the published revision matches the workspace.
 
+<VersionBadge version="v0.0.9" languages={["Rust"]} />
+
+Each rebuild also derives a lexical unit for [`search`](/docs/protocol/mcp#tool-search): one per
+indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) admits, split into
+several units once a file crosses that table's chunk bound. Publication writes the whole set
+into a [SQLite](https://www.sqlite.org/) database at `.rift/db`, replacing its prior content and
+stamping it with the tree revision the publication just made current. That database is where
+Rift's own stores share space — the lexical index today, with later stores meant to join it —
+while the server lock, projections, and execution scratch stay separate files under `.rift`.
+
+An [FTS5](https://www.sqlite.org/fts5.html) virtual table inside that database serves content
+queries against those units. Alongside a unit's own spelling, Rift indexes its name split into
+words on case and separator boundaries, so a query for `get user name` also reaches a declaration
+spelled `getUserName`.
+
+A search request only trusts the lexical database when its stamped revision equals the snapshot
+the request is reading — the two disagree while a rebuild's population is still catching up, or
+after one failed outright. When they disagree, the request serves no lexical matches at all,
+falling back to identifier and source-line matching instead of returning a hit the tree has
+already moved past.
+
 ### Search
 
 [`search`](/docs/protocol/mcp#tool-search) is for reads where the exact name isn't known.

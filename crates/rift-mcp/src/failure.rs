@@ -41,7 +41,7 @@ pub(crate) fn hook_failure_diagnostic(
             Some(code) => format!("exited {code}"),
             None => "exited nonzero".to_owned(),
         },
-        HookStatus::TimedOut => format!("killed after {}ms", hook.timeout_ms),
+        HookStatus::TimedOut => format!("killed after {}ms", hook.timeout.milliseconds()),
         HookStatus::Error(message) => message.clone(),
     };
     let mut message = format!("hook {} did not pass: {account}", hook.id);
@@ -137,7 +137,7 @@ impl<K: Fault> WireFailure for rift_core::Error<K> {
             retry: descriptor.retry(),
             phase,
             diagnostics: Vec::new(),
-            limit: None,
+            limit: self.fault().limit_evidence(),
             causes: self.wire_causes(),
         }
     }
@@ -260,8 +260,8 @@ mod tests {
             changed_paths: ChangedPaths::None,
             working_directory: rift_protocol::read::ProjectPath(String::new()),
             environment: std::collections::BTreeMap::new(),
-            timeout_ms: 120_000,
-            output_limit_bytes: 4_096,
+            timeout: rift_protocol::configuration::Duration::from_millis(120_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
         }
@@ -357,6 +357,7 @@ mod tests {
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )
         .expect_err("missing root must fail");
         let causes = error.wire_causes();

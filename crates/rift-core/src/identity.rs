@@ -2,6 +2,9 @@ use std::fmt::{self, Write as _};
 use std::num::NonZeroU64;
 use std::str::FromStr;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::Serialize;
+
 use crate::constants::{
     HEX_LETTER_VALUE_OFFSET, HEX_NIBBLE_BITS, PERCENT_ESCAPE_BYTES, PERCENT_ESCAPE_HIGH_OFFSET,
     PERCENT_ESCAPE_LOW_OFFSET, PERCENT_ESCAPE_MARKER, SOURCE_RESOLVER_ID_BYTES_MAX,
@@ -9,7 +12,58 @@ use crate::constants::{
     SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX,
 };
 use crate::{Error, ErrorCode, ErrorContext, ErrorName, Fault, PathError, SourcePath};
-use serde::Serialize;
+
+/// ASCII bytes percent-encoded inside one segment of a `rift://` identity.
+///
+/// The kept characters are the RFC 3986 path set; every other byte, including each byte of a
+/// multi-byte UTF-8 sequence, is `%XX`-escaped. This is a display spelling, not a
+/// round-trip-parseable encoding: unlike [`SourceUnitId`]'s hand-rolled percent-encoding,
+/// nothing decodes a `rift://symbol/...`, `rift://file/...`, or `rift://node/...` identity
+/// back into its segments.
+const RIFT_PATH_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b';')
+    .remove(b'=')
+    .remove(b':')
+    .remove(b'@')
+    .remove(b'/')
+    .remove(b'-');
+
+/// Percent-encodes one segment of a `rift://` identity, keeping the RFC 3986 path set
+/// literal and escaping everything else.
+///
+/// The read service and the lexical index share this one function so a project path or
+/// qualified name is escaped identically wherever a wire identity is minted from it.
+#[must_use]
+pub fn encode_path(value: &str) -> String {
+    utf8_percent_encode(value, RIFT_PATH_ESCAPE_SET).to_string()
+}
+
+/// Mints the wire identity for one Rust symbol declaration:
+/// `rift://symbol/rust/{escaped_path}/{escaped_qualified_name}`.
+///
+/// The read service mints this as a declaration's `SymbolId`, and the lexical index mints
+/// the same spelling as a symbol lexical unit's identity, so a lexical hit's identity equals
+/// the id `get_symbol` returns for that declaration.
+#[must_use]
+pub fn rust_symbol_identity(path: &str, qualified_name: &str) -> String {
+    format!(
+        "rift://symbol/rust/{}/{}",
+        encode_path(path),
+        encode_path(qualified_name)
+    )
+}
 
 /// An identity value that is empty or carries a control character.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,11 +472,29 @@ mod tests {
         CompositionId, CompositionRevision, CursorId, IndexRevision, ModelId, ModelRevision,
         ProviderId, ProviderRevision, SourceResolverId, SourceResolverIdViolation, SourceRevision,
         SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
+        encode_path, rust_symbol_identity,
     };
     use crate::SourcePath;
     use crate::constants::{
         SOURCE_RESOLVER_ID_BYTES_MAX, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX,
     };
+
+    #[test]
+    fn encode_path_keeps_the_rfc3986_path_set_literal_and_escapes_the_rest() {
+        assert_eq!(encode_path("src/lib.rs"), "src/lib.rs");
+        assert_eq!(encode_path("Rift::update"), "Rift::update");
+        assert_eq!(encode_path("a b"), "a%20b");
+        assert_eq!(encode_path("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn rust_symbol_identity_pins_the_exact_wire_spelling_with_escaped_characters() {
+        let identity = rust_symbol_identity("src/café mod.rs", "Rift::separated name");
+        assert_eq!(
+            identity,
+            "rift://symbol/rust/src/caf%C3%A9%20mod.rs/Rift::separated%20name"
+        );
+    }
 
     #[test]
     fn identities_reject_ambiguous_values() {

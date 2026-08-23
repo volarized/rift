@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use data_encoding::BASE32_NOPAD;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::{DIGEST_WIRE_CHARS, OPAQUE_ID_DIGEST_CHARS, RUST_READ_PROVIDER_ID};
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility};
+use rift_core::{
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileAdmission,
+};
 use rift_history::{HistoryError, Repository};
 use rift_index::{
     IndexedFile, SymbolMatch, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
@@ -234,6 +235,7 @@ impl ReadService {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
+        text_admission: &TextFileAdmission,
     ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
             "index.build",
@@ -243,10 +245,11 @@ impl ReadService {
             outcome = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let index = WorkspaceIndex::build(root, limits, visibility).map_err(|source| {
-            span.record("outcome", "error");
-            ReadFault::index(source)
-        })?;
+        let index =
+            WorkspaceIndex::build(root, limits, visibility, text_admission).map_err(|source| {
+                span.record("outcome", "error");
+                ReadFault::index(source)
+            })?;
         let snapshot = captured_snapshot(&index, None);
         span.record("files_count", index.files().len());
         span.record("tree_revision", snapshot.tree_revision.0.as_str());
@@ -311,6 +314,32 @@ impl ReadService {
     #[must_use]
     pub const fn workspace_fingerprint(&self) -> &WorkspaceFingerprint {
         self.index.fingerprint()
+    }
+
+    /// Returns the tree revision this snapshot's wire answers report — the
+    /// same eight-hex-character string every `ReadSnapshot` in this
+    /// service's results carries. A lexical population stamps this exact
+    /// string, and a search request compares its query-time lexical
+    /// revision against it, so the two never drift apart.
+    #[must_use]
+    pub fn tree_revision(&self) -> &str {
+        &self.snapshot.tree_revision.0
+    }
+
+    /// Derives this snapshot's lexical search units: one per indexed
+    /// symbol and admitted text file, chunked where a text file exceeds
+    /// `[search.text].max_chunk`.
+    #[must_use]
+    pub fn lexical_units(&self) -> Vec<rift_index::LexicalUnit> {
+        self.index.lexical_units()
+    }
+
+    /// Returns each admitted text file split into more than one lexical
+    /// chunk, paired with its chunk count, so a caller can warn about the
+    /// split instead of it passing silently.
+    #[must_use]
+    pub fn chunked_text_files(&self) -> Vec<(CoreProjectPath, usize)> {
+        self.index.chunked_text_files()
     }
 
     /// Reads Rust syntax nodes covering one UTF-8 byte position. The tree
@@ -431,7 +460,7 @@ fn wire_node(file: &IndexedFile, node: &RustNode) -> Node {
     Node {
         id: node_id(file, node),
         symbol: symbol_for_range(file, node.range).map(|symbol| symbol_id(file, symbol)),
-        unit: file_id(file),
+        unit: file_id(file.path()),
         language: rust_language(),
         kind: ExactKind(format!("rust.{}", node.kind)),
         facets: node_facets(node),
@@ -453,7 +482,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
         || Node {
             id: NodeId(node_address(matched.file, matched.symbol.range)),
             symbol: Some(symbol_id(matched.file, matched.symbol)),
-            unit: file_id(matched.file),
+            unit: file_id(matched.file.path()),
             language: rust_language(),
             kind: ExactKind(symbol_kind(matched.symbol.kind).to_owned()),
             facets: vec![NodeFacet::Declaration, NodeFacet::Definition],
@@ -477,16 +506,15 @@ pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
         origin: SymbolOrigin {
             location: Some(SourceLocation::Project { package: None }),
             source_kind: SourceKind::Authored,
-            unit: Some(source_unit_id(matched.file)),
+            unit: Some(source_unit_id(matched.file.path())),
         },
         container: symbol
             .qualified_name
             .rsplit_once("::")
             .map(|(container, _)| {
-                SymbolId(format!(
-                    "rift://symbol/rust/{}/{}",
-                    encode_path(matched.file.path().as_str()),
-                    encode_path(container)
+                SymbolId(rift_core::rust_symbol_identity(
+                    matched.file.path().as_str(),
+                    container,
                 ))
             }),
         modifiers: Vec::new(),
@@ -508,14 +536,14 @@ pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
         .min(file.source().len());
     let text = file.source().get(start..end).unwrap_or_default().to_owned();
     SourceExcerpt {
-        span: source_span(file, range),
+        span: source_span(file.path(), range),
         text,
     }
 }
 
-pub(crate) fn source_span(file: &IndexedFile, range: ByteRange) -> SourceUnitSpan {
+pub(crate) fn source_span(path: &CoreProjectPath, range: ByteRange) -> SourceUnitSpan {
     SourceUnitSpan {
-        unit: source_unit_id(file),
+        unit: source_unit_id(path),
         range: text_range(range),
     }
 }
@@ -534,29 +562,31 @@ pub(crate) fn rust_language() -> Language {
     }
 }
 
-pub(crate) fn file_id(file: &IndexedFile) -> FileId {
-    FileId(format!("rift://file/{}", encode_path(file.path().as_str())))
+pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
+    FileId(format!(
+        "rift://file/{}",
+        rift_core::encode_path(path.as_str())
+    ))
 }
 
 /// Mints the project resolver's source-unit identity: the resolver name, then the
 /// project-relative path as the resolver's own canonical unit key.
-pub(crate) fn source_unit_id(file: &IndexedFile) -> SourceUnitId {
+pub(crate) fn source_unit_id(path: &CoreProjectPath) -> SourceUnitId {
     SourceUnitId(format!(
         "rift://source/project/{}",
-        encode_path(file.path().as_str())
+        rift_core::encode_path(path.as_str())
     ))
 }
 
-/// Project-relative path of one indexed file, as the wire model carries it.
-pub(crate) fn project_path(file: &IndexedFile) -> ProjectPath {
-    ProjectPath(file.path().as_str().to_owned())
+/// Project-relative path, as the wire model carries it.
+pub(crate) fn project_path(path: &CoreProjectPath) -> ProjectPath {
+    ProjectPath(path.as_str().to_owned())
 }
 
 fn symbol_id(file: &IndexedFile, symbol: &RustSymbol) -> SymbolId {
-    SymbolId(format!(
-        "rift://symbol/rust/{}/{}",
-        encode_path(file.path().as_str()),
-        encode_path(&symbol.qualified_name)
+    SymbolId(rift_core::rust_symbol_identity(
+        file.path().as_str(),
+        &symbol.qualified_name,
     ))
 }
 
@@ -567,7 +597,7 @@ fn node_id(file: &IndexedFile, node: &RustNode) -> NodeId {
 fn node_address(file: &IndexedFile, range: ByteRange) -> String {
     format!(
         "rift://node/rust/{}@{}-{}#{}",
-        encode_path(file.path().as_str()),
+        rift_core::encode_path(file.path().as_str()),
         range.start,
         range.end,
         node_witness(file.source(), range)
@@ -640,34 +670,6 @@ pub(crate) fn digest_prefix_base32(bytes: &[u8]) -> String {
     let mut encoded = BASE32_NOPAD.encode(bytes).to_ascii_lowercase();
     encoded.truncate(OPAQUE_ID_DIGEST_CHARS);
     encoded
-}
-
-/// ASCII bytes percent-encoded inside `rift://` path segments.
-///
-/// The kept characters are the RFC 3986 path set; every other byte,
-/// including each byte of multi-byte UTF-8 sequences, is `%XX`-escaped.
-const PATH_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~')
-    .remove(b'!')
-    .remove(b'$')
-    .remove(b'&')
-    .remove(b'\'')
-    .remove(b'(')
-    .remove(b')')
-    .remove(b'*')
-    .remove(b'+')
-    .remove(b',')
-    .remove(b';')
-    .remove(b'=')
-    .remove(b':')
-    .remove(b'@')
-    .remove(b'/')
-    .remove(b'-');
-
-pub(crate) fn encode_path(value: &str) -> String {
-    utf8_percent_encode(value, PATH_ESCAPE_SET).to_string()
 }
 
 /// Complete coverage for a request served in full from `snapshot`, carrying the real
@@ -794,6 +796,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -808,6 +811,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -854,6 +858,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         Ok((directory, service))
     }
@@ -1021,6 +1026,7 @@ pub fn compute() -> i32 {
             std::path::Path::new("not-a-real-rift-workspace"),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )
         .expect_err("missing root must fail");
 
@@ -1252,6 +1258,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileAdmission::default(),
         )?;
         assert_ne!(
             at_head.snapshot().tree_revision,

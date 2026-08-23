@@ -15,7 +15,7 @@ use serde_json::json;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// A `[[hooks]]` block whose `timeout_ms` breaks its documented bound.
+/// A `[[hooks]]` block whose `timeout` breaks its documented bound.
 const INVALID_CONFIGURATION: &str = r#"
 [[hooks]]
 type = "command"
@@ -26,8 +26,8 @@ arguments = ["test"]
 changed_paths = "none"
 working_directory = ""
 environment = {}
-timeout_ms = 0
-output_limit_bytes = 4096
+timeout = "0ms"
+output_limit = "4kb"
 guarantees = []
 determinism = "deterministic"
 "#;
@@ -43,10 +43,24 @@ arguments = ["test"]
 changed_paths = "none"
 working_directory = ""
 environment = {}
-timeout_ms = 120000
-output_limit_bytes = 4096
+timeout = "120s"
+output_limit = "4kb"
 guarantees = []
 determinism = "deterministic"
+"#;
+
+/// A `[search.text]` block whose `max_chunk` breaks its documented 1kb..16mb bound.
+const INVALID_TEXT_CONFIGURATION: &str = r#"
+[search.text]
+extensions = ["md", "mdx", "txt"]
+max_chunk = "1b"
+"#;
+
+/// A `[search.text]` block with a custom, in-bound extension list and chunk bound.
+const VALID_TEXT_CONFIGURATION: &str = r#"
+[search.text]
+extensions = ["md", "rst"]
+max_chunk = "2mb"
 "#;
 
 fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> {
@@ -106,7 +120,7 @@ async fn invalid_configuration_fails_reads_and_changes_typed() -> TestResult {
     assert_eq!(read["phase"], json!("read"));
     let message = read["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("hooks.timeout_ms") && message.contains("1..=3600000"),
+        message.contains("hooks.timeout") && message.contains("1..=3600000"),
         "the refusal must name the field and its range: {message}"
     );
 
@@ -165,6 +179,45 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
     fs::write(directory.path().join("rift.toml"), INVALID_CONFIGURATION)?;
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
     assert_eq!(refused["code"], json!("configuration_invalid"));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_search_text_configuration_fails_reads_typed() -> TestResult {
+    let directory = workspace_with(Some(INVALID_TEXT_CONFIGURATION))?;
+    let client = client_for(directory.path()).await?;
+
+    let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
+    assert_eq!(read["code"], json!("configuration_invalid"));
+    assert_eq!(read["retry"], json!("operator_action"));
+    let message = read["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("search.text.max_chunk"),
+        "the refusal must name the out-of-range field: {message}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn valid_search_text_configuration_serves_normally() -> TestResult {
+    let directory = workspace_with(Some(VALID_TEXT_CONFIGURATION))?;
+    fs::write(directory.path().join("guide.md"), "guide body")?;
+    let client = client_for(directory.path()).await?;
+
+    let served = client
+        .call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+        )
+        .await?;
+    assert_eq!(
+        served.structured_content.ok_or("structured content")?["hits"][0]["symbol"]["name"],
+        json!("beacon")
+    );
 
     client.cancel().await?;
     Ok(())

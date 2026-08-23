@@ -36,6 +36,10 @@ pub const RIFT_STATE_DIRECTORY: &str = ".rift";
 pub const RIFT_STATE_DIRECTORY_PREFIX: &str = ".rift/";
 /// Workspace configuration file, read from the workspace root.
 pub const WORKSPACE_CONFIGURATION_FILE: &str = "rift.toml";
+/// Workspace database file, below [`RIFT_STATE_DIRECTORY`]: one `SQLite`
+/// database at `.rift/db` holds every store Rift persists for the
+/// workspace.
+pub const WORKSPACE_DATABASE_FILE_NAME: &str = "db";
 /// Maximum ASCII bytes in one provider-composition stage name.
 pub const STAGE_NAME_BYTES_MAX: usize = 64;
 /// Punctuation accepted in provider-composition stage names.

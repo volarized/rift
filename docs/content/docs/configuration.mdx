@@ -142,10 +142,37 @@ immutable revision as stale without presenting it as current.
 
 ## Search
 
+<VersionBadge version="v0.0.9" />
+
+[`search`](/docs/protocol/mcp#tool-search) runs on a lexical index. `[search.text]` decides
+which files join it beyond source files; `pool_slots` and `busy_timeout` bound the SQLite
+connections behind the whole index:
+
+```toml
+[search.text]
+extensions = ["md", "mdx", "txt"]
+max_chunk = "1mb"
+
+[search]
+pool_slots = 4
+busy_timeout = "1s"
+```
+
+Each key is shown at its default:
+
+- `extensions` names which file extensions, without the leading dot, join the index alongside
+  source files — `md`, `mdx`, and `txt` by default, prose formats with no syntax provider of
+  their own
+- `max_chunk` bounds how large a file may grow before it's split into several indexed chunks,
+  1kb to 16mb; an operator who wants a file out of the index entirely excludes it in
+  [`[source]`](/docs/configuration#source) or drops its extension from `extensions`
+- `pool_slots` bounds SQLite connections the lexical index may hold open at once, 1 to 16
+- `busy_timeout` bounds how long one of those connections waits on SQLite's own lock before
+  failing with `SQLITE_BUSY`, 100ms to 30s
+
 <VersionBadge version="planned" />
 
-[`search`](/docs/protocol/mcp#tool-search) runs on a lexical index with nothing to
-configure. The `search` table names the embedding model that adds dense ranking on top of it:
+`embedding` names the model that adds dense ranking on top of the lexical index:
 
 ```toml
 [search]
@@ -174,8 +201,8 @@ arguments = ["test"]
 changed_paths = "none"
 working_directory = ""
 environment = {}
-timeout_ms = 120000
-output_limit_bytes = 4096
+timeout = "120s"
+output_limit = "4kb"
 guarantees = []
 determinism = "deterministic"
 ```
@@ -197,8 +224,8 @@ a configured hook executes the agent's change each time one applies.
 Every key in the block is required — the schema carries no defaults, so a missing `environment`
 fails the file with `configuration_invalid`. The list holds at most 32 hooks.
 
-Two keys carry bounds: `timeout_ms`, when Rift kills the process, takes 1 to 3600000, and
-`output_limit_bytes`, how much of each stream Rift keeps, takes 256 to 4096. The full size is
+Two keys carry bounds: `timeout`, when Rift kills the process, takes `"1ms"` to `"1h"`, and
+`output_limit`, how much of each stream Rift keeps, takes `"256b"` to `"4kb"`. The full size is
 still reported, so you can tell a truncated log from a short one.
 
 `guarantees` declares what a pass actually establishes, which is what turns a green run into
@@ -208,7 +235,7 @@ and the exact claim in words (`detail`); the evidence on the change carries them
 hook's `id`. `determinism` says whether the same tree and environment are expected to give the
 same answer twice.
 
-A hook that exits nonzero, overruns `timeout_ms`, or fails to launch contributes an error
+A hook that exits nonzero, overruns `timeout`, or fails to launch contributes an error
 finding under the code `rift.hook.failed`, naming what ended the run and quoting each non-empty
 stream with its size. The change itself stays applied — hooks observe a change that has already
 landed, so their verdicts ride the result instead of rolling it back.
