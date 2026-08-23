@@ -219,12 +219,21 @@ async fn open_lexical_index(
 
 /// Rust workspace MCP server: reads serve an immutable snapshot, changes
 /// write the workspace and swap in a fresh snapshot.
-#[derive(Debug)]
+///
+/// Clones share every piece of server state. The HTTP transport clones one
+/// server per request, so index-supervisor cancellation keys off the last
+/// clone's drop, never each clone's.
+#[derive(Clone, Debug)]
 pub struct RiftMcp {
     root: PathBuf,
     limits: WorkspaceIndexLimits,
     published: Arc<RwLock<IndexState>>,
     validation: Arc<IndexValidation>,
+    /// Cancels the index supervisor when the last clone drops. The
+    /// supervisor task and the watcher hold [`IndexValidation`] directly,
+    /// never this guard, so the guard's drop is what ends them.
+    #[expect(dead_code, reason = "held for its cancel-on-last-drop effect")]
+    supervisor_cancellation: Arc<tokio_util::sync::DropGuard>,
     changes: Arc<ChangeService>,
     change_lane: Arc<ChangeLane>,
     blocking: BlockingExecutor,
@@ -232,12 +241,6 @@ pub struct RiftMcp {
     /// startup; `search` then serves identifier matching alone.
     lexical: Option<Arc<LexicalSearchIndex>>,
     tool_router: ToolRouter<Self>,
-}
-
-impl Drop for RiftMcp {
-    fn drop(&mut self) {
-        self.validation.cancellation.cancel();
-    }
 }
 
 /// One already-serialized change's outcome, threaded out of the blocking executor so the
@@ -328,11 +331,13 @@ impl RiftMcp {
         let mut task = validation.task.lock().await;
         *task = Some(supervisor_task);
         drop(task);
+        let supervisor_cancellation = Arc::new(validation.cancellation.clone().drop_guard());
         Ok(Self {
             root: root.clone(),
             limits,
             published,
             validation,
+            supervisor_cancellation,
             changes: Arc::new(ChangeService::new(&root)),
             change_lane,
             blocking,
@@ -346,6 +351,17 @@ impl RiftMcp {
         IndexSupervisor {
             validation: Arc::clone(&self.validation),
         }
+    }
+
+    /// The `[server]` table from the currently published acceptance, or the
+    /// default table while `rift.toml` is invalid.
+    pub(crate) async fn server_configuration(&self) -> ServerConfiguration {
+        self.published
+            .read()
+            .await
+            .current
+            .configuration
+            .server_configuration()
     }
 
     /// Finds Rust declarations and their source by exact symbol name. Each hit
@@ -929,6 +945,25 @@ mod tests {
                 Err("fixture configuration must remain stable".into())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn supervisor_cancellation_keys_off_the_last_clone() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let validation = Arc::clone(&server.validation);
+        let cloned = server.clone();
+        drop(server);
+        assert!(
+            !validation.cancellation.is_cancelled(),
+            "the supervisor must keep running while a clone still serves"
+        );
+        drop(cloned);
+        assert!(
+            validation.cancellation.is_cancelled(),
+            "dropping the last clone must cancel the supervisor"
+        );
+        drop(directory);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1756,8 +1791,8 @@ mod tests {
         peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
         params: CallToolRequestParams,
     ) -> TestResult<rmcp::model::CallToolResult> {
-        const ADMISSION_ATTEMPTS_MAX: usize = 8;
-        for _attempt in 0..ADMISSION_ATTEMPTS_MAX {
+        const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
+        for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
             match peer.call_tool(params.clone()).await {
                 Ok(result) => return Ok(result),
                 Err(ServiceError::McpError(error))
