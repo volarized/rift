@@ -39,7 +39,7 @@ formatters, linters, and test runners, which check each change after it lands.
       mcp -- "HTTP :port" --> server["rift server<br/>one per workspace"]:::rift
       agent -. "MCP over HTTP" .-> server
       lock[".rift/server.json"]:::store -- "port + token" --> mcp
-      toml["rift.toml"]:::store -- "admission" --> server
+      toml["rift.toml"]:::store -- "acceptance" --> server
       server -- "discover" --> resolvers["source resolvers"]:::provider
       server -- "facts" --> providers["providers"]:::provider
       server -- "on change" --> hooks["hooks"]:::hook
@@ -104,14 +104,14 @@ And why HTTP rather than a socket? `rift mcp` needs a rendezvous either way, whi
 agent can connect to the port without `rift mcp`.
 </Callout>
 
-On startup the server reads `rift.toml` from the workspace root and admits the workspace. The
+On startup the server reads `rift.toml` from the workspace root and accepts the workspace. The
 file decides:
 
 - which languages may execute agent-written code
 - which embedding model, if any, ranks search
 - which hooks run on every change
 
-An edit to the file takes effect for later requests once it validates again; a change to
+An edit to the file takes effect for later requests once it is accepted again; a change to
 `rift.toml` made in a projection carries a `configuration` confirmation into
 [`publish`](/docs/protocol/mcp#tool-publish), because publishing it changes which hooks
 and limits the server runs with. An invalid file keeps the workspace unusable until you fix it.
@@ -267,7 +267,7 @@ distinguish a compiler-resolved answer from a syntax fallback.
 <VersionBadge version="v0.0.8" languages={["Rust"]} />
 
 The server keeps an immutable index over the project's source. Tree-sitter extracts
-declarations and syntax nodes from the files admitted by the workspace's source policy; the
+declarations and syntax nodes from the files the workspace's source policy includes; the
 badge above names the languages the index currently covers.
 
 The server watches the workspace and validates the published index against it before each
@@ -282,7 +282,7 @@ reconciliation established that the published revision matches the workspace.
 <VersionBadge version="v0.0.9" languages={["Rust"]} />
 
 Each rebuild also derives lexical units for [`search`](/docs/protocol/mcp#tool-search): one per
-indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) admits. The units
+indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) includes. The units
 persist in the workspace database at `.rift/db`, stamped with the tree revision that published
 them.
 
@@ -305,7 +305,7 @@ the tool.
 
 Matching serves two query shapes. An identifier-shaped query — `ReadService`,
 `num_workers` — matches the declaration names it resembles. A prose query — `source
-extensions admitted` — ranks by [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance
+extensions included` — ranks by [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance
 over names, signatures, documentation, and content together.
 
 Names are indexed both as spelled and split into words on case and separator boundaries, so

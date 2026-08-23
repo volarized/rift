@@ -42,7 +42,7 @@ Each key is shown at its default:
 
 The worker pool exists before the first request, so the server sizes it once at startup: a
 change to this table applies on the next start, while every other table applies to later
-requests as soon as the file validates.
+requests as soon as the file is accepted.
 
 ## Source
 
@@ -59,7 +59,7 @@ exclude = []
 respect_gitignore = true
 ```
 
-Empty `include` admits every file `exclude` and `.gitignore` leave standing; a match in `exclude`
+Empty `include` includes every file `exclude` and `.gitignore` leave standing; a match in `exclude`
 drops a file even when `include` also matches it. `respect_gitignore`, on by default, applies the
 workspace's own `.gitignore` files, root and nested — global and parent-directory ignore sources
 are never read.

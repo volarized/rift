@@ -10,12 +10,12 @@ This page goes into how Rift is built. It's developer-oriented — if you just w
 check the [main documentation](/docs).
 
 <FlatDiagram
-  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /api/mcp route over Streamable HTTP. The server, an Axum application on Tokio, admits rift.toml, mounts projections through Rift FS, and runs hooks on each change. Inside the providers-and-index box, provider compositions feed facts into the in-memory index, which publishes lexical units through Toasty over SQLite into .rift/db; the server queries both. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
+  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /api/mcp route over Streamable HTTP. The server, an Axum application on Tokio, accepts rift.toml, mounts projections through Rift FS, and runs hooks on each change. Inside the providers-and-index box, provider compositions feed facts into the in-memory index, which publishes lexical units through Toasty over SQLite into .rift/db; the server queries both. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
       mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
-      toml["rift.toml"]:::config -- "admission" --> server
+      toml["rift.toml"]:::config -- "acceptance" --> server
       server -- "mounts" --> fs["Rift FS<br/>NFS or FUSE"]:::rift
       fs -- "serves" --> proj[".rift/projections/<br/>my-feature-one"]:::store
       subgraph indexing["providers and index"]
@@ -64,7 +64,7 @@ routes are reserved for other surfaces, the SCIP export for example.
 
 Startup runs one cycle:
 
-1. Parse `rift.toml` and admit the workspace; an invalid file keeps the server running but
+1. Parse `rift.toml` and accept the workspace; an invalid file keeps the server running but
    refuses every request until fixed.
 2. Take the file lock on `.rift/server.json`, which picks one starter among racing `rift mcp`
    processes.
@@ -81,13 +81,13 @@ queue, and a worker picks it up when one is free. The pool's bounds — `num_wor
 
 The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories. The
 symbol index stays in memory as one immutable value: a rebuild constructs the next index and
-admitted configuration outside the async lock, then swaps the complete value under its write
+accepted configuration outside the async lock, then swaps the complete value under its write
 lock. Each request clones the published value under a read lock and retains that capture through
 its result, so reads never combine state from two index revisions.
 
 Watcher events and Rift-applied changes advance one workspace change counter and enter the same
 serialized rebuild lane. Before each current-tree read, the server reconciles watcher state
-against an exact fingerprint of the admitted workspace files, then waits until the published
+against an exact fingerprint of the included workspace files, then waits until the published
 index counter matches it — the mechanism behind the freshness the
 [`ReadSnapshot`](/docs/protocol/reference#ReadSnapshot) reports.
 
@@ -155,7 +155,7 @@ because no filesystem watcher sees inside a served tree.
 
 ## Hooks and configuration
 
-`rift.toml` at the workspace root is admitted at startup and re-validated on change; its schema
+`rift.toml` at the workspace root is accepted at startup and re-accepted on change; its schema
 is exported beside the MCP surface as [`rift.schema.json`](https://volar.sh/rift/rift.schema.json),
 so editors validate the file as it is written. A quantity value carries its unit:
 `timeout = "120s"`.
