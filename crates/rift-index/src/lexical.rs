@@ -13,7 +13,9 @@
 
 use std::path::{Path, PathBuf};
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, fault_label};
+use rift_core::{
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, ProjectPath, fault_label,
+};
 use serde::Serialize;
 use toasty::db::Connection;
 use toasty::migration::{MigrationFile, MigrationSet};
@@ -189,6 +191,27 @@ pub struct LexicalMatch {
 }
 
 impl LexicalMatch {
+    /// Constructs one lexical match directly. Production code only ever builds these from
+    /// a live [`LexicalSearchIndex::search`]; this constructor exists for callers that
+    /// merge or resolve matches from a search result they already hold — most notably
+    /// tests exercising that merge without a live database.
+    #[must_use]
+    pub fn new(
+        identity: impl Into<String>,
+        path: ProjectPath,
+        kind: LexicalUnitKind,
+        name: Option<String>,
+        rank: f64,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            path,
+            kind,
+            name,
+            rank,
+        }
+    }
+
     /// Returns the matched unit's stable identity.
     #[must_use]
     pub fn identity(&self) -> &str {
@@ -329,13 +352,26 @@ pub enum LexicalIndexViolation {
     DuplicateIdentity,
 }
 
+/// The bound and observed value behind a `limit_exceeded` violation, minted from the exact
+/// numbers the caller already computed. The wire [`LimitEvidence`] and this fault's own
+/// rendered `observed`/`maximum` context both derive from this one typed value, so they
+/// cannot drift apart the way reparsing rendered text back into numbers could.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LimitBreach {
+    field: &'static str,
+    observed: u64,
+    maximum: u64,
+}
+
 /// One lexical indexing failure: its violation, the offending path when
-/// known, and the underlying cause.
+/// known, the underlying cause, and — for a limit violation — the typed
+/// bound it crossed.
 #[derive(Debug)]
 pub struct LexicalIndexFault {
     violation: LexicalIndexViolation,
     path: Option<PathBuf>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    limit: Option<LimitBreach>,
 }
 
 impl LexicalIndexFault {
@@ -371,6 +407,10 @@ impl Fault for LexicalIndexFault {
         if let Some(path) = &self.path {
             context.push(ErrorContext::new("path", path.display().to_string()));
         }
+        if let Some(breach) = self.limit {
+            context.push(ErrorContext::new("observed", breach.observed.to_string()));
+            context.push(ErrorContext::new("maximum", breach.maximum.to_string()));
+        }
         context
     }
 
@@ -378,6 +418,14 @@ impl Fault for LexicalIndexFault {
         self.source
             .as_deref()
             .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+
+    fn limit_evidence(&self) -> Option<LimitEvidence> {
+        self.limit.map(|breach| LimitEvidence {
+            field: breach.field.to_owned(),
+            limit: breach.maximum,
+            required: breach.observed,
+        })
     }
 }
 
@@ -389,14 +437,7 @@ fn lexical_error(violation: LexicalIndexViolation) -> LexicalIndexError {
         violation,
         path: None,
         source: None,
-    })
-}
-
-fn lexical_error_at(violation: LexicalIndexViolation, path: &Path) -> LexicalIndexError {
-    Error::new(LexicalIndexFault {
-        violation,
-        path: Some(path.to_path_buf()),
-        source: None,
+        limit: None,
     })
 }
 
@@ -409,7 +450,37 @@ fn lexical_error_caused_by(
         violation,
         path: path.map(Path::to_path_buf),
         source: Some(Box::new(source)),
+        limit: None,
     })
+}
+
+/// Refuses a `limit_exceeded`-classified violation, carrying the bound and the value that
+/// crossed it as one typed [`LimitBreach`] the wire [`LimitEvidence`] and the rendered
+/// `observed`/`maximum` context both derive from.
+fn lexical_error_over_limit(
+    violation: LexicalIndexViolation,
+    path: Option<&Path>,
+    field: &'static str,
+    observed: u64,
+    maximum: u64,
+) -> LexicalIndexError {
+    Error::new(LexicalIndexFault {
+        violation,
+        path: path.map(Path::to_path_buf),
+        source: None,
+        limit: Some(LimitBreach {
+            field,
+            observed,
+            maximum,
+        }),
+    })
+}
+
+/// Widens a bounded `usize` count into the `u64` domain [`LimitBreach`] and the wire
+/// `LimitEvidence` share; every count this module bounds already fits comfortably, so the
+/// fallback only guards the conversion, never fires in practice.
+fn limit_count(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 /// Maps one Toasty operating failure onto [`LexicalIndexViolation::Storage`].
@@ -445,9 +516,13 @@ fn match_expression(query: &str, terms_max: usize) -> Result<Option<String>, Lex
         }
         terms.push(candidate);
         if terms.len() > terms_max {
-            return Err(lexical_error(LexicalIndexViolation::QueryTermLimit)
-                .with_context(ErrorContext::new("observed", terms.len().to_string()))
-                .with_context(ErrorContext::new("maximum", terms_max.to_string())));
+            return Err(lexical_error_over_limit(
+                LexicalIndexViolation::QueryTermLimit,
+                None,
+                "query_terms_max",
+                limit_count(terms.len()),
+                limit_count(terms_max),
+            ));
         }
     }
     if terms.is_empty() {
@@ -526,13 +601,14 @@ fn oversized_field_error(
     observed: usize,
     maximum: usize,
 ) -> LexicalIndexError {
-    lexical_error_at(
+    lexical_error_over_limit(
         LexicalIndexViolation::UnitTooLarge,
-        Path::new(unit.path().as_str()),
+        Some(Path::new(unit.path().as_str())),
+        field,
+        limit_count(observed),
+        limit_count(maximum),
     )
     .with_context(ErrorContext::new("field", field))
-    .with_context(ErrorContext::new("observed", observed.to_string()))
-    .with_context(ErrorContext::new("maximum", maximum.to_string()))
 }
 
 /// Refuses a `replace_all` batch that violates a configured bound, before any
@@ -544,9 +620,13 @@ fn validate_lexical_batch(
     limits: LexicalIndexLimits,
 ) -> Result<(), LexicalIndexError> {
     if units.len() > bound_as_usize(limits.units_max()) {
-        return Err(lexical_error(LexicalIndexViolation::UnitLimit)
-            .with_context(ErrorContext::new("observed", units.len().to_string()))
-            .with_context(ErrorContext::new("maximum", limits.units_max().to_string())));
+        return Err(lexical_error_over_limit(
+            LexicalIndexViolation::UnitLimit,
+            None,
+            "units_max",
+            limit_count(units.len()),
+            u64::from(limits.units_max()),
+        ));
     }
     let mut identities_seen = std::collections::HashSet::with_capacity(units.len());
     for unit in units {
@@ -918,10 +998,9 @@ mod tests {
         LexicalIndexFault, LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation,
         LexicalSearchIndex, LexicalUnit, LexicalUnitKind, LexicalUnitRecord, UNIT_NAME_BYTES_MAX,
         checked_byte_length, decode_lexical_match, identifier_expansion, lexical_error,
-        lexical_error_at, lexical_error_caused_by, match_expression, require_pragma_row,
-        validate_lexical_batch,
+        lexical_error_caused_by, match_expression, require_pragma_row, validate_lexical_batch,
     };
-    use rift_core::{ErrorCode, ErrorName, ProjectPath};
+    use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath};
     use toasty::stmt::Value;
 
     #[test]
@@ -1006,10 +1085,12 @@ mod tests {
     }
 
     #[test]
-    fn test_lexical_error_at_context_includes_violation_and_path() {
-        let error = lexical_error_at(
+    fn test_lexical_error_caused_by_context_includes_violation_and_path() {
+        let cause = std::io::Error::other("disk unavailable");
+        let error = lexical_error_caused_by(
             LexicalIndexViolation::UnitTooLarge,
-            std::path::Path::new("docs/big.md"),
+            Some(std::path::Path::new("docs/big.md")),
+            cause,
         );
         let keys: Vec<&str> = error
             .context()
@@ -1096,6 +1177,69 @@ mod tests {
             "loop must refuse on the first term past terms_max, not after scanning every term"
         );
         assert_eq!(maximum, Some("2"));
+    }
+
+    #[test]
+    fn test_query_term_limit_exposes_typed_limit_evidence() {
+        let error = match_expression("alpha beta gamma delta", 3)
+            .expect_err("over-limit query must refuse");
+        assert_eq!(
+            error.fault().limit_evidence(),
+            Some(rift_core::LimitEvidence {
+                field: "query_terms_max".to_owned(),
+                limit: 3,
+                required: 4,
+            }),
+            "the wire evidence must derive from the same typed breach as the rendered context"
+        );
+    }
+
+    #[test]
+    fn test_unit_limit_exposes_typed_limit_evidence() {
+        let units = vec![
+            symbol_unit_with_name("a".to_owned()),
+            symbol_unit_with_name("b".to_owned()),
+        ];
+        let limits = LexicalIndexLimits::new(1, 1_048_576, 32, 1_000, 4, 1_000);
+        let error =
+            validate_lexical_batch(&units, limits).expect_err("a batch over units_max must refuse");
+        assert_eq!(
+            error.fault().limit_evidence(),
+            Some(rift_core::LimitEvidence {
+                field: "units_max".to_owned(),
+                limit: 1,
+                required: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_unit_too_large_exposes_typed_limit_evidence_and_field_context() {
+        let unit = symbol_unit_with_name("n".repeat(UNIT_NAME_BYTES_MAX + 1));
+        let error = validate_lexical_batch(&[unit], LexicalIndexLimits::default())
+            .expect_err("an oversized name must refuse");
+        assert_eq!(
+            error.fault().limit_evidence(),
+            Some(rift_core::LimitEvidence {
+                field: "name".to_owned(),
+                limit: UNIT_NAME_BYTES_MAX as u64,
+                required: (UNIT_NAME_BYTES_MAX + 1) as u64,
+            })
+        );
+        // The rendered `field` context (used by the human-readable message) still comes
+        // from the same `oversized_field_error` call, not a second, drifting source.
+        let context = error.context();
+        let field = context
+            .iter()
+            .find(|entry| entry.key() == "field")
+            .map(rift_core::ErrorContext::value);
+        assert_eq!(field, Some("name"));
+    }
+
+    #[test]
+    fn test_a_non_limit_violation_exposes_no_limit_evidence() {
+        let error = lexical_error(LexicalIndexViolation::IdentityEmpty);
+        assert_eq!(error.fault().limit_evidence(), None);
     }
 
     #[test]
@@ -1300,6 +1444,7 @@ mod tests {
             violation: LexicalIndexViolation::Storage,
             path: Some(std::path::PathBuf::from("index.db")),
             source: None,
+            limit: None,
         };
         assert_eq!(fault.path(), Some(std::path::Path::new("index.db")));
         assert_eq!(fault.violation(), LexicalIndexViolation::Storage);

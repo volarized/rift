@@ -315,6 +315,25 @@ pub fn declare_server_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`SearchConfiguration`](crate::configuration::SearchConfiguration) states its
+/// `Duration` ceiling as `rift:range` on the key: schema validation alone cannot compare
+/// `"1s"` against a ceiling, so the server enforces the bound at load and the schema carries
+/// it for readers.
+pub fn declare_search_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        Duration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_BUSY_TIMEOUT_MS_MIN, SearchConfiguration,
+    };
+    annotate_property(
+        schema,
+        property!(SearchConfiguration, busy_timeout),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_MIN),
+            &Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_MAX),
+        ),
+    );
+}
+
 /// A [`TextSearchConfiguration`](crate::configuration::TextSearchConfiguration) states its
 /// `ByteSize` ceiling as `rift:range` on the key: schema validation alone cannot compare
 /// `"1mb"` against a ceiling, so the server enforces the bound at load and the schema carries
@@ -708,6 +727,17 @@ mod tests {
             schema["properties"]["blocking_queue_timeout"][RIFT_RANGE],
             json!({ "min": "1ms", "max": "1h" }),
             "blocking_queue_timeout must state its admitted range"
+        );
+    }
+
+    #[test]
+    fn search_configuration_schema_states_range_on_busy_timeout() {
+        let schema = serde_json::to_value(schema_for!(crate::configuration::SearchConfiguration))
+            .expect("schema");
+        assert_eq!(
+            schema["properties"]["busy_timeout"][RIFT_RANGE],
+            json!({ "min": "100ms", "max": "30s" }),
+            "busy_timeout must state its admitted range"
         );
     }
 

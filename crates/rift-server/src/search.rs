@@ -1,17 +1,21 @@
 //! `search` tool execution: lexical symbol and source-line search, narrowed or extended by a
 //! request's `paths` selector. Extracted from `read` so that module stays below its size bound.
 
+use std::cmp::Ordering;
 use std::path::Path;
 
 use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT};
 use rift_core::line;
-use rift_index::{PathMatcher, SymbolMatch, SymbolMatchRank, WorkspaceIndex};
+use rift_index::{
+    IndexedFile, LexicalMatch, LexicalUnitKind, PathMatcher, SymbolMatch, SymbolMatchRank,
+    TextSourceFile, WorkspaceIndex,
+};
 use rift_protocol::read::{
     File, FileContent, MatchedField, PathPattern, PathSelector, SearchHit, SearchHitTarget,
-    SearchParams, SearchParamsTarget, SearchResult,
+    SearchParams, SearchParamsTarget, SearchResult, SymbolId,
 };
-use rift_syntax::ByteRange;
+use rift_syntax::{ByteRange, RustSymbol};
 
 use crate::read::{
     ReadError, ReadFault, ReadService, admitted_limit, complete_coverage, excerpt, file_id,
@@ -20,13 +24,20 @@ use crate::read::{
 
 impl ReadService {
     /// Searches Rust declarations and source lines, optionally narrowed or extended by
-    /// `params.paths`.
+    /// `params.paths`, merged with `lexical_matches` from the caller's lexical search-index
+    /// tier. `lexical_matches` is empty when that tier is unavailable or its stamped
+    /// revision no longer matches what is published — the caller decides that, this method
+    /// only merges what it is handed.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] for deferred filters, traversal, cursors, projections, scopes, an
     /// invalid `paths` glob, or a `force_include` bound crossed.
-    pub fn search(&self, params: &SearchParams) -> Result<SearchResult, ReadError> {
+    pub fn search(
+        &self,
+        params: &SearchParams,
+        lexical_matches: &[LexicalMatch],
+    ) -> Result<SearchResult, ReadError> {
         validate_search(params)?;
         if self.revision().is_some() && force_include_requested(params) {
             return Err(ReadFault::unsupported("force_include at a revision"));
@@ -60,7 +71,6 @@ impl ReadService {
             query,
             params.target,
             fetch_limit,
-            limit,
             &mut results,
         )?;
         if results.len() < limit
@@ -75,6 +85,14 @@ impl ReadService {
                 &mut results,
             )?;
         }
+        collect_lexical_hits(
+            self.index(),
+            query,
+            params.target,
+            lexical_matches,
+            &mut results,
+        );
+        order_by_relevance(&mut results);
         results.truncate(limit);
         let snapshot = self.snapshot().clone();
         Ok(SearchResult {
@@ -164,12 +182,12 @@ fn admits(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> boo
     matcher.is_none_or(|matcher| matcher.admits(&root.join(path.as_str())))
 }
 
-/// Symbol and lexical hits from the index, filtered by `matcher` before the page is cut down to
-/// `limit` so a `paths`-narrowed search still returns a full page where enough matches exist.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each parameter is a distinct search input; grouping them would just move the count into a struct only this function reads"
-)]
+/// Symbol and lexical hits from the index, filtered by `matcher` and collected up to
+/// `fetch_limit` — never cut short at the smaller `limit` — because [`order_by_relevance`]
+/// sorts this whole pool before the final page is cut down to `limit`; stopping collection
+/// at `limit` could drop a later, higher-scoring candidate (a file hit scores 1.0 flat, so
+/// this matters whenever a lower-scoring symbol substring match would otherwise fill the
+/// page first).
 fn collect_indexed_hits(
     index: &WorkspaceIndex,
     matcher: Option<&PathMatcher>,
@@ -177,7 +195,6 @@ fn collect_indexed_hits(
     query: &str,
     target: SearchParamsTarget,
     fetch_limit: usize,
-    limit: usize,
     results: &mut Vec<SearchHit>,
 ) -> Result<(), ReadError> {
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
@@ -189,12 +206,13 @@ fn collect_indexed_hits(
                 continue;
             }
             results.push(symbol_search_hit(matched));
-            if results.len() >= limit {
+            if results.len() >= fetch_limit {
                 return Ok(());
             }
         }
     }
-    if results.len() < limit && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
+    if results.len() < fetch_limit
+        && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
     {
         for (file, line, text) in index
             .source_matches(query, fetch_limit)
@@ -204,7 +222,7 @@ fn collect_indexed_hits(
                 continue;
             }
             results.push(file_search_hit(file, line, text));
-            if results.len() >= limit {
+            if results.len() >= fetch_limit {
                 break;
             }
         }
@@ -251,34 +269,45 @@ fn collect_force_include_hits(
 
 fn symbol_search_hit(matched: SymbolMatch<'_>) -> SearchHit {
     let score = symbol_match_score(matched.rank);
+    build_symbol_hit(matched, score, vec![MatchedField::Name])
+}
+
+/// Builds one symbol hit's wire shape. `symbol_search_hit` and the lexical merge's
+/// `lexical_symbol_hit` share this: both surface the same declaration, differing only in
+/// score and which indexed field produced the match.
+fn build_symbol_hit(
+    matched: SymbolMatch<'_>,
+    score: f64,
+    matched_by: Vec<MatchedField>,
+) -> SearchHit {
     SearchHit {
         hit: SearchHitTarget::Symbol {
             symbol: wire_symbol(matched),
         },
         score,
-        matched_by: vec![MatchedField::Name],
+        matched_by,
         relationships: None,
         source: Some(excerpt(matched.file, matched.symbol.range).text),
         diagnostics: None,
-        span: Some(source_span(matched.file, matched.symbol.range)),
+        span: Some(source_span(matched.file.path(), matched.symbol.range)),
         line: Some(line::line_number_at(
             matched.file.source(),
             matched.symbol.range.start,
         )),
-        path: Some(project_path(matched.file)),
+        path: Some(project_path(matched.file.path())),
         traversal_path: None,
         distance: None,
     }
 }
 
-fn file_search_hit(file: &rift_index::IndexedFile, line_index: usize, text: String) -> SearchHit {
+fn file_search_hit(file: &IndexedFile, line_index: usize, text: String) -> SearchHit {
     let start = line::line_start_offset(file.source(), line_index);
     let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
     let range = ByteRange { start, end };
     SearchHit {
         hit: SearchHitTarget::File {
             file: File {
-                id: file_id(file),
+                id: file_id(file.path()),
                 content: FileContent::Regular {
                     size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
                     executable: false,
@@ -293,9 +322,9 @@ fn file_search_hit(file: &rift_index::IndexedFile, line_index: usize, text: Stri
         relationships: None,
         source: Some(text),
         diagnostics: None,
-        span: Some(source_span(file, range)),
+        span: Some(source_span(file.path(), range)),
         line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
-        path: Some(project_path(file)),
+        path: Some(project_path(file.path())),
         traversal_path: None,
         distance: None,
     }
@@ -310,6 +339,227 @@ const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
     }
 }
 
+/// Maps lexical `bm25`'s negative best-first rank into a `(0, 1)` score, monotone and
+/// comparable within one request. A later dense-ranking layer fuses upstream of this merge,
+/// so the mapping stays deliberately local instead of trying to anticipate that fusion.
+fn lexical_score(rank: f64) -> f64 {
+    let magnitude = (-rank).max(0.0);
+    magnitude / (1.0 + magnitude)
+}
+
+/// Merges lexical search-index matches into `results`: a resolved symbol becomes a hit
+/// scored by [`lexical_score`], and a text file's best-ranked chunk becomes a file hit whose
+/// line is the first line containing a query term. Each merges against an
+/// identifier-matched hit already in `results` by identity, rather than duplicating it.
+fn collect_lexical_hits(
+    index: &WorkspaceIndex,
+    query: &str,
+    target: SearchParamsTarget,
+    lexical_matches: &[LexicalMatch],
+    results: &mut Vec<SearchHit>,
+) {
+    if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
+        for matched in lexical_matches
+            .iter()
+            .filter(|matched| matched.kind() == LexicalUnitKind::Symbol)
+        {
+            let Some((file, symbol)) = resolve_symbol(index, matched.path(), matched.identity())
+            else {
+                // The lexical tier indexed this symbol at a tree revision the request's
+                // revision guard already proved current, but a symbol it named can still be
+                // gone from this exact index (a race the guard narrows, never closes to
+                // zero); skipping it silently is correct, not a defect to surface.
+                continue;
+            };
+            merge_symbol_hit(results, file, symbol, lexical_score(matched.rank()));
+        }
+    }
+    if matches!(target, SearchParamsTarget::All | SearchParamsTarget::File) {
+        for (path, rank) in best_rank_per_text_file(lexical_matches) {
+            let Some(file) = index.text_files().iter().find(|file| file.path() == &path) else {
+                continue;
+            };
+            let (line_number, range, text) = locate_query_line(file.content(), query);
+            merge_file_hit(results, file, line_number, range, text, lexical_score(rank));
+        }
+    }
+}
+
+/// Resolves one lexical symbol match's identity back to its declaration in `index`. `path`
+/// narrows the search to the one file the lexical unit named, so this stays a scan of that
+/// file's own symbols rather than the whole index.
+fn resolve_symbol<'a>(
+    index: &'a WorkspaceIndex,
+    path: &ProjectPath,
+    identity: &str,
+) -> Option<(&'a IndexedFile, &'a RustSymbol)> {
+    let file = index.file(path)?;
+    let symbol = file.syntax().symbols().iter().find(|symbol| {
+        rift_core::rust_symbol_identity(file.path().as_str(), &symbol.qualified_name) == identity
+    })?;
+    Some((file, symbol))
+}
+
+/// Collapses text-file lexical matches to one entry per path, keeping the best (most
+/// negative) `bm25` rank when a file contributed more than one chunk match.
+fn best_rank_per_text_file(lexical_matches: &[LexicalMatch]) -> Vec<(ProjectPath, f64)> {
+    let mut best: Vec<(ProjectPath, f64)> = Vec::new();
+    for matched in lexical_matches
+        .iter()
+        .filter(|matched| matched.kind() == LexicalUnitKind::TextFile)
+    {
+        if let Some(entry) = best.iter_mut().find(|(path, _)| path == matched.path()) {
+            entry.1 = entry.1.min(matched.rank());
+        } else {
+            best.push((matched.path().clone(), matched.rank()));
+        }
+    }
+    best
+}
+
+/// Finds the first line of `content` containing any of `query`'s whitespace-split terms,
+/// case-insensitively, byte-exact so its span survives a CRLF file unchanged. Falls back to
+/// line 1 with a whole-file span when no line matches.
+fn locate_query_line(content: &str, query: &str) -> (u64, ByteRange, String) {
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut offset: u64 = 0;
+    for (index, raw_line) in line::lines_inclusive(content).enumerate() {
+        let text = line::without_ending(raw_line);
+        if terms
+            .iter()
+            .any(|term| text.to_lowercase().contains(term.as_str()))
+        {
+            let start = offset;
+            let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+            let line_number = u64::try_from(index + 1).unwrap_or(u64::MAX);
+            return (line_number, ByteRange { start, end }, text.to_owned());
+        }
+        offset = offset.saturating_add(u64::try_from(raw_line.len()).unwrap_or(u64::MAX));
+    }
+    let end = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    (1, ByteRange { start: 0, end }, content.to_owned())
+}
+
+/// Merges one resolved lexical symbol hit: an identifier-matched hit for the same symbol
+/// keeps its place and absorbs `score`; otherwise the lexical hit joins `results` new.
+fn merge_symbol_hit(
+    results: &mut Vec<SearchHit>,
+    file: &IndexedFile,
+    symbol: &RustSymbol,
+    score: f64,
+) {
+    let identity = SymbolId(rift_core::rust_symbol_identity(
+        file.path().as_str(),
+        &symbol.qualified_name,
+    ));
+    let existing = results.iter_mut().find(
+        |hit| matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if symbol.id == identity),
+    );
+    if let Some(existing) = existing {
+        absorb_content_match(existing, score);
+        return;
+    }
+    let matched = SymbolMatch {
+        file,
+        symbol,
+        // Unused: `lexical_symbol_hit`'s caller supplies `score` directly, never
+        // `symbol_match_score`, so no identifier rank need be a genuine one here.
+        rank: SymbolMatchRank::Substring,
+    };
+    results.push(build_symbol_hit(
+        matched,
+        score,
+        vec![MatchedField::Content],
+    ));
+}
+
+/// Merges one lexical text-file hit: an identifier-matched hit at the same path and line
+/// keeps its place and absorbs `score`; otherwise the lexical hit joins `results` new.
+fn merge_file_hit(
+    results: &mut Vec<SearchHit>,
+    file: &TextSourceFile,
+    line_number: u64,
+    range: ByteRange,
+    text: String,
+    score: f64,
+) {
+    let path = project_path(file.path());
+    let existing = results.iter_mut().find(|hit| {
+        matches!(&hit.hit, SearchHitTarget::File { .. })
+            && hit.path.as_ref() == Some(&path)
+            && hit.line == Some(line_number)
+    });
+    if let Some(existing) = existing {
+        absorb_content_match(existing, score);
+        return;
+    }
+    results.push(lexical_file_hit(file, line_number, range, text, score));
+}
+
+/// Records that `existing` also matched by content: adds [`MatchedField::Content`] when
+/// absent, and raises its score to the better of the two.
+fn absorb_content_match(existing: &mut SearchHit, score: f64) {
+    if !existing.matched_by.contains(&MatchedField::Content) {
+        existing.matched_by.push(MatchedField::Content);
+    }
+    existing.score = existing.score.max(score);
+}
+
+fn lexical_file_hit(
+    file: &TextSourceFile,
+    line_number: u64,
+    range: ByteRange,
+    text: String,
+    score: f64,
+) -> SearchHit {
+    SearchHit {
+        hit: SearchHitTarget::File {
+            file: File {
+                id: file_id(file.path()),
+                content: FileContent::Regular {
+                    size: u64::try_from(file.content().len()).unwrap_or(u64::MAX),
+                    executable: false,
+                },
+                languages: Vec::new(),
+                regions: Vec::new(),
+                semantic: false,
+            },
+        },
+        score,
+        matched_by: vec![MatchedField::Content],
+        relationships: None,
+        source: Some(text),
+        diagnostics: None,
+        span: Some(source_span(file.path(), range)),
+        line: Some(line_number),
+        path: Some(project_path(file.path())),
+        traversal_path: None,
+        distance: None,
+    }
+}
+
+/// Sorts merged hits by descending score, breaking ties on a hit's own stable wire identity
+/// so the order does not depend on the arrival order of lexical matches, which carries no
+/// guaranteed order of its own.
+fn order_by_relevance(results: &mut [SearchHit]) {
+    results.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| hit_identity(left).cmp(hit_identity(right)))
+    });
+}
+
+/// The wire id `order_by_relevance` breaks score ties on.
+fn hit_identity(hit: &SearchHit) -> &str {
+    match &hit.hit {
+        SearchHitTarget::Symbol { symbol } => symbol.id.0.as_str(),
+        SearchHitTarget::File { file } => file.id.0.as_str(),
+        SearchHitTarget::Node { node } => node.id.0.as_str(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -317,12 +567,18 @@ mod tests {
 
     use rift_core::SourceVisibility;
     use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
-    use rift_index::WorkspaceIndexLimits;
-    use rift_protocol::read::SearchParams;
+    use rift_index::{LexicalMatch, LexicalUnitKind, WorkspaceIndexLimits};
+    use rift_protocol::read::{
+        ExactKind, Extensions, FileContent, FileId, MatchedField, Node, NodeId, SearchParams,
+        SearchParamsTarget, TextRange,
+    };
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{ReadFault, ReadService, SymbolMatchRank, symbol_match_score};
+    use super::{
+        ByteRange, File, ReadFault, ReadService, SearchHit, SearchHitTarget, SymbolMatchRank,
+        rust_language, symbol_match_score,
+    };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -454,20 +710,25 @@ pub fn compute() -> i32 {
             "query": "Beacon",
             "limit": 3
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
 
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0]["hit"]["target"], "symbol");
+        // "Beacon" ties three ways at rank/score: the struct symbol and its own declaration
+        // line both score 1.0, so the identity tie-break (`rift://file/...` sorts before
+        // `rift://symbol/...`) puts the file hit first; the `signal` method's substring
+        // match on the qualified name `Beacon::signal` scores lower and sorts last.
+        assert_eq!(results[0]["hit"]["target"], "file");
         assert_eq!(results[0]["score"], 1.0);
         assert_eq!(results[0]["path"], json!("src/lib.rs"));
-        assert_eq!(results[2]["hit"]["target"], "file");
-        assert_eq!(results[2]["line"], 1);
+        assert_eq!(results[1]["hit"]["target"], "symbol");
+        assert_eq!(results[1]["score"], 1.0);
+        assert_eq!(results[2]["hit"]["target"], "symbol");
         assert!(
             results[2]["path"]
                 .as_str()
                 .is_some_and(|path| !path.is_empty()),
-            "the file hit must carry a non-empty project-relative path: {:#?}",
+            "every hit must carry a non-empty project-relative path: {:#?}",
             results[2]
         );
         Ok(())
@@ -483,7 +744,7 @@ pub fn compute() -> i32 {
             "target": "symbol",
             "limit": 10
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(
@@ -512,7 +773,7 @@ pub fn compute() -> i32 {
             "include": ["source"],
             "limit": 1
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let hit = &value["results"][0];
         assert!(
             hit["source"].is_string(),
@@ -529,7 +790,7 @@ pub fn compute() -> i32 {
     fn search_result_origins_carry_the_snapshots_real_revisions() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: SearchParams = serde_json::from_value(json!({"query": "Beacon"}))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let snapshot_tree = value["snapshot"]["tree_revision"].clone();
         let snapshot_source = value["snapshot"]["source_revision"].clone();
         let origin = &value["coverage"]["origins"][0];
@@ -557,7 +818,7 @@ pub fn compute() -> i32 {
             serde_json::from_value(json!({"query": "Beacon", "cursor": "page-two"}))?;
         assert!(matches!(
             service
-                .search(&cursor)
+                .search(&cursor, &[])
                 .expect_err("cursor reads must fail")
                 .fault(),
             ReadFault::Unsupported { .. }
@@ -567,7 +828,7 @@ pub fn compute() -> i32 {
             serde_json::from_value(json!({"query": "Beacon", "target": "node"}))?;
         assert!(matches!(
             service
-                .search(&node_target)
+                .search(&node_target, &[])
                 .expect_err("node target must fail")
                 .fault(),
             ReadFault::Unsupported { .. }
@@ -581,7 +842,7 @@ pub fn compute() -> i32 {
         let missing_query: SearchParams = serde_json::from_value(json!({}))?;
         assert!(matches!(
             service
-                .search(&missing_query)
+                .search(&missing_query, &[])
                 .expect_err("missing query must fail")
                 .fault(),
             ReadFault::Invalid { .. }
@@ -590,7 +851,7 @@ pub fn compute() -> i32 {
         let empty_query: SearchParams = serde_json::from_value(json!({"query": ""}))?;
         assert!(matches!(
             service
-                .search(&empty_query)
+                .search(&empty_query, &[])
                 .expect_err("empty query must fail")
                 .fault(),
             ReadFault::Invalid { .. }
@@ -599,7 +860,7 @@ pub fn compute() -> i32 {
         let zero_limit: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
         let error = service
-            .search(&zero_limit)
+            .search(&zero_limit, &[])
             .expect_err("zero limit must fail");
         assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
         assert_eq!(
@@ -620,7 +881,7 @@ pub fn compute() -> i32 {
         }))?;
         assert!(matches!(
             service
-                .search(&params)
+                .search(&params, &[])
                 .expect_err("oversized file-target limit must fail")
                 .fault(),
             ReadFault::Index(_)
@@ -636,7 +897,7 @@ pub fn compute() -> i32 {
             "target": "symbol",
             "limit": 5
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(results.iter().all(|hit| hit["hit"]["target"] == "symbol"));
@@ -650,7 +911,7 @@ pub fn compute() -> i32 {
             "query": "lookout marker",
             "target": "file"
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 1);
         assert!(results[0]["line"].as_u64().is_some_and(|line| line > 1));
@@ -678,7 +939,7 @@ pub fn compute() -> i32 {
                 "target": "symbol",
                 "limit": 1
             }))?;
-            let value = serde_json::to_value(service.search(&params)?)?;
+            let value = serde_json::to_value(service.search(&params, &[])?)?;
             let hit = &value["results"][0]["hit"]["symbol"];
             assert_eq!(hit["kind"], kind, "unexpected kind for {name}");
             if let Some(expected_visibility) = visibility {
@@ -721,7 +982,7 @@ pub fn compute() -> i32 {
             assert!(
                 matches!(
                     service
-                        .search(&params)
+                        .search(&params, &[])
                         .expect_err("filter and traversal must stay refused")
                         .fault(),
                     ReadFault::Unsupported { .. }
@@ -739,7 +1000,7 @@ pub fn compute() -> i32 {
             "query": "Beacon",
             "paths": {"include": ["src/lib.rs"]}
         }))?;
-        let result = service.search(&params)?;
+        let result = service.search(&params, &[])?;
         assert!(!result.results.is_empty());
         Ok(())
     }
@@ -751,7 +1012,7 @@ pub fn compute() -> i32 {
             "query": "beacon",
             "paths": {"include": ["other.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(results.iter().all(|hit| {
@@ -772,7 +1033,7 @@ pub fn compute() -> i32 {
             "limit": 10,
             "paths": {"exclude": ["other.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(results.iter().all(|hit| {
@@ -793,7 +1054,7 @@ pub fn compute() -> i32 {
             "limit": 10,
             "paths": {"include": ["src/**"], "exclude": ["src/nested/**"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 1);
         assert!(
@@ -813,7 +1074,7 @@ pub fn compute() -> i32 {
             "limit": 10,
             "paths": {"include": ["src/*.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 1);
         assert!(
@@ -833,7 +1094,7 @@ pub fn compute() -> i32 {
             "limit": 10,
             "paths": {"include": ["src/**"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 2);
         Ok(())
@@ -847,7 +1108,7 @@ pub fn compute() -> i32 {
             "target": "file",
             "paths": {"include": ["src/lib.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(results.iter().all(|hit| hit["hit"]["target"] == "file"));
@@ -868,7 +1129,7 @@ pub fn compute() -> i32 {
         }))?;
         assert!(matches!(
             service
-                .search(&params)
+                .search(&params, &[])
                 .expect_err("an invalid include glob must refuse")
                 .fault(),
             ReadFault::Index(_)
@@ -885,7 +1146,7 @@ pub fn compute() -> i32 {
         }))?;
         assert!(matches!(
             service
-                .search(&params)
+                .search(&params, &[])
                 .expect_err("a backslash pattern must be refused")
                 .fault(),
             ReadFault::Invalid { field: "paths", .. }
@@ -910,8 +1171,8 @@ pub fn compute() -> i32 {
             "paths": {"include": ["**/*.rs"]},
             "limit": 3
         }))?;
-        let narrow_value = serde_json::to_value(service.search(&narrow)?)?;
-        let wide_value = serde_json::to_value(service.search(&wide)?)?;
+        let narrow_value = serde_json::to_value(service.search(&narrow, &[])?)?;
+        let wide_value = serde_json::to_value(service.search(&wide, &[])?)?;
         assert_eq!(narrow_value["results"][0], wide_value["results"][0]);
         Ok(())
     }
@@ -924,7 +1185,7 @@ pub fn compute() -> i32 {
             "target": "symbol",
             "paths": {"force_include": ["gitignored.rs", "configured_out.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 2);
         for hit in results {
@@ -945,7 +1206,7 @@ pub fn compute() -> i32 {
             "target": "file",
             "paths": {"force_include": ["gitignored.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 1);
         let hit = &results[0];
@@ -970,7 +1231,7 @@ pub fn compute() -> i32 {
             "target": "symbol",
             "paths": {"force_include": ["visible.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(
             results.len(),
@@ -987,7 +1248,7 @@ pub fn compute() -> i32 {
             "query": "floor",
             "paths": {"force_include": [".git/**"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params)?)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(
             results.is_empty(),
@@ -1019,7 +1280,7 @@ pub fn compute() -> i32 {
         }))?;
         assert!(matches!(
             service
-                .search(&params)
+                .search(&params, &[])
                 .expect_err("a force_include match count above the bound must refuse")
                 .fault(),
             ReadFault::Index(_)
@@ -1036,7 +1297,7 @@ pub fn compute() -> i32 {
         }))?;
         assert!(matches!(
             service
-                .search(&params)
+                .search(&params, &[])
                 .expect_err("an invalid force_include glob must refuse")
                 .fault(),
             ReadFault::Index(_)
@@ -1071,7 +1332,7 @@ pub fn compute() -> i32 {
     fn search_at_a_revision_serves_committed_matches_only() -> TestResult {
         let (_directory, service) = committed_fixture()?;
         let committed: SearchParams = serde_json::from_value(json!({"query": "committed_probe"}))?;
-        let value = serde_json::to_value(service.search(&committed)?)?;
+        let value = serde_json::to_value(service.search(&committed, &[])?)?;
         let results = value["results"].as_array().ok_or("results array")?;
         assert!(!results.is_empty(), "the committed declaration matches");
         assert!(
@@ -1079,7 +1340,7 @@ pub fn compute() -> i32 {
             "a revision search's snapshot carries the resolved commit"
         );
         let drifted: SearchParams = serde_json::from_value(json!({"query": "drifted_probe"}))?;
-        let drifted_value = serde_json::to_value(service.search(&drifted)?)?;
+        let drifted_value = serde_json::to_value(service.search(&drifted, &[])?)?;
         assert_eq!(
             drifted_value["results"].as_array().map(Vec::len),
             Some(0),
@@ -1095,7 +1356,7 @@ pub fn compute() -> i32 {
             "query": "committed_probe",
             "paths": {"force_include": ["lib.rs"]}
         }))?;
-        let error = service.search(&params).expect_err(
+        let error = service.search(&params, &[]).expect_err(
             "force_include walks the working tree, which a revision search has none of",
         );
         assert!(matches!(
@@ -1105,5 +1366,400 @@ pub fn compute() -> i32 {
             }
         ));
         Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "lexical_score is deterministic pure arithmetic over exact literals; the \
+                  equality it proves is exact, not a measurement subject to rounding drift"
+    )]
+    fn lexical_score_stays_within_zero_one_and_is_monotone_in_rank() {
+        let ranks = [-100.0, -10.0, -5.0, -1.0, -0.5, -0.001];
+        let scores: Vec<f64> = ranks
+            .iter()
+            .map(|&rank| super::lexical_score(rank))
+            .collect();
+        for (rank, score) in ranks.iter().zip(&scores) {
+            assert!(
+                *score > 0.0 && *score < 1.0,
+                "score for rank {rank} must lie in (0, 1): {score}"
+            );
+        }
+        for pair in scores.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "a more negative bm25 rank must score strictly higher: {pair:?}"
+            );
+        }
+        // bm25 never produces a non-negative rank, but the mapping still clamps rather than
+        // producing a negative or out-of-range score.
+        assert_eq!(super::lexical_score(0.0), 0.0);
+        assert_eq!(super::lexical_score(5.0), 0.0);
+    }
+
+    fn indexed_symbol<'a>(
+        service: &'a ReadService,
+        path: &str,
+        name: &str,
+    ) -> TestResult<(&'a rift_index::IndexedFile, &'a rift_syntax::RustSymbol)> {
+        let file = service
+            .index()
+            .file(&rift_core::ProjectPath::new(path)?)
+            .ok_or("fixture file must be indexed")?;
+        let symbol = file
+            .syntax()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .ok_or("fixture must declare the named symbol")?;
+        Ok((file, symbol))
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the score under test is `f64::max` over exact literals, not a measurement \
+                  subject to rounding drift"
+    )]
+    fn merge_symbol_hit_unions_matched_by_and_keeps_the_higher_score() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let (file, symbol) = indexed_symbol(&service, "src/lib.rs", "Beacon")?;
+        let existing = super::build_symbol_hit(
+            super::SymbolMatch {
+                file,
+                symbol,
+                rank: SymbolMatchRank::NameExact,
+            },
+            0.5,
+            vec![MatchedField::Name],
+        );
+        let mut results = vec![existing];
+
+        super::merge_symbol_hit(&mut results, file, symbol, 0.9);
+        assert_eq!(results.len(), 1, "the same symbol must not duplicate");
+        assert_eq!(results[0].score, 0.9, "the higher score must win");
+        assert_eq!(
+            results[0].matched_by,
+            vec![MatchedField::Name, MatchedField::Content]
+        );
+
+        // A second merge at a lower score keeps the existing higher score and does not
+        // duplicate the already-present Content field.
+        super::merge_symbol_hit(&mut results, file, symbol, 0.1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 0.9);
+        assert_eq!(
+            results[0].matched_by,
+            vec![MatchedField::Name, MatchedField::Content]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collect_lexical_hits_skips_a_symbol_identity_the_index_no_longer_carries() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let vanished = LexicalMatch::new(
+            "rift://symbol/rust/src/lib.rs/Vanished",
+            path,
+            LexicalUnitKind::Symbol,
+            Some("Vanished".to_owned()),
+            -5.0,
+        );
+        let mut results = Vec::new();
+        super::collect_lexical_hits(
+            service.index(),
+            "Beacon",
+            SearchParamsTarget::All,
+            &[vanished],
+            &mut results,
+        );
+        assert!(
+            results.is_empty(),
+            "a symbol identity absent from the index must be skipped silently: {results:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collect_lexical_hits_skips_a_text_file_path_the_index_no_longer_carries() -> TestResult {
+        // `fixture()` admits `README.md` as its only text file, so `guide.md` is a path the
+        // index never carried.
+        let (_directory, service) = fixture()?;
+        let vanished = LexicalMatch::new(
+            "guide.md",
+            rift_core::ProjectPath::new("guide.md")?,
+            LexicalUnitKind::TextFile,
+            Some("guide".to_owned()),
+            -5.0,
+        );
+        let mut results = Vec::new();
+        super::collect_lexical_hits(
+            service.index(),
+            "Beacon",
+            SearchParamsTarget::All,
+            &[vanished],
+            &mut results,
+        );
+        assert!(
+            results.is_empty(),
+            "a text-file path absent from the index must be skipped silently: {results:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the winning score is `lexical_score` applied to the exact literal rank the \
+                  test supplies, not a measurement subject to rounding drift"
+    )]
+    fn text_file_lexical_matches_dedupe_to_one_hit_at_the_best_rank() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let content = "intro\nsearch replace all units here\nend\n";
+        fs::write(directory.path().join("guide.md"), content)?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_admission = rift_core::TextFileAdmission::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text_admission)?;
+        let worse = LexicalMatch::new(
+            "guide.md#0",
+            rift_core::ProjectPath::new("guide.md")?,
+            LexicalUnitKind::TextFile,
+            Some("guide".to_owned()),
+            -1.0,
+        );
+        let better = LexicalMatch::new(
+            "guide.md#1",
+            rift_core::ProjectPath::new("guide.md")?,
+            LexicalUnitKind::TextFile,
+            Some("guide".to_owned()),
+            -9.0,
+        );
+        let mut results = Vec::new();
+        super::collect_lexical_hits(
+            service.index(),
+            "units",
+            SearchParamsTarget::All,
+            &[worse, better],
+            &mut results,
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "chunk matches for the same file must collapse to one hit: {results:#?}"
+        );
+        assert_eq!(results[0].score, super::lexical_score(-9.0));
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the winning score is an exact literal the test supplies, not a measurement \
+                  subject to rounding drift"
+    )]
+    fn merge_file_hit_absorbs_a_second_match_at_the_same_path_and_line() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("guide.md"), "alpha units beta\n")?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_admission = rift_core::TextFileAdmission::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text_admission)?;
+        let file = service
+            .index()
+            .text_files()
+            .first()
+            .ok_or("fixture text file must be indexed")?;
+        let range = ByteRange { start: 0, end: 17 };
+        let mut results = Vec::new();
+
+        super::merge_file_hit(
+            &mut results,
+            file,
+            1,
+            range,
+            "alpha units beta".to_owned(),
+            0.4,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 0.4);
+        assert_eq!(results[0].matched_by, vec![MatchedField::Content]);
+
+        super::merge_file_hit(
+            &mut results,
+            file,
+            1,
+            range,
+            "alpha units beta".to_owned(),
+            0.9,
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "a second match at the same path and line must not duplicate the hit"
+        );
+        assert_eq!(results[0].score, 0.9, "the higher score must win");
+        assert_eq!(
+            results[0].matched_by,
+            vec![MatchedField::Content],
+            "matched_by must union without duplicating an already-present field"
+        );
+
+        // A lower-scoring third match must not pull the absorbed score back down.
+        super::merge_file_hit(
+            &mut results,
+            file,
+            1,
+            range,
+            "alpha units beta".to_owned(),
+            0.1,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 0.9);
+        Ok(())
+    }
+
+    /// Slices `content` at `range`'s byte offsets, for tests proving a returned span
+    /// addresses exactly the bytes its accompanying text carries.
+    fn byte_slice(content: &str, range: ByteRange) -> &str {
+        let start = usize::try_from(range.start).expect("test fixture bytes must fit usize");
+        let end = usize::try_from(range.end).expect("test fixture bytes must fit usize");
+        &content[start..end]
+    }
+
+    #[test]
+    fn locate_query_line_finds_first_matching_line_case_insensitively() {
+        let content = "intro line\nSEARCH replace ALL units here\nend line\n";
+        let (line_number, range, text) = super::locate_query_line(content, "replace all");
+        assert_eq!(line_number, 2);
+        assert_eq!(text, "SEARCH replace ALL units here");
+        assert_eq!(
+            byte_slice(content, range),
+            text,
+            "the returned span must address the exact matched line's bytes"
+        );
+    }
+
+    #[test]
+    fn locate_query_line_reports_byte_exact_spans_in_a_crlf_file() {
+        let content = "one\r\ntwo replace\r\nthree\r\n";
+        let (line_number, range, text) = super::locate_query_line(content, "replace");
+        assert_eq!(line_number, 2);
+        assert_eq!(text, "two replace");
+        assert_eq!(byte_slice(content, range), "two replace");
+    }
+
+    #[test]
+    fn locate_query_line_falls_back_to_a_whole_file_span_without_a_term_match() {
+        let content = "alpha\nbeta\n";
+        let (line_number, range, text) = super::locate_query_line(content, "gamma");
+        assert_eq!(line_number, 1);
+        assert_eq!(range.start, 0);
+        assert_eq!(range.end, content.len() as u64);
+        assert_eq!(text, content);
+    }
+
+    fn file_hit_stub(id: &str, score: f64) -> SearchHit {
+        SearchHit {
+            hit: SearchHitTarget::File {
+                file: File {
+                    id: FileId(id.to_owned()),
+                    content: FileContent::Regular {
+                        size: 0,
+                        executable: false,
+                    },
+                    languages: Vec::new(),
+                    regions: Vec::new(),
+                    semantic: false,
+                },
+            },
+            score,
+            matched_by: vec![MatchedField::Content],
+            relationships: None,
+            source: None,
+            diagnostics: None,
+            span: None,
+            line: None,
+            path: None,
+            traversal_path: None,
+            distance: None,
+        }
+    }
+
+    #[test]
+    fn order_by_relevance_sorts_by_score_then_a_deterministic_identity_tie_break() {
+        let mut first_arrival = vec![
+            file_hit_stub("rift://file/z.rs", 0.5),
+            file_hit_stub("rift://file/b.rs", 0.9),
+            file_hit_stub("rift://file/a.rs", 0.9),
+        ];
+        super::order_by_relevance(&mut first_arrival);
+        let ordered_ids: Vec<&str> = first_arrival.iter().map(super::hit_identity).collect();
+        assert_eq!(
+            ordered_ids,
+            ["rift://file/a.rs", "rift://file/b.rs", "rift://file/z.rs"],
+            "higher score sorts first; a tie breaks on ascending wire identity"
+        );
+
+        // The same three hits arriving in a different order sort to the identical result:
+        // the tie-break is independent of arrival order, not merely input-stable.
+        let mut second_arrival = vec![
+            file_hit_stub("rift://file/b.rs", 0.9),
+            file_hit_stub("rift://file/z.rs", 0.5),
+            file_hit_stub("rift://file/a.rs", 0.9),
+        ];
+        super::order_by_relevance(&mut second_arrival);
+        let reordered_ids: Vec<&str> = second_arrival.iter().map(super::hit_identity).collect();
+        assert_eq!(reordered_ids, ordered_ids);
+    }
+
+    fn node_hit_stub(id: &str, score: f64) -> SearchHit {
+        SearchHit {
+            hit: SearchHitTarget::Node {
+                node: Node {
+                    id: NodeId(id.to_owned()),
+                    symbol: None,
+                    unit: FileId("rift://file/lib.rs".to_owned()),
+                    language: rust_language(),
+                    kind: ExactKind("rust.function_item".to_owned()),
+                    facets: Vec::new(),
+                    range: TextRange { start: 0, end: 1 },
+                    regions: Vec::new(),
+                    parent: None,
+                    extensions: Extensions(std::collections::BTreeMap::new()),
+                },
+            },
+            score,
+            matched_by: vec![MatchedField::Content],
+            relationships: None,
+            source: None,
+            diagnostics: None,
+            span: None,
+            line: None,
+            path: None,
+            traversal_path: None,
+            distance: None,
+        }
+    }
+
+    /// `hit_identity`'s `Node` arm never runs through the live `search` path — a `target:
+    /// "node"` request is refused before any hit is ever built — so this proves the arm
+    /// directly: a `Node` hit tied in score with a `File` hit still breaks the tie on the
+    /// node's own wire id, exactly as the `File` and `Symbol` arms already do.
+    #[test]
+    fn hit_identity_uses_the_node_id_as_tiebreak() {
+        let mut results = vec![
+            file_hit_stub("rift://file/z.rs", 0.5),
+            node_hit_stub("rift://node/rust/lib.rs@0-1#00000000", 0.5),
+        ];
+        super::order_by_relevance(&mut results);
+        let ids: Vec<&str> = results.iter().map(super::hit_identity).collect();
+        // "rift://file/..." sorts before "rift://node/..." lexicographically ('f' < 'n').
+        assert_eq!(
+            ids,
+            ["rift://file/z.rs", "rift://node/rust/lib.rs@0-1#00000000",]
+        );
     }
 }

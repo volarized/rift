@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-pub use rift_protocol::error::{ErrorCode, RetryDirective};
+pub use rift_protocol::error::{ErrorCode, LimitEvidence, RetryDirective};
 use serde::Serialize;
 use strum::VariantArray;
 
@@ -333,6 +333,14 @@ pub trait Fault: fmt::Debug {
 
     /// The underlying failure this kind wraps, where one exists.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+
+    /// Evidence a `limit_exceeded` classification carries: the bound in force and what the
+    /// request would have needed to succeed. `None` for every other classification, and
+    /// for a `limit_exceeded` fault that cannot state a required value. A kind that
+    /// classifies as `limit_exceeded` and overrides this must keep both consistent.
+    fn limit_evidence(&self) -> Option<LimitEvidence> {
         None
     }
 }

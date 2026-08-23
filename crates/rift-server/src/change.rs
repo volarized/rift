@@ -436,7 +436,7 @@ impl ChangeService {
                 rewrite.path.as_str().to_owned(),
             ));
             let unit = match reads.index().file(&rewrite.path) {
-                Some(file) => file_id(file),
+                Some(file) => file_id(file.path()),
                 None => FileId(format!(
                     "rift://file/{}",
                     rift_core::encode_path(rewrite.path.as_str())
@@ -624,7 +624,7 @@ impl ChangeService {
             let _ = fs::remove_file(&staged);
             return Err(ReadFault::storage(plan.path.as_str(), "publish", &error));
         }
-        let unit = file_id(file);
+        let unit = file_id(file.path());
         let edit = Edit::Replace {
             span: SourceSpan {
                 unit: unit.clone(),
