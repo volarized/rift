@@ -436,8 +436,17 @@
     },
     "ServerConfiguration": {
       "additionalProperties": false,
-      "description": "The `[server]` table. Filesystem scans and parses run on a bounded\nworker pool; this table sets the worker count and bounds the queue\nwait. The server reads the table at startup, so a change applies on\nthe next start.",
+      "description": "The `[server]` table. Filesystem scans and parses run on a bounded\nworker pool; this table sets the worker count, bounds the queue wait,\nand sets how long the server serves with no request before it stops.\nThe server reads the table at startup, so a change applies on the next\nstart.",
       "properties": {
+        "idle_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30m",
+          "description": "Wall-clock span with no served request that stops the server, 1s to 1d.",
+          "rift:range": {
+            "max": "1d",
+            "min": "1s"
+          }
+        },
         "num_workers": {
           "default": 4,
           "description": "Workers running blocking filesystem and parser operations at once, 1 to 64.",
@@ -571,6 +580,7 @@
     "server": {
       "$ref": "#/$defs/ServerConfiguration",
       "default": {
+        "idle_timeout": "30m",
         "num_workers": 4,
         "worker_queue_timeout": "30s"
       },

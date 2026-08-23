@@ -303,7 +303,10 @@ pub fn declare_execution_ranges(schema: &mut Schema) {
 /// validation alone cannot compare `"30s"` against a ceiling, so the server
 /// enforces the bound at load and the schema carries it for readers.
 pub fn declare_server_ranges(schema: &mut Schema) {
-    use crate::configuration::{Duration, SERVER_QUEUE_TIMEOUT_MS_MAX, ServerConfiguration};
+    use crate::configuration::{
+        Duration, SERVER_IDLE_TIMEOUT_MS_MAX, SERVER_IDLE_TIMEOUT_MS_MIN,
+        SERVER_QUEUE_TIMEOUT_MS_MAX, ServerConfiguration,
+    };
     annotate_property(
         schema,
         property!(ServerConfiguration, worker_queue_timeout),
@@ -311,6 +314,15 @@ pub fn declare_server_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(1),
             &Duration::from_millis(SERVER_QUEUE_TIMEOUT_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, idle_timeout),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(SERVER_IDLE_TIMEOUT_MS_MIN),
+            &Duration::from_millis(SERVER_IDLE_TIMEOUT_MS_MAX),
         ),
     );
 }

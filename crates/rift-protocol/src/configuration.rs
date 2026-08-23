@@ -17,6 +17,12 @@ use serde::{Deserialize, Serialize};
 pub const SERVER_NUM_WORKERS_MAX: u64 = 64;
 /// Milliseconds one request may wait for a free worker, at most: one hour.
 pub const SERVER_QUEUE_TIMEOUT_MS_MAX: u64 = 3_600_000;
+/// Milliseconds the server serves with no request before it stops, at
+/// least: one second.
+pub const SERVER_IDLE_TIMEOUT_MS_MIN: u64 = 1_000;
+/// Milliseconds the server serves with no request before it stops, at
+/// most: one day.
+pub const SERVER_IDLE_TIMEOUT_MS_MAX: u64 = 86_400_000;
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
 /// Milliseconds one evaluation may run, at most: one day.
@@ -341,9 +347,10 @@ impl WorkspaceConfiguration {
 }
 
 /// The `[server]` table. Filesystem scans and parses run on a bounded
-/// worker pool; this table sets the worker count and bounds the queue
-/// wait. The server reads the table at startup, so a change applies on
-/// the next start.
+/// worker pool; this table sets the worker count, bounds the queue wait,
+/// and sets how long the server serves with no request before it stops.
+/// The server reads the table at startup, so a change applies on the next
+/// start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_server_ranges)]
@@ -353,6 +360,8 @@ pub struct ServerConfiguration {
     pub num_workers: u64,
     /// Wall-clock bound one request waits for a free worker, 1ms to 1h.
     pub worker_queue_timeout: Duration,
+    /// Wall-clock span with no served request that stops the server, 1s to 1d.
+    pub idle_timeout: Duration,
 }
 
 impl Default for ServerConfiguration {
@@ -360,6 +369,7 @@ impl Default for ServerConfiguration {
         Self {
             num_workers: 4,
             worker_queue_timeout: Duration::from_millis(30_000),
+            idle_timeout: Duration::from_millis(1_800_000),
         }
     }
 }
@@ -379,6 +389,12 @@ impl ServerConfiguration {
                 self.worker_queue_timeout.milliseconds(),
                 1,
                 SERVER_QUEUE_TIMEOUT_MS_MAX,
+            ),
+            (
+                "server.idle_timeout",
+                self.idle_timeout.milliseconds(),
+                SERVER_IDLE_TIMEOUT_MS_MIN,
+                SERVER_IDLE_TIMEOUT_MS_MAX,
             ),
         ])
     }
@@ -1409,6 +1425,7 @@ mod tests {
         let table = ServerConfiguration::default();
         assert_eq!(table.num_workers, 4);
         assert_eq!(table.worker_queue_timeout, Duration::from_millis(30_000));
+        assert_eq!(table.idle_timeout, Duration::from_millis(1_800_000));
         assert_eq!(WorkspaceConfiguration::default().validate(), Ok(()));
     }
 
@@ -1444,7 +1461,30 @@ mod tests {
         }
         configuration.server.worker_queue_timeout =
             Duration::from_millis(SERVER_QUEUE_TIMEOUT_MS_MAX);
-        assert_eq!(configuration.validate(), Ok(()));
+        for timeout_ms in [
+            SERVER_IDLE_TIMEOUT_MS_MIN - 1,
+            SERVER_IDLE_TIMEOUT_MS_MAX + 1,
+        ] {
+            configuration.server.idle_timeout = Duration::from_millis(timeout_ms);
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "server.idle_timeout",
+                        ..
+                    })
+                ),
+                "idle_timeout {timeout_ms}ms must be refused"
+            );
+        }
+        for timeout_ms in [SERVER_IDLE_TIMEOUT_MS_MIN, SERVER_IDLE_TIMEOUT_MS_MAX] {
+            configuration.server.idle_timeout = Duration::from_millis(timeout_ms);
+            assert_eq!(
+                configuration.validate(),
+                Ok(()),
+                "idle_timeout {timeout_ms}ms must be accepted"
+            );
+        }
     }
 
     #[test]
