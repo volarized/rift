@@ -116,37 +116,13 @@ async fn run(cli: Cli) -> Result<Option<update::UpdateOutcome>, CliError> {
                 .map_err(CliError::Mcp)?;
             Ok(None)
         }
-        Some(CliCommand::Update) => run_update().await.map(Some),
+        Some(CliCommand::Update) => update::update().await.map(Some).map_err(CliError::Update),
         #[cfg(windows)]
         Some(CliCommand::__CleanupUpdate { parent_pid }) => {
             let _ = parent_pid;
             update::cleanup_replaced_binary().map_err(CliError::Update)?;
             Ok(None)
         }
-    }
-}
-
-/// Runs the blocking updater on the runtime's blocking pool.
-///
-/// The updater's HTTP transport and file staging block by design, and its
-/// transport tears down a private runtime on drop - hosted on an async
-/// worker, that teardown aborts the process. The blocking pool is the
-/// runtime's place for such work, so no worker is ever blocked.
-///
-/// # Cancel safety
-///
-/// Dropping this future detaches the update, which runs to completion on
-/// the blocking pool; the process outcome is then unreported.
-async fn run_update() -> Result<update::UpdateOutcome, CliError> {
-    match tokio::task::spawn_blocking(update::update).await {
-        Ok(outcome) => outcome.map_err(CliError::Update),
-        Err(join_error) if join_error.is_panic() => {
-            std::panic::resume_unwind(join_error.into_panic())
-        }
-        Err(join_error) => unreachable!(
-            "the updater task is never cancelled: the runtime lives until run returns, \
-             join_error={join_error}"
-        ),
     }
 }
 
