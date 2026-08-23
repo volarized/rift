@@ -2737,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "axum",
  "clap",
@@ -2768,7 +2768,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "percent-encoding",
  "rift-protocol",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "gix",
  "rift-core",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "ignore",
  "rift-core",
@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "axum",
  "data-encoding",
@@ -2834,14 +2834,14 @@ dependencies = [
 
 [[package]]
 name = "rift-model"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "rift-core",
 ]
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "schemars",
  "serde",
@@ -2851,7 +2851,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "rift-core",
  "serde",
@@ -2859,7 +2859,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "data-encoding",
  "diffy",
@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "rift-core",
  "rift-provider",
