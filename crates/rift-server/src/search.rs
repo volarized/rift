@@ -1154,12 +1154,13 @@ pub fn compute() -> i32 {
         let (_directory, service) = multi_file_fixture()?;
         let mut seen = Vec::new();
         for page_index in 0..3_u64 {
-            let params: SearchParams = serde_json::from_value(json!({
+            let request = json!({
                 "query": "beacon",
                 "target": "symbol",
                 "limit": 1,
                 "page_index": page_index
-            }))?;
+            });
+            let params: SearchParams = serde_json::from_value(request)?;
             let value = serde_json::to_value(service.search(&params, &[])?)?;
             assert_eq!(
                 value["pagination"],
@@ -1178,12 +1179,13 @@ pub fn compute() -> i32 {
     #[test]
     fn search_page_past_the_end_is_empty_with_the_true_page_count() -> TestResult {
         let (_directory, service) = multi_file_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
+        let request = json!({
             "query": "beacon",
             "target": "symbol",
             "limit": 1,
             "page_index": 30
-        }))?;
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.search(&params, &[])?)?;
         assert_eq!(value["results"], json!([]));
         assert_eq!(
