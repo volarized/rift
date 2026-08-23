@@ -5,16 +5,6 @@
       "description": "Finds Rust declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt; `include_body: false` omits\nboth. `rev` serves the lookup from a version-control revision instead of\nthe current tree. Use `search` when the name is not exactly known.",
       "input_schema": {
         "$defs": {
-          "Cursor": {
-            "description": "An opaque base64url string that continues a paginated answer from where the last page\nended. It binds the request, state, order, and page size that apply to that answer.\nPadding is omitted. A mismatch returns `cursor_invalid`. For a captured result set,\nprocess restart or eviction returns `cursor_expired`, and later writes do not change\nremaining pages.",
-            "examples": [
-              "eyJvZmZzZXQiOjV9"
-            ],
-            "maxLength": 4096,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9_-]+$",
-            "type": "string"
-          },
           "Language": {
             "additionalProperties": false,
             "description": "A language name and its optional dialect. The pair is the identity facts are filed under,\nso `sql` and `sql:postgresql` are two languages with two symbol spaces.",
@@ -95,7 +85,6 @@
         ],
         "examples": [
           {
-            "cursor": null,
             "include_body": true,
             "include_history": false,
             "language": {
@@ -104,22 +93,11 @@
             },
             "limit": 5,
             "name": "ReadService",
+            "page_index": 0,
             "scope": "all"
           }
         ],
         "properties": {
-          "cursor": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/Cursor"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "description": "Continues a previous lookup where its last page ended."
-          },
           "include_body": {
             "default": true,
             "description": "Whether each hit carries its declaration source.",
@@ -155,6 +133,13 @@
             "maxLength": 4096,
             "minLength": 1,
             "type": "string"
+          },
+          "page_index": {
+            "default": 0,
+            "description": "Zero-based page of the result set to serve, sized by `limit`. A `page_index` past\nthe last page returns an empty page whose `pagination` carries the requested\n`page_index` and the true `total_pages`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
           },
           "projection": {
             "anyOf": [
@@ -820,6 +805,31 @@
               "manager",
               "name",
               "version"
+            ],
+            "type": "object"
+          },
+          "Pagination": {
+            "additionalProperties": false,
+            "description": "Where one page sits in the full result set the request's `limit` divides.",
+            "properties": {
+              "page_index": {
+                "description": "The zero-based page this answer serves.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "total_pages": {
+                "description": "The page count of the full result set under the request's `limit`, computed within\nthe server's result bound. Zero when the result set is empty.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "page_index",
+              "total_pages"
             ],
             "type": "object"
           },
@@ -1869,18 +1879,9 @@
             },
             "type": "array"
           },
-          "next_cursor": {
-            "description": "Cursor for the next page, or null after the final hit.",
-            "examples": [
-              "eyJvZmZzZXQiOjV9"
-            ],
-            "maxLength": 4096,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9_-]+$",
-            "type": [
-              "string",
-              "null"
-            ]
+          "pagination": {
+            "$ref": "#/$defs/Pagination",
+            "description": "Where this page sits in the full result set under the request's `limit`."
           },
           "warnings": {
             "description": "Warnings attached to this result, empty when there is nothing to warn about.",
@@ -1893,7 +1894,7 @@
         "required": [
           "hits",
           "coverage",
-          "next_cursor",
+          "pagination",
           "warnings"
         ],
         "type": "object"
@@ -6247,16 +6248,6 @@
       "description": "Searches indexed Rust declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the lexical tier's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate lexical matches against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
-          "Cursor": {
-            "description": "An opaque base64url string that continues a paginated answer from where the last page\nended. It binds the request, state, order, and page size that apply to that answer.\nPadding is omitted. A mismatch returns `cursor_invalid`. For a captured result set,\nprocess restart or eviction returns `cursor_expired`, and later writes do not change\nremaining pages.",
-            "examples": [
-              "eyJvZmZzZXQiOjV9"
-            ],
-            "maxLength": 4096,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9_-]+$",
-            "type": "string"
-          },
           "ElementFilter": {
             "additionalProperties": false,
             "description": "A predicate over one entry of a list-valued field. `Symbol.types` holds several entries,\nand a filter that tests `role` and the resolved symbol separately would accept a symbol\nwhose return type and whose `Config` came from two different entries. Everything under\n`where` addresses one entry, so both have to hold of the same one.",
@@ -6821,7 +6812,7 @@
             ]
           },
           "ResultOrder": {
-            "description": "The total order a paginated answer comes back in, named in the request so a cursor can be\nbound to it. Every order ends in the result's own identity, so two results that tie never\nswap places between pages.",
+            "description": "The total order a paginated answer comes back in. Every order ends in the result's own\nidentity, so two results that tie never swap places between pages.",
             "oneOf": [
               {
                 "const": "relevance",
@@ -7098,7 +7089,6 @@
         ],
         "examples": [
           {
-            "cursor": null,
             "filter": null,
             "include": [
               "source",
@@ -7106,6 +7096,7 @@
             ],
             "limit": 20,
             "order": "relevance",
+            "page_index": 0,
             "paths": {
               "exclude": [],
               "force_include": [],
@@ -7119,18 +7110,6 @@
           }
         ],
         "properties": {
-          "cursor": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/Cursor"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "description": "Continues a previous search where its last page ended. Omit it for the first page;\neverything else in the request has to match what the cursor was minted for."
-          },
           "filter": {
             "anyOf": [
               {
@@ -7168,7 +7147,14 @@
           "order": {
             "$ref": "#/$defs/ResultOrder",
             "default": "relevance",
-            "description": "Which total order the page comes back in. The cursor is bound to it, so it cannot\nchange between pages of one query. Omitted, relevance."
+            "description": "Which total order the page comes back in. Omitted, relevance."
+          },
+          "page_index": {
+            "default": 0,
+            "description": "Zero-based page of the result set to serve, sized by `limit`. A `page_index` past\nthe last page returns an empty page whose `pagination` carries the requested\n`page_index` and the true `total_pages`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
           },
           "paths": {
             "anyOf": [
@@ -7196,7 +7182,7 @@
           },
           "query": {
             "default": null,
-            "description": "Text to match against file contents, symbol names, and rendered signatures. Matching\nis case-insensitive and identifier-aware - the query and the fields split on case\nand underscore boundaries, so `loadConfig` finds `load_config`. Scoring is\nserver-defined and stable for one cursor's life.",
+            "description": "Text to match against file contents, symbol names, and rendered signatures. Matching\nis case-insensitive and identifier-aware - the query and the fields split on case\nand underscore boundaries, so `loadConfig` finds `load_config`. Scoring is\nserver-defined and comparable within one answer.",
             "type": [
               "string",
               "null"
@@ -8251,6 +8237,31 @@
             ],
             "type": "object"
           },
+          "Pagination": {
+            "additionalProperties": false,
+            "description": "Where one page sits in the full result set the request's `limit` divides.",
+            "properties": {
+              "page_index": {
+                "description": "The zero-based page this answer serves.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "total_pages": {
+                "description": "The page count of the full result set under the request's `limit`, computed within\nthe server's result bound. Zero when the result set is empty.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "page_index",
+              "total_pages"
+            ],
+            "type": "object"
+          },
           "Parameter": {
             "additionalProperties": false,
             "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list.",
@@ -8748,7 +8759,7 @@
                 ]
               },
               "score": {
-                "description": "How well this hit matched. Scores are comparable across every page of one request\nand nowhere else.",
+                "description": "How well this hit matched. Scores are comparable within one answer and nowhere\nelse.",
                 "format": "double",
                 "type": "number"
               },
@@ -9666,18 +9677,9 @@
             "$ref": "#/$defs/Coverage",
             "description": "Coverage of the indexed candidate set used for this search. An empty result proves\nno match only where this is complete."
           },
-          "next_cursor": {
-            "description": "Cursor for the next page, or null after the final result.",
-            "examples": [
-              "eyJvZmZzZXQiOjV9"
-            ],
-            "maxLength": 4096,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9_-]+$",
-            "type": [
-              "string",
-              "null"
-            ]
+          "pagination": {
+            "$ref": "#/$defs/Pagination",
+            "description": "Where this page sits in the full result set under the request's `limit`."
           },
           "results": {
             "description": "The hits on this page, in the order the request asked for.",
@@ -9697,7 +9699,7 @@
         "required": [
           "coverage",
           "results",
-          "next_cursor",
+          "pagination",
           "warnings"
         ],
         "type": "object"

@@ -4,8 +4,9 @@
 //! paths keep resolving.
 
 use crate::read::{
-    Coverage, Cursor, DiagnosticContext, File, Node, ProjectPath, ProjectionId, ReadWarning,
-    Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitSpan, Symbol, SymbolId,
+    Coverage, DiagnosticContext, File, Node, PAGE_INDEX_DEFAULT, Pagination, ProjectPath,
+    ProjectionId, ReadWarning, Relationship, RelationshipFacet, RevisionId, SearchScope,
+    SourceUnitSpan, Symbol, SymbolId,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -307,9 +308,8 @@ pub enum RelationFilterQuantifier {
     NotExists,
 }
 
-/// The total order a paginated answer comes back in, named in the request so a cursor can be
-/// bound to it. Every order ends in the result's own identity, so two results that tie never
-/// swap places between pages.
+/// The total order a paginated answer comes back in. Every order ends in the result's own
+/// identity, so two results that tie never swap places between pages.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -331,8 +331,8 @@ pub enum ResultOrder {
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file - whichever `target` allowed.
     pub hit: SearchHitTarget,
-    /// How well this hit matched. Scores are comparable across every page of one request
-    /// and nowhere else.
+    /// How well this hit matched. Scores are comparable within one answer and nowhere
+    /// else.
     pub score: f64,
     /// Which indexed fields produced the match.
     pub matched_by: Vec<MatchedField>,
@@ -444,7 +444,7 @@ pub enum SearchIntent {
     },
     "include": ["source", "signature"],
     "limit": 20,
-    "cursor": null,
+    "page_index": 0,
     "scope": "project"
 }]))]
 #[schemars(transform = schema::restrict_traversal_and_paths)]
@@ -456,14 +456,13 @@ pub struct SearchParams {
     /// and Node records that bind it, and filters can search those attachments.
     #[serde(default = "default_search_params_target")]
     pub target: SearchParamsTarget,
-    /// Which total order the page comes back in. The cursor is bound to it, so it cannot
-    /// change between pages of one query. Omitted, relevance.
+    /// Which total order the page comes back in. Omitted, relevance.
     #[serde(default = "default_search_params_order")]
     pub order: ResultOrder,
     /// Text to match against file contents, symbol names, and rendered signatures. Matching
     /// is case-insensitive and identifier-aware - the query and the fields split on case
     /// and underscore boundaries, so `loadConfig` finds `load_config`. Scoring is
-    /// server-defined and stable for one cursor's life.
+    /// server-defined and comparable within one answer.
     #[serde(default)]
     pub query: Option<String>,
     /// A predicate over resolved fields and relationships. This is where provider knowledge
@@ -484,10 +483,11 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(range(min = 1_u64, max = 10_000_u64))]
     pub limit: Option<u64>,
-    /// Continues a previous search where its last page ended. Omit it for the first page;
-    /// everything else in the request has to match what the cursor was minted for.
-    #[serde(default)]
-    pub cursor: Option<Cursor>,
+    /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
+    /// the last page returns an empty page whose `pagination` carries the requested
+    /// `page_index` and the true `total_pages`.
+    #[serde(default = "default_search_params_page_index")]
+    pub page_index: u64,
     /// The projection to search. Null searches the workspace tree.
     #[serde(default)]
     pub projection: Option<ProjectionId>,
@@ -513,6 +513,10 @@ fn default_search_params_target() -> SearchParamsTarget {
 
 fn default_search_params_order() -> ResultOrder {
     ResultOrder::Relevance
+}
+
+fn default_search_params_page_index() -> u64 {
+    PAGE_INDEX_DEFAULT
 }
 
 fn default_search_params_scope() -> SearchScope {
@@ -546,10 +550,8 @@ pub struct SearchResult {
     pub coverage: Coverage,
     /// The hits on this page, in the order the request asked for.
     pub results: Vec<SearchHit>,
-    /// Cursor for the next page, or null after the final result.
-    #[serde(deserialize_with = "crate::read::deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
-    pub next_cursor: Option<Cursor>,
+    /// Where this page sits in the full result set under the request's `limit`.
+    pub pagination: Pagination,
     /// Warnings attached to this result, empty when there is nothing to warn about.
     pub warnings: Vec<ReadWarning>,
 }
@@ -616,10 +618,22 @@ pub enum TraversalDirection {
 #[cfg(test)]
 mod tests {
     use super::{
-        PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_HOPS_DEFAULT,
-        SEARCH_TRAVERSAL_NODES_DEFAULT, SearchTraversal,
+        PAGE_INDEX_DEFAULT, PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_HOPS_DEFAULT,
+        SEARCH_TRAVERSAL_NODES_DEFAULT, SearchParams, SearchTraversal,
     };
     use serde_json::json;
+
+    /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
+    /// from the schema; this pins the advertised default to the constant the field's
+    /// default function returns.
+    #[test]
+    fn search_params_schema_page_index_default_equals_the_enforced_constant() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
+        assert_eq!(
+            schema["properties"]["page_index"]["default"],
+            json!(PAGE_INDEX_DEFAULT)
+        );
+    }
 
     #[test]
     fn path_pattern_violation_classifies_every_schema_rule() {

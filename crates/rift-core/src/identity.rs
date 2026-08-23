@@ -118,7 +118,6 @@ define_id!(SymbolId, "Language-qualified symbol identity.");
 define_id!(ProviderId, "Provider component identity.");
 define_id!(CompositionId, "Provider composition identity.");
 define_id!(ModelId, "Resolved embedding model identity.");
-define_id!(CursorId, "Opaque search cursor identity.");
 
 /// Violated source-resolver identity rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -469,8 +468,8 @@ mod tests {
     use std::str::FromStr as _;
 
     use super::{
-        CompositionId, CompositionRevision, CursorId, IndexRevision, ModelId, ModelRevision,
-        ProviderId, ProviderRevision, SourceResolverId, SourceResolverIdViolation, SourceRevision,
+        CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision, ProviderId,
+        ProviderRevision, SourceResolverId, SourceResolverIdViolation, SourceRevision,
         SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
         encode_path, rust_symbol_identity,
     };
@@ -826,10 +825,6 @@ mod tests {
         assert_eq!(
             ModelId::new("owner/model@revision").map(|id| id.to_string()),
             Ok("owner/model@revision".into())
-        );
-        assert_eq!(
-            CursorId::new("cursor").map(|id| id.to_string()),
-            Ok("cursor".into())
         );
     }
 

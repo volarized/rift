@@ -1474,7 +1474,10 @@ mod tests {
             .structured_content
             .ok_or("get_symbol must return structured content")?;
         assert_eq!(structured["hits"][0]["symbol"]["name"], "beacon");
-        assert_eq!(structured["next_cursor"], serde_json::Value::Null);
+        assert_eq!(
+            structured["pagination"],
+            json!({ "page_index": 0, "total_pages": 1 })
+        );
 
         let search = client
             .call_tool(

@@ -1,11 +1,11 @@
 //! Validates and verifies the behaviour of every advertised tool on the MCP
 //! surface: each corpus request against the tool's advertised input schema,
 //! each structured result against its advertised output schema, and every
-//! sub-variant a result can take - the `next_cursor` string and `null` arms,
-//! cohesive cursor walkthroughs across pages, and so on. The walk follows any
-//! cursor a result returns, so live pagination joins the gate as soon as a
-//! read mints one. Every `ChangeResult` arm is proven the same way: applied
-//! (with and without parser findings), and refused for a failed
+//! sub-variant a result can take. The walk follows a paginated result page
+//! by page - `page_index` climbing under the result's own `total_pages` -
+//! so a live multi-page answer and the empty page past the end are both
+//! proven against the schema. Every `ChangeResult` arm is proven the same
+//! way: applied (with and without parser findings), and refused for a failed
 //! precondition, an ambiguous target, and an unsupported file-level change -
 //! plus a live witnessed `replace_node` that lands after the walk.
 
@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// Most cursor pages one corpus request may walk before the gate fails.
+/// Most pages one corpus request may walk before the gate fails.
 const FOLLOWED_PAGES_MAX: usize = 16;
 
 /// Sample validation corpus with various scenarios: one request per
@@ -37,6 +37,14 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("search", json!({ "query": "beacon" })),
         ("search", json!({ "query": "beacon", "limit": 1 })),
+        (
+            "search",
+            json!({ "query": "beacon", "limit": 1, "page_index": 100 }),
+        ),
+        (
+            "get_symbol",
+            json!({ "name": "beacon", "limit": 1, "page_index": 50 }),
+        ),
         (
             "search",
             json!({ "query": "beacon", "paths": { "include": ["lib.rs"] } }),
@@ -237,6 +245,17 @@ fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
         .ok_or_else(|| "tool arguments must be an object".into())
 }
 
+/// The result rows a paginated answer pages: search hits or symbol hits. None for a tool
+/// whose result carries no pagination.
+fn paged_rows<'result>(name: &str, structured: &'result Value) -> Option<&'result [Value]> {
+    let rows = match name {
+        "search" => "results",
+        "get_symbol" => "hits",
+        _ => return None,
+    };
+    structured[rows].as_array().map(Vec::as_slice)
+}
+
 fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     let failures: Vec<String> = validator
         .iter_errors(instance)
@@ -378,8 +397,8 @@ async fn served_fixture() -> TestResult<(
 /// one was never produced.
 #[derive(Default)]
 struct CorpusArms {
-    null_cursor_pages: usize,
-    present_cursor_pages: usize,
+    multi_page_results: usize,
+    past_end_pages: usize,
     applied_changes: usize,
     applied_with_findings: usize,
     refusal_reasons: BTreeSet<String>,
@@ -410,11 +429,11 @@ impl CorpusArms {
     /// Fails the walk unless every tracked arm was produced live.
     fn assert_proven(&self) {
         assert!(
-            self.null_cursor_pages > 0 && self.present_cursor_pages > 0,
-            "the corpus must prove both next_cursor arms against the schema: \
-             null_cursor_pages={}, present_cursor_pages={}",
-            self.null_cursor_pages,
-            self.present_cursor_pages
+            self.multi_page_results > 0 && self.past_end_pages > 0,
+            "the corpus must prove a multi-page result set and an empty page past the end: \
+             multi_page_results={}, past_end_pages={}",
+            self.multi_page_results,
+            self.past_end_pages
         );
         assert!(
             self.applied_changes >= 3 && self.applied_with_findings >= 1,
@@ -507,8 +526,8 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
         loop {
             assert!(
                 followed_pages <= FOLLOWED_PAGES_MAX,
-                "cursor walk for {name} exceeded {FOLLOWED_PAGES_MAX} pages: \
-                 the fixture is too large or pagination never terminates"
+                "page walk for {name} exceeded {FOLLOWED_PAGES_MAX} pages: \
+                 the fixture is too large or the page count never converges"
             );
             assert_validates(input_validator, &request, &format!("{name} request"));
             let result = call_tool_retrying_acceptance(
@@ -522,28 +541,42 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
             assert_validates(output_validator, &structured, &format!("{name} result"));
             assert_wire_hygiene(name, &structured);
             arms.observe(&structured);
-            if structured.get("next_cursor").is_some() {
-                let mut continued = structured.clone();
-                continued["next_cursor"] = json!("b3BhcXVl");
-                assert_validates(
-                    output_validator,
-                    &continued,
-                    &format!("{name} result with a present cursor"),
+            let Some(pagination) = structured.get("pagination") else {
+                break;
+            };
+            let page_index = pagination["page_index"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} pagination.page_index must be an integer"));
+            let total_pages = pagination["total_pages"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} pagination.total_pages must be an integer"));
+            let requested_page = request
+                .get("page_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            assert_eq!(
+                page_index, requested_page,
+                "{name} must answer the page the request asked for"
+            );
+            if total_pages > 1 {
+                arms.multi_page_results += 1;
+            }
+            if page_index >= total_pages {
+                let rows =
+                    paged_rows(name, &structured).ok_or_else(|| format!("{name} result rows"))?;
+                assert!(
+                    rows.is_empty(),
+                    "{name} page {page_index} past total_pages {total_pages} must be empty: \
+                     {structured:#}"
                 );
-                arms.present_cursor_pages += 1;
+                arms.past_end_pages += 1;
+                break;
             }
-            match &structured["next_cursor"] {
-                Value::String(cursor) => {
-                    arms.present_cursor_pages += 1;
-                    followed_pages += 1;
-                    request["cursor"] = json!(cursor);
-                }
-                Value::Null => {
-                    arms.null_cursor_pages += 1;
-                    break;
-                }
-                other => panic!("{name} next_cursor must be a string or null, got {other}"),
+            if page_index + 1 >= total_pages {
+                break;
             }
+            followed_pages += 1;
+            request["page_index"] = json!(page_index + 1);
         }
     }
     arms.assert_proven();

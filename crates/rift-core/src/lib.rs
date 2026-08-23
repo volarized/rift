@@ -17,8 +17,8 @@ pub use error::{
     RetryDirective, RiftError, fault_label, render_failure,
 };
 pub use identity::{
-    CompositionId, CompositionRevision, CursorId, IdError, IdFault, IndexRevision, ModelId,
-    ModelRevision, ProviderId, ProviderRevision, RevisionError, RevisionFault, SourceResolverId,
+    CompositionId, CompositionRevision, IdError, IdFault, IndexRevision, ModelId, ModelRevision,
+    ProviderId, ProviderRevision, RevisionError, RevisionFault, SourceResolverId,
     SourceResolverIdError, SourceResolverIdFault, SourceResolverIdViolation, SourceRevision,
     SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
     encode_path, rust_symbol_identity,

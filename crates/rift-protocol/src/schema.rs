@@ -653,15 +653,15 @@ mod tests {
     #[test]
     fn test_nullable_reference_gains_any_of_null_arm() {
         let mut schema = schema_from(json!({
-            "$ref": "#/$defs/Cursor",
-            "description": "Cursor for the next page."
+            "$ref": "#/$defs/SymbolId",
+            "description": "The symbol that declares this type."
         }));
         nullable(&mut schema);
         assert_eq!(
             schema.as_value(),
             &json!({
-                "description": "Cursor for the next page.",
-                "anyOf": [{ "$ref": "#/$defs/Cursor" }, { "type": "null" }]
+                "description": "The symbol that declares this type.",
+                "anyOf": [{ "$ref": "#/$defs/SymbolId" }, { "type": "null" }]
             })
         );
     }

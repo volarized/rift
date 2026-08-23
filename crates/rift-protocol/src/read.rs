@@ -157,21 +157,6 @@ pub enum CoverageStateState {
     NotApplicable,
 }
 
-/// An opaque base64url string that continues a paginated answer from where the last page
-/// ended. It binds the request, state, order, and page size that apply to that answer.
-/// Padding is omitted. A mismatch returns `cursor_invalid`. For a captured result set,
-/// process restart or eviction returns `cursor_expired`, and later writes do not change
-/// remaining pages.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct Cursor(
-    #[schemars(example = &"eyJvZmZzZXQiOjV9")]
-    #[schemars(length(min = 1, max = 4096))]
-    #[schemars(regex(pattern = r"^[A-Za-z0-9_-]+$"))]
-    pub String,
-);
-
 /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
 /// uses. The full digest is computed and compared internally; only this short form ever
 /// reaches the wire.
@@ -364,7 +349,7 @@ pub struct GetSymbolHit {
     "include_body": true,
     "include_history": false,
     "limit": 5,
-    "cursor": null,
+    "page_index": 0,
     "scope": "all"
 }]))]
 #[schemars(transform = schema::forbid_get_symbol_rev_with_projection)]
@@ -389,9 +374,11 @@ pub struct GetSymbolParams {
     #[serde(default = "default_get_symbol_params_limit")]
     #[schemars(range(min = 1_u64, max = 10_000_u64))]
     pub limit: u64,
-    /// Continues a previous lookup where its last page ended.
-    #[serde(default)]
-    pub cursor: Option<Cursor>,
+    /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
+    /// the last page returns an empty page whose `pagination` carries the requested
+    /// `page_index` and the true `total_pages`.
+    #[serde(default = "default_get_symbol_params_page_index")]
+    pub page_index: u64,
     /// The projection to read. Null reads the workspace tree.
     #[serde(default)]
     pub projection: Option<ProjectionId>,
@@ -419,6 +406,10 @@ fn default_get_symbol_params_limit() -> u64 {
     5
 }
 
+fn default_get_symbol_params_page_index() -> u64 {
+    PAGE_INDEX_DEFAULT
+}
+
 fn default_get_symbol_params_scope() -> SearchScope {
     SearchScope::All
 }
@@ -432,10 +423,8 @@ pub struct GetSymbolResult {
     /// Coverage of the symbol index used for this lookup. An empty result proves absence
     /// only where this is complete.
     pub coverage: Coverage,
-    /// Cursor for the next page, or null after the final hit.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required, transform = schema::nullable)]
-    pub next_cursor: Option<Cursor>,
+    /// Where this page sits in the full result set under the request's `limit`.
+    pub pagination: Pagination,
     /// Warnings attached to this result, empty when there is nothing to warn about.
     pub warnings: Vec<ReadWarning>,
 }
@@ -637,6 +626,22 @@ pub struct PackageIdentity {
     /// Resolved package version.
     #[schemars(length(max = 4096))]
     pub version: String,
+}
+
+/// Default `page_index` for a paginated request: the first page.
+pub const PAGE_INDEX_DEFAULT: u64 = 0;
+
+/// Where one page sits in the full result set the request's `limit` divides.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pagination {
+    /// The zero-based page this answer serves.
+    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub page_index: u64,
+    /// The page count of the full result set under the request's `limit`, computed within
+    /// the server's result bound. Zero when the result set is empty.
+    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub total_pages: u64,
 }
 
 /// One parameter of a `Signature`: what it is called, the types bound to it, and how a call
@@ -1400,9 +1405,24 @@ pub struct TypeExpression {
 
 #[cfg(test)]
 mod tests {
-    use super::{Digest, REVISION_ID_BYTES_MAX, RevisionId, RevisionIdViolation, SourceUnitId};
+    use super::{
+        Digest, GetSymbolParams, PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX, RevisionId,
+        RevisionIdViolation, SourceUnitId,
+    };
     use schemars::schema_for;
     use serde_json::json;
+
+    /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
+    /// from the schema; this pins the advertised default to the constant the field's
+    /// default function returns.
+    #[test]
+    fn get_symbol_params_schema_page_index_default_equals_the_enforced_constant() {
+        let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
+        assert_eq!(
+            schema["properties"]["page_index"]["default"],
+            json!(PAGE_INDEX_DEFAULT)
+        );
+    }
 
     #[test]
     fn revision_id_schema_pattern_states_the_enforced_length_bound() {

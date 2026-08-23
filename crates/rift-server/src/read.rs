@@ -15,9 +15,9 @@ use rift_index::{
 use rift_protocol::read::{
     Coverage, CoverageCompleteState, CoverageReach, CoverageScope, Digest, ExactKind, Extensions,
     FactFamily, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult, Language, Node, NodeFacet,
-    NodeId, NodesParams, NodesResult, ProjectPath, ReadWarning, RevisionId, SearchScope,
-    SemanticCoverage, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId, SourceUnitSpan,
-    Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    NodeId, NodesParams, NodesResult, Pagination, ProjectPath, ReadWarning, RevisionId,
+    SearchScope, SemanticCoverage, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
+    SourceUnitSpan, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, RustNode, RustSymbol, RustSymbolKind, RustVisibility};
 use sha2::{Digest as _, Sha256};
@@ -350,7 +350,6 @@ impl ReadService {
     /// Returns [`ReadError`] for projections, invalid paths, or missing files.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
         validate_common(
-            false,
             params.projection.is_some(),
             params.rev.is_some(),
             SearchScope::Project,
@@ -388,10 +387,9 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for unsupported history, cursor, projection, or scope.
+    /// Returns [`ReadError`] for unsupported history, projection, or scope.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
         validate_common(
-            params.cursor.is_some(),
             params.projection.is_some(),
             params.rev.is_some(),
             params.scope,
@@ -400,10 +398,14 @@ impl ReadService {
             return Err(ReadFault::unsupported("symbol history"));
         }
         let limit = accepted_limit(params.limit)?;
-        let hits = self
+        // The whole ranked match set is collected up to the index's own `results_max`
+        // bound, so `pagination.total_pages` counts the full result set the pages divide.
+        let matches = self
             .index
-            .symbols(&params.name, limit)
-            .map_err(ReadFault::index)?
+            .symbols(&params.name, self.index.results_max())
+            .map_err(ReadFault::index)?;
+        let (window, pagination) = page(matches, params.page_index, limit);
+        let hits = window
             .into_iter()
             .map(|matched| GetSymbolHit {
                 symbol: wire_symbol(matched),
@@ -418,7 +420,7 @@ impl ReadService {
         Ok(GetSymbolResult {
             hits,
             coverage: complete_coverage(),
-            next_cursor: None,
+            pagination,
             warnings: self.warnings(),
         })
     }
@@ -435,7 +437,6 @@ pub(crate) fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
 }
 
 pub(crate) fn validate_common(
-    cursor: bool,
     projection: bool,
     rev: bool,
     scope: SearchScope,
@@ -446,13 +447,41 @@ pub(crate) fn validate_common(
             "combines with projection; a read serves one tree",
         ));
     }
-    if cursor || projection {
-        return Err(ReadFault::unsupported("cursor and projection reads"));
+    if projection {
+        return Err(ReadFault::unsupported("projection reads"));
     }
     if scope == SearchScope::Dependencies {
         return Err(ReadFault::unsupported("dependency reads"));
     }
     Ok(())
+}
+
+/// Cuts one page out of a fully collected result set and states where the page sits.
+///
+/// Work is bounded upstream: every caller collects at most the index's `results_max`
+/// results before paging. `limit` is positive - `accepted_limit` refuses zero - so
+/// `total_pages` is `results.len().div_ceil(limit)`, zero for an empty set. A
+/// `page_index` past the last page yields an empty page carrying the requested index
+/// and the true page count.
+pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
+    assert!(
+        limit > 0,
+        "page limit must be positive after acceptance: limit={limit}"
+    );
+    let total = results.len();
+    let total_pages = u64::try_from(total.div_ceil(limit)).unwrap_or(u64::MAX);
+    let pagination = Pagination {
+        page_index,
+        total_pages,
+    };
+    let start = usize::try_from(page_index)
+        .ok()
+        .and_then(|index| index.checked_mul(limit));
+    let window = match start {
+        Some(start) if start < total => results.into_iter().skip(start).take(limit).collect(),
+        _ => Vec::new(),
+    };
+    (window, pagination)
 }
 
 fn wire_node(file: &IndexedFile, node: &RustNode) -> Node {
@@ -800,7 +829,7 @@ mod tests {
     use rift_protocol::read::{
         GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, RevisionId,
     };
-    use serde_json::{Value, json};
+    use serde_json::json;
     use tempfile::TempDir;
 
     use super::{ReadFault, ReadService, WorkspaceIndexLimits};
@@ -994,7 +1023,10 @@ pub fn compute() -> i32 {
             value["hits"][0]["symbol"]["origin"]["unit"],
             json!("rift://source/project/src/lib.rs")
         );
-        assert_eq!(value["next_cursor"], Value::Null);
+        assert_eq!(
+            value["pagination"],
+            json!({ "page_index": 0, "total_pages": 1 })
+        );
         Ok(())
     }
 
@@ -1365,6 +1397,92 @@ pub fn compute() -> i32 {
             "the request does not match the documented form: field rev, \
              violation charset_forbidden; correct the reported field and \
              resend the request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn page_of_an_empty_set_reports_zero_total_pages() {
+        let (window, pagination) = super::page(Vec::<u8>::new(), 0, 5);
+        assert_eq!(window, Vec::<u8>::new());
+        assert_eq!(pagination.page_index, 0);
+        assert_eq!(pagination.total_pages, 0);
+    }
+
+    #[test]
+    fn page_zero_serves_the_first_window_by_default() {
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5], 0, 2);
+        assert_eq!(window, vec![1, 2]);
+        assert_eq!(pagination.page_index, 0);
+        assert_eq!(pagination.total_pages, 3);
+    }
+
+    #[test]
+    fn page_count_is_exact_for_a_set_that_divides_evenly() {
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6], 1, 3);
+        assert_eq!(window, vec![4, 5, 6]);
+        assert_eq!(pagination.total_pages, 2);
+    }
+
+    #[test]
+    fn page_count_rounds_up_and_the_last_page_carries_the_remainder() {
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6, 7], 2, 3);
+        assert_eq!(window, vec![7]);
+        assert_eq!(pagination.total_pages, 3);
+    }
+
+    #[test]
+    fn page_past_the_end_is_empty_and_keeps_the_true_page_count() {
+        let (window, pagination) = super::page(vec![1, 2, 3], 9, 2);
+        assert_eq!(window, Vec::<i32>::new());
+        assert_eq!(pagination.page_index, 9);
+        assert_eq!(pagination.total_pages, 2);
+    }
+
+    /// The window offset is `page_index * limit` at checked boundaries: an index whose
+    /// offset cannot be represented is past every collectable page, never a panic.
+    #[test]
+    fn page_index_beyond_arithmetic_range_is_an_empty_page() {
+        let (window, pagination) = super::page(vec![1, 2, 3], u64::MAX, usize::MAX);
+        assert_eq!(window, Vec::<i32>::new());
+        assert_eq!(pagination.page_index, u64::MAX);
+        assert_eq!(pagination.total_pages, 1);
+    }
+
+    #[test]
+    fn get_symbol_pages_walk_the_full_match_set_without_overlap() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let first: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon", "limit": 1}))?;
+        let first_value = serde_json::to_value(service.get_symbol(&first)?)?;
+        assert_eq!(
+            first_value["pagination"],
+            json!({ "page_index": 0, "total_pages": 2 })
+        );
+        let second: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "limit": 1, "page_index": 1}))?;
+        let second_value = serde_json::to_value(service.get_symbol(&second)?)?;
+        assert_eq!(
+            second_value["pagination"],
+            json!({ "page_index": 1, "total_pages": 2 })
+        );
+        assert_eq!(second_value["hits"].as_array().map(Vec::len), Some(1));
+        assert_ne!(
+            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            "consecutive pages must serve distinct declarations"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_symbol_page_past_the_end_is_empty_with_the_true_page_count() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "limit": 1, "page_index": 40}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        assert_eq!(value["hits"], json!([]));
+        assert_eq!(
+            value["pagination"],
+            json!({ "page_index": 40, "total_pages": 2 })
         );
         Ok(())
     }
