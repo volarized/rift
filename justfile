@@ -32,7 +32,7 @@ clean:
     git worktree list --porcelain | sed -n 's/^worktree //p' | while read -r tree; do
         if [ -f "$tree/Cargo.toml" ]; then
             echo "cleaning $tree"
-            cargo clean --manifest-path "$tree/Cargo.toml"
+            cargo clean --manifest-path "$tree/Cargo.toml" || echo "skipped $tree: broken checkout"
         fi
     done
 
