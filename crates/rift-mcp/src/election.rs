@@ -194,6 +194,7 @@ impl ElectionGuard {
         };
         let staged =
             tempfile::NamedTempFile::new_in(&self.state_directory).map_err(stage_failed)?;
+        restrict_to_owner(staged.as_file()).map_err(stage_failed)?;
         staged.as_file().write_all(bytes).map_err(stage_failed)?;
         staged.as_file().sync_all().map_err(stage_failed)?;
         staged.persist(&self.document_path).map_err(|error| {
@@ -294,6 +295,23 @@ fn published_document(root: &Path) -> Result<ServerLock, ServerPresence> {
             violation,
         ))),
     }
+}
+
+/// Restricts the staged document to its owner before the token is written.
+///
+/// The token separates OS users, so the file that carries it is never
+/// readable by another user. Windows inherits the profile's ACLs instead;
+/// the mode call has nothing to narrow there.
+#[cfg(unix)]
+fn restrict_to_owner(file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+/// See the unix arm: Windows scopes the file by the profile's ACLs.
+#[cfg(not(unix))]
+fn restrict_to_owner(_file: &std::fs::File) -> io::Result<()> {
+    Ok(())
 }
 
 /// Whether a live process stands behind a validated document.
@@ -521,6 +539,25 @@ mod tests {
             "retire must remove the document"
         );
         guard.retire();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_document_is_readable_by_its_owner_alone() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        guard.publish(&valid_document())?;
+        let mode = fs::metadata(document_path(directory.path()))?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the token-carrying document must be owner-only, got mode {mode:o}"
+        );
         Ok(())
     }
 
