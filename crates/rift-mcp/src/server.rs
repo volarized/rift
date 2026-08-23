@@ -1583,14 +1583,10 @@ mod tests {
     #[tokio::test]
     async fn client_search_merges_lexical_symbol_and_text_file_hits() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(
-            directory.path().join("lib.rs"),
-            "/// Converts a raw measurement into base units.\npub fn scale_value(value: f64) -> f64 {\n    value * 2.0\n}\n",
-        )?;
-        fs::write(
-            directory.path().join("guide.md"),
-            "# Guide\n\nThis document explains how to replace all safely.\n",
-        )?;
+        let lib_rs = "/// Converts a raw measurement into base units.\npub fn scale_value(value: f64) -> f64 {\n    value * 2.0\n}\n";
+        fs::write(directory.path().join("lib.rs"), lib_rs)?;
+        let guide_md = "# Guide\n\nThis document explains how to replace all safely.\n";
+        fs::write(directory.path().join("guide.md"), guide_md)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
@@ -1618,9 +1614,7 @@ mod tests {
         let file_hit = results
             .iter()
             .find(|hit| hit["hit"]["target"] == "file" && hit["path"] == json!("guide.md"))
-            .ok_or_else(|| {
-                format!("a text-file hit for guide.md must be present: {structured:#}")
-            })?;
+            .ok_or_else(|| format!("guide.md text-file hit missing: {structured:#}"))?;
         assert_eq!(file_hit["matched_by"], json!(["content"]));
 
         let symbol_hit = results
@@ -1628,11 +1622,7 @@ mod tests {
             .find(|hit| {
                 hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
             })
-            .ok_or_else(|| {
-                format!(
-                    "scale_value must be found through its doc comment's content: {structured:#}"
-                )
-            })?;
+            .ok_or_else(|| format!("scale_value doc-comment hit missing: {structured:#}"))?;
         assert!(
             symbol_hit["matched_by"]
                 .as_array()
@@ -1662,9 +1652,7 @@ mod tests {
 
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
             .await
-            .map_err(|error| {
-                format!("a corrupt lexical database must not fail startup: {error:?}")
-            })?;
+            .map_err(|error| format!("corrupt database must not fail startup: {error:?}"))?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -2219,6 +2207,11 @@ pub fn beacon() -> u64 {
 
     #[tokio::test]
     async fn build_disables_lexical_tier_when_rift_state_path_is_a_file() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A regular file already occupies `.rift`, so `create_dir_all` cannot make the
@@ -2234,6 +2227,11 @@ pub fn beacon() -> u64 {
 
     #[tokio::test]
     async fn build_disables_lexical_tier_when_database_path_is_a_directory() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A directory at the database path fails the initial open; `remove_file` cannot
