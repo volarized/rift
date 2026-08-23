@@ -1,9 +1,11 @@
 "use client";
 
+import { Dialog } from "@base-ui/react/dialog";
 import { Popover } from "@base-ui/react/popover";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Maximize2, X } from "lucide-react";
 import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import mcpDocumentJson from "../../public/mcp.json";
 
 type JsonPrimitive = boolean | number | string | null;
@@ -161,7 +163,7 @@ function DescriptionKey({ name, description }: { name: string; description?: str
         {label}
       </Popover.Trigger>
       <Popover.Portal>
-        <Popover.Positioner sideOffset={8} align="start" className="z-50">
+        <Popover.Positioner sideOffset={8} align="start" className="z-[70]">
           <Popover.Popup className="max-w-[min(22rem,calc(100vw-2rem))] border border-border bg-popover px-3 py-2 font-sans text-xs leading-relaxed text-popover-foreground shadow-lg outline-none">
             <Popover.Description>{description}</Popover.Description>
           </Popover.Popup>
@@ -287,39 +289,55 @@ function JsonNode({
   );
 }
 
-function JsonShape({ label, schema }: { label: "input" | "output"; schema: JsonSchema }) {
+function JsonShape({
+  fullscreen = false,
+  label,
+  schema,
+}: {
+  fullscreen?: boolean;
+  label: "input" | "output";
+  schema: JsonSchema;
+}) {
   const value = exampleFromSchema(schema, schema);
   const resolved = structuralSchema(schema, schema);
   const entries = Array.isArray(value)
     ? value.map((item, index) => [String(index), item] as const)
     : Object.entries(value as Record<string, JsonValue>);
   const array = Array.isArray(value);
+  const payload = (
+    <div className="min-w-max whitespace-nowrap px-2 py-3 font-mono text-[0.75rem] sm:text-[0.8125rem]">
+      <div className="leading-6 text-muted-foreground">{array ? "[" : "{"}</div>
+      {entries.map(([name, entryValue], index) => {
+        const entrySchema = array ? (resolved.items ?? {}) : (resolved.properties?.[name] ?? {});
+        return (
+          <JsonNode
+            key={array ? JSON.stringify(entryValue) : name}
+            name={array ? undefined : name}
+            fallbackDescription={resolved.description}
+            value={entryValue}
+            schema={entrySchema}
+            root={schema}
+            depth={1}
+            comma={index < entries.length - 1}
+          />
+        );
+      })}
+      <div className="leading-6 text-muted-foreground">{array ? "]" : "}"}</div>
+    </div>
+  );
 
   return (
-    <div className="min-w-0 border border-border bg-background">
-      <div className="flex items-center justify-between border-b border-border px-3 py-2 font-mono text-[0.6875rem] uppercase tracking-[0.16em] text-muted-foreground">
+    <div
+      className={
+        fullscreen
+          ? "flex min-h-0 min-w-0 flex-col overflow-hidden bg-background"
+          : "flex max-h-[85vh] min-w-0 flex-col overflow-hidden bg-background"
+      }
+    >
+      <div className="flex shrink-0 items-center border-b border-border px-3 py-2 font-mono text-[0.6875rem] uppercase tracking-[0.16em] text-muted-foreground">
         <span>{label}</span>
-        <span>json</span>
       </div>
-      <div className="overflow-visible px-2 py-3 font-mono text-[0.75rem] sm:text-[0.8125rem]">
-        <div className="leading-6 text-muted-foreground">{array ? "[" : "{"}</div>
-        {entries.map(([name, entryValue], index) => {
-          const entrySchema = array ? (resolved.items ?? {}) : (resolved.properties?.[name] ?? {});
-          return (
-            <JsonNode
-              key={array ? JSON.stringify(entryValue) : name}
-              name={array ? undefined : name}
-              fallbackDescription={resolved.description}
-              value={entryValue}
-              schema={entrySchema}
-              root={schema}
-              depth={1}
-              comma={index < entries.length - 1}
-            />
-          );
-        })}
-        <div className="leading-6 text-muted-foreground">{array ? "]" : "}"}</div>
-      </div>
+      <div className="min-h-0 min-w-0 flex-1 overflow-auto">{payload}</div>
     </div>
   );
 }
@@ -348,10 +366,57 @@ export function McpTool({ name }: { name: string }) {
           {tool.description}
         </p>
       </header>
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
-        <JsonShape label="input" schema={tool.input_schema} />
-        <JsonShape label="output" schema={tool.output_schema} />
-      </div>
+      <Dialog.Root>
+        <div className="overflow-hidden border border-border bg-border">
+          <div className="flex items-center justify-between border-b border-border bg-background px-3 py-1.5">
+            <span className="font-mono text-[0.6875rem] uppercase tracking-[0.16em] text-muted-foreground">
+              Payloads
+            </span>
+            <Dialog.Trigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Open ${tool.name} payloads in fullscreen`}
+                />
+              }
+            >
+              <Maximize2 aria-hidden="true" />
+            </Dialog.Trigger>
+          </div>
+          <div className="grid grid-cols-1 gap-px md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+            <JsonShape label="input" schema={tool.input_schema} />
+            <JsonShape label="output" schema={tool.output_schema} />
+          </div>
+        </div>
+        <Dialog.Portal>
+          <Dialog.Backdrop className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" />
+          <Dialog.Viewport className="fixed inset-0 z-[60] flex p-2 sm:p-4">
+            <Dialog.Popup className="flex min-h-0 w-full flex-col overflow-hidden border border-border bg-background shadow-2xl outline-none">
+              <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
+                <Dialog.Title className="font-mono text-sm font-medium">
+                  {tool.name} payloads
+                </Dialog.Title>
+                <Dialog.Close
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Close ${tool.name} payloads fullscreen view`}
+                    />
+                  }
+                >
+                  <X aria-hidden="true" />
+                </Dialog.Close>
+              </div>
+              <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-2 gap-px bg-border md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:grid-rows-1">
+                <JsonShape fullscreen label="input" schema={tool.input_schema} />
+                <JsonShape fullscreen label="output" schema={tool.output_schema} />
+              </div>
+            </Dialog.Popup>
+          </Dialog.Viewport>
+        </Dialog.Portal>
+      </Dialog.Root>
     </section>
   );
 }
