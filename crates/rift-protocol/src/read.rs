@@ -343,15 +343,26 @@ pub struct GetSymbolHit {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
-#[schemars(extend("examples" = [{
-    "name": "ReadService",
-    "language": { "name": "rust", "dialect": null },
-    "include_body": true,
-    "include_history": false,
-    "limit": 5,
-    "page_index": 0,
-    "scope": "all"
-}]))]
+#[schemars(extend("examples" = [
+    {
+        "name": "ReadService",
+        "language": {
+            "name": "rust",
+            "dialect": null
+        },
+        "include_body": true,
+        "include_history": true,
+        "limit": 5,
+        "page_index": 0,
+        "scope": "all"
+    },
+    {
+        "name": "Deserialize",
+        "scope": "dependencies",
+        "limit": 10,
+        "page_index": 1
+    }
+]))]
 #[schemars(transform = schema::forbid_get_symbol_rev_with_projection)]
 pub struct GetSymbolParams {
     /// The declaration name to look up - a name, not a free-text query; `search` takes
@@ -417,6 +428,217 @@ fn default_get_symbol_params_scope() -> SearchScope {
 /// One page of declarations matching a name.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "hits": [
+            {
+                "symbol": {
+                    "id": "rift://symbol/rust/src/config.rs/load_config",
+                    "language": {
+                        "name": "rust",
+                        "dialect": null
+                    },
+                    "name": "load_config",
+                    "kind": "rust.function",
+                    "facets": [
+                        "value",
+                        "callable",
+                        "public"
+                    ],
+                    "origin": {
+                        "location": {
+                            "kind": "project",
+                            "package": null
+                        },
+                        "source_kind": "authored",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    "container": null,
+                    "modifiers": [],
+                    "visibility": "pub",
+                    "types": [
+                        {
+                            "role": "return",
+                            "origin": "declared",
+                            "type": {
+                                "language": {
+                                    "name": "rust",
+                                    "dialect": null
+                                },
+                                "source": "Result<Config, ConfigError>",
+                                "resolved": null,
+                                "extensions": {}
+                            }
+                        }
+                    ],
+                    "signatures": [
+                        {
+                            "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+                            "links": [
+                                {
+                                    "range": {
+                                        "start": 42,
+                                        "end": 48
+                                    },
+                                    "symbol": "rift://symbol/rust/src/config.rs/Config"
+                                }
+                            ],
+                            "language": {
+                                "name": "rust",
+                                "dialect": null
+                            },
+                            "receiver": null,
+                            "parameters": [
+                                {
+                                    "name": "path",
+                                    "node": null,
+                                    "types": [
+                                        {
+                                            "role": "parameter",
+                                            "origin": "declared",
+                                            "type": {
+                                                "language": {
+                                                    "name": "rust",
+                                                    "dialect": null
+                                                },
+                                                "source": "&Path",
+                                                "resolved": null,
+                                                "extensions": {}
+                                            }
+                                        }
+                                    ],
+                                    "optional": false,
+                                    "variadic": false,
+                                    "default": null,
+                                    "extensions": {}
+                                }
+                            ],
+                            "returns": [
+                                {
+                                    "role": "return",
+                                    "origin": "declared",
+                                    "type": {
+                                        "language": {
+                                            "name": "rust",
+                                            "dialect": null
+                                        },
+                                        "source": "Result<Config, ConfigError>",
+                                        "resolved": null,
+                                        "extensions": {}
+                                    }
+                                }
+                            ],
+                            "type_parameters": [],
+                            "throws": [],
+                            "effects": [],
+                            "extensions": {}
+                        }
+                    ],
+                    "documentation": [
+                        {
+                            "format": "markdown",
+                            "text": "Loads the workspace configuration from `rift.toml`."
+                        }
+                    ],
+                    "extensions": {},
+                    "document_local": false
+                },
+                "node": {
+                    "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                    "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                    "unit": "rift://file/src/config.rs",
+                    "language": {
+                        "name": "rust",
+                        "dialect": null
+                    },
+                    "kind": "rust.function_item",
+                    "facets": [
+                        "declaration",
+                        "definition"
+                    ],
+                    "range": {
+                        "start": 218,
+                        "end": 355
+                    },
+                    "regions": [
+                        {
+                            "role": "name",
+                            "range": {
+                                "start": 225,
+                                "end": 236
+                            }
+                        },
+                        {
+                            "role": "body",
+                            "range": {
+                                "start": 281,
+                                "end": 355
+                            }
+                        }
+                    ],
+                    "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                    "extensions": {}
+                },
+                "source": {
+                    "span": {
+                        "unit": "rift://source/project/src/config.rs",
+                        "range": {
+                            "start": 162,
+                            "end": 355
+                        }
+                    },
+                    "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+                },
+                "history": {
+                    "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                    "versions": [
+                        {
+                            "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
+                            "path": "src/config.rs",
+                            "kind": "signature_changed",
+                            "timestamp": "2026-08-21T14:03:22Z",
+                            "summary": "Return ConfigError from load_config"
+                        },
+                        {
+                            "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
+                            "path": "src/config.rs",
+                            "kind": "introduced",
+                            "timestamp": "2026-08-17T09:41:05Z",
+                            "summary": "Add workspace configuration loading"
+                        }
+                    ],
+                    "coverage": {
+                        "state": "complete",
+                        "scope": {
+                            "kind": "reach",
+                            "reach": "request"
+                        }
+                    }
+                },
+                "co_changes": [
+                    {
+                        "subject": "rift://symbol/rust/src/config.rs/load_config",
+                        "partner": "rift://symbol/rust/src/error.rs/ConfigError",
+                        "together": 4,
+                        "touches": 9
+                    }
+                ]
+            }
+        ],
+        "coverage": {
+            "state": "complete",
+            "scope": {
+                "kind": "reach",
+                "reach": "request"
+            }
+        },
+        "pagination": {
+            "page_index": 0,
+            "total_pages": 1
+        },
+        "warnings": []
+    }
+]))]
 pub struct GetSymbolResult {
     /// The declarations on this page, best match first.
     pub hits: Vec<GetSymbolHit>,
@@ -574,10 +796,12 @@ pub struct NodeRegion {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
-#[schemars(extend("examples" = [{
-    "path": "src/lib.rs",
-    "position": 240
-}]))]
+#[schemars(extend("examples" = [
+    {
+        "path": "src/config.rs",
+        "position": 338
+    }
+]))]
 #[schemars(transform = schema::forbid_nodes_rev_with_projection)]
 pub struct NodesParams {
     /// Project-relative file to inspect.
@@ -602,6 +826,184 @@ pub struct NodesParams {
 /// from this listing refuses cleanly once the bytes drift.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "nodes": [
+            {
+                "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                "symbol": null,
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust",
+                    "dialect": null
+                },
+                "kind": "rust.source_file",
+                "facets": [],
+                "range": {
+                    "start": 0,
+                    "end": 356
+                },
+                "regions": [],
+                "parent": null,
+                "extensions": {}
+            },
+            {
+                "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust",
+                    "dialect": null
+                },
+                "kind": "rust.function_item",
+                "facets": [
+                    "declaration",
+                    "definition"
+                ],
+                "range": {
+                    "start": 218,
+                    "end": 355
+                },
+                "regions": [
+                    {
+                        "role": "name",
+                        "range": {
+                            "start": 225,
+                            "end": 236
+                        }
+                    },
+                    {
+                        "role": "body",
+                        "range": {
+                            "start": 281,
+                            "end": 355
+                        }
+                    }
+                ],
+                "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                "extensions": {}
+            },
+            {
+                "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+                "symbol": null,
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust",
+                    "dialect": null
+                },
+                "kind": "rust.block",
+                "facets": [],
+                "range": {
+                    "start": 281,
+                    "end": 355
+                },
+                "regions": [],
+                "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                "extensions": {}
+            },
+            {
+                "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
+                "symbol": null,
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust",
+                    "dialect": null
+                },
+                "kind": "rust.call_expression",
+                "facets": [
+                    "expression"
+                ],
+                "range": {
+                    "start": 334,
+                    "end": 353
+                },
+                "regions": [],
+                "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+                "extensions": {}
+            },
+            {
+                "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
+                "symbol": null,
+                "unit": "rift://file/src/config.rs",
+                "language": {
+                    "name": "rust",
+                    "dialect": null
+                },
+                "kind": "rust.identifier",
+                "facets": [],
+                "range": {
+                    "start": 334,
+                    "end": 346
+                },
+                "regions": [],
+                "parent": "rift://node/rust/src/config.rs@334-353#4df4426e",
+                "extensions": {}
+            }
+        ],
+        "source": [
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 0,
+                        "end": 356
+                    }
+                },
+                "text": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
+            },
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 218,
+                        "end": 355
+                    }
+                },
+                "text": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+            },
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 281,
+                        "end": 355
+                    }
+                },
+                "text": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+            },
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 334,
+                        "end": 353
+                    }
+                },
+                "text": "parse_config(&text)"
+            },
+            {
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 334,
+                        "end": 346
+                    }
+                },
+                "text": "parse_config"
+            }
+        ],
+        "coverage": {
+            "nodes": {
+                "state": "complete",
+                "scope": {
+                    "kind": "reach",
+                    "reach": "request"
+                }
+            }
+        },
+        "warnings": []
+    }
+]))]
 pub struct NodesResult {
     /// Nodes covering the position, outermost first.
     pub nodes: Vec<Node>,
@@ -1243,7 +1645,7 @@ pub struct SymbolHistory {
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct SymbolId(
-    #[schemars(example = &"rift://symbol/rust/rift_server.read.ReadService")]
+    #[schemars(example = &"rift://symbol/rust/crates/rift-server/src/read.rs/ReadService")]
     #[schemars(length(min = 17, max = 8192))]
     #[schemars(regex(
         pattern = r"^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$"

@@ -586,6 +586,44 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
     Ok(())
 }
 
+/// Every advertised tool carries at least one authored request example and
+/// one authored result example, and each example validates against the
+/// schema that carries it. The examples ride the exported document into the
+/// docs, so a drifted example is a contract defect the same way a drifted
+/// schema is - and a future tool cannot ship exampleless.
+#[test]
+fn every_tool_example_validates_against_its_advertised_schemas() -> TestResult {
+    let document: Value = serde_json::from_str(&rift_mcp::schema::schema_document())?;
+    let tools = document["tools"]
+        .as_array()
+        .ok_or("the exported document must list tools")?;
+    assert!(!tools.is_empty(), "the exported document must list tools");
+    for tool in tools {
+        let name = tool["name"]
+            .as_str()
+            .ok_or("every exported tool must carry a name")?;
+        for plane in ["input_schema", "output_schema"] {
+            let schema = &tool[plane];
+            let examples = schema["examples"]
+                .as_array()
+                .unwrap_or_else(|| panic!("tool {name} must carry at least one {plane} example"));
+            assert!(
+                !examples.is_empty(),
+                "tool {name} must carry at least one {plane} example"
+            );
+            let validator = jsonschema::validator_for(schema)?;
+            for (index, example) in examples.iter().enumerate() {
+                assert_validates(
+                    &validator,
+                    example,
+                    &format!("{name} {plane} example {index}"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn insert_symbol_schema_rejects_invalid_target_combinations() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;

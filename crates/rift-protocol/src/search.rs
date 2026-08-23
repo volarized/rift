@@ -432,21 +432,71 @@ pub enum SearchIntent {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.6"))]
-#[schemars(extend("examples" = [{
-    "target": "all",
-    "order": "relevance",
-    "query": "ReadService",
-    "filter": null,
-    "paths": {
-        "include": ["crates/**"],
-        "exclude": [],
-        "force_include": []
+#[schemars(extend("examples" = [
+    {
+        "target": "all",
+        "order": "relevance",
+        "query": "load_config",
+        "filter": null,
+        "paths": {
+            "include": [
+                "src/**"
+            ],
+            "exclude": [],
+            "force_include": []
+        },
+        "include": [
+            "source",
+            "signature"
+        ],
+        "limit": 20,
+        "page_index": 0,
+        "scope": "project"
     },
-    "include": ["source", "signature"],
-    "limit": 20,
-    "page_index": 0,
-    "scope": "project"
-}]))]
+    {
+        "target": "symbol",
+        "filter": {
+            "kind": "all",
+            "all": [
+                {
+                    "kind": "field",
+                    "field": {
+                        "field": "facets",
+                        "op": "contains",
+                        "value": "callable"
+                    }
+                },
+                {
+                    "kind": "relation",
+                    "relation": {
+                        "direction": "incoming",
+                        "facet": [
+                            "calls"
+                        ],
+                        "target": {
+                            "kind": "field",
+                            "field": {
+                                "field": "facets",
+                                "op": "contains",
+                                "value": "test"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        "limit": 10
+    },
+    {
+        "target": "symbol",
+        "traversal": {
+            "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+            "intent": "find_tests",
+            "max_nodes": 50
+        },
+        "limit": 25
+    }
+]))]
 #[schemars(transform = schema::restrict_traversal_and_paths)]
 #[schemars(transform = schema::require_query_filter_or_traversal)]
 #[schemars(transform = schema::forbid_search_rev_with_projection)]
@@ -544,6 +594,197 @@ pub enum SearchParamsTarget {
 /// result proves that no indexed candidate matched.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "coverage": {
+            "state": "complete",
+            "scope": {
+                "kind": "reach",
+                "reach": "request"
+            }
+        },
+        "results": [
+            {
+                "hit": {
+                    "target": "symbol",
+                    "symbol": {
+                        "id": "rift://symbol/rust/src/config.rs/load_config",
+                        "language": {
+                            "name": "rust",
+                            "dialect": null
+                        },
+                        "name": "load_config",
+                        "kind": "rust.function",
+                        "facets": [
+                            "value",
+                            "callable",
+                            "public"
+                        ],
+                        "origin": {
+                            "location": {
+                                "kind": "project",
+                                "package": null
+                            },
+                            "source_kind": "authored",
+                            "unit": "rift://source/project/src/config.rs"
+                        },
+                        "container": null,
+                        "modifiers": [],
+                        "visibility": "pub",
+                        "types": [
+                            {
+                                "role": "return",
+                                "origin": "declared",
+                                "type": {
+                                    "language": {
+                                        "name": "rust",
+                                        "dialect": null
+                                    },
+                                    "source": "Result<Config, ConfigError>",
+                                    "resolved": null,
+                                    "extensions": {}
+                                }
+                            }
+                        ],
+                        "signatures": [
+                            {
+                                "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+                                "links": [
+                                    {
+                                        "range": {
+                                            "start": 42,
+                                            "end": 48
+                                        },
+                                        "symbol": "rift://symbol/rust/src/config.rs/Config"
+                                    }
+                                ],
+                                "language": {
+                                    "name": "rust",
+                                    "dialect": null
+                                },
+                                "receiver": null,
+                                "parameters": [
+                                    {
+                                        "name": "path",
+                                        "node": null,
+                                        "types": [
+                                            {
+                                                "role": "parameter",
+                                                "origin": "declared",
+                                                "type": {
+                                                    "language": {
+                                                        "name": "rust",
+                                                        "dialect": null
+                                                    },
+                                                    "source": "&Path",
+                                                    "resolved": null,
+                                                    "extensions": {}
+                                                }
+                                            }
+                                        ],
+                                        "optional": false,
+                                        "variadic": false,
+                                        "default": null,
+                                        "extensions": {}
+                                    }
+                                ],
+                                "returns": [
+                                    {
+                                        "role": "return",
+                                        "origin": "declared",
+                                        "type": {
+                                            "language": {
+                                                "name": "rust",
+                                                "dialect": null
+                                            },
+                                            "source": "Result<Config, ConfigError>",
+                                            "resolved": null,
+                                            "extensions": {}
+                                        }
+                                    }
+                                ],
+                                "type_parameters": [],
+                                "throws": [],
+                                "effects": [],
+                                "extensions": {}
+                            }
+                        ],
+                        "documentation": [
+                            {
+                                "format": "markdown",
+                                "text": "Loads the workspace configuration from `rift.toml`."
+                            }
+                        ],
+                        "extensions": {},
+                        "document_local": false
+                    }
+                },
+                "score": 0.9,
+                "matched_by": [
+                    "name"
+                ],
+                "relationships": null,
+                "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+                "diagnostics": null,
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 162,
+                        "end": 355
+                    }
+                },
+                "line": 10,
+                "path": "src/config.rs",
+                "traversal_path": null,
+                "distance": null
+            },
+            {
+                "hit": {
+                    "target": "file",
+                    "file": {
+                        "id": "rift://file/src/lib.rs",
+                        "content": {
+                            "kind": "regular",
+                            "size": 241,
+                            "executable": false
+                        },
+                        "languages": [
+                            {
+                                "name": "rust",
+                                "dialect": null
+                            }
+                        ],
+                        "regions": [],
+                        "semantic": true
+                    }
+                },
+                "score": 1.0,
+                "matched_by": [
+                    "content"
+                ],
+                "relationships": null,
+                "source": "    let config = load_config(&arguments.path)?;",
+                "diagnostics": null,
+                "span": {
+                    "unit": "rift://source/project/src/lib.rs",
+                    "range": {
+                        "start": 121,
+                        "end": 168
+                    }
+                },
+                "line": 7,
+                "path": "src/lib.rs",
+                "traversal_path": null,
+                "distance": null
+            }
+        ],
+        "pagination": {
+            "page_index": 0,
+            "total_pages": 3
+        },
+        "warnings": []
+    }
+]))]
 pub struct SearchResult {
     /// Coverage of the indexed candidate set used for this search. An empty result proves
     /// no match only where this is complete.
