@@ -18,6 +18,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::{Command, Stdio};
+use tokio::io::AsyncWriteExt as _;
 
 /// File name for the staged latest-release metadata response.
 const RELEASE_METADATA_FILE_NAME: &str = "latest.json";
@@ -222,27 +223,58 @@ impl ReleaseArtifact {
 }
 
 trait DownloadTransport {
-    fn download(&self, url: &str, destination: &Path, bytes_max: u64) -> Result<(), UpdateError>;
+    async fn download(
+        &self,
+        url: &str,
+        destination: &Path,
+        bytes_max: u64,
+    ) -> Result<(), UpdateError>;
 }
 
 trait UpdateSource {
-    fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError>;
-    fn stage(&self, directory: &Path, version: Version) -> Result<PathBuf, UpdateError>;
+    async fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError>;
+    async fn stage(&self, directory: &Path, version: Version) -> Result<PathBuf, UpdateError>;
 }
 
 trait Publisher {
-    fn publish(&self, current: &Path, candidate: &Path) -> Result<OldBinaryCleanup, UpdateError>;
+    async fn publish(
+        &self,
+        current: &Path,
+        candidate: &Path,
+    ) -> Result<OldBinaryCleanup, UpdateError>;
 }
 
 struct ReqwestTransport {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 struct GitHubReleaseSource<T> {
     transport: T,
 }
 struct AtomicPublisher;
 
-pub(super) fn update() -> Result<UpdateOutcome, UpdateError> {
+/// Replaces the current binary with the latest official release.
+///
+/// Release lookup and downloads run on the async HTTP client; checksum
+/// verification, extraction, and replacement are synchronous stages on the
+/// runtime's blocking pool.
+///
+/// # Errors
+///
+/// Returns an [`UpdateError`] carrying its registry code when the release
+/// lookup, download, checksum verification, extraction, or replacement
+/// fails.
+///
+/// # Cancel safety
+///
+/// Not cancel safe. Dropping the future mid-download stops the transfer and
+/// removes the staging directory with every partial file. Dropping it while
+/// a blocking stage runs detaches that stage, which completes on the
+/// blocking pool with its outcome unreported: verification and extraction
+/// then fail benignly against the removed staging directory, a Unix
+/// replacement publishes atomically or cleans its staged sibling, and a
+/// Windows replacement may leave sibling files that the next `rift update`
+/// run removes or reports.
+pub(super) async fn update() -> Result<UpdateOutcome, UpdateError> {
     let current = std::env::current_exe().map_err(locate_error)?;
     let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| version_error(env!("CARGO_PKG_VERSION"), &current, error))?;
@@ -254,16 +286,17 @@ pub(super) fn update() -> Result<UpdateOutcome, UpdateError> {
         &current,
         current_version,
     )
+    .await
 }
 
-fn update_with(
+async fn update_with(
     source: &impl UpdateSource,
     publisher: &impl Publisher,
     current_path: &Path,
     current_version: Version,
 ) -> Result<UpdateOutcome, UpdateError> {
-    let staging = tempfile::tempdir().map_err(staging_error)?;
-    let latest_version = source.latest_version(staging.path())?;
+    let staging = run_blocking(|| tempfile::tempdir().map_err(staging_error)).await?;
+    let latest_version = source.latest_version(staging.path()).await?;
     match latest_version.cmp(&current_version) {
         Ordering::Equal => Ok(UpdateOutcome::Current(current_version)),
         Ordering::Less => Ok(UpdateOutcome::Unreleased {
@@ -271,14 +304,33 @@ fn update_with(
             latest: latest_version,
         }),
         Ordering::Greater => {
-            let candidate = source.stage(staging.path(), latest_version.clone())?;
-            let cleanup = publisher.publish(current_path, &candidate)?;
+            let candidate = source.stage(staging.path(), latest_version.clone()).await?;
+            let cleanup = publisher.publish(current_path, &candidate).await?;
             Ok(UpdateOutcome::Updated {
                 from: current_version,
                 to: latest_version,
                 cleanup,
             })
         }
+    }
+}
+
+/// Runs one synchronous updater stage on the runtime's blocking pool.
+///
+/// A panic inside the stage resumes on the caller; the cancelled arm is
+/// unreachable because the runtime lives until `update` returns.
+async fn run_blocking<T: Send + 'static>(
+    stage: impl FnOnce() -> Result<T, UpdateError> + Send + 'static,
+) -> Result<T, UpdateError> {
+    match tokio::task::spawn_blocking(stage).await {
+        Ok(result) => result,
+        Err(join_error) if join_error.is_panic() => {
+            std::panic::resume_unwind(join_error.into_panic())
+        }
+        Err(join_error) => unreachable!(
+            "the updater's blocking stage is never cancelled: the runtime lives until update \
+             returns, join_error={join_error}"
+        ),
     }
 }
 
@@ -334,7 +386,7 @@ impl ReqwestTransport {
                 attempt.follow()
             }
         });
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .redirect(redirects)
             .timeout(RELEASE_DOWNLOAD_TIMEOUT)
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
@@ -346,13 +398,19 @@ impl ReqwestTransport {
 }
 
 impl DownloadTransport for ReqwestTransport {
-    fn download(&self, url: &str, destination: &Path, bytes_max: u64) -> Result<(), UpdateError> {
+    async fn download(
+        &self,
+        url: &str,
+        destination: &Path,
+        bytes_max: u64,
+    ) -> Result<(), UpdateError> {
         let mut response = self
             .client
             .get(url)
             .header(reqwest::header::ACCEPT, GITHUB_JSON_ACCEPT)
             .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(download_error)?;
         if response
             .content_length()
@@ -360,47 +418,101 @@ impl DownloadTransport for ReqwestTransport {
         {
             return Err(download_too_large(bytes_max));
         }
-        let mut output = fs::File::create(destination).map_err(download_error)?;
-        let copied = io::copy(
-            &mut response.by_ref().take(bytes_max_with_sentinel(bytes_max)),
-            &mut output,
-        )
-        .map_err(download_error)?;
-        if copied == 0 || copied > bytes_max {
+        let mut output = tokio::fs::File::create(destination)
+            .await
+            .map_err(download_error)?;
+        let received = write_bounded_body(&mut response, &mut output, bytes_max).await?;
+        if received == 0 || received > bytes_max {
             return Err(download_too_large(bytes_max));
         }
-        output.sync_all().map_err(download_error)?;
+        output.sync_all().await.map_err(download_error)?;
         Ok(())
     }
 }
 
+/// Streams a response body to `output`, counting at most one byte past `bytes_max`.
+///
+/// Reading stops at the sentinel ceiling, so an oversized body is detected
+/// without being drained or buffered whole.
+async fn write_bounded_body(
+    response: &mut reqwest::Response,
+    output: &mut tokio::fs::File,
+    bytes_max: u64,
+) -> Result<u64, UpdateError> {
+    let ceiling = bytes_max_with_sentinel(bytes_max);
+    let mut received = 0_u64;
+    while received < ceiling {
+        let Some(chunk) = response.chunk().await.map_err(download_error)? else {
+            break;
+        };
+        let kept = bytes_within_budget(chunk.len(), ceiling - received);
+        output
+            .write_all(&chunk[..kept])
+            .await
+            .map_err(download_error)?;
+        received = received.saturating_add(u64::try_from(kept).unwrap_or(u64::MAX));
+    }
+    Ok(received)
+}
+
+/// Bytes of one body chunk that fit within the remaining counted budget.
+fn bytes_within_budget(chunk_length: usize, budget: u64) -> usize {
+    usize::try_from(budget).map_or(chunk_length, |budget| chunk_length.min(budget))
+}
+
 impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
-    fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError> {
+    async fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError> {
         let metadata_path = directory.join(RELEASE_METADATA_FILE_NAME);
         self.transport
-            .download(RELEASE_API_URL, &metadata_path, RELEASE_METADATA_BYTES_MAX)?;
-        let bytes = fs::read(metadata_path).map_err(release_error)?;
-        let release: LatestRelease = serde_json::from_slice(&bytes).map_err(release_error)?;
-        parse_release_tag(&release.tag_name)
+            .download(RELEASE_API_URL, &metadata_path, RELEASE_METADATA_BYTES_MAX)
+            .await?;
+        let bytes = tokio::fs::read(&metadata_path)
+            .await
+            .map_err(release_error)?;
+        parse_release_metadata(&bytes)
     }
 
-    fn stage(&self, directory: &Path, version: Version) -> Result<PathBuf, UpdateError> {
+    async fn stage(&self, directory: &Path, version: Version) -> Result<PathBuf, UpdateError> {
         let artifact = ReleaseArtifact::new(version);
         let manifest_path = directory.join(&artifact.checksum_name);
         let archive_path = directory.join(&artifact.archive_name);
-        self.transport.download(
-            &artifact.download_url(&artifact.checksum_name),
-            &manifest_path,
-            CHECKSUM_MANIFEST_BYTES_MAX,
-        )?;
-        self.transport.download(
-            &artifact.download_url(&artifact.archive_name),
-            &archive_path,
-            RELEASE_ARCHIVE_BYTES_MAX,
-        )?;
-        verify_checksum(&archive_path, &manifest_path, &artifact.archive_name)?;
-        extract_candidate(&archive_path, directory, &artifact)
+        self.transport
+            .download(
+                &artifact.download_url(&artifact.checksum_name),
+                &manifest_path,
+                CHECKSUM_MANIFEST_BYTES_MAX,
+            )
+            .await?;
+        self.transport
+            .download(
+                &artifact.download_url(&artifact.archive_name),
+                &archive_path,
+                RELEASE_ARCHIVE_BYTES_MAX,
+            )
+            .await?;
+        let directory = directory.to_owned();
+        run_blocking(move || {
+            stage_verified_candidate(&archive_path, &manifest_path, &directory, &artifact)
+        })
+        .await
     }
+}
+
+/// Parses GitHub's latest-release document into a stable release version.
+fn parse_release_metadata(bytes: &[u8]) -> Result<Version, UpdateError> {
+    let release: LatestRelease = serde_json::from_slice(bytes).map_err(release_error)?;
+    parse_release_tag(&release.tag_name)
+}
+
+/// Verifies the archive checksum, then extracts and validates the binary candidate.
+fn stage_verified_candidate(
+    archive_path: &Path,
+    manifest_path: &Path,
+    directory: &Path,
+    artifact: &ReleaseArtifact,
+) -> Result<PathBuf, UpdateError> {
+    verify_checksum(archive_path, manifest_path, &artifact.archive_name)?;
+    extract_candidate(archive_path, directory, artifact)
 }
 
 fn parse_release_tag(tag: &str) -> Result<Version, UpdateError> {
@@ -712,8 +824,14 @@ fn archive_error(error: impl std::error::Error + Send + Sync + 'static) -> Updat
 }
 
 impl Publisher for AtomicPublisher {
-    fn publish(&self, current: &Path, candidate: &Path) -> Result<OldBinaryCleanup, UpdateError> {
-        publish_candidate(current, candidate)
+    async fn publish(
+        &self,
+        current: &Path,
+        candidate: &Path,
+    ) -> Result<OldBinaryCleanup, UpdateError> {
+        let current = current.to_owned();
+        let candidate = candidate.to_owned();
+        run_blocking(move || publish_candidate(&current, &candidate)).await
     }
 }
 
@@ -903,11 +1021,14 @@ mod tests {
     }
 
     impl UpdateSource for FakeSource {
-        fn latest_version(&self, _directory: &std::path::Path) -> Result<Version, UpdateError> {
+        async fn latest_version(
+            &self,
+            _directory: &std::path::Path,
+        ) -> Result<Version, UpdateError> {
             Ok(self.version.clone())
         }
 
-        fn stage(
+        async fn stage(
             &self,
             directory: &std::path::Path,
             _version: Version,
@@ -924,7 +1045,7 @@ mod tests {
     }
 
     impl Publisher for FakePublisher {
-        fn publish(
+        async fn publish(
             &self,
             _current: &std::path::Path,
             _candidate: &std::path::Path,
@@ -969,8 +1090,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn current_and_older_releases_never_stage() -> TestResult {
+    #[tokio::test]
+    async fn current_and_older_releases_never_stage() -> TestResult {
         let publisher = FakePublisher {
             calls: Cell::new(0),
         };
@@ -989,7 +1110,7 @@ mod tests {
                 version: version(latest),
                 stage_calls: Cell::new(0),
             };
-            let result = update_with(&source, &publisher, &current, version("0.0.2"))?;
+            let result = update_with(&source, &publisher, &current, version("0.0.2")).await?;
             assert_eq!(result, expected);
             assert_eq!(source.stage_calls.get(), 0);
         }
@@ -997,8 +1118,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn newer_release_stages_and_publishes_once() -> TestResult {
+    #[tokio::test]
+    async fn newer_release_stages_and_publishes_once() -> TestResult {
         let source = FakeSource {
             version: version("0.0.3"),
             stage_calls: Cell::new(0),
@@ -1011,7 +1132,8 @@ mod tests {
             &publisher,
             &std::env::current_exe()?,
             version("0.0.2"),
-        )?;
+        )
+        .await?;
         assert_eq!(
             outcome,
             UpdateOutcome::Updated {
@@ -1216,8 +1338,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn unix_publish_is_atomic_and_preserves_permissions() -> TestResult {
+    #[tokio::test]
+    async fn unix_publish_is_atomic_and_preserves_permissions() -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
@@ -1227,7 +1349,7 @@ mod tests {
         fs::write(&candidate, b"new")?;
         fs::set_permissions(&current, fs::Permissions::from_mode(0o751))?;
         assert_eq!(
-            AtomicPublisher.publish(&current, &candidate)?,
+            AtomicPublisher.publish(&current, &candidate).await?,
             OldBinaryCleanup::Unnecessary
         );
         assert_eq!(fs::read(&current)?, b"new");
@@ -1406,7 +1528,7 @@ mod tests {
     }
 
     impl super::DownloadTransport for FixtureTransport {
-        fn download(
+        async fn download(
             &self,
             url: &str,
             destination: &std::path::Path,
@@ -1428,8 +1550,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn github_source_propagates_download_failures() -> TestResult {
+    #[tokio::test]
+    async fn github_source_propagates_download_failures() -> TestResult {
         for (manifest, archive) in [(Vec::new(), b"x".to_vec()), (b"x".to_vec(), Vec::new())] {
             let staging = tempfile::tempdir()?;
             let source = super::GitHubReleaseSource {
@@ -1441,14 +1563,15 @@ mod tests {
             };
             let error = source
                 .stage(staging.path(), version("0.0.3"))
+                .await
                 .expect_err("unavailable release asset must fail");
             assert!(error.to_string().contains("release download failed"));
         }
         Ok(())
     }
 
-    #[test]
-    fn github_source_parses_latest_release_metadata() -> TestResult {
+    #[tokio::test]
+    async fn github_source_parses_latest_release_metadata() -> TestResult {
         let directory = tempfile::tempdir()?;
         let source = super::GitHubReleaseSource {
             transport: FixtureTransport {
@@ -1457,7 +1580,10 @@ mod tests {
                 archive: Vec::new(),
             },
         };
-        assert_eq!(source.latest_version(directory.path())?, version("0.0.3"));
+        assert_eq!(
+            source.latest_version(directory.path()).await?,
+            version("0.0.3")
+        );
 
         let source = super::GitHubReleaseSource {
             transport: FixtureTransport {
@@ -1468,6 +1594,7 @@ mod tests {
         };
         let error = source
             .latest_version(directory.path())
+            .await
             .expect_err("malformed metadata must fail");
         assert!(
             error
@@ -1478,8 +1605,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn github_source_stages_checksummed_candidate() -> TestResult {
+    #[tokio::test]
+    async fn github_source_stages_checksummed_candidate() -> TestResult {
         use sha2::{Digest as _, Sha256};
 
         let build = tempfile::tempdir()?;
@@ -1498,7 +1625,7 @@ mod tests {
                 archive: archive.clone(),
             },
         };
-        let candidate = source.stage(staging.path(), version("0.0.3"))?;
+        let candidate = source.stage(staging.path(), version("0.0.3")).await?;
         assert_eq!(fs::read(candidate)?, b"binary");
 
         let staging = tempfile::tempdir()?;
@@ -1511,6 +1638,7 @@ mod tests {
         };
         let error = source
             .stage(staging.path(), version("0.0.3"))
+            .await
             .expect_err("corrupted archive must fail");
         assert!(
             error
@@ -1521,8 +1649,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn unix_publish_reports_failing_operation_and_path() -> TestResult {
+    #[tokio::test]
+    async fn unix_publish_reports_failing_operation_and_path() -> TestResult {
         let directory = tempfile::tempdir()?;
         let current = directory.path().join("rift");
         fs::write(&current, b"old")?;
@@ -1530,6 +1658,7 @@ mod tests {
         let missing = directory.path().join("missing");
         let error = AtomicPublisher
             .publish(&current, &missing)
+            .await
             .expect_err("missing candidate must fail");
         assert!(error.to_string().contains("opening the downloaded binary"));
         assert!(error.to_string().contains("missing"));
@@ -1538,6 +1667,7 @@ mod tests {
         fs::write(&empty, [])?;
         let error = AtomicPublisher
             .publish(&current, &empty)
+            .await
             .expect_err("empty candidate must fail");
         assert!(
             error
@@ -1550,18 +1680,20 @@ mod tests {
         fs::write(&candidate, b"new")?;
         let error = AtomicPublisher
             .publish(&ghost, &candidate)
+            .await
             .expect_err("missing current binary must fail");
         assert!(error.to_string().contains("reading permissions of"));
 
         let error = AtomicPublisher
             .publish(std::path::Path::new("/"), &candidate)
+            .await
             .expect_err("rootless current path must fail");
         assert!(error.to_string().contains("has no parent directory"));
         Ok(())
     }
 
-    #[test]
-    fn transport_download_enforces_status_and_bounds() -> TestResult {
+    #[tokio::test]
+    async fn transport_download_enforces_status_and_bounds() -> TestResult {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
 
@@ -1570,6 +1702,8 @@ mod tests {
         let responses: Vec<Vec<u8>> = vec![
             b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\npayload".to_vec(),
             b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\npayload".to_vec(),
+            b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\npayload".to_vec(),
+            b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\nshort".to_vec(),
             b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
             b"HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                 .to_vec(),
@@ -1591,7 +1725,8 @@ mod tests {
             &format!("http://{address}/ok"),
             &destination,
             64,
-        )?;
+        )
+        .await?;
         assert_eq!(fs::read(&destination)?, b"payload");
 
         let error = super::DownloadTransport::download(
@@ -1600,8 +1735,29 @@ mod tests {
             &destination,
             3,
         )
+        .await
         .expect_err("oversized download must fail");
         assert!(error.to_string().contains("exceeded 3 bytes"));
+
+        let error = super::DownloadTransport::download(
+            &transport,
+            &format!("http://{address}/unsized"),
+            &destination,
+            3,
+        )
+        .await
+        .expect_err("unsized oversized body must stop at the counting ceiling");
+        assert!(error.to_string().contains("exceeded 3 bytes"));
+
+        let error = super::DownloadTransport::download(
+            &transport,
+            &format!("http://{address}/truncated"),
+            &destination,
+            256,
+        )
+        .await
+        .expect_err("body shorter than its declared length must fail");
+        assert!(error.to_string().contains("release download failed"));
 
         let error = super::DownloadTransport::download(
             &transport,
@@ -1609,6 +1765,7 @@ mod tests {
             &destination,
             64,
         )
+        .await
         .expect_err("missing asset must fail");
         assert!(error.to_string().contains("release download failed"));
 
@@ -1618,6 +1775,7 @@ mod tests {
             &destination,
             64,
         )
+        .await
         .expect_err("insecure redirect must stop with an empty body");
         assert!(error.to_string().contains("was empty or exceeded"));
 
@@ -1625,8 +1783,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn transport_follows_secure_redirects_within_hop_budget() -> TestResult {
+    #[tokio::test]
+    async fn transport_follows_secure_redirects_within_hop_budget() -> TestResult {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
 
@@ -1652,10 +1810,27 @@ mod tests {
             &destination,
             64,
         )
+        .await
         .expect_err("followed secure redirect must fail to connect");
         assert!(error.to_string().contains("release download failed"));
         server.join().expect("server thread must finish");
         Ok(())
+    }
+
+    #[test]
+    fn body_chunks_are_counted_within_budget() {
+        assert_eq!(super::bytes_within_budget(5, 3), 3);
+        assert_eq!(super::bytes_within_budget(5, 5), 5);
+        assert_eq!(super::bytes_within_budget(5, 9), 5);
+        assert_eq!(super::bytes_within_budget(0, 9), 0);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "fixture blocking panic")]
+    async fn blocking_stage_panics_resume_on_the_caller() {
+        let _ =
+            super::run_blocking(|| -> Result<(), UpdateError> { panic!("fixture blocking panic") })
+                .await;
     }
 
     #[cfg(unix)]

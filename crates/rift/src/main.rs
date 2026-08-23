@@ -147,6 +147,7 @@ async fn run(cli: Cli) -> Result<Option<CliOutcome>, CliError> {
             .map(|outcome| outcome.map(CliOutcome::Server))
             .map_err(CliError::Server),
         Some(CliCommand::Update) => update::update()
+            .await
             .map(CliOutcome::Update)
             .map(Some)
             .map_err(CliError::Update),
