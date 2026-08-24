@@ -28,6 +28,7 @@ EXPECTED_EDGES = {
     "rift-index -> rift-model",
     "rift-index -> rift-provider",
     "rift-index -> rift-syntax",
+    "rift-lsp -> rift-core",
     "rift-mcp -> rift-core",
     "rift-mcp -> rift-history",
     "rift-mcp -> rift-index",
@@ -102,11 +103,16 @@ def main() -> int:
         if "bin" in target["kind"]
     )
     # rift is the only released binary; rift-schema-export is the repo-internal
-    # generator that writes the served tool surface into docs/protocol.
-    if binaries != ["rift-mcp:rift-schema-export", "rift:rift"]:
+    # generator that writes the served tool surface into docs/protocol, and
+    # fake_engine is rift-lsp's scripted LSP engine for integration tests.
+    expected_binaries = [
+        "rift-lsp:fake_engine",
+        "rift-mcp:rift-schema-export",
+        "rift:rift",
+    ]
+    if binaries != expected_binaries:
         raise RuntimeError(
-            "expected exactly rift:rift and rift-mcp:rift-schema-export "
-            f"binary targets, got {binaries}"
+            f"expected exactly {expected_binaries} binary targets, got {binaries}"
         )
     return 0
 

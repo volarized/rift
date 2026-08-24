@@ -1,5 +1,6 @@
 //! Pure domain vocabulary and correctness primitives for Rift.
 
+mod capture;
 mod configuration;
 mod error;
 mod identity;
@@ -11,6 +12,7 @@ mod path;
 pub mod constants;
 pub mod line;
 
+pub use capture::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 pub use configuration::{SourceVisibility, TextFileInclusion};
 pub use error::{
     CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, LimitEvidence,
