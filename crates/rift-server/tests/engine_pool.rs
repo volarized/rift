@@ -3,7 +3,7 @@
 //! Every test resolves rift-lsp's `fake_engine` binary through an overlaid
 //! `PATH`, exactly as an operator's `[engines.<name>]` table would resolve
 //! a real engine. The fake engine's lifecycle log counts how many engine
-//! processes initialized and exited, so spawn-once, reuse, respawn, and
+//! processes initialized and exited, so spawn-once, reuse, restart, and
 //! shutdown are each proven by counting, never by timing.
 
 #![cfg(unix)]
@@ -17,6 +17,7 @@ use rift_core::ProjectPath;
 use rift_lsp::session::{EngineFault, EngineSession};
 use rift_protocol::configuration::{ByteSize, Duration, EngineConfiguration};
 use rift_protocol::read::Language;
+use rift_protocol::retry::{RestartPolicy, RetryPolicy};
 use rift_server::EnginePool;
 
 /// The directory holding the compiled `fake_engine` binary.
@@ -64,7 +65,18 @@ fn engine_table(behavior: &str, languages: &[&str], log: &Path) -> EngineConfigu
         startup_timeout: Duration::from_millis(10_000),
         request_timeout: Duration::from_millis(10_000),
         output_limit: ByteSize::from_bytes(4_096),
+        retry: RetryPolicy::default(),
+        restart: RestartPolicy::default(),
     }
+}
+
+/// The same table with its restart budget narrowed to `attempts`.
+fn restarting(mut table: EngineConfiguration, attempts: u64) -> EngineConfiguration {
+    table.restart = RestartPolicy {
+        attempts,
+        ..RestartPolicy::default()
+    };
+    table
 }
 
 fn pool_of(workspace: &Path, entries: Vec<(&str, EngineConfiguration)>) -> EnginePool {
@@ -159,12 +171,15 @@ async fn first_request_spawns_and_later_requests_reuse_one_session() {
 }
 
 #[tokio::test]
-async fn dead_engine_is_respawned_once_and_a_second_death_surfaces() {
+async fn dead_engine_is_restarted_within_the_budget_and_a_death_past_it_surfaces() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let log = workspace.path().join("lifecycle.log");
     let pool = pool_of(
         workspace.path(),
-        vec![("fake", engine_table("dies-on-command", &["rust"], &log))],
+        vec![(
+            "fake",
+            restarting(engine_table("dies-on-command", &["rust"], &log), 1),
+        )],
     );
     let error = rename_through(&pool, "rust", "die")
         .await
@@ -176,21 +191,228 @@ async fn dead_engine_is_respawned_once_and_a_second_death_surfaces() {
     assert_eq!(
         recorded(&log, "initialize"),
         2,
-        "the request spawned once and respawned exactly once"
-    );
-    rename_through(&pool, "rust", "renamed")
-        .await
-        .expect("the next request replaces the dead engine and serves");
-    assert_eq!(
-        recorded(&log, "initialize"),
-        3,
-        "the later request respawned the dead engine once"
+        "the request started one engine and restarted it once"
     );
     pool.shutdown().await;
 }
 
+/// A budget spent inside its window refuses the next request's start.
+///
+/// The one-restart budget is spent by the first request's crash loop, so
+/// the second request finds no engine and no budget to start one: it
+/// surfaces `temporarily_unavailable` without adding a lifecycle line.
 #[tokio::test]
-async fn refusal_leaves_the_engine_serving_without_a_respawn() {
+async fn restart_budget_spent_inside_the_window_refuses_the_next_start() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let pool = pool_of(
+        workspace.path(),
+        vec![(
+            "fake",
+            restarting(engine_table("dies-on-command", &["rust"], &log), 1),
+        )],
+    );
+    rename_through(&pool, "rust", "die")
+        .await
+        .expect_err("the engine dies on both attempts");
+    assert_eq!(recorded(&log, "initialize"), 2);
+    let refused = rename_through(&pool, "rust", "renamed")
+        .await
+        .expect_err("the spent budget refuses another start");
+    assert!(
+        matches!(refused.fault(), EngineFault::Ended),
+        "unexpected fault {:?}",
+        refused.fault()
+    );
+    assert_eq!(
+        recorded(&log, "initialize"),
+        2,
+        "a refused claim starts no engine"
+    );
+    pool.shutdown().await;
+}
+
+/// An engine that stopped answering is restarted, not merely reported.
+///
+/// The `deaf` behavior completes its handshake and then reads nothing, so
+/// the rename overstays the one-second request bound and the session ends
+/// itself. The one-restart budget carries exactly one replacement, which
+/// goes deaf the same way, and the timeout surfaces.
+#[tokio::test]
+async fn engine_that_stopped_answering_is_restarted_within_the_budget() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let mut deaf = restarting(engine_table("deaf", &["rust"], &log), 1);
+    deaf.request_timeout = Duration::from_millis(1_000);
+    let pool = pool_of(workspace.path(), vec![("fake", deaf)]);
+    let error = rename_through(&pool, "rust", "renamed")
+        .await
+        .expect_err("neither engine answers");
+    assert!(
+        matches!(error.fault(), EngineFault::TimedOut { .. }),
+        "unexpected fault {:?}",
+        error.fault()
+    );
+    assert_eq!(
+        recorded(&log, "initialize"),
+        2,
+        "the timed-out engine was replaced once"
+    );
+    pool.shutdown().await;
+}
+
+/// A start that never succeeds spends the budget like any other restart.
+///
+/// The program resolves through no `PATH` entry, so every start fails
+/// before a process exists. The first request spends its one restart on a
+/// second failed start; the second request has none left and surfaces
+/// `temporarily_unavailable` instead of trying again.
+#[tokio::test]
+async fn failed_starts_spend_the_restart_budget() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let mut absent = restarting(engine_table("happy", &["rust"], &log), 1);
+    absent.program = "rift_absent_engine".to_owned();
+    let pool = pool_of(workspace.path(), vec![("fake", absent)]);
+    let error = rename_through(&pool, "rust", "renamed")
+        .await
+        .expect_err("the program cannot be started");
+    assert!(
+        matches!(error.fault(), EngineFault::LaunchFailed { .. }),
+        "unexpected fault {:?}",
+        error.fault()
+    );
+    let refused = rename_through(&pool, "rust", "renamed")
+        .await
+        .expect_err("the spent budget refuses another start");
+    assert!(
+        matches!(refused.fault(), EngineFault::Ended),
+        "unexpected fault {:?}",
+        refused.fault()
+    );
+}
+
+/// A restart that left the window stops counting against the budget.
+///
+/// The clock is paused, so the window passes without the test waiting for
+/// it. This engine's program resolves nowhere, so no child process is ever
+/// created and the paused clock drives the whole test: a runtime with its
+/// time frozen auto-advances whenever it is idle, and an idle wait on a
+/// real engine's pipes would jump straight onto that engine's own request
+/// bound. The answer is what proves the window: a spent budget refuses
+/// with `Ended`, and once the earlier restart has left the window the same
+/// request reaches the start again and reports the start's own failure.
+#[tokio::test(start_paused = true)]
+async fn restart_budget_frees_once_its_window_passes() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let mut absent = restarting(engine_table("happy", &["rust"], &log), 1);
+    absent.program = "rift_absent_engine".to_owned();
+    absent.restart.window = Duration::from_millis(1_000);
+    let pool = pool_of(workspace.path(), vec![("fake", absent)]);
+    let failed = rename_through(&pool, "rust", "renamed")
+        .await
+        .expect_err("the program cannot be started");
+    assert!(matches!(failed.fault(), EngineFault::LaunchFailed { .. }));
+    let refused = rename_through(&pool, "rust", "renamed")
+        .await
+        .expect_err("the spent budget refuses another start");
+    assert!(
+        matches!(refused.fault(), EngineFault::Ended),
+        "unexpected fault {:?}",
+        refused.fault()
+    );
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let freed = rename_through(&pool, "rust", "renamed")
+        .await
+        .expect_err("the program still cannot be started");
+    assert!(
+        matches!(freed.fault(), EngineFault::LaunchFailed { .. }),
+        "the freed budget must reach the start again, not refuse: {:?}",
+        freed.fault()
+    );
+}
+
+/// A configuration fault surfaces at once instead of restarting.
+///
+/// An absolute program is refused before any process exists and answers
+/// the same way every time, so the pool never restarts past it. The
+/// one-restart budget makes that countable: a request that did restart
+/// would spend the whole budget on its own, leaving the second request
+/// nothing and turning its answer into `temporarily_unavailable`.
+#[tokio::test]
+async fn a_configuration_fault_surfaces_without_restarting() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let mut absolute = restarting(engine_table("happy", &["rust"], &log), 1);
+    absolute.program = "/usr/bin/rift_absent_engine".to_owned();
+    let pool = pool_of(workspace.path(), vec![("fake", absolute)]);
+    for _ in 0..2 {
+        let error = rename_through(&pool, "rust", "renamed")
+            .await
+            .expect_err("the program is refused");
+        assert!(
+            matches!(error.fault(), EngineFault::ProgramAbsolute { .. }),
+            "unexpected fault {:?}",
+            error.fault()
+        );
+    }
+}
+
+/// One slot's held lock never stalls another engine.
+///
+/// Each slot owns its own lock over its own session and restart budget, so
+/// a request that waits inside one slot - on a spawn, on a restart, on a
+/// wait an operation takes between its own attempts - leaves every other
+/// slot free. The gated engine parks inside its start, holding its slot's
+/// lock for the whole test; the second engine serves anyway, and the first
+/// completes once its gate opens.
+#[tokio::test]
+async fn a_request_held_in_one_slot_leaves_other_engines_serving() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let gate = workspace.path().join("start.gate");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&gate)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "mkfifo must create the gate");
+    let mut gated = engine_table("happy", &["rust"], &log);
+    gated.environment.insert(
+        "RIFT_FAKE_ENGINE_START_GATE".to_owned(),
+        gate.display().to_string(),
+    );
+    let pool = Arc::new(pool_of(
+        workspace.path(),
+        vec![
+            ("gated", gated),
+            ("free", engine_table("happy", &["python"], &log)),
+        ],
+    ));
+    let (issued_sender, mut issued) = tokio::sync::mpsc::channel::<()>(1);
+    let held = tokio::spawn({
+        let pool = Arc::clone(&pool);
+        async move {
+            issued_sender.send(()).await.expect("the test listens");
+            rename_through(&pool, "rust", "renamed").await
+        }
+    });
+    issued.recv().await.expect("the held request was issued");
+    rename_through(&pool, "python", "renamed")
+        .await
+        .expect("the second engine serves while the first slot is held");
+    tokio::task::spawn_blocking(move || std::fs::write(&gate, b"go"))
+        .await
+        .expect("the gate writer joins")
+        .expect("the gate opens");
+    held.await
+        .expect("the held task joins")
+        .expect("the released request serves");
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn refusal_leaves_the_engine_serving_without_a_restart() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let log = workspace.path().join("lifecycle.log");
     let pool = pool_of(
@@ -219,7 +441,7 @@ async fn refusal_leaves_the_engine_serving_without_a_respawn() {
     assert_eq!(
         recorded(&log, "initialize"),
         1,
-        "a refusal never respawns the engine"
+        "a refusal never restarts the engine"
     );
     pool.shutdown().await;
 }

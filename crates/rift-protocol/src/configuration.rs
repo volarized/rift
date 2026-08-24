@@ -10,6 +10,11 @@ use std::collections::BTreeMap;
 
 use crate::lock::{SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN};
 use crate::read::{CoverageScope, ProjectPath};
+use crate::retry::{
+    RESTART_ATTEMPTS_MAX, RESTART_ATTEMPTS_MIN, RESTART_WINDOW_MS_MAX, RESTART_WINDOW_MS_MIN,
+    RETRY_ATTEMPTS_MAX, RETRY_ATTEMPTS_MIN, RETRY_DELAY_LIMIT_MS_MAX, RETRY_DELAY_LIMIT_MS_MIN,
+    RETRY_DELAY_MS_MAX, RETRY_DELAY_MS_MIN, RestartPolicy, RetryPolicy,
+};
 use crate::source::SourceConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
@@ -1001,6 +1006,14 @@ pub struct EngineConfiguration {
     /// full size is still reported.
     #[serde(default = "default_engine_output_limit")]
     pub output_limit: ByteSize,
+    /// How a refusal this engine invites again is resent: the attempt
+    /// bound and the growing wait between attempts.
+    #[serde(default)]
+    pub retry: RetryPolicy,
+    /// How often Rift replaces this engine on its own, and over what
+    /// window; the budget spent, the engine's own failure surfaces.
+    #[serde(default)]
+    pub restart: RestartPolicy,
 }
 
 fn default_engine_startup_timeout() -> Duration {
@@ -1453,6 +1466,50 @@ fn engine_violation(name: &str, engine: &EngineConfiguration) -> Option<Configur
         .or_else(|| engine_languages_violation(name, engine))
         .or_else(|| engine_options_violation(name, engine))
         .or_else(|| engine_bounds_violation(engine))
+        .or_else(|| engine_retry_violation(&engine.retry))
+        .or_else(|| engine_restart_violation(&engine.restart))
+}
+
+/// The bounds one engine's `[retry]` table carries, in key order.
+fn engine_retry_violation(retry: &RetryPolicy) -> Option<ConfigurationViolation> {
+    first_out_of_range([
+        (
+            "engines.retry.attempts",
+            retry.attempts,
+            RETRY_ATTEMPTS_MIN,
+            RETRY_ATTEMPTS_MAX,
+        ),
+        (
+            "engines.retry.delay",
+            retry.delay.milliseconds(),
+            RETRY_DELAY_MS_MIN,
+            RETRY_DELAY_MS_MAX,
+        ),
+        (
+            "engines.retry.delay_limit",
+            retry.delay_limit.milliseconds(),
+            RETRY_DELAY_LIMIT_MS_MIN,
+            RETRY_DELAY_LIMIT_MS_MAX,
+        ),
+    ])
+}
+
+/// The bounds one engine's `[restart]` table carries, in key order.
+fn engine_restart_violation(restart: &RestartPolicy) -> Option<ConfigurationViolation> {
+    first_out_of_range([
+        (
+            "engines.restart.attempts",
+            restart.attempts,
+            RESTART_ATTEMPTS_MIN,
+            RESTART_ATTEMPTS_MAX,
+        ),
+        (
+            "engines.restart.window",
+            restart.window.milliseconds(),
+            RESTART_WINDOW_MS_MIN,
+            RESTART_WINDOW_MS_MAX,
+        ),
+    ])
 }
 
 /// The rules on what the engine runs: a present, non-absolute program.
@@ -1616,6 +1673,8 @@ mod tests {
             startup_timeout: Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_DEFAULT),
             request_timeout: Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_DEFAULT),
             output_limit: ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_DEFAULT),
+            retry: RetryPolicy::default(),
+            restart: RestartPolicy::default(),
         }
     }
 
@@ -2624,7 +2683,36 @@ mod tests {
             engine.output_limit,
             ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_DEFAULT)
         );
+        assert_eq!(engine.retry, RetryPolicy::default());
+        assert_eq!(engine.restart, RestartPolicy::default());
         assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_engine_retry_and_restart_tables_decode_key_by_key() {
+        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
+            "engines": { "ty": {
+                "program": "uvx",
+                "languages": ["python"],
+                "retry": { "attempts": 3, "delay": "1s" },
+                "restart": { "attempts": 0 },
+            } }
+        }))
+        .expect("the nested tables must deserialize");
+        let engine = &configuration.engines["ty"];
+        assert_eq!(engine.retry.attempts, 3);
+        assert_eq!(engine.retry.delay, Duration::from_millis(1_000));
+        assert_eq!(
+            engine.retry.delay_limit,
+            RetryPolicy::default().delay_limit,
+            "an absent key inside the table keeps its own default"
+        );
+        assert_eq!(engine.restart.attempts, 0);
+        assert_eq!(engine.restart.window, RestartPolicy::default().window);
+        assert_eq!(configuration.validate(), Ok(()));
+        let value = serde_json::to_value(&configuration).expect("serialize");
+        assert_eq!(value["engines"]["ty"]["retry"]["delay"], json!("1s"));
+        assert_eq!(value["engines"]["ty"]["restart"]["window"], json!("5m"));
     }
 
     #[test]
@@ -2893,6 +2981,87 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_retry_and_restart_bounds_are_enforced() {
+        let break_and_expect: [EngineBoundCase; 6] = [
+            (
+                |engine| engine.retry.attempts = RETRY_ATTEMPTS_MIN - 1,
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.retry.attempts",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| engine.retry.attempts = RETRY_ATTEMPTS_MAX + 1,
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.retry.attempts",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| engine.retry.delay = Duration::from_millis(RETRY_DELAY_MS_MIN - 1),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.retry.delay",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| {
+                    engine.retry.delay_limit = Duration::from_millis(RETRY_DELAY_LIMIT_MS_MAX + 1);
+                },
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.retry.delay_limit",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| engine.restart.attempts = RESTART_ATTEMPTS_MAX + 1,
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.restart.attempts",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| engine.restart.window = Duration::from_millis(RESTART_WINDOW_MS_MIN - 1),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.restart.window",
+                            ..
+                        }
+                    )
+                },
+            ),
+        ];
+        assert_engines_refused(break_and_expect);
+    }
+
+    #[test]
     fn test_engine_bounds_accept_their_edges() {
         let mut edged = engine();
         edged.arguments = vec!["x".repeat(ENGINE_ARGUMENT_BYTES_MAX); ENGINE_ARGUMENTS_MAX];
@@ -2905,6 +3074,15 @@ mod tests {
         edged.startup_timeout = Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MAX);
         edged.request_timeout = Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MIN);
         edged.output_limit = ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MAX);
+        edged.retry = RetryPolicy {
+            attempts: RETRY_ATTEMPTS_MAX,
+            delay: Duration::from_millis(RETRY_DELAY_MS_MIN),
+            delay_limit: Duration::from_millis(RETRY_DELAY_LIMIT_MS_MAX),
+        };
+        edged.restart = RestartPolicy {
+            attempts: RESTART_ATTEMPTS_MIN,
+            window: Duration::from_millis(RESTART_WINDOW_MS_MAX),
+        };
         assert_eq!(engines(vec![("ty", edged)]).validate(), Ok(()));
     }
 

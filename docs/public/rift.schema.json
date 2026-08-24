@@ -255,6 +255,23 @@
             "min": "1s"
           }
         },
+        "restart": {
+          "$ref": "#/$defs/RestartPolicy",
+          "default": {
+            "attempts": 3,
+            "window": "5m"
+          },
+          "description": "How often Rift replaces this engine on its own, and over what\nwindow; the budget spent, the engine's own failure surfaces."
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy",
+          "default": {
+            "attempts": 8,
+            "delay": "250ms",
+            "delay_limit": "2s"
+          },
+          "description": "How a refusal this engine invites again is resent: the attempt\nbound and the growing wait between attempts."
+        },
         "startup_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30s",
@@ -491,6 +508,63 @@
             "max_revisions": 500
           },
           "description": "The history provider's budget."
+        }
+      },
+      "type": "object"
+    },
+    "RestartPolicy": {
+      "additionalProperties": false,
+      "description": "How often Rift may replace one language engine on its own, and over\nwhat window.\n\nA restart is any start after the first: the first is the start, and\nevery start that follows it replaces an engine that ended, failed to\nstart, or stopped answering. A restart older than `window` no longer\ncounts, so a workspace whose engine dies once a day keeps its full\nbudget while a crash-looping one spends it and stops.",
+      "properties": {
+        "attempts": {
+          "default": 3,
+          "description": "Restarts allowed inside one window, 0 to 16. Zero never restarts.",
+          "format": "uint64",
+          "maximum": 16,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "$ref": "#/$defs/Duration",
+          "default": "5m",
+          "description": "Span the restarts are counted over, 1s to 1d.",
+          "rift:range": {
+            "max": "1d",
+            "min": "1s"
+          }
+        }
+      },
+      "type": "object"
+    },
+    "RetryPolicy": {
+      "additionalProperties": false,
+      "description": "How often one failed operation is attempted again, and how the waits\nbetween attempts grow.\n\nAttempts are numbered from one and the first is counted, so\n`attempts = 1` never resends. Each wait is twice the one before it,\nheld at `delay_limit`; a `delay_limit` below `delay` therefore holds\nevery wait at `delay_limit`.\n\nThe waits carry no jitter. Jitter spreads a set of independent retriers\napart so they stop arriving together; requests to one language engine\nserialize on that engine's own slot, so there is never such a set, and\nthe sequence stays a function of the attempt number alone.",
+      "properties": {
+        "attempts": {
+          "default": 8,
+          "description": "Attempts one operation takes, the first counted, 1 to 64.",
+          "format": "uint64",
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "delay": {
+          "$ref": "#/$defs/Duration",
+          "default": "250ms",
+          "description": "Wait before the second attempt, 1ms to 1m. Every later wait\ndoubles the one before it.",
+          "rift:range": {
+            "max": "1m",
+            "min": "1ms"
+          }
+        },
+        "delay_limit": {
+          "$ref": "#/$defs/Duration",
+          "default": "2s",
+          "description": "Longest wait between two attempts, 1ms to 10m.",
+          "rift:range": {
+            "max": "10m",
+            "min": "1ms"
+          }
         }
       },
       "type": "object"
