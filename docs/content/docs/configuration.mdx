@@ -208,6 +208,15 @@ environment = {}
 startup_timeout = "30s"
 request_timeout = "1m"
 output_limit = "4kb"
+
+[engines.rust.retry]
+attempts = 8
+delay = "250ms"
+delay_limit = "2s"
+
+[engines.rust.restart]
+attempts = 3
+window = "5m"
 ```
 
 `program` and `languages` have no default, `initialization_options` is absent unless you write
@@ -226,10 +235,36 @@ it, and the other keys are shown at theirs.
 - `request_timeout` - bounds each later request, 1s to 10m
 - `output_limit` - bytes of the engine's standard error Rift keeps, 1kb to 8mb; Rift still
   reports the full size, so you can tell a truncated log from a short one
+- `retry.attempts` - times one request is asked before Rift gives up on it, the first ask
+  counted, 1 to 64; `1` never asks twice
+- `retry.delay` - the wait before the second ask, 1ms to 1m; every later wait doubles the one
+  before it
+- `retry.delay_limit` - the longest wait between two asks, 1ms to 10m; the doubling stops here
+- `restart.attempts` - engines Rift starts to replace a failed one inside `restart.window`, 0
+  to 16; `0` never replaces one
+- `restart.window` - the span those restarts are counted over, 1s to 1d
 
 The table holds at most 16 engines. The server starts one on the first request for a language it
 serves and keeps the session across later requests, because a language server pays for its
 project load once and answers from it afterwards.
+
+A language server may decline a request it is already serving, or report that the file moved
+under it while it was answering. LSP asks the client to send such a request again, so Rift does,
+under `retry`: the waits grow from `delay` and stop growing at `delay_limit`, which keeps the
+resends off an engine that is busy re-analyzing your project. At the defaults a request waits at
+most 9.75s across its eight asks. Once the attempts run out Rift degrades honestly - the change
+it was gathering diagnostics for has already applied, and the summary carries one warning naming
+the engine. A refusal the engine did not invite again - it disagrees with the new name, it has
+no such capability - is never resent.
+
+`restart` bounds what Rift does when the engine itself fails: one that ended, that could not be
+started, or that stopped answering is replaced automatically, and the replacement serves the
+request. Each replacement spends one of `restart.attempts`, and a replacement older than
+`restart.window` stops counting, so an engine that dies once a week never runs out. An engine
+that crash-loops does: once the budget is spent, requests for its languages fail
+`temporarily_unavailable` until the window passes, instead of starting a process that dies
+again. The first engine a workspace starts is the start, not a replacement, and a refused
+`program` - empty, or an absolute path - is reported at once rather than started again.
 
 A `languages` entry is a language identity segment: a bare name such as `rust`, or
 `name:dialect` to pin one dialect. Segments are how a symbol address spells its language, and a
