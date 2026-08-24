@@ -123,11 +123,20 @@ async fn applied_move_with_an_engine_rewrites_the_referencing_file() -> TestResu
     Ok(())
 }
 
+/// An engine that has announced its work and then proposes nothing is
+/// taken at its word: the move lands, the engine was asked once, and
+/// nothing warns.
 #[tokio::test]
-async fn null_proposal_moves_the_file_without_a_warning() -> TestResult {
+async fn null_proposal_from_an_announced_engine_moves_without_a_warning() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
     let (directory, client, server_task) = served_workspace(
         &[("hub.rs", HUB)],
-        Some(engine_configuration("moves-null", "20s")),
+        Some(counted(
+            &engine_configuration("announces-then-answers-nothing", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
     )
     .await?;
 
@@ -135,9 +144,105 @@ async fn null_proposal_moves_the_file_without_a_warning() -> TestResult {
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert!(
         move_warnings(&structured).is_empty(),
-        "a consulted engine that proposes nothing is not a skip: {structured:#}"
+        "an engine that announced its work is believed when it proposes nothing: {structured:#}"
+    );
+    assert_eq!(
+        recorded(&log, "will-rename"),
+        1,
+        "an announced engine's answer is settled, so it is asked once"
     );
     assert_eq!(fs::read_to_string(directory.path().join("spoke.rs"))?, HUB);
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The first request of a session races the engine's first announcement:
+/// an engine that has not read the file yet answers the will-rename with
+/// no edit, which is what an engine with nothing to update answers too.
+/// The server asks once more, and the imports the second answer carries
+/// land with the move.
+#[tokio::test]
+async fn a_first_empty_proposal_is_asked_again_and_the_imports_land() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("hub.rs", HUB), ("main.rs", CALLER)],
+        Some(counted(
+            &engine_configuration("moves-null-then-imports", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert!(
+        move_warnings(&structured).is_empty(),
+        "the resent request carried the updates: {structured:#}"
+    );
+    assert_eq!(
+        recorded(&log, "will-rename"),
+        2,
+        "the empty answer was discarded and the engine asked again"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("main.rs"))?,
+        "mod spoke;\n",
+        "the reference the second answer proposed was rewritten"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("spoke.rs"))?,
+        "pub fn spoke() {}\n// spoke module\n"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// An engine that answers nothing twice has said what it has to say. The
+/// move lands, the engine was asked exactly twice, and the summary carries
+/// the references-not-updated warning: this engine has never announced any
+/// work, so its silence is not proof that nothing needed updating.
+#[tokio::test]
+async fn a_second_empty_proposal_moves_the_file_with_the_warning() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("hub.rs", HUB), ("main.rs", CALLER)],
+        Some(counted(
+            &engine_configuration("moves-null", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let warnings = move_warnings(&structured);
+    assert_eq!(warnings.len(), 1, "{structured:#}");
+    assert!(
+        warnings[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("has announced no work of its own"),
+        "the warning names what the engine never did: {structured:#}"
+    );
+    assert_eq!(
+        recorded(&log, "will-rename"),
+        2,
+        "one resend, and only one, however many attempts the table allows"
+    );
+    assert_eq!(fs::read_to_string(directory.path().join("spoke.rs"))?, HUB);
+    assert_eq!(
+        fs::read_to_string(directory.path().join("main.rs"))?,
+        CALLER,
+        "the references stay as they were, which is what the warning says"
+    );
 
     client.cancel().await?;
     server_task.await?;

@@ -428,6 +428,50 @@ async fn a_pull_answered_mid_analysis_waits_for_the_settled_findings() -> TestRe
     Ok(())
 }
 
+/// The first pull of a session races the engine's first announcement: an
+/// engine that has not analyzed the document yet reports nothing, which is
+/// what a clean document reports too, and it has announced no work to wait
+/// on. The server pulls once more, and the finding the second pull carried
+/// rides the change.
+#[tokio::test]
+async fn a_first_empty_report_is_pulled_again_before_the_change_reports_clean() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (_directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(counted(
+            &engine_configuration("pulls-empty-then-reports", "20s"),
+            &log,
+            CONFIGURED_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, replace_request("pub fn beacon() -> u8 { 7 }")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let findings = engine_findings(&structured);
+    assert_eq!(findings.len(), 1, "{structured:#}");
+    assert_eq!(
+        findings[0]["message"],
+        json!("settled finding"),
+        "the second pull is the one whose findings ride: {structured:#}"
+    );
+    assert!(
+        analyzing_warnings(&structured).is_empty(),
+        "an engine that answered inside its budget never warns: {structured:#}"
+    );
+    assert_eq!(
+        recorded(&log, "diagnostic"),
+        2,
+        "the empty report was discarded and the document pulled again"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// An engine that never stops analyzing spends the whole attempt bound and
 /// then says so. The change already landed, so the summary carries a
 /// warning and no error, and the empty report the engine kept giving never

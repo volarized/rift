@@ -121,6 +121,8 @@ struct EngineState {
     opened: HashMap<String, String>,
     /// Diagnostic pulls answered so far, counting the one in flight.
     diagnostic_pulls: usize,
+    /// Will-rename requests answered so far, counting the one in flight.
+    will_renames: usize,
 }
 
 /// Reads frames and dispatches until stdin closes or the script exits.
@@ -216,9 +218,12 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
 /// how many times the engine was asked. The default answer is an edit set
 /// holding no edit, which says exactly what a `null` answer says;
 /// `announces-then-answers-nothing` ends the work it announced before
-/// giving that same nothing, so its silence is its own verdict.
-fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
+/// giving that same nothing, so its silence is its own verdict, and
+/// `moves-null-then-imports` answers nothing first and the stem rename on
+/// the request after it.
+fn answer_will_rename(behavior: &str, message: &Value, state: &mut EngineState) {
     record_lifecycle("will-rename");
+    state.will_renames += 1;
     let id = &message["id"];
     match behavior {
         "parks-on-move" => park(),
@@ -227,6 +232,7 @@ fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
             end_progress();
             respond(id, &Value::Null);
         }
+        "moves-null-then-imports" if state.will_renames == 1 => respond(id, &Value::Null),
         "moves-outside-root" => {
             let edit = json!({"range": zero_range(), "newText": "moved"});
             respond(
@@ -234,7 +240,9 @@ fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
                 &json!({"changes": {"file:///rift-elsewhere/out.rs": [edit]}}),
             );
         }
-        "moves-imports" => respond(id, &stem_rename_answer(message, state)),
+        "moves-imports" | "moves-null-then-imports" => {
+            respond(id, &stem_rename_answer(message, state));
+        }
         _ => {
             let new_uri = message["params"]["files"][0]["newUri"].clone();
             respond(

@@ -24,7 +24,7 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource, registry};
 use sha2::{Digest as _, Sha256};
 
-use crate::move_file::{MovePlan, skip_diagnostic};
+use crate::move_file::MovePlan;
 use crate::patch::{self, FileRewrite, RewriteKind};
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id, node_witness};
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
@@ -415,9 +415,9 @@ impl ChangeService {
         rewrites.sort_by(|first, second| first.path.as_str().cmp(second.path.as_str()));
         let mut result = self.apply_rewrites(reads, &rewrites)?;
         if let ChangeResult::Applied { summary } = &mut result
-            && let Some(skip) = &plan.engine_skip
+            && let Some(reason) = &plan.references_not_updated
         {
-            summary.diagnostics.push(skip_diagnostic(skip));
+            summary.diagnostics.push(reason.diagnostic());
         }
         Ok(result)
     }
@@ -2340,13 +2340,14 @@ mod tests {
     }
 
     /// A move plan over the fixture's `old/hub.rs`, with an optional
-    /// reference rewrite and an optional engine skip.
+    /// reference rewrite and an optional reason its references were not
+    /// updated.
     fn move_plan(
         from: &str,
         to: &str,
         moved: (&str, &str),
         rewrites: Vec<(&str, &str, &str)>,
-        engine_skip: Option<crate::move_file::EngineSkip>,
+        references_not_updated: Option<crate::move_file::ReferencesNotUpdated>,
     ) -> crate::move_file::MovePlan {
         crate::move_file::MovePlan {
             from: CoreProjectPath::new(from).expect("fixture path is valid"),
@@ -2363,7 +2364,7 @@ mod tests {
                     },
                 )
                 .collect(),
-            engine_skip,
+            references_not_updated,
         }
     }
 
@@ -2416,7 +2417,7 @@ mod tests {
     fn apply_move_into_a_new_directory_creates_its_parents() -> TestResult {
         let hub = "pub fn hub() {}\n";
         let (directory, reads, changes) = multi_file_fixture(&[("hub.rs", hub)])?;
-        let skip = crate::move_file::EngineSkip::NoEngine {
+        let reason = crate::move_file::ReferencesNotUpdated::NoEngine {
             language_segment: "rust".to_owned(),
         };
         let plan = move_plan(
@@ -2424,7 +2425,7 @@ mod tests {
             "nested/deep/hub.rs",
             (hub, hub),
             vec![],
-            Some(skip),
+            Some(reason),
         );
         let summary = applied_summary(changes.apply_move(&reads, &plan)?);
         let warning = summary
