@@ -29,6 +29,7 @@
 //! pool.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -234,6 +235,9 @@ impl EngineSlot {
     /// The operation runs again, unchanged, for every attempt: one that
     /// opens a document opens it again on the next attempt.
     ///
+    /// The operation returns a boxed future borrowing the session, the one
+    /// shape that lets callers state the future's `Send` bound.
+    ///
     /// The slot's lock is held for the whole call, so operations against
     /// one engine serialize. Three outcomes send the operation back:
     ///
@@ -286,7 +290,11 @@ impl EngineSlot {
     /// session to discard later, as the session documents.
     pub async fn request<T>(
         &self,
-        mut operation: impl AsyncFnMut(&mut EngineSession) -> Result<T, EngineError>,
+        mut operation: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<T, EngineError>> + Send + 'session>,
+        >,
     ) -> Result<T, EngineError> {
         let retry = self.configuration.retry;
         let mut held = self.state.lock().await;

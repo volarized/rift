@@ -6,8 +6,9 @@
 //! process is test scaffolding: it never ships and may end abruptly by
 //! script.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, StdinLock, Write};
+use std::path::PathBuf;
 
 use lsp_types::error_codes::SERVER_CANCELLED;
 use rift_lsp::framing::{Framing, MESSAGE_BYTES_MAX};
@@ -18,6 +19,12 @@ const READ_BYTES: usize = 8 << 10;
 
 /// Bytes of standard error the flooding behavior writes.
 const FLOOD_BYTES: usize = 1 << 20;
+
+/// Most `.rs` files the word-renaming behaviors scan under the root.
+const SCANNED_FILES_MAX: usize = 256;
+
+/// Deepest directory level the word-renaming behaviors walk.
+const SCANNED_DEPTH_MAX: usize = 3;
 
 /// The work-done progress token the progress behaviors mint.
 const PROGRESS_TOKEN: &str = "fake/analysis";
@@ -102,6 +109,15 @@ impl EngineInput {
     }
 }
 
+/// Conversation state the word-renaming behaviors read back.
+#[derive(Default)]
+struct EngineState {
+    /// The workspace root path, decoded from the initialize `rootUri`.
+    root: String,
+    /// Each opened document's text, by URI.
+    opened: HashMap<String, String>,
+}
+
 /// Reads frames and dispatches until stdin closes or the script exits.
 fn serve(behavior: &str) {
     if behavior == "environment" {
@@ -109,13 +125,14 @@ fn serve(behavior: &str) {
     }
     wait_for_start_gate();
     let mut input = EngineInput::new();
+    let mut state = EngineState::default();
     while let Some(message) = input.next_message() {
-        dispatch(behavior, &message, &mut input);
+        dispatch(behavior, &message, &mut input, &mut state);
     }
 }
 
 /// Handles one client message under the selected behavior.
-fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput) {
+fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mut EngineState) {
     let method = message["method"].as_str().unwrap_or_default();
     let id = &message["id"];
     match method {
@@ -124,6 +141,12 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput) {
             if behavior == "initialization-options" {
                 verify_initialization_options(message);
             }
+            message["params"]["rootUri"]
+                .as_str()
+                .unwrap_or_default()
+                .strip_prefix("file://")
+                .unwrap_or_default()
+                .clone_into(&mut state.root);
             respond(id, &initialize_answer(behavior));
             if behavior == "happy" {
                 send_unretained_notifications();
@@ -145,19 +168,37 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput) {
             }
         }
         "textDocument/didOpen" => {
+            let uri = message["params"]["textDocument"]["uri"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let text = message["params"]["textDocument"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            state.opened.insert(uri, text);
             publish_open_diagnostics(behavior, message);
             if PROGRESS_BEHAVIORS.contains(&behavior) {
                 report_progress();
             }
         }
-        "textDocument/rename" => answer_rename(behavior, message, input),
-        "textDocument/prepareRename" => respond(
-            id,
-            &json!({
-                "range": zero_range(),
-                "placeholder": "renamed",
-            }),
-        ),
+        "textDocument/rename" => answer_rename(behavior, message, input, state),
+        "textDocument/prepareRename" => match behavior {
+            "declines-prepare" => respond(id, &Value::Null),
+            "parks-on-prepare" => park(),
+            "refuses-prepare" => print_message(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32602, "message": "cannot rename here"},
+            })),
+            _ => respond(
+                id,
+                &json!({
+                    "range": zero_range(),
+                    "placeholder": "renamed",
+                }),
+            ),
+        },
         "workspace/willRenameFiles" => answer_will_rename(behavior, message),
         "textDocument/diagnostic" => answer_diagnostic(behavior, id),
         _ => {}
@@ -243,23 +284,34 @@ fn initialize_answer(behavior: &str) -> Value {
 /// so a test counts how many times the engine was asked - and the
 /// behaviors that act once and then serve read that count back, which an
 /// engine that dies and restarts could not keep in memory.
-fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput) {
+fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state: &EngineState) {
     record_lifecycle("rename");
+    if answered_once_then_served(behavior, message, state) {
+        return;
+    }
     match behavior {
         "exit-mid-request" => std::process::exit(0),
+        "parks-on-rename" => park(),
+        "renames-outside-root" => {
+            let edit = json!({"range": zero_range(), "newText": "renamed"});
+            respond(
+                &message["id"],
+                &json!({"changes": {"file:///rift-elsewhere/out.rs": [edit]}}),
+            );
+            return;
+        }
+        "renames-word" => {
+            respond(&message["id"], &word_rename_answer(message, state));
+            return;
+        }
+        "mutates-then-renames" => {
+            drift_target(message);
+            respond(&message["id"], &word_rename_answer(message, state));
+            return;
+        }
         "dies-on-command" => {
             if message["params"]["newName"] == json!("die") {
                 std::process::exit(0);
-            }
-        }
-        "dies-once-on-rename" => {
-            if recorded_lifecycle("rename") == 1 {
-                std::process::exit(0);
-            }
-        }
-        "analyzes-then-serves" => {
-            if recorded_lifecycle("rename") > 1 {
-                end_progress();
             }
         }
         "reports-progress" => end_progress(),
@@ -282,16 +334,6 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput) {
             }
             refuse_rename(&message["id"], -32602, "new name is not an identifier");
             return;
-        }
-        "cancels-first-rename" => {
-            if recorded_lifecycle("rename") == 1 {
-                refuse_rename(
-                    &message["id"],
-                    SERVER_CANCELLED,
-                    "cancelled the first rename",
-                );
-                return;
-            }
         }
         "cancels-rename" => {
             refuse_rename(
@@ -321,6 +363,138 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput) {
         &message["id"],
         &json!({"changes": {(uri): [edit.clone()], (sibling): [edit]}}),
     );
+}
+
+/// The word-rename proposal: every word-boundary occurrence of the word at
+/// the requested position, replaced across the root's `.rs` files.
+///
+/// The opened target contributes edits computed from its `didOpen` text;
+/// every other file is read from disk. Positions are UTF-8, matching the
+/// encoding the default capabilities advertise, and the fixtures are ASCII.
+fn word_rename_answer(message: &Value, state: &EngineState) -> Value {
+    let uri = message["params"]["textDocument"]["uri"]
+        .as_str()
+        .unwrap_or_default();
+    let new_name = message["params"]["newName"].as_str().unwrap_or_default();
+    let line = usize::try_from(
+        message["params"]["position"]["line"]
+            .as_u64()
+            .unwrap_or_default(),
+    )
+    .expect("fixture lines fit in usize");
+    let character = usize::try_from(
+        message["params"]["position"]["character"]
+            .as_u64()
+            .unwrap_or_default(),
+    )
+    .expect("fixture characters fit in usize");
+    let target_text = state
+        .opened
+        .get(uri)
+        .expect("the rename target was opened")
+        .clone();
+    let offset = line_start(&target_text, line) + character;
+    let old_name = word_at(&target_text, offset);
+    let mut changes = serde_json::Map::new();
+    for path in rust_files(&state.root) {
+        let path_uri = format!("file://{}", path.display());
+        let text = if path_uri == uri {
+            target_text.clone()
+        } else {
+            std::fs::read_to_string(&path).expect("fake engine reads sources")
+        };
+        let edits = word_edits(&text, &old_name, new_name);
+        if !edits.is_empty() {
+            changes.insert(path_uri, Value::Array(edits));
+        }
+    }
+    json!({ "changes": changes })
+}
+
+/// Byte offset where line `line` starts.
+fn line_start(text: &str, line: usize) -> usize {
+    text.split_inclusive('\n').take(line).map(str::len).sum()
+}
+
+/// The ASCII word starting at `offset`.
+fn word_at(text: &str, offset: usize) -> String {
+    let bytes = text.as_bytes();
+    let mut end = offset;
+    while end < bytes.len() && is_ascii_word(bytes[end]) {
+        end += 1;
+    }
+    text[offset..end].to_owned()
+}
+
+/// Whether one byte continues an ASCII word.
+fn is_ascii_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Word-boundary replacement edits with UTF-8 line and character positions.
+fn word_edits(text: &str, old_name: &str, new_name: &str) -> Vec<Value> {
+    let bytes = text.as_bytes();
+    let mut edits = Vec::new();
+    for (offset, matched) in text.match_indices(old_name) {
+        let clear_before = offset == 0 || !is_ascii_word(bytes[offset - 1]);
+        let clear_after = bytes
+            .get(offset + matched.len())
+            .is_none_or(|byte| !is_ascii_word(*byte));
+        if !(clear_before && clear_after) {
+            continue;
+        }
+        let (line, character) = line_character(text, offset);
+        edits.push(json!({
+            "range": {
+                "start": {"line": line, "character": character},
+                "end": {"line": line, "character": character + old_name.len()},
+            },
+            "newText": new_name,
+        }));
+    }
+    edits
+}
+
+/// Zero-based line and UTF-8 character of one byte offset.
+fn line_character(text: &str, offset: usize) -> (usize, usize) {
+    let before = &text[..offset];
+    let line = before.matches('\n').count();
+    let start = before.rfind('\n').map_or(0, |position| position + 1);
+    (line, offset - start)
+}
+
+/// The root's `.rs` files in path order, walked to a bounded depth and
+/// count, hidden directories skipped.
+fn rust_files(root: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_rust_files(std::path::Path::new(root), 0, &mut files);
+    files.sort();
+    files
+}
+
+/// Recursive walk behind [`rust_files`], bounded by depth and file count.
+fn collect_rust_files(directory: &std::path::Path, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth > SCANNED_DEPTH_MAX || files.len() >= SCANNED_FILES_MAX {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let rust_source = std::path::Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"));
+        if path.is_dir() {
+            collect_rust_files(&path, depth + 1, files);
+        } else if rust_source && files.len() < SCANNED_FILES_MAX {
+            files.push(path);
+        }
+    }
 }
 
 /// Sends four server-initiated requests and verifies every answer.
@@ -368,6 +542,55 @@ fn verify_client_answer(answer: &Value) {
         _ => false,
     };
     assert!(verdict, "client answer broke the routing policy: {answer}");
+}
+
+/// The behaviors that act once and then serve, answering a word rename on
+/// every attempt after the one they act on.
+///
+/// Each reads its own request count back from the lifecycle log, because a
+/// scripted death ends the process and any count it held in memory. The
+/// answer says whether this function handled the request.
+fn answered_once_then_served(behavior: &str, message: &Value, state: &EngineState) -> bool {
+    match behavior {
+        "dies-once-on-rename" => {
+            if recorded_lifecycle("rename") == 1 {
+                std::process::exit(0);
+            }
+        }
+        "analyzes-then-serves" => {
+            if recorded_lifecycle("rename") > 1 {
+                end_progress();
+            }
+        }
+        "cancels-first-rename" => {
+            if recorded_lifecycle("rename") == 1 {
+                refuse_rename(
+                    &message["id"],
+                    SERVER_CANCELLED,
+                    "cancelled the first rename",
+                );
+                return true;
+            }
+        }
+        _ => return false,
+    }
+    respond(&message["id"], &word_rename_answer(message, state));
+    true
+}
+
+/// Appends a comment to the rename target on disk, drifting it away from
+/// the bytes the client opened.
+fn drift_target(message: &Value) {
+    let target = message["params"]["textDocument"]["uri"]
+        .as_str()
+        .unwrap_or_default()
+        .strip_prefix("file://")
+        .unwrap_or_default();
+    let mutated = format!(
+        "{}// the engine drifted this file\n",
+        std::fs::read_to_string(target).expect("fake engine reads its target")
+    );
+    std::fs::write(target, mutated).expect("fake engine mutates its target");
 }
 
 /// Refuses one rename with a JSON-RPC error.

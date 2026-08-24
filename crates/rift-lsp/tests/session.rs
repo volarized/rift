@@ -649,6 +649,164 @@ async fn missing_program_fails_the_launch_with_a_typed_error() {
     assert!(matches!(error.fault(), EngineFault::LaunchFailed { .. }));
 }
 
+/// The word-renaming behavior proposes word-boundary edits across the
+/// root's `.rs` files: the opened target from its `didOpen` bytes, every
+/// other file from disk. The graceful shutdown lets the engine flush.
+#[tokio::test]
+async fn word_renaming_engine_proposes_edits_across_files() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let library = "pub fn beacon() {}\n";
+    // `beacons` fails the word boundary, so this file gains exactly one edit.
+    let caller = "pub fn caller() { beacon(); } // beacons\n";
+    std::fs::write(workspace.path().join("lib.rs"), library).expect("fixture writes");
+    std::fs::write(workspace.path().join("main.rs"), caller).expect("fixture writes");
+    std::fs::write(workspace.path().join("notes.md"), "beacon\n").expect("fixture writes");
+    // The scan skips hidden directories, recurses to its depth bound, and
+    // survives an unreadable directory.
+    std::fs::create_dir(workspace.path().join(".hidden")).expect("fixture directory creates");
+    std::fs::write(workspace.path().join(".hidden/skipped.rs"), "beacon\n")
+        .expect("fixture writes");
+    let deep = workspace.path().join("a/b/c/d");
+    std::fs::create_dir_all(&deep).expect("fixture directory creates");
+    std::fs::write(deep.join("too_deep.rs"), "beacon\n").expect("fixture writes");
+    let sealed = workspace.path().join("sealed");
+    std::fs::create_dir(&sealed).expect("fixture directory creates");
+    std::fs::set_permissions(&sealed, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        .expect("fixture permissions set");
+    let mut session = EngineSession::start(launch("renames-word"), workspace.path())
+        .await
+        .expect("the fake engine starts");
+    let target = path("lib.rs");
+    session
+        .open(&target, "rust", library.to_owned())
+        .await
+        .expect("didOpen is sent");
+    let edit = session
+        .rename(
+            &target,
+            Position {
+                line: 0,
+                character: 7,
+            },
+            "flare",
+        )
+        .await
+        .expect("rename answers");
+    let proposal = serde_json::to_value(&edit).expect("the edit serializes");
+    let library_uri = session
+        .root()
+        .document_uri(&target)
+        .expect("the target uri composes")
+        .to_string();
+    let caller_uri = session
+        .root()
+        .document_uri(&path("main.rs"))
+        .expect("the caller uri composes")
+        .to_string();
+    assert_eq!(
+        proposal["changes"][&library_uri][0]["newText"],
+        serde_json::json!("flare")
+    );
+    assert_eq!(
+        proposal["changes"][&caller_uri][0]["range"]["start"]["character"],
+        serde_json::json!(18)
+    );
+    assert_eq!(
+        proposal["changes"]
+            .as_object()
+            .expect("changes is a map")
+            .len(),
+        2,
+        "the markdown file, the hidden directory, and the too-deep file are never \
+         proposed: {proposal:#}"
+    );
+    assert_eq!(
+        proposal["changes"][&caller_uri]
+            .as_array()
+            .expect("the caller's edits are a list")
+            .len(),
+        1,
+        "`beacons` fails the word boundary: {proposal:#}"
+    );
+    session.shutdown().await;
+    std::fs::set_permissions(&sealed, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("fixture permissions restore");
+}
+
+/// The mutating behavior drifts the target on disk before answering, and
+/// its answer still derives from the opened bytes.
+#[tokio::test]
+async fn mutating_engine_drifts_the_target_and_answers_from_opened_bytes() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let library = "pub fn beacon() {}\n";
+    std::fs::write(workspace.path().join("lib.rs"), library).expect("fixture writes");
+    let mut session = EngineSession::start(launch("mutates-then-renames"), workspace.path())
+        .await
+        .expect("the fake engine starts");
+    let target = path("lib.rs");
+    session
+        .open(&target, "rust", library.to_owned())
+        .await
+        .expect("didOpen is sent");
+    let edit = session
+        .rename(
+            &target,
+            Position {
+                line: 0,
+                character: 7,
+            },
+            "flare",
+        )
+        .await
+        .expect("rename answers");
+    let drifted =
+        std::fs::read_to_string(workspace.path().join("lib.rs")).expect("the target reads");
+    assert!(
+        drifted.contains("the engine drifted this file"),
+        "the engine mutated its target: {drifted}"
+    );
+    let proposal = serde_json::to_value(&edit).expect("the edit serializes");
+    let library_uri = session
+        .root()
+        .document_uri(&target)
+        .expect("the target uri composes")
+        .to_string();
+    assert_eq!(
+        proposal["changes"][&library_uri][0]["range"]["start"]["character"],
+        serde_json::json!(7),
+        "the edits derive from the opened bytes, not the drifted disk"
+    );
+    session.shutdown().await;
+}
+
+/// The outside-root behavior answers its fixed escape URI verbatim.
+#[tokio::test]
+async fn outside_root_engine_answers_its_escape_uri() {
+    let (_workspace, mut session) = started("renames-outside-root").await;
+    let target = path("lib.rs");
+    session
+        .open(&target, "rust", "pub fn beacon() {}\n".to_owned())
+        .await
+        .expect("didOpen is sent");
+    let edit = session
+        .rename(
+            &target,
+            Position {
+                line: 0,
+                character: 7,
+            },
+            "flare",
+        )
+        .await
+        .expect("rename answers");
+    let proposal = serde_json::to_value(&edit).expect("the edit serializes");
+    assert!(
+        proposal["changes"]["file:///rift-elsewhere/out.rs"].is_array(),
+        "the escape URI rides the answer: {proposal:#}"
+    );
+    session.shutdown().await;
+}
+
 /// The session reads the engine's `$/progress` traffic and answers whether
 /// work is outstanding.
 ///
@@ -696,6 +854,35 @@ async fn work_done_progress_decides_whether_the_engine_is_analyzing() {
         !session.is_analyzing(),
         "the end the rename consumed retires the token"
     );
+    session.shutdown().await;
+}
+
+/// The prepare behaviors answer a typed decline and a typed refusal, and
+/// both leave the engine serving.
+#[tokio::test]
+async fn prepare_behaviors_decline_and_refuse_with_typed_answers() {
+    let (_workspace, mut session) = started("declines-prepare").await;
+    let target = path("lib.rs");
+    let position = Position {
+        line: 0,
+        character: 0,
+    };
+    let declined = session
+        .prepare_rename(&target, position)
+        .await
+        .expect("prepare answers");
+    assert!(declined.is_none(), "a null prepare answer declines");
+    session.shutdown().await;
+
+    let (_workspace, mut session) = started("refuses-prepare").await;
+    let refused = session
+        .prepare_rename(&target, position)
+        .await
+        .expect_err("the engine refuses the prepare");
+    assert!(matches!(
+        refused.fault(),
+        EngineFault::Refused { message, .. } if message == "cannot rename here"
+    ));
     session.shutdown().await;
 }
 

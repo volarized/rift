@@ -423,6 +423,70 @@ pub struct ReplaceNodeParams {
     pub body: String,
 }
 
+/// Longest `new_name` a rename request may carry, in UTF-8 bytes.
+pub const RENAME_NEW_NAME_BYTES_MAX: usize = 256;
+
+/// Renames one declaration addressed by symbol through the configured language engine.
+/// The engine proposes the edits; the server verifies each one against the tree and
+/// writes them atomically, then reports surviving occurrences of the old name as
+/// warnings. Refused as `unsupported` when no engine serves the declaration's language,
+/// `unmet_precondition` when the engine declines the rename or the source drifted, and
+/// `ambiguous_target` when the address resolves to several declarations.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.14"))]
+#[schemars(extend("examples" = [
+    {
+        "symbol": "rift://symbol/rust/src/config.rs/load_config",
+        "new_name": "read_config"
+    }
+]))]
+pub struct RenameSymbolParams {
+    /// The declaration to rename, in the address form the read tools return.
+    pub symbol: SymbolId,
+    /// The declaration's new name. The engine judges identifier validity for its
+    /// language; a name the engine refuses returns an `unmet_precondition` refusal
+    /// carrying the engine's own words.
+    #[schemars(length(min = 1, max = 256))]
+    pub new_name: String,
+}
+
+impl RenameSymbolParams {
+    /// Classifies `new_name` against the length its schema advertises. `schemars`
+    /// constraints are declarative only - nothing enforces them at deserialization -
+    /// so the server calls this before the name reaches an engine.
+    #[must_use]
+    pub fn new_name_violation(&self) -> Option<NewNameViolation> {
+        match self.new_name.as_bytes() {
+            [] => Some(NewNameViolation::Empty),
+            bytes if bytes.len() > RENAME_NEW_NAME_BYTES_MAX => Some(NewNameViolation::TooLong),
+            _ => None,
+        }
+    }
+}
+
+/// Reason a `new_name` spelling breaks the contract [`RenameSymbolParams`]'s schema
+/// advertises.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewNameViolation {
+    /// The name is empty.
+    Empty,
+    /// The name is longer than [`RENAME_NEW_NAME_BYTES_MAX`] bytes.
+    TooLong,
+}
+
+impl NewNameViolation {
+    /// This violation's wire spelling, equal to its `Serialize` output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::TooLong => "too_long",
+        }
+    }
+}
+
 /// Applies unified-diff hunks to workspace files atomically.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -537,5 +601,52 @@ mod tests {
             "projection": "rift://projection/my-feature-one"
         }));
         assert!(result.is_err());
+    }
+
+    /// The schema's `length` literals restate [`RENAME_NEW_NAME_BYTES_MAX`], because
+    /// attribute arguments take only literals; this pins the two to each other.
+    #[test]
+    fn rename_new_name_schema_length_pins_the_enforced_bound() {
+        let schema =
+            serde_json::to_value(schema_for!(RenameSymbolParams)).expect("rename params schema");
+        let new_name = &schema["properties"]["new_name"];
+        assert_eq!(new_name["minLength"], json!(1));
+        assert_eq!(
+            new_name["maxLength"],
+            json!(RENAME_NEW_NAME_BYTES_MAX),
+            "the advertised length must equal the enforced constant"
+        );
+    }
+
+    #[test]
+    fn rename_new_name_violations_classify_empty_and_oversized() {
+        let params = |new_name: String| RenameSymbolParams {
+            symbol: SymbolId("rift://symbol/rust/lib.rs/beacon".to_owned()),
+            new_name,
+        };
+        assert_eq!(
+            params(String::new()).new_name_violation(),
+            Some(NewNameViolation::Empty)
+        );
+        assert_eq!(NewNameViolation::Empty.as_str(), "empty");
+        let oversized = params("n".repeat(RENAME_NEW_NAME_BYTES_MAX + 1));
+        assert_eq!(
+            oversized.new_name_violation(),
+            Some(NewNameViolation::TooLong)
+        );
+        assert_eq!(NewNameViolation::TooLong.as_str(), "too_long");
+        let at_bound = params("n".repeat(RENAME_NEW_NAME_BYTES_MAX));
+        assert_eq!(at_bound.new_name_violation(), None);
+        assert_eq!(params("renamed".to_owned()).new_name_violation(), None);
+    }
+
+    /// The wire spelling and `as_str` come from one serde declaration; this
+    /// pins the two together for every variant.
+    #[test]
+    fn new_name_violation_spellings_match_their_serialization() {
+        for violation in [NewNameViolation::Empty, NewNameViolation::TooLong] {
+            let serialized = serde_json::to_value(violation).expect("violations serialize");
+            assert_eq!(serialized, json!(violation.as_str()));
+        }
     }
 }

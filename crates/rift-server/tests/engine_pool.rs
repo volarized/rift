@@ -145,14 +145,18 @@ async fn rename_through(
         .expect("the language is served");
     let target = document();
     let renamed = new_name.to_owned();
-    slot.request(async move |session: &mut EngineSession| {
-        session
-            .open(&target, "rust", "fn beacon() {}\n".to_owned())
-            .await?;
-        session
-            .rename(&target, start_position(), &renamed)
-            .await
-            .map(|_edit| ())
+    slot.request(move |session: &mut EngineSession| {
+        let target = target.clone();
+        let renamed = renamed.clone();
+        Box::pin(async move {
+            session
+                .open(&target, "rust", "fn beacon() {}\n".to_owned())
+                .await?;
+            session
+                .rename(&target, start_position(), &renamed)
+                .await
+                .map(|_edit| ())
+        })
     })
     .await
 }
@@ -446,11 +450,14 @@ async fn refusal_leaves_the_engine_serving_without_a_restart() {
         .engine_for(&language("rust"))
         .expect("the language is served");
     let target = document();
-    slot.request(async move |session: &mut EngineSession| {
-        session
-            .prepare_rename(&target, start_position())
-            .await
-            .map(|_verdict| ())
+    slot.request(move |session: &mut EngineSession| {
+        let target = target.clone();
+        Box::pin(async move {
+            session
+                .prepare_rename(&target, start_position())
+                .await
+                .map(|_verdict| ())
+        })
     })
     .await
     .expect("the refusal left the engine serving");
@@ -744,10 +751,14 @@ async fn will_rename_through(
     let slot = pool
         .engine_for(&language(name))
         .expect("the language is served");
-    let from = document();
-    let to = ProjectPath::new("src/moved.rs").expect("fixture path is valid");
-    slot.request(async move |session: &mut EngineSession| {
-        session.will_rename_files(&from, &to).await
+    // The boxed future may only borrow the session, so each attempt gets
+    // its own owned copy of the request paths.
+    let request_from = document();
+    let request_to = ProjectPath::new("src/moved.rs").expect("fixture path is valid");
+    slot.request(move |session: &mut EngineSession| {
+        let from = request_from.clone();
+        let to = request_to.clone();
+        Box::pin(async move { session.will_rename_files(&from, &to).await })
     })
     .await
 }
@@ -760,12 +771,15 @@ async fn pull_through(
     let slot = pool
         .engine_for(&language(name))
         .expect("the language is served");
-    let target = document();
-    slot.request(async move |session: &mut EngineSession| {
-        session
-            .open(&target, "rust", "fn beacon() {}\n".to_owned())
-            .await?;
-        session.pull_diagnostics(&target).await
+    let request_target = document();
+    slot.request(move |session: &mut EngineSession| {
+        let target = request_target.clone();
+        Box::pin(async move {
+            session
+                .open(&target, "rust", "fn beacon() {}\n".to_owned())
+                .await?;
+            session.pull_diagnostics(&target).await
+        })
     })
     .await
 }

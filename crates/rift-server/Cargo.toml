@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 diffy.workspace = true
+lsp-types.workspace = true
 percent-encoding.workspace = true
 rift-core.workspace = true
 rift-history.workspace = true
@@ -26,7 +27,6 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-lsp-types.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 serde_json.workspace = true
 tempfile.workspace = true

@@ -34,6 +34,8 @@ pub enum ReadFault {
     Index(WorkspaceIndexError),
     /// The workspace's version control could not serve the requested revision.
     History(HistoryError),
+    /// A language engine failed while serving the request.
+    Engine(rift_lsp::session::EngineError),
     /// Request uses functionality this release does not serve.
     Unsupported {
         /// The unserved capability the request named.
@@ -88,6 +90,7 @@ impl Fault for ReadFault {
         match self {
             Self::Index(source) => source.descriptor().name(),
             Self::History(source) => source.descriptor().name(),
+            Self::Engine(source) => source.name(),
             Self::Unsupported { .. } => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
             Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
@@ -103,6 +106,7 @@ impl Fault for ReadFault {
         match self {
             Self::Index(source) => source.context(),
             Self::History(source) => source.context(),
+            Self::Engine(source) => source.context(),
             Self::Unsupported { capability } => {
                 vec![ErrorContext::new("capability", *capability)]
             }
@@ -138,6 +142,7 @@ impl Fault for ReadFault {
         match self {
             Self::Index(source) => Some(source),
             Self::History(source) => Some(source),
+            Self::Engine(source) => Some(source),
             Self::Unsupported { .. }
             | Self::Invalid { .. }
             | Self::NotFound { .. }
@@ -183,6 +188,12 @@ impl ReadFault {
 
     pub(crate) fn history(source: HistoryError) -> ReadError {
         Error::new(Self::History(source))
+    }
+
+    /// Classifies a language engine failure, keeping the engine fault's own
+    /// wire classification.
+    pub(crate) fn engine(source: rift_lsp::session::EngineError) -> ReadError {
+        Error::new(Self::Engine(source))
     }
 
     /// Classifies a Tokio blocking-executor failure.

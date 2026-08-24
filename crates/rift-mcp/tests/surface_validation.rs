@@ -108,6 +108,15 @@ fn corpus() -> Vec<(&'static str, Value)> {
                 "body": "pub fn beacon_three( {"
             }),
         ),
+        // The shared fixture configures no `[engines]` tables, so the
+        // rename refuses `unsupported` with the no-engine capability text.
+        (
+            "rename_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/lib.rs/beacon_two",
+                "new_name": "beacon_renamed"
+            }),
+        ),
     ];
     requests.extend(patch_corpus());
     requests.extend(revision_read_corpus());
@@ -240,6 +249,25 @@ fn invalid_insert_symbol_corpus() -> Vec<Value> {
             "file": "../escape.rs",
             "position": "after",
             "body": "x"
+        }),
+    ]
+}
+
+/// `rename_symbol` requests that must fail the advertised input schema
+/// before any tool resolves them: a malformed address, an empty name, an
+/// oversized name, and an unknown field.
+fn invalid_rename_symbol_corpus() -> Vec<Value> {
+    vec![
+        json!({ "symbol": "not-an-address", "new_name": "beacon_renamed" }),
+        json!({ "symbol": "rift://symbol/rust/lib.rs/beacon_one", "new_name": "" }),
+        json!({
+            "symbol": "rift://symbol/rust/lib.rs/beacon_one",
+            "new_name": "n".repeat(257)
+        }),
+        json!({
+            "symbol": "rift://symbol/rust/lib.rs/beacon_one",
+            "new_name": "beacon_renamed",
+            "dry_run": true
         }),
     ]
 }
@@ -640,6 +668,24 @@ async fn insert_symbol_schema_rejects_invalid_target_combinations() -> TestResul
         assert!(
             input_validator.iter_errors(&request).next().is_some(),
             "insert_symbol request must fail its advertised schema: {request:#}"
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rename_symbol_schema_rejects_invalid_requests() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+    let (input_validator, _) = &validators["rename_symbol"];
+    for request in invalid_rename_symbol_corpus() {
+        assert!(
+            input_validator.iter_errors(&request).next().is_some(),
+            "rename_symbol request must fail its advertised schema: {request:#}"
         );
     }
 

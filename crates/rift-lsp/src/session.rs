@@ -523,6 +523,14 @@ impl EngineSession {
         &self.root
     }
 
+    /// The version the most recent `didOpen` carried. An engine echoes it
+    /// on a versioned edit, and a compiler of that edit compares against
+    /// this value.
+    #[must_use]
+    pub fn document_version(&self) -> i32 {
+        self.document_version
+    }
+
     /// Whether the session already killed its engine.
     ///
     /// An ended session refuses every later operation; the holder decides
