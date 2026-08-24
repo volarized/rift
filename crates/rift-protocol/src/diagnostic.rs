@@ -56,6 +56,10 @@ pub enum DiagnosticCode {
     /// server publishes a fresh snapshot.
     #[serde(rename = "rift.snapshot.stale")]
     SnapshotStale,
+    /// A word-boundary occurrence of a renamed declaration's old name survives in the
+    /// changed tree after the rename.
+    #[serde(rename = "rift.rename.survivor")]
+    RenameSurvivor,
 }
 
 impl DiagnosticCode {
@@ -171,5 +175,9 @@ mod tests {
     fn test_diagnostic_codes_serialize_to_their_documented_spellings() {
         assert_eq!(DiagnosticCode::HookFailed.code(), "rift.hook.failed");
         assert_eq!(DiagnosticCode::SnapshotStale.code(), "rift.snapshot.stale");
+        assert_eq!(
+            DiagnosticCode::RenameSurvivor.code(),
+            "rift.rename.survivor"
+        );
     }
 }

@@ -12,7 +12,7 @@ use rift_index::{
 };
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
-    ReplaceNodeParams, ReplaceSymbolParams,
+    RenameSymbolParams, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
     CommandHook, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX,
@@ -23,7 +23,8 @@ use rift_protocol::read::{
     GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
 };
 use rift_server::{
-    ChangeService, EnginePool, HookStatus, ReadError, ReadFault, ReadService, run_hooks,
+    ChangeService, EnginePool, HookStatus, ReadError, ReadFault, ReadService, RenameResolution,
+    plan_rename, run_hooks,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -596,6 +597,32 @@ impl RiftMcp {
             .await
     }
 
+    /// Renames one declaration addressed by symbol through the configured
+    /// language engine. The engine proposes the edits; the server verifies
+    /// each one against the tree and writes them atomically, then reports
+    /// surviving occurrences of the old name as warning findings. Refused
+    /// as `unsupported` when no engine serves the declaration's language;
+    /// a refusal leaves the workspace untouched.
+    #[tool]
+    async fn rename_symbol(
+        &self,
+        Parameters(params): Parameters<RenameSymbolParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        let published = self.published_workspace(wire::ErrorPhase::Change).await?;
+        published.configuration.accepted(wire::ErrorPhase::Change)?;
+        let pool = self.engine_pool().await;
+        let resolution = plan_rename(&published.reads, &pool, &self.root, &params)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
+        match resolution {
+            RenameResolution::Refused(result) => Ok(Json(result)),
+            RenameResolution::Planned(plan) => {
+                self.change(move |reads, changes| changes.apply_rename(reads, &plan))
+                    .await
+            }
+        }
+    }
+
     /// Applies unified-diff hunks to workspace files atomically. Hunk
     /// context guards the change; header line numbers are hints, as with
     /// `git apply`. A `/dev/null` header creates or deletes the file.
@@ -967,8 +994,8 @@ impl ServerHandler for RiftMcp {
             .with_instructions(
                 "Read and edit the current workspace: get_symbol and search find \
                  declarations, nodes lists witnessed syntax nodes at a byte position, \
-                 and replace_symbol, insert_symbol, replace_node, and patch change \
-                 code atomically behind verified preconditions.",
+                 and replace_symbol, insert_symbol, replace_node, rename_symbol, and \
+                 patch change code atomically behind verified preconditions.",
             )
     }
 }
@@ -1613,6 +1640,7 @@ mod tests {
                 "insert_symbol",
                 "nodes",
                 "patch",
+                "rename_symbol",
                 "replace_node",
                 "replace_symbol",
                 "search"

@@ -26,6 +26,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::patch::{self, FileRewrite, RewriteKind};
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id, node_witness};
+use crate::rename::{RenamePlan, survivor_findings};
 
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
@@ -314,6 +315,94 @@ impl ChangeService {
         self.conclude(reads, resolution)
     }
 
+    /// Verifies and writes one engine-proposed rename plan atomically, then
+    /// sweeps the changed tree for surviving occurrences of the old name.
+    ///
+    /// Every rewritten file must still hold the exact bytes the plan was
+    /// compiled against: the last precondition before an engine proposal
+    /// may write, the same proof `verified_against_disk` runs for the
+    /// parser-derived plans.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for a filesystem failure; a file that drifted
+    /// since the plan was compiled returns a refused [`ChangeResult`]
+    /// instead.
+    pub fn apply_rename(
+        &self,
+        reads: &ReadService,
+        plan: &RenamePlan,
+    ) -> Result<ChangeResult, ReadError> {
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(refusal) = self.rename_precondition_failure(reads, plan)? {
+            return Ok(refusal);
+        }
+        let rewrites: Vec<FileRewrite> = plan
+            .rewrites
+            .iter()
+            .map(|rewrite| FileRewrite {
+                path: rewrite.path.clone(),
+                kind: RewriteKind::Modify,
+                previous_len: rewrite.base_source.len() as u64,
+                next_source: rewrite.next_source.clone(),
+            })
+            .collect();
+        let mut result = self.apply_rewrites(reads, &rewrites)?;
+        if let ChangeResult::Applied { summary } = &mut result {
+            summary.diagnostics.extend(survivor_findings(reads, plan));
+        }
+        Ok(result)
+    }
+
+    /// The first rename precondition that fails: a rewritten file gone from
+    /// the index, or one whose disk bytes drifted from the bytes the plan
+    /// was compiled against. Nothing when every file still matches.
+    fn rename_precondition_failure(
+        &self,
+        reads: &ReadService,
+        plan: &RenamePlan,
+    ) -> Result<Option<ChangeResult>, ReadError> {
+        for rewrite in &plan.rewrites {
+            let path = &rewrite.path;
+            if reads.index().file(path).is_none() {
+                return Ok(Some(ChangeResult::refused(
+                    RefusalReason::UnmetPrecondition,
+                    vec![OperationPrecondition::new(
+                        OperationPreconditionKind::TargetExists,
+                        OperationPreconditionStatus::Failed,
+                        plan.symbol_addresses(),
+                        vec![path.as_str().to_owned()],
+                        PreconditionValue::Boolean { value: true },
+                        PreconditionValue::Boolean { value: false },
+                    )],
+                )));
+            }
+            let disk = fs::read_to_string(self.root.join(path.as_str()))
+                .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
+            if disk != rewrite.base_source {
+                return Ok(Some(ChangeResult::refused(
+                    RefusalReason::UnmetPrecondition,
+                    vec![OperationPrecondition::new(
+                        OperationPreconditionKind::SourceUnchanged,
+                        OperationPreconditionStatus::Failed,
+                        plan.symbol_addresses(),
+                        vec![path.as_str().to_owned()],
+                        PreconditionValue::Text {
+                            value: digest_hex8(&rewrite.base_source),
+                        },
+                        PreconditionValue::Text {
+                            value: digest_hex8(&disk),
+                        },
+                    )],
+                )));
+            }
+        }
+        Ok(None)
+    }
+
     /// Applies unified-diff hunks to workspace files atomically.
     ///
     /// Hunk context locates each hunk; header line numbers are hints, as
@@ -477,63 +566,17 @@ impl ChangeService {
         address: &SymbolAddress,
         plan: impl Fn(ByteRange) -> ChangePlan,
     ) -> Result<Resolution, ReadError> {
-        let path = &address.path;
-        let symbol_address = || {
-            vec![PreconditionAddress::Symbol {
-                symbol: rift_protocol::read::SymbolId(rift_core::symbol_identity(
-                    &address.language_segment,
-                    path.as_str(),
-                    &address.qualified_name,
-                )),
-            }]
-        };
-        let Some(file) = reads.index().file(path) else {
-            return Ok(Resolution::Refused {
-                reason: RefusalReason::UnmetPrecondition,
-                preconditions: vec![OperationPrecondition::new(
-                    OperationPreconditionKind::TargetExists,
-                    OperationPreconditionStatus::Failed,
-                    symbol_address(),
-                    vec![path.as_str().to_owned()],
-                    PreconditionValue::Boolean { value: true },
-                    PreconditionValue::Boolean { value: false },
-                )],
-            });
-        };
-        verified_address_language("symbol", &address.language_segment, file.syntax())?;
-        let spans: Vec<ByteRange> = file
-            .syntax()
-            .symbols()
-            .iter()
-            .filter(|symbol| symbol.qualified_name == address.qualified_name)
-            .map(|symbol| symbol.range)
-            .collect();
-        match spans.as_slice() {
-            [] => Ok(Resolution::Refused {
-                reason: RefusalReason::UnmetPrecondition,
-                preconditions: vec![OperationPrecondition::new(
-                    OperationPreconditionKind::TargetExists,
-                    OperationPreconditionStatus::Failed,
-                    symbol_address(),
-                    vec![path.as_str().to_owned()],
-                    PreconditionValue::Boolean { value: true },
-                    PreconditionValue::Boolean { value: false },
-                )],
+        match resolve_symbol(reads, address)? {
+            SymbolResolution::Refused {
+                reason,
+                preconditions,
+            } => Ok(Resolution::Refused {
+                reason,
+                preconditions,
             }),
-            [only] => self.verified_against_disk(reads, path, plan(*only)),
-            several => Ok(Resolution::Refused {
-                reason: RefusalReason::AmbiguousTarget,
-                preconditions: vec![OperationPrecondition::new(
-                    OperationPreconditionKind::TargetExists,
-                    OperationPreconditionStatus::Failed,
-                    symbol_address(),
-                    vec![path.as_str().to_owned()],
-                    PreconditionValue::Count { value: 1 },
-                    PreconditionValue::Count {
-                        value: several.len() as u64,
-                    },
-                )],
-            }),
+            SymbolResolution::Declared { symbol, .. } => {
+                self.verified_against_disk(reads, &address.path, plan(symbol.range))
+            }
         }
     }
 
@@ -672,16 +715,105 @@ struct NodeAddress {
 /// A parsed symbol address: the language segment it files under, and its
 /// decoded path and qualified name.
 #[derive(Debug)]
-struct SymbolAddress {
-    language_segment: String,
-    path: CoreProjectPath,
-    qualified_name: String,
+pub(crate) struct SymbolAddress {
+    pub(crate) language_segment: String,
+    pub(crate) path: CoreProjectPath,
+    pub(crate) qualified_name: String,
+}
+
+impl SymbolAddress {
+    /// The wire symbol identity this address spells, re-encoded.
+    pub(crate) fn wire_symbol(&self) -> rift_protocol::read::SymbolId {
+        rift_protocol::read::SymbolId(rift_core::symbol_identity(
+            &self.language_segment,
+            self.path.as_str(),
+            &self.qualified_name,
+        ))
+    }
+}
+
+/// One symbol address resolved against the served snapshot: the single
+/// declaration it names, or the refusal resolution produced.
+#[derive(Debug)]
+pub(crate) enum SymbolResolution<'reads> {
+    /// The address names exactly one declaration in one indexed file.
+    Declared {
+        /// The indexed file holding the declaration.
+        file: &'reads rift_index::IndexedFile,
+        /// The declaration the address names.
+        symbol: &'reads rift_syntax::SyntaxSymbol,
+    },
+    /// Resolution produced no single declaration; the tree stays untouched.
+    Refused {
+        /// The condition the caller can act on.
+        reason: RefusalReason,
+        /// The checked conditions, including the failed entry.
+        preconditions: Vec<OperationPrecondition>,
+    },
+}
+
+/// Resolves one symbol address to its single declaration, refusing when the
+/// file is missing, the name resolves to nothing, or it resolves to several
+/// declarations.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when the address's language segment does not match
+/// the indexed file's language.
+pub(crate) fn resolve_symbol<'reads>(
+    reads: &'reads ReadService,
+    address: &SymbolAddress,
+) -> Result<SymbolResolution<'reads>, ReadError> {
+    let path = &address.path;
+    let symbol_addresses = || {
+        vec![PreconditionAddress::Symbol {
+            symbol: address.wire_symbol(),
+        }]
+    };
+    let missing_target = || SymbolResolution::Refused {
+        reason: RefusalReason::UnmetPrecondition,
+        preconditions: vec![OperationPrecondition::new(
+            OperationPreconditionKind::TargetExists,
+            OperationPreconditionStatus::Failed,
+            symbol_addresses(),
+            vec![path.as_str().to_owned()],
+            PreconditionValue::Boolean { value: true },
+            PreconditionValue::Boolean { value: false },
+        )],
+    };
+    let Some(file) = reads.index().file(path) else {
+        return Ok(missing_target());
+    };
+    verified_address_language("symbol", &address.language_segment, file.syntax())?;
+    let declarations: Vec<&rift_syntax::SyntaxSymbol> = file
+        .syntax()
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.qualified_name == address.qualified_name)
+        .collect();
+    match declarations.as_slice() {
+        [] => Ok(missing_target()),
+        [only] => Ok(SymbolResolution::Declared { file, symbol: only }),
+        several => Ok(SymbolResolution::Refused {
+            reason: RefusalReason::AmbiguousTarget,
+            preconditions: vec![OperationPrecondition::new(
+                OperationPreconditionKind::TargetExists,
+                OperationPreconditionStatus::Failed,
+                symbol_addresses(),
+                vec![path.as_str().to_owned()],
+                PreconditionValue::Count { value: 1 },
+                PreconditionValue::Count {
+                    value: several.len() as u64,
+                },
+            )],
+        }),
+    }
 }
 
 /// Splits `rift://symbol/<language>/<path>/<qualified-name>` into its
 /// decoded parts. The language segment is taken as spelled; resolution
 /// verifies it against the addressed file's document.
-fn parse_symbol_address(address: &str) -> Result<SymbolAddress, ReadError> {
+pub(crate) fn parse_symbol_address(address: &str) -> Result<SymbolAddress, ReadError> {
     let malformed = || ReadFault::invalid("symbol", "not a rift symbol address");
     let remainder = address
         .strip_prefix("rift://symbol/")
@@ -1994,6 +2126,141 @@ mod tests {
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(untouched, source);
+        Ok(())
+    }
+
+    /// Builds a workspace of several files and the services over it.
+    fn multi_file_fixture(
+        files: &[(&str, &str)],
+    ) -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
+        let directory = tempfile::tempdir()?;
+        for (name, source) in files {
+            fs::write(directory.path().join(name), source)?;
+        }
+        let root = directory.path();
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let reads = ReadService::build(root, limits, &visibility, &inclusion, history)?;
+        let changes = ChangeService::new(root);
+        Ok((directory, reads, changes))
+    }
+
+    fn rename_plan(rewrites: Vec<(&str, &str, &str)>) -> crate::rename::RenamePlan {
+        crate::rename::RenamePlan {
+            symbol: SymbolId("rift://symbol/rust/lib.rs/beacon".to_owned()),
+            old_name: "beacon".to_owned(),
+            rewrites: rewrites
+                .into_iter()
+                .map(
+                    |(path, base_source, next_source)| crate::rename::PlannedRewrite {
+                        path: CoreProjectPath::new(path).expect("fixture path is valid"),
+                        base_source: base_source.to_owned(),
+                        next_source: next_source.to_owned(),
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn apply_rename_writes_every_file_and_sweeps_clean() -> TestResult {
+        let library = "pub fn beacon() {}\n";
+        let caller = "pub fn caller() { beacon(); }\n";
+        let (directory, reads, changes) =
+            multi_file_fixture(&[("lib.rs", library), ("main.rs", caller)])?;
+        let plan = rename_plan(vec![
+            ("lib.rs", library, "pub fn flare() {}\n"),
+            ("main.rs", caller, "pub fn caller() { flare(); }\n"),
+        ]);
+        let summary = applied_summary(changes.apply_rename(&reads, &plan)?);
+        assert_eq!(summary.paths.len(), 2);
+        assert_eq!(summary.edits.len(), 2, "one whole-file edit per rewrite");
+        assert!(
+            summary
+                .diagnostics
+                .iter()
+                .all(|finding| finding.code.as_deref() != Some("rift.rename.survivor")),
+            "a full rename must sweep clean: {:?}",
+            summary.diagnostics
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            "pub fn flare() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("main.rs"))?,
+            "pub fn caller() { flare(); }\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rename_reports_survivors_after_a_partial_rewrite() -> TestResult {
+        let library = "pub fn beacon() {}\n";
+        let caller = "pub fn caller() { beacon(); }\n";
+        let (_directory, reads, changes) =
+            multi_file_fixture(&[("lib.rs", library), ("main.rs", caller)])?;
+        let plan = rename_plan(vec![("lib.rs", library, "pub fn flare() {}\n")]);
+        let summary = applied_summary(changes.apply_rename(&reads, &plan)?);
+        let survivor = summary
+            .diagnostics
+            .iter()
+            .find(|finding| finding.code.as_deref() == Some("rift.rename.survivor"))
+            .expect("the unrewritten caller must surface as a survivor");
+        assert!(survivor.message.contains("beacon"));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rename_refuses_when_the_disk_drifted_after_planning() -> TestResult {
+        let library = "pub fn beacon() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("lib.rs", library)])?;
+        let plan = rename_plan(vec![("lib.rs", library, "pub fn flare() {}\n")]);
+        let drifted = "pub fn beacon() { let _late = 1; }\n";
+        fs::write(directory.path().join("lib.rs"), drifted)?;
+        let result = changes.apply_rename(&reads, &plan)?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a drifted base must refuse, got {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            drifted,
+            "a refusal leaves the tree untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rename_refuses_when_a_planned_file_left_the_index() -> TestResult {
+        let library = "pub fn beacon() {}\n";
+        let (_directory, reads, changes) = multi_file_fixture(&[("lib.rs", library)])?;
+        let plan = rename_plan(vec![("vanished.rs", library, "pub fn flare() {}\n")]);
+        let result = changes.apply_rename(&reads, &plan)?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("an unindexed file must refuse, got {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
         Ok(())
     }
 }
