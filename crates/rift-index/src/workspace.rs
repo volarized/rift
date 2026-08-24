@@ -2544,6 +2544,26 @@ mod tests {
         );
     }
 
+    /// `json`, `yaml`, and `yml` sit outside the default `[search.text]`
+    /// extensions; when an operator lists one there anyway, the claiming
+    /// provider still wins, so the file is source, never a second text
+    /// representation.
+    #[test]
+    fn test_classify_path_source_wins_for_json_and_yaml_over_configured_text_extensions() {
+        let inclusion = TextFileInclusion::new(
+            vec!["json".to_owned(), "yaml".to_owned(), "yml".to_owned()],
+            1_024,
+        );
+        for path in ["config.json", "deploy.yaml", "deploy.yml"] {
+            assert!(inclusion.includes(Path::new(path)));
+            assert_eq!(
+                classify_path(Path::new(path), &inclusion),
+                Some(PathClass::Source),
+                "the claiming provider must win {path} over the text tier"
+            );
+        }
+    }
+
     #[test]
     fn test_classify_path_returns_none_for_an_extension_outside_both_sets() {
         let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 1_024);
@@ -2626,6 +2646,54 @@ mod tests {
             "rift://symbol/markdown/README.md/Install"
         );
         assert_eq!(units[0].content(), "# Install\n\nRun the beacon.\n");
+    }
+
+    /// A workspace `.json` or `.yml` file is source through its claiming
+    /// provider - a `package.json` is indexed like any other source file -
+    /// while `.rift`'s own files stay outside the walk.
+    #[test]
+    fn test_build_indexes_json_and_yaml_files_as_source() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(
+            directory.path().join("config.json"),
+            "{\"server\": {\"port\": 8080}}\n",
+        )
+        .expect("json fixture");
+        fs::write(directory.path().join("deploy.yml"), "retries: 3\n").expect("yaml fixture");
+        fs::create_dir_all(directory.path().join(".rift")).expect("state directory");
+        fs::write(
+            directory.path().join(".rift/server.json"),
+            "{\"port\": 1}\n",
+        )
+        .expect("state file");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("workspace index");
+        let source_paths: Vec<&str> = index
+            .files()
+            .iter()
+            .map(|file| file.path().as_str())
+            .collect();
+        assert_eq!(
+            source_paths,
+            ["config.json", "deploy.yml"],
+            "the workspace files are source and `.rift/server.json` stays outside the walk"
+        );
+        assert!(index.text_files().is_empty());
+        let units = index.lexical_units();
+        let identities: Vec<&str> = units.iter().map(LexicalUnit::identity).collect();
+        assert_eq!(
+            identities,
+            [
+                "rift://symbol/json/config.json/server",
+                "rift://symbol/json/config.json/server%20%3E%20port",
+                "rift://symbol/yaml/deploy.yml/retries",
+            ]
+        );
     }
 
     #[test]

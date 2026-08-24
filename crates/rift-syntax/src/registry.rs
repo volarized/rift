@@ -10,10 +10,12 @@ use std::sync::OnceLock;
 use rift_protocol::read::Language;
 
 use crate::javascript::JavaScriptSyntaxProvider;
+use crate::json::JsonSyntaxProvider;
 use crate::markdown::MarkdownSyntaxProvider;
 use crate::provider::SyntaxProvider;
 use crate::rust::RustSyntaxProvider;
 use crate::typescript::TypeScriptDialect;
+use crate::yaml::YamlSyntaxProvider;
 
 /// Every provider this build ships, in registration order.
 fn build_registry() -> Vec<Box<dyn SyntaxProvider>> {
@@ -23,6 +25,8 @@ fn build_registry() -> Vec<Box<dyn SyntaxProvider>> {
         Box::new(TypeScriptDialect::TypeScript.provider()),
         Box::new(TypeScriptDialect::Tsx.provider()),
         Box::new(MarkdownSyntaxProvider::default()),
+        Box::new(JsonSyntaxProvider::default()),
+        Box::new(YamlSyntaxProvider::default()),
     ]
 }
 
@@ -153,7 +157,7 @@ mod tests {
     fn test_source_file_extensions_union_lists_every_declared_extension() {
         assert_eq!(
             source_file_extensions(),
-            ["rs", "js", "jsx", "ts", "tsx", "md"]
+            ["rs", "js", "jsx", "ts", "tsx", "md", "json", "yaml", "yml"]
         );
     }
 
@@ -169,6 +173,36 @@ mod tests {
         let by_language =
             provider_for_language(&language).expect("the markdown provider serves markdown");
         assert_eq!(by_language.extensions(), ["md"]);
+    }
+
+    #[test]
+    fn test_provider_for_extension_serves_json() {
+        let provider = provider_for_extension("json").expect("the JSON provider claims json");
+        assert_eq!(provider.language().name, "json");
+        assert_eq!(provider.language().dialect, None);
+        let language = Language {
+            name: "json".to_owned(),
+            dialect: None,
+        };
+        let by_language = provider_for_language(&language).expect("the JSON provider serves json");
+        assert_eq!(by_language.extensions(), ["json"]);
+    }
+
+    /// One YAML provider claims both spellings of the extension.
+    #[test]
+    fn test_provider_for_extension_serves_yaml_under_both_extensions() {
+        for extension in ["yaml", "yml"] {
+            let provider = provider_for_extension(extension)
+                .unwrap_or_else(|| panic!("the YAML provider claims {extension}"));
+            assert_eq!(provider.language().name, "yaml");
+            assert_eq!(provider.language().dialect, None);
+        }
+        let language = Language {
+            name: "yaml".to_owned(),
+            dialect: None,
+        };
+        let by_language = provider_for_language(&language).expect("the YAML provider serves yaml");
+        assert_eq!(by_language.extensions(), ["yaml", "yml"]);
     }
 
     #[test]

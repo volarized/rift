@@ -159,14 +159,8 @@ The history provider correlates declarations across revisions using their parsed
 surrounding changes. A [`SymbolId`](/docs/protocol/reference#SymbolId) can change when a
 language includes a module path in its qualified name; the timeline still records the move.
 
-A [`CoChange`](/docs/protocol/reference#CoChange) records empirical coupling: of the
-walked revisions that touched `subject`, how many also touched `partner`. The relation is
-observed rather than resolved, so it reaches coupling no reference graph carries - two
-implementations of one concept with no edge between them. The walk is bounded by the configured
-history depth.
-
-Both ride a [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) hit when the request asks
-for history.
+The walk is bounded by the configured history depth, and the timeline rides a
+[`get_symbol`](/docs/protocol/mcp#tool-get_symbol) hit when the request asks for history.
 
 ## Changes
 

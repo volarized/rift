@@ -242,6 +242,34 @@ mod tests {
         assert_eq!(matches[0].file.syntax().language().name, "markdown");
     }
 
+    /// Committed `.json` and `.yml` files join revision reads through their
+    /// claiming providers' declared extensions, like any other source file.
+    #[test]
+    fn test_at_revision_serves_committed_json_and_yaml_members() {
+        let directory = committed_workspace();
+        fs::write(
+            directory.path().join("config.json"),
+            "{\"server\": {\"port\": 8080}}\n",
+        )
+        .expect("json fixture");
+        fs::write(directory.path().join("deploy.yml"), "retries: 3\n").expect("yaml fixture");
+        commit_all(directory.path(), "introduce configuration");
+        let index = revision_index(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("revision index");
+        let members = index.symbols("port", 5).expect("symbol read");
+        assert_eq!(members[0].symbol.qualified_name, "server > port");
+        assert_eq!(members[0].symbol.kind, "member");
+        assert_eq!(members[0].file.syntax().language().name, "json");
+        let entries = index.symbols("retries", 5).expect("symbol read");
+        assert_eq!(entries[0].symbol.qualified_name, "retries");
+        assert_eq!(entries[0].symbol.kind, "mapping_entry");
+        assert_eq!(entries[0].file.syntax().language().name, "yaml");
+    }
+
     #[test]
     fn test_at_revision_applies_source_policy_and_hard_floor() {
         let directory = committed_workspace();
