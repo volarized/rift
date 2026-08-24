@@ -2,11 +2,12 @@
 //!
 //! The session is request-scoped and sequential: it reads the engine's
 //! stdout only while a call runs, answers server-initiated requests inline,
-//! and retains published diagnostics in a bounded record. Every wait is
-//! bounded by a timeout, and an engine that overstays one is killed and
-//! reaped - a child is never left unobserved. The child starts from the
-//! environment the server inherited, with the launch's `environment`
-//! entries laid on top.
+//! and retains published diagnostics in a bounded record. It also reads the
+//! engine's `$/progress` traffic, so the holder can ask whether the engine
+//! was still analyzing when it answered. Every wait is bounded by a
+//! timeout, and an engine that overstays one is killed and reaped - a child
+//! is never left unobserved. The child starts from the environment the
+//! server inherited, with the launch's `environment` entries laid on top.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -14,7 +15,8 @@ use std::time::Duration;
 
 use lsp_types::error_codes::{CONTENT_MODIFIED, SERVER_CANCELLED};
 use lsp_types::notification::{
-    DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification, PublishDiagnostics,
+    DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification, Progress,
+    PublishDiagnostics,
 };
 use lsp_types::request::{
     DocumentDiagnosticRequest, Initialize, PrepareRenameRequest, RegisterCapability, Rename,
@@ -24,8 +26,9 @@ use lsp_types::{
     ConfigurationParams, Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult, FileRename,
     InitializeParams, InitializedParams, PartialResultParams, Position, PrepareRenameResponse,
-    PublishDiagnosticsParams, RenameFilesParams, RenameParams, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, WorkDoneProgressParams, WorkspaceEdit,
+    ProgressParams, ProgressParamsValue, ProgressToken, PublishDiagnosticsParams,
+    RenameFilesParams, RenameParams, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
     WorkspaceFolder,
 };
 use rift_core::{
@@ -54,6 +57,13 @@ const DOCUMENT_DIAGNOSTICS_MAX: usize = 256;
 
 /// Maximum `workspace/configuration` items answered with `null` each.
 const CONFIGURATION_ITEMS_MAX: usize = 256;
+
+/// Maximum work-done progress tokens retained as outstanding at once.
+///
+/// The record only has to answer whether any work runs, so a token past
+/// the bound is dropped: the record is already non-empty, and the session
+/// already reads as analyzing.
+const PROGRESS_TOKENS_MAX: usize = 64;
 
 /// The refusal codes that name a transient condition, not a bad request.
 ///
@@ -166,6 +176,16 @@ pub enum EngineFault {
         /// The unserved method.
         capability: String,
     },
+    /// The engine answered every attempt while it was still analyzing.
+    ///
+    /// The answers were provisional: the engine had work-done progress
+    /// outstanding each time, so the same request may answer differently
+    /// once that work ends. The holder spent its whole attempt bound
+    /// waiting, and reports the wait rather than the provisional answer.
+    Analyzing {
+        /// Attempts the operation was given.
+        attempts: u64,
+    },
     /// The session already killed its engine; nothing further is served.
     Ended,
 }
@@ -203,9 +223,10 @@ impl Fault for EngineFault {
             Self::ProgramEmpty | Self::ProgramAbsolute { .. } => {
                 ErrorName::Wire(ErrorCode::ConfigurationInvalid)
             }
-            Self::ConnectionClosed { .. } | Self::TimedOut { .. } | Self::Ended => {
-                ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
-            }
+            Self::ConnectionClosed { .. }
+            | Self::TimedOut { .. }
+            | Self::Analyzing { .. }
+            | Self::Ended => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
             Self::Refused { .. } if self.is_retryable_refusal() => {
                 ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
             }
@@ -249,6 +270,9 @@ impl Fault for EngineFault {
                     Self::CapabilityAbsent { capability } => {
                         context.push(ErrorContext::new("capability", capability.clone()));
                     }
+                    Self::Analyzing { attempts } => {
+                        context.push(ErrorContext::new("attempts", attempts.to_string()));
+                    }
                     _ => {}
                 }
                 context
@@ -286,6 +310,7 @@ pub struct EngineSession {
     root: TreeRoot,
     request_timeout: Duration,
     published: BTreeMap<ProjectPath, Vec<Diagnostic>>,
+    progress: Vec<ProgressToken>,
     document_version: i32,
     ended: bool,
 }
@@ -343,6 +368,7 @@ impl EngineSession {
             root,
             request_timeout: launch.request_timeout,
             published: BTreeMap::new(),
+            progress: Vec::new(),
             document_version: 0,
             ended: false,
         };
@@ -366,6 +392,23 @@ impl EngineSession {
     #[must_use]
     pub fn root(&self) -> &TreeRoot {
         &self.root
+    }
+
+    /// Whether the engine began work-done progress it has not ended.
+    ///
+    /// An engine loading a project reports that work over `$/progress`,
+    /// beginning a token through `window/workDoneProgress/create` and
+    /// ending it when the work is done. An answer the engine gives while
+    /// a token is outstanding is provisional: the same request may answer
+    /// differently once the work ends, so the holder may send it again.
+    ///
+    /// The record only holds what the session has read, and the session
+    /// reads only while a call runs, so the query answers the state as of
+    /// the most recent answer. An engine that reports no progress at all
+    /// never reads as analyzing, and its answers are final at once.
+    #[must_use]
+    pub fn is_analyzing(&self) -> bool {
+        !self.progress.is_empty()
     }
 
     /// Opens one document with the text the caller hands in.
@@ -779,12 +822,18 @@ impl EngineSession {
         self.stdin.flush().await.map_err(|_| closed())
     }
 
-    /// Retains one published-diagnostics notification, bounded; every
+    /// Records the two notifications the session keeps state for; every
     /// other notification is consumed without record.
     fn record_notification(&mut self, method: &str, params: Option<Value>) {
-        if method != PublishDiagnostics::METHOD {
-            return;
+        match method {
+            PublishDiagnostics::METHOD => self.record_published(params),
+            Progress::METHOD => self.record_progress(params),
+            _ => {}
         }
+    }
+
+    /// Retains one published-diagnostics notification, bounded.
+    fn record_published(&mut self, params: Option<Value>) {
         let Ok(published) =
             serde_json::from_value::<PublishDiagnosticsParams>(params.unwrap_or(Value::Null))
         else {
@@ -794,6 +843,25 @@ impl EngineSession {
             return;
         };
         retain_published(&mut self.published, path, published.diagnostics);
+    }
+
+    /// Records what one `$/progress` notification says about its token.
+    ///
+    /// A begin or a report leaves the token outstanding; an end retires
+    /// it. A report on a token no begin announced still counts as work
+    /// running, because the report is itself the engine saying so.
+    fn record_progress(&mut self, params: Option<Value>) {
+        let Ok(progress) = serde_json::from_value::<ProgressParams>(params.unwrap_or(Value::Null))
+        else {
+            return;
+        };
+        let ProgressParamsValue::WorkDone(work) = progress.value;
+        match work {
+            WorkDoneProgress::Begin(_) | WorkDoneProgress::Report(_) => {
+                retain_progress(&mut self.progress, progress.token);
+            }
+            WorkDoneProgress::End(_) => self.progress.retain(|held| held != &progress.token),
+        }
     }
 
     /// The file URI for one project path, as an engine fault on refusal.
@@ -854,6 +922,19 @@ fn retain_published(
     }
     diagnostics.truncate(DOCUMENT_DIAGNOSTICS_MAX);
     record.insert(path, diagnostics);
+}
+
+/// Records one work-done progress token as outstanding, bounded.
+///
+/// A token already outstanding stays as it is, and a new token past
+/// [`PROGRESS_TOKENS_MAX`] is dropped: the record is already non-empty,
+/// so the session reads as analyzing either way, and an end for the
+/// dropped token retires nothing.
+fn retain_progress(record: &mut Vec<ProgressToken>, token: ProgressToken) {
+    if record.len() >= PROGRESS_TOKENS_MAX || record.contains(&token) {
+        return;
+    }
+    record.push(token);
 }
 
 /// Refuses the operation when the engine was advertised without it.
@@ -1116,6 +1197,12 @@ mod tests {
                 "textDocument/diagnostic",
             ),
             (
+                EngineFault::Analyzing { attempts: 8 },
+                ErrorCode::TemporarilyUnavailable,
+                false,
+                "attempts 8",
+            ),
+            (
                 EngineFault::Ended,
                 ErrorCode::TemporarilyUnavailable,
                 false,
@@ -1228,6 +1315,30 @@ mod tests {
             record.get(&path(0)).map(Vec::len),
             Some(DOCUMENT_DIAGNOSTICS_MAX),
             "a retained document is replaced and truncated at the bound"
+        );
+    }
+
+    #[test]
+    fn progress_record_retires_ended_tokens_and_stays_bounded() {
+        let token = |index: usize| ProgressToken::String(format!("rift/work/{index}"));
+        let mut record = Vec::new();
+        retain_progress(&mut record, token(0));
+        retain_progress(&mut record, token(0));
+        assert_eq!(
+            record.len(),
+            1,
+            "a token already outstanding is not doubled"
+        );
+        record.retain(|held| held != &token(0));
+        assert!(record.is_empty(), "an ended token retires");
+        for index in 0..PROGRESS_TOKENS_MAX {
+            retain_progress(&mut record, token(index));
+        }
+        retain_progress(&mut record, token(PROGRESS_TOKENS_MAX));
+        assert_eq!(
+            record.len(),
+            PROGRESS_TOKENS_MAX,
+            "a token past the bound is dropped"
         );
     }
 

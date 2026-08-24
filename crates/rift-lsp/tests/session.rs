@@ -612,3 +612,70 @@ async fn missing_program_fails_the_launch_with_a_typed_error() {
         .expect_err("the program cannot be found");
     assert!(matches!(error.fault(), EngineFault::LaunchFailed { .. }));
 }
+
+/// The session reads the engine's `$/progress` traffic and answers whether
+/// work is outstanding.
+///
+/// The engine mints its token and begins work right after initialize, so
+/// nothing is outstanding until a later exchange pumps those messages: the
+/// first pull reads the create request, answers it, reads the begin, and
+/// then answers with no items - the shape a loading engine produces. The
+/// `didOpen` before it adds a report, and the rename ends the token, so
+/// the session reads as analyzing between them and settled after.
+#[tokio::test]
+async fn work_done_progress_decides_whether_the_engine_is_analyzing() {
+    let (_workspace, mut session) = started("reports-progress").await;
+    let document = path("src/lib.rs");
+    assert!(
+        !session.is_analyzing(),
+        "a session that has read no progress is never analyzing"
+    );
+
+    session
+        .open(&document, "rust", "fn a() {}\n".to_owned())
+        .await
+        .expect("didOpen is sent");
+    let pulled = session
+        .pull_diagnostics(&document)
+        .await
+        .expect("the loading engine answers its pull");
+    assert!(pulled.is_empty(), "a loading engine reports nothing yet");
+    assert!(
+        session.is_analyzing(),
+        "the begin and report the pull consumed leave the token outstanding"
+    );
+
+    session
+        .rename(
+            &document,
+            Position {
+                line: 0,
+                character: 3,
+            },
+            "renamed",
+        )
+        .await
+        .expect("the rename answers");
+    assert!(
+        !session.is_analyzing(),
+        "the end the rename consumed retires the token"
+    );
+    session.shutdown().await;
+}
+
+/// An engine that never ends its progress keeps reading as analyzing, so
+/// every answer it gives stays provisional.
+#[tokio::test]
+async fn progress_that_never_ends_keeps_the_engine_analyzing() {
+    let (_workspace, mut session) = started("never-ends-progress").await;
+    let document = path("src/lib.rs");
+    for _pull in 0..3 {
+        let pulled = session
+            .pull_diagnostics(&document)
+            .await
+            .expect("the loading engine answers its pull");
+        assert!(pulled.is_empty());
+        assert!(session.is_analyzing());
+    }
+    session.shutdown().await;
+}

@@ -19,6 +19,17 @@ const READ_BYTES: usize = 8 << 10;
 /// Bytes of standard error the flooding behavior writes.
 const FLOOD_BYTES: usize = 1 << 20;
 
+/// The work-done progress token the progress behaviors mint.
+const PROGRESS_TOKEN: &str = "fake/analysis";
+
+/// Behaviors that begin work-done progress as soon as they initialize.
+///
+/// Each mints [`PROGRESS_TOKEN`] through `window/workDoneProgress/create`
+/// and begins it, exactly as a language server loading a project does.
+/// `reports-progress` ends the token before it answers a rename;
+/// `never-ends-progress` never ends it at all.
+const PROGRESS_BEHAVIORS: &[&str] = &["reports-progress", "never-ends-progress"];
+
 fn main() {
     let behavior = std::env::args().nth(1).unwrap_or_default();
     match behavior.as_str() {
@@ -103,6 +114,9 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput) {
             if behavior == "happy" {
                 send_unretained_notifications();
             }
+            if PROGRESS_BEHAVIORS.contains(&behavior) {
+                begin_progress();
+            }
         }
         "initialized" => match behavior {
             "deaf" => park(),
@@ -115,7 +129,12 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput) {
                 std::process::exit(0);
             }
         }
-        "textDocument/didOpen" => publish_open_diagnostics(behavior, message),
+        "textDocument/didOpen" => {
+            publish_open_diagnostics(behavior, message);
+            if PROGRESS_BEHAVIORS.contains(&behavior) {
+                report_progress();
+            }
+        }
         "textDocument/rename" => answer_rename(behavior, message, input),
         "textDocument/prepareRename" => respond(
             id,
@@ -131,16 +150,17 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput) {
                 &json!({"changes": {(new_uri.as_str().unwrap_or_default()): []}}),
             );
         }
-        "textDocument/diagnostic" => {
-            if behavior == "server-requests" {
-                respond(id, &json!({"kind": "unchanged", "resultId": "1"}));
-            } else {
-                respond(
-                    id,
-                    &json!({"kind": "full", "items": [diagnostic("pulled diagnostic")]}),
-                );
+        "textDocument/diagnostic" => match behavior {
+            "server-requests" => respond(id, &json!({"kind": "unchanged", "resultId": "1"})),
+            _ if PROGRESS_BEHAVIORS.contains(&behavior) => {
+                // An engine still loading answers cleanly and says nothing.
+                respond(id, &json!({"kind": "full", "items": []}));
             }
-        }
+            _ => respond(
+                id,
+                &json!({"kind": "full", "items": [diagnostic("pulled diagnostic")]}),
+            ),
+        },
         _ => {}
     }
 }
@@ -175,6 +195,7 @@ fn initialize_answer(behavior: &str) -> Value {
 fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput) {
     match behavior {
         "exit-mid-request" => std::process::exit(0),
+        "reports-progress" => end_progress(),
         "stderr-flood" => {
             let flood = vec![b'f'; FLOOD_BYTES];
             std::io::stderr()
@@ -268,6 +289,40 @@ fn verify_client_answer(answer: &Value) {
         _ => false,
     };
     assert!(verdict, "client answer broke the routing policy: {answer}");
+}
+
+/// Mints the progress token and begins work on it.
+///
+/// The create request is sent without waiting for its answer: the client
+/// is not reading at this point in the handshake, and it answers the
+/// request during its next exchange, exactly as a real client does.
+fn begin_progress() {
+    print_message(&json!({
+        "jsonrpc": "2.0",
+        "id": 80,
+        "method": "window/workDoneProgress/create",
+        "params": {"token": PROGRESS_TOKEN},
+    }));
+    print_progress(&json!({"kind": "begin", "title": "loading the project"}));
+}
+
+/// Reports continued work on the progress token.
+fn report_progress() {
+    print_progress(&json!({"kind": "report", "message": "indexing"}));
+}
+
+/// Ends the progress token: the work the engine announced is done.
+fn end_progress() {
+    print_progress(&json!({"kind": "end", "message": "project loaded"}));
+}
+
+/// Sends one `$/progress` notification for the minted token.
+fn print_progress(value: &Value) {
+    print_message(&json!({
+        "jsonrpc": "2.0",
+        "method": "$/progress",
+        "params": {"token": PROGRESS_TOKEN, "value": value},
+    }));
 }
 
 /// Publishes one diagnostic for the opened document, happy path only.
