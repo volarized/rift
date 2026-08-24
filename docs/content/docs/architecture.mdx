@@ -557,14 +557,13 @@ a write per site, and finding every site is reference resolution - a semantic fa
   `}
 />
 
-The server treats an engine's answer as unsettled until the engine says it has stopped working.
-A language server answers from the moment it initializes and answers wrongly until it has loaded
-the project - rust-analyzer refuses a rename with `No references found at position` for a
-declaration it has not indexed - and it announces that work over LSP's `$/progress`. While the
-work is outstanding the server discards what came back and asks the engine again, under that
-engine's [`retry`](/docs/configuration#engines) table; it does the same for a refusal LSP marks
+A language server answers from the moment it initializes, and answers wrongly until it has
+loaded the project: rust-analyzer refuses a rename with `No references found at position` for a
+declaration it has not indexed yet. It announces that load over LSP's `$/progress`, and while
+the work is outstanding the server discards what came back and asks the engine again, under that
+engine's [`retry`](/docs/configuration#engines) table. It does the same for a refusal LSP marks
 as re-askable, and it replaces an engine that died mid-request under `restart`. Whatever tool
-asked, nothing below this point sees a provisional answer.
+asked, nothing below this point sees an answer the engine gave while it was still working.
 
 When the whole budget is spent, a rename or a move fails `temporarily_unavailable` with the tree
 untouched, so the caller can send the same request again once the engine has loaded.
@@ -622,9 +621,9 @@ found 2`, under its own code `E0107`.
 
 A pull the engine answers while it is still loading the project comes back empty, and so does a
 pull over code that is genuinely clean. The server tells the two apart from the engine's own
-`$/progress` traffic and pulls again while the engine has work outstanding, so the findings that
-ride the summary are the ones the engine reached with the project loaded. Clean bytes cost
-nothing extra: an engine with no work outstanding has already settled.
+`$/progress` traffic: while the engine has work outstanding its answer is provisional, and the
+server pulls again under that engine's [`retry`](/docs/configuration#engines) table. Clean bytes
+cost nothing extra, because an engine with no work outstanding has already settled.
 
 An engine that advertises no pull contributes nothing and says nothing about it, because a
 capability the engine never advertised is not a failure. typescript-language-server is that case:
