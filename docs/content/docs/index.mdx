@@ -103,6 +103,10 @@ interleaved bytes:
   witnessed address from `nodes`; a stale witness refuses with the expected and observed values.
 - [`patch`](/docs/protocol/mcp#tool-patch) applies unified-diff hunks, several files in one
   change; a context mismatch refuses and the tree stays untouched.
+- [`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol) renames a declaration and every
+  reference the configured [language engine](/docs/configuration#engines) resolves.
+- [`move_file`](/docs/protocol/mcp#tool-move_file) moves one file, and an engine that supports it
+  updates the imports that pointed at the old path.
 
 A change that cannot land returns a refusal naming the failed precondition, and the tree is
 untouched. After a change applies, the server re-parses what it touched and reports parser

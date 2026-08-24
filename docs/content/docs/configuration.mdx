@@ -16,9 +16,9 @@ An editor that supports TOML schema directives can load the generated schema:
 #:schema https://volar.sh/rift/rift.schema.json
 ```
 
-Treat `rift.toml` as executable workspace configuration: hooks a repository names run with the
-server's OS permissions after each applied change. Inspect the file before running Rift in a
-cloned repository.
+Treat `rift.toml` as executable workspace configuration: the hooks a repository names run with
+the server's OS permissions after each applied change, and the engines it names start with them.
+Inspect the file before running Rift in a cloned repository.
 
 Each section's example shows its keys at their defaults. Durations take `ms`, `s`, `m`, `h`, or
 `d`; byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
@@ -187,6 +187,96 @@ With `embedding` set, the server embeds indexed declarations and fuses cosine si
 the lexical score. The server stores vectors per model - two models' vectors aren't
 comparable - so changing the value rebuilds the dense index. Leaving the key out keeps search
 lexical.
+
+## Engines
+
+<VersionBadge version="v0.0.14" />
+
+A [language engine](/docs/architecture#semantics) is an external language server Rift starts for
+the workspace and speaks LSP to. Each `[engines.<name>]` table names one program, the languages
+it serves, and the bounds Rift holds it to;
+[`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol) and
+[`move_file`](/docs/protocol/mcp#tool-move_file) refuse `unsupported` for a language no table
+claims, so the entry is what turns those tools on:
+
+```toml
+[engines.rust]
+program = "rust-analyzer"
+arguments = []
+languages = ["rust"]
+environment = {}
+startup_timeout = "30s"
+request_timeout = "1m"
+output_limit = "4kb"
+```
+
+`program` and `languages` have no default, `initialization_options` is absent unless you write
+it, and the other keys are shown at theirs.
+
+- `program` - refuses an absolute path; a bare name resolves through the `PATH` of the
+  environment the engine runs with - the server's, with `environment` applied on top
+- `arguments` - the program's literal arguments, in order; may be empty, and holds at most 64
+- `environment` - values added on top of the environment the server inherited
+- `languages` - the language identity segments this engine answers for, 1 to 16 of them; each
+  segment belongs to one engine across the whole table
+- `initialization_options` - a JSON object handed to the engine in its initialize request; Rift
+  passes it through untouched and the engine defines what the keys mean
+- `startup_timeout` - bounds the initialize handshake, 1s to 10m; an engine that doesn't finish
+  it in time is killed
+- `request_timeout` - bounds each later request, 1s to 10m
+- `output_limit` - bytes of the engine's standard error Rift keeps, 1kb to 8mb; Rift still
+  reports the full size, so you can tell a truncated log from a short one
+
+The table holds at most 16 engines. The server starts one on the first request for a language it
+serves and keeps the session across later requests, because a language server pays for its
+project load once and answers from it afterwards.
+
+A `languages` entry is a language identity segment: a bare name such as `rust`, or
+`name:dialect` to pin one dialect. Segments are how a symbol address spells its language, and a
+declaration in a `.tsx` file is addressed under the dialect -
+`rift://symbol/typescript:tsx/view.tsx/Banner`.
+
+The server looks the engine up by that exact segment, so an engine that should serve those
+declarations lists the dialect beside the bare name:
+`languages = ["typescript", "typescript:tsx"]`. Without the dialect entry the same rename
+refuses `unsupported`.
+
+A segment no syntax provider knows is accepted, because the engine tier may serve a language the
+syntax tier does not. A misspelled segment therefore fails nothing at load and simply never
+matches an address.
+
+An engine that ships as a package runs through its package runner. This table serves both
+TypeScript dialects through `bunx`, with the language server version pinned so a registry
+publish can't move it under you:
+
+```toml
+[source]
+exclude = ["node_modules/**"]
+
+[engines.typescript]
+program = "bunx"
+arguments = ["typescript-language-server@6.0.0", "--stdio"]
+languages = ["typescript", "typescript:tsx"]
+
+[engines.typescript.initialization_options.tsserver]
+useSyntaxServer = "never"
+```
+
+typescript-language-server refuses its initialize request unless a `typescript` package resolves
+from the workspace root, answering `Could not find a valid TypeScript installation`. Install that
+package in the workspace, or name an existing one with the `tsserver.path` initialization option;
+without either, every rename and move for the language fails on the engine's own words.
+
+`[source] exclude` keeps the installed package directory out of the index. Without it the walk
+reaches `typescript`'s own sources and the first change fails with `limit_exceeded` on
+`node_modules/typescript/lib/_tsc.js`, which is past the index's per-file byte bound. Any
+workspace with an installed package directory needs the same entry.
+
+`tsserver.useSyntaxServer = "never"` keeps the engine to one semantic server. Under the default
+`auto` it also runs a syntax-only server, and that one can answer the first rename after startup
+from the open file alone - the observed cold answer renamed the declaration and left both
+importers standing. With one semantic server the rename waits for the loaded project and reaches
+every file.
 
 ## Hooks
 

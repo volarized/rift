@@ -38,10 +38,10 @@ installer resolves the latest release.
 
 ## MCP
 
-Run `rift mcp` from a Rust codebase. Rift exposes structured reads (`search`, `get_symbol`,
-`nodes`) and precondition-guarded changes (`replace_symbol`, `insert_symbol`, `replace_node`,
-`patch`) over stdio MCP. Later reads include edits made through Rift or another filesystem tool,
-such as a formatter.
+Run `rift mcp` from a codebase. Rift exposes structured reads (`search`, `get_symbol`, `nodes`)
+and precondition-guarded changes (`replace_symbol`, `insert_symbol`, `replace_node`, `patch`,
+`rename_symbol`, `move_file`) over stdio MCP. Later reads include edits made through Rift or
+another filesystem tool, such as a formatter.
 
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration
 uses `rift` as command and `["mcp"]` as arguments.

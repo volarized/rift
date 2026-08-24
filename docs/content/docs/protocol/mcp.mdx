@@ -324,6 +324,21 @@ support.
 A hunk that resolves nowhere refuses with `unmet_precondition`, naming the failed hunk's
 ordinal, the file line the search reached, and the context it expected against what stood there.
 
+<McpTool name="rename_symbol" />
+
+The [language engine](/docs/architecture#semantic-edits) configured for the symbol's language
+proposes the edit set; the server compiles that proposal into the same witnessed rewrites every
+change tool produces. A language no [`[engines]`](/docs/configuration#engines) table claims
+refuses as `unsupported`, and an engine that declines the new name refuses as
+`unmet_precondition` carrying the engine's own words. After the change applies, the server sweeps
+the tree for surviving occurrences of the old name and reports each one as a warning.
+
+<McpTool name="move_file" />
+
+An engine advertising `workspace/willRenameFiles` proposes the reference updates, and they land
+with the move as one change. Without such an engine the file still moves, and the result carries
+a warning saying references were not updated.
+
 ### Change results
 
 The change tools return the same `ChangeResult`. A request whose shape is wrong - an
