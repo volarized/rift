@@ -131,11 +131,18 @@ pub fn claim(root: &Path) -> Result<ElectionGuard, ElectionError> {
         .open(&election_path)
         .map_err(|error| ElectionFault::storage("open election file", &election_path, error))?;
     match election_file.try_lock() {
-        Ok(()) => Ok(ElectionGuard {
-            election_file,
-            document_path: state_directory.join(SERVER_LOCK_FILE_NAME),
-            state_directory,
-        }),
+        Ok(()) => {
+            let guard = ElectionGuard {
+                election_file,
+                document_path: document_path(root),
+                state_directory,
+            };
+            // The free election proves any leftover document stale. Scrub it
+            // now, before serving starts, so a concurrent probe cannot pair
+            // the previous holder's document with this holder's lock.
+            guard.retire();
+            Ok(guard)
+        }
         Err(TryLockError::WouldBlock) => Err(Error::new(ElectionFault::AlreadyServing)),
         Err(TryLockError::Error(error)) => Err(ElectionFault::storage(
             "lock election file",
@@ -276,10 +283,15 @@ pub fn probe(root: &Path) -> ServerPresence {
     }
 }
 
+/// The workspace's lock document path, `.rift/server.json` below `root`.
+#[must_use]
+pub fn document_path(root: &Path) -> PathBuf {
+    root.join(RIFT_STATE_DIRECTORY).join(SERVER_LOCK_FILE_NAME)
+}
+
 /// The published document when it exists, parses, and validates.
 fn published_document(root: &Path) -> Result<ServerLock, ServerPresence> {
-    let document_path = root.join(RIFT_STATE_DIRECTORY).join(SERVER_LOCK_FILE_NAME);
-    let bytes = match std::fs::read(&document_path) {
+    let bytes = match std::fs::read(document_path(root)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(ServerPresence::Absent);
@@ -525,6 +537,25 @@ mod tests {
         assert_eq!(refused.descriptor().code(), "server_already_serving");
         drop(first);
         let _reclaimed = claim(directory.path())?;
+        Ok(())
+    }
+
+    /// A free election proves any leftover document stale, so the claim
+    /// scrubs it before serving starts and a probe in the claim-to-publish
+    /// window reads absence, never the previous holder's facts.
+    #[test]
+    fn claim_scrubs_the_previous_holder_document() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join(".rift"))?;
+        fs::write(
+            document_path(directory.path()),
+            serde_json::to_vec(&valid_document())?,
+        )?;
+        let _guard = claim(directory.path())?;
+        assert!(
+            !document_path(directory.path()).exists(),
+            "the claim must scrub the leftover document"
+        );
         Ok(())
     }
 
