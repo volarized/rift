@@ -172,32 +172,162 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
                 }),
             ),
         },
-        "workspace/willRenameFiles" => {
+        "workspace/willRenameFiles" => answer_will_rename(behavior, message, state),
+        "textDocument/diagnostic" => answer_diagnostic(behavior, id),
+        _ => {}
+    }
+}
+
+/// Answers one will-rename request under the selected behavior.
+fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
+    let id = &message["id"];
+    match behavior {
+        "parks-on-move" => park(),
+        "moves-null" => respond(id, &Value::Null),
+        "moves-outside-root" => {
+            let edit = json!({"range": zero_range(), "newText": "moved"});
+            respond(
+                id,
+                &json!({"changes": {"file:///rift-elsewhere/out.rs": [edit]}}),
+            );
+        }
+        "moves-imports" => respond(id, &stem_rename_answer(message, state)),
+        _ => {
             let new_uri = message["params"]["files"][0]["newUri"].clone();
             respond(
                 id,
                 &json!({"changes": {(new_uri.as_str().unwrap_or_default()): []}}),
             );
         }
-        "textDocument/diagnostic" => {
-            if behavior == "server-requests" {
-                respond(id, &json!({"kind": "unchanged", "resultId": "1"}));
-            } else {
-                respond(
-                    id,
-                    &json!({"kind": "full", "items": [diagnostic("pulled diagnostic")]}),
-                );
-            }
-        }
-        _ => {}
     }
 }
 
+/// Answers one diagnostic pull under the selected behavior.
+///
+/// The default is a full report with no items, so applied-change pulls in
+/// unrelated tests stay clean; the scripted behaviors return items, an
+/// unchanged report, or death mid-request.
+fn answer_diagnostic(behavior: &str, id: &Value) {
+    match behavior {
+        "server-requests" => respond(id, &json!({"kind": "unchanged", "resultId": "1"})),
+        "happy" => respond(
+            id,
+            &json!({"kind": "full", "items": [diagnostic("pulled diagnostic")]}),
+        ),
+        "diagnostic-severities" | "renames-word-diagnostics" => {
+            respond(id, &json!({"kind": "full", "items": severity_items()}));
+        }
+        "diagnostic-flood" => {
+            let items: Vec<Value> = (0..32)
+                .map(|index| diagnostic(&format!("flood {index}")))
+                .collect();
+            respond(id, &json!({"kind": "full", "items": items}));
+        }
+        "dies-on-diagnostic" => std::process::exit(0),
+        _ => respond(id, &json!({"kind": "full", "items": []})),
+    }
+}
+
+/// One item per LSP severity, plus a string and a numeric code.
+fn severity_items() -> Vec<Value> {
+    vec![
+        json!({
+            "range": zero_range(),
+            "severity": 1,
+            "code": "E100",
+            "message": "scripted error",
+        }),
+        json!({"range": zero_range(), "severity": 2, "message": "scripted warning"}),
+        json!({
+            "range": zero_range(),
+            "severity": 3,
+            "code": 7,
+            "message": "scripted information",
+        }),
+        json!({"range": zero_range(), "severity": 4, "message": "scripted hint"}),
+    ]
+}
+
+/// The stem-rename proposal for one will-rename request: every
+/// word-boundary occurrence of the old file stem becomes the new stem,
+/// across the root's `.rs` files read from disk. Edits for the moved file
+/// itself ride under its old URI.
+fn stem_rename_answer(message: &Value, state: &EngineState) -> Value {
+    let old_uri = message["params"]["files"][0]["oldUri"]
+        .as_str()
+        .unwrap_or_default();
+    let new_uri = message["params"]["files"][0]["newUri"]
+        .as_str()
+        .unwrap_or_default();
+    let old_stem = file_stem(old_uri);
+    let new_stem = file_stem(new_uri);
+    let mut changes = serde_json::Map::new();
+    for path in rust_files(&state.root) {
+        let path_uri = format!("file://{}", path.display());
+        let text = std::fs::read_to_string(&path).expect("fake engine reads sources");
+        let edits = word_edits(&text, &old_stem, &new_stem);
+        if !edits.is_empty() {
+            changes.insert(path_uri, Value::Array(edits));
+        }
+    }
+    json!({ "changes": changes })
+}
+
+/// The final path segment of one URI, without its extension.
+fn file_stem(uri: &str) -> String {
+    let name = uri.rsplit('/').next().unwrap_or_default();
+    name.rsplit_once('.')
+        .map_or(name, |(stem, _)| stem)
+        .to_owned()
+}
+
 /// The initialize result each behavior advertises.
+///
+/// The shaped arms cover the capability grid a live engine pair exhibits:
+/// `no-file-operations` advertises pulls without will-rename (the ty
+/// shape), `no-pull-diagnostics` advertises will-rename without pulls at
+/// the UTF-16 default (the typescript-language-server shape), and
+/// `python-filters` advertises will-rename filters that cover no `.rs`
+/// file.
 fn initialize_answer(behavior: &str) -> Value {
     match behavior {
         "no-rename-capability" => json!({"capabilities": {}}),
         "bad-encoding" => json!({"capabilities": {"positionEncoding": "utf-32"}}),
+        "no-file-operations" => json!({
+            "capabilities": {
+                "positionEncoding": "utf-8",
+                "renameProvider": {"prepareProvider": true},
+                "diagnosticProvider": {
+                    "identifier": "fake",
+                    "interFileDependencies": false,
+                    "workspaceDiagnostics": false,
+                },
+            },
+        }),
+        "no-pull-diagnostics" => json!({
+            "capabilities": {
+                "renameProvider": {"prepareProvider": true},
+                "workspace": {
+                    "fileOperations": {
+                        "willRename": {
+                            "filters": [{"pattern": {"glob": "**/*"}}],
+                        },
+                    },
+                },
+            },
+        }),
+        "python-filters" => json!({
+            "capabilities": {
+                "positionEncoding": "utf-8",
+                "workspace": {
+                    "fileOperations": {
+                        "willRename": {
+                            "filters": [{"pattern": {"glob": "**/*.py"}}],
+                        },
+                    },
+                },
+            },
+        }),
         _ => json!({
             "capabilities": {
                 "positionEncoding": "utf-8",
@@ -232,7 +362,7 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state
             );
             return;
         }
-        "renames-word" => {
+        "renames-word" | "renames-word-diagnostics" => {
             respond(&message["id"], &word_rename_answer(message, state));
             return;
         }
