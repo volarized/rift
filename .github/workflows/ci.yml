@@ -181,10 +181,13 @@ jobs:
 
   # The live-engine suites against real language servers. One job owns
   # every engine-live suite, so every engine's resolver installs here:
-  # rustup serves rust-analyzer today, and bun waits for the typescript
-  # suite. rust-analyzer needs no display and no network; it does need
-  # cargo metadata to succeed inside the fixture, and every fixture is a
-  # self-contained cargo project in a tempdir.
+  # rustup serves rust-analyzer and bun serves typescript-language-server.
+  # rust-analyzer needs no display and no network; it does need cargo
+  # metadata to succeed inside the fixture, and every fixture is a
+  # self-contained cargo project in a tempdir. The typescript fixtures are
+  # bun projects, installed from a committed lockfile into their own
+  # tempdirs; the pre-warm step below keeps the registry out of the test
+  # run itself.
   engines:
     runs-on: ubuntu-latest
     permissions:
@@ -207,4 +210,13 @@ jobs:
       # too. Adding an installed component again is a no-op.
       - run: rustup component add rust-analyzer
         working-directory: ${{ runner.temp }}
+      # Both halves of the typescript engine land in bun's cache first:
+      # the package the fixtures install from their lockfile, and the
+      # pinned server every fixture starts through bunx. The lockfile is
+      # copied out of the checkout, so no install writes into it.
+      - run: |
+          cp crates/rift-mcp/tests/fixtures/typescript/package.json \
+             crates/rift-mcp/tests/fixtures/typescript/bun.lock "$RUNNER_TEMP"
+          bun install --frozen-lockfile --cwd "$RUNNER_TEMP"
+          bunx typescript-language-server@6.0.0 --version
       - run: just engine-test
