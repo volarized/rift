@@ -352,6 +352,94 @@ pub fn declare_hook_ranges(schema: &mut Schema) {
     }
 }
 
+/// An [`EngineConfiguration`](crate::configuration::EngineConfiguration)
+/// states its `Duration` and `ByteSize` ceilings as `rift:range` on their
+/// keys: schema validation alone cannot compare `"30s"` or `"4kb"` against
+/// a ceiling, so the server enforces the bound at load and the schema
+/// carries it for readers.
+pub fn declare_engine_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ByteSize, Duration, ENGINE_OUTPUT_BYTES_MAX, ENGINE_OUTPUT_BYTES_MIN,
+        ENGINE_REQUEST_TIMEOUT_MS_MAX, ENGINE_REQUEST_TIMEOUT_MS_MIN,
+        ENGINE_STARTUP_TIMEOUT_MS_MAX, ENGINE_STARTUP_TIMEOUT_MS_MIN, EngineConfiguration,
+    };
+    let ranges = [
+        (
+            property!(EngineConfiguration, startup_timeout),
+            range(
+                &Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MIN),
+                &Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MAX),
+            ),
+        ),
+        (
+            property!(EngineConfiguration, request_timeout),
+            range(
+                &Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MIN),
+                &Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MAX),
+            ),
+        ),
+        (
+            property!(EngineConfiguration, output_limit),
+            range(
+                &ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MIN),
+                &ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MAX),
+            ),
+        ),
+    ];
+    for (name, accepted) in ranges {
+        annotate_property(schema, name, RIFT_RANGE, accepted);
+    }
+}
+
+/// A [`RetryPolicy`](crate::retry::RetryPolicy) states its `Duration`
+/// bounds as `rift:range` on their keys: schema validation alone cannot
+/// compare `"250ms"` against a ceiling, so the server enforces the bounds
+/// at load and the schema carries them for readers.
+pub fn declare_retry_ranges(schema: &mut Schema) {
+    use crate::configuration::Duration;
+    use crate::retry::{
+        RETRY_DELAY_LIMIT_MS_MAX, RETRY_DELAY_LIMIT_MS_MIN, RETRY_DELAY_MS_MAX, RETRY_DELAY_MS_MIN,
+        RetryPolicy,
+    };
+    let ranges = [
+        (
+            property!(RetryPolicy, delay),
+            range(
+                &Duration::from_millis(RETRY_DELAY_MS_MIN),
+                &Duration::from_millis(RETRY_DELAY_MS_MAX),
+            ),
+        ),
+        (
+            property!(RetryPolicy, delay_limit),
+            range(
+                &Duration::from_millis(RETRY_DELAY_LIMIT_MS_MIN),
+                &Duration::from_millis(RETRY_DELAY_LIMIT_MS_MAX),
+            ),
+        ),
+    ];
+    for (name, accepted) in ranges {
+        annotate_property(schema, name, RIFT_RANGE, accepted);
+    }
+}
+
+/// A [`RestartPolicy`](crate::retry::RestartPolicy) states its `Duration`
+/// bounds as `rift:range` on the key: schema validation alone cannot
+/// compare `"5m"` against a ceiling, so the server enforces the bounds at
+/// load and the schema carries them for readers.
+pub fn declare_restart_ranges(schema: &mut Schema) {
+    use crate::configuration::Duration;
+    use crate::retry::{RESTART_WINDOW_MS_MAX, RESTART_WINDOW_MS_MIN, RestartPolicy};
+    annotate_property(
+        schema,
+        property!(RestartPolicy, window),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(RESTART_WINDOW_MS_MIN),
+            &Duration::from_millis(RESTART_WINDOW_MS_MAX),
+        ),
+    );
+}
+
 /// An [`ErrorData`](crate::error::ErrorData) carries `limit` only when
 /// `code` is `limit_exceeded`; any other code forbids it.
 pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
@@ -702,6 +790,23 @@ mod tests {
     }
 
     #[test]
+    fn engine_configuration_schema_states_ranges_on_each_bounded_key() {
+        let schema = serde_json::to_value(schema_for!(crate::configuration::EngineConfiguration))
+            .expect("schema");
+        let cases = [
+            ("startup_timeout", json!({ "min": "1s", "max": "10m" })),
+            ("request_timeout", json!({ "min": "1s", "max": "10m" })),
+            ("output_limit", json!({ "min": "1kb", "max": "8mb" })),
+        ];
+        for (name, accepted) in cases {
+            assert_eq!(
+                schema["properties"][name][RIFT_RANGE], accepted,
+                "{name} must state its accepted range"
+            );
+        }
+    }
+
+    #[test]
     fn insert_symbol_addresses_one_target_states_exclusive_composition() {
         let mut schema = schema_from(json!({}));
         insert_symbol_addresses_one_target(&mut schema);
@@ -730,7 +835,13 @@ mod tests {
     /// proves serde serves it under the same name, closing the rename gap.
     #[test]
     fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 8] = [
+        let cases: [(&str, Value, &[&str]); 9] = [
+            (
+                "EngineConfiguration",
+                serde_json::to_value(schema_for!(crate::configuration::EngineConfiguration))
+                    .expect("schema"),
+                &["startup_timeout", "request_timeout", "output_limit"],
+            ),
             (
                 "GetSymbolParams",
                 serde_json::to_value(schema_for!(crate::read::GetSymbolParams)).expect("schema"),

@@ -2,6 +2,7 @@
 
 mod change;
 mod configuration;
+mod engine;
 mod history;
 mod hook;
 mod patch;
@@ -12,6 +13,7 @@ pub use change::ChangeService;
 pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault, load_configuration,
 };
+pub use engine::{EnginePool, EngineSlot};
 pub use hook::{HookRun, HookStatus, run_hooks};
 pub use read::{ReadError, ReadFault, ReadService};
 pub use rift_core::CapturedStream;

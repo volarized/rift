@@ -16,14 +16,18 @@ percent-encoding.workspace = true
 rift-core.workspace = true
 rift-history.workspace = true
 rift-index.workspace = true
+rift-lsp.workspace = true
 rift-protocol.workspace = true
 rift-provider.workspace = true
 rift-syntax.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+lsp-types.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

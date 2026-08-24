@@ -24,6 +24,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::RiftMcp;
+use crate::server::EngineHold;
 use crate::validation::IndexSupervisor;
 
 /// A route under the server's one API base path, spelled here once.
@@ -153,6 +154,7 @@ pub async fn serve_http(
     let server_table = server.server_configuration().await;
     let idle_timeout = Duration::from_millis(server_table.idle_timeout.milliseconds());
     let supervisor = server.index_supervisor();
+    let engines = server.engine_hold();
     let token = mint_token()?;
     let (port, listener) = bind_loopback_listener(server_table.serving_ports())?;
     let stop = shutdown.child_token();
@@ -177,6 +179,7 @@ pub async fn serve_http(
         serving,
         idle_watch,
         supervisor,
+        engines,
     })
 }
 
@@ -189,6 +192,7 @@ pub struct HttpServer {
     serving: JoinHandle<Result<(), std::io::Error>>,
     idle_watch: JoinHandle<()>,
     supervisor: IndexSupervisor,
+    engines: Arc<EngineHold>,
 }
 
 impl HttpServer {
@@ -226,6 +230,7 @@ impl HttpServer {
         // on every path.
         self.stop.cancel();
         let idle_outcome = self.idle_watch.await;
+        self.engines.shutdown().await;
         let supervisor_outcome = self
             .supervisor
             .shutdown()
