@@ -11,6 +11,7 @@ description = "Generic LSP stdio client for Rift language engines"
 workspace = true
 
 [dependencies]
+globset.workspace = true
 lsp-types.workspace = true
 percent-encoding.workspace = true
 rift-core.workspace = true

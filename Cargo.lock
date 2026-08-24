@@ -2832,6 +2832,7 @@ dependencies = [
 name = "rift-lsp"
 version = "0.0.13"
 dependencies = [
+ "globset",
  "lsp-types",
  "percent-encoding",
  "rift-core",
