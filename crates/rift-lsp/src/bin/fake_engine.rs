@@ -37,12 +37,15 @@ const PROGRESS_TOKEN: &str = "fake/analysis";
 /// `reports-progress` ends the token before it answers a rename,
 /// `analyzes-then-serves` and `refuses-while-analyzing` before the second
 /// rename each is asked for, `analyzes-then-reports` before the second
-/// diagnostic pull, and `never-ends-progress` never ends it at all.
+/// diagnostic pull, `announces-then-answers-nothing` before the
+/// will-rename it answers with `null`, and `never-ends-progress` never
+/// ends it at all.
 const PROGRESS_BEHAVIORS: &[&str] = &[
     "reports-progress",
     "analyzes-then-serves",
     "refuses-while-analyzing",
     "analyzes-then-reports",
+    "announces-then-answers-nothing",
     "never-ends-progress",
 ];
 
@@ -208,11 +211,22 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
 }
 
 /// Answers one will-rename request under the selected behavior.
+///
+/// Every request is recorded in the lifecycle log first, so a test counts
+/// how many times the engine was asked. The default answer is an edit set
+/// holding no edit, which says exactly what a `null` answer says;
+/// `announces-then-answers-nothing` ends the work it announced before
+/// giving that same nothing, so its silence is its own verdict.
 fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
+    record_lifecycle("will-rename");
     let id = &message["id"];
     match behavior {
         "parks-on-move" => park(),
         "moves-null" => respond(id, &Value::Null),
+        "announces-then-answers-nothing" => {
+            end_progress();
+            respond(id, &Value::Null);
+        }
         "moves-outside-root" => {
             let edit = json!({"range": zero_range(), "newText": "moved"});
             respond(
@@ -240,7 +254,8 @@ fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
 /// how many times it was asked off the wire. `analyzes-then-reports`
 /// answers the first pull the way a loading engine does - cleanly and with
 /// nothing to say - and ends its progress before the pull that carries the
-/// finding.
+/// finding; `pulls-empty-then-reports` gives the same first answer without
+/// announcing any work at all.
 fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
     record_lifecycle("diagnostic");
     state.diagnostic_pulls += 1;
@@ -278,6 +293,13 @@ fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
                 &json!({"kind": "full", "items": [diagnostic("settled finding")]}),
             );
         }
+        "pulls-empty-then-reports" if pull == 1 => {
+            respond(id, &json!({"kind": "full", "items": []}));
+        }
+        "pulls-empty-then-reports" => respond(
+            id,
+            &json!({"kind": "full", "items": [diagnostic("settled finding")]}),
+        ),
         "cancels-every-diagnostic" => refuse_pull(id, SERVER_CANCELLED, pull),
         "refuses-diagnostic" => refuse_pull(id, METHOD_NOT_FOUND_CODE, pull),
         _ => respond(id, &json!({"kind": "full", "items": []})),
