@@ -565,6 +565,21 @@ engine's [`retry`](/docs/configuration#engines) table. It does the same for a re
 as re-askable, and it replaces an engine that died mid-request under `restart`. Whatever tool
 asked, nothing below this point sees an answer the engine gave while it was still working.
 
+That wait needs something announced to wait on, and the first request of a session can arrive
+before the first announcement does. An engine that has announced nothing and answers nothing
+looks exactly like one that has finished and has nothing to report:
+`workspace/willRenameFiles` comes back with no edit, `textDocument/diagnostic` with no item, and
+those are the answers a loaded engine gives for a move with no import to rewrite and for a file
+that is clean. So an engine that has never announced any work is asked once more when it answers
+one of those with nothing, after the same `retry` wait. Once per operation, once per engine
+process: an engine that announces nothing at all - typescript-language-server is one - pays that
+resend on its first such answer and nothing afterwards.
+
+The second answer is the engine's answer, empty or not. A move whose engine proposed nothing
+twice applies carrying the `rift.move.references_not_updated` warning that [moving a
+file](#move-a-file) describes, and a pull that reported nothing twice contributes nothing, as it
+does for a file that is clean.
+
 When the whole budget is spent, a rename or a move fails `temporarily_unavailable` with the tree
 untouched, so the caller can send the same request again once the engine has loaded.
 
@@ -608,6 +623,11 @@ the result carries a warning under `rift.move.references_not_updated` saying ref
 updated. Refusing the move instead would trade a gap the caller can see and repair for an error
 it cannot act on.
 
+The same warning names an engine that was asked and proposed nothing twice while it had announced
+no work of its own. A loaded engine that proposes nothing is telling you there is nothing to
+update, and its move carries no warning; one that has never said what it is doing is not, and the
+warning names it so the caller can check the imports itself.
+
 ### Diagnostics on a change
 
 After any change applies - a rename, a move, a [`patch`](/docs/protocol/mcp#tool-patch) - the
@@ -623,7 +643,9 @@ A pull the engine answers while it is still loading the project comes back empty
 pull over code that is genuinely clean. The server tells the two apart from the engine's own
 `$/progress` traffic: while the engine has work outstanding its answer is provisional, and the
 server pulls again under that engine's [`retry`](/docs/configuration#engines) table. Clean bytes
-cost nothing extra, because an engine with no work outstanding has already settled.
+cost nothing extra, because an engine with no work outstanding has already settled - except for
+the one empty report an engine gives before it has announced any work at all, which the server
+pulls a second time.
 
 An engine that advertises no pull contributes nothing and says nothing about it, because a
 capability the engine never advertised is not a failure. typescript-language-server is that case:
