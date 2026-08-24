@@ -2,6 +2,7 @@
 
 mod change;
 mod configuration;
+mod history;
 mod hook;
 mod patch;
 mod read;

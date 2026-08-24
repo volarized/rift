@@ -358,6 +358,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
         )
         .expect_err("missing root must fail");
         let causes = error.wire_causes();

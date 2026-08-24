@@ -35,6 +35,12 @@ fn corpus() -> Vec<(&'static str, Value)> {
             "get_symbol",
             json!({ "name": "beacon", "include_body": false }),
         ),
+        // The fixture's committed baseline serves the timeline: one
+        // `introduced` version from the walk's first commit.
+        (
+            "get_symbol",
+            json!({ "name": "beacon_one", "include_history": true }),
+        ),
         ("search", json!({ "query": "beacon" })),
         ("search", json!({ "query": "beacon", "limit": 1 })),
         (

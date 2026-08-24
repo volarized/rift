@@ -366,8 +366,10 @@ impl RiftMcp {
 
     /// Finds declarations and their source by exact symbol name. Each hit
     /// carries the declaration and its source excerpt; `include_body: false` omits
-    /// both. `rev` serves the lookup from a version-control revision instead of
-    /// the current tree. Use `search` when the name is not exactly known.
+    /// both. `include_history: true` adds each hit's version-control timeline,
+    /// walked from the served revision. `rev` serves the lookup from a
+    /// version-control revision instead of the current tree. Use `search` when
+    /// the name is not exactly known.
     #[tool]
     async fn get_symbol(
         &self,
@@ -543,11 +545,12 @@ impl RiftMcp {
             .tool_error(wire::ErrorPhase::Read));
         }
         let visibility = SourceVisibility::from(&configuration.source);
+        let history = configuration.providers.history.clone();
         let root = self.root.clone();
         let limits = self.limits;
         self.blocking
             .run("revision workspace read", move || {
-                let reads = ReadService::at_revision(&root, &rev, limits, &visibility)?;
+                let reads = ReadService::at_revision(&root, &rev, limits, &visibility, history)?;
                 operation(&reads)
             })
             .await
@@ -792,7 +795,9 @@ impl RiftMcp {
         Self::attach_hook_verdicts(root, &configuration.hooks, summary);
         let visibility = SourceVisibility::from(&configuration.source);
         let text_inclusion = TextFileInclusion::from(&configuration.search);
-        let rebuilt = match ReadService::build(root, limits, &visibility, &text_inclusion) {
+        let history = configuration.providers.history.clone();
+        let rebuilt = match ReadService::build(root, limits, &visibility, &text_inclusion, history)
+        {
             Ok(rebuilt) => rebuilt,
             Err(error) => {
                 summary.diagnostics.push(stale_snapshot_diagnostic(&error));
