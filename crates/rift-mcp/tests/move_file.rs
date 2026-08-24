@@ -6,13 +6,13 @@
 
 #![cfg(unix)]
 
-mod support;
+mod workspace_client;
 
 use std::fs;
 
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use support::{
+use workspace_client::{
     TestResult, call_retrying_acceptance, engine_configuration, served_workspace, tool_request,
 };
 
