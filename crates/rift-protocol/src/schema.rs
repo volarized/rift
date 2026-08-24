@@ -391,6 +391,55 @@ pub fn declare_engine_ranges(schema: &mut Schema) {
     }
 }
 
+/// A [`RetryPolicy`](crate::retry::RetryPolicy) states its `Duration`
+/// bounds as `rift:range` on their keys: schema validation alone cannot
+/// compare `"250ms"` against a ceiling, so the server enforces the bounds
+/// at load and the schema carries them for readers.
+pub fn declare_retry_ranges(schema: &mut Schema) {
+    use crate::configuration::Duration;
+    use crate::retry::{
+        RETRY_DELAY_LIMIT_MS_MAX, RETRY_DELAY_LIMIT_MS_MIN, RETRY_DELAY_MS_MAX, RETRY_DELAY_MS_MIN,
+        RetryPolicy,
+    };
+    let ranges = [
+        (
+            property!(RetryPolicy, delay),
+            range(
+                &Duration::from_millis(RETRY_DELAY_MS_MIN),
+                &Duration::from_millis(RETRY_DELAY_MS_MAX),
+            ),
+        ),
+        (
+            property!(RetryPolicy, delay_limit),
+            range(
+                &Duration::from_millis(RETRY_DELAY_LIMIT_MS_MIN),
+                &Duration::from_millis(RETRY_DELAY_LIMIT_MS_MAX),
+            ),
+        ),
+    ];
+    for (name, accepted) in ranges {
+        annotate_property(schema, name, RIFT_RANGE, accepted);
+    }
+}
+
+/// A [`RestartPolicy`](crate::retry::RestartPolicy) states its `Duration`
+/// bounds as `rift:range` on the key: schema validation alone cannot
+/// compare `"5m"` against a ceiling, so the server enforces the bounds at
+/// load and the schema carries them for readers.
+pub fn declare_restart_ranges(schema: &mut Schema) {
+    use crate::configuration::Duration;
+    use crate::retry::{RESTART_WINDOW_MS_MAX, RESTART_WINDOW_MS_MIN, RestartPolicy};
+    annotate_property(
+        schema,
+        property!(RestartPolicy, window),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(RESTART_WINDOW_MS_MIN),
+            &Duration::from_millis(RESTART_WINDOW_MS_MAX),
+        ),
+    );
+}
+
 /// An [`ErrorData`](crate::error::ErrorData) carries `limit` only when
 /// `code` is `limit_exceeded`; any other code forbids it.
 pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {

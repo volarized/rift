@@ -5,7 +5,10 @@
 //! and closed; the engine's findings ride the change summary, mapped and
 //! bounded. The change already applied, so nothing here refuses or fails
 //! the call: an engine failure degrades to one warning naming the engine,
-//! and an engine without the capability stays silent.
+//! and an engine without the capability stays silent. A refusal the engine
+//! invites again - it cancelled the pull, or the content moved under it -
+//! is resent under the engine's own `[engines.<name>.retry]` policy before
+//! it degrades.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,6 +22,7 @@ use rift_protocol::read::{
     Diagnostic, DiagnosticCode, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
     Language, ProjectPath, Severity, SourceSpan, TextRange,
 };
+use rift_protocol::retry::RetryPolicy;
 
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadService, file_id};
@@ -34,7 +38,9 @@ pub const ENGINE_DIAGNOSTICS_PER_CHANGE_MAX: usize = 16;
 /// bounded by [`ENGINE_DIAGNOSTICS_PER_CHANGE_MAX`] across all paths. An
 /// engine that fails contributes one warning naming it and is not asked
 /// again within this walk; an engine without the pull capability
-/// contributes nothing.
+/// contributes nothing. Each path's pull is resent while the engine keeps
+/// refusing it retryably and its `retry` table still allows an attempt, so
+/// the walk asks at most `retry.attempts` times per path before degrading.
 ///
 /// # Cancel safety
 ///
@@ -101,11 +107,12 @@ async fn pulled_diagnostics(
     let request_path = path.clone();
     let request_language = language.name.clone();
     let request_source = source.to_owned();
+    let retry = slot.configuration().retry;
     slot.request(move |session: &mut EngineSession| {
         let path = request_path.clone();
         let language = request_language.clone();
         let text = request_source.clone();
-        Box::pin(async move { pull_on_session(session, &path, &language, text).await })
+        Box::pin(async move { pull_on_session(session, &path, &language, text, retry).await })
     })
     .await
 }
@@ -120,6 +127,7 @@ async fn pull_on_session(
     path: &CoreProjectPath,
     language_id: &str,
     text: String,
+    retry: RetryPolicy,
 ) -> Result<(Vec<LspDiagnostic>, PositionEncoding), EngineError> {
     if !session.capabilities().pull_diagnostics {
         return Err(rift_core::Error::new(EngineFault::CapabilityAbsent {
@@ -128,11 +136,43 @@ async fn pull_on_session(
     }
     let encoding = session.capabilities().position_encoding;
     session.open(path, language_id, text).await?;
-    let pulled = session.pull_diagnostics(path).await;
+    let pulled = pulled_within_attempts(session, path, retry).await;
     // The close is best-effort: a session the pull's fault ended refuses
     // it, and the pull's own outcome is what the caller acts on.
     let _ = session.close(path).await;
     Ok((pulled?, encoding))
+}
+
+/// Pulls one open document's diagnostics, resending a retryable refusal.
+///
+/// The document stays open across the attempts, so no reopen can cancel
+/// the next pull. The loop runs at most `retry.attempts` times and waits
+/// what the policy answers between them: a growing wait that starts at
+/// `retry.delay` and is held at `retry.delay_limit`. The change already
+/// applied, so those waits only delay its answer; at the shipped defaults
+/// they add at most 9.75s. A refusal that is not retryable comes back at
+/// once, and a retryable one that outlasts the attempt bound comes back as
+/// itself, for the caller to degrade into its single warning.
+async fn pulled_within_attempts(
+    session: &mut EngineSession,
+    path: &CoreProjectPath,
+    retry: RetryPolicy,
+) -> Result<Vec<LspDiagnostic>, EngineError> {
+    let mut attempt: u64 = 1;
+    loop {
+        let refusal = match session.pull_diagnostics(path).await {
+            Ok(items) => return Ok(items),
+            Err(refusal) => refusal,
+        };
+        if !refusal.fault().is_retryable_refusal() {
+            return Err(refusal);
+        }
+        let Some(wait) = retry.delay_after(attempt) else {
+            return Err(refusal);
+        };
+        tokio::time::sleep(wait).await;
+        attempt += 1;
+    }
 }
 
 /// One LSP diagnostic mapped into the change summary's carrier.

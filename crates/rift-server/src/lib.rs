@@ -17,7 +17,7 @@ pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault, load_configuration,
 };
 pub use diagnose::{ENGINE_DIAGNOSTICS_PER_CHANGE_MAX, engine_change_diagnostics};
-pub use engine::{EnginePool, EngineSlot, RESPAWN_PER_REQUEST_MAX};
+pub use engine::{EnginePool, EngineSlot};
 pub use hook::{HookRun, HookStatus, run_hooks};
 pub use move_file::{MovePlan, MoveResolution, plan_move};
 pub use read::{ReadError, ReadFault, ReadService};

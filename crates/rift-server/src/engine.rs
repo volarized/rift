@@ -2,29 +2,32 @@
 //!
 //! One [`EngineSlot`] exists per accepted `[engines.<name>]` table. A slot
 //! spawns its engine on the first request for a language it serves, reuses
-//! the running session across requests, and replaces a dead engine at most
-//! [`RESPAWN_PER_REQUEST_MAX`] times per request. The pool never invents an
+//! the running session across requests, and replaces an engine that ended,
+//! failed to start, or stopped answering within the budget its
+//! `[engines.<name>.restart]` table states. The pool never invents an
 //! engine: a language no table claims answers no slot, and the caller turns
 //! that absence into its own refusal.
 //!
-//! Locking: each slot owns one Tokio mutex over its session. A request
-//! holds that slot's lock while it speaks to the engine, so requests for
-//! one engine serialize while requests for different engines proceed
-//! independently. No std lock is held across an await anywhere in the
+//! Locking: each slot owns one Tokio mutex over its own session and its own
+//! restart budget, and the pool holds no lock spanning two slots. A request
+//! holds that slot's lock for the whole conversation - across a spawn, a
+//! restart, and any wait an operation takes between its own attempts - so
+//! requests for one engine serialize while requests for other engines
+//! proceed untouched. No std lock is held across an await anywhere in the
 //! pool.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rift_lsp::session::{EngineError, EngineLaunch, EngineSession};
+use rift_core::{Error, ErrorCode, ErrorName};
+use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineSession};
 use rift_protocol::configuration::EngineConfiguration;
 use rift_protocol::read::Language;
+use rift_protocol::retry::RestartPolicy;
 use tokio::sync::Mutex;
-
-/// Replacements of one dead engine a single request may trigger, at most.
-pub const RESPAWN_PER_REQUEST_MAX: usize = 1;
+use tokio::time::Instant;
 
 /// The language engines one workspace serves, spawned lazily and reused.
 ///
@@ -60,7 +63,7 @@ impl EnginePool {
                     name,
                     configuration,
                     workspace_root: workspace_root.to_path_buf(),
-                    session: Mutex::new(None),
+                    state: Mutex::new(SlotState::default()),
                 },
             );
         }
@@ -101,8 +104,8 @@ impl EnginePool {
     /// the session's kill-on-drop arming.
     pub async fn shutdown(&self) {
         for slot in self.engines.values() {
-            let mut held = slot.session.lock().await;
-            if let Some(session) = held.take() {
+            let mut held = slot.state.lock().await;
+            if let Some(session) = held.session.take() {
                 let stderr = session.shutdown().await;
                 tracing::debug!(
                     component = "engine",
@@ -121,7 +124,62 @@ pub struct EngineSlot {
     name: String,
     configuration: EngineConfiguration,
     workspace_root: PathBuf,
-    session: Mutex<Option<EngineSession>>,
+    state: Mutex<SlotState>,
+}
+
+/// Everything one slot's lock guards: the running engine and the restarts
+/// already spent on it.
+#[derive(Debug, Default)]
+struct SlotState {
+    session: Option<EngineSession>,
+    restarts: RestartBudget,
+}
+
+/// The restarts one slot spent, and whether it ever started an engine.
+///
+/// A slot's first start is the start, not a restart, so it is free. Every
+/// start after it replaces an engine that ended, failed to start, or
+/// stopped answering, and must fit the configured budget; a restart older
+/// than the window stops counting against it.
+#[derive(Debug, Default)]
+struct RestartBudget {
+    started: bool,
+    spent: VecDeque<Instant>,
+}
+
+impl RestartBudget {
+    /// Claims one start against `policy`, `false` when the budget is spent.
+    ///
+    /// The queue holds at most `policy.attempts` instants, because a claim
+    /// that would exceed the bound is refused instead of recorded.
+    fn claim(&mut self, policy: &RestartPolicy, now: Instant) -> bool {
+        if !self.started {
+            self.started = true;
+            return true;
+        }
+        let window = policy.window();
+        while self
+            .spent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= window)
+        {
+            self.spent.pop_front();
+        }
+        if self.spent.len() as u64 >= policy.attempts {
+            return false;
+        }
+        self.spent.push_back(now);
+        true
+    }
+}
+
+/// Whether restarting the engine could change this failure's answer.
+///
+/// A configuration fault - an empty program, an absolute one - answers the
+/// same way every time, so it surfaces at once instead of spending the
+/// restart budget on a start that cannot succeed.
+fn restart_may_help(error: &EngineError) -> bool {
+    error.name() != ErrorName::Wire(ErrorCode::ConfigurationInvalid)
 }
 
 impl EngineSlot {
@@ -144,17 +202,20 @@ impl EngineSlot {
     ///
     /// The slot's lock is held for the whole call, so operations against
     /// one engine serialize. A session found dead - ended by an earlier
-    /// request, or ended by this operation's own failure - is replaced at
-    /// most [`RESPAWN_PER_REQUEST_MAX`] times within one call, and the
+    /// request, or ended by this operation's own failure - is replaced
+    /// while the `[engines.<name>.restart]` budget allows, and the
     /// operation runs again on the replacement; the loop therefore runs at
-    /// most [`RESPAWN_PER_REQUEST_MAX`] + 1 times. A failure that leaves
+    /// most `restart.attempts` + 1 times, and fewer when earlier requests
+    /// already spent the budget inside its window. A failure that leaves
     /// the engine serving - a refusal, an absent capability - returns
-    /// without any respawn.
+    /// without any restart.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when a spawn fails, or when the operation
-    /// fails past the respawn budget.
+    /// Returns [`EngineError`]: the operation's own failure when the
+    /// engine keeps serving or the budget is spent, the start failure when
+    /// no engine could be started, and [`EngineFault::Ended`] when the
+    /// budget was already spent before this call asked anything.
     ///
     /// # Cancel safety
     ///
@@ -170,27 +231,58 @@ impl EngineSlot {
             Box<dyn Future<Output = Result<T, EngineError>> + Send + 'session>,
         >,
     ) -> Result<T, EngineError> {
-        let mut held = self.session.lock().await;
-        let mut respawn_count: usize = 0;
+        let mut held = self.state.lock().await;
+        let mut reported: Option<EngineError> = None;
         loop {
-            let session = match held.take() {
-                Some(running) if !running.is_ended() => held.insert(running),
+            let state = &mut *held;
+            let session = match state.session.take() {
+                Some(running) if !running.is_ended() => state.session.insert(running),
                 dead => {
                     if let Some(dead) = dead {
-                        respawn_count += 1;
                         self.reap(dead).await;
                     }
-                    let started = EngineSession::start(self.launch(), &self.workspace_root).await?;
-                    held.insert(started)
+                    let started = self
+                        .start_within_budget(&mut state.restarts, reported.take())
+                        .await?;
+                    state.session.insert(started)
                 }
             };
             match operation(session).await {
                 Ok(answer) => return Ok(answer),
-                Err(error) => {
-                    if !session.is_ended() || respawn_count >= RESPAWN_PER_REQUEST_MAX {
-                        return Err(error);
-                    }
-                }
+                Err(error) if !session.is_ended() => return Err(error),
+                Err(error) => reported = Some(error),
+            }
+        }
+    }
+
+    /// Starts one engine, restarting past a failed start while the budget
+    /// allows.
+    ///
+    /// The loop runs at most `restart.attempts` + 1 times: each pass
+    /// claims one start, and a refused claim ends it. A refused claim
+    /// surfaces `reported` - the failure that sent the caller back here -
+    /// or [`EngineFault::Ended`] when this call has no failure of its own
+    /// to report, which is the honest answer for a budget an earlier
+    /// request already spent.
+    async fn start_within_budget(
+        &self,
+        budget: &mut RestartBudget,
+        mut reported: Option<EngineError>,
+    ) -> Result<EngineSession, EngineError> {
+        loop {
+            if !budget.claim(&self.configuration.restart, Instant::now()) {
+                tracing::warn!(
+                    component = "engine",
+                    engine = %self.name,
+                    attempts = self.configuration.restart.attempts,
+                    "language engine restart budget is spent for this window"
+                );
+                return Err(reported.unwrap_or_else(|| Error::new(EngineFault::Ended)));
+            }
+            match EngineSession::start(self.launch(), &self.workspace_root).await {
+                Ok(session) => return Ok(session),
+                Err(failure) if !restart_may_help(&failure) => return Err(failure),
+                Err(failure) => reported = Some(failure),
             }
         }
     }
@@ -230,6 +322,7 @@ impl EngineSlot {
 mod tests {
     use super::*;
     use rift_protocol::configuration::{ByteSize, Duration as ConfiguredDuration};
+    use rift_protocol::retry::RetryPolicy;
 
     fn table(program: &str, languages: &[&str]) -> EngineConfiguration {
         EngineConfiguration {
@@ -244,6 +337,8 @@ mod tests {
             startup_timeout: ConfiguredDuration::from_millis(10_000),
             request_timeout: ConfiguredDuration::from_millis(20_000),
             output_limit: ByteSize::from_bytes(2_048),
+            retry: RetryPolicy::default(),
+            restart: RestartPolicy::default(),
         }
     }
 
@@ -323,6 +418,78 @@ mod tests {
         }
         assert!(!built.built_from(&retimed));
         assert!(!built.built_from(&BTreeMap::new()));
+    }
+
+    fn restart_policy(attempts: u64, window_ms: u64) -> RestartPolicy {
+        RestartPolicy {
+            attempts,
+            window: ConfiguredDuration::from_millis(window_ms),
+        }
+    }
+
+    #[test]
+    fn a_slots_first_start_is_the_start_not_a_restart() {
+        let policy = restart_policy(0, 60_000);
+        let mut budget = RestartBudget::default();
+        let start = Instant::now();
+        assert!(
+            budget.claim(&policy, start),
+            "a slot that never started an engine starts one with no budget at all"
+        );
+        assert!(
+            !budget.claim(&policy, start),
+            "every later start is a restart, and this policy allows none"
+        );
+    }
+
+    #[test]
+    fn restarts_spend_the_budget_and_stop_at_the_bound() {
+        let policy = restart_policy(2, 60_000);
+        let mut budget = RestartBudget::default();
+        let start = Instant::now();
+        assert!(budget.claim(&policy, start), "the start is free");
+        assert!(budget.claim(&policy, start), "the first restart fits");
+        assert!(budget.claim(&policy, start), "the second restart fits");
+        assert!(!budget.claim(&policy, start), "the third is past the bound");
+        assert_eq!(
+            budget.spent.len(),
+            2,
+            "a refused claim is never recorded, so the queue stays bounded"
+        );
+    }
+
+    #[test]
+    fn a_restart_older_than_the_window_stops_counting() {
+        let policy = restart_policy(1, 60_000);
+        let mut budget = RestartBudget::default();
+        let start = Instant::now();
+        assert!(budget.claim(&policy, start));
+        assert!(budget.claim(&policy, start), "the one restart fits");
+        let inside = start + Duration::from_millis(59_999);
+        assert!(
+            !budget.claim(&policy, inside),
+            "a restart still inside the window keeps the budget spent"
+        );
+        let past = start + Duration::from_mins(1);
+        assert!(
+            budget.claim(&policy, past),
+            "the earlier restart left the window, so the budget is free again"
+        );
+        assert_eq!(budget.spent.len(), 1);
+    }
+
+    #[test]
+    fn a_configuration_fault_is_the_one_failure_no_restart_helps() {
+        let absolute = Error::new(EngineFault::ProgramAbsolute {
+            program: "/usr/bin/engine".to_owned(),
+        });
+        assert!(!restart_may_help(&absolute));
+        assert!(!restart_may_help(&Error::new(EngineFault::ProgramEmpty)));
+        assert!(restart_may_help(&Error::new(EngineFault::Ended)));
+        assert!(restart_may_help(&Error::new(EngineFault::TimedOut {
+            method: "textDocument/rename".to_owned(),
+            timeout_ms: 1_000,
+        })));
     }
 
     #[test]
