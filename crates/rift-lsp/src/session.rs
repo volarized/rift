@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
+use lsp_types::error_codes::{CONTENT_MODIFIED, SERVER_CANCELLED};
 use lsp_types::notification::{
     DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification, PublishDiagnostics,
 };
@@ -53,6 +54,16 @@ const DOCUMENT_DIAGNOSTICS_MAX: usize = 256;
 
 /// Maximum `workspace/configuration` items answered with `null` each.
 const CONFIGURATION_ITEMS_MAX: usize = 256;
+
+/// The refusal codes that name a transient condition, not a bad request.
+///
+/// `SERVER_CANCELLED` (-32802) is the engine cancelling a request it
+/// serves cancellably, which the specification tells the client to
+/// retrigger; `CONTENT_MODIFIED` (-32801) is an answer made outdated by a
+/// document change, which the client re-issues. `REQUEST_CANCELLED`
+/// (-32800) is the client's own cancellation and every other code is the
+/// engine's verdict on the request itself, so neither is resent.
+const RETRYABLE_REFUSAL_CODES: [i64; 2] = [SERVER_CANCELLED, CONTENT_MODIFIED];
 
 /// How to start one engine child: the executable and the bounds it runs
 /// under.
@@ -131,6 +142,9 @@ pub enum EngineFault {
         source: UriError,
     },
     /// The engine answered the request with a JSON-RPC error.
+    ///
+    /// The code decides whether the same request is worth sending again;
+    /// [`EngineFault::is_retryable_refusal`] reads that verdict.
     Refused {
         /// The refused request.
         method: String,
@@ -168,6 +182,19 @@ impl EngineFault {
                 | Self::Correlation { .. }
         )
     }
+
+    /// Whether the engine refused with a code that invites the same
+    /// request again.
+    ///
+    /// Only [`EngineFault::Refused`] can answer yes, and only for the
+    /// codes in [`RETRYABLE_REFUSAL_CODES`]: the engine cancelled the
+    /// request, or the document moved under it. Every other refusal is
+    /// the engine's verdict on the request, and resending it changes
+    /// nothing.
+    #[must_use]
+    pub fn is_retryable_refusal(&self) -> bool {
+        matches!(self, Self::Refused { code, .. } if RETRYABLE_REFUSAL_CODES.contains(code))
+    }
 }
 
 impl Fault for EngineFault {
@@ -177,6 +204,9 @@ impl Fault for EngineFault {
                 ErrorName::Wire(ErrorCode::ConfigurationInvalid)
             }
             Self::ConnectionClosed { .. } | Self::TimedOut { .. } | Self::Ended => {
+                ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+            }
+            Self::Refused { .. } if self.is_retryable_refusal() => {
                 ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
             }
             Self::Refused { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
@@ -1059,6 +1089,16 @@ mod tests {
                 "not an identifier",
             ),
             (
+                EngineFault::Refused {
+                    method: "textDocument/diagnostic".to_owned(),
+                    code: SERVER_CANCELLED,
+                    message: "server cancelled the request".to_owned(),
+                },
+                ErrorCode::TemporarilyUnavailable,
+                false,
+                "server cancelled the request",
+            ),
+            (
                 EngineFault::ResultInvalid {
                     method: "shutdown".to_owned(),
                     source: serde_json::from_value::<u64>(Value::Null).expect_err("typed"),
@@ -1124,6 +1164,39 @@ mod tests {
             assert!(std::error::Error::source(error).is_some(), "{error:?}");
         }
         assert!(std::error::Error::source(&Error::new(EngineFault::Ended)).is_none());
+    }
+
+    #[test]
+    fn refusal_codes_decide_the_retry_verdict_and_the_wire_code() {
+        let rows = [
+            (SERVER_CANCELLED, true),
+            (CONTENT_MODIFIED, true),
+            (lsp_types::error_codes::REQUEST_CANCELLED, false),
+            (METHOD_NOT_FOUND_CODE, false),
+            (1, false),
+        ];
+        for (code, retryable) in rows {
+            let fault = EngineFault::Refused {
+                method: "textDocument/diagnostic".to_owned(),
+                code,
+                message: "engine words".to_owned(),
+            };
+            assert_eq!(fault.is_retryable_refusal(), retryable, "code {code}");
+            let expected = if retryable {
+                ErrorCode::TemporarilyUnavailable
+            } else {
+                ErrorCode::InvalidRequest
+            };
+            assert_eq!(
+                Error::new(fault).name(),
+                ErrorName::Wire(expected),
+                "code {code}"
+            );
+        }
+        assert!(
+            !EngineFault::Ended.is_retryable_refusal(),
+            "a fault that is not a refusal is never a retryable refusal"
+        );
     }
 
     #[test]
