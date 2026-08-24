@@ -7,8 +7,9 @@
 use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DiagnosticServerCapabilities,
     FileOperationFilter, GeneralClientCapabilities, InitializeResult, OneOf, PositionEncodingKind,
-    RenameClientCapabilities, TextDocumentClientCapabilities, WorkspaceClientCapabilities,
-    WorkspaceEditClientCapabilities, WorkspaceFileOperationsClientCapabilities,
+    RenameClientCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
+    WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+    WorkspaceFileOperationsClientCapabilities,
 };
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
 use serde::Serialize;
@@ -199,6 +200,11 @@ fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
 ///
 /// UTF-8 positions preferred with the mandatory UTF-16 fallback, prepared
 /// renames, will-rename requests, and document diagnostic pulls.
+///
+/// `window.workDoneProgress` is what makes an engine report the work it is
+/// doing: the protocol forbids server-initiated progress unless the client
+/// declares it, so without this entry an engine loading a project reports
+/// nothing and every answer it gives while loading reads as settled.
 #[must_use]
 pub fn offered() -> ClientCapabilities {
     ClientCapabilities {
@@ -227,6 +233,10 @@ pub fn offered() -> ClientCapabilities {
             }),
             diagnostic: Some(DiagnosticClientCapabilities::default()),
             ..TextDocumentClientCapabilities::default()
+        }),
+        window: Some(WindowClientCapabilities {
+            work_done_progress: Some(true),
+            ..WindowClientCapabilities::default()
         }),
         ..ClientCapabilities::default()
     }
@@ -448,5 +458,11 @@ mod tests {
             .file_operations
             .expect("file operations are offered");
         assert_eq!(operations.will_rename, Some(true));
+        let window = offered.window.expect("window capabilities are offered");
+        assert_eq!(
+            window.work_done_progress,
+            Some(true),
+            "an engine only reports its work when the client declares this"
+        );
     }
 }
