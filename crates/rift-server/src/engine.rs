@@ -8,6 +8,15 @@
 //! engine: a language no table claims answers no slot, and the caller turns
 //! that absence into its own refusal.
 //!
+//! The slot is also where every transient condition between Rift and one
+//! engine is absorbed. [`EngineSlot::request`] runs the caller's operation
+//! again while the engine answers provisionally or refuses retryably, under
+//! that engine's `[engines.<name>.retry]` table, and starts a replacement
+//! engine under its `[engines.<name>.restart]` table when the one it has
+//! dies. Callers hold no retry loop of their own: an operation returns
+//! either the engine's settled answer or the failure that outlasted the
+//! whole budget.
+//!
 //! Locking: each slot owns one Tokio mutex over its own session and its own
 //! restart budget, and the pool holds no lock spanning two slots. A request
 //! holds that slot's lock for the whole conversation - across a spawn, a
@@ -173,6 +182,21 @@ impl RestartBudget {
     }
 }
 
+/// One condition the slot absorbs: the engine may answer the same request
+/// differently, so the operation is worth sending again.
+///
+/// A dead engine is not one of these. It is answered by starting a
+/// replacement under the restart budget, not by waiting.
+#[derive(Debug)]
+enum Transient {
+    /// The engine answered while it still had work-done progress
+    /// outstanding, so what it answered - a result or a refusal - is
+    /// provisional.
+    Analyzing,
+    /// The engine refused with a code that invites the same request again.
+    Refused(EngineError),
+}
+
 /// Whether restarting the engine could change this failure's answer.
 ///
 /// A configuration fault - an empty program, an absolute one - answers the
@@ -195,27 +219,48 @@ impl EngineSlot {
         &self.configuration
     }
 
-    /// Runs one operation against this engine, spawning it when none runs.
+    /// Runs one operation against this engine, absorbing every transient
+    /// condition between Rift and it.
+    ///
+    /// The operation runs again, unchanged, for every attempt: one that
+    /// opens a document opens it again on the next attempt.
     ///
     /// The operation returns a boxed future borrowing the session, the one
     /// shape that lets callers state the future's `Send` bound.
     ///
     /// The slot's lock is held for the whole call, so operations against
-    /// one engine serialize. A session found dead - ended by an earlier
-    /// request, or ended by this operation's own failure - is replaced
-    /// while the `[engines.<name>.restart]` budget allows, and the
-    /// operation runs again on the replacement; the loop therefore runs at
-    /// most `restart.attempts` + 1 times, and fewer when earlier requests
-    /// already spent the budget inside its window. A failure that leaves
-    /// the engine serving - a refusal, an absent capability - returns
-    /// without any restart.
+    /// one engine serialize. Three outcomes send the operation back:
+    ///
+    /// - The engine answered while it was still analyzing. That answer is
+    ///   provisional, so it is discarded and the operation is sent again
+    ///   after the `[engines.<name>.retry]` wait. A refusal it answered
+    ///   mid-analysis is provisional for the same reason: rust-analyzer
+    ///   refuses a rename with `No references found at position` for a
+    ///   declaration it has not indexed yet, which is not its verdict on
+    ///   the request.
+    /// - The engine refused with a code that invites the same request
+    ///   again ([`EngineFault::is_retryable_refusal`]). Same treatment.
+    /// - The session found or left the engine dead. A replacement starts
+    ///   while the `[engines.<name>.restart]` budget allows, and the
+    ///   operation runs on it.
+    ///
+    /// Every other failure - a verdict the settled engine reached, an
+    /// absent capability, a broken exchange - returns at once, because
+    /// sending it again changes nothing. So does a settled answer: an
+    /// engine that reports no progress at all never pays a retry wait.
+    ///
+    /// Both tables bound the loop. Each pass either returns, spends one of
+    /// `retry.attempts`, or claims one of `restart.attempts` inside its
+    /// window, so the loop runs at most their sum plus one.
     ///
     /// # Errors
     ///
     /// Returns [`EngineError`]: the operation's own failure when the
-    /// engine keeps serving or the budget is spent, the start failure when
-    /// no engine could be started, and [`EngineFault::Ended`] when the
-    /// budget was already spent before this call asked anything.
+    /// engine keeps serving, the last retryable refusal once the retry
+    /// budget is spent, [`EngineFault::Analyzing`] when every attempt was
+    /// answered mid-analysis, the start failure when no engine could be
+    /// started, and [`EngineFault::Ended`] when the restart budget was
+    /// already spent before this call asked anything.
     ///
     /// # Cancel safety
     ///
@@ -231,7 +276,9 @@ impl EngineSlot {
             Box<dyn Future<Output = Result<T, EngineError>> + Send + 'session>,
         >,
     ) -> Result<T, EngineError> {
+        let retry = self.configuration.retry;
         let mut held = self.state.lock().await;
+        let mut attempt: u64 = 1;
         let mut reported: Option<EngineError> = None;
         loop {
             let state = &mut *held;
@@ -247,10 +294,49 @@ impl EngineSlot {
                     state.session.insert(started)
                 }
             };
-            match operation(session).await {
-                Ok(answer) => return Ok(answer),
-                Err(error) if !session.is_ended() => return Err(error),
-                Err(error) => reported = Some(error),
+            let outcome = operation(session).await;
+            let analyzing = session.is_analyzing();
+            let ended = session.is_ended();
+            let absorbed = match outcome {
+                Ok(answer) if !analyzing => return Ok(answer),
+                Ok(_provisional) => Transient::Analyzing,
+                Err(error) if ended => {
+                    reported = Some(error);
+                    continue;
+                }
+                Err(error) if analyzing && error.fault().is_refusal() => Transient::Analyzing,
+                Err(error) if error.fault().is_retryable_refusal() => Transient::Refused(error),
+                Err(error) => return Err(error),
+            };
+            let Some(wait) = retry.delay_after(attempt) else {
+                return Err(self.exhausted(absorbed, retry.attempts));
+            };
+            tokio::time::sleep(wait).await;
+            attempt += 1;
+        }
+    }
+
+    /// The failure one absorbed condition surfaces once the attempt bound
+    /// is spent, logged as the boundary a caller is about to see.
+    fn exhausted(&self, absorbed: Transient, attempts: u64) -> EngineError {
+        match absorbed {
+            Transient::Analyzing => {
+                tracing::warn!(
+                    component = "engine",
+                    engine = %self.name,
+                    attempts,
+                    "language engine was still analyzing on every attempt"
+                );
+                Error::new(EngineFault::Analyzing { attempts })
+            }
+            Transient::Refused(refusal) => {
+                tracing::warn!(
+                    component = "engine",
+                    engine = %self.name,
+                    attempts,
+                    "language engine refused every attempt retryably"
+                );
+                refusal
             }
         }
     }

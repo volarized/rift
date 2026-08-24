@@ -4,7 +4,8 @@
 //! how long to wait before the next one. It computes; it never sleeps, so
 //! the loop that does is a thin shell over it. [`RestartPolicy`] bounds how
 //! often Rift may replace one language engine, and over what window, so a
-//! crash-looping engine cannot be restarted forever.
+//! crash-looping engine cannot be restarted forever. Between them they
+//! bound every wait Rift takes on one engine before it reports.
 //!
 //! Both are configuration models: they deserialize from `rift.toml`,
 //! advertise their ranges to the exported schema, and are compared field by
@@ -56,8 +57,8 @@ pub const RESTART_WINDOW_MS_MAX: u64 = 86_400_000;
 /// Milliseconds `restart.window` holds when the key is absent.
 const RESTART_WINDOW_MS_DEFAULT: u64 = 300_000;
 
-/// How often one failed operation is attempted again, and how the waits
-/// between attempts grow.
+/// How often one unsettled operation is attempted again, and how the
+/// waits between attempts grow.
 ///
 /// Attempts are numbered from one and the first is counted, so
 /// `attempts = 1` never resends. Each wait is twice the one before it,

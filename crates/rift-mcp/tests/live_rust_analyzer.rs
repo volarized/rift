@@ -10,6 +10,11 @@
 //! scripted suites only imitate. Every asserted shape was observed on a
 //! live rust-analyzer answer first, then pinned.
 //!
+//! No test warms the engine up first. rust-analyzer answers from the
+//! moment it initializes, and answers wrongly until it has loaded the
+//! project: the server waits that out under the engine's `retry` table,
+//! so each test makes one call and asserts what a caller would see.
+//!
 //! The fixture is a cargo project, because rust-analyzer resolves nothing
 //! outside one: a manifest whose `[lib]` path keeps every module file at
 //! the tree root, and whose empty `[workspace]` table stops cargo climbing
@@ -23,11 +28,9 @@ mod rust_engine;
 mod workspace_client;
 
 use std::fs;
-use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
 use rmcp::model::CallToolRequestParams;
-use rmcp::service::{RoleClient, RunningService};
 use rust_engine::{require_rust_analyzer, rust_engine_configuration};
 use serde_json::{Value, json};
 use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
@@ -80,42 +83,6 @@ fn coded_findings<'summary>(structured: &'summary Value, code: &str) -> Vec<&'su
         .unwrap_or_default()
 }
 
-/// Most warm-up attempts one test makes, and the pause between them: at
-/// most a minute of waiting, then the test fails instead of hanging.
-const WARMUP_ATTEMPTS_MAX: usize = 240;
-const WARMUP_PAUSE: Duration = Duration::from_millis(250);
-
-/// Drives the rename tool until rust-analyzer has loaded the cargo project.
-///
-/// rust-analyzer answers initialize in milliseconds and keeps loading
-/// afterwards, and it answers requests throughout: while it warms it
-/// declines the rename with `No references found at position`, then with
-/// `content modified`, and only then resolves the declaration. Locally the
-/// declaration resolved after 2.5s of a 250ms cadence, five attempts in.
-///
-/// The probe renames the declaration to the name it already has. Once
-/// rust-analyzer resolves it, the proposal edits every occurrence to the
-/// bytes already there, so the compiled plan holds no rewrite and the tool
-/// refuses with `proposed no edits` - the readiness signal, with the tree
-/// untouched either way. The wait is bounded by attempts against the
-/// tool's own answer, and paced so the loop does not spin on an engine
-/// that is busy indexing.
-async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
-    let started = Instant::now();
-    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
-        let structured = call_retrying_acceptance(client, rename_request("beacon")).await?;
-        if refusal_detail(&structured).contains("proposed no edits") {
-            eprintln!(
-                "rust-analyzer resolved the declaration after {:?}",
-                started.elapsed()
-            );
-            return Ok(());
-        }
-        tokio::time::sleep(WARMUP_PAUSE).await;
-    }
-    Err("rust-analyzer never resolved the declaration".into())
-}
-
 /// The engine resolves every reference itself, so the rewrite covers both
 /// files and the word-boundary sweep finds no survivor to report.
 #[tokio::test]
@@ -126,7 +93,6 @@ async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
     let (directory, client, server_task) =
         served_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
-    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(&client, rename_request("flare")).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
@@ -183,7 +149,6 @@ async fn applied_move_rewrites_the_module_declaration_and_the_import() -> TestRe
     let (directory, client, server_task) =
         served_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
-    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(
         &client,
@@ -222,42 +187,15 @@ async fn applied_move_rewrites_the_module_declaration_and_the_import() -> TestRe
 const ARGUMENT_PATCH: &str =
     "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2, 3)\n";
 
-/// The inverse of [`ARGUMENT_PATCH`], restoring the single argument.
-const ARGUMENT_REVERT_PATCH: &str =
-    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2, 3)\n+    beacon(2)\n";
-
-/// Lands the arity error until rust-analyzer reports it, and answers with
-/// the applied change that carried the finding.
-///
-/// The engine's analysis warms after the resolution the rename probe waits
-/// on, and a pull answered before the changed file is analyzed comes back
-/// as an empty report. An empty report is what clean bytes answer too, so
-/// the server cannot resend it - only a refusal is retryable. Each attempt
-/// here is therefore a fresh change: the error lands, and an empty answer
-/// reverts it so the next attempt lands it again and pulls afresh.
-async fn reported_arity_error(client: &RunningService<RoleClient, ()>) -> TestResult<Value> {
-    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
-        let structured = call_retrying_acceptance(
-            client,
-            tool_request("patch", &json!({ "patch": ARGUMENT_PATCH })),
-        )
-        .await?;
-        if !coded_findings(&structured, "E0107").is_empty() {
-            return Ok(structured);
-        }
-        call_retrying_acceptance(
-            client,
-            tool_request("patch", &json!({ "patch": ARGUMENT_REVERT_PATCH })),
-        )
-        .await?;
-        tokio::time::sleep(WARMUP_PAUSE).await;
-    }
-    Err("rust-analyzer reported no arity error within the warm-up bound".into())
-}
-
 /// The applied change carries rust-analyzer's own finding for the file it
 /// changed: the pull runs on the document Rift just wrote, so the answer
 /// is the engine's reading of the landed bytes.
+///
+/// One patch, one assertion. The engine answers a pull it takes while it
+/// is still analyzing with an empty report, which reads exactly like clean
+/// bytes; the server tells the two apart from the engine's own
+/// `$/progress` traffic and pulls again until the engine has settled, so
+/// the finding rides the result of the change that produced it.
 #[tokio::test]
 async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     if !engine_live() {
@@ -266,9 +204,12 @@ async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     let (directory, client, server_task) =
         served_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
-    warmed_engine(&client).await?;
 
-    let structured = reported_arity_error(&client).await?;
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request("patch", &json!({ "patch": ARGUMENT_PATCH })),
+    )
+    .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(structured["summary"]["paths"], json!(["caller.rs"]));
     let findings = coded_findings(&structured, "E0107");
@@ -308,7 +249,6 @@ async fn engine_refused_new_name_carries_the_engine_words() -> TestResult {
     let (directory, client, server_task) =
         served_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
-    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(&client, rename_request("crate")).await?;
     assert_eq!(structured["status"], json!("refused"), "{structured:#}");
