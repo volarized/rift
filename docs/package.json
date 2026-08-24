@@ -25,7 +25,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "fumadocs-core": "15.7.5",
-    "fumadocs-mdx": "11.8.1",
+    "fumadocs-mdx": "15.3.1",
     "fumadocs-ui": "15.7.5",
     "json-schema-traverse": "^1.0.0",
     "lucide-react": "^1.28.0",
