@@ -17,10 +17,13 @@
 
 #[path = "support/live.rs"]
 mod live;
+#[path = "support/live_rust.rs"]
+mod live_rust;
 
 use std::time::{Duration, Instant};
 
-use live::{RUST_ANALYZER_PROGRAM, engine_live, require_rust_analyzer, rust_analyzer_environment};
+use live::engine_live;
+use live_rust::{RUST_ANALYZER_PROGRAM, require_rust_analyzer, rust_analyzer_environment};
 use lsp_types::FileOperationPatternKind;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};

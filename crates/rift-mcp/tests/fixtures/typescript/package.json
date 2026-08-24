@@ -1,0 +1,7 @@
+{
+  "name": "rift-live-fixture",
+  "private": true,
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

@@ -61,6 +61,8 @@ coverage:
 engine-test:
     RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_rust_analyzer
     RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer
+    RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_typescript
+    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_typescript
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
