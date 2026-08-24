@@ -11,6 +11,7 @@ use rift_index::{
     IndexedFile, SymbolMatch, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits,
 };
+use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
     Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
     Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination, ProjectPath,
@@ -19,6 +20,8 @@ use rift_protocol::read::{
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
+
+use crate::history::SymbolTimelines;
 
 /// One read-service failure: what was asked, and why it cannot be served.
 ///
@@ -218,12 +221,16 @@ pub struct ReadService {
     revisions: CapturedRevisions,
     /// The resolved commit this service serves, or null for the current tree.
     revision: Option<RevisionId>,
+    /// The accepted `[providers.history]` table: whether symbol history is
+    /// served from this snapshot, and how far its walks may reach.
+    history: HistoryConfiguration,
 }
 
 impl ReadService {
     /// Builds one in-memory snapshot from real workspace files, applying
     /// `visibility`'s `.gitignore` and `[source]` policy on top of the hard
-    /// floor.
+    /// floor. `history` gates and bounds later symbol-history reads served
+    /// from this snapshot.
     ///
     /// # Errors
     ///
@@ -233,6 +240,7 @@ impl ReadService {
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
         text_inclusion: &TextFileInclusion,
+        history: HistoryConfiguration,
     ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
             "index.build",
@@ -255,13 +263,15 @@ impl ReadService {
             index,
             revisions,
             revision: None,
+            history,
         })
     }
 
     /// Builds one in-memory snapshot of the workspace at a version-control
     /// revision, read in place from the workspace's repository with no
     /// checkout. The revision tree passes the same `[source]` policy and
-    /// bounds as the workspace scan.
+    /// bounds as the workspace scan. `history` gates and bounds later
+    /// symbol-history reads served from this snapshot.
     ///
     /// # Errors
     ///
@@ -274,6 +284,7 @@ impl ReadService {
         rev: &RevisionId,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
+        history: HistoryConfiguration,
     ) -> Result<Self, ReadError> {
         if let Some(violation) = rev.violation() {
             return Err(ReadFault::invalid("rev", violation.as_str()));
@@ -287,6 +298,7 @@ impl ReadService {
             index,
             revisions,
             revision: Some(RevisionId(resolved.commit_id())),
+            history,
         })
     }
 
@@ -380,20 +392,19 @@ impl ReadService {
         })
     }
 
-    /// Finds declarations by name.
+    /// Finds declarations by name, with each hit's version-control timeline
+    /// when the request asks for history.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for unsupported history, projection, or scope.
+    /// Returns [`ReadError`] for an unsupported projection or scope, and
+    /// for symbol history the workspace's version control cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
         validate_common(
             params.projection.is_some(),
             params.rev.is_some(),
             params.scope,
         )?;
-        if params.include_history {
-            return Err(ReadFault::unsupported("symbol history"));
-        }
         let limit = accepted_limit(params.limit)?;
         // The whole ranked match set is collected up to the index's own `results_max`
         // bound, so `pagination.total_pages` counts the full result set the pages divide.
@@ -402,23 +413,45 @@ impl ReadService {
             .symbols(&params.name, self.index.results_max())
             .map_err(ReadFault::index)?;
         let (window, pagination) = page(matches, params.page_index, limit);
-        let hits = window
-            .into_iter()
-            .map(|matched| GetSymbolHit {
+        let mut timelines = if params.include_history {
+            Some(self.symbol_timelines()?)
+        } else {
+            None
+        };
+        let mut hits = Vec::with_capacity(window.len());
+        for matched in window {
+            let history = match timelines.as_mut() {
+                Some(timelines) => Some(
+                    timelines
+                        .timeline(language_provider(matched.file.syntax().language()), matched)?,
+                ),
+                None => None,
+            };
+            hits.push(GetSymbolHit {
                 symbol: wire_symbol(matched),
                 node: params.include_body.then(|| symbol_node(matched)),
                 source: params
                     .include_body
                     .then(|| excerpt(matched.file, matched.symbol.range)),
-                history: None,
-                co_changes: None,
-            })
-            .collect();
+                history,
+            });
+        }
         Ok(GetSymbolResult {
             hits,
             pagination,
             warnings: self.warnings(),
         })
+    }
+
+    /// Opens this snapshot's timeline composition, walking from the served
+    /// commit for a revision read and from `HEAD` for a current-tree read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when `[providers.history]` is disabled or the
+    /// workspace's version control cannot serve a walk start.
+    fn symbol_timelines(&self) -> Result<SymbolTimelines, ReadError> {
+        SymbolTimelines::open(self.index.root(), self.revision.as_ref(), &self.history)
     }
 }
 
@@ -593,7 +626,7 @@ fn wire_kind(language: &Language, kind: &str) -> ExactKind {
 /// Panics when no registered provider serves it: the index only produces
 /// documents through registered providers, so an unserved language here is a
 /// programmer invariant break, not a reachable operating state.
-fn language_provider(language: &Language) -> &'static dyn SyntaxProvider {
+pub(crate) fn language_provider(language: &Language) -> &'static dyn SyntaxProvider {
     registry::provider_for_language(language).unwrap_or_else(|| {
         panic!(
             "an indexed document's language must have a registered syntax provider: language={}",
@@ -623,7 +656,7 @@ pub(crate) fn project_path(path: &CoreProjectPath) -> ProjectPath {
     ProjectPath(path.as_str().to_owned())
 }
 
-fn symbol_id(file: &IndexedFile, symbol: &SyntaxSymbol) -> SymbolId {
+pub(crate) fn symbol_id(file: &IndexedFile, symbol: &SyntaxSymbol) -> SymbolId {
     SymbolId(rift_core::symbol_identity(
         &file.syntax().language().identity_segment(),
         file.path().as_str(),
@@ -770,7 +803,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{ReadFault, ReadService, WorkspaceIndexLimits};
+    use super::{HistoryConfiguration, ReadFault, ReadService, WorkspaceIndexLimits};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -787,6 +820,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
     }
@@ -802,6 +836,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
     }
@@ -849,6 +884,7 @@ pub fn compute() -> i32 {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
     }
@@ -1006,7 +1042,7 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn unsupported_projection_and_history_are_rejected() -> TestResult {
+    fn unsupported_projection_is_rejected() -> TestResult {
         let (_directory, service) = fixture()?;
         let projection = ProjectionId("rift://projection/my-feature-one".to_owned());
         let nodes = service.nodes(NodesParams {
@@ -1019,16 +1055,172 @@ pub fn compute() -> i32 {
             nodes.expect_err("projection must fail").fault(),
             ReadFault::Unsupported { .. }
         ));
+        Ok(())
+    }
 
-        let mut symbol: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
-        symbol.include_history = true;
-        assert!(matches!(
-            service
-                .get_symbol(&symbol)
-                .expect_err("history must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
+    #[test]
+    fn symbol_history_on_an_unversioned_workspace_is_a_history_fault() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let mut params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
+        params.include_history = true;
+        let error = service
+            .get_symbol(&params)
+            .expect_err("a workspace without a repository cannot serve history");
+        assert!(matches!(error.fault(), ReadFault::History(_)));
+        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_history_with_the_provider_disabled_is_unsupported() -> TestResult {
+        let directory = committed_fixture()?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration {
+                enabled: false,
+                max_revisions: 500,
+            },
+        )?;
+        let mut params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+        params.include_history = true;
+        let error = service
+            .get_symbol(&params)
+            .expect_err("a disabled history provider must refuse");
+        let ReadFault::Unsupported { capability } = error.fault() else {
+            panic!("expected Unsupported, got {:?}", error.fault());
+        };
+        assert_eq!(*capability, "symbol history (providers.history disabled)");
+        Ok(())
+    }
+
+    /// One symbol changed four ways across four commits: introduced, body
+    /// grown, signature widened, decorated. The timeline lists them newest
+    /// first with the classifier's kinds.
+    fn timeline_fixture() -> TestResult<TempDir> {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn beacon() { let _shift = 1; }\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "grow beacon body");
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn beacon() -> u8 { 7 }\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "widen beacon signature");
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "#[inline]\npub fn beacon() -> u8 { 7 }\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "decorate beacon");
+        Ok(directory)
+    }
+
+    #[test]
+    fn symbol_history_lists_the_committed_timeline_newest_first() -> TestResult {
+        let directory = timeline_fixture()?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "beacon", "include_history": true}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let history = &value["hits"][0]["history"];
+        assert_eq!(
+            history["symbol"],
+            json!("rift://symbol/rust/src/lib.rs/beacon")
+        );
+        let versions = history["versions"]
+            .as_array()
+            .ok_or("history must carry versions")?;
+        let kinds: Vec<&str> = versions
+            .iter()
+            .filter_map(|version| version["kind"].as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "decorators_changed",
+                "signature_changed",
+                "body_changed",
+                "introduced"
+            ]
+        );
+        let summaries: Vec<&str> = versions
+            .iter()
+            .filter_map(|version| version["summary"].as_str())
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                "decorate beacon",
+                "widen beacon signature",
+                "grow beacon body",
+                "introduce beacon"
+            ]
+        );
+        for version in versions {
+            assert_eq!(version["path"], json!("src/lib.rs"));
+            assert_eq!(version["timestamp"], json!("2026-01-01T00:00:00+00:00"));
+            assert_eq!(
+                version["revision"].as_str().map(str::len),
+                Some(40),
+                "a served revision is the full hex commit id"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_history_revision_read_starts_at_the_addressed_commit() -> TestResult {
+        let directory = timeline_fixture()?;
+        rift_history::fixture::git(directory.path(), &["tag", "grown", "main~2"]);
+        let service = revision_service(directory.path(), "grown")?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "beacon", "include_history": true}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let versions = value["hits"][0]["history"]["versions"]
+            .as_array()
+            .ok_or("history must carry versions")?;
+        let kinds: Vec<&str> = versions
+            .iter()
+            .filter_map(|version| version["kind"].as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["body_changed", "introduced"],
+            "the walk starts at the addressed commit, not the branch head"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_history_stays_off_the_wire_without_the_request_flag() -> TestResult {
+        let directory = timeline_fixture()?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        assert!(
+            value["hits"][0].get("history").is_none(),
+            "an unrequested timeline never rides a hit"
+        );
         Ok(())
     }
 
@@ -1055,6 +1247,7 @@ pub fn compute() -> i32 {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )
         .expect_err("missing root must fail");
 
@@ -1257,6 +1450,7 @@ pub fn compute() -> i32 {
             &RevisionId(rev.to_owned()),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            HistoryConfiguration::default(),
         )
     }
 
@@ -1283,6 +1477,7 @@ pub fn compute() -> i32 {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         assert_ne!(
             at_head.tree_revision(),

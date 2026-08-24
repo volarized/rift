@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt; `include_body: false` omits\nboth. `rev` serves the lookup from a version-control revision instead of\nthe current tree. Use `search` when the name is not exactly known.",
+      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt; `include_body: false` omits\nboth. `include_history: true` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. Use `search` when\nthe name is not exactly known.",
       "input_schema": {
         "$defs": {
           "Language": {
@@ -109,7 +109,7 @@
           },
           "include_history": {
             "default": false,
-            "description": "Whether each hit carries its version-control timeline and co-change coupling. Off by\ndefault: a timeline is read when the caller is deciding about the symbol, not on\nevery lookup.",
+            "description": "Whether each hit carries its version-control timeline. Off by default: a timeline is\nread when the caller is deciding about the symbol, not on every lookup.",
             "type": "boolean"
           },
           "language": {
@@ -181,41 +181,6 @@
       "name": "get_symbol",
       "output_schema": {
         "$defs": {
-          "CoChange": {
-            "additionalProperties": false,
-            "description": "Empirical coupling between two symbols: how often revisions that touched one touched the\nother. The relation is observed from history rather than resolved from source, so it\nreaches coupling no reference graph carries - two implementations of one concept with no\nedge between them.",
-            "properties": {
-              "partner": {
-                "$ref": "#/$defs/SymbolId",
-                "description": "The symbol that historically changes with it."
-              },
-              "subject": {
-                "$ref": "#/$defs/SymbolId",
-                "description": "The symbol the coupling is stated for."
-              },
-              "together": {
-                "description": "Revisions inside the walked depth that touched both symbols.",
-                "format": "uint64",
-                "maximum": 9007199254740991,
-                "minimum": 1,
-                "type": "integer"
-              },
-              "touches": {
-                "description": "Revisions inside the walked depth that touched `subject` at all. Never below\n`together`.",
-                "format": "uint64",
-                "maximum": 9007199254740991,
-                "minimum": 1,
-                "type": "integer"
-              }
-            },
-            "required": [
-              "subject",
-              "partner",
-              "together",
-              "touches"
-            ],
-            "type": "object"
-          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -307,16 +272,6 @@
             "additionalProperties": false,
             "description": "One declaration a `get_symbol` lookup found.",
             "properties": {
-              "co_changes": {
-                "description": "Symbols that historically change with this one, strongest coupling first, present\nwhen the request asked for history.",
-                "items": {
-                  "$ref": "#/$defs/CoChange"
-                },
-                "type": [
-                  "array",
-                  "null"
-                ]
-              },
               "history": {
                 "anyOf": [
                   {
@@ -1294,7 +1249,7 @@
           },
           "SymbolHistory": {
             "additionalProperties": false,
-            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk is bounded by the configured history depth.",
+            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk follows first parents from the served revision along the declaration's\ncurrent path only, bounded by the configured history depth.",
             "properties": {
               "symbol": {
                 "$ref": "#/$defs/SymbolId",
@@ -1315,7 +1270,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -1362,7 +1317,7 @@
           },
           "SymbolVersion": {
             "additionalProperties": false,
-            "description": "One revision that touched a symbol. The history provider derives it by parsing the\ndeclaration at each revision that changed its file, so a version exists only where the\nparse found the symbol.",
+            "description": "One revision that touched a symbol. The history provider parses the declaration at each\nfirst-parent revision that changed its file and classifies adjacent states; a revision\nwhose source cannot be parsed contributes no version.",
             "properties": {
               "kind": {
                 "$ref": "#/$defs/SymbolVersionKind",
@@ -1609,14 +1564,6 @@
           {
             "hits": [
               {
-                "co_changes": [
-                  {
-                    "partner": "rift://symbol/rust/src/error.rs/ConfigError",
-                    "subject": "rift://symbol/rust/src/config.rs/load_config",
-                    "together": 4,
-                    "touches": 9
-                  }
-                ],
                 "history": {
                   "symbol": "rift://symbol/rust/src/config.rs/load_config",
                   "versions": [
@@ -1625,14 +1572,14 @@
                       "path": "src/config.rs",
                       "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
                       "summary": "Return ConfigError from load_config",
-                      "timestamp": "2026-08-21T14:03:22Z"
+                      "timestamp": "2026-08-21T14:03:22+00:00"
                     },
                     {
                       "kind": "introduced",
                       "path": "src/config.rs",
                       "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
                       "summary": "Add workspace configuration loading",
-                      "timestamp": "2026-08-17T09:41:05Z"
+                      "timestamp": "2026-08-17T09:41:05+00:00"
                     }
                   ]
                 },
@@ -1845,7 +1792,7 @@
             "type": "string"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -2644,7 +2591,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -3311,7 +3258,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -4267,7 +4214,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -5235,7 +5182,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -5451,7 +5398,7 @@
             ]
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -6203,7 +6150,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -7114,7 +7061,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -9317,7 +9264,7 @@
             ]
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name;\nhistory correlation records the declaration across that change.",
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],

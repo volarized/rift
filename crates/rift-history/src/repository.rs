@@ -147,6 +147,75 @@ impl TreeFile {
     pub fn path(&self) -> &str {
         &self.path
     }
+
+    /// The blob's full lowercase hex object id - the durable spelling for
+    /// the exact committed bytes, usable as a content cache key.
+    #[must_use]
+    pub fn blob_id(&self) -> String {
+        self.blob.to_string()
+    }
+}
+
+/// One first-parent commit that changed a path's tree entry: the commit's
+/// recorded facts and the blob its tree holds at the path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathRevision {
+    commit_id: String,
+    timestamp: String,
+    summary: Option<String>,
+    blob: Option<TreeFile>,
+}
+
+impl PathRevision {
+    /// The full lowercase hex commit id.
+    #[must_use]
+    pub fn commit_id(&self) -> &str {
+        &self.commit_id
+    }
+
+    /// The commit's committer time, an RFC 3339 date-time carrying the
+    /// recorded fixed offset.
+    #[must_use]
+    pub fn timestamp(&self) -> &str {
+        &self.timestamp
+    }
+
+    /// The commit message's summary line; `None` for an empty message.
+    #[must_use]
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    /// The blob the commit's tree holds at the path; `None` when the commit
+    /// removed the path.
+    #[must_use]
+    pub const fn blob(&self) -> Option<&TreeFile> {
+        self.blob.as_ref()
+    }
+}
+
+/// The first-parent commits that changed one path's tree entry, newest
+/// first, and whether the walk covered the path's whole history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathHistory {
+    revisions: Vec<PathRevision>,
+    complete: bool,
+}
+
+impl PathHistory {
+    /// The commits that changed the path's entry, newest first.
+    #[must_use]
+    pub fn revisions(&self) -> &[PathRevision] {
+        &self.revisions
+    }
+
+    /// Whether the walk examined the path's whole first-parent history.
+    /// `false` when the examination bound stopped the walk first, so
+    /// touching commits older than the listed ones may exist.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
 }
 
 /// The git repository that versions one workspace root.
@@ -307,6 +376,73 @@ impl Repository {
         Ok(object.detach().data)
     }
 
+    /// Lists the first-parent commits from `revision` whose tree changed
+    /// `path`'s entry, newest first, examining at most `revisions_max`
+    /// commits - one commit read and one tree-entry read per examined
+    /// commit.
+    ///
+    /// The comparison is by blob object id alone: no diffing, no content
+    /// read. A non-blob entry at the path - a directory, a symbolic link,
+    /// a submodule - counts as absent, the same policy `tree_files`
+    /// applies. A walk whose examination bound is spent before the first
+    /// commit reports itself incomplete and lists the newest touching
+    /// commits only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HistoryError`] when the object store cannot be read.
+    pub fn path_revisions(
+        &self,
+        revision: &ResolvedRevision,
+        path: &str,
+        revisions_max: usize,
+    ) -> Result<PathHistory, HistoryError> {
+        let repository_path = self.repository_path(path);
+        let mut commit = self
+            .inner
+            .find_commit(revision.commit)
+            .map_err(|error| storage("read commit", &error))?;
+        let mut entry = blob_entry(&commit, &repository_path)?;
+        let mut revisions = Vec::new();
+        let mut complete = false;
+        for _ in 0..revisions_max {
+            let parent_id = commit.parent_ids().next().map(gix::Id::detach);
+            let (parent, parent_entry) = match parent_id {
+                Some(id) => {
+                    let parent = self
+                        .inner
+                        .find_commit(id)
+                        .map_err(|error| storage("read commit", &error))?;
+                    let parent_entry = blob_entry(&parent, &repository_path)?;
+                    (Some(parent), parent_entry)
+                }
+                None => (None, None),
+            };
+            if entry != parent_entry {
+                revisions.push(path_revision(&commit, path, entry)?);
+            }
+            let Some(parent) = parent else {
+                complete = true;
+                break;
+            };
+            commit = parent;
+            entry = parent_entry;
+        }
+        Ok(PathHistory {
+            revisions,
+            complete,
+        })
+    }
+
+    /// The repository-relative spelling of one workspace-relative path.
+    fn repository_path(&self, path: &str) -> String {
+        if self.prefix.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{}/{path}", self.prefix)
+        }
+    }
+
     /// The workspace-relative form of one repository-relative path: `None`
     /// when the path lies outside the workspace, an error when its bytes
     /// inside the workspace are not UTF-8.
@@ -326,6 +462,52 @@ fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> Option<&'a [
         return Some(filepath);
     }
     filepath.strip_prefix(prefix)?.strip_prefix(b"/")
+}
+
+/// The blob object id one commit's tree holds at `repository_path`; `None`
+/// for an absent path or a non-blob entry.
+fn blob_entry(
+    commit: &gix::Commit<'_>,
+    repository_path: &str,
+) -> Result<Option<gix::ObjectId>, HistoryError> {
+    let tree = commit
+        .tree()
+        .map_err(|error| storage("read commit tree", &error))?;
+    let entry = tree
+        .lookup_entry_by_path(repository_path)
+        .map_err(|error| storage("read tree entry", &error))?;
+    Ok(entry
+        .filter(|entry| entry.mode().is_blob())
+        .map(|entry| entry.object_id()))
+}
+
+/// One touching commit's recorded facts, with the blob its tree holds at
+/// the path.
+fn path_revision(
+    commit: &gix::Commit<'_>,
+    path: &str,
+    blob: Option<gix::ObjectId>,
+) -> Result<PathRevision, HistoryError> {
+    let time = commit
+        .time()
+        .map_err(|error| storage("read commit time", &error))?;
+    let timestamp = time
+        .format(gix::date::time::format::ISO8601_STRICT)
+        .map_err(|error| storage("render commit time", &error))?;
+    let summary = commit
+        .message()
+        .map_err(|error| storage("read commit message", &error))?
+        .summary()
+        .to_string();
+    Ok(PathRevision {
+        commit_id: commit.id.to_string(),
+        timestamp,
+        summary: (!summary.is_empty()).then_some(summary),
+        blob: blob.map(|blob| TreeFile {
+            path: path.to_owned(),
+            blob,
+        }),
+    })
 }
 
 /// One committed path's UTF-8 form. The refusal renders the full
@@ -763,6 +945,216 @@ mod tests {
             .tree_files(&head, &include_all, 1)
             .expect_err("a subtree past the budget must refuse, not descend");
         assert!(matches!(error.fault(), HistoryFault::TreeTooLarge { .. }));
+    }
+
+    /// A workspace whose lib.rs changed in three commits, with one commit
+    /// in between touching only another file.
+    fn walked_fixture() -> tempfile::TempDir {
+        let directory = repository_fixture();
+        fs::write(directory.path().join("other.rs"), "pub fn other() {}\n").expect("source");
+        commit_all(directory.path(), "introduce other");
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() -> u8 { 7 }\n",
+        )
+        .expect("source");
+        commit_all(directory.path(), "widen beacon");
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() -> u8 { 9 }\n",
+        )
+        .expect("source");
+        commit_all(directory.path(), "raise beacon");
+        directory
+    }
+
+    #[test]
+    fn test_path_revisions_lists_touching_commits_newest_first() {
+        let directory = walked_fixture();
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let history = repository
+            .path_revisions(&head, "lib.rs", 100)
+            .expect("walk");
+        assert!(history.is_complete(), "four commits fit a bound of 100");
+        let summaries: Vec<Option<&str>> = history
+            .revisions()
+            .iter()
+            .map(PathRevision::summary)
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                Some("raise beacon"),
+                Some("widen beacon"),
+                Some("introduce beacon")
+            ],
+            "the commit touching only other.rs is not listed"
+        );
+        for revision in history.revisions() {
+            assert_eq!(
+                revision.commit_id().len(),
+                40,
+                "a commit id is the full hex spelling"
+            );
+            assert_eq!(revision.timestamp(), "2026-01-01T00:00:00+00:00");
+        }
+        let newest = history.revisions()[0].blob().expect("blob present");
+        assert_eq!(newest.path(), "lib.rs");
+        let bytes = repository.blob_bytes(newest, 4_096).expect("bytes");
+        assert_eq!(bytes, b"pub fn beacon() -> u8 { 9 }\n");
+        let oldest = history.revisions()[2].blob().expect("blob present");
+        assert_ne!(
+            newest.blob_id(),
+            oldest.blob_id(),
+            "each touching commit carries its own committed bytes"
+        );
+    }
+
+    #[test]
+    fn test_path_revisions_of_an_uncommitted_path_is_empty_and_complete() {
+        let directory = repository_fixture();
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let history = repository
+            .path_revisions(&head, "never.rs", 100)
+            .expect("walk");
+        assert_eq!(history.revisions(), []);
+        assert!(history.is_complete());
+    }
+
+    #[test]
+    fn test_path_revisions_bound_exactly_covering_history_is_complete() {
+        let directory = walked_fixture();
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let exact = repository.path_revisions(&head, "lib.rs", 4).expect("walk");
+        assert!(
+            exact.is_complete(),
+            "a bound equal to the commit count reaches the first commit"
+        );
+        assert_eq!(exact.revisions().len(), 3);
+    }
+
+    #[test]
+    fn test_path_revisions_one_under_the_history_stops_incomplete() {
+        let directory = walked_fixture();
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let truncated = repository.path_revisions(&head, "lib.rs", 3).expect("walk");
+        assert!(
+            !truncated.is_complete(),
+            "a bound under the commit count cannot prove the walk covered the history"
+        );
+        let summaries: Vec<Option<&str>> = truncated
+            .revisions()
+            .iter()
+            .map(PathRevision::summary)
+            .collect();
+        assert_eq!(
+            summaries,
+            [Some("raise beacon"), Some("widen beacon")],
+            "only the newest touching commits inside the bound are listed"
+        );
+    }
+
+    #[test]
+    fn test_path_revisions_zero_bound_examines_nothing() {
+        let directory = walked_fixture();
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let none = repository.path_revisions(&head, "lib.rs", 0).expect("walk");
+        assert_eq!(none.revisions(), []);
+        assert!(!none.is_complete());
+    }
+
+    #[test]
+    fn test_path_revisions_removed_path_carries_no_blob() {
+        let directory = repository_fixture();
+        git(directory.path(), &["rm", "-q", "lib.rs"]);
+        commit_all(directory.path(), "retire beacon");
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let history = repository
+            .path_revisions(&head, "lib.rs", 100)
+            .expect("walk");
+        assert_eq!(history.revisions().len(), 2);
+        assert!(
+            history.revisions()[0].blob().is_none(),
+            "the removing commit holds no blob at the path"
+        );
+        assert!(history.revisions()[1].blob().is_some());
+    }
+
+    #[test]
+    fn test_path_revisions_follows_first_parents_only() {
+        let directory = repository_fixture();
+        git(directory.path(), &["checkout", "-q", "-b", "side"]);
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() { /* side */ }\n",
+        )
+        .expect("source");
+        commit_all(directory.path(), "side edit");
+        git(directory.path(), &["checkout", "-q", "main"]);
+        git(
+            directory.path(),
+            &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+        );
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("main").expect("head resolves");
+        let history = repository
+            .path_revisions(&head, "lib.rs", 100)
+            .expect("walk");
+        let summaries: Vec<Option<&str>> = history
+            .revisions()
+            .iter()
+            .map(PathRevision::summary)
+            .collect();
+        assert_eq!(
+            summaries,
+            [Some("merge side"), Some("introduce beacon")],
+            "the merge commit changed the entry against its first parent; \
+             the side-branch commit stays invisible"
+        );
+        assert!(history.is_complete());
+    }
+
+    #[test]
+    fn test_path_revisions_summary_is_the_message_summary_line() {
+        let directory = repository_fixture();
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() { 0; }\n").expect("source");
+        commit_all(
+            directory.path(),
+            "summary line\n\nbody paragraph the summary never carries",
+        );
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let history = repository
+            .path_revisions(&head, "lib.rs", 100)
+            .expect("walk");
+        assert_eq!(history.revisions()[0].summary(), Some("summary line"));
+    }
+
+    #[test]
+    fn test_path_revisions_workspace_below_the_repository_root_uses_the_prefix() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        init(directory.path());
+        let workspace = directory.path().join("packages/app");
+        fs::create_dir_all(&workspace).expect("workspace directory");
+        fs::write(workspace.join("lib.rs"), "pub fn nested() {}\n").expect("source");
+        commit_all(directory.path(), "introduce nested workspace");
+        let repository = Repository::open(&workspace).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let history = repository
+            .path_revisions(&head, "lib.rs", 100)
+            .expect("walk");
+        assert_eq!(history.revisions().len(), 1);
+        assert_eq!(
+            history.revisions()[0].blob().expect("blob present").path(),
+            "lib.rs",
+            "the workspace-relative spelling answers, not the repository one"
+        );
     }
 
     #[test]

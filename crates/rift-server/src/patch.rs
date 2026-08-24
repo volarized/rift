@@ -632,6 +632,7 @@ mod tests {
         ChangeResult, ChangeSummary, OperationPreconditionKind, PatchParams, PreconditionValue,
         RefusalReason,
     };
+    use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::ProjectPath;
 
     use super::{
@@ -656,6 +657,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         let changes = ChangeService::new(directory.path());
         Ok((directory, reads, changes))
@@ -1246,6 +1248,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         let changes = ChangeService::new(directory.path());
         let patch = [
@@ -1346,6 +1349,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         let changes = ChangeService::new(directory.path());
         let patch = [

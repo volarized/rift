@@ -568,6 +568,7 @@ mod tests {
     use rift_core::SourceVisibility;
     use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
     use rift_index::{LexicalMatch, LexicalUnitKind, WorkspaceIndexLimits};
+    use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
         ExactKind, Extensions, FileContent, FileId, MatchedField, Node, NodeId, SearchParams,
         SearchParamsTarget, TextRange,
@@ -595,6 +596,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
     }
@@ -640,6 +642,7 @@ pub fn compute() -> i32 {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
     }
@@ -666,6 +669,7 @@ pub fn compute() -> i32 {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
     }
@@ -699,6 +703,7 @@ pub fn compute() -> i32 {
             WorkspaceIndexLimits::default(),
             &visibility,
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
     }
@@ -1297,6 +1302,7 @@ pub fn compute() -> i32 {
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "extra",
@@ -1348,6 +1354,7 @@ pub fn compute() -> i32 {
             &rift_protocol::read::RevisionId("main".to_owned()),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
     }
@@ -1547,7 +1554,13 @@ pub fn compute() -> i32 {
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
         let text_inclusion = rift_core::TextFileInclusion::default();
-        let service = ReadService::build(directory.path(), limits, &visibility, &text_inclusion)?;
+        let service = ReadService::build(
+            directory.path(),
+            limits,
+            &visibility,
+            &text_inclusion,
+            HistoryConfiguration::default(),
+        )?;
         let worse = LexicalMatch::new(
             "guide.md#0",
             rift_core::ProjectPath::new("guide.md")?,
@@ -1591,7 +1604,13 @@ pub fn compute() -> i32 {
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
         let text_inclusion = rift_core::TextFileInclusion::default();
-        let service = ReadService::build(directory.path(), limits, &visibility, &text_inclusion)?;
+        let service = ReadService::build(
+            directory.path(),
+            limits,
+            &visibility,
+            &text_inclusion,
+            HistoryConfiguration::default(),
+        )?;
         let file = service
             .index()
             .text_files()

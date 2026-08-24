@@ -15,7 +15,7 @@ use rift_index::{
     LexicalSearchIndex, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
-    SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+    HistoryConfiguration, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
 use rift_server::{
@@ -182,6 +182,15 @@ impl ConfigurationState {
             |_| TextFileInclusion::default(),
             |configuration| TextFileInclusion::from(&configuration.search),
         )
+    }
+
+    /// The `[providers.history]` table from the last acceptance, or the
+    /// default table while `rift.toml` is invalid.
+    pub(crate) fn history_configuration(&self) -> HistoryConfiguration {
+        self.accepted
+            .as_ref()
+            .map(|configuration| configuration.providers.history.clone())
+            .unwrap_or_default()
     }
 
     /// The `[search]` table from the last acceptance, or the default table
@@ -609,7 +618,13 @@ pub(crate) fn build_workspace_candidate(
     let configuration = ConfigurationState::accept(root);
     let visibility = configuration.source_visibility();
     let text_inclusion = configuration.text_inclusion();
-    let reads = ReadService::build(root, limits, &visibility, &text_inclusion)?;
+    let reads = ReadService::build(
+        root,
+        limits,
+        &visibility,
+        &text_inclusion,
+        configuration.history_configuration(),
+    )?;
     let source_policy = WorkspaceSourcePolicy::build(root, limits, &visibility, &text_inclusion)
         .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
     if configuration.fingerprint != configuration_fingerprint(root) {

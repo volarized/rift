@@ -160,6 +160,49 @@ async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
 }
 
 #[tokio::test]
+async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    let wire = failing_wire_error(
+        directory.path(),
+        "get_symbol",
+        json!({ "name": "beacon", "include_history": true }),
+    )
+    .await?;
+    assert_eq!(wire["code"], json!("capability_unavailable"));
+    assert_eq!(wire["retry"], json!("operator_action"));
+    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert!(
+        message.contains("requires a git repository - run `git init`"),
+        "the refusal must name the remedy: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        "[providers.history]\nenabled = false\n",
+    )?;
+    let wire = failing_wire_error(
+        directory.path(),
+        "get_symbol",
+        json!({ "name": "beacon", "include_history": true }),
+    )
+    .await?;
+    assert_eq!(wire["code"], json!("capability_unavailable"));
+    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert!(
+        message.contains("symbol history (providers.history disabled)"),
+        "the refusal must name the disabling configuration: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn revision_read_with_history_disabled_is_refused() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;

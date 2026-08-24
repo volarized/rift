@@ -26,26 +26,6 @@ pub use crate::diagnostic::{
     DiagnosticRelated, DiagnosticReliability, DiagnosticTag,
 };
 
-/// Empirical coupling between two symbols: how often revisions that touched one touched the
-/// other. The relation is observed from history rather than resolved from source, so it
-/// reaches coupling no reference graph carries - two implementations of one concept with no
-/// edge between them.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoChange {
-    /// The symbol the coupling is stated for.
-    pub subject: SymbolId,
-    /// The symbol that historically changes with it.
-    pub partner: SymbolId,
-    /// Revisions inside the walked depth that touched both symbols.
-    #[schemars(range(min = 1_u64, max = 9_007_199_254_740_991_u64))]
-    pub together: u64,
-    /// Revisions inside the walked depth that touched `subject` at all. Never below
-    /// `together`.
-    #[schemars(range(min = 1_u64, max = 9_007_199_254_740_991_u64))]
-    pub touches: u64,
-}
-
 /// How far the claim reaches.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -232,10 +212,6 @@ pub struct GetSymbolHit {
     /// The symbol's timeline, present when the request asked for history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<SymbolHistory>,
-    /// Symbols that historically change with this one, strongest coupling first, present
-    /// when the request asked for history.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub co_changes: Option<Vec<CoChange>>,
 }
 
 /// Gets declarations by name and returns them with their bodies inline, so one call replaces
@@ -275,9 +251,8 @@ pub struct GetSymbolParams {
     /// Whether each hit carries its declaration source.
     #[serde(default = "default_get_symbol_params_include_body")]
     pub include_body: bool,
-    /// Whether each hit carries its version-control timeline and co-change coupling. Off by
-    /// default: a timeline is read when the caller is deciding about the symbol, not on
-    /// every lookup.
+    /// Whether each hit carries its version-control timeline. Off by default: a timeline is
+    /// read when the caller is deciding about the symbol, not on every lookup.
     #[serde(default = "default_get_symbol_params_include_history")]
     pub include_history: bool,
     /// Most hits to return in one page, capped by `max_page_items`.
@@ -481,26 +456,18 @@ fn default_get_symbol_params_scope() -> SearchScope {
                             "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
                             "path": "src/config.rs",
                             "kind": "signature_changed",
-                            "timestamp": "2026-08-21T14:03:22Z",
+                            "timestamp": "2026-08-21T14:03:22+00:00",
                             "summary": "Return ConfigError from load_config"
                         },
                         {
                             "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
                             "path": "src/config.rs",
                             "kind": "introduced",
-                            "timestamp": "2026-08-17T09:41:05Z",
+                            "timestamp": "2026-08-17T09:41:05+00:00",
                             "summary": "Add workspace configuration loading"
                         }
                     ]
-                },
-                "co_changes": [
-                    {
-                        "subject": "rift://symbol/rust/src/config.rs/load_config",
-                        "partner": "rift://symbol/rust/src/error.rs/ConfigError",
-                        "together": 4,
-                        "touches": 9
-                    }
-                ]
+                }
             }
         ],
         "pagination": {
@@ -1473,7 +1440,8 @@ pub enum SymbolFacet {
 }
 
 /// One symbol's timeline across the workspace's version-control history, newest revision
-/// first. The walk is bounded by the configured history depth.
+/// first. The walk follows first parents from the served revision along the declaration's
+/// current path only, bounded by the configured history depth.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
@@ -1487,8 +1455,7 @@ pub struct SymbolHistory {
 /// name for the declaration; where the language derives module identity from the file path,
 /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
 /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-/// change the identity when the language includes module path in that qualified name;
-/// history correlation records the declaration across that change.
+/// change the identity when the language includes module path in that qualified name.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
@@ -1517,9 +1484,9 @@ pub struct SymbolOrigin {
     pub unit: Option<SourceUnitId>,
 }
 
-/// One revision that touched a symbol. The history provider derives it by parsing the
-/// declaration at each revision that changed its file, so a version exists only where the
-/// parse found the symbol.
+/// One revision that touched a symbol. The history provider parses the declaration at each
+/// first-parent revision that changed its file and classifies adjacent states; a revision
+/// whose source cannot be parsed contributes no version.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolVersion {
