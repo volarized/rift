@@ -161,7 +161,7 @@ mod tests {
             "pub fn committed() {}\n",
         )
         .expect("source");
-        fs::write(directory.path().join("README.md"), "prose\n").expect("prose");
+        fs::write(directory.path().join("README.txt"), "prose\n").expect("prose");
         commit_all(directory.path(), "introduce committed");
         directory
     }
@@ -217,6 +217,29 @@ mod tests {
         );
         let lines = index.source_matches("committed", 5).expect("lexical read");
         assert_eq!(lines[0].1, 1);
+    }
+
+    /// A committed `.md` file joins revision reads through the markdown
+    /// provider's declared extension, like any other source file.
+    #[test]
+    fn test_at_revision_serves_committed_markdown_headings() {
+        let directory = committed_workspace();
+        fs::write(
+            directory.path().join("docs.md"),
+            "# Install\n\nRun the beacon.\n",
+        )
+        .expect("markdown fixture");
+        commit_all(directory.path(), "introduce docs");
+        let index = revision_index(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("revision index");
+        let matches = index.symbols("Install", 5).expect("symbol read");
+        assert_eq!(matches[0].symbol.qualified_name, "Install");
+        assert_eq!(matches[0].symbol.kind, "heading");
+        assert_eq!(matches[0].file.syntax().language().name, "markdown");
     }
 
     #[test]
