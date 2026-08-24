@@ -7,16 +7,15 @@
 
 #![cfg(unix)]
 
-#[path = "support/fake_engine.rs"]
 mod fake_engine;
-mod support;
+mod workspace_client;
 
 use std::fs;
 
 use fake_engine::engine_configuration;
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use support::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
+use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
 fn rename_request(symbol: &str, new_name: &str) -> CallToolRequestParams {
     tool_request(
