@@ -13,7 +13,10 @@
 //! again while the engine answers provisionally or refuses retryably, under
 //! that engine's `[engines.<name>.retry]` table, and starts a replacement
 //! engine under its `[engines.<name>.restart]` table when the one it has
-//! dies. Callers hold no retry loop of their own: an operation returns
+//! dies. It also sends the operation again once when an engine that has
+//! never announced any work answers nothing, because until the first
+//! announcement arrives an empty answer is indistinguishable from a real
+//! one. Callers hold no retry loop of their own: an operation returns
 //! either the engine's settled answer or the failure that outlasted the
 //! whole budget.
 //!
@@ -187,13 +190,20 @@ impl RestartBudget {
 /// A dead engine is not one of these. It is answered by starting a
 /// replacement under the restart budget, not by waiting.
 #[derive(Debug)]
-enum Transient {
+enum Transient<T> {
     /// The engine answered while it still had work-done progress
     /// outstanding, so what it answered - a result or a refusal - is
     /// provisional.
     Analyzing,
     /// The engine refused with a code that invites the same request again.
     Refused(EngineError),
+    /// The engine has never announced any work and answered nothing where
+    /// something was expected, so its silence proves nothing.
+    ///
+    /// The answer rides along: the engine did answer, so a `retry` table
+    /// too narrow to carry the one resend leaves this as the only answer
+    /// there is.
+    AnsweredNothing(T),
 }
 
 /// Whether restarting the engine could change this failure's answer.
@@ -236,14 +246,24 @@ impl EngineSlot {
     ///   the request.
     /// - The engine refused with a code that invites the same request
     ///   again ([`EngineFault::is_retryable_refusal`]). Same treatment.
+    /// - The engine has never announced any work and answered nothing
+    ///   where something was expected. Announcing is what makes the wait
+    ///   above possible, so until the engine has announced once, an empty
+    ///   answer is indistinguishable from a real one: the session claims
+    ///   one resend for it
+    ///   ([`EngineSession::claim_empty_answer_resend`]) and the operation
+    ///   goes back after the same wait. The claim is spent per operation
+    ///   per session, so an engine that announces nothing ever pays this
+    ///   once and answers at once from then on.
     /// - The session found or left the engine dead. A replacement starts
     ///   while the `[engines.<name>.restart]` budget allows, and the
     ///   operation runs on it.
     ///
     /// Every other failure - a verdict the settled engine reached, an
     /// absent capability, a broken exchange - returns at once, because
-    /// sending it again changes nothing. So does a settled answer: an
-    /// engine that reports no progress at all never pays a retry wait.
+    /// sending it again changes nothing. So does a settled answer that
+    /// said something, and so does the second empty answer: what the
+    /// engine says twice is what it has to say.
     ///
     /// Both tables bound the loop. Each pass either returns, spends one of
     /// `retry.attempts`, or claims one of `restart.attempts` inside its
@@ -290,7 +310,12 @@ impl EngineSlot {
             let analyzing = session.is_analyzing();
             let ended = session.is_ended();
             let absorbed = match outcome {
-                Ok(answer) if !analyzing => return Ok(answer),
+                Ok(answer) if !analyzing => {
+                    if !session.claim_empty_answer_resend() {
+                        return Ok(answer);
+                    }
+                    Transient::AnsweredNothing(answer)
+                }
                 Ok(_provisional) => Transient::Analyzing,
                 Err(error) if ended => {
                     reported = Some(error);
@@ -301,16 +326,21 @@ impl EngineSlot {
                 Err(error) => return Err(error),
             };
             let Some(wait) = retry.delay_after(attempt) else {
-                return Err(self.exhausted(absorbed, retry.attempts));
+                return self.exhausted(absorbed, retry.attempts);
             };
             tokio::time::sleep(wait).await;
             attempt += 1;
         }
     }
 
-    /// The failure one absorbed condition surfaces once the attempt bound
-    /// is spent, logged as the boundary a caller is about to see.
-    fn exhausted(&self, absorbed: Transient, attempts: u64) -> EngineError {
+    /// What one absorbed condition surfaces once the attempt bound is
+    /// spent, logged as the boundary a caller is about to see.
+    ///
+    /// Two of the three end the call with a failure. The third does not:
+    /// an engine that answered nothing did answer, and a `retry` table
+    /// with no second attempt in it leaves that answer as the only one
+    /// there is.
+    fn exhausted<T>(&self, absorbed: Transient<T>, attempts: u64) -> Result<T, EngineError> {
         match absorbed {
             Transient::Analyzing => {
                 tracing::warn!(
@@ -319,7 +349,7 @@ impl EngineSlot {
                     attempts,
                     "language engine was still analyzing on every attempt"
                 );
-                Error::new(EngineFault::Analyzing { attempts })
+                Err(Error::new(EngineFault::Analyzing { attempts }))
             }
             Transient::Refused(refusal) => {
                 tracing::warn!(
@@ -328,7 +358,16 @@ impl EngineSlot {
                     attempts,
                     "language engine refused every attempt retryably"
                 );
-                refusal
+                Err(refusal)
+            }
+            Transient::AnsweredNothing(answer) => {
+                tracing::debug!(
+                    component = "engine",
+                    engine = %self.name,
+                    attempts,
+                    "language engine answered nothing and the attempts allow no resend"
+                );
+                Ok(answer)
             }
         }
     }
