@@ -104,18 +104,18 @@ jobs:
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just,cargo-audit,cargo-deny,cargo-llvm-cov
+
+      # `just test` runs the live-engine suites, so the engines are gate
+      # dependencies. The component lands on the default toolchain, the one
+      # an engine child resolves: the fixtures run outside this repository,
+      # where rust-toolchain.toml no longer applies, so the step runs
+      # outside it too. Adding an installed component again is a no-op.
+      - run: rustup component add rust-analyzer
+        working-directory: ${{ runner.temp }}
+
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
-
-      # The live-engine suites run inside `just test`, so their engines
-      # are gate dependencies. The rust-analyzer component lands on the
-      # default toolchain, the one an engine child resolves: the fixtures
-      # run outside this repository, where rust-toolchain.toml no longer
-      # applies, so the step runs outside it too. Adding an installed
-      # component again is a no-op.
-      - run: rustup component add rust-analyzer
-        working-directory: ${{ runner.temp }}
 
       # Both halves of the typescript engine land in bun's cache first:
       # the package the fixtures install from their lockfile, and the
@@ -127,7 +127,9 @@ jobs:
           bun install --frozen-lockfile --cwd "$RUNNER_TEMP"
           bunx typescript-language-server@6.0.0 --version
 
-      # Each local gate target is its own CI step.
+      # Each local gate target is its own CI step. There is no separate
+      # coverage step: `just test` is the one instrumented run, and its
+      # lcov output is the artifact uploaded below.
       - run: just format
       - run: just dashes
       - run: just generate-check
@@ -200,13 +202,3 @@ jobs:
       - run: >-
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py
-
-  # The live-engine suites against real language servers. One job owns
-  # every engine-live suite, so every engine's resolver installs here:
-  # rustup serves rust-analyzer and bun serves typescript-language-server.
-  # rust-analyzer needs no display and no network; it does need cargo
-  # metadata to succeed inside the fixture, and every fixture is a
-  # self-contained cargo project in a tempdir. The typescript fixtures are
-  # bun projects, installed from a committed lockfile into their own
-  # tempdirs; the pre-warm step below keeps the registry out of the test
-  # run itself.
