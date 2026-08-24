@@ -115,7 +115,10 @@ intersection per language.
 
 ## Providers
 
-<VersionBadge version="v0.0.7" languages={["Rust"]} />
+<VersionBadge
+  version="v0.0.7"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
 
 The built-in providers run without configuration; the `providers` table exists to bound or
 disable them:
@@ -131,13 +134,12 @@ max_revisions = 500
 `capability_unavailable`. A workspace without version control cannot serve those reads whatever
 this table says.
 
-<VersionBadge version="planned" />
+<VersionBadge version="v0.0.13" />
 
-`max_revisions` bounds the timeline walk from the current head, 1 to 100000, because the walk's
-cost scales with how far back it reaches. The history provider computes timelines and co-change
-coupling inside that depth, and a [`SymbolHistory`](/docs/protocol/reference#SymbolHistory)
-whose walk ended early says so in the result's `warnings` rather than pretending the symbol has
-no earlier past.
+`max_revisions` bounds the timeline walk from the served revision, 1 to 100000, because the
+walk's cost scales with how far back it reaches. The history provider computes a
+[`SymbolHistory`](/docs/protocol/reference#SymbolHistory) timeline inside that depth; a
+revision beyond it contributes no version.
 
 Provider configuration does not set merge order or freshness. The server reports provider order,
 state, and revision through `rift://workspace`. A provider rebuilding after a file change can

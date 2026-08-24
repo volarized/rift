@@ -2,7 +2,10 @@
 title: MCP
 ---
 
-<VersionBadge version="v0.0.12" languages={["Rust"]} />
+<VersionBadge
+  version="v0.0.13"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
 
 `rift mcp` serves MCP over stdio for harnesses that launch servers as subprocesses. Stdout carries
 MCP frames; the process writes tracing events to stderr.
@@ -50,7 +53,10 @@ when both are absent. The server refuses a read naming a `projection` with
 
 ### Revision-addressed reads [#revision-reads]
 
-<VersionBadge version="v0.0.7" languages={["Rust"]} />
+<VersionBadge
+  version="v0.0.7"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
 
 Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
 `main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
@@ -90,8 +96,15 @@ refuses every revision read.
 
 <McpTool name="get_symbol" />
 
-`include_history` applies to project symbols and attaches their version-control timeline and
-co-change coupling.
+<VersionBadge version="v0.0.13" />
+
+`include_history` applies to project symbols and attaches their version-control timeline as a
+[`SymbolHistory`](/docs/protocol/reference#SymbolHistory). The server follows first parents
+from the served revision along the declaration's current path, bounded by the `max_revisions`
+key in [`[providers.history]`](/docs/configuration#providers), and classifies what each
+touching revision did: `introduced`, `body_changed`, `signature_changed`, `removed`, or
+`decorators_changed`. A revision whose source cannot be parsed, or where the symbol is absent,
+contributes no version.
 
 <McpTool name="search" />
 
@@ -149,7 +162,10 @@ This request names a `traversal`, which the server does not serve:
 
 ### Full-text search [#search-fulltext]
 
-<VersionBadge version="v0.0.9" languages={["Rust"]} />
+<VersionBadge
+  version="v0.0.9"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
 
 `query` matches declaration names, file contents, and declaration sources through a full-text
 index. A multi-word query matches a unit that carries any one of its terms anywhere in its

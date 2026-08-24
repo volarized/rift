@@ -204,15 +204,19 @@ access serves revision-addressed reads: `get_symbol`, `search`, and `nodes` acce
 the server indexes that commit's tree - the same syntax providers, over committed bytes - without
 touching the working tree.
 
-The provider composition runs the same syntax providers over changed files at each revision. A
-history enricher then matches revision-qualified declarations, so a symbol gets a timeline -
-introduced, body changed, signature changed, moved - that survives renames and file moves, plus its
-**co-change** coupling: which symbols the walked revisions touched together.
+<VersionBadge
+  version="v0.0.13"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
 
-Co-change is observed rather than resolved, so it reaches coupling no reference graph
-carries - two implementations of one concept that never mention each other. The walk is
-bounded by [`providers.history.max_revisions`](/docs/configuration#providers),
-and a workspace without version control serves no history facts.
+Asking for a symbol's history walks that same object store: the server follows first parents
+from the served revision along the declaration's current path and parses the committed bytes at
+each revision that changed the file - the same syntax provider, per revision. Comparing adjacent
+parsed states gives the symbol a timeline: introduced, body changed, signature changed, removed.
+
+The walk is bounded by
+[`providers.history.max_revisions`](/docs/configuration#providers), because its cost scales
+with how far back it reaches, and a workspace without version control serves no history facts.
 
 ### Custom
 
@@ -273,7 +277,10 @@ diagnostics, by canonical identity, and each retained fact keeps its evidence.
 
 ## Index
 
-<VersionBadge version="v0.0.8" languages={["Rust"]} />
+<VersionBadge
+  version="v0.0.8"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
 
 The server keeps an immutable index over the project's source. Tree-sitter extracts
 declarations and syntax nodes from the files the workspace's source policy includes.
@@ -287,7 +294,10 @@ When the published index lags the tree a read captured, the result says so: a `s
 entry in `warnings` carries the digests of the tree revision the index covers and the revision
 the read captured, so the caller knows the answer may miss the newest writes.
 
-<VersionBadge version="v0.0.9" languages={["Rust"]} />
+<VersionBadge
+  version="v0.0.9"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
 
 Each rebuild also derives lexical units for [`search`](/docs/protocol/mcp#tool-search): one per
 indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) includes. The units
@@ -344,11 +354,14 @@ configured model rebuilds the dense index rather than mixing spaces.
 known. The answer carries the declaration's body inline, so reading a function takes one call
 rather than a search followed by a file read.
 
-Asking for history attaches the symbol's timeline and co-change partners to the same answer.
+Asking for history attaches the symbol's committed timeline to the same answer.
 
 ## Changes
 
-<VersionBadge version="v0.0.4" languages={["Rust"]} />
+<VersionBadge
+  version="v0.0.4"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
 
 By default, a change lands in your working tree - the same files your editor and your terminal
 see. Your agent's harness already runs its shell commands and its tests in that checkout;
