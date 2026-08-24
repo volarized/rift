@@ -10,12 +10,12 @@ version: 2
 # inherit it too. 50-character limit on `prefix`.
 #
 # `prefix-development` is only honoured by bundler, composer, mix, maven, npm,
-# and pip — so it applies to bun (npm family) and is inert for cargo and
+# and pip - so it applies to bun (npm family) and is inert for cargo and
 # github-actions, where every update is treated as production.
 
 updates:
   # docs/ JavaScript. NOTE: Dependabot supports *version* updates for bun but
-  # NOT security updates — that gap is why ci.yml also runs `bun audit` as a
+  # NOT security updates - that gap is why ci.yml also runs `bun audit` as a
   # blocking gate. Requires the text-based bun.lock (>=1.1.39), which we have.
   - package-ecosystem: bun
     directory: /docs
@@ -43,7 +43,7 @@ updates:
       cargo-minor-patch:
         update-types: [minor, patch]
 
-  # Keeps the action pins current — notably `rustsec/audit-check`, which
+  # Keeps the action pins current - notably `rustsec/audit-check`, which
   # publishes no floating major tag and so is pinned exactly.
   - package-ecosystem: github-actions
     directory: /

@@ -7,7 +7,7 @@ name: dependabot-automerge
 # with write access. It is safe here for two specific reasons, both of which
 # must hold if this file is ever edited:
 #   1. the job is gated on actor == dependabot[bot], and
-#   2. it NEVER checks out or executes PR code — no actions/checkout, no build.
+#   2. it NEVER checks out or executes PR code - no actions/checkout, no build.
 # Add a checkout step and this becomes a remote code execution path.
 on: pull_request_target
 
@@ -24,7 +24,7 @@ jobs:
       - uses: dependabot/fetch-metadata@v3
         id: meta
 
-      # Majors deliberately excluded — they carry breaking changes and want a
+      # Majors deliberately excluded - they carry breaking changes and want a
       # human. Everything else merges once the required checks pass; auto-merge
       # waits for them rather than bypassing them.
       - name: Enable auto-merge for non-major updates
@@ -36,7 +36,7 @@ jobs:
 
       - name: Comment on major updates
         if: steps.meta.outputs.update-type == 'version-update:semver-major'
-        run: gh pr comment "$PR_URL" --body "Major version bump — auto-merge skipped, needs a human."
+        run: gh pr comment "$PR_URL" --body "Major version bump - auto-merge skipped, needs a human."
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

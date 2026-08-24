@@ -27,11 +27,21 @@ generate-check:
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null
-    cargo check --workspace --all-targets --all-features
     uv run --script scripts/check_rust_architecture.py
 
+# The em-dash ban, over every surface a reader meets: the docs pages and
+# the app shell, the prose inside the crates, the README, the artifacts
+# `just generate` writes, and the CI configuration's own comments. The
+# scanner itself is not among them: it spells the banned characters.
+dashes:
+    uv run --script scripts/check_dashes.py \
+        docs/content docs/src/app crates README.md docs/public .github
+
+# One run of every suite, live engines included: the engine tier's own code
+# is only exercised against a real language server, so a hermetic run would
+# report it uncovered. Coverage is this run's artifact, not a second run.
 test:
-    cargo test --workspace --all-targets --all-features
+    RIFT_ENGINE_LIVE=1 cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -53,8 +63,6 @@ clean:
         fi
     done
 
-coverage:
-    cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
@@ -62,4 +70,4 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-rust-gate: format generate-check check test clippy docs audit coverage release-test installer-test
+rust-gate: format dashes generate-check check clippy docs audit test release-test installer-test
