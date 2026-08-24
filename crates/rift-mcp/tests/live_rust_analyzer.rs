@@ -10,6 +10,14 @@
 //! scripted suites only imitate. Every asserted shape was observed on a
 //! live rust-analyzer answer first, then pinned.
 //!
+//! Each test warms the engine first, then makes one call and asserts what
+//! a caller sees. The server waits out an engine that is loading, but only
+//! while the engine announces that work: the first request a session sends
+//! races that announcement, and rust-analyzer answers a will-rename or a
+//! diagnostics pull it cannot serve yet with nothing at all - no refusal,
+//! no progress, nothing to wait on. The warm-up puts the engine past that
+//! window once per fixture.
+//!
 //! The fixture is a cargo project, because rust-analyzer resolves nothing
 //! outside one: a manifest whose `[lib]` path keeps every module file at
 //! the tree root, and whose empty `[workspace]` table stops cargo climbing
@@ -85,19 +93,22 @@ const WARMUP_PAUSE: Duration = Duration::from_millis(250);
 
 /// Drives the rename tool until rust-analyzer has loaded the cargo project.
 ///
-/// rust-analyzer answers initialize in milliseconds and keeps loading
-/// afterwards, and it answers requests throughout: while it warms it
-/// declines the rename with `No references found at position`, then with
-/// `content modified`, and only then resolves the declaration. Locally the
-/// declaration resolved after 2.5s of a 250ms cadence, five attempts in.
-///
 /// The probe renames the declaration to the name it already has. Once
 /// rust-analyzer resolves it, the proposal edits every occurrence to the
 /// bytes already there, so the compiled plan holds no rewrite and the tool
 /// refuses with `proposed no edits` - the readiness signal, with the tree
-/// untouched either way. The wait is bounded by attempts against the
-/// tool's own answer, and paced so the loop does not spin on an engine
-/// that is busy indexing.
+/// untouched either way.
+///
+/// The server absorbs a loading engine on its own while the engine
+/// announces its work: locally the announcement runs for the first 830ms
+/// and the engine cancels requests until about 2.3s, and every attempt
+/// inside that window is resent under the `retry` table. What it cannot
+/// absorb is the window before the first announcement arrives, where this
+/// engine answers a will-rename with no edit and a pull with no items -
+/// answers a settled engine gives for a tree that needs neither. This
+/// probe puts the engine past that window once, so the assertions that
+/// follow are about a loaded engine. It never proves how far a proposal
+/// reaches; the assertions do.
 async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
     let started = Instant::now();
     for _attempt in 0..WARMUP_ATTEMPTS_MAX {
@@ -220,42 +231,15 @@ async fn applied_move_rewrites_the_module_declaration_and_the_import() -> TestRe
 const ARGUMENT_PATCH: &str =
     "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2, 3)\n";
 
-/// The inverse of [`ARGUMENT_PATCH`], restoring the single argument.
-const ARGUMENT_REVERT_PATCH: &str =
-    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2, 3)\n+    beacon(2)\n";
-
-/// Lands the arity error until rust-analyzer reports it, and answers with
-/// the applied change that carried the finding.
-///
-/// The engine's analysis warms after the resolution the rename probe waits
-/// on, and a pull answered before the changed file is analyzed comes back
-/// as an empty report. An empty report is what clean bytes answer too, so
-/// the server cannot resend it - only a refusal is retryable. Each attempt
-/// here is therefore a fresh change: the error lands, and an empty answer
-/// reverts it so the next attempt lands it again and pulls afresh.
-async fn reported_arity_error(client: &RunningService<RoleClient, ()>) -> TestResult<Value> {
-    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
-        let structured = call_retrying_acceptance(
-            client,
-            tool_request("patch", &json!({ "patch": ARGUMENT_PATCH })),
-        )
-        .await?;
-        if !coded_findings(&structured, "E0107").is_empty() {
-            return Ok(structured);
-        }
-        call_retrying_acceptance(
-            client,
-            tool_request("patch", &json!({ "patch": ARGUMENT_REVERT_PATCH })),
-        )
-        .await?;
-        tokio::time::sleep(WARMUP_PAUSE).await;
-    }
-    Err("rust-analyzer reported no arity error within the warm-up bound".into())
-}
-
 /// The applied change carries rust-analyzer's own finding for the file it
 /// changed: the pull runs on the document Rift just wrote, so the answer
 /// is the engine's reading of the landed bytes.
+///
+/// One patch, one assertion. The engine answers a pull it takes while it
+/// is still analyzing with an empty report, which reads exactly like clean
+/// bytes; the server tells the two apart from the engine's own
+/// `$/progress` traffic and pulls again until the engine has settled, so
+/// the finding rides the result of the change that produced it.
 #[tokio::test]
 async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     if !engine_live() {
@@ -266,7 +250,11 @@ async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     require_rust_analyzer(directory.path());
     warmed_engine(&client).await?;
 
-    let structured = reported_arity_error(&client).await?;
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request("patch", &json!({ "patch": ARGUMENT_PATCH })),
+    )
+    .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(structured["summary"]["paths"], json!(["caller.rs"]));
     let findings = coded_findings(&structured, "E0107");
