@@ -11,6 +11,7 @@ use std::io::{Read, StdinLock, Write};
 use std::path::PathBuf;
 
 use lsp_types::error_codes::SERVER_CANCELLED;
+use rift_lsp::correlation::METHOD_NOT_FOUND_CODE;
 use rift_lsp::framing::{Framing, MESSAGE_BYTES_MAX};
 use serde_json::{Value, json};
 
@@ -96,6 +97,8 @@ struct EngineState {
     root: String,
     /// Each opened document's text, by URI.
     opened: HashMap<String, String>,
+    /// Diagnostic pulls answered so far, counting the one in flight.
+    diagnostic_pulls: usize,
 }
 
 /// Reads frames and dispatches until stdin closes or the script exits.
@@ -174,7 +177,7 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
             ),
         },
         "workspace/willRenameFiles" => answer_will_rename(behavior, message, state),
-        "textDocument/diagnostic" => answer_diagnostic(behavior, id),
+        "textDocument/diagnostic" => answer_diagnostic(behavior, id, state),
         _ => {}
     }
 }
@@ -207,8 +210,12 @@ fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
 ///
 /// The default is a full report with no items, so applied-change pulls in
 /// unrelated tests stay clean; the scripted behaviors return items, an
-/// unchanged report, or death mid-request.
-fn answer_diagnostic(behavior: &str, id: &Value) {
+/// unchanged report, a refusal, or death mid-request. The refusing
+/// behaviors stamp the pull's ordinal into their message, so a test reads
+/// how many times it was asked off the wire.
+fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
+    state.diagnostic_pulls += 1;
+    let pull = state.diagnostic_pulls;
     match behavior {
         "server-requests" => respond(id, &json!({"kind": "unchanged", "resultId": "1"})),
         "happy" => respond(
@@ -225,8 +232,24 @@ fn answer_diagnostic(behavior: &str, id: &Value) {
             respond(id, &json!({"kind": "full", "items": items}));
         }
         "dies-on-diagnostic" => std::process::exit(0),
+        "cancels-first-diagnostic" if pull == 1 => refuse_pull(id, SERVER_CANCELLED, pull),
+        "cancels-first-diagnostic" => respond(
+            id,
+            &json!({"kind": "full", "items": [diagnostic(&format!("settled on pull {pull}"))]}),
+        ),
+        "cancels-every-diagnostic" => refuse_pull(id, SERVER_CANCELLED, pull),
+        "refuses-diagnostic" => refuse_pull(id, METHOD_NOT_FOUND_CODE, pull),
         _ => respond(id, &json!({"kind": "full", "items": []})),
     }
+}
+
+/// Refuses one diagnostic pull, naming the code and the pull's ordinal.
+fn refuse_pull(id: &Value, code: i64, pull: usize) {
+    print_message(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": format!("declined pull {pull}")},
+    }));
 }
 
 /// One item per LSP severity, plus a string and a numeric code.
