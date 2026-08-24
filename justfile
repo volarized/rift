@@ -27,11 +27,8 @@ generate-check:
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null
-    cargo check --workspace --all-targets --all-features
     uv run --script scripts/check_rust_architecture.py
 
-test:
-    cargo test --workspace --all-targets --all-features
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -53,11 +50,15 @@ clean:
         fi
     done
 
-coverage:
-    cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
+# One run of every suite, live engines included: the engine tier's own code
+# is only exercised against a real language server, so a hermetic run would
+# report it uncovered. Needs rust-analyzer on the default toolchain and bun
+# on the PATH. Coverage is this run's artifact, not a second run.
+test:
+    RIFT_ENGINE_LIVE=1 cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 
-# The live-engine suites: gated by RIFT_ENGINE_LIVE, run in CI's engines
-# job, and outside `rust-gate` so the local default gate stays hermetic.
+# The live-engine suites alone, for iterating on them without paying for
+# the instrumented workspace run.
 engine-test:
     RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_rust_analyzer
     RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer
@@ -70,4 +71,4 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-rust-gate: format generate-check check test clippy docs audit coverage release-test installer-test
+rust-gate: format generate-check check clippy docs audit test release-test installer-test

@@ -104,16 +104,37 @@ jobs:
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just,cargo-audit,cargo-deny,cargo-llvm-cov
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
 
-      # Keep every local just target visible as its own CI check step.
+      # The live-engine suites run inside `just test`, so their engines
+      # are gate dependencies. The rust-analyzer component lands on the
+      # default toolchain, the one an engine child resolves: the fixtures
+      # run outside this repository, where rust-toolchain.toml no longer
+      # applies, so the step runs outside it too. Adding an installed
+      # component again is a no-op.
+      - run: rustup component add rust-analyzer
+        working-directory: ${{ runner.temp }}
+
+      # Both halves of the typescript engine land in bun's cache first:
+      # the package the fixtures install from their lockfile, and the
+      # pinned server every fixture starts through bunx. The lockfile is
+      # copied out of the checkout, so no install writes into it.
+      - run: |
+          cp crates/rift-mcp/tests/fixtures/typescript/package.json \
+             crates/rift-mcp/tests/fixtures/typescript/bun.lock "$RUNNER_TEMP"
+          bun install --frozen-lockfile --cwd "$RUNNER_TEMP"
+          bunx typescript-language-server@6.0.0 --version
+
+      # Each local gate target is its own CI step.
       - run: just format
       - run: just generate-check
       - run: just check
-      - run: just test
       - run: just clippy
       - run: just docs
       - run: just audit
-      - run: just coverage
+      - run: just test
       - run: just release-test
       - run: just installer-test
 
@@ -188,35 +209,3 @@ jobs:
   # bun projects, installed from a committed lockfile into their own
   # tempdirs; the pre-warm step below keeps the registry out of the test
   # run itself.
-  engines:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@v2.9.2
-      - uses: taiki-e/install-action@v2.86.3
-        with:
-          tool: just
-      - uses: oven-sh/setup-bun@v2.2.0
-        with:
-          bun-version: latest
-      # The component lands on the default toolchain, the one the engine
-      # child resolves: the fixtures run outside this repository, where
-      # rust-toolchain.toml no longer applies, so the step runs outside it
-      # too. Adding an installed component again is a no-op.
-      - run: rustup component add rust-analyzer
-        working-directory: ${{ runner.temp }}
-      # Both halves of the typescript engine land in bun's cache first:
-      # the package the fixtures install from their lockfile, and the
-      # pinned server every fixture starts through bunx. The lockfile is
-      # copied out of the checkout, so no install writes into it.
-      - run: |
-          cp crates/rift-mcp/tests/fixtures/typescript/package.json \
-             crates/rift-mcp/tests/fixtures/typescript/bun.lock "$RUNNER_TEMP"
-          bun install --frozen-lockfile --cwd "$RUNNER_TEMP"
-          bunx typescript-language-server@6.0.0 --version
-      - run: just engine-test

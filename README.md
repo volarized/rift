@@ -76,12 +76,11 @@ Rust uses the toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `
 | --- | --- |
 | `just format` | Rust formatting |
 | `just generate-check` | Generated protocol drift |
-| `just check` | All targets, features, crate edges, and binary ownership |
-| `just test` | Workspace tests |
+| `just check` | Lock freshness, crate edges, and binary ownership |
 | `just clippy` | Strict Clippy policy |
 | `just docs` | Warning-free Rust documentation |
 | `just audit` | Advisory, license, ban, and source policy |
-| `just coverage` | CLI coverage report and hard 86% line floor |
+| `just test` | Every suite, live engines included; writes coverage and holds an 86% line floor |
 | `just release-test` | Deterministic release archive contract |
 | `just installer-test` | Offline curl and irm installer contract |
 | `just rust-gate` | Every gate above |
