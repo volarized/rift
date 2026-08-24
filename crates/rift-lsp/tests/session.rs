@@ -390,6 +390,47 @@ async fn refused_rename_is_typed_and_leaves_the_session_serving() {
     session.shutdown().await;
 }
 
+/// A server cancellation is a refusal the caller may resend: the typed
+/// fault carries the code, classifies as temporarily unavailable, and
+/// leaves the engine serving the next request.
+#[tokio::test]
+async fn cancelled_rename_is_a_retryable_refusal() {
+    let (_workspace, mut session) = started("cancels-rename").await;
+    let document = path("src/lib.rs");
+    let refusal = session
+        .rename(
+            &document,
+            Position {
+                line: 0,
+                character: 0,
+            },
+            "renamed",
+        )
+        .await
+        .expect_err("the engine cancels the request");
+    assert!(matches!(
+        refusal.fault(),
+        EngineFault::Refused { code: -32802, message, .. }
+            if message == "server cancelled the request"
+    ));
+    assert!(refusal.fault().is_retryable_refusal());
+    assert_eq!(
+        refusal.name(),
+        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    );
+    session
+        .prepare_rename(
+            &document,
+            Position {
+                line: 0,
+                character: 0,
+            },
+        )
+        .await
+        .expect("a cancellation leaves the engine serving");
+    session.shutdown().await;
+}
+
 #[tokio::test]
 async fn payload_without_an_envelope_ends_the_session() {
     let (_workspace, mut session) = started("unreadable").await;

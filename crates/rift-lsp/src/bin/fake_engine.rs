@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, StdinLock, Write};
 use std::path::PathBuf;
 
+use lsp_types::error_codes::SERVER_CANCELLED;
 use rift_lsp::framing::{Framing, MESSAGE_BYTES_MAX};
 use serde_json::{Value, json};
 
@@ -267,6 +268,17 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state
                 "jsonrpc": "2.0",
                 "id": message["id"],
                 "error": {"code": -32602, "message": "new name is not an identifier"},
+            }));
+            return;
+        }
+        "cancels-rename" => {
+            print_message(&json!({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "error": {
+                    "code": SERVER_CANCELLED,
+                    "message": "server cancelled the request",
+                },
             }));
             return;
         }
