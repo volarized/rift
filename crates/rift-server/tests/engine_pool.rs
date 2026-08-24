@@ -739,3 +739,160 @@ async fn a_refusal_answered_mid_analysis_is_absorbed_until_the_engine_settles() 
     );
     pool.shutdown().await;
 }
+
+/// One will-rename conversation through the pool for `name`.
+///
+/// The request names the two URIs alone, so nothing is opened first and
+/// the answer is the engine's whole contribution.
+async fn will_rename_through(
+    pool: &EnginePool,
+    name: &str,
+) -> Result<Option<lsp_types::WorkspaceEdit>, rift_lsp::session::EngineError> {
+    let slot = pool
+        .engine_for(&language(name))
+        .expect("the language is served");
+    // The boxed future may only borrow the session, so each attempt gets
+    // its own owned copy of the request paths.
+    let request_from = document();
+    let request_to = ProjectPath::new("src/moved.rs").expect("fixture path is valid");
+    slot.request(move |session: &mut EngineSession| {
+        let from = request_from.clone();
+        let to = request_to.clone();
+        Box::pin(async move { session.will_rename_files(&from, &to).await })
+    })
+    .await
+}
+
+/// One diagnostic pull through the pool for `name`.
+async fn pull_through(
+    pool: &EnginePool,
+    name: &str,
+) -> Result<Vec<lsp_types::Diagnostic>, rift_lsp::session::EngineError> {
+    let slot = pool
+        .engine_for(&language(name))
+        .expect("the language is served");
+    let request_target = document();
+    slot.request(move |session: &mut EngineSession| {
+        let target = request_target.clone();
+        Box::pin(async move {
+            session
+                .open(&target, "rust", "fn beacon() {}\n".to_owned())
+                .await?;
+            session.pull_diagnostics(&target).await
+        })
+    })
+    .await
+}
+
+/// An engine that has never announced work answers nothing where
+/// something was expected, and nothing is what a settled engine answers
+/// for a document that is clean. The slot sends the pull again once, and
+/// the answer the second pull carries is the one the caller gets.
+#[tokio::test]
+async fn an_empty_answer_from_an_unannounced_engine_is_pulled_again() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(
+        engine_table("pulls-empty-then-reports", &["rust"], &log),
+        ABSORPTION_ATTEMPTS,
+    );
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    let pulled = pull_through(&pool, "rust")
+        .await
+        .expect("the engine answers both pulls");
+    assert_eq!(
+        pulled.len(),
+        1,
+        "the finding the second pull carried is the answer: {pulled:#?}"
+    );
+    assert_eq!(
+        recorded(&log, "diagnostic"),
+        2,
+        "the empty answer was discarded and the document pulled again"
+    );
+    assert_eq!(recorded(&log, "initialize"), 1, "nothing was restarted");
+    pool.shutdown().await;
+}
+
+/// The resend is claimed once per operation per session. An engine that
+/// answers nothing twice has said what it has to say, and the second
+/// answer comes back as the operation's own.
+#[tokio::test]
+async fn a_second_empty_answer_is_the_engines_own_and_is_never_asked_again() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(engine_table("happy", &["rust"], &log), ABSORPTION_ATTEMPTS);
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    let proposal = will_rename_through(&pool, "rust")
+        .await
+        .expect("the engine answers both requests");
+    assert!(
+        rift_lsp::session::proposes_no_edit(proposal.as_ref()),
+        "the engine proposed nothing twice: {proposal:#?}"
+    );
+    assert_eq!(
+        recorded(&log, "will-rename"),
+        2,
+        "one resend, and only one, for an engine that announces nothing"
+    );
+
+    will_rename_through(&pool, "rust")
+        .await
+        .expect("the engine answers the later request");
+    assert_eq!(
+        recorded(&log, "will-rename"),
+        3,
+        "a later request on the same session pays no resend at all"
+    );
+    pool.shutdown().await;
+}
+
+/// An engine that has announced work keeps its empty answer: it reports
+/// what it is doing, so its silence about a request is its own verdict
+/// and the operation is never sent again.
+#[tokio::test]
+async fn an_announced_engine_keeps_its_empty_answer() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(
+        engine_table("announces-then-answers-nothing", &["rust"], &log),
+        ABSORPTION_ATTEMPTS,
+    );
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    let proposal = will_rename_through(&pool, "rust")
+        .await
+        .expect("the engine answers");
+    assert!(
+        proposal.is_none(),
+        "the engine answered null: {proposal:#?}"
+    );
+    assert_eq!(
+        recorded(&log, "will-rename"),
+        1,
+        "an engine that announced its work is asked once"
+    );
+    pool.shutdown().await;
+}
+
+/// A `retry` table with no second attempt in it carries no resend, and
+/// the empty answer is then the only answer there is.
+#[tokio::test]
+async fn a_table_without_a_resend_hands_back_the_empty_answer() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(engine_table("happy", &["rust"], &log), 1);
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    let proposal = will_rename_through(&pool, "rust")
+        .await
+        .expect("the engine's own answer comes back");
+    assert!(
+        rift_lsp::session::proposes_no_edit(proposal.as_ref()),
+        "the engine proposed nothing: {proposal:#?}"
+    );
+    assert_eq!(
+        recorded(&log, "will-rename"),
+        1,
+        "a table that allows one attempt asks once"
+    );
+    pool.shutdown().await;
+}

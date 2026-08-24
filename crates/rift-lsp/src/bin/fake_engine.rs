@@ -35,12 +35,14 @@ const PROGRESS_TOKEN: &str = "fake/analysis";
 /// and begins it, exactly as a language server loading a project does.
 /// `reports-progress` ends the token before it answers a rename,
 /// `analyzes-then-serves` and `refuses-while-analyzing` before the second
-/// rename each is asked for, and `never-ends-progress` never ends it at
-/// all.
+/// rename each is asked for, `announces-then-answers-nothing` before the
+/// will-rename it answers with `null`, and `never-ends-progress` never
+/// ends it at all.
 const PROGRESS_BEHAVIORS: &[&str] = &[
     "reports-progress",
     "analyzes-then-serves",
     "refuses-while-analyzing",
+    "announces-then-answers-nothing",
     "never-ends-progress",
 ];
 
@@ -197,25 +199,56 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
                 }),
             ),
         },
-        "workspace/willRenameFiles" => {
-            let new_uri = message["params"]["files"][0]["newUri"].clone();
-            respond(
-                id,
-                &json!({"changes": {(new_uri.as_str().unwrap_or_default()): []}}),
-            );
-        }
-        "textDocument/diagnostic" => match behavior {
-            "server-requests" => respond(id, &json!({"kind": "unchanged", "resultId": "1"})),
-            _ if PROGRESS_BEHAVIORS.contains(&behavior) => {
-                // An engine still loading answers cleanly and says nothing.
-                respond(id, &json!({"kind": "full", "items": []}));
-            }
-            _ => respond(
-                id,
-                &json!({"kind": "full", "items": [diagnostic("pulled diagnostic")]}),
-            ),
-        },
+        "workspace/willRenameFiles" => answer_will_rename(behavior, message),
+        "textDocument/diagnostic" => answer_diagnostic(behavior, id),
         _ => {}
+    }
+}
+
+/// Answers one will-rename request under the selected behavior.
+///
+/// Every request is recorded in the lifecycle log first, so a test counts
+/// how many times the engine was asked. The default answer is an edit set
+/// holding no edit, which says exactly what a `null` answer says;
+/// `announces-then-answers-nothing` ends the work it announced before
+/// giving the same nothing, so its silence is its own.
+fn answer_will_rename(behavior: &str, message: &Value) {
+    record_lifecycle("will-rename");
+    let id = &message["id"];
+    if behavior == "announces-then-answers-nothing" {
+        end_progress();
+        respond(id, &Value::Null);
+        return;
+    }
+    let new_uri = message["params"]["files"][0]["newUri"].clone();
+    respond(
+        id,
+        &json!({"changes": {(new_uri.as_str().unwrap_or_default()): []}}),
+    );
+}
+
+/// Answers one diagnostic pull under the selected behavior.
+///
+/// Every pull is recorded in the lifecycle log first, so a test counts how
+/// many times the engine was asked, and `pulls-empty-then-reports` reads
+/// that count back: it answers the first pull the way an engine that has
+/// not analyzed the document does - cleanly and with nothing to say - and
+/// carries its finding on the pull after it.
+fn answer_diagnostic(behavior: &str, id: &Value) {
+    record_lifecycle("diagnostic");
+    match behavior {
+        "server-requests" => respond(id, &json!({"kind": "unchanged", "resultId": "1"})),
+        "pulls-empty-then-reports" if recorded_lifecycle("diagnostic") == 1 => {
+            respond(id, &json!({"kind": "full", "items": []}));
+        }
+        _ if PROGRESS_BEHAVIORS.contains(&behavior) => {
+            // An engine still loading answers cleanly and says nothing.
+            respond(id, &json!({"kind": "full", "items": []}));
+        }
+        _ => respond(
+            id,
+            &json!({"kind": "full", "items": [diagnostic("pulled diagnostic")]}),
+        ),
     }
 }
 
