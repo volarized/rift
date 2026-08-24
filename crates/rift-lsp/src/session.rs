@@ -475,7 +475,7 @@ impl EngineSession {
     ///
     /// An unchanged or partial report answers no items; the session never
     /// sends a previous result id, so a full report is the served shape.
-    /// At most [`DOCUMENT_DIAGNOSTICS_MAX`] items come back.
+    /// At most `DOCUMENT_DIAGNOSTICS_MAX` items come back.
     ///
     /// # Errors
     ///
@@ -812,7 +812,7 @@ impl EngineSession {
 ///
 /// A publish replaces the document's earlier entry; a publish for a new
 /// document is dropped once [`PUBLISHED_DOCUMENTS_MAX`] documents are
-/// retained, and each entry keeps at most [`DOCUMENT_DIAGNOSTICS_MAX`]
+/// retained, and each entry keeps at most `DOCUMENT_DIAGNOSTICS_MAX`
 /// items.
 fn retain_published(
     record: &mut BTreeMap<ProjectPath, Vec<Diagnostic>>,
