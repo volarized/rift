@@ -1456,6 +1456,10 @@ pub fn compute() -> i32 {
         )?;
         let guide_md = "# Beacon Guide\n\nHow the beacon works.\n";
         fs::write(directory.path().join("src/guide.md"), guide_md)?;
+        let settings_json = "{\"beacon settings\": {\"port\": 8080}}\n";
+        fs::write(directory.path().join("settings.json"), settings_json)?;
+        let pipeline_yaml = "beacon pipeline:\n  retries: 3\n";
+        fs::write(directory.path().join("pipeline.yaml"), pipeline_yaml)?;
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -1747,6 +1751,216 @@ pub fn compute() -> i32 {
             .filter_map(|version| version["summary"].as_str())
             .collect();
         assert_eq!(summaries, ["grow install guide", "introduce install guide"]);
+        Ok(())
+    }
+
+    /// A JSON member answers `get_symbol` like any declaration: the
+    /// composed wire kind, empty facets, an id escaping the key, and the
+    /// whole pair as the source excerpt.
+    #[test]
+    fn get_symbol_finds_a_json_member_beside_other_languages() -> TestResult {
+        let (_directory, service) = multi_language_fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon settings"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let symbol = &value["hits"][0]["symbol"];
+        assert_eq!(symbol["language"], json!({ "name": "json" }));
+        assert_eq!(symbol["kind"], json!("json.member"));
+        assert_eq!(symbol["facets"], json!([]));
+        assert_eq!(
+            symbol["id"],
+            json!("rift://symbol/json/settings.json/beacon%20settings")
+        );
+        assert_eq!(
+            value["hits"][0]["source"]["text"],
+            "\"beacon settings\": {\"port\": 8080}"
+        );
+
+        let nested: GetSymbolParams = serde_json::from_value(json!({
+            "name": "port",
+            "language": {"name": "json"}
+        }))?;
+        let value = serde_json::to_value(service.get_symbol(&nested)?)?;
+        assert_eq!(
+            value["hits"][0]["symbol"]["id"],
+            json!("rift://symbol/json/settings.json/beacon%20settings%20%3E%20port"),
+            "a nested member's id escapes its whole key path"
+        );
+        Ok(())
+    }
+
+    /// A YAML mapping entry answers `get_symbol` like any declaration: the
+    /// composed wire kind, empty facets, an id escaping the key, and the
+    /// whole pair as the source excerpt.
+    #[test]
+    fn get_symbol_finds_a_yaml_entry_beside_other_languages() -> TestResult {
+        let (_directory, service) = multi_language_fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon pipeline"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let symbol = &value["hits"][0]["symbol"];
+        assert_eq!(symbol["language"], json!({ "name": "yaml" }));
+        assert_eq!(symbol["kind"], json!("yaml.mapping_entry"));
+        assert_eq!(symbol["facets"], json!([]));
+        assert_eq!(
+            symbol["id"],
+            json!("rift://symbol/yaml/pipeline.yaml/beacon%20pipeline")
+        );
+        assert_eq!(
+            value["hits"][0]["source"]["text"], "beacon pipeline:\n  retries: 3\n",
+            "the excerpt serves whole lines, so the pair's last line ends it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_serve_a_json_file_under_the_json_wire_kinds() -> TestResult {
+        let (directory, service) = multi_language_fixture()?;
+        let source = fs::read_to_string(directory.path().join("settings.json"))?;
+        let position = source.find("8080").ok_or("fixture must contain the port")? as u64;
+        let params = NodesParams {
+            path: ProjectPath("settings.json".to_owned()),
+            position,
+            projection: None,
+            rev: None,
+        };
+        let value = serde_json::to_value(service.nodes(params)?)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        assert!(!nodes.is_empty());
+        assert!(
+            nodes.iter().all(|node| {
+                node["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("json."))
+            }),
+            "every wire kind composes from the language name: {nodes:#?}"
+        );
+        let pair = nodes
+            .iter()
+            .find(|node| node["kind"] == "json.pair")
+            .ok_or("position sits inside the port member's pair")?;
+        assert_eq!(pair["language"], json!({ "name": "json" }));
+        assert_eq!(pair["facets"], json!(["declaration"]));
+        let pair_id = pair["id"].as_str().unwrap_or_default();
+        assert!(
+            pair_id.starts_with("rift://node/json/"),
+            "a JSON node address files under the json segment: {pair_id}"
+        );
+        assert!(
+            nodes.iter().any(|node| node["kind"] == "json.number"),
+            "position sits inside the number value: {nodes:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_serve_a_yaml_file_under_the_yaml_wire_kinds() -> TestResult {
+        let (directory, service) = multi_language_fixture()?;
+        let source = fs::read_to_string(directory.path().join("pipeline.yaml"))?;
+        let position = source
+            .find("retries")
+            .ok_or("fixture must contain the entry")? as u64;
+        let params = NodesParams {
+            path: ProjectPath("pipeline.yaml".to_owned()),
+            position,
+            projection: None,
+            rev: None,
+        };
+        let value = serde_json::to_value(service.nodes(params)?)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        assert!(!nodes.is_empty());
+        assert!(
+            nodes.iter().all(|node| {
+                node["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("yaml."))
+            }),
+            "every wire kind composes from the language name: {nodes:#?}"
+        );
+        let pair = nodes
+            .iter()
+            .find(|node| node["kind"] == "yaml.block_mapping_pair")
+            .ok_or("position sits inside the retries entry's pair")?;
+        assert_eq!(pair["language"], json!({ "name": "yaml" }));
+        assert_eq!(pair["facets"], json!(["declaration"]));
+        let pair_id = pair["id"].as_str().unwrap_or_default();
+        assert!(
+            pair_id.starts_with("rift://node/yaml/"),
+            "a YAML node address files under the yaml segment: {pair_id}"
+        );
+        Ok(())
+    }
+
+    /// One JSON member introduced and then value-edited across two commits;
+    /// the timeline classifies both through the JSON provider.
+    #[test]
+    fn json_symbol_history_lists_the_committed_timeline() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(
+            directory.path().join("settings.json"),
+            "{\"server\": {\"port\": 1}}\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "introduce settings");
+        fs::write(
+            directory.path().join("settings.json"),
+            "{\"server\": {\"port\": 2}}\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "grow settings");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service =
+            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let request = json!({"name": "server", "include_history": true});
+        let params: GetSymbolParams = serde_json::from_value(request)?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let history = &value["hits"][0]["history"];
+        assert_eq!(
+            history["symbol"],
+            json!("rift://symbol/json/settings.json/server")
+        );
+        let kinds: Vec<&str> = history["versions"]
+            .as_array()
+            .ok_or("history must carry versions")?
+            .iter()
+            .filter_map(|version| version["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["body_changed", "introduced"]);
+        Ok(())
+    }
+
+    /// One YAML entry introduced and then value-edited across two commits
+    /// in a `.yml` file; the timeline classifies both through the YAML
+    /// provider.
+    #[test]
+    fn yaml_symbol_history_lists_the_committed_timeline() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(directory.path().join("deploy.yml"), "retries: 3\n")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce deploy");
+        fs::write(directory.path().join("deploy.yml"), "retries: 5\n")?;
+        rift_history::fixture::commit_all(directory.path(), "grow deploy");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service =
+            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let request = json!({"name": "retries", "include_history": true});
+        let params: GetSymbolParams = serde_json::from_value(request)?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let history = &value["hits"][0]["history"];
+        assert_eq!(
+            history["symbol"],
+            json!("rift://symbol/yaml/deploy.yml/retries")
+        );
+        let kinds: Vec<&str> = history["versions"]
+            .as_array()
+            .ok_or("history must carry versions")?
+            .iter()
+            .filter_map(|version| version["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["body_changed", "introduced"]);
         Ok(())
     }
 

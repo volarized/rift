@@ -1,0 +1,11 @@
+{
+  "name": "beacon",
+  "server": {
+    "port": 8080,
+    "tls": { "cert": "beacon.pem" }
+  },
+  "targets": [{ "host": "alpha" }, { "host": "beta" }],
+  "retries": 3,
+  "verbose": false,
+  "fallback": null
+}

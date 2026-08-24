@@ -1,0 +1,11 @@
+name: beacon
+server:
+  port: 8080
+  hosts:
+    - alpha
+    - beta
+defaults: &defaults
+  retries: 3
+job:
+  <<: *defaults
+  flow: { a: 1, b: [2, 3] }

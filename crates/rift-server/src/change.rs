@@ -1010,6 +1010,45 @@ mod tests {
         Ok(())
     }
 
+    /// A JSON symbol id minted by `get_symbol` - key path escaped, nested
+    /// under its ` > ` key path - round-trips through address parsing into
+    /// an applied member rewrite, and the reparse runs through the JSON
+    /// provider.
+    #[test]
+    fn json_symbol_address_round_trips_from_minted_id_to_replacement() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let settings_json = "{\"server\": {\"port\": 8080}}\n";
+        fs::write(directory.path().join("settings.json"), settings_json)?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let reads = ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let changes = ChangeService::new(directory.path());
+        let request = serde_json::json!({"name": "port"});
+        let params: GetSymbolParams = serde_json::from_value(request)?;
+        let hits = reads.get_symbol(&params)?.hits;
+        let minted = hits[0].symbol.id.clone();
+        assert_eq!(
+            minted.0,
+            "rift://symbol/json/settings.json/server%20%3E%20port"
+        );
+        let replacement = ReplaceSymbolParams {
+            symbol: minted,
+            region: None,
+            body: "\"port\": 9090".to_owned(),
+        };
+        let result = changes.replace_symbol(&reads, &replacement)?;
+        let summary = applied_summary(result);
+        assert!(
+            summary.diagnostics.is_empty(),
+            "the JSON provider reparses the rewritten member cleanly"
+        );
+        let written = fs::read_to_string(directory.path().join("settings.json"))?;
+        assert_eq!(written, "{\"server\": {\"port\": 9090}}\n");
+        Ok(())
+    }
+
     #[test]
     fn replace_symbol_refuses_when_disk_drifted_from_snapshot() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;

@@ -44,6 +44,33 @@ const MARKDOWN_KINDS: &[&str] = &["section", "atx_heading", "setext_heading"];
 /// Grammar fields the markdown rules read from the pinned block grammar.
 const MARKDOWN_FIELDS: &[&str] = &["heading_content"];
 
+/// Node kinds the JSON rules read from the pinned grammar, restated here so
+/// a grammar bump that renames one fails this suite before it fails
+/// extraction.
+const JSON_KINDS: &[&str] = &["pair", "string"];
+
+/// Grammar fields the JSON rules read from the pinned grammar.
+const JSON_FIELDS: &[&str] = &["key", "value"];
+
+/// Node kinds the YAML rules read from the pinned grammar, restated here so
+/// a grammar bump that renames one fails this suite before it fails
+/// extraction.
+const YAML_KINDS: &[&str] = &[
+    "stream",
+    "document",
+    "block_node",
+    "flow_node",
+    "block_mapping_pair",
+    "flow_pair",
+    "plain_scalar",
+    "single_quote_scalar",
+    "double_quote_scalar",
+    "block_scalar",
+];
+
+/// Grammar fields the YAML rules read from the pinned grammar.
+const YAML_FIELDS: &[&str] = &["key", "value"];
+
 fn rust_language() -> Language {
     tree_sitter_rust::LANGUAGE.into()
 }
@@ -62,6 +89,14 @@ fn tsx_language() -> Language {
 
 fn markdown_language() -> Language {
     tree_sitter_md::LANGUAGE.into()
+}
+
+fn json_language() -> Language {
+    tree_sitter_json::LANGUAGE.into()
+}
+
+fn yaml_language() -> Language {
+    tree_sitter_yaml::LANGUAGE.into()
 }
 
 fn assert_abi_in_runtime_window(name: &str, language: &Language) {
@@ -273,6 +308,58 @@ fn test_markdown_block_grammar_parses_valid_and_malformed_fixtures() {
     assert!(
         malformed_tree.root_node().has_error(),
         "an unterminated heading must report an error"
+    );
+}
+
+#[test]
+fn test_json_grammar_uses_supported_abi() {
+    assert_abi_in_runtime_window("JSON", &json_language());
+}
+
+#[test]
+fn test_json_grammar_resolves_every_read_kind_and_field() {
+    let language = json_language();
+    assert_kinds_resolve("JSON", &language, JSON_KINDS);
+    assert_fields_resolve("JSON", &language, JSON_FIELDS);
+}
+
+/// The pinned grammar marks a pair missing its value; the malformed fixture
+/// is exactly that pair.
+#[test]
+fn test_json_grammar_parses_valid_and_malformed_fixtures() {
+    let language = json_language();
+    let valid_tree = parse(&language, include_str!("fixtures/json/valid.json"));
+    assert!(!valid_tree.root_node().has_error(), "valid JSON must parse");
+
+    let malformed_tree = parse(&language, include_str!("fixtures/json/malformed.json"));
+    assert!(
+        malformed_tree.root_node().has_error(),
+        "a pair missing its value must report an error"
+    );
+}
+
+#[test]
+fn test_yaml_grammar_uses_supported_abi() {
+    assert_abi_in_runtime_window("YAML", &yaml_language());
+}
+
+#[test]
+fn test_yaml_grammar_resolves_every_read_kind_and_field() {
+    let language = yaml_language();
+    assert_kinds_resolve("YAML", &language, YAML_KINDS);
+    assert_fields_resolve("YAML", &language, YAML_FIELDS);
+}
+
+#[test]
+fn test_yaml_grammar_parses_valid_and_malformed_fixtures() {
+    let language = yaml_language();
+    let valid_tree = parse(&language, include_str!("fixtures/yaml/valid.yaml"));
+    assert!(!valid_tree.root_node().has_error(), "valid YAML must parse");
+
+    let malformed_tree = parse(&language, include_str!("fixtures/yaml/malformed.yaml"));
+    assert!(
+        malformed_tree.root_node().has_error(),
+        "an unclosed flow sequence must report an error"
     );
 }
 

@@ -774,6 +774,54 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// Symbol hits from JSON and YAML files carry their languages, the
+    /// composed wire kinds, and ids escaping the key path.
+    #[test]
+    fn search_symbol_hits_carry_the_json_and_yaml_languages() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("config.json"),
+            "{\"beacon port\": 8080}\n",
+        )?;
+        fs::write(directory.path().join("deploy.yaml"), "beacon retries: 3\n")?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service =
+            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let expectations = [
+            (
+                "beacon port",
+                "json",
+                "json.member",
+                "rift://symbol/json/config.json/beacon%20port",
+            ),
+            (
+                "beacon retries",
+                "yaml",
+                "yaml.mapping_entry",
+                "rift://symbol/yaml/deploy.yaml/beacon%20retries",
+            ),
+        ];
+        for (query, language, kind, id) in expectations {
+            let request = json!({
+                "query": query,
+                "target": "symbol",
+                "limit": 5
+            });
+            let params: SearchParams = serde_json::from_value(request)?;
+            let value = serde_json::to_value(service.search(&params, &[])?)?;
+            let results = value["results"].as_array().ok_or("results must be array")?;
+            assert!(!results.is_empty(), "{query} must return a hit");
+            let symbol = &results[0]["hit"]["symbol"];
+            assert_eq!(symbol["language"], json!({ "name": language }));
+            assert_eq!(symbol["kind"], json!(kind));
+            assert_eq!(symbol["id"], json!(id));
+        }
+        Ok(())
+    }
+
     #[test]
     fn search_combines_symbol_and_source_matches_with_limit() -> TestResult {
         let (_directory, service) = fixture()?;
