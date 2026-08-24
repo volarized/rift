@@ -187,7 +187,7 @@ impl EngineFault {
     /// request again.
     ///
     /// Only [`EngineFault::Refused`] can answer yes, and only for the
-    /// codes in [`RETRYABLE_REFUSAL_CODES`]: the engine cancelled the
+    /// codes in `RETRYABLE_REFUSAL_CODES`: the engine cancelled the
     /// request, or the document moved under it. Every other refusal is
     /// the engine's verdict on the request, and resending it changes
     /// nothing.
