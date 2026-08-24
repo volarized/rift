@@ -205,6 +205,17 @@ impl EngineFault {
         )
     }
 
+    /// Whether the fault is the engine's own reply to the request.
+    ///
+    /// Only [`EngineFault::Refused`] is: the engine read the request and
+    /// answered it with an error code. Every other fault names something
+    /// around the request - an absent capability, a broken exchange, a
+    /// killed child - and no amount of further analysis changes it.
+    #[must_use]
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::Refused { .. })
+    }
+
     /// Whether the engine refused with a code that invites the same
     /// request again.
     ///
@@ -1308,6 +1319,19 @@ mod tests {
         assert!(
             !EngineFault::Ended.is_retryable_refusal(),
             "a fault that is not a refusal is never a retryable refusal"
+        );
+        assert!(
+            !EngineFault::Ended.is_refusal(),
+            "a fault the engine never answered is not its reply"
+        );
+        assert!(
+            EngineFault::Refused {
+                method: "textDocument/rename".to_owned(),
+                code: -32602,
+                message: "No references found at position".to_owned(),
+            }
+            .is_refusal(),
+            "a verdict the engine answered is still its reply"
         );
     }
 
