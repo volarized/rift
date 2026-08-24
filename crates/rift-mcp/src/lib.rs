@@ -11,7 +11,7 @@ mod validation;
 
 pub use election::{
     ElectedServer, ElectionError, ElectionFault, ElectionGuard, ServerPresence, StaleReason, claim,
-    probe, read_serving, serve_elected,
+    document_path, probe, read_serving, serve_elected,
 };
 pub use http::{HttpServeError, HttpServeFault, HttpServer, serve_http};
 pub use proxy::{ProxyFault, ProxyServeError, serve_proxy};
