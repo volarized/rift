@@ -28,8 +28,13 @@ allow-wildcard-paths = true
 # gix's sha1 still pins cpufeatures 0.2 while uuid's rand stack uses 0.3.
 # hyper-util 0.1 and reqwest's hyper-tls still pin base64 0.22 while rmcp's
 # HTTP transports are on 0.23.
+# lsp-types 0.97 still pins fluent-uri 0.1 while jsonschema's referencing and
+# toasty-core are on 0.4, and lsp-types with fluent-uri 0.1 still pin
+# bitflags 1 while the rest of the graph is on 2.
 skip = [
   { name = "syn", version = "2.0.119" },
+  { name = "fluent-uri", version = "0.1.4" },
+  { name = "bitflags", version = "1.3.2" },
   { name = "hashbrown", version = "0.16.1" },
   { name = "windows-sys", version = "0.60.2" },
   { name = "cpufeatures", version = "0.2.17" },
