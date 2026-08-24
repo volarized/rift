@@ -10,10 +10,13 @@
 //! scripted suites only imitate. Every asserted shape was observed on a
 //! live rust-analyzer answer first, then pinned.
 //!
-//! No test warms the engine up first. rust-analyzer answers from the
-//! moment it initializes, and answers wrongly until it has loaded the
-//! project: the server waits that out under the engine's `retry` table,
-//! so each test makes one call and asserts what a caller would see.
+//! Each test warms the engine first, then makes one call and asserts what
+//! a caller sees. The server waits out an engine that is loading, but only
+//! while the engine announces that work: the first request a session sends
+//! races that announcement, and rust-analyzer answers a will-rename or a
+//! diagnostics pull it cannot serve yet with nothing at all - no refusal,
+//! no progress, nothing to wait on. The warm-up puts the engine past that
+//! window once per fixture.
 //!
 //! The fixture is a cargo project, because rust-analyzer resolves nothing
 //! outside one: a manifest whose `[lib]` path keeps every module file at
@@ -28,9 +31,11 @@ mod rust_engine;
 mod workspace_client;
 
 use std::fs;
+use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
 use rmcp::model::CallToolRequestParams;
+use rmcp::service::{RoleClient, RunningService};
 use rust_engine::{require_rust_analyzer, rust_engine_configuration};
 use serde_json::{Value, json};
 use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
@@ -83,6 +88,45 @@ fn coded_findings<'summary>(structured: &'summary Value, code: &str) -> Vec<&'su
         .unwrap_or_default()
 }
 
+/// Most warm-up attempts one test makes, and the pause between them: at
+/// most a minute of waiting, then the test fails instead of hanging.
+const WARMUP_ATTEMPTS_MAX: usize = 240;
+const WARMUP_PAUSE: Duration = Duration::from_millis(250);
+
+/// Drives the rename tool until rust-analyzer has loaded the cargo project.
+///
+/// The probe renames the declaration to the name it already has. Once
+/// rust-analyzer resolves it, the proposal edits every occurrence to the
+/// bytes already there, so the compiled plan holds no rewrite and the tool
+/// refuses with `proposed no edits` - the readiness signal, with the tree
+/// untouched either way.
+///
+/// The server absorbs a loading engine on its own while the engine
+/// announces its work: locally the announcement runs for the first 830ms
+/// and the engine cancels requests until about 2.3s, and every attempt
+/// inside that window is resent under the `retry` table. What it cannot
+/// absorb is the window before the first announcement arrives, where this
+/// engine answers a will-rename with no edit and a pull with no items -
+/// answers a settled engine gives for a tree that needs neither. This
+/// probe puts the engine past that window once, so the assertions that
+/// follow are about a loaded engine. It never proves how far a proposal
+/// reaches; the assertions do.
+async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
+    let started = Instant::now();
+    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
+        let structured = call_retrying_acceptance(client, rename_request("beacon")).await?;
+        if refusal_detail(&structured).contains("proposed no edits") {
+            eprintln!(
+                "rust-analyzer resolved the declaration after {:?}",
+                started.elapsed()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(WARMUP_PAUSE).await;
+    }
+    Err("rust-analyzer never resolved the declaration".into())
+}
+
 /// The engine resolves every reference itself, so the rewrite covers both
 /// files and the word-boundary sweep finds no survivor to report.
 #[tokio::test]
@@ -93,6 +137,7 @@ async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
     let (directory, client, server_task) =
         served_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
+    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(&client, rename_request("flare")).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
@@ -149,6 +194,7 @@ async fn applied_move_rewrites_the_module_declaration_and_the_import() -> TestRe
     let (directory, client, server_task) =
         served_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
+    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(
         &client,
@@ -204,6 +250,7 @@ async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     let (directory, client, server_task) =
         served_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
+    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(
         &client,
@@ -249,6 +296,7 @@ async fn engine_refused_new_name_carries_the_engine_words() -> TestResult {
     let (directory, client, server_task) =
         served_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
+    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(&client, rename_request("crate")).await?;
     assert_eq!(structured["status"], json!("refused"), "{structured:#}");
