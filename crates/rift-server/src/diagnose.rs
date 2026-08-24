@@ -5,10 +5,15 @@
 //! and closed; the engine's findings ride the change summary, mapped and
 //! bounded. The change already applied, so nothing here refuses or fails
 //! the call: an engine failure degrades to one warning naming the engine,
-//! and an engine without the capability stays silent. A refusal the engine
-//! invites again - it cancelled the pull, or the content moved under it -
-//! is resent under the engine's own `[engines.<name>.retry]` policy before
-//! it degrades.
+//! and an engine without the capability stays silent.
+//!
+//! The engine slot absorbs every transient condition first - a refusal the
+//! engine invites again, an engine still analyzing, an engine that died -
+//! under that engine's `[engines.<name>.retry]` and
+//! `[engines.<name>.restart]` tables. What reaches this module is either
+//! the engine's settled findings or the condition that outlasted the whole
+//! budget, and an engine that never stopped analyzing degrades to its own
+//! warning: an empty list would read as clean bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,7 +27,6 @@ use rift_protocol::read::{
     Diagnostic, DiagnosticCode, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
     Language, ProjectPath, Severity, SourceSpan, TextRange,
 };
-use rift_protocol::retry::RetryPolicy;
 
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadService, file_id};
@@ -38,9 +42,8 @@ pub const ENGINE_DIAGNOSTICS_PER_CHANGE_MAX: usize = 16;
 /// bounded by [`ENGINE_DIAGNOSTICS_PER_CHANGE_MAX`] across all paths. An
 /// engine that fails contributes one warning naming it and is not asked
 /// again within this walk; an engine without the pull capability
-/// contributes nothing. Each path's pull is resent while the engine keeps
-/// refusing it retryably and its `retry` table still allows an attempt, so
-/// the walk asks at most `retry.attempts` times per path before degrading.
+/// contributes nothing. The slot has already spent that engine's whole
+/// retry budget on the path before any warning is raised.
 ///
 /// # Cancel safety
 ///
@@ -84,7 +87,7 @@ pub async fn engine_change_diagnostics(
             }
             Err(error) => {
                 if !matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
-                    findings.push(engine_failure_diagnostic(slot.name(), &error));
+                    findings.push(engine_warning(slot.name(), &error));
                 }
                 // Silence for an absent capability, one warning otherwise;
                 // either way this engine is not asked again in this walk.
@@ -107,12 +110,11 @@ async fn pulled_diagnostics(
     let request_path = path.clone();
     let request_language = language.name.clone();
     let request_source = source.to_owned();
-    let retry = slot.configuration().retry;
     slot.request(move |session: &mut EngineSession| {
         let path = request_path.clone();
         let language = request_language.clone();
         let text = request_source.clone();
-        Box::pin(async move { pull_on_session(session, &path, &language, text, retry).await })
+        Box::pin(async move { pull_on_session(session, &path, &language, text).await })
     })
     .await
 }
@@ -127,7 +129,6 @@ async fn pull_on_session(
     path: &CoreProjectPath,
     language_id: &str,
     text: String,
-    retry: RetryPolicy,
 ) -> Result<(Vec<LspDiagnostic>, PositionEncoding), EngineError> {
     if !session.capabilities().pull_diagnostics {
         return Err(rift_core::Error::new(EngineFault::CapabilityAbsent {
@@ -136,43 +137,11 @@ async fn pull_on_session(
     }
     let encoding = session.capabilities().position_encoding;
     session.open(path, language_id, text).await?;
-    let pulled = pulled_within_attempts(session, path, retry).await;
+    let pulled = session.pull_diagnostics(path).await;
     // The close is best-effort: a session the pull's fault ended refuses
     // it, and the pull's own outcome is what the caller acts on.
     let _ = session.close(path).await;
     Ok((pulled?, encoding))
-}
-
-/// Pulls one open document's diagnostics, resending a retryable refusal.
-///
-/// The document stays open across the attempts, so no reopen can cancel
-/// the next pull. The loop runs at most `retry.attempts` times and waits
-/// what the policy answers between them: a growing wait that starts at
-/// `retry.delay` and is held at `retry.delay_limit`. The change already
-/// applied, so those waits only delay its answer; at the shipped defaults
-/// they add at most 9.75s. A refusal that is not retryable comes back at
-/// once, and a retryable one that outlasts the attempt bound comes back as
-/// itself, for the caller to degrade into its single warning.
-async fn pulled_within_attempts(
-    session: &mut EngineSession,
-    path: &CoreProjectPath,
-    retry: RetryPolicy,
-) -> Result<Vec<LspDiagnostic>, EngineError> {
-    let mut attempt: u64 = 1;
-    loop {
-        let refusal = match session.pull_diagnostics(path).await {
-            Ok(items) => return Ok(items),
-            Err(refusal) => refusal,
-        };
-        if !refusal.fault().is_retryable_refusal() {
-            return Err(refusal);
-        }
-        let Some(wait) = retry.delay_after(attempt) else {
-            return Err(refusal);
-        };
-        tokio::time::sleep(wait).await;
-        attempt += 1;
-    }
 }
 
 /// One LSP diagnostic mapped into the change summary's carrier.
@@ -234,14 +203,31 @@ fn mapped_severity(severity: Option<DiagnosticSeverity>) -> Severity {
     }
 }
 
-/// The one warning an engine that failed to serve diagnostics contributes.
-fn engine_failure_diagnostic(engine: &str, error: &EngineError) -> Diagnostic {
+/// The one warning an engine that did not serve settled diagnostics
+/// contributes.
+///
+/// An engine that was still analyzing on every attempt gets its own code
+/// and its own words: the pull answered, and what it answered is simply
+/// not final. Reporting that as no findings would tell the caller the
+/// changed bytes are clean. Every other failure keeps the engine-failed
+/// code.
+fn engine_warning(engine: &str, error: &EngineError) -> Diagnostic {
+    let (code, message) = match error.fault() {
+        EngineFault::Analyzing { attempts } => (
+            DiagnosticCode::EngineAnalyzing,
+            format!(
+                "engine {engine} was still analyzing on all {attempts} attempts, so its                  findings over the applied change may be incomplete"
+            ),
+        ),
+        _ => (
+            DiagnosticCode::EngineFailed,
+            format!("engine {engine} could not serve diagnostics over the applied change: {error}"),
+        ),
+    };
     Diagnostic {
         severity: Severity::Warning,
-        code: Some(DiagnosticCode::EngineFailed.code()),
-        message: format!(
-            "engine {engine} could not serve diagnostics over the applied change: {error}"
-        ),
+        code: Some(code.code()),
+        message,
         span: None,
         related: Vec::new(),
         tags: Vec::new(),
@@ -361,12 +347,29 @@ mod tests {
     }
 
     #[test]
-    fn engine_failure_diagnostic_names_the_engine_and_the_code() {
-        let error = rift_core::Error::new(EngineFault::Ended);
-        let warning = engine_failure_diagnostic("fake", &error);
-        assert_eq!(warning.severity, Severity::Warning);
-        assert_eq!(warning.code.as_deref(), Some("rift.engine.failed"));
-        assert!(warning.message.contains("fake"), "{}", warning.message);
+    fn engine_warnings_carry_their_own_code_and_name_the_engine() {
+        let failed = engine_warning("fake", &rift_core::Error::new(EngineFault::Ended));
+        assert_eq!(failed.severity, Severity::Warning);
+        assert_eq!(failed.code.as_deref(), Some("rift.engine.failed"));
+        assert!(failed.message.contains("fake"), "{}", failed.message);
+        let analyzing = engine_warning(
+            "fake",
+            &rift_core::Error::new(EngineFault::Analyzing { attempts: 8 }),
+        );
+        assert_eq!(analyzing.severity, Severity::Warning);
+        assert_eq!(analyzing.code.as_deref(), Some("rift.engine.analyzing"));
+        assert!(
+            analyzing
+                .message
+                .contains("still analyzing on all 8 attempts"),
+            "{}",
+            analyzing.message
+        );
+        assert!(
+            analyzing.message.contains("may be incomplete"),
+            "{}",
+            analyzing.message
+        );
     }
 
     #[tokio::test]

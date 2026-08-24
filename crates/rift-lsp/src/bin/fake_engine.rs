@@ -27,6 +27,25 @@ const SCANNED_FILES_MAX: usize = 256;
 /// Deepest directory level the word-renaming behaviors walk.
 const SCANNED_DEPTH_MAX: usize = 3;
 
+/// The work-done progress token the progress behaviors mint.
+const PROGRESS_TOKEN: &str = "fake/analysis";
+
+/// Behaviors that begin work-done progress as soon as they initialize.
+///
+/// Each mints [`PROGRESS_TOKEN`] through `window/workDoneProgress/create`
+/// and begins it, exactly as a language server loading a project does.
+/// `reports-progress` ends the token before it answers a rename,
+/// `analyzes-then-serves` and `refuses-while-analyzing` before the second
+/// rename each is asked for, `analyzes-then-reports` before the second
+/// diagnostic pull, and `never-ends-progress` never ends it at all.
+const PROGRESS_BEHAVIORS: &[&str] = &[
+    "reports-progress",
+    "analyzes-then-serves",
+    "refuses-while-analyzing",
+    "analyzes-then-reports",
+    "never-ends-progress",
+];
+
 fn main() {
     let behavior = std::env::args().nth(1).unwrap_or_default();
     match behavior.as_str() {
@@ -134,6 +153,9 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
             if behavior == "happy" {
                 send_unretained_notifications();
             }
+            if PROGRESS_BEHAVIORS.contains(&behavior) {
+                begin_progress();
+            }
         }
         "initialized" => match behavior {
             "deaf" => park(),
@@ -158,6 +180,9 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
                 .to_owned();
             state.opened.insert(uri, text);
             publish_open_diagnostics(behavior, message);
+            if PROGRESS_BEHAVIORS.contains(&behavior) {
+                report_progress();
+            }
         }
         "textDocument/rename" => answer_rename(behavior, message, input, state),
         "textDocument/prepareRename" => match behavior {
@@ -212,8 +237,12 @@ fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
 /// unrelated tests stay clean; the scripted behaviors return items, an
 /// unchanged report, a refusal, or death mid-request. The refusing
 /// behaviors stamp the pull's ordinal into their message, so a test reads
-/// how many times it was asked off the wire.
+/// how many times it was asked off the wire. `analyzes-then-reports`
+/// answers the first pull the way a loading engine does - cleanly and with
+/// nothing to say - and ends its progress before the pull that carries the
+/// finding.
 fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
+    record_lifecycle("diagnostic");
     state.diagnostic_pulls += 1;
     let pull = state.diagnostic_pulls;
     match behavior {
@@ -237,6 +266,18 @@ fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
             id,
             &json!({"kind": "full", "items": [diagnostic(&format!("settled on pull {pull}"))]}),
         ),
+        "analyzes-then-reports" if pull == 1 => {
+            // A pull answered mid-analysis reports nothing yet, exactly as
+            // clean bytes would.
+            respond(id, &json!({"kind": "full", "items": []}));
+        }
+        "analyzes-then-reports" => {
+            end_progress();
+            respond(
+                id,
+                &json!({"kind": "full", "items": [diagnostic("settled finding")]}),
+            );
+        }
         "cancels-every-diagnostic" => refuse_pull(id, SERVER_CANCELLED, pull),
         "refuses-diagnostic" => refuse_pull(id, METHOD_NOT_FOUND_CODE, pull),
         _ => respond(id, &json!({"kind": "full", "items": []})),
@@ -374,7 +415,16 @@ fn initialize_answer(behavior: &str) -> Value {
 }
 
 /// Answers a rename, first exercising the scripted misbehavior, if any.
+///
+/// Every rename is recorded in the lifecycle log before the behavior runs,
+/// so a test counts how many times the engine was asked - and the
+/// behaviors that act once and then serve read that count back, which an
+/// engine that dies and restarts could not keep in memory.
 fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state: &EngineState) {
+    record_lifecycle("rename");
+    if answered_once_then_served(behavior, message, state) {
+        return;
+    }
     match behavior {
         "exit-mid-request" => std::process::exit(0),
         "parks-on-rename" => park(),
@@ -391,16 +441,7 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state
             return;
         }
         "mutates-then-renames" => {
-            let target = message["params"]["textDocument"]["uri"]
-                .as_str()
-                .unwrap_or_default()
-                .strip_prefix("file://")
-                .unwrap_or_default();
-            let mutated = format!(
-                "{}// the engine drifted this file\n",
-                std::fs::read_to_string(target).expect("fake engine reads its target")
-            );
-            std::fs::write(target, mutated).expect("fake engine mutates its target");
+            drift_target(message);
             respond(&message["id"], &word_rename_answer(message, state));
             return;
         }
@@ -409,6 +450,7 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state
                 std::process::exit(0);
             }
         }
+        "reports-progress" => end_progress(),
         "stderr-flood" => {
             let flood = vec![b'f'; FLOOD_BYTES];
             std::io::stderr()
@@ -417,22 +459,24 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state
         }
         "server-requests" => demand_client_answers(input),
         "refuses-rename" => {
-            print_message(&json!({
-                "jsonrpc": "2.0",
-                "id": message["id"],
-                "error": {"code": -32602, "message": "new name is not an identifier"},
-            }));
+            refuse_rename(&message["id"], -32602, "new name is not an identifier");
+            return;
+        }
+        "refuses-while-analyzing" => {
+            // A verdict answered mid-analysis is not a verdict: the engine
+            // reaches its real one only once its work has ended.
+            if recorded_lifecycle("rename") > 1 {
+                end_progress();
+            }
+            refuse_rename(&message["id"], -32602, "new name is not an identifier");
             return;
         }
         "cancels-rename" => {
-            print_message(&json!({
-                "jsonrpc": "2.0",
-                "id": message["id"],
-                "error": {
-                    "code": SERVER_CANCELLED,
-                    "message": "server cancelled the request",
-                },
-            }));
+            refuse_rename(
+                &message["id"],
+                SERVER_CANCELLED,
+                "server cancelled the request",
+            );
             return;
         }
         "unreadable" => {
@@ -636,6 +680,98 @@ fn verify_client_answer(answer: &Value) {
     assert!(verdict, "client answer broke the routing policy: {answer}");
 }
 
+/// The behaviors that act once and then serve, answering a word rename on
+/// every attempt after the one they act on.
+///
+/// Each reads its own request count back from the lifecycle log, because a
+/// scripted death ends the process and any count it held in memory. The
+/// answer says whether this function handled the request.
+fn answered_once_then_served(behavior: &str, message: &Value, state: &EngineState) -> bool {
+    match behavior {
+        "dies-once-on-rename" => {
+            if recorded_lifecycle("rename") == 1 {
+                std::process::exit(0);
+            }
+        }
+        "analyzes-then-serves" => {
+            if recorded_lifecycle("rename") > 1 {
+                end_progress();
+            }
+        }
+        "cancels-first-rename" => {
+            if recorded_lifecycle("rename") == 1 {
+                refuse_rename(
+                    &message["id"],
+                    SERVER_CANCELLED,
+                    "cancelled the first rename",
+                );
+                return true;
+            }
+        }
+        _ => return false,
+    }
+    respond(&message["id"], &word_rename_answer(message, state));
+    true
+}
+
+/// Appends a comment to the rename target on disk, drifting it away from
+/// the bytes the client opened.
+fn drift_target(message: &Value) {
+    let target = message["params"]["textDocument"]["uri"]
+        .as_str()
+        .unwrap_or_default()
+        .strip_prefix("file://")
+        .unwrap_or_default();
+    let mutated = format!(
+        "{}// the engine drifted this file\n",
+        std::fs::read_to_string(target).expect("fake engine reads its target")
+    );
+    std::fs::write(target, mutated).expect("fake engine mutates its target");
+}
+
+/// Refuses one rename with a JSON-RPC error.
+fn refuse_rename(id: &Value, code: i64, message: &str) {
+    print_message(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message},
+    }));
+}
+
+/// Mints the progress token and begins work on it.
+///
+/// The create request is sent without waiting for its answer: the client
+/// is not reading at this point in the handshake, and it answers the
+/// request during its next exchange, exactly as a real client does.
+fn begin_progress() {
+    print_message(&json!({
+        "jsonrpc": "2.0",
+        "id": 80,
+        "method": "window/workDoneProgress/create",
+        "params": {"token": PROGRESS_TOKEN},
+    }));
+    print_progress(&json!({"kind": "begin", "title": "loading the project"}));
+}
+
+/// Reports continued work on the progress token.
+fn report_progress() {
+    print_progress(&json!({"kind": "report", "message": "indexing"}));
+}
+
+/// Ends the progress token: the work the engine announced is done.
+fn end_progress() {
+    print_progress(&json!({"kind": "end", "message": "project loaded"}));
+}
+
+/// Sends one `$/progress` notification for the minted token.
+fn print_progress(value: &Value) {
+    print_message(&json!({
+        "jsonrpc": "2.0",
+        "method": "$/progress",
+        "params": {"token": PROGRESS_TOKEN, "value": value},
+    }));
+}
+
 /// Publishes one diagnostic for the opened document, happy path only.
 fn publish_open_diagnostics(behavior: &str, message: &Value) {
     if behavior != "happy" && behavior != "server-requests" {
@@ -689,8 +825,8 @@ fn wait_for_start_gate() {
 /// Appends one lifecycle line when the log environment variable is set.
 ///
 /// A test that sets `RIFT_FAKE_ENGINE_LIFECYCLE_LOG` counts the lines to
-/// prove how many engine processes initialized and how many were asked to
-/// exit.
+/// prove how many engine processes initialized, how many renames they
+/// were asked for, and how many were asked to exit.
 fn record_lifecycle(event: &str) {
     let Ok(path) = std::env::var("RIFT_FAKE_ENGINE_LIFECYCLE_LOG") else {
         return;
@@ -701,6 +837,23 @@ fn record_lifecycle(event: &str) {
         .open(path)
         .expect("fake engine opens its lifecycle log");
     writeln!(log, "{event}").expect("fake engine appends its lifecycle log");
+}
+
+/// Lines of one lifecycle event the log already holds.
+///
+/// The behaviors that act once and then serve read their count back from
+/// the log: a scripted death ends the process, and any count it kept in
+/// memory with it. Such a behavior requires the log variable and dies
+/// without it, so a test that forgot to wire it fails with these words
+/// rather than watching the behavior never fire.
+fn recorded_lifecycle(event: &str) -> usize {
+    let path = std::env::var("RIFT_FAKE_ENGINE_LIFECYCLE_LOG")
+        .expect("this behavior counts its requests in the lifecycle log");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == event)
+        .count()
 }
 
 /// Dies unless the expected initialization options rode the request.

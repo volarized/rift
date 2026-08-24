@@ -11,7 +11,7 @@ mod workspace_client;
 
 use std::fs;
 
-use fake_engine::engine_configuration;
+use fake_engine::{counted, engine_configuration, recorded};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
 use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
@@ -23,6 +23,15 @@ fn move_request(from: &str, to: &str) -> CallToolRequestParams {
 /// The moved module and the file referencing it by stem.
 const HUB: &str = "pub fn hub() {}\n// hub module\n";
 const CALLER: &str = "mod hub;\n";
+
+/// One tool call expected to fail, returning its wire error payload.
+fn wire_error(error: rmcp::ServiceError) -> TestResult<Value> {
+    let rmcp::ServiceError::McpError(data) = error else {
+        return Err(format!("expected a tool error, got {error:?}").into());
+    };
+    data.data
+        .ok_or_else(|| "wire error data must be present".into())
+}
 
 fn move_warnings(structured: &Value) -> Vec<&Value> {
     structured["summary"]["diagnostics"]
@@ -257,15 +266,8 @@ async fn engine_timeout_is_a_typed_error_and_nothing_moves() -> TestResult {
         .call_tool(move_request("hub.rs", "spoke.rs"))
         .await
         .expect_err("a parked will-rename request must time out as a typed error");
-    let rmcp::ServiceError::McpError(error) = error else {
-        return Err(format!("expected a tool error, got {error:?}").into());
-    };
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str);
-    assert_eq!(code, Some("temporarily_unavailable"), "{error:?}");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
     assert_eq!(fs::read_to_string(directory.path().join("hub.rs"))?, HUB);
     assert!(!directory.path().join("spoke.rs").exists());
 
@@ -287,16 +289,54 @@ async fn illegal_paths_fail_as_typed_invalid_requests() -> TestResult {
             .call_tool(move_request(from, to))
             .await
             .expect_err("an illegal move request fails before resolution");
-        let rmcp::ServiceError::McpError(error) = error else {
-            return Err(format!("expected a tool error, got {error:?}").into());
-        };
-        let code = error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("code"))
-            .and_then(Value::as_str);
-        assert_eq!(code, Some("invalid_request"), "{from} -> {to}: {error:?}");
+        let wire = wire_error(error)?;
+        assert_eq!(
+            wire["code"],
+            json!("invalid_request"),
+            "{from} -> {to}: {wire:#}"
+        );
     }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The attempt bound the absorption test states for itself, small enough
+/// to count off the lifecycle log.
+const ABSORPTION_ATTEMPTS: u64 = 3;
+
+/// A move is a plan phase, so an engine that never stops analyzing spends
+/// the whole attempt bound and then surfaces the failure the caller can
+/// resend. Nothing moved: the plan never reached the apply.
+#[tokio::test]
+async fn a_move_that_never_settles_surfaces_after_the_whole_budget() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("hub.rs", HUB), ("lib.rs", CALLER)],
+        Some(counted(
+            &engine_configuration("never-ends-progress", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let error = client
+        .call_tool(move_request("hub.rs", "spoke.rs"))
+        .await
+        .expect_err("an engine that never settles must surface a typed error");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
+    assert_eq!(wire["retry"], json!("same_request"), "{wire:#}");
+    assert_eq!(
+        recorded(&log, "initialize"),
+        1,
+        "an engine that keeps answering is never restarted"
+    );
+    assert_eq!(fs::read_to_string(directory.path().join("hub.rs"))?, HUB);
+    assert!(!directory.path().join("spoke.rs").exists());
 
     client.cancel().await?;
     server_task.await?;

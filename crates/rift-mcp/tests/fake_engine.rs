@@ -4,7 +4,7 @@
 //! `rift.toml` through an overlaid `PATH`, exactly as an operator's
 //! `[engines.<name>]` table would resolve a real engine.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The directory holding the compiled `fake_engine` binary.
 ///
@@ -36,4 +36,29 @@ pub(crate) fn engine_configuration(behavior: &str, request_timeout: &str) -> Str
          languages = [\"rust\"]\nrequest_timeout = \"{request_timeout}\"\n\n\
          [engines.fake.environment]\nPATH = \"{path_overlay}\"\n"
     )
+}
+
+/// The same engine table with a lifecycle log and a narrow retry budget.
+///
+/// The log is how a test counts the engine's requests: the behaviors that
+/// act once and then serve read their own count back from it, and the
+/// assertions read the same lines. The waits are held at a millisecond so
+/// the suite spends no time on them; the shape of the growing wait is
+/// proven by the policy's own unit tests.
+pub(crate) fn counted(configuration: &str, log: &Path, attempts: u64) -> String {
+    format!(
+        "{configuration}RIFT_FAKE_ENGINE_LIFECYCLE_LOG = \"{}\"\n\n\
+         [engines.fake.retry]\nattempts = {attempts}\ndelay = \"1ms\"\n\
+         delay_limit = \"1ms\"\n",
+        log.display()
+    )
+}
+
+/// Lines of one lifecycle event the engine recorded.
+pub(crate) fn recorded(log: &Path, event: &str) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == event)
+        .count()
 }

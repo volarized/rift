@@ -68,6 +68,10 @@ pub enum DiagnosticCode {
     /// change itself landed.
     #[serde(rename = "rift.engine.failed")]
     EngineFailed,
+    /// The language engine was still analyzing when it answered every attempt, so its
+    /// findings over an applied change may be incomplete; the change itself landed.
+    #[serde(rename = "rift.engine.analyzing")]
+    EngineAnalyzing,
 }
 
 impl DiagnosticCode {
@@ -192,5 +196,9 @@ mod tests {
             "rift.move.references_not_updated"
         );
         assert_eq!(DiagnosticCode::EngineFailed.code(), "rift.engine.failed");
+        assert_eq!(
+            DiagnosticCode::EngineAnalyzing.code(),
+            "rift.engine.analyzing"
+        );
     }
 }
