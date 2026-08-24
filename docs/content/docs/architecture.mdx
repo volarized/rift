@@ -177,8 +177,9 @@ for `typescript` and its `tsx` dialect. Adding a language is that entry, not a R
 
 The server starts an engine on the first request for a language it serves and keeps the session
 for later requests, because a language server pays for its project load once and answers from it
-afterwards. A crashed engine is replaced and the request runs again; a second failure fails the
-request rather than writing half a rename.
+afterwards. A crashed engine is replaced and the request runs again, within the restart budget
+its [`[engines.<name>.restart]`](/docs/configuration#engines) table states; once that budget is
+spent the request fails rather than writing half a rename.
 
 The engine never writes. It answers with proposed edits and with diagnostics, and Rift applies
 what it proposes through the change path every other tool uses, described under [Semantic
@@ -556,6 +557,18 @@ a write per site, and finding every site is reference resolution - a semantic fa
   `}
 />
 
+The server treats an engine's answer as unsettled until the engine says it has stopped working.
+A language server answers from the moment it initializes and answers wrongly until it has loaded
+the project - rust-analyzer refuses a rename with `No references found at position` for a
+declaration it has not indexed - and it announces that work over LSP's `$/progress`. While the
+work is outstanding the server discards what came back and asks the engine again, under that
+engine's [`retry`](/docs/configuration#engines) table; it does the same for a refusal LSP marks
+as re-askable, and it replaces an engine that died mid-request under `restart`. Whatever tool
+asked, nothing below this point sees a provisional answer.
+
+When the whole budget is spent, a rename or a move fails `temporarily_unavailable` with the tree
+untouched, so the caller can send the same request again once the engine has loaded.
+
 ### Rename a declaration
 
 [`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol) hands the decision to the language
@@ -607,12 +620,21 @@ The pull reads the landed bytes, so what comes back is the engine's reading of t
 than of the tree before it. rust-analyzer answers a broken call this way: `expected 1 argument,
 found 2`, under its own code `E0107`.
 
+A pull the engine answers while it is still loading the project comes back empty, and so does a
+pull over code that is genuinely clean. The server tells the two apart from the engine's own
+`$/progress` traffic and pulls again while the engine has work outstanding, so the findings that
+ride the summary are the ones the engine reached with the project loaded. Clean bytes cost
+nothing extra: an engine with no work outstanding has already settled.
+
 An engine that advertises no pull contributes nothing and says nothing about it, because a
 capability the engine never advertised is not a failure. typescript-language-server is that case:
 it publishes diagnostics instead of serving pulls, so an applied change carries its silence.
 
-An engine that fails the pull degrades to one warning naming it, under `rift.engine.failed`. The
-change has already landed by then, so nothing at this step can refuse it.
+An engine that fails the pull degrades to one warning naming it, under `rift.engine.failed`, and
+one that never stopped analyzing inside its retry budget degrades to a warning under
+`rift.engine.analyzing` saying its findings may be incomplete. The change has already landed by
+then, so nothing at this step can refuse it - and neither warning is ever replaced by an empty
+finding list, which would tell the caller the file is clean.
 
 ### Edit plans
 

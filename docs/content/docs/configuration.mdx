@@ -235,7 +235,7 @@ it, and the other keys are shown at theirs.
 - `request_timeout` - bounds each later request, 1s to 10m
 - `output_limit` - bytes of the engine's standard error Rift keeps, 1kb to 8mb; Rift still
   reports the full size, so you can tell a truncated log from a short one
-- `retry.attempts` - times one request is asked before Rift gives up on it, the first ask
+- `retry.attempts` - times one request is asked while its answer stays unsettled, the first ask
   counted, 1 to 64; `1` never asks twice
 - `retry.delay` - the wait before the second ask, 1ms to 1m; every later wait doubles the one
   before it
@@ -248,14 +248,34 @@ The table holds at most 16 engines. The server starts one on the first request f
 serves and keeps the session across later requests, because a language server pays for its
 project load once and answers from it afterwards.
 
+`retry` bounds what Rift does while an engine's answer is not settled, and two things leave it
+unsettled.
+
 A language server may decline a request it is already serving, or report that the file moved
-under it while it was answering. LSP asks the client to send such a request again, so Rift does,
-under `retry`: the waits grow from `delay` and stop growing at `delay_limit`, which keeps the
-resends off an engine that is busy re-analyzing your project. At the defaults a request waits at
-most 9.75s across its eight asks. Once the attempts run out Rift degrades honestly - the change
-it was gathering diagnostics for has already applied, and the summary carries one warning naming
-the engine. A refusal the engine did not invite again - it disagrees with the new name, it has
-no such capability - is never resent.
+under it while it was answering. LSP asks the client to send such a request again, so Rift does.
+
+A server still loading your project answers anyway, and answers thinly: rust-analyzer reports no
+diagnostics at all for a file it has not analyzed, and refuses a rename with `No references found
+at position` for a declaration it has not indexed. Neither is its verdict. The engine says which
+it is, because a language server announces the work it is doing over LSP's `$/progress`, so Rift
+treats an answer that arrives while that work is outstanding as provisional: it discards the
+answer and asks again. An engine that announces no work pays nothing for this, and its first
+answer is its settled one.
+
+The waits grow from `delay` and stop growing at `delay_limit`, which keeps the resends off an
+engine that is busy indexing. At the defaults a request waits at most 9.75s across its eight
+asks, which covers a rust-analyzer cold start on a small project.
+
+What the caller sees when the attempts run out depends on what was being asked. `rename_symbol`
+and `move_file` ask before anything is written, so the call fails `temporarily_unavailable` with
+the tree untouched, and the same request is worth sending again once the engine has loaded. The
+diagnostics pull runs after the change has already applied, so it cannot fail the call: the
+summary carries one warning naming the engine - `rift.engine.analyzing` when the engine never
+finished, `rift.engine.failed` when it failed outright - rather than an empty finding list, which
+would tell the caller the changed file is clean.
+
+A refusal the settled engine did not invite again - it disagrees with the new name, it has no
+such capability - is never resent.
 
 `restart` bounds what Rift does when the engine itself fails: one that ended, that could not be
 started, or that stopped answering is replaced automatically, and the replacement serves the

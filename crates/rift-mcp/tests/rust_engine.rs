@@ -68,10 +68,11 @@ pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
 /// keeps indexing afterwards, so the bounds are generous - and still
 /// bounds: a wedged engine fails the suite instead of hanging it.
 ///
-/// The retry table is wider than the shipped default for the same reason.
-/// This suite runs beside the whole instrumented workspace, where a
-/// loading engine cancels a diagnostics pull for longer than a request
-/// answered on an idle machine ever needs.
+/// No `[engines.rust.retry]` table: the suite runs on the shipped
+/// defaults, which is what makes it a proof. rust-analyzer announces its
+/// project load over `$/progress` and ends that announcement about 830ms
+/// in on this fixture, then cancels requests until it settles around
+/// 2.3s; the eight default attempts reach past 9.75s.
 pub(crate) fn rust_engine_configuration() -> String {
     let environment = rust_analyzer_environment()
         .into_iter()
@@ -81,7 +82,6 @@ pub(crate) fn rust_engine_configuration() -> String {
     format!(
         "[engines.rust]\nprogram = \"{RUST_ANALYZER_PROGRAM}\"\nlanguages = [\"rust\"]\n\
          startup_timeout = \"2m\"\nrequest_timeout = \"2m\"\n\n\
-         [engines.rust.retry]\nattempts = 40\ndelay = \"250ms\"\ndelay_limit = \"2s\"\n\n\
          [engines.rust.environment]\n{environment}\n"
     )
 }
