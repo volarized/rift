@@ -35,11 +35,13 @@ const PROGRESS_TOKEN: &str = "fake/analysis";
 /// Each mints [`PROGRESS_TOKEN`] through `window/workDoneProgress/create`
 /// and begins it, exactly as a language server loading a project does.
 /// `reports-progress` ends the token before it answers a rename,
-/// `analyzes-then-serves` before the second rename it is asked for, and
+/// `analyzes-then-serves` before the second rename it is asked for,
+/// `analyzes-then-reports` before the second diagnostic pull, and
 /// `never-ends-progress` never ends it at all.
 const PROGRESS_BEHAVIORS: &[&str] = &[
     "reports-progress",
     "analyzes-then-serves",
+    "analyzes-then-reports",
     "never-ends-progress",
 ];
 
@@ -234,8 +236,12 @@ fn answer_will_rename(behavior: &str, message: &Value, state: &EngineState) {
 /// unrelated tests stay clean; the scripted behaviors return items, an
 /// unchanged report, a refusal, or death mid-request. The refusing
 /// behaviors stamp the pull's ordinal into their message, so a test reads
-/// how many times it was asked off the wire.
+/// how many times it was asked off the wire. `analyzes-then-reports`
+/// answers the first pull the way a loading engine does - cleanly and with
+/// nothing to say - and ends its progress before the pull that carries the
+/// finding.
 fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
+    record_lifecycle("diagnostic");
     state.diagnostic_pulls += 1;
     let pull = state.diagnostic_pulls;
     match behavior {
@@ -259,6 +265,18 @@ fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
             id,
             &json!({"kind": "full", "items": [diagnostic(&format!("settled on pull {pull}"))]}),
         ),
+        "analyzes-then-reports" if pull == 1 => {
+            // A pull answered mid-analysis reports nothing yet, exactly as
+            // clean bytes would.
+            respond(id, &json!({"kind": "full", "items": []}));
+        }
+        "analyzes-then-reports" => {
+            end_progress();
+            respond(
+                id,
+                &json!({"kind": "full", "items": [diagnostic("settled finding")]}),
+            );
+        }
         "cancels-every-diagnostic" => refuse_pull(id, SERVER_CANCELLED, pull),
         "refuses-diagnostic" => refuse_pull(id, METHOD_NOT_FOUND_CODE, pull),
         _ => respond(id, &json!({"kind": "full", "items": []})),

@@ -3,7 +3,8 @@
 //! Every change tool shares one post-apply attach point, proven here for
 //! `replace_symbol` and `rename_symbol` against the scripted fake engine:
 //! mapped findings for each severity, the bound, the capability-honest
-//! silence, and the one warning an engine death degrades to.
+//! silence, the wait for an engine that is still analyzing, and the
+//! warnings an engine death and an engine that never settles degrade to.
 
 #![cfg(unix)]
 
@@ -14,7 +15,8 @@ use std::fs;
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, call_retrying_acceptance, engine_configuration, served_workspace, tool_request,
+    TestResult, call_retrying_acceptance, counted, engine_configuration, recorded,
+    served_workspace, tool_request,
 };
 
 const LIBRARY: &str = "pub fn beacon() {}\n";
@@ -22,18 +24,6 @@ const LIBRARY: &str = "pub fn beacon() {}\n";
 /// Attempts the exhaustion test gives one pull through its own
 /// `[engines.fake.retry]` table.
 const CONFIGURED_ATTEMPTS: u64 = 3;
-
-/// The same engine table with an `[engines.fake.retry]` policy on it.
-///
-/// The exhaustion test states its own bound, so it is small and the waits
-/// between attempts are short enough to keep the suite quick; the growth
-/// of those waits is proven by the policy's own unit tests.
-fn retrying(configuration: &str, attempts: u64, delay: &str) -> String {
-    format!(
-        "{configuration}\n[engines.fake.retry]\nattempts = {attempts}\n\
-         delay = \"{delay}\"\ndelay_limit = \"{delay}\"\n"
-    )
-}
 
 fn replace_request(body: &str) -> CallToolRequestParams {
     tool_request(
@@ -253,12 +243,14 @@ async fn a_cancelled_pull_is_resent_and_its_findings_ride_the_change() -> TestRe
 /// `attempts` - not the shipped default - is the number it names.
 #[tokio::test]
 async fn a_cancelling_engine_degrades_once_the_attempts_run_out() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
     let (directory, client, server_task) = served_workspace(
         &[("lib.rs", LIBRARY)],
-        Some(retrying(
+        Some(counted(
             &engine_configuration("cancels-every-diagnostic", "20s"),
+            &log,
             CONFIGURED_ATTEMPTS,
-            "1ms",
         )),
     )
     .await?;
@@ -373,6 +365,119 @@ async fn applied_rename_gains_the_same_engine_findings() -> TestResult {
             .iter()
             .any(|finding| finding["message"] == json!("scripted hint")),
         "{structured:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The warnings an engine that never finished analyzing degraded to.
+fn analyzing_warnings(structured: &Value) -> Vec<&Value> {
+    structured["summary"]["diagnostics"]
+        .as_array()
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|finding| finding["code"] == json!("rift.engine.analyzing"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A pull answered while the engine is still loading reports nothing, and
+/// nothing is exactly what clean bytes report. The server waits for the
+/// engine's own progress to end and attaches the findings the settled pull
+/// carried.
+#[tokio::test]
+async fn a_pull_answered_mid_analysis_waits_for_the_settled_findings() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (_directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(counted(
+            &engine_configuration("analyzes-then-reports", "20s"),
+            &log,
+            CONFIGURED_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, replace_request("pub fn beacon() -> u8 { 7 }")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let findings = engine_findings(&structured);
+    assert_eq!(findings.len(), 1, "{structured:#}");
+    assert_eq!(
+        findings[0]["message"],
+        json!("settled finding"),
+        "the settled pull is the one whose findings ride: {structured:#}"
+    );
+    assert!(
+        analyzing_warnings(&structured).is_empty(),
+        "an engine that settled inside its budget never warns: {structured:#}"
+    );
+    assert_eq!(
+        recorded(&log, "diagnostic"),
+        2,
+        "the provisional pull was discarded and the document pulled again"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// An engine that never stops analyzing spends the whole attempt bound and
+/// then says so. The change already landed, so the summary carries a
+/// warning and no error, and the empty report the engine kept giving never
+/// reaches the caller as a clean bill.
+#[tokio::test]
+async fn an_engine_that_never_settles_warns_instead_of_reporting_clean() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(counted(
+            &engine_configuration("never-ends-progress", "20s"),
+            &log,
+            CONFIGURED_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, replace_request("pub fn beacon() -> u8 { 7 }")).await?;
+    assert_eq!(
+        structured["status"],
+        json!("applied"),
+        "an engine still analyzing never fails the call: {structured:#}"
+    );
+    let warnings = analyzing_warnings(&structured);
+    assert_eq!(warnings.len(), 1, "{structured:#}");
+    assert_eq!(warnings[0]["severity"], json!("warning"));
+    let message = warnings[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("fake") && message.contains("still analyzing"),
+        "the warning names the engine and what it was doing: {structured:#}"
+    );
+    assert!(
+        message.contains(&format!("all {CONFIGURED_ATTEMPTS} attempts")),
+        "the warning names the budget that was spent: {structured:#}"
+    );
+    assert!(
+        engine_findings(&structured).is_empty(),
+        "no provisional finding rides the summary: {structured:#}"
+    );
+    assert_eq!(
+        recorded(&log, "diagnostic"),
+        usize::try_from(CONFIGURED_ATTEMPTS)?,
+        "the engine was pulled for the whole budget before the warning"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        "pub fn beacon() -> u8 { 7 }\n",
+        "the change stays applied"
     );
 
     client.cancel().await?;
