@@ -11,7 +11,6 @@ mod support;
 
 use std::fs;
 
-use rift_server::ENGINE_DIAGNOSTICS_ATTEMPTS_MAX;
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
 use support::{
@@ -19,6 +18,22 @@ use support::{
 };
 
 const LIBRARY: &str = "pub fn beacon() {}\n";
+
+/// Attempts the exhaustion test gives one pull through its own
+/// `[engines.fake.retry]` table.
+const CONFIGURED_ATTEMPTS: u64 = 3;
+
+/// The same engine table with an `[engines.fake.retry]` policy on it.
+///
+/// The exhaustion test states its own bound, so it is small and the waits
+/// between attempts are short enough to keep the suite quick; the growth
+/// of those waits is proven by the policy's own unit tests.
+fn retrying(configuration: &str, attempts: u64, delay: &str) -> String {
+    format!(
+        "{configuration}\n[engines.fake.retry]\nattempts = {attempts}\n\
+         delay = \"{delay}\"\ndelay_limit = \"{delay}\"\n"
+    )
+}
 
 fn replace_request(body: &str) -> CallToolRequestParams {
     tool_request(
@@ -233,12 +248,18 @@ async fn a_cancelled_pull_is_resent_and_its_findings_ride_the_change() -> TestRe
 
 /// An engine that keeps cancelling exhausts the attempt budget and then
 /// degrades exactly as a terminal failure does: one warning, the change
-/// still applied. The last refusal's ordinal names how many pulls ran.
+/// still applied. The engine stamps each pull's ordinal into its refusal,
+/// so the last one names how many pulls ran, and the table's own
+/// `attempts` - not the shipped default - is the number it names.
 #[tokio::test]
 async fn a_cancelling_engine_degrades_once_the_attempts_run_out() -> TestResult {
     let (directory, client, server_task) = served_workspace(
         &[("lib.rs", LIBRARY)],
-        Some(engine_configuration("cancels-every-diagnostic", "20s")),
+        Some(retrying(
+            &engine_configuration("cancels-every-diagnostic", "20s"),
+            CONFIGURED_ATTEMPTS,
+            "1ms",
+        )),
     )
     .await?;
 
@@ -251,13 +272,13 @@ async fn a_cancelling_engine_degrades_once_the_attempts_run_out() -> TestResult 
         1,
         "an exhausted budget degrades to one warning: {structured:#}"
     );
-    let expected = format!("declined pull {ENGINE_DIAGNOSTICS_ATTEMPTS_MAX}");
+    let expected = format!("declined pull {CONFIGURED_ATTEMPTS}");
     assert!(
         warnings[0]["message"]
             .as_str()
             .unwrap_or_default()
             .contains(&expected),
-        "the warning carries the last of {ENGINE_DIAGNOSTICS_ATTEMPTS_MAX} attempts: {structured:#}"
+        "the warning carries the last of {CONFIGURED_ATTEMPTS} configured attempts: {structured:#}"
     );
     assert_eq!(
         fs::read_to_string(directory.path().join("lib.rs"))?,
