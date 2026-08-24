@@ -132,6 +132,11 @@ const WARMUP_PAUSE: Duration = Duration::from_millis(250);
 /// run resolved the declaration inside that attempt, about 400ms in. The
 /// loop bounds the wait a cold runner can add. It never proves how far the
 /// proposal reaches - the assertions that follow do.
+///
+/// The server cannot wait this out on the caller's behalf, as it does for
+/// rust-analyzer: this engine reports no work-done progress at all, so
+/// every answer it gives reads as settled. Dropping the probe made the
+/// move test fail on every run.
 async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
     let started = Instant::now();
     for _attempt in 0..WARMUP_ATTEMPTS_MAX {
