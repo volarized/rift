@@ -4,6 +4,13 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  # Every published bisync version was yanked upstream on 2026-08-24 while
+  # gix-protocol (0.64 and 0.65 alike) still requires ^0.3.0, so no lock
+  # update can satisfy the gate. Drop this entry once gix-protocol sheds
+  # bisync or a non-yanked version returns.
+  { crate = "bisync@0.3.0", reason = "all bisync releases yanked; gix-protocol pins ^0.3.0" },
+]
 
 [licenses]
 version = 2
