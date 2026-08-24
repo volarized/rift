@@ -14,7 +14,9 @@ use std::fs;
 use fake_engine::{counted, engine_configuration, recorded};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
+use workspace_client::{
+    TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
+};
 
 fn move_request(from: &str, to: &str) -> CallToolRequestParams {
     tool_request("move_file", &json!({ "from": from, "to": to }))
@@ -112,6 +114,38 @@ async fn applied_move_with_an_engine_rewrites_the_referencing_file() -> TestResu
         "pub fn spoke() {}\n// spoke module\n",
         "edits addressed to the moved file land on the moved bytes"
     );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("main.rs"))?,
+        "mod spoke;\n"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A workspace served under the CLI's own root spelling moves the same way
+/// one served under an absolute path does.
+///
+/// The engine proposes the reference rewrite in `file://` URIs, which carry
+/// no working directory, so the root's spelling reaches the proposal
+/// conversion even though every filesystem operation below the root is
+/// blind to it.
+#[tokio::test]
+async fn applied_move_under_a_relative_root_rewrites_the_referencing_file() -> TestResult {
+    let (directory, client, server_task) = served_relative_workspace(
+        &[("hub.rs", HUB), ("main.rs", CALLER)],
+        Some(engine_configuration("moves-imports", "20s")),
+    )
+    .await?;
+
+    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert!(
+        move_warnings(&structured).is_empty(),
+        "an engine-covered move carries no warning: {structured:#}"
+    );
+    assert!(!directory.path().join("hub.rs").exists());
     assert_eq!(
         fs::read_to_string(directory.path().join("main.rs"))?,
         "mod spoke;\n"

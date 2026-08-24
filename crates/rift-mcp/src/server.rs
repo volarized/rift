@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -203,6 +203,44 @@ impl ChangeLane {
     }
 }
 
+/// Resolves the workspace root the server serves into an absolute path.
+///
+/// The CLI serves the process working directory, which it names `.`, and every
+/// filesystem operation below the root resolves against that same directory, so
+/// a relative root reads and writes correctly. A language engine does not: it is
+/// addressed in `file://` URIs, which carry no working directory, so a relative
+/// root refuses every engine-backed operation. Resolution happens here, where the
+/// server takes ownership of the root, rather than at each entry point that could
+/// hand one over.
+///
+/// The operation is lexical: the working directory is prepended, `.` segments drop
+/// out, and each `..` cancels the segment before it. Symbolic links keep the
+/// spelling the caller used - a link is never followed - because a language engine
+/// answers under the root it was handed, and the two must still be the same path.
+/// A `..` that follows a link therefore cancels the link's own segment rather than
+/// the directory it points at, which is how [`ProjectPath`] already reads a path,
+/// and why it refuses `..` in every address below the root.
+///
+/// [`ProjectPath`]: rift_protocol::path::ProjectPath
+fn absolute_root(root: &Path) -> Result<PathBuf, ReadError> {
+    let absolute = std::path::absolute(root)
+        .map_err(|error| ReadFault::task("workspace root resolution", error.to_string()))?;
+    let mut segments: Vec<Component<'_>> = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            // A `..` above the root has nothing to cancel: `/..` is `/`.
+            Component::ParentDir => {
+                if matches!(segments.last(), Some(Component::Normal(_))) {
+                    segments.pop();
+                }
+            }
+            named => segments.push(named),
+        }
+    }
+    Ok(segments.iter().collect())
+}
+
 /// Sizes the lexical search index's connection pool and busy-wait budget from one accepted
 /// `[search]` table, keeping this release's fixed unit, query-term, and match-count bounds.
 fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
@@ -345,7 +383,7 @@ impl RiftMcp {
     /// Dropping this future discards construction. An accepted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
     pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let root = root.to_path_buf();
+        let root = absolute_root(root)?;
         let configuration_root = root.clone();
         let startup_configuration =
             tokio::task::spawn_blocking(move || ConfigurationState::accept(&configuration_root))

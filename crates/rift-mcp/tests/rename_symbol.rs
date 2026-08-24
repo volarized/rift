@@ -15,7 +15,9 @@ use std::fs;
 use fake_engine::{counted, engine_configuration, recorded};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
+use workspace_client::{
+    TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
+};
 
 fn rename_request(symbol: &str, new_name: &str) -> CallToolRequestParams {
     tool_request(
@@ -101,6 +103,43 @@ async fn applied_rename_rewrites_every_referencing_file() -> TestResult {
         2,
         "one whole-file edit per rewritten file"
     );
+    assert!(
+        survivor_findings(&structured).is_empty(),
+        "a full rename must sweep clean: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        "pub fn flare() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("main.rs"))?,
+        "pub fn caller() { flare(); }\n"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A workspace served under the CLI's own root spelling renames the same
+/// way one served under an absolute path does.
+///
+/// `rift mcp` and `rift server start` serve the process working directory,
+/// which they name `.`. Reads and writes below the root resolve against
+/// that directory either way, so the spelling is invisible to them; the
+/// engine tier is addressed in `file://` URIs, which carry no working
+/// directory, so it is the one caller that can tell the spellings apart.
+#[tokio::test]
+async fn applied_rename_under_a_relative_root_rewrites_every_referencing_file() -> TestResult {
+    let (directory, client, server_task) = served_relative_workspace(
+        &[("lib.rs", LIBRARY), ("main.rs", CALLER)],
+        Some(engine_configuration("renames-word", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert!(
         survivor_findings(&structured).is_empty(),
         "a full rename must sweep clean: {structured:#}"
