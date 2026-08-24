@@ -133,10 +133,12 @@ const WARMUP_PAUSE: Duration = Duration::from_millis(250);
 /// loop bounds the wait a cold runner can add. It never proves how far the
 /// proposal reaches - the assertions that follow do.
 ///
-/// The server cannot wait this out on the caller's behalf, as it does for
-/// rust-analyzer: this engine reports no work-done progress at all, so
-/// every answer it gives reads as settled. Dropping the probe made the
-/// move test fail on every run.
+/// This engine reports no work-done progress at all, so the server cannot
+/// wait it out the way it waits out rust-analyzer. What it does instead is
+/// send an empty first answer's operation again once, which is enough for
+/// the renames, the patch, and the refusal below: each ran cold ten times,
+/// idle and saturated, without a failure. It is not enough for the move,
+/// which keeps this probe.
 async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
     let started = Instant::now();
     for _attempt in 0..WARMUP_ATTEMPTS_MAX {
@@ -164,7 +166,6 @@ async fn applied_rename_rewrites_the_module_the_importer_and_the_component() -> 
         return Ok(());
     }
     let (directory, client, server_task) = served_project().await?;
-    warmed_engine(&client).await?;
 
     let structured =
         call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
@@ -225,7 +226,6 @@ async fn applied_rename_of_the_component_routes_the_tsx_dialect() -> TestResult 
         return Ok(());
     }
     let (directory, client, server_task) = served_project().await?;
-    warmed_engine(&client).await?;
 
     let structured =
         call_retrying_acceptance(&client, rename_request(BANNER_SYMBOL, "Marker")).await?;
@@ -261,6 +261,12 @@ async fn applied_rename_of_the_component_routes_the_tsx_dialect() -> TestResult 
 /// in both dialects: this engine's filters claim `ts` and `tsx` alike, and
 /// a module here is a path, so the moved file needs no declaration
 /// rewritten anywhere.
+///
+/// This is the one test here that still warms the engine. Run cold it
+/// failed all ten runs, idle and saturated alike, and it failed honestly:
+/// the server asked twice, the engine proposed nothing both times, and the
+/// move applied carrying `rift.move.references_not_updated`. The resend
+/// makes the gap visible; only a loaded engine closes it.
 #[tokio::test]
 async fn applied_move_rewrites_the_import_specifiers() -> TestResult {
     if !engine_live() {
@@ -325,7 +331,6 @@ async fn applied_patch_carries_no_engine_diagnostics() -> TestResult {
         return Ok(());
     }
     let (directory, client, server_task) = served_project().await?;
-    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(
         &client,
@@ -363,7 +368,6 @@ async fn engine_refused_rename_of_a_standard_library_declaration() -> TestResult
         return Ok(());
     }
     let (directory, client, server_task) = served_project().await?;
-    warmed_engine(&client).await?;
 
     let structured =
         call_retrying_acceptance(&client, rename_request(STANDARD_LIBRARY_SYMBOL, "Text")).await?;
