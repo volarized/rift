@@ -37,11 +37,6 @@ dashes:
     uv run --script scripts/check_dashes.py \
         docs/content docs/src/app crates README.md docs/public .github
 
-# One run of every suite, live engines included: the engine tier's own code
-# is only exercised against a real language server, so a hermetic run would
-# report it uncovered. Coverage is this run's artifact, not a second run.
-test:
-    RIFT_ENGINE_LIVE=1 cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -63,9 +58,15 @@ clean:
         fi
     done
 
+# One run of every suite, live engines included: the engine tier's own code
+# is only exercised against a real language server, so a hermetic run would
+# report it uncovered. Needs rust-analyzer on the default toolchain and bun
+# on the PATH. Coverage is this run's artifact, not a second run.
+test:
+    RIFT_ENGINE_LIVE=1 cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 
-# The live-engine suites: gated by RIFT_ENGINE_LIVE, run in CI's engines
-# job, and outside `rust-gate` so the local default gate stays hermetic.
+# The live-engine suites alone, for iterating on them without paying for
+# the instrumented workspace run.
 engine-test:
     RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_rust_analyzer
     RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer

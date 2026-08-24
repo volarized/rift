@@ -110,6 +110,7 @@ configuration allows you to describe:
 
 - which languages may execute agent-written code
 - which embedding model, if any, ranks search
+- which language engines serve which languages
 - which hooks run on every change
 
 An edit to the file takes effect for later requests once the server accepts it again. An
@@ -162,39 +163,55 @@ The server invalidates a changed path's syntax facts and search-index entries.
 
 ### Semantics
 
-For languages with deeper analysis, semantic providers add facts a grammar cannot resolve, such
-as references, definitions, types, and hover information. For Python, Rift embeds
-[ty](https://github.com/astral-sh/ty) and builds one analysis database per targeted tree on first
-use.
+<VersionBadge version="v0.0.14" languages={["Rust", "TypeScript"]} />
 
-The analyzer behind a semantic provider is its **language engine**. An engine takes one of these
-shapes:
+A grammar shows how one file is written; it cannot say which other files reference a declaration
+in it. Resolving that is a **language engine**'s job - an external language server Rift starts
+for the workspace and speaks
+[LSP](https://microsoft.github.io/language-server-protocol/) to over stdio.
 
-- an embedded library, compiled into the server - ty is one; there is no process to supervise,
-  and the engine version ships with the Rift release
-- a language server the server spawns for the workspace and speaks
-  [LSP](https://microsoft.github.io/language-server-protocol/) to -
-  [rust-analyzer](https://rust-analyzer.github.io/) answers this way; the process stays warm and
-  reanalyzes incrementally, which suits a long editing session
+Each [`[engines.<name>]`](/docs/configuration#engines) table names one program and the language
+identity segments it serves: [rust-analyzer](https://rust-analyzer.github.io/) for `rust`,
+[typescript-language-server](https://github.com/typescript-language-server/typescript-language-server)
+for `typescript` and its `tsx` dialect. Adding a language is that entry, not a Rift release.
+
+The server starts an engine on the first request for a language it serves and keeps the session
+for later requests, because a language server pays for its project load once and answers from it
+afterwards. A crashed engine is replaced and the request runs again, within the restart budget
+its [`[engines.<name>.restart]`](/docs/configuration#engines) table states; once that budget is
+spent the request fails rather than writing half a rename.
+
+The engine never writes. It answers with proposed edits and with diagnostics, and Rift applies
+what it proposes through the change path every other tool uses, described under [Semantic
+edits](#semantic-edits).
+
+A language no table claims keeps everything the syntax tier gives it: reads answer, the direct
+change tools apply, and only the engine-served tools refuse.
+
+<VersionBadge version="planned" />
+
+Reads deepen next. A semantic provider merges the facts a grammar cannot resolve - references,
+definitions, types, and hover information - into the same declarations tree-sitter found, so
+answers carry `types` and `relationships` where a provider resolved them. A provider may
+invalidate dependent facts, such as callers after a signature changes.
+
+Semantic providers also expose dependency, standard-library, and synthetic declarations when
+their language engine knows them without readable source.
+
+An engine can take shapes other than a language server:
+
+- an embedded library, compiled into the server - [ty](https://github.com/astral-sh/ty) for
+  Python is one; there is no process to supervise, and the engine version ships with the Rift
+  release. The Python provider supplies ty with the source catalog and tree-sitter facts, and ty
+  maps resolved facts back to the same declarations and concrete source ranges.
 - a batch indexer whose output the server reads - a [SCIP](https://github.com/sourcegraph/scip)
   index such as the one `rust-analyzer scip` emits, the same format Rift itself
   [exports](/docs/protocol/scip); the index describes exactly one tree revision, so the server
   caches it per revision
 
-The provider contract is the same in front of every shape, so a language can swap engines -
-or use one engine for facts and another for [edit plans](#semantic-edits) - without changing any
-tool an agent calls. A missing engine degrades the answer: when rust-analyzer is not installed,
-the answer carries no semantic facts and syntax still answers.
-
-The Python provider supplies ty with the source catalog and tree-sitter facts. Ty maps
-resolved facts back to the same declarations and concrete source ranges, while syntax remains the
-fallback where semantic analysis has no answer.
-
-Semantic providers can also expose dependency, standard-library, and synthetic declarations when
-their language engine knows them without readable source. Answers carry `types` and
-`relationships` when a provider resolves them.
-
-A provider may invalidate dependent facts, such as callers after a signature changes.
+The provider contract is the same in front of every shape, so a language can swap engines - or
+use one engine for facts and another for [edit plans](#edit-plans) - without changing any tool an
+agent calls. Syntax remains the fallback wherever semantic analysis has no answer.
 
 ### History
 
@@ -384,7 +401,9 @@ recorded in the tree's changeset, and comes back carrying everything Rift learne
 
 What rides on the result is the part that changes agent behavior. Each applied change carries:
 
-- its diagnostics - the syntax provider re-parses what changed
+- its diagnostics - the syntax provider re-parses what changed, and the
+  [language engine](#diagnostics-on-a-change) serving a changed path reports what it makes of the
+  new bytes
 - the verdicts of the workspace's [hooks](/docs/configuration#hooks), run inside the changed tree
 - its [`Advisory`](/docs/protocol/reference#Advisory) list: concerns a provider or hook attached
   to exactly this change
@@ -519,67 +538,151 @@ Projections outlive the agent that made them. After a server restart,
 
 ## Semantic edits
 
-<VersionBadge version="planned" />
+<VersionBadge version="v0.0.14" languages={["Rust", "TypeScript"]} />
 
-Threading a new parameter through twenty call sites is one decision followed by twenty mechanical
-edits. The change tools address one declaration per call, so that decision costs the agent a read
-and a write per site. The missing step turns the decision into the full edit set, and
-finding every site is reference resolution - a semantic fact.
-
-An **edit plan** is that set before any of it is applied: each affected site as a concrete byte
-range with its replacement, resolved by the language engine for the plan's language. The server
-asks the engine where the edits go; applying them stays the server's job. A plan compiles into
-the same [`Edit`](/docs/protocol/reference#Edit) set every change tool produces - one shared
-input state, no overlaps, atomic application across files - so plans add no second write path.
-
-A language server normally hands its edits straight to the editor that hosts it, and whether
-every file got its share is the editor's problem. Rift treats the engine's answer as a proposal:
-resolution recomputes each witness as the plan applies, so a plan computed against bytes that
-have since moved refuses with a failed `source_unchanged` precondition - the same guard every
-direct write gets.
-
-A plan targets a tree the way every change does: the workspace by default, or a projection the
-call names. Projections stay the agent's decision - the server never creates one on the agent's
-behalf. A quick rename with a clean plan lands directly; a refactor worth reviewing whole runs in
-a projection the agent created for it.
-
-The engine works against the targeted tree's directory, because a language server and a batch
-indexer take a directory, like `cargo test` and the linter before them. A live language server
-reads the tree's bytes as the change tools write them, so its analysis tracks the plan as it
-lands. A batch indexer needs a tree that holds still: a projection is already pinned, and for the
-workspace target the server pins an internal tree through [Rift FS](#rift-fs) - that tree feeds
-the indexer and is never a projection the agent has to manage.
+Renaming a declaration is one decision followed by an edit in every file that mentions it. The
+direct change tools address one declaration per call, so that decision costs the agent a read and
+a write per site, and finding every site is reference resolution - a semantic fact.
 
 <FlatDiagram
-  alt="An agent asks the rift server for a rename, here targeting a projection the agent created. The server requests an edit plan from the language engine - a language server or a SCIP index - which reads the projection directory. The server compiles the plan into witnessed edits, applies them to the projection as one change, and publish carries the result into the workspace tree. A workspace-targeted plan lands in the workspace tree directly."
+  alt="An agent calls rename_symbol on the rift server. The server asks the language engine, an LSP child process, to rename the declaration; the engine reads the workspace tree and answers with proposed edits. The server compiles the proposal into witnessed edits and writes them to the workspace tree as one atomic change, then pulls diagnostics from the same engine over the paths it just wrote."
   chart={`
     flowchart LR
-      agent["agent"]:::agent -- "rename" --> server["rift server"]:::rift
-      server -- "plan request" --> engine["language engine<br/>language server or SCIP index"]:::provider
-      engine -- "edit plan" --> server
-      server -- "witnessed edits" --> projection["projection"]:::store
-      engine -. "reads" .-> projection
-      projection -- "publish" --> workspace["workspace tree"]:::store
+      agent["agent"]:::agent -- "rename_symbol" --> server["rift server"]:::rift
+      server -- "rename request" --> engine["language engine<br/>LSP child process"]:::provider
+      engine -- "proposed edits" --> server
+      engine -. "reads" .-> workspace["workspace tree"]:::store
+      server -- "witnessed edits" --> workspace
+      server -- "pull diagnostics" --> engine
   `}
 />
 
-An engine can miss sites - a name built at runtime, an occurrence in a doc comment or a template
-no resolver parses. After a plan applies, the server sweeps the targeted tree for surviving
-occurrences of the replaced name, and each finding becomes an open warning
-[`Advisory`](/docs/protocol/reference#Advisory) on the change.
+A language server answers from the moment it initializes, and answers wrongly until it has
+loaded the project: rust-analyzer refuses a rename with `No references found at position` for a
+declaration it has not indexed yet. It announces that load over LSP's `$/progress`, and while
+the work is outstanding the server discards what came back and asks the engine again, under that
+engine's [`retry`](/docs/configuration#engines) table. It does the same for a refusal LSP marks
+as re-askable, and it replaces an engine that died mid-request under `restart`. Whatever tool
+asked, nothing below this point sees an answer the engine gave while it was still working.
 
-On a workspace-targeted plan those warnings ride the result for the caller to act on, like any
-direct write's advisories. In a projection an open warning mints a
-[`ConfirmationRequirement`](/docs/protocol/reference#ConfirmationRequirement), so
+That wait needs something announced to wait on, and the first request of a session can arrive
+before the first announcement does. An engine that has announced nothing and answers nothing
+looks exactly like one that has finished and has nothing to report:
+`workspace/willRenameFiles` comes back with no edit, `textDocument/diagnostic` with no item, and
+those are the answers a loaded engine gives for a move with no import to rewrite and for a file
+that is clean. So an engine that has never announced any work is asked once more when it answers
+one of those with nothing, after the same `retry` wait. Once per operation, once per engine
+process: an engine that announces nothing at all - typescript-language-server is one - pays that
+resend on its first such answer and nothing afterwards.
+
+The second answer is the engine's answer, empty or not. A move whose engine proposed nothing
+twice applies carrying the `rift.move.references_not_updated` warning that [moving a
+file](#move-a-file) describes, and a pull that reported nothing twice contributes nothing, as it
+does for a file that is clean.
+
+When the whole budget is spent, a rename or a move fails `temporarily_unavailable` with the tree
+untouched, so the caller can send the same request again once the engine has loaded.
+
+### Rename a declaration
+
+[`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol) hands the decision to the language
+engine. The server resolves the address to the declaration's position, asks the engine to rename
+it there, and receives the affected files with the byte ranges to replace. Applying them stays
+the server's job.
+
+A language server normally hands its edits straight to the editor that hosts it, and whether
+every file got its share is the editor's problem. Rift treats the answer as a proposal: it
+compiles into the same [`Edit`](/docs/protocol/reference#Edit) set every change tool produces -
+one shared input state, no overlaps, atomic across files - and the server re-proves each file's
+bytes before writing, so a proposal computed against bytes that have since moved refuses with a
+failed `source_unchanged` precondition.
+
+The engine works against the workspace directory, because a language server takes a directory,
+like `cargo test` and the linter before it. It reads the tree's bytes as the change tools write
+them, so its analysis tracks the rename as it lands.
+
+An engine can miss sites - a name built at runtime, an occurrence in a doc comment or a template
+no resolver parses. After the rewrites land, the server sweeps the changed tree for surviving
+word-boundary occurrences of the old name, and each finding rides the change summary as a warning
+under `rift.rename.survivor`.
+
+A language no [`[engines.<name>]`](/docs/configuration#engines) table claims refuses the call as
+`unsupported`, naming the segment nothing serves. The engine's own refusal comes back the same
+way and keeps the engine's words - rust-analyzer's `cannot rename to a keyword` reaches the
+caller as `unmet_precondition` - and the tree stays as it was.
+
+### Move a file
+
+[`move_file`](/docs/protocol/mcp#tool-move_file) moves one visible file and asks the engine for
+the reference updates through LSP's `workspace/willRenameFiles`. Those rewrites and the move land
+in one atomic change, so a moved module and the imports naming it never disagree on disk.
+
+An engine that does not advertise that request still gets the file moved, and so does a workspace
+with no engine for the language or an engine whose filters skip the file. The move applies, and
+the result carries a warning under `rift.move.references_not_updated` saying references were not
+updated. Refusing the move instead would trade a gap the caller can see and repair for an error
+it cannot act on.
+
+The same warning names an engine that was asked and proposed nothing twice while it had announced
+no work of its own. A loaded engine that proposes nothing is telling you there is nothing to
+update, and its move carries no warning; one that has never said what it is doing is not, and the
+warning names it so the caller can check the imports itself.
+
+### Diagnostics on a change
+
+After any change applies - a rename, a move, a [`patch`](/docs/protocol/mcp#tool-patch) - the
+server asks each changed path's engine what it now makes of the file. It opens the document with
+the bytes just written, pulls the engine's diagnostics, closes it, and maps the findings onto the
+change summary beside the syntax provider's own.
+
+The pull reads the landed bytes, so what comes back is the engine's reading of the change rather
+than of the tree before it. rust-analyzer answers a broken call this way: `expected 1 argument,
+found 2`, under its own code `E0107`.
+
+A pull the engine answers while it is still loading the project comes back empty, and so does a
+pull over code that is genuinely clean. The server tells the two apart from the engine's own
+`$/progress` traffic: while the engine has work outstanding its answer is provisional, and the
+server pulls again under that engine's [`retry`](/docs/configuration#engines) table. Clean bytes
+cost nothing extra, because an engine with no work outstanding has already settled - except for
+the one empty report an engine gives before it has announced any work at all, which the server
+pulls a second time.
+
+An engine that advertises no pull contributes nothing and says nothing about it, because a
+capability the engine never advertised is not a failure. typescript-language-server is that case:
+it publishes diagnostics instead of serving pulls, so an applied change carries its silence.
+
+An engine that fails the pull degrades to one warning naming it, under `rift.engine.failed`, and
+one that never stopped analyzing inside its retry budget degrades to a warning under
+`rift.engine.analyzing` saying its findings may be incomplete. The change has already landed by
+then, so nothing at this step can refuse it - and neither warning is ever replaced by an empty
+finding list, which would tell the caller the file is clean.
+
+### Edit plans
+
+<VersionBadge version="planned" />
+
+An **edit plan** is the proposal before any of it is applied, held for the caller to look at:
+each affected site as a concrete byte range with its replacement. A plan targets a tree the way
+every change does - the workspace by default, or a projection the call names. Projections stay
+the agent's decision, so a quick rename lands directly while a refactor worth reviewing whole
+runs in a projection the agent created for it.
+
+In a projection each surviving occurrence becomes an open warning
+[`Advisory`](/docs/protocol/reference#Advisory), which mints a
+[`ConfirmationRequirement`](/docs/protocol/reference#ConfirmationRequirement) on the change, so
 [`publish`](/docs/protocol/mcp#tool-publish) refuses the rename until someone has looked at what
 the engine left behind.
 
+A batch indexer needs a tree that holds still: a projection is already pinned, and for the
+workspace target the server pins an internal tree through [Rift FS](#rift-fs) - that tree feeds
+the indexer and is never a projection the agent has to manage.
+
 The engine's whole job is the plan. Everything after it - witnessing, atomic application, the
-publish gate - is the write path the server already owns, so swapping a language's engine,
-a live language server for a cached SCIP index or the reverse, is a provider change invisible
-above the provider contract. A custom integration contributes a plan source the way it
-contributes facts: implement the [fact provider](/docs/protocol/core#semantic-facts) contract,
-and the composition routes the language to it.
+publish gate - is the write path the server already owns, so swapping a live language server for
+a cached SCIP index or the reverse is a provider change invisible above the provider contract. A
+custom integration contributes a plan source the way it contributes facts: implement the
+[fact provider](/docs/protocol/core#semantic-facts) contract, and the composition routes the
+language to it.
 
 ## Execution
 

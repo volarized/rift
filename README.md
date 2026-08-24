@@ -38,10 +38,10 @@ installer resolves the latest release.
 
 ## MCP
 
-Run `rift mcp` from a Rust codebase. Rift exposes structured reads (`search`, `get_symbol`,
-`nodes`) and precondition-guarded changes (`replace_symbol`, `insert_symbol`, `replace_node`,
-`patch`) over stdio MCP. Later reads include edits made through Rift or another filesystem tool,
-such as a formatter.
+Run `rift mcp` from a codebase. Rift exposes structured reads (`search`, `get_symbol`, `nodes`)
+and precondition-guarded changes (`replace_symbol`, `insert_symbol`, `replace_node`, `patch`,
+`rename_symbol`, `move_file`) over stdio MCP. Later reads include edits made through Rift or
+another filesystem tool, such as a formatter.
 
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration
 uses `rift` as command and `["mcp"]` as arguments.
@@ -76,12 +76,11 @@ Rust uses the toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `
 | --- | --- |
 | `just format` | Rust formatting |
 | `just generate-check` | Generated protocol drift |
-| `just check` | All targets, features, crate edges, and binary ownership |
-| `just test` | Workspace tests |
+| `just check` | Lock freshness, crate edges, and binary ownership |
 | `just clippy` | Strict Clippy policy |
 | `just docs` | Warning-free Rust documentation |
 | `just audit` | Advisory, license, ban, and source policy |
-| `just coverage` | CLI coverage report and hard 86% line floor |
+| `just test` | Every suite, live engines included; writes coverage and holds an 86% line floor |
 | `just release-test` | Deterministic release archive contract |
 | `just installer-test` | Offline curl and irm installer contract |
 | `just rust-gate` | Every gate above |

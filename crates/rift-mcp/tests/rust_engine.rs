@@ -67,6 +67,12 @@ pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
 /// rust-analyzer answers initialize before it has loaded the project and
 /// keeps indexing afterwards, so the bounds are generous - and still
 /// bounds: a wedged engine fails the suite instead of hanging it.
+///
+/// No `[engines.rust.retry]` table: the suite runs on the shipped
+/// defaults, which is what makes it a proof. rust-analyzer announces its
+/// project load over `$/progress` and ends that announcement about 830ms
+/// in on this fixture, then cancels requests until it settles around
+/// 2.3s; the eight default attempts reach past 9.75s.
 pub(crate) fn rust_engine_configuration() -> String {
     let environment = rust_analyzer_environment()
         .into_iter()
