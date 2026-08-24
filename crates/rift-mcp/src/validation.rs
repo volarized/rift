@@ -1,6 +1,7 @@
 //! Current-index validation: filesystem observation, serialized rebuilds,
 //! and atomic publication of the workspace snapshot.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,7 +16,8 @@ use rift_index::{
     LexicalSearchIndex, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
-    HistoryConfiguration, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+    EngineConfiguration, HistoryConfiguration, SearchConfiguration, ServerConfiguration,
+    WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
 use rift_server::{
@@ -199,6 +201,15 @@ impl ConfigurationState {
         self.accepted
             .as_ref()
             .map(|configuration| configuration.search.clone())
+            .unwrap_or_default()
+    }
+
+    /// The `[engines]` tables from the last acceptance, or no engines while
+    /// `rift.toml` is invalid.
+    pub(crate) fn engines_configuration(&self) -> BTreeMap<String, EngineConfiguration> {
+        self.accepted
+            .as_ref()
+            .map(|configuration| configuration.engines.clone())
             .unwrap_or_default()
     }
 }
@@ -980,6 +991,22 @@ mod tests {
         let invalid = ConfigurationState::accept(directory.path());
         assert!(invalid.accepted.is_err());
         assert_eq!(invalid.source_visibility(), SourceVisibility::default());
+        assert!(
+            invalid.engines_configuration().is_empty(),
+            "an invalid file serves no engines"
+        );
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[engines.ty]\nprogram = \"uvx\"\nlanguages = [\"python\"]\n",
+        )?;
+        let with_engines = ConfigurationState::accept(directory.path());
+        let engines = with_engines.engines_configuration();
+        assert_eq!(
+            engines.get("ty").map(|engine| engine.program.as_str()),
+            Some("uvx"),
+            "an accepted [engines] table is served"
+        );
 
         fs::write(
             directory.path().join("rift.toml"),

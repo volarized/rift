@@ -2897,16 +2897,19 @@ name = "rift-server"
 version = "0.0.13"
 dependencies = [
  "diffy",
+ "lsp-types",
  "percent-encoding",
  "rift-core",
  "rift-history",
  "rift-index",
+ "rift-lsp",
  "rift-protocol",
  "rift-provider",
  "rift-syntax",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "toml",
  "tracing",
 ]

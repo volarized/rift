@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -14,14 +15,16 @@ use rift_protocol::change::{
     ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
-    CommandHook, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX, SERVER_NUM_WORKERS_MAX,
-    SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+    CommandHook, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX,
+    SERVER_NUM_WORKERS_MAX, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
 use rift_protocol::read::{
     GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
 };
-use rift_server::{ChangeService, HookStatus, ReadError, ReadFault, ReadService, run_hooks};
+use rift_server::{
+    ChangeService, EnginePool, HookStatus, ReadError, ReadFault, ReadService, run_hooks,
+};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
@@ -103,6 +106,66 @@ impl BlockingExecutor {
         })
         .await
         .map_err(|error| ReadFault::task(operation, error.to_string()))?
+    }
+}
+
+/// The engine pool held across requests, replaced when the accepted
+/// `[engines]` tables change.
+///
+/// Rebuilds recreate the published `ConfigurationState` but never the
+/// long-lived services, so the hold compares the published tables against
+/// the pool it keeps: unchanged tables reuse the running sessions, and
+/// changed tables swap in a fresh pool and shut the replaced one down.
+#[derive(Debug)]
+pub(crate) struct EngineHold {
+    root: PathBuf,
+    pool: AsyncMutex<Arc<EnginePool>>,
+}
+
+impl EngineHold {
+    /// Builds the hold with a pool for the startup `[engines]` tables.
+    pub(crate) fn new(root: PathBuf, engines: BTreeMap<String, EngineConfiguration>) -> Self {
+        let pool = Arc::new(EnginePool::new(&root, engines));
+        Self {
+            root,
+            pool: AsyncMutex::new(pool),
+        }
+    }
+
+    /// The pool serving `engines`: the held pool while its tables are
+    /// unchanged, or a replacement built for the new tables.
+    ///
+    /// A replaced pool's sessions are shut down after the hold's lock is
+    /// released, so concurrent callers proceed against the replacement
+    /// while the old engines end; a request still holding the replaced
+    /// pool finishes its exchange first, because shutdown takes each slot's
+    /// own lock.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future after the swap skips the replaced pool's
+    /// graceful shutdown; its children are then killed through the
+    /// session's kill-on-drop arming once the last holder drops the pool.
+    pub(crate) async fn pool_for(
+        &self,
+        engines: BTreeMap<String, EngineConfiguration>,
+    ) -> Arc<EnginePool> {
+        let mut held = self.pool.lock().await;
+        if held.built_from(&engines) {
+            return Arc::clone(&held);
+        }
+        let rebuilt = Arc::new(EnginePool::new(&self.root, engines));
+        let replaced = std::mem::replace(&mut *held, Arc::clone(&rebuilt));
+        drop(held);
+        replaced.shutdown().await;
+        rebuilt
+    }
+
+    /// Ends the held pool's running engines; the pool stays usable and a
+    /// later request respawns what it needs.
+    pub(crate) async fn shutdown(&self) {
+        let held = Arc::clone(&*self.pool.lock().await);
+        held.shutdown().await;
     }
 }
 
@@ -240,6 +303,7 @@ pub struct RiftMcp {
     /// The lexical search database, absent when it could not be opened at
     /// startup; `search` then serves identifier matching alone.
     lexical: Option<Arc<LexicalSearchIndex>>,
+    engines: Arc<EngineHold>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -332,6 +396,10 @@ impl RiftMcp {
         *task = Some(supervisor_task);
         drop(task);
         let supervisor_cancellation = Arc::new(validation.cancellation.clone().drop_guard());
+        let engines = Arc::new(EngineHold::new(
+            root.clone(),
+            startup_configuration.engines_configuration(),
+        ));
         Ok(Self {
             root: root.clone(),
             limits,
@@ -342,8 +410,30 @@ impl RiftMcp {
             change_lane,
             blocking,
             lexical,
+            engines,
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// The engine pool serving the currently published `[engines]` tables.
+    ///
+    /// The hold outlives rebuilds: a publication whose engine tables are
+    /// unchanged reuses the running sessions, and one whose tables differ
+    /// replaces the pool and shuts the old engines down.
+    pub async fn engine_pool(&self) -> Arc<EnginePool> {
+        let engines = self
+            .published
+            .read()
+            .await
+            .current
+            .configuration
+            .engines_configuration();
+        self.engines.pool_for(engines).await
+    }
+
+    /// Returns the shared engine hold for transport shutdown paths.
+    pub(crate) fn engine_hold(&self) -> Arc<EngineHold> {
+        Arc::clone(&self.engines)
     }
 
     /// Returns owned supervisor shutdown access for transport adapters.
@@ -950,6 +1040,67 @@ mod tests {
                 Err("fixture configuration must remain stable".into())
             }
         }
+    }
+
+    /// One `[engines]` table set naming `program`, built through serde so
+    /// the optional keys carry their documented defaults.
+    fn engine_tables(
+        program: &str,
+    ) -> std::collections::BTreeMap<String, rift_protocol::configuration::EngineConfiguration> {
+        serde_json::from_value(json!({
+            "ty": { "program": program, "languages": ["python"] }
+        }))
+        .expect("the engine table fixture deserializes")
+    }
+
+    #[tokio::test]
+    async fn engine_hold_reuses_and_replaces_pools_by_table_equality() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let hold = super::EngineHold::new(directory.path().to_path_buf(), engine_tables("uvx"));
+        let first = hold.pool_for(engine_tables("uvx")).await;
+        let second = hold.pool_for(engine_tables("uvx")).await;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged tables reuse the held pool"
+        );
+        let replaced = hold.pool_for(engine_tables("pyright")).await;
+        assert!(
+            !Arc::ptr_eq(&first, &replaced),
+            "changed tables replace the pool"
+        );
+        assert!(replaced.built_from(&engine_tables("pyright")));
+        hold.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn engine_pool_serves_the_published_engine_tables() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[engines.ty]\nprogram = \"uvx\"\nlanguages = [\"python\"]\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let pool = server.engine_pool().await;
+        let language = |name: &str| rift_protocol::read::Language {
+            name: name.to_owned(),
+            dialect: None,
+        };
+        assert!(
+            pool.engine_for(&language("python")).is_some(),
+            "the accepted table serves its language"
+        );
+        assert!(
+            pool.engine_for(&language("rust")).is_none(),
+            "an unclaimed language answers no engine"
+        );
+        let again = server.engine_pool().await;
+        assert!(
+            Arc::ptr_eq(&pool, &again),
+            "unchanged published tables reuse the held pool"
+        );
+        Ok(())
     }
 
     #[tokio::test]
