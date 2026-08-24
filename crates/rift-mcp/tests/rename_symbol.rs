@@ -1,0 +1,565 @@
+//! Integration tests: `rename_symbol` against the scripted fake engine.
+//!
+//! Every test wires rift-lsp's `fake_engine` binary into the workspace's
+//! own `rift.toml` through an overlaid `PATH`, exactly as an operator's
+//! `[engines.<name>]` table would resolve a real engine, and drives the
+//! tool through a live rmcp client.
+
+#![cfg(unix)]
+
+use std::error::Error;
+use std::fs;
+use std::path::PathBuf;
+
+use rift_index::WorkspaceIndexLimits;
+use rift_mcp::RiftMcp;
+use rmcp::ServiceExt as _;
+use rmcp::model::CallToolRequestParams;
+use serde_json::{Value, json};
+
+type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+/// The directory holding the compiled `fake_engine` binary.
+///
+/// This test binary runs from `target/<profile>/deps`, and Cargo places
+/// another crate's binary one level up. Running the suite with `rift-lsp`
+/// in the invocation - the workspace suite does - builds the binary before
+/// any test runs.
+fn fake_engine_directory() -> PathBuf {
+    let mut directory = std::env::current_exe().expect("the test binary has a path");
+    directory.pop();
+    if directory.ends_with("deps") {
+        directory.pop();
+    }
+    assert!(
+        directory.join("fake_engine").exists(),
+        "fake_engine is missing from {}: build it first with `cargo test -p rift-lsp`",
+        directory.display(),
+    );
+    directory
+}
+
+/// One `[engines.fake]` table resolving `fake_engine` through an overlaid
+/// `PATH`, claiming `rust`.
+fn engine_configuration(behavior: &str, request_timeout: &str) -> String {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let path_overlay = format!("{}:{inherited}", fake_engine_directory().display());
+    format!(
+        "[engines.fake]\nprogram = \"fake_engine\"\narguments = [\"{behavior}\"]\n\
+         languages = [\"rust\"]\nrequest_timeout = \"{request_timeout}\"\n\n\
+         [engines.fake.environment]\nPATH = \"{path_overlay}\"\n"
+    )
+}
+
+/// Builds one workspace of `files`, optionally with an engine table, and
+/// serves it to one client.
+async fn served_workspace(
+    files: &[(&str, &str)],
+    engine: Option<String>,
+) -> TestResult<(
+    tempfile::TempDir,
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let directory = tempfile::tempdir()?;
+    for (name, source) in files {
+        fs::write(directory.path().join(name), source)?;
+    }
+    if let Some(configuration) = engine {
+        fs::write(directory.path().join("rift.toml"), configuration)?;
+    }
+    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        let service = server
+            .serve(server_transport)
+            .await
+            .expect("server must initialize");
+        service.waiting().await.expect("server must stop cleanly");
+    });
+    let client = ().serve(client_transport).await?;
+    Ok((directory, client, server_task))
+}
+
+fn rename_request(symbol: &str, new_name: &str) -> CallToolRequestParams {
+    let arguments = json!({ "symbol": symbol, "new_name": new_name })
+        .as_object()
+        .cloned()
+        .expect("rename arguments are an object");
+    CallToolRequestParams::new("rename_symbol").with_arguments(arguments)
+}
+
+/// Most attempts one request retries before giving up on acceptance.
+const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
+
+/// Calls the tool, retrying the refusal the server advertises as
+/// `retry: same_request`: a change the engine itself wrote to the tree can
+/// move the index between one request's snapshot and its acceptance.
+async fn call_retrying_acceptance(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    params: CallToolRequestParams,
+) -> TestResult<Value> {
+    for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
+        match client.call_tool(params.clone()).await {
+            Ok(result) => {
+                return result
+                    .structured_content
+                    .ok_or_else(|| "rename_symbol must return structured content".into());
+            }
+            Err(rmcp::ServiceError::McpError(error))
+                if error
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("the server kept refusing a retryable rename request".into())
+}
+
+/// The library and the file referencing it, both served by the engine.
+const LIBRARY: &str = "pub fn beacon() {}\n";
+const CALLER: &str = "pub fn caller() { beacon(); }\n";
+const BEACON_SYMBOL: &str = "rift://symbol/rust/lib.rs/beacon";
+
+fn survivor_findings(structured: &Value) -> Vec<&Value> {
+    structured["summary"]["diagnostics"]
+        .as_array()
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|finding| finding["code"] == json!("rift.rename.survivor"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn refusal_detail(structured: &Value) -> String {
+    structured["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn applied_rename_rewrites_every_referencing_file() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY), ("main.rs", CALLER)],
+        Some(engine_configuration("renames-word", "20s")),
+    )
+    .await?;
+
+    let tools = client.list_all_tools().await?;
+    let rename_tool = tools
+        .iter()
+        .find(|tool| tool.name == "rename_symbol")
+        .ok_or("rename_symbol must be advertised")?;
+    let output_schema = rename_tool
+        .output_schema
+        .as_ref()
+        .map(|schema| Value::Object(schema.as_ref().clone()))
+        .ok_or("rename_symbol must advertise an output schema")?;
+    let validator = jsonschema::validator_for(&output_schema)?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    let failures: Vec<String> = validator
+        .iter_errors(&structured)
+        .map(|failure| failure.to_string())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "the live result must validate against the advertised schema: {failures:#?}"
+    );
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert_eq!(
+        structured["summary"]["paths"],
+        json!(["lib.rs", "main.rs"]),
+        "both files carry the rename"
+    );
+    assert_eq!(
+        structured["summary"]["edits"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        2,
+        "one whole-file edit per rewritten file"
+    );
+    assert!(
+        survivor_findings(&structured).is_empty(),
+        "a full rename must sweep clean: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        "pub fn flare() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("main.rs"))?,
+        "pub fn caller() { flare(); }\n"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn applied_rename_reports_the_surviving_occurrence() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[
+            ("lib.rs", LIBRARY),
+            ("main.rs", CALLER),
+            ("notes.md", "# beacon\nThe beacon stays documented here.\n"),
+        ],
+        Some(engine_configuration("renames-word", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let survivors = survivor_findings(&structured);
+    assert!(
+        !survivors.is_empty(),
+        "the markdown mention must surface as a survivor: {structured:#}"
+    );
+    for survivor in survivors {
+        assert_eq!(survivor["severity"], json!("warning"));
+        assert!(
+            survivor["span"]["unit"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("notes.md"),
+            "the survivor names its file: {survivor:#}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(directory.path().join("notes.md"))?,
+        "# beacon\nThe beacon stays documented here.\n",
+        "the sweep reports and never rewrites"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unserved_language_refuses_unsupported() -> TestResult {
+    let (_directory, client, server_task) = served_workspace(&[("lib.rs", LIBRARY)], None).await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unsupported"));
+    assert!(
+        refusal_detail(&structured).contains("no engine configured for language rust"),
+        "the refusal names the unserved language: {structured:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_without_the_rename_capability_refuses_unsupported() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("no-rename-capability", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unsupported"));
+    assert!(
+        refusal_detail(&structured).contains("does not advertise"),
+        "the refusal names the missing capability: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn declined_prepare_refuses_with_the_engine_verdict() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("declines-prepare", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unmet_precondition"));
+    assert!(
+        refusal_detail(&structured).contains("serves no rename at this declaration"),
+        "the refusal carries the prepare verdict: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn out_of_tree_proposal_refuses_and_leaves_the_tree() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("renames-outside-root", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unsupported"));
+    assert!(
+        refusal_detail(&structured).contains("outside the workspace tree"),
+        "the refusal names the escape: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_timeout_is_a_typed_error_and_the_tree_is_untouched() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("parks-on-rename", "1s")),
+    )
+    .await?;
+
+    let error = client
+        .call_tool(rename_request(BEACON_SYMBOL, "flare"))
+        .await
+        .expect_err("a parked engine must time out as a typed error");
+    let rmcp::ServiceError::McpError(error) = error else {
+        return Err(format!("expected a tool error, got {error:?}").into());
+    };
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str);
+    assert_eq!(code, Some("temporarily_unavailable"), "{error:?}");
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disk_mutation_between_plan_and_apply_refuses_source_unchanged() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("mutates-then-renames", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unmet_precondition"));
+    assert_eq!(
+        structured["preconditions"][0]["kind"],
+        json!("source_unchanged"),
+        "{structured:#}"
+    );
+    let on_disk = fs::read_to_string(directory.path().join("lib.rs"))?;
+    assert!(
+        on_disk.contains("the engine drifted this file"),
+        "the engine's own write stays: {on_disk}"
+    );
+    assert!(
+        !on_disk.contains("flare"),
+        "Rift must not write over the drifted bytes: {on_disk}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_refused_rename_carries_the_engine_words() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("refuses-rename", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "1nvalid")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unmet_precondition"));
+    let detail = refusal_detail(&structured);
+    assert!(
+        detail.contains("declined the rename") && detail.contains("not an identifier"),
+        "the refusal keeps the engine's words: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_refused_prepare_carries_the_engine_words() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("refuses-prepare", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unmet_precondition"));
+    assert!(
+        refusal_detail(&structured).contains("cannot rename here"),
+        "the refusal keeps the engine's words: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_proposal_that_changes_nothing_refuses() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("renames-word", "20s")),
+    )
+    .await?;
+
+    // Renaming `beacon` to `beacon` proposes edits that leave every byte
+    // as it was, so the compiled plan holds no rewrites.
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "beacon")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unmet_precondition"));
+    assert!(
+        refusal_detail(&structured).contains("proposed no edits"),
+        "the refusal names the empty proposal: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_symbol_refuses_before_the_engine_is_asked() -> TestResult {
+    let (_directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("renames-word", "20s")),
+    )
+    .await?;
+
+    let structured = call_retrying_acceptance(
+        &client,
+        rename_request("rift://symbol/rust/lib.rs/vanished", "flare"),
+    )
+    .await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unmet_precondition"));
+    assert_eq!(
+        structured["preconditions"][0]["kind"],
+        json!("target_exists"),
+        "{structured:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_new_name_is_a_typed_invalid_request() -> TestResult {
+    let (_directory, client, server_task) = served_workspace(&[("lib.rs", LIBRARY)], None).await?;
+
+    let error = client
+        .call_tool(rename_request(BEACON_SYMBOL, ""))
+        .await
+        .expect_err("the schema-advertised length is enforced at acceptance");
+    let rmcp::ServiceError::McpError(error) = error else {
+        return Err(format!("expected a tool error, got {error:?}").into());
+    };
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str);
+    assert_eq!(code, Some("invalid_request"), "{error:?}");
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn prepare_timeout_is_a_typed_error_and_the_tree_is_untouched() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("parks-on-prepare", "1s")),
+    )
+    .await?;
+
+    let error = client
+        .call_tool(rename_request(BEACON_SYMBOL, "flare"))
+        .await
+        .expect_err("a parked prepare must time out as a typed error");
+    let rmcp::ServiceError::McpError(error) = error else {
+        return Err(format!("expected a tool error, got {error:?}").into());
+    };
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str);
+    assert_eq!(code, Some("temporarily_unavailable"), "{error:?}");
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}

@@ -113,11 +113,15 @@ async fn rename_through(
         .expect("the language is served");
     let target = document();
     let renamed = new_name.to_owned();
-    slot.request(async move |session: &mut EngineSession| {
-        session
-            .rename(&target, start_position(), &renamed)
-            .await
-            .map(|_edit| ())
+    slot.request(move |session: &mut EngineSession| {
+        let target = target.clone();
+        let renamed = renamed.clone();
+        Box::pin(async move {
+            session
+                .rename(&target, start_position(), &renamed)
+                .await
+                .map(|_edit| ())
+        })
     })
     .await
 }
@@ -201,11 +205,14 @@ async fn refusal_leaves_the_engine_serving_without_a_respawn() {
         .engine_for(&language("rust"))
         .expect("the language is served");
     let target = document();
-    slot.request(async move |session: &mut EngineSession| {
-        session
-            .prepare_rename(&target, start_position())
-            .await
-            .map(|_verdict| ())
+    slot.request(move |session: &mut EngineSession| {
+        let target = target.clone();
+        Box::pin(async move {
+            session
+                .prepare_rename(&target, start_position())
+                .await
+                .map(|_verdict| ())
+        })
     })
     .await
     .expect("the refusal left the engine serving");
