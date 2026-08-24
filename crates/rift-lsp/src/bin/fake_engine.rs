@@ -35,12 +35,13 @@ const PROGRESS_TOKEN: &str = "fake/analysis";
 /// Each mints [`PROGRESS_TOKEN`] through `window/workDoneProgress/create`
 /// and begins it, exactly as a language server loading a project does.
 /// `reports-progress` ends the token before it answers a rename,
-/// `analyzes-then-serves` before the second rename it is asked for,
-/// `analyzes-then-reports` before the second diagnostic pull, and
-/// `never-ends-progress` never ends it at all.
+/// `analyzes-then-serves` and `refuses-while-analyzing` before the second
+/// rename each is asked for, `analyzes-then-reports` before the second
+/// diagnostic pull, and `never-ends-progress` never ends it at all.
 const PROGRESS_BEHAVIORS: &[&str] = &[
     "reports-progress",
     "analyzes-then-serves",
+    "refuses-while-analyzing",
     "analyzes-then-reports",
     "never-ends-progress",
 ];
@@ -458,6 +459,15 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state
         }
         "server-requests" => demand_client_answers(input),
         "refuses-rename" => {
+            refuse_rename(&message["id"], -32602, "new name is not an identifier");
+            return;
+        }
+        "refuses-while-analyzing" => {
+            // A verdict answered mid-analysis is not a verdict: the engine
+            // reaches its real one only once its work has ended.
+            if recorded_lifecycle("rename") > 1 {
+                end_progress();
+            }
             refuse_rename(&message["id"], -32602, "new name is not an identifier");
             return;
         }
