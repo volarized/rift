@@ -32,5 +32,9 @@ name = "live_rust_analyzer"
 path = "tests/live_rust_analyzer.rs"
 
 [[test]]
+name = "live_typescript"
+path = "tests/live_typescript.rs"
+
+[[test]]
 name = "session"
 path = "tests/session.rs"

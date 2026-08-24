@@ -33,14 +33,16 @@
 #![cfg(unix)]
 
 mod live_engine_gate;
+mod rust_engine;
 mod workspace_client;
 
 use std::fs;
 use std::time::{Duration, Instant};
 
-use live_engine_gate::{engine_live, require_rust_analyzer, rust_engine_configuration};
+use live_engine_gate::engine_live;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
+use rust_engine::{require_rust_analyzer, rust_engine_configuration};
 use serde_json::{Value, json};
 use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
