@@ -12,7 +12,7 @@ mod workspace_client;
 
 use std::fs;
 
-use fake_engine::engine_configuration;
+use fake_engine::{counted, engine_configuration, recorded};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
 use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
@@ -22,6 +22,15 @@ fn rename_request(symbol: &str, new_name: &str) -> CallToolRequestParams {
         "rename_symbol",
         &json!({ "symbol": symbol, "new_name": new_name }),
     )
+}
+
+/// One tool call expected to fail, returning its wire error payload.
+fn wire_error(error: rmcp::ServiceError) -> TestResult<Value> {
+    let rmcp::ServiceError::McpError(data) = error else {
+        return Err(format!("expected a tool error, got {error:?}").into());
+    };
+    data.data
+        .ok_or_else(|| "wire error data must be present".into())
 }
 
 /// The library and the file referencing it, both served by the engine.
@@ -259,15 +268,8 @@ async fn engine_timeout_is_a_typed_error_and_the_tree_is_untouched() -> TestResu
         .call_tool(rename_request(BEACON_SYMBOL, "flare"))
         .await
         .expect_err("a parked engine must time out as a typed error");
-    let rmcp::ServiceError::McpError(error) = error else {
-        return Err(format!("expected a tool error, got {error:?}").into());
-    };
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str);
-    assert_eq!(code, Some("temporarily_unavailable"), "{error:?}");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
     assert_eq!(
         fs::read_to_string(directory.path().join("lib.rs"))?,
         LIBRARY
@@ -425,15 +427,8 @@ async fn empty_new_name_is_a_typed_invalid_request() -> TestResult {
         .call_tool(rename_request(BEACON_SYMBOL, ""))
         .await
         .expect_err("the schema-advertised length is enforced at acceptance");
-    let rmcp::ServiceError::McpError(error) = error else {
-        return Err(format!("expected a tool error, got {error:?}").into());
-    };
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str);
-    assert_eq!(code, Some("invalid_request"), "{error:?}");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
 
     client.cancel().await?;
     server_task.await?;
@@ -452,18 +447,192 @@ async fn prepare_timeout_is_a_typed_error_and_the_tree_is_untouched() -> TestRes
         .call_tool(rename_request(BEACON_SYMBOL, "flare"))
         .await
         .expect_err("a parked prepare must time out as a typed error");
-    let rmcp::ServiceError::McpError(error) = error else {
-        return Err(format!("expected a tool error, got {error:?}").into());
-    };
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str);
-    assert_eq!(code, Some("temporarily_unavailable"), "{error:?}");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
     assert_eq!(
         fs::read_to_string(directory.path().join("lib.rs"))?,
         LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The attempt bound the absorption tests state for themselves, small
+/// enough to count off the lifecycle log.
+const ABSORPTION_ATTEMPTS: u64 = 3;
+
+/// A refusal the engine invites again never reaches the caller: the server
+/// resends the whole conversation and the rename lands.
+#[tokio::test]
+async fn a_cancelled_rename_is_resent_and_applies() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY), ("main.rs", CALLER)],
+        Some(counted(
+            &engine_configuration("cancels-first-rename", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert_eq!(
+        recorded(&log, "rename"),
+        2,
+        "the cancelled rename was resent once: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        "pub fn flare() {}\n"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A refusal that is the engine's verdict on the request surfaces at once,
+/// with the tree untouched and the engine asked exactly once.
+#[tokio::test]
+async fn a_verdict_refusal_surfaces_without_a_resend() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(counted(
+            &engine_configuration("refuses-rename", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "1nvalid")).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(
+        recorded(&log, "rename"),
+        1,
+        "a verdict is never sent a second time: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// An engine that answers while it is still analyzing is asked again, and
+/// the settled answer is the one the caller sees.
+#[tokio::test]
+async fn a_rename_answered_mid_analysis_waits_for_the_settled_answer() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY), ("main.rs", CALLER)],
+        Some(counted(
+            &engine_configuration("analyzes-then-serves", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert_eq!(
+        recorded(&log, "rename"),
+        2,
+        "the provisional answer was discarded and the rename asked again"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("main.rs"))?,
+        "pub fn caller() { flare(); }\n",
+        "the settled proposal spans the referencing file"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// An engine that never stops analyzing spends the whole attempt bound,
+/// and only then does the plan surface a failure the caller can resend.
+/// The tree is untouched: nothing was applied on a provisional answer.
+#[tokio::test]
+async fn a_rename_that_never_settles_surfaces_after_the_whole_budget() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(counted(
+            &engine_configuration("never-ends-progress", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let error = client
+        .call_tool(rename_request(BEACON_SYMBOL, "flare"))
+        .await
+        .expect_err("an engine that never settles must surface a typed error");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
+    assert_eq!(wire["retry"], json!("same_request"), "{wire:#}");
+    assert_eq!(
+        recorded(&log, "rename"),
+        usize::try_from(ABSORPTION_ATTEMPTS)?,
+        "the engine was asked for the whole budget before the caller heard"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        LIBRARY,
+        "a plan that never settled writes nothing"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// An engine that dies mid-plan is replaced inside its restart budget and
+/// the plan runs on the replacement, so the caller sees the rename.
+#[tokio::test]
+async fn an_engine_that_dies_mid_plan_is_replaced_before_the_caller_sees_it() -> TestResult {
+    let logs = tempfile::tempdir()?;
+    let log = logs.path().join("lifecycle.log");
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY), ("main.rs", CALLER)],
+        Some(counted(
+            &engine_configuration("dies-once-on-rename", "20s"),
+            &log,
+            ABSORPTION_ATTEMPTS,
+        )),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert_eq!(
+        recorded(&log, "initialize"),
+        2,
+        "the dead engine was replaced once: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        "pub fn flare() {}\n"
     );
 
     client.cancel().await?;

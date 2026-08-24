@@ -270,7 +270,7 @@
             "delay": "250ms",
             "delay_limit": "2s"
           },
-          "description": "How a refusal this engine invites again is resent: the attempt\nbound and the growing wait between attempts."
+          "description": "How often Rift sends this engine the same request again while its\nanswer stays unsettled - a refusal the engine invites again, or an\nanswer it gave while still analyzing - and how the waits between\nthose attempts grow."
         },
         "startup_timeout": {
           "$ref": "#/$defs/Duration",
@@ -538,7 +538,7 @@
     },
     "RetryPolicy": {
       "additionalProperties": false,
-      "description": "How often one failed operation is attempted again, and how the waits\nbetween attempts grow.\n\nAttempts are numbered from one and the first is counted, so\n`attempts = 1` never resends. Each wait is twice the one before it,\nheld at `delay_limit`; a `delay_limit` below `delay` therefore holds\nevery wait at `delay_limit`.\n\nThe waits carry no jitter. Jitter spreads a set of independent retriers\napart so they stop arriving together; requests to one language engine\nserialize on that engine's own slot, so there is never such a set, and\nthe sequence stays a function of the attempt number alone.",
+      "description": "How often one unsettled operation is attempted again, and how the\nwaits between attempts grow.\n\nAttempts are numbered from one and the first is counted, so\n`attempts = 1` never resends. Each wait is twice the one before it,\nheld at `delay_limit`; a `delay_limit` below `delay` therefore holds\nevery wait at `delay_limit`.\n\nThe waits carry no jitter. Jitter spreads a set of independent retriers\napart so they stop arriving together; requests to one language engine\nserialize on that engine's own slot, so there is never such a set, and\nthe sequence stays a function of the attempt number alone.",
       "properties": {
         "attempts": {
           "default": 8,
