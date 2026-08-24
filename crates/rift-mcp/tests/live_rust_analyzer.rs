@@ -18,21 +18,20 @@
 
 #![cfg(unix)]
 
-#[path = "support/live.rs"]
-mod live;
+mod live_engine_gate;
 #[path = "support/live_rust.rs"]
 mod live_rust;
-mod support;
+mod workspace_client;
 
 use std::fs;
 use std::time::{Duration, Instant};
 
-use live::engine_live;
+use live_engine_gate::engine_live;
 use live_rust::{require_rust_analyzer, rust_engine_configuration};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
-use support::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
+use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
 /// The cargo project: a manifest, a crate root, the `hub` module holding
 /// the declaration, and the `caller` module importing and calling it. The

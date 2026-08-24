@@ -16,15 +16,14 @@
 
 #![cfg(unix)]
 
-#[path = "support/live.rs"]
-mod live;
+mod live_engine_gate;
 #[path = "support/live_typescript.rs"]
 mod live_typescript;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use live::engine_live;
+use live_engine_gate::engine_live;
 use live_typescript::{
     BUNX_PROGRAM, LANGUAGE_SERVER_PACKAGE, install_typescript_engine, typescript_package_files,
 };
