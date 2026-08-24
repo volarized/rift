@@ -28,7 +28,7 @@ jobs:
           bun-version: latest
 
       # DO NOT DELETE as redundant with setup-bun. setup-bun caches only the
-      # downloaded *bun executable* (`no-cache` input, `cache-hit` output —
+      # downloaded *bun executable* (`no-cache` input, `cache-hit` output -
       # both scoped to the binary). It has no `cache:` /
       # `cache-dependency-path` input like actions/setup-node. Dependency
       # caching is entirely on us; without this step `bun install` refetches
@@ -60,13 +60,13 @@ jobs:
       - run: bun install --frozen-lockfile
 
       # `biome ci` = format + lint + assists (import sorting), non-mutating.
-      # Baseline is RED today (25 errors / 12 warnings) — see plan step 0.
+      # Baseline is RED today (25 errors / 12 warnings) - see plan step 0.
       - run: bunx biome ci .
 
       # `LayoutProps`/`PageProps` are globals Next generates into .next/types.
       # Without this, `tsc` on a cold checkout fails with TS2304 "Cannot find
-      # name 'LayoutProps'". Caching does not help — we cache .next/cache, not
-      # .next/types — and it passes locally only off a stale .next from an
+      # name 'LayoutProps'". Caching does not help - we cache .next/cache, not
+      # .next/types - and it passes locally only off a stale .next from an
       # earlier build. `typegen` emits them without paying for a full build.
       - run: bunx next typegen
 
@@ -80,7 +80,7 @@ jobs:
       # Baseline is clean as of the dependency upgrade PR; `--audit-level=high`
       # keeps moderates visible in the log without failing the build.
       # image-size (build-time transitive of fumadocs-core) has two open DoS
-      # advisories with no patched release — 2.0.2 is the newest version. The
+      # advisories with no patched release - 2.0.2 is the newest version. The
       # parsers never see untrusted bytes here: the build sizes this repo's own
       # images. Drop the ignores once fumadocs picks up a fixed image-size.
       - run: bun audit --audit-level=high --ignore=GHSA-w3rx-r6r6-pgpr --ignore=GHSA-5p2g-fcmc-qvqq
@@ -105,15 +105,17 @@ jobs:
         with:
           tool: just,cargo-audit,cargo-deny,cargo-llvm-cov
 
-      # Keep every local just target visible as its own CI check step.
+      # Each local gate target is its own CI step. There is no separate
+      # coverage step: `just test` is the one instrumented run, and its
+      # lcov output is the artifact uploaded below.
       - run: just format
+      - run: just dashes
       - run: just generate-check
       - run: just check
-      - run: just test
       - run: just clippy
       - run: just docs
       - run: just audit
-      - run: just coverage
+      - run: just test
       - run: just release-test
       - run: just installer-test
 
