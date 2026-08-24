@@ -408,10 +408,13 @@ impl ReadService {
         let limit = accepted_limit(params.limit)?;
         // The whole ranked match set is collected up to the index's own `results_max`
         // bound, so `pagination.total_pages` counts the full result set the pages divide.
-        let matches = self
+        let mut matches = self
             .index
             .symbols(&params.name, self.index.results_max())
             .map_err(ReadFault::index)?;
+        if let Some(language) = &params.language {
+            matches.retain(|matched| language_selects(language, matched.file.syntax().language()));
+        }
         let (window, pagination) = page(matches, params.page_index, limit);
         let mut timelines = if params.include_history {
             Some(self.symbol_timelines()?)
@@ -633,6 +636,14 @@ pub(crate) fn language_provider(language: &Language) -> &'static dyn SyntaxProvi
             language.identity_segment()
         )
     })
+}
+
+/// A caller's `language` filter selects a document language when the names
+/// match and, where the filter states a dialect, the dialects match too. A
+/// filter without a dialect selects every dialect of its name.
+fn language_selects(filter: &Language, candidate: &Language) -> bool {
+    filter.name == candidate.name
+        && (filter.dialect.is_none() || filter.dialect == candidate.dialect)
 }
 
 pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
@@ -1423,6 +1434,208 @@ pub fn compute() -> i32 {
             impl_node.get("symbol").is_none(),
             "impl_item is not itself a declared symbol, so the member stays off the wire"
         );
+        Ok(())
+    }
+
+    /// One workspace holding all four shipped source languages.
+    fn multi_language_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("src/routes.ts"),
+            "export interface Route {\n  path: string;\n}\n",
+        )?;
+        fs::write(
+            directory.path().join("src/App.tsx"),
+            "export function App() {\n  return <main>beacon</main>;\n}\n",
+        )?;
+        fs::write(
+            directory.path().join("src/banner.js"),
+            "export function banner() { return 1; }\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        Ok((directory, service))
+    }
+
+    #[test]
+    fn get_symbol_finds_a_typescript_interface_beside_other_languages() -> TestResult {
+        let (_directory, service) = multi_language_fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Route"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let symbol = &value["hits"][0]["symbol"];
+        assert_eq!(symbol["language"], json!({ "name": "typescript" }));
+        assert_eq!(symbol["kind"], json!("typescript.interface"));
+        assert_eq!(symbol["facets"], json!(["type", "public"]));
+        assert_eq!(
+            symbol["id"],
+            json!("rift://symbol/typescript/src/routes.ts/Route")
+        );
+        assert_eq!(
+            value["hits"][0]["source"]["text"],
+            "interface Route {\n  path: string;\n}"
+        );
+        Ok(())
+    }
+
+    /// One name declared in two languages; the `language` filter narrows the
+    /// hits and the pagination counts the filtered set.
+    #[test]
+    fn get_symbol_language_filter_narrows_the_hits() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("src/beacon.ts"),
+            "export function beacon() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let unfiltered: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+        assert_eq!(service.get_symbol(&unfiltered)?.hits.len(), 2);
+        let filtered: GetSymbolParams =
+            serde_json::from_value(json!({"name": "beacon", "language": {"name": "rust"}}))?;
+        let result = service.get_symbol(&filtered)?;
+        let value = serde_json::to_value(&result)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(
+            value["hits"][0]["symbol"]["language"],
+            json!({"name": "rust"})
+        );
+        assert_eq!(
+            value["pagination"],
+            json!({"page_index": 0, "total_pages": 1})
+        );
+        let dialect_filtered: GetSymbolParams = serde_json::from_value(json!({
+            "name": "beacon",
+            "language": {"name": "typescript", "dialect": "tsx"}
+        }))?;
+        assert!(
+            service.get_symbol(&dialect_filtered)?.hits.is_empty(),
+            "a dialect-stated filter must not select the dialect-free typescript document"
+        );
+        Ok(())
+    }
+
+    /// A filter without a dialect selects every dialect of its name.
+    #[test]
+    fn get_symbol_language_filter_without_a_dialect_selects_every_dialect() -> TestResult {
+        let (_directory, service) = multi_language_fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({
+            "name": "App",
+            "language": {"name": "typescript"}
+        }))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        assert_eq!(
+            value["hits"][0]["symbol"]["language"],
+            json!({"name": "typescript", "dialect": "tsx"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_serve_a_tsx_file_under_the_typescript_wire_kinds() -> TestResult {
+        let (directory, service) = multi_language_fixture()?;
+        let source = fs::read_to_string(directory.path().join("src/App.tsx"))?;
+        let position = source.find("<main>").ok_or("fixture must contain JSX")? as u64;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/App.tsx".to_owned()),
+            position,
+            projection: None,
+            rev: None,
+        })?;
+        let value = serde_json::to_value(result)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        assert!(!nodes.is_empty());
+        assert!(
+            nodes.iter().all(|node| {
+                node["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("typescript."))
+            }),
+            "every wire kind composes from the language name: {nodes:#?}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node["kind"] == "typescript.jsx_element"),
+            "position sits inside the JSX element: {nodes:#?}"
+        );
+        let jsx = nodes
+            .iter()
+            .find(|node| node["kind"] == "typescript.jsx_element")
+            .ok_or("fixture must witness the jsx_element node")?;
+        assert_eq!(
+            jsx["language"],
+            json!({ "name": "typescript", "dialect": "tsx" })
+        );
+        assert_eq!(jsx["facets"], json!(["expression"]));
+        assert!(
+            jsx["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("rift://node/typescript:tsx/")),
+            "a tsx node address files under the dialect segment: {:?}",
+            jsx["id"]
+        );
+        Ok(())
+    }
+
+    /// One TypeScript declaration introduced and then body-edited across two
+    /// commits; the timeline classifies both through the typescript provider.
+    #[test]
+    fn typescript_symbol_history_lists_the_committed_timeline() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(
+            directory.path().join("src/routes.ts"),
+            "export function lookup(route: string): string {\n  return route;\n}\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "introduce lookup");
+        fs::write(
+            directory.path().join("src/routes.ts"),
+            "export function lookup(route: string): string {\n  return route + \"/v2\";\n}\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "grow lookup body");
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "lookup", "include_history": true}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let history = &value["hits"][0]["history"];
+        assert_eq!(
+            history["symbol"],
+            json!("rift://symbol/typescript/src/routes.ts/lookup")
+        );
+        let versions = history["versions"]
+            .as_array()
+            .ok_or("history must carry versions")?;
+        let kinds: Vec<&str> = versions
+            .iter()
+            .filter_map(|version| version["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["body_changed", "introduced"]);
+        let summaries: Vec<&str> = versions
+            .iter()
+            .filter_map(|version| version["summary"].as_str())
+            .collect();
+        assert_eq!(summaries, ["grow lookup body", "introduce lookup"]);
         Ok(())
     }
 

@@ -708,6 +708,40 @@ pub fn compute() -> i32 {
         Ok((directory, service))
     }
 
+    /// Symbol hits from a TypeScript file carry the `typescript` language
+    /// and its composed wire kind.
+    #[test]
+    fn search_symbol_hits_carry_the_typescript_language() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("routes.ts"),
+            "export interface Route {\n  path: string;\n}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "Route",
+            "target": "symbol",
+            "limit": 5
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert!(!results.is_empty());
+        let symbol = &results[0]["hit"]["symbol"];
+        assert_eq!(symbol["language"], json!({ "name": "typescript" }));
+        assert_eq!(symbol["kind"], json!("typescript.interface"));
+        assert_eq!(
+            symbol["id"],
+            json!("rift://symbol/typescript/routes.ts/Route")
+        );
+        Ok(())
+    }
+
     #[test]
     fn search_combines_symbol_and_source_matches_with_limit() -> TestResult {
         let (_directory, service) = fixture()?;

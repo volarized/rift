@@ -858,7 +858,9 @@ mod tests {
         ReplaceSymbolParams,
     };
     use rift_protocol::configuration::HistoryConfiguration;
-    use rift_protocol::read::{FileId, Language, NodeId, NodesParams, ProjectPath, SymbolId};
+    use rift_protocol::read::{
+        FileId, GetSymbolParams, Language, NodeId, NodesParams, ProjectPath, SymbolId,
+    };
     use rift_syntax::ByteRange;
 
     use super::ChangeService;
@@ -920,6 +922,49 @@ mod tests {
         );
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(written, "pub fn beacon() -> u8 {\n    7\n}\n");
+        Ok(())
+    }
+
+    /// A `typescript:tsx` symbol id minted by `get_symbol` round-trips
+    /// through address parsing into an applied replacement, and the reparse
+    /// runs through the tsx dialect.
+    #[test]
+    fn tsx_symbol_address_round_trips_from_minted_id_to_replacement() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("App.tsx"),
+            "export function App() {\n  return <main>beacon</main>;\n}\n",
+        )?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let params: GetSymbolParams = serde_json::from_value(serde_json::json!({"name": "App"}))?;
+        let hits = reads.get_symbol(&params)?.hits;
+        let minted = hits[0].symbol.id.clone();
+        assert_eq!(minted.0, "rift://symbol/typescript:tsx/App.tsx/App");
+        let result = changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: minted,
+                region: None,
+                body: "function App() {\n  return <main>rift</main>;\n}".to_owned(),
+            },
+        )?;
+        let summary = applied_summary(result);
+        assert!(
+            summary.diagnostics.is_empty(),
+            "the tsx dialect reparses the replacement cleanly"
+        );
+        let written = fs::read_to_string(directory.path().join("App.tsx"))?;
+        assert_eq!(
+            written,
+            "export function App() {\n  return <main>rift</main>;\n}\n"
+        );
         Ok(())
     }
 
