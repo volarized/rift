@@ -189,7 +189,8 @@ impl RestartBudget {
 #[derive(Debug)]
 enum Transient {
     /// The engine answered while it still had work-done progress
-    /// outstanding, so the answer it gave is provisional.
+    /// outstanding, so what it answered - a result or a refusal - is
+    /// provisional.
     Analyzing,
     /// The engine refused with a code that invites the same request again.
     Refused(EngineError),
@@ -228,17 +229,21 @@ impl EngineSlot {
     ///
     /// - The engine answered while it was still analyzing. That answer is
     ///   provisional, so it is discarded and the operation is sent again
-    ///   after the `[engines.<name>.retry]` wait.
+    ///   after the `[engines.<name>.retry]` wait. A refusal it answered
+    ///   mid-analysis is provisional for the same reason: rust-analyzer
+    ///   refuses a rename with `No references found at position` for a
+    ///   declaration it has not indexed yet, which is not its verdict on
+    ///   the request.
     /// - The engine refused with a code that invites the same request
     ///   again ([`EngineFault::is_retryable_refusal`]). Same treatment.
     /// - The session found or left the engine dead. A replacement starts
     ///   while the `[engines.<name>.restart]` budget allows, and the
     ///   operation runs on it.
     ///
-    /// Every other failure - a refusal that is the engine's verdict on the
-    /// request, an absent capability - returns at once, because sending it
-    /// again changes nothing. So does a settled answer: an engine that
-    /// reports no progress at all never pays a retry wait.
+    /// Every other failure - a verdict the settled engine reached, an
+    /// absent capability, a broken exchange - returns at once, because
+    /// sending it again changes nothing. So does a settled answer: an
+    /// engine that reports no progress at all never pays a retry wait.
     ///
     /// Both tables bound the loop. Each pass either returns, spends one of
     /// `retry.attempts`, or claims one of `restart.attempts` inside its
@@ -291,6 +296,7 @@ impl EngineSlot {
                     reported = Some(error);
                     continue;
                 }
+                Err(error) if analyzing && error.fault().is_refusal() => Transient::Analyzing,
                 Err(error) if error.fault().is_retryable_refusal() => Transient::Refused(error),
                 Err(error) => return Err(error),
             };

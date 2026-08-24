@@ -702,3 +702,33 @@ async fn an_engine_that_dies_mid_request_is_replaced_before_the_caller_sees_it()
     assert_eq!(recorded(&log, "rename"), 2);
     pool.shutdown().await;
 }
+
+/// A refusal the engine answered while it was still analyzing is not its
+/// verdict on the request: rust-analyzer refuses a rename with `No
+/// references found at position` for a declaration it has not indexed yet.
+/// The slot sends the operation again, and the verdict the settled engine
+/// reaches is the one that surfaces.
+#[tokio::test]
+async fn a_refusal_answered_mid_analysis_is_absorbed_until_the_engine_settles() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(
+        engine_table("refuses-while-analyzing", &["rust"], &log),
+        ABSORPTION_ATTEMPTS,
+    );
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    let error = rename_through(&pool, "rust", "1nvalid")
+        .await
+        .expect_err("the settled engine still refuses the name");
+    assert!(
+        matches!(error.fault(), EngineFault::Refused { code: -32602, .. }),
+        "the settled engine's own verdict surfaces: {:?}",
+        error.fault()
+    );
+    assert_eq!(
+        recorded(&log, "rename"),
+        2,
+        "the refusal answered mid-analysis was asked again"
+    );
+    pool.shutdown().await;
+}
