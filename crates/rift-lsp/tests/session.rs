@@ -679,3 +679,80 @@ async fn progress_that_never_ends_keeps_the_engine_analyzing() {
     }
     session.shutdown().await;
 }
+
+/// An engine that has announced no work of its own answers a will-rename
+/// with an edit set holding no edit - the answer of an engine that has
+/// nothing to update, and of one that has not indexed the file yet.
+///
+/// The session claims one resend for it, and exactly one: the second
+/// answer to the same operation is the engine's own, however empty. An
+/// answer that proposed something claims nothing at all.
+#[tokio::test]
+async fn an_empty_proposal_from_an_unannounced_engine_claims_one_resend() {
+    let (_workspace, mut session) = started("happy").await;
+    let document = path("src/lib.rs");
+    assert!(
+        session.has_never_announced_work(),
+        "this engine announces no work at all"
+    );
+
+    let proposal = session
+        .will_rename_files(&document, &path("src/moved.rs"))
+        .await
+        .expect("willRenameFiles answers");
+    assert!(
+        proposal.is_some(),
+        "the answer is an edit set, not a null: {proposal:#?}"
+    );
+    assert!(
+        session.claim_empty_answer_resend(),
+        "an edit set holding no edit is worth asking again once"
+    );
+
+    session
+        .will_rename_files(&document, &path("src/moved.rs"))
+        .await
+        .expect("willRenameFiles answers again");
+    assert!(
+        !session.claim_empty_answer_resend(),
+        "the operation's one resend per session is spent"
+    );
+
+    session
+        .open(&document, "rust", "fn a() {}\n".to_owned())
+        .await
+        .expect("didOpen is sent");
+    let pulled = session
+        .pull_diagnostics(&document)
+        .await
+        .expect("the pull answers");
+    assert_eq!(pulled.len(), 1, "this engine reports one finding");
+    assert!(
+        !session.claim_empty_answer_resend(),
+        "an answer that said something is never asked again"
+    );
+    session.shutdown().await;
+}
+
+/// An engine that has announced work keeps its empty answers: it has
+/// shown it reports what it is doing, so nothing it says while it reports
+/// nothing outstanding needs asking again.
+#[tokio::test]
+async fn an_announced_engine_keeps_its_empty_answer() {
+    let (_workspace, mut session) = started("never-ends-progress").await;
+    let document = path("src/lib.rs");
+    let pulled = session
+        .pull_diagnostics(&document)
+        .await
+        .expect("the loading engine answers its pull");
+    assert!(pulled.is_empty(), "a loading engine reports nothing yet");
+    assert!(
+        !session.has_never_announced_work(),
+        "the begin the pull consumed is the engine announcing its work"
+    );
+    assert!(
+        !session.claim_empty_answer_resend(),
+        "an announced engine's empty answer is its own"
+    );
+    session.shutdown().await;
+}

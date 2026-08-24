@@ -4,10 +4,11 @@
 //! stdout only while a call runs, answers server-initiated requests inline,
 //! and retains published diagnostics in a bounded record. It also reads the
 //! engine's `$/progress` traffic, so the holder can ask whether the engine
-//! was still analyzing when it answered. Every wait is bounded by a
-//! timeout, and an engine that overstays one is killed and reaped - a child
-//! is never left unobserved. The child starts from the environment the
-//! server inherited, with the launch's `environment` entries laid on top.
+//! was still analyzing when it answered, and whether it has ever announced
+//! any work at all. Every wait is bounded by a timeout, and an engine that
+//! overstays one is killed and reaped - a child is never left unobserved.
+//! The child starts from the environment the server inherited, with the
+//! launch's `environment` entries laid on top.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -24,12 +25,12 @@ use lsp_types::request::{
 };
 use lsp_types::{
     ConfigurationParams, Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult, FileRename,
-    InitializeParams, InitializedParams, PartialResultParams, Position, PrepareRenameResponse,
-    ProgressParams, ProgressParamsValue, ProgressToken, PublishDiagnosticsParams,
-    RenameFilesParams, RenameParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
-    WorkspaceFolder,
+    DocumentChangeOperation, DocumentChanges, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentDiagnosticReportResult, FileRename, InitializeParams, InitializedParams,
+    PartialResultParams, Position, PrepareRenameResponse, ProgressParams, ProgressParamsValue,
+    ProgressToken, PublishDiagnosticsParams, RenameFilesParams, RenameParams,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, WorkDoneProgress,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
 };
 use rift_core::{
     CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath,
@@ -64,6 +65,15 @@ const CONFIGURATION_ITEMS_MAX: usize = 256;
 /// the bound is dropped: the record is already non-empty, and the session
 /// already reads as analyzing.
 const PROGRESS_TOKENS_MAX: usize = 64;
+
+/// Resends one operation whose empty answer says nothing gets per
+/// session.
+///
+/// The resend closes the one window the engine cannot report: the first
+/// request of a session, answered before the engine has announced any
+/// work. One resend closes it; a second would wait on an engine that may
+/// simply have nothing to say.
+const EMPTY_ANSWER_RESENDS_MAX: u32 = 1;
 
 /// The refusal codes that name a transient condition, not a bad request.
 ///
@@ -307,6 +317,106 @@ impl Fault for EngineFault {
 /// A failed engine session or operation.
 pub type EngineError = Error<EngineFault>;
 
+/// What the engine has said about its own work over `$/progress`.
+///
+/// Two facts ride here, and the second outlives the first: which tokens
+/// are outstanding right now, and whether the engine has ever announced
+/// any work at all. An engine that began one token and ended it has
+/// announced work with nothing outstanding.
+#[derive(Debug, Default)]
+struct WorkProgress {
+    announced: bool,
+    outstanding: Vec<ProgressToken>,
+}
+
+impl WorkProgress {
+    /// Records one token as outstanding, bounded.
+    ///
+    /// A token already outstanding stays as it is, and a new token past
+    /// [`PROGRESS_TOKENS_MAX`] is dropped: the record is already
+    /// non-empty, so the session reads as analyzing either way, and an
+    /// end for the dropped token retires nothing. The announcement holds
+    /// whatever the bound does with the token.
+    fn began(&mut self, token: ProgressToken) {
+        self.announced = true;
+        if self.outstanding.len() >= PROGRESS_TOKENS_MAX || self.outstanding.contains(&token) {
+            return;
+        }
+        self.outstanding.push(token);
+    }
+
+    /// Retires one token the engine ended.
+    fn ended(&mut self, token: &ProgressToken) {
+        self.outstanding.retain(|held| held != token);
+    }
+
+    /// Whether any announced work is still outstanding.
+    fn is_outstanding(&self) -> bool {
+        !self.outstanding.is_empty()
+    }
+
+    /// Whether the engine has ever announced work.
+    fn is_announced(&self) -> bool {
+        self.announced
+    }
+}
+
+/// One request whose empty answer says nothing a real answer would not.
+///
+/// An engine that has not indexed the tree yet answers
+/// `workspace/willRenameFiles` with no edit and `textDocument/diagnostic`
+/// with no item - the same answers a settled engine gives for a move that
+/// needs no import rewritten and for a file that is clean.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum EmptyAnswer {
+    /// `workspace/willRenameFiles` proposed no edit.
+    WillRenameFiles,
+    /// `textDocument/diagnostic` reported no item.
+    Diagnostics,
+}
+
+/// What the session's most recent answer said, and the resends already
+/// spent on each operation.
+///
+/// Every request clears `latest` before it is sent, so a verdict cannot
+/// outlive the answer that set it, and only the two operations above ever
+/// set one. `resends` holds one counter per variant, so it is bounded by
+/// the enum, and each operation is sent again at most
+/// [`EMPTY_ANSWER_RESENDS_MAX`] times per session.
+#[derive(Debug, Default)]
+struct EmptyAnswers {
+    latest: Option<EmptyAnswer>,
+    resends: BTreeMap<EmptyAnswer, u32>,
+}
+
+impl EmptyAnswers {
+    /// Forgets the previous answer's verdict; every request starts here.
+    fn forget(&mut self) {
+        self.latest = None;
+    }
+
+    /// Records whether one answer to `operation` said nothing.
+    fn record(&mut self, operation: EmptyAnswer, empty: bool) {
+        self.latest = empty.then_some(operation);
+    }
+
+    /// Claims one resend for the answer just given.
+    ///
+    /// Answers `false` when that answer said something, or when this
+    /// operation's resend is already spent.
+    fn claim(&mut self) -> bool {
+        let Some(operation) = self.latest else {
+            return false;
+        };
+        let spent = self.resends.entry(operation).or_default();
+        if *spent >= EMPTY_ANSWER_RESENDS_MAX {
+            return false;
+        }
+        *spent += 1;
+        true
+    }
+}
+
 /// One running engine child and the conversation state around it.
 #[derive(Debug)]
 pub struct EngineSession {
@@ -321,7 +431,8 @@ pub struct EngineSession {
     root: TreeRoot,
     request_timeout: Duration,
     published: BTreeMap<ProjectPath, Vec<Diagnostic>>,
-    progress: Vec<ProgressToken>,
+    progress: WorkProgress,
+    empty_answers: EmptyAnswers,
     document_version: i32,
     ended: bool,
 }
@@ -379,7 +490,8 @@ impl EngineSession {
             root,
             request_timeout: launch.request_timeout,
             published: BTreeMap::new(),
-            progress: Vec::new(),
+            progress: WorkProgress::default(),
+            empty_answers: EmptyAnswers::default(),
             document_version: 0,
             ended: false,
         };
@@ -419,7 +531,40 @@ impl EngineSession {
     /// never reads as analyzing, and its answers are final at once.
     #[must_use]
     pub fn is_analyzing(&self) -> bool {
-        !self.progress.is_empty()
+        self.progress.is_outstanding()
+    }
+
+    /// Whether the engine has never announced any work of its own.
+    ///
+    /// [`EngineSession::is_analyzing`] answers what the engine is doing
+    /// now; this answers whether it has ever said what it is doing. Until
+    /// one `$/progress` begin has arrived, nothing distinguishes an engine
+    /// that has finished its work from one that has not started
+    /// announcing it, so an empty answer given in that window is not
+    /// evidence that there was nothing to answer.
+    #[must_use]
+    pub fn has_never_announced_work(&self) -> bool {
+        !self.progress.is_announced()
+    }
+
+    /// Claims one resend for an answer that said nothing where something
+    /// was expected.
+    ///
+    /// Answers `true` only when the engine has never announced work, the
+    /// request just served answered nothing
+    /// (`workspace/willRenameFiles` with no edit,
+    /// `textDocument/diagnostic` with no item), and this session has not
+    /// already sent that operation again. Each operation claims at most
+    /// `EMPTY_ANSWER_RESENDS_MAX` resends per session, so the holder
+    /// cannot loop on an engine that has nothing to say. Once the engine
+    /// has announced work even once, its empty answers are its own and
+    /// this claim is refused.
+    #[must_use]
+    pub fn claim_empty_answer_resend(&mut self) -> bool {
+        if self.progress.is_announced() {
+            return false;
+        }
+        self.empty_answers.claim()
     }
 
     /// Opens one document with the text the caller hands in.
@@ -552,7 +697,12 @@ impl EngineSession {
                 new_uri: self.document_uri(to)?.as_str().to_owned(),
             }],
         };
-        self.request::<WillRenameFiles>(params).await
+        let edit = self.request::<WillRenameFiles>(params).await?;
+        self.empty_answers.record(
+            EmptyAnswer::WillRenameFiles,
+            proposes_no_edit(edit.as_ref()),
+        );
+        Ok(edit)
     }
 
     /// Pulls the engine's current diagnostics for one document.
@@ -595,6 +745,8 @@ impl EngineSession {
             _ => Vec::new(),
         };
         items.truncate(DOCUMENT_DIAGNOSTICS_MAX);
+        self.empty_answers
+            .record(EmptyAnswer::Diagnostics, items.is_empty());
         Ok(items)
     }
 
@@ -674,13 +826,16 @@ impl EngineSession {
 
     /// Sends one request under an explicit timeout.
     ///
-    /// A timeout or a broken exchange ends the session.
+    /// A timeout or a broken exchange ends the session. The previous
+    /// answer's emptiness verdict is forgotten here, so the one the
+    /// holder reads always belongs to the request it just made.
     async fn request_within<R: Request>(
         &mut self,
         params: R::Params,
         timeout: Duration,
     ) -> Result<R::Result, EngineError> {
         self.refuse_ended()?;
+        self.empty_answers.forget();
         let id = self
             .correlation
             .begin(R::METHOD)
@@ -869,9 +1024,9 @@ impl EngineSession {
         let ProgressParamsValue::WorkDone(work) = progress.value;
         match work {
             WorkDoneProgress::Begin(_) | WorkDoneProgress::Report(_) => {
-                retain_progress(&mut self.progress, progress.token);
+                self.progress.began(progress.token);
             }
-            WorkDoneProgress::End(_) => self.progress.retain(|held| held != &progress.token),
+            WorkDoneProgress::End(_) => self.progress.ended(&progress.token),
         }
     }
 
@@ -935,17 +1090,37 @@ fn retain_published(
     record.insert(path, diagnostics);
 }
 
-/// Records one work-done progress token as outstanding, bounded.
+/// Whether one will-rename answer proposes no edit at all.
 ///
-/// A token already outstanding stays as it is, and a new token past
-/// [`PROGRESS_TOKENS_MAX`] is dropped: the record is already non-empty,
-/// so the session reads as analyzing either way, and an end for the
-/// dropped token retires nothing.
-fn retain_progress(record: &mut Vec<ProgressToken>, token: ProgressToken) {
-    if record.len() >= PROGRESS_TOKENS_MAX || record.contains(&token) {
-        return;
+/// An engine that has not indexed the moved file's references answers
+/// `null`, and one that answers an edit set holding no edit says exactly
+/// the same thing. Versioned document changes take precedence over the
+/// plain `changes` map, as the compile of the proposal does, and a
+/// create, rename, or delete operation counts as an edit even though it
+/// carries no text.
+#[must_use]
+pub fn proposes_no_edit(edit: Option<&WorkspaceEdit>) -> bool {
+    let Some(edit) = edit else {
+        return true;
+    };
+    match (&edit.document_changes, &edit.changes) {
+        (Some(DocumentChanges::Edits(documents)), _) => {
+            documents.iter().all(|document| document.edits.is_empty())
+        }
+        (Some(DocumentChanges::Operations(operations)), _) => {
+            operations.iter().all(operation_edits_nothing)
+        }
+        (None, Some(changes)) => changes.values().all(Vec::is_empty),
+        (None, None) => true,
     }
-    record.push(token);
+}
+
+/// Whether one mixed document-change operation changes nothing.
+fn operation_edits_nothing(operation: &DocumentChangeOperation) -> bool {
+    match operation {
+        DocumentChangeOperation::Op(_) => false,
+        DocumentChangeOperation::Edit(document) => document.edits.is_empty(),
+    }
 }
 
 /// Refuses the operation when the engine was advertised without it.
@@ -1345,25 +1520,142 @@ mod tests {
     #[test]
     fn progress_record_retires_ended_tokens_and_stays_bounded() {
         let token = |index: usize| ProgressToken::String(format!("rift/work/{index}"));
-        let mut record = Vec::new();
-        retain_progress(&mut record, token(0));
-        retain_progress(&mut record, token(0));
+        let mut record = WorkProgress::default();
+        assert!(
+            !record.is_announced() && !record.is_outstanding(),
+            "a session that has read no progress has heard no announcement"
+        );
+        record.began(token(0));
+        record.began(token(0));
         assert_eq!(
-            record.len(),
+            record.outstanding.len(),
             1,
             "a token already outstanding is not doubled"
         );
-        record.retain(|held| held != &token(0));
-        assert!(record.is_empty(), "an ended token retires");
+        record.ended(&token(0));
+        assert!(!record.is_outstanding(), "an ended token retires");
+        assert!(
+            record.is_announced(),
+            "the announcement outlives the work it announced"
+        );
         for index in 0..PROGRESS_TOKENS_MAX {
-            retain_progress(&mut record, token(index));
+            record.began(token(index));
         }
-        retain_progress(&mut record, token(PROGRESS_TOKENS_MAX));
+        record.began(token(PROGRESS_TOKENS_MAX));
         assert_eq!(
-            record.len(),
+            record.outstanding.len(),
             PROGRESS_TOKENS_MAX,
             "a token past the bound is dropped"
         );
+    }
+
+    #[test]
+    fn empty_answers_claim_one_resend_per_operation_and_forget_between_requests() {
+        let mut record = EmptyAnswers::default();
+        assert!(
+            !record.claim(),
+            "a session that answered nothing yet claims nothing"
+        );
+        record.record(EmptyAnswer::WillRenameFiles, true);
+        assert!(record.claim(), "the first empty answer claims its resend");
+        record.record(EmptyAnswer::WillRenameFiles, true);
+        assert!(
+            !record.claim(),
+            "the operation's one resend per session is spent"
+        );
+        record.record(EmptyAnswer::Diagnostics, true);
+        assert!(record.claim(), "each operation carries its own resend");
+        record.record(EmptyAnswer::Diagnostics, false);
+        assert!(
+            !record.claim(),
+            "an answer that said something claims nothing"
+        );
+        record.record(EmptyAnswer::WillRenameFiles, true);
+        record.forget();
+        assert!(
+            !record.claim(),
+            "a request forgets the verdict the previous answer left"
+        );
+    }
+
+    /// One will-rename answer per proposal shape, and whether it proposes
+    /// an edit: `null`, both empty carriers, and each carrier holding one.
+    fn will_rename_answers() -> Vec<(Option<WorkspaceEdit>, bool, &'static str)> {
+        use lsp_types::{
+            CreateFile, OneOf, OptionalVersionedTextDocumentIdentifier, ResourceOp,
+            TextDocumentEdit, TextEdit,
+        };
+        let uri: lsp_types::Uri = "file:///workspace/lib.rs".parse().expect("fixture uri");
+        let created: lsp_types::Uri = "file:///workspace/new.rs".parse().expect("fixture uri");
+        let edit = TextEdit {
+            range: lsp_types::Range::default(),
+            new_text: "renamed".to_owned(),
+        };
+        let document =
+            |edits: Vec<OneOf<TextEdit, lsp_types::AnnotatedTextEdit>>| TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: None,
+                },
+                edits,
+            };
+        let changed = |edits: Vec<TextEdit>| WorkspaceEdit {
+            changes: Some([(uri.clone(), edits)].into_iter().collect()),
+            ..WorkspaceEdit::default()
+        };
+        let versioned = |changes: DocumentChanges| WorkspaceEdit {
+            document_changes: Some(changes),
+            ..WorkspaceEdit::default()
+        };
+        vec![
+            (None, true, "a null answer proposes nothing"),
+            (Some(WorkspaceEdit::default()), true, "no carrier at all"),
+            (Some(changed(Vec::new())), true, "a document with no edit"),
+            (
+                Some(versioned(DocumentChanges::Edits(vec![
+                    document(Vec::new()),
+                ]))),
+                true,
+                "a versioned document with no edit",
+            ),
+            (
+                Some(versioned(DocumentChanges::Operations(vec![
+                    DocumentChangeOperation::Edit(document(Vec::new())),
+                ]))),
+                true,
+                "a mixed operation list with no edit",
+            ),
+            (
+                Some(changed(vec![edit.clone()])),
+                false,
+                "one edit in the changes map",
+            ),
+            (
+                Some(versioned(DocumentChanges::Edits(vec![document(vec![
+                    OneOf::Left(edit),
+                ])]))),
+                false,
+                "one versioned edit",
+            ),
+            (
+                Some(versioned(DocumentChanges::Operations(vec![
+                    DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                        uri: created,
+                        options: None,
+                        annotation_id: None,
+                    })),
+                ]))),
+                false,
+                "a file operation is an edit even with no text of its own",
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_proposal_without_an_edit_says_what_no_answer_says() {
+        for (answer, empty, evidence) in will_rename_answers() {
+            assert_eq!(proposes_no_edit(answer.as_ref()), empty, "{evidence}");
+        }
     }
 
     #[test]
