@@ -6,8 +6,8 @@
 //! variable is set the tests run and fail if the engine is unavailable -
 //! CI must never green-skip what it meant to run.
 //!
-//! Each engine's probe and launch details live in their own support module
-//! beside this one - `live_rust.rs`, `live_typescript.rs` - so a suite
+//! Each engine's probe and launch details live in their own module beside
+//! this one - `rust_engine.rs`, `typescript_engine.rs` - so a suite
 //! compiles only the engine it drives.
 
 /// The environment variable that turns the live-engine tests on.

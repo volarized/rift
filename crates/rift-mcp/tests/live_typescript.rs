@@ -18,18 +18,17 @@
 #![cfg(unix)]
 
 mod live_engine_gate;
-#[path = "support/live_typescript.rs"]
-mod live_typescript;
+mod typescript_engine;
 mod workspace_client;
 
 use std::fs;
 use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
-use live_typescript::{install_typescript_engine, typescript_engine_configuration};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
+use typescript_engine::{install_typescript_engine, typescript_engine_configuration};
 use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
 /// The manifest and lockfile `bun install --frozen-lockfile` reads.

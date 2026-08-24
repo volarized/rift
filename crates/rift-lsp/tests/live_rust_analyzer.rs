@@ -16,16 +16,15 @@
 #![cfg(unix)]
 
 mod live_engine_gate;
-#[path = "support/live_rust.rs"]
-mod live_rust;
+mod rust_engine;
 
 use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
-use live_rust::{RUST_ANALYZER_PROGRAM, require_rust_analyzer, rust_analyzer_environment};
 use lsp_types::FileOperationPatternKind;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};
+use rust_engine::{RUST_ANALYZER_PROGRAM, require_rust_analyzer, rust_analyzer_environment};
 
 /// The cargo project fixture: a manifest, a crate root, a module, and the
 /// module's cross-file reference.
