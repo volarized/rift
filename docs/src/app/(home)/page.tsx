@@ -79,9 +79,9 @@ const DIFFERENCES: {
   fit?: number;
 }[] = [
   {
-    statement: "Code facts with reported coverage.",
+    statement: "Code facts with symbol history.",
     title: "Programming language providers",
-    body: "Rift will combine syntax, semantic analysis, and history to give agents the best available context.",
+    body: "Rift combines syntax and history, and will add semantic analysis to give agents the best available context.",
     solid: "sphere",
   },
   {
@@ -95,7 +95,7 @@ const DIFFERENCES: {
   {
     statement: "Structured reads and guarded edits.",
     title: "MCP tools and resources",
-    body: "Agents will read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
+    body: "Agents read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
