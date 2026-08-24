@@ -3,8 +3,9 @@
 //! Every test resolves rift-lsp's `fake_engine` binary through an overlaid
 //! `PATH`, exactly as an operator's `[engines.<name>]` table would resolve
 //! a real engine. The fake engine's lifecycle log counts how many engine
-//! processes initialized and exited, so spawn-once, reuse, restart, and
-//! shutdown are each proven by counting, never by timing.
+//! processes initialized, how many renames each was asked for, and how
+//! many exited, so spawn-once, reuse, restart, absorption, and shutdown
+//! are each proven by counting, never by timing.
 
 #![cfg(unix)]
 
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lsp_types::Position;
-use rift_core::ProjectPath;
+use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_lsp::session::{EngineFault, EngineSession};
 use rift_protocol::configuration::{ByteSize, Duration, EngineConfiguration};
 use rift_protocol::read::Language;
@@ -79,6 +80,20 @@ fn restarting(mut table: EngineConfiguration, attempts: u64) -> EngineConfigurat
     table
 }
 
+/// The same table with its retry budget narrowed to `attempts`.
+///
+/// The waits are held at a millisecond so the suite spends no time on
+/// them; the shape of the growing wait is proven by the policy's own unit
+/// tests.
+fn retrying(mut table: EngineConfiguration, attempts: u64) -> EngineConfiguration {
+    table.retry = RetryPolicy {
+        attempts,
+        delay: Duration::from_millis(1),
+        delay_limit: Duration::from_millis(1),
+    };
+    table
+}
+
 fn pool_of(workspace: &Path, entries: Vec<(&str, EngineConfiguration)>) -> EnginePool {
     let engines = entries
         .into_iter()
@@ -114,7 +129,12 @@ fn recorded(log: &Path, event: &str) -> usize {
         .count()
 }
 
-/// One rename request through the pool for `name`, discarding the edit.
+/// One rename conversation through the pool for `name`, discarding the
+/// edit.
+///
+/// The document is opened first, as the server's own rename does, so an
+/// absorbed condition sends the whole conversation again and every
+/// scripted behavior sees the target it renames.
 async fn rename_through(
     pool: &EnginePool,
     name: &str,
@@ -126,6 +146,9 @@ async fn rename_through(
     let target = document();
     let renamed = new_name.to_owned();
     slot.request(async move |session: &mut EngineSession| {
+        session
+            .open(&target, "rust", "fn beacon() {}\n".to_owned())
+            .await?;
         session
             .rename(&target, start_position(), &renamed)
             .await
@@ -544,5 +567,138 @@ async fn concurrent_requests_on_an_empty_slot_spawn_one_engine() {
         1,
         "the racing requests must share one spawned engine"
     );
+    pool.shutdown().await;
+}
+
+/// The attempt bound the absorption tests state for themselves, small
+/// enough to count off the lifecycle log.
+const ABSORPTION_ATTEMPTS: u64 = 3;
+
+/// An answer the engine gave while it was still analyzing is provisional,
+/// so the slot asks again until the engine ends its work.
+///
+/// The scripted engine begins work-done progress at initialize and ends it
+/// before the second rename it is asked for. The lifecycle log counts both
+/// renames, and the caller sees one settled answer.
+#[tokio::test]
+async fn a_provisional_answer_is_asked_again_until_the_engine_settles() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(
+        engine_table("analyzes-then-serves", &["rust"], &log),
+        ABSORPTION_ATTEMPTS,
+    );
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    rename_through(&pool, "rust", "renamed")
+        .await
+        .expect("the settled answer comes back as the operation's own");
+    assert_eq!(
+        recorded(&log, "rename"),
+        2,
+        "the provisional answer was discarded and the operation ran again"
+    );
+    assert_eq!(recorded(&log, "initialize"), 1, "nothing was restarted");
+    pool.shutdown().await;
+}
+
+/// An engine that never ends its work spends the whole attempt bound and
+/// then says so, instead of handing the caller a provisional answer.
+#[tokio::test]
+async fn an_engine_that_never_settles_spends_the_budget_and_reports_it() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(
+        engine_table("never-ends-progress", &["rust"], &log),
+        ABSORPTION_ATTEMPTS,
+    );
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    let error = rename_through(&pool, "rust", "renamed")
+        .await
+        .expect_err("every attempt was answered mid-analysis");
+    assert!(
+        matches!(
+            error.fault(),
+            EngineFault::Analyzing { attempts } if *attempts == ABSORPTION_ATTEMPTS
+        ),
+        "unexpected fault {:?}",
+        error.fault()
+    );
+    assert_eq!(
+        error.name(),
+        ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
+        "the caller is told to send the request again"
+    );
+    assert_eq!(
+        recorded(&log, "rename"),
+        usize::try_from(ABSORPTION_ATTEMPTS).expect("the bound fits in usize"),
+        "the engine was asked exactly as often as the table allows"
+    );
+    pool.shutdown().await;
+}
+
+/// A refusal the engine invites again is absorbed: the resend answers, and
+/// the caller never learns the first attempt happened.
+#[tokio::test]
+async fn a_retryable_refusal_is_absorbed_and_the_resend_answers() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(
+        engine_table("cancels-first-rename", &["rust"], &log),
+        ABSORPTION_ATTEMPTS,
+    );
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    rename_through(&pool, "rust", "renamed")
+        .await
+        .expect("the resend answers");
+    assert_eq!(recorded(&log, "rename"), 2);
+    assert_eq!(recorded(&log, "initialize"), 1, "a refusal never restarts");
+    pool.shutdown().await;
+}
+
+/// A refusal that is the engine's verdict on the request surfaces at once:
+/// resending it would change nothing and cost the caller its latency.
+#[tokio::test]
+async fn a_verdict_refusal_surfaces_without_a_resend() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = retrying(
+        engine_table("refuses-rename", &["rust"], &log),
+        ABSORPTION_ATTEMPTS,
+    );
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    let error = rename_through(&pool, "rust", "1nvalid")
+        .await
+        .expect_err("the engine refuses the name");
+    assert!(
+        matches!(error.fault(), EngineFault::Refused { code: -32602, .. }),
+        "unexpected fault {:?}",
+        error.fault()
+    );
+    assert_eq!(
+        recorded(&log, "rename"),
+        1,
+        "a verdict is never sent a second time"
+    );
+    pool.shutdown().await;
+}
+
+/// An engine that dies mid-request is replaced inside its restart budget
+/// and the operation runs on the replacement, so the caller sees the
+/// answer and never the death.
+#[tokio::test]
+async fn an_engine_that_dies_mid_request_is_replaced_before_the_caller_sees_it() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let log = workspace.path().join("lifecycle.log");
+    let table = restarting(engine_table("dies-once-on-rename", &["rust"], &log), 1);
+    let pool = pool_of(workspace.path(), vec![("fake", table)]);
+    rename_through(&pool, "rust", "renamed")
+        .await
+        .expect("the replacement answers the same operation");
+    assert_eq!(
+        recorded(&log, "initialize"),
+        2,
+        "the dead engine was replaced once"
+    );
+    assert_eq!(recorded(&log, "rename"), 2);
     pool.shutdown().await;
 }
