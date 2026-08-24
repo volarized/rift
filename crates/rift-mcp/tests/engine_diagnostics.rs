@@ -14,6 +14,7 @@ mod support;
 use std::fs;
 
 use fake_engine::engine_configuration;
+use rift_server::ENGINE_DIAGNOSTICS_ATTEMPTS_MAX;
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
 use support::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
@@ -39,6 +40,19 @@ fn engine_findings(structured: &Value) -> Vec<&Value> {
             findings
                 .iter()
                 .filter(|finding| finding["language"]["name"] == json!("rust"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The warnings one failed engine degraded to.
+fn engine_warnings(structured: &Value) -> Vec<&Value> {
+    structured["summary"]["diagnostics"]
+        .as_array()
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|finding| finding["code"] == json!("rift.engine.failed"))
                 .collect()
         })
         .unwrap_or_default()
@@ -140,17 +154,9 @@ async fn a_dead_engine_is_not_asked_again_for_later_paths() -> TestResult {
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    let warnings = structured["summary"]["diagnostics"]
-        .as_array()
-        .map(|findings| {
-            findings
-                .iter()
-                .filter(|finding| finding["code"] == json!("rift.engine.failed"))
-                .count()
-        })
-        .unwrap_or_default();
     assert_eq!(
-        warnings, 1,
+        engine_warnings(&structured).len(),
+        1,
         "the second changed path must not raise a second warning: {structured:#}"
     );
 
@@ -174,15 +180,7 @@ async fn engine_death_after_apply_degrades_to_one_warning() -> TestResult {
         json!("applied"),
         "an engine death after apply never fails the call: {structured:#}"
     );
-    let warnings: Vec<&Value> = structured["summary"]["diagnostics"]
-        .as_array()
-        .map(|findings| {
-            findings
-                .iter()
-                .filter(|finding| finding["code"] == json!("rift.engine.failed"))
-                .collect()
-        })
-        .unwrap_or_default();
+    let warnings = engine_warnings(&structured);
     assert_eq!(warnings.len(), 1, "{structured:#}");
     assert_eq!(warnings[0]["severity"], json!("warning"));
     assert!(
@@ -196,6 +194,104 @@ async fn engine_death_after_apply_degrades_to_one_warning() -> TestResult {
         fs::read_to_string(directory.path().join("lib.rs"))?,
         "pub fn beacon() -> u8 { 7 }\n",
         "the change stays applied"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A cancelled pull is the engine asking to be asked again: the resend
+/// lands the findings, and nothing degrades. The engine stamps each pull's
+/// ordinal into its answer, so the message proves the second pull served.
+#[tokio::test]
+async fn a_cancelled_pull_is_resent_and_its_findings_ride_the_change() -> TestResult {
+    let (_directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("cancels-first-diagnostic", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, replace_request("pub fn beacon() -> u8 { 7 }")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let findings = engine_findings(&structured);
+    assert_eq!(findings.len(), 1, "{structured:#}");
+    assert_eq!(
+        findings[0]["message"],
+        json!("settled on pull 2"),
+        "the second pull is the one that answered: {structured:#}"
+    );
+    assert!(
+        engine_warnings(&structured).is_empty(),
+        "a refusal the resend recovered from never degrades: {structured:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// An engine that keeps cancelling exhausts the attempt budget and then
+/// degrades exactly as a terminal failure does: one warning, the change
+/// still applied. The last refusal's ordinal names how many pulls ran.
+#[tokio::test]
+async fn a_cancelling_engine_degrades_once_the_attempts_run_out() -> TestResult {
+    let (directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("cancels-every-diagnostic", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, replace_request("pub fn beacon() -> u8 { 7 }")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let warnings = engine_warnings(&structured);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "an exhausted budget degrades to one warning: {structured:#}"
+    );
+    let expected = format!("declined pull {ENGINE_DIAGNOSTICS_ATTEMPTS_MAX}");
+    assert!(
+        warnings[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&expected),
+        "the warning carries the last of {ENGINE_DIAGNOSTICS_ATTEMPTS_MAX} attempts: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        "pub fn beacon() -> u8 { 7 }\n",
+        "the change stays applied"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A refusal the engine did not invite again is never resent: the warning
+/// carries the first pull's ordinal, so the engine was asked exactly once.
+#[tokio::test]
+async fn a_terminal_refusal_is_never_resent() -> TestResult {
+    let (_directory, client, server_task) = served_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("refuses-diagnostic", "20s")),
+    )
+    .await?;
+
+    let structured =
+        call_retrying_acceptance(&client, replace_request("pub fn beacon() -> u8 { 7 }")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let warnings = engine_warnings(&structured);
+    assert_eq!(warnings.len(), 1, "{structured:#}");
+    assert!(
+        warnings[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("declined pull 1"),
+        "a terminal refusal is answered once and degraded: {structured:#}"
     );
 
     client.cancel().await?;
