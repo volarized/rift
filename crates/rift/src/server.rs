@@ -278,21 +278,35 @@ async fn start_detached(root: &Path) -> Result<ServerOutcome, ServerCommandError
             pid: lock.pid,
         });
     }
+    // A stale document keeps its bytes until the elected child scrubs it.
+    // Remember them so the wait below never answers with the old document
+    // read in the instant the child already holds the election.
+    let stale_bytes = std::fs::read(rift_mcp::document_path(root)).ok();
     spawn_detached_server(root)
         .map_err(|source| Error::new(ServerCommandFault::SpawnFailed { source }))?;
-    await_serving(root, START_POLL_ATTEMPT_COUNT).await
+    await_serving(root, START_POLL_ATTEMPT_COUNT, stale_bytes.as_deref()).await
 }
 
 /// Polls until the workspace serves, bounded by `attempt_count` probes.
 ///
 /// The caller passes [`START_POLL_ATTEMPT_COUNT`], which derives from
-/// [`START_WAIT_MAX`] over the poll interval.
+/// [`START_WAIT_MAX`] over the poll interval. A poll that finds the document
+/// still byte-equal to `stale_bytes` - the pre-spawn leftover - keeps
+/// waiting: the started server always publishes a fresh document (its own
+/// pid, token, and port), so the leftover can only mean the child has not
+/// published yet.
 async fn await_serving(
     root: &Path,
     attempt_count: u32,
+    stale_bytes: Option<&[u8]>,
 ) -> Result<ServerOutcome, ServerCommandError> {
     for _ in 0..attempt_count {
-        if let Some(lock) = read_serving(root) {
+        let leftover_unscrubbed = match (stale_bytes, std::fs::read(rift_mcp::document_path(root)))
+        {
+            (Some(stale), Ok(current)) => stale == current.as_slice(),
+            _ => false,
+        };
+        if !leftover_unscrubbed && let Some(lock) = read_serving(root) {
             return Ok(ServerOutcome::Listening {
                 port: lock.port,
                 pid: lock.pid,
@@ -765,9 +779,52 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_serving_times_out_against_an_empty_workspace() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let error = await_serving(directory.path(), 1)
+        let error = await_serving(directory.path(), 1, None)
             .await
             .expect_err("a workspace nobody serves must time the wait out");
+        assert!(matches!(error.fault(), ServerCommandFault::StartTimedOut));
+        Ok(())
+    }
+
+    /// The pre-spawn leftover document paired with a held election is not an
+    /// answer: the wait holds out for the fresh document the holder
+    /// publishes, and returns its facts, not the leftover's.
+    #[tokio::test(start_paused = true)]
+    async fn await_serving_holds_out_for_the_fresh_document_over_a_leftover() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        let leftover = serde_json::to_vec(&holder())?;
+        std::fs::write(rift_mcp::document_path(directory.path()), &leftover)?;
+        let fresh = ServerLock {
+            pid: 9_999,
+            ..holder()
+        };
+        let outcome = {
+            let publish = async {
+                tokio::time::sleep(PRESENCE_POLL_INTERVAL * 2).await;
+                guard.publish(&fresh).expect("the holder must publish");
+            };
+            let wait = await_serving(directory.path(), START_POLL_ATTEMPT_COUNT, Some(&leftover));
+            let (outcome, ()) = tokio::join!(wait, publish);
+            outcome?
+        };
+        assert!(
+            matches!(outcome, ServerOutcome::Listening { pid: 9_999, .. }),
+            "the wait must answer with the published document: {outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// A leftover that never scrubs keeps the wait unanswered to its bound.
+    #[tokio::test(start_paused = true)]
+    async fn await_serving_times_out_while_the_leftover_stands() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = rift_mcp::claim(directory.path())?;
+        let leftover = serde_json::to_vec(&holder())?;
+        std::fs::write(rift_mcp::document_path(directory.path()), &leftover)?;
+        let error = await_serving(directory.path(), 2, Some(&leftover))
+            .await
+            .expect_err("an unscrubbed leftover is never an answer");
         assert!(matches!(error.fault(), ServerCommandFault::StartTimedOut));
         Ok(())
     }
