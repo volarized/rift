@@ -9,12 +9,19 @@ use std::sync::OnceLock;
 
 use rift_protocol::read::Language;
 
+use crate::javascript::JavaScriptSyntaxProvider;
 use crate::provider::SyntaxProvider;
 use crate::rust::RustSyntaxProvider;
+use crate::typescript::TypeScriptDialect;
 
 /// Every provider this build ships, in registration order.
 fn build_registry() -> Vec<Box<dyn SyntaxProvider>> {
-    vec![Box::new(RustSyntaxProvider::default())]
+    vec![
+        Box::new(RustSyntaxProvider::default()),
+        Box::new(JavaScriptSyntaxProvider::default()),
+        Box::new(TypeScriptDialect::TypeScript.provider()),
+        Box::new(TypeScriptDialect::Tsx.provider()),
+    ]
 }
 
 /// The shipped providers and the facts derived from them once, at first use.
@@ -142,7 +149,39 @@ mod tests {
 
     #[test]
     fn test_source_file_extensions_union_lists_every_declared_extension() {
-        assert_eq!(source_file_extensions(), ["rs"]);
+        assert_eq!(source_file_extensions(), ["rs", "js", "jsx", "ts", "tsx"]);
+    }
+
+    #[test]
+    fn test_provider_for_extension_routes_each_ecmascript_extension_to_its_dialect() {
+        let routes = [
+            ("js", "javascript", None),
+            ("jsx", "javascript", None),
+            ("ts", "typescript", None),
+            ("tsx", "typescript", Some("tsx")),
+        ];
+        for (extension, name, dialect) in routes {
+            let provider = provider_for_extension(extension)
+                .unwrap_or_else(|| panic!("a shipped provider claims {extension}"));
+            assert_eq!(provider.language().name, name);
+            assert_eq!(provider.language().dialect.as_deref(), dialect);
+        }
+    }
+
+    #[test]
+    fn test_provider_for_language_separates_the_typescript_dialects() {
+        let tsx = Language {
+            name: "typescript".to_owned(),
+            dialect: Some("tsx".to_owned()),
+        };
+        let provider = provider_for_language(&tsx).expect("the tsx dialect is shipped");
+        assert_eq!(provider.extensions(), ["tsx"]);
+        let plain = Language {
+            name: "typescript".to_owned(),
+            dialect: None,
+        };
+        let provider = provider_for_language(&plain).expect("plain typescript is shipped");
+        assert_eq!(provider.extensions(), ["ts"]);
     }
 
     #[test]
