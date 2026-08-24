@@ -2,9 +2,11 @@
 
 mod change;
 mod configuration;
+mod diagnose;
 mod engine;
 mod history;
 mod hook;
+mod move_file;
 mod patch;
 mod read;
 mod rename;
@@ -14,8 +16,10 @@ pub use change::ChangeService;
 pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault, load_configuration,
 };
+pub use diagnose::{ENGINE_DIAGNOSTICS_PER_CHANGE_MAX, engine_change_diagnostics};
 pub use engine::{EnginePool, EngineSlot, RESPAWN_PER_REQUEST_MAX};
 pub use hook::{HookRun, HookStatus, run_hooks};
+pub use move_file::{MovePlan, MoveResolution, plan_move};
 pub use read::{ReadError, ReadFault, ReadService};
 pub use rename::{
     RENAME_FILE_BYTES_MAX, RENAME_FILE_EDITS_MAX, RENAME_FILES_MAX, RENAME_SWEEP_BYTES_MAX,

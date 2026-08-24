@@ -6,6 +6,11 @@
 //! write. After an applied rename the changed tree is swept for surviving
 //! word-boundary occurrences of the old name, and each survivor rides the
 //! summary as a warning finding.
+//!
+//! The proposal compile kernel - URI conversion, version and bound checks,
+//! bottom-up edit application - is shared: [`crate::move_file`] compiles
+//! its will-rename proposals through the same functions under its own
+//! [`ProposalContext`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -92,14 +97,35 @@ pub enum RenameResolution {
 
 /// Why one planning stage ended the request early.
 #[derive(Debug)]
-enum RenameEnd {
+pub(crate) enum PlanEnd {
     /// A typed refusal; the targeted tree is untouched.
     Refused(ChangeResult),
     /// An operating failure.
     Failed(ReadError),
 }
 
-impl From<ReadError> for RenameEnd {
+/// The operation prose opening every rename refusal detail.
+pub(crate) const RENAME_OPERATION: &str = "semantic rename";
+
+/// What the compile kernel needs to judge one engine proposal, whichever
+/// operation asked for it.
+#[derive(Debug)]
+pub(crate) struct ProposalContext<'plan> {
+    /// Operation prose opening every refusal detail, such as
+    /// [`RENAME_OPERATION`].
+    pub(crate) operation: &'static str,
+    /// Addressed subjects a failed condition names; empty for a file move,
+    /// which addresses paths alone.
+    pub(crate) addresses: Vec<PreconditionAddress>,
+    /// The document opened for the engine and the version its `didOpen`
+    /// carried. A proposal for an operation that opened nothing accepts
+    /// only version-free documents.
+    pub(crate) opened: Option<(&'plan CoreProjectPath, i32)>,
+    /// Paths whose compile base is served from held bytes instead of disk.
+    pub(crate) bases: BTreeMap<&'plan CoreProjectPath, &'plan str>,
+}
+
+impl From<ReadError> for PlanEnd {
     fn from(error: ReadError) -> Self {
         Self::Failed(error)
     }
@@ -128,19 +154,19 @@ pub async fn plan_rename(
 ) -> Result<RenameResolution, ReadError> {
     match planned_rename(reads, engines, workspace_root, params).await {
         Ok(plan) => Ok(RenameResolution::Planned(plan)),
-        Err(RenameEnd::Refused(refusal)) => Ok(RenameResolution::Refused(refusal)),
-        Err(RenameEnd::Failed(error)) => Err(error),
+        Err(PlanEnd::Refused(refusal)) => Ok(RenameResolution::Refused(refusal)),
+        Err(PlanEnd::Failed(error)) => Err(error),
     }
 }
 
 /// The planning pipeline behind [`plan_rename`], with every early end as
-/// one typed [`RenameEnd`].
+/// one typed [`PlanEnd`].
 async fn planned_rename(
     reads: &ReadService,
     engines: &EnginePool,
     workspace_root: &Path,
     params: &RenameSymbolParams,
-) -> Result<RenamePlan, RenameEnd> {
+) -> Result<RenamePlan, PlanEnd> {
     if let Some(violation) = params.new_name_violation() {
         return Err(ReadFault::invalid("new_name", violation.as_str()).into());
     }
@@ -172,10 +198,10 @@ struct RenameTarget {
 fn claimed_engine<'pool>(
     engines: &'pool EnginePool,
     address: &SymbolAddress,
-) -> Result<&'pool EngineSlot, RenameEnd> {
+) -> Result<&'pool EngineSlot, PlanEnd> {
     let language = segment_language(&address.language_segment);
     engines.engine_for(&language).ok_or_else(|| {
-        RenameEnd::Refused(unsupported_refusal(format!(
+        PlanEnd::Refused(unsupported_refusal(format!(
             "semantic rename (no engine configured for language {})",
             address.language_segment
         )))
@@ -183,7 +209,7 @@ fn claimed_engine<'pool>(
 }
 
 /// The `Language` one identity segment spells: `name` or `name:dialect`.
-fn segment_language(segment: &str) -> Language {
+pub(crate) fn segment_language(segment: &str) -> Language {
     match segment.split_once(':') {
         Some((name, dialect)) => Language {
             name: name.to_owned(),
@@ -198,15 +224,12 @@ fn segment_language(segment: &str) -> Language {
 
 /// Resolves the address to its single declaration, keeping the shared
 /// refusal shapes for a missing or ambiguous target.
-fn resolved_target(
-    reads: &ReadService,
-    address: &SymbolAddress,
-) -> Result<RenameTarget, RenameEnd> {
+fn resolved_target(reads: &ReadService, address: &SymbolAddress) -> Result<RenameTarget, PlanEnd> {
     match resolve_symbol(reads, address)? {
         SymbolResolution::Refused {
             reason,
             preconditions,
-        } => Err(RenameEnd::Refused(ChangeResult::refused(
+        } => Err(PlanEnd::Refused(ChangeResult::refused(
             reason,
             preconditions,
         ))),
@@ -245,21 +268,21 @@ async fn verified_disk_target(
     workspace_root: &Path,
     address: &SymbolAddress,
     target: &RenameTarget,
-) -> Result<(), RenameEnd> {
+) -> Result<(), PlanEnd> {
     let absolute = workspace_root.join(target.path.as_str());
     let disk = tokio::fs::read_to_string(&absolute)
         .await
-        .map_err(|error| {
-            RenameEnd::from(ReadFault::storage(target.path.as_str(), "read", &error))
-        })?;
+        .map_err(|error| PlanEnd::from(ReadFault::storage(target.path.as_str(), "read", &error)))?;
     if disk == target.indexed_source {
         return Ok(());
     }
-    Err(RenameEnd::Refused(ChangeResult::refused(
+    Err(PlanEnd::Refused(ChangeResult::refused(
         RefusalReason::UnmetPrecondition,
         vec![failed_precondition(
             OperationPreconditionKind::SourceUnchanged,
-            address,
+            &[PreconditionAddress::Symbol {
+                symbol: address.wire_symbol(),
+            }],
             &target.path,
             PreconditionValue::Text {
                 value: digest_hex8(&target.indexed_source),
@@ -292,11 +315,11 @@ impl NamePositions {
 /// Converts the name offset into both offered encodings. The offset came
 /// from the same source bytes, so a conversion failure is an internal
 /// fault, never a caller mistake.
-fn name_positions(source: &str, name_offset: usize) -> Result<NamePositions, RenameEnd> {
+fn name_positions(source: &str, name_offset: usize) -> Result<NamePositions, PlanEnd> {
     let index = LineIndex::new(source);
     let converted = |encoding| {
         index.position(encoding, name_offset).map_err(|error| {
-            RenameEnd::Failed(ReadFault::task(
+            PlanEnd::Failed(ReadFault::task(
                 "rename position conversion",
                 error.to_string(),
             ))
@@ -332,7 +355,7 @@ async fn engine_exchange(
     target: &RenameTarget,
     positions: &NamePositions,
     new_name: &str,
-) -> Result<EngineAnswer, RenameEnd> {
+) -> Result<EngineAnswer, PlanEnd> {
     // The boxed future may only borrow the session, so each attempt gets
     // its own owned copy of the request data.
     let request_target = target.clone();
@@ -351,12 +374,12 @@ async fn engine_exchange(
         Ok(answer) => Ok(answer),
         Err(error) => {
             if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
-                return Err(RenameEnd::Refused(unsupported_refusal(format!(
+                return Err(PlanEnd::Refused(unsupported_refusal(format!(
                     "semantic rename (engine {} does not advertise textDocument/rename)",
                     slot.name()
                 ))));
             }
-            Err(RenameEnd::Failed(ReadFault::engine(error)))
+            Err(PlanEnd::Failed(ReadFault::engine(error)))
         }
     }
 }
@@ -439,7 +462,7 @@ async fn prepare_declined(
 fn proposed_edit(
     answer: EngineAnswer,
     address: &SymbolAddress,
-) -> Result<(WorkspaceEdit, PositionEncoding, i32), RenameEnd> {
+) -> Result<(WorkspaceEdit, PositionEncoding, i32), PlanEnd> {
     match answer {
         EngineAnswer::Proposed {
             edit,
@@ -447,7 +470,7 @@ fn proposed_edit(
             version,
         } => Ok((edit, encoding, version)),
         EngineAnswer::Declined { detail } => {
-            Err(RenameEnd::Refused(declined_refusal(address, detail)))
+            Err(PlanEnd::Refused(declined_refusal(address, detail)))
         }
     }
 }
@@ -465,27 +488,20 @@ async fn compiled_plan(
     version: i32,
     address: &SymbolAddress,
     target: &RenameTarget,
-) -> Result<RenamePlan, RenameEnd> {
-    let tree_root = TreeRoot::new(workspace_root).map_err(|error| {
-        RenameEnd::Failed(ReadFault::task("rename root conversion", error.to_string()))
-    })?;
-    let documents = proposal_documents(edit, &tree_root, (&target.path, version))?;
-    let mut rewrites = Vec::with_capacity(documents.len());
-    for (path, edits) in documents {
-        let base = document_base(workspace_root, address, target, &path).await?;
-        refused_oversized(&path, base.len())?;
-        let next = rewritten_source(address, &path, &base, &edits, encoding)?;
-        refused_oversized(&path, next.len())?;
-        if next != base {
-            rewrites.push(PlannedRewrite {
-                path,
-                base_source: base,
-                next_source: next,
-            });
-        }
-    }
+) -> Result<RenamePlan, PlanEnd> {
+    let tree_root = workspace_tree_root(workspace_root)?;
+    let context = ProposalContext {
+        operation: RENAME_OPERATION,
+        addresses: vec![PreconditionAddress::Symbol {
+            symbol: address.wire_symbol(),
+        }],
+        opened: Some((&target.path, version)),
+        bases: BTreeMap::from([(&target.path, target.indexed_source.as_str())]),
+    };
+    let documents = proposal_documents(edit, &tree_root, &context)?;
+    let rewrites = compiled_rewrites(workspace_root, documents, encoding, &context).await?;
     if rewrites.is_empty() {
-        return Err(RenameEnd::Refused(declined_refusal(
+        return Err(PlanEnd::Refused(declined_refusal(
             address,
             "the engine proposed no edits".to_owned(),
         )));
@@ -497,29 +513,64 @@ async fn compiled_plan(
     })
 }
 
+/// The workspace root as a tree root for proposal URI conversion.
+pub(crate) fn workspace_tree_root(workspace_root: &Path) -> Result<TreeRoot, PlanEnd> {
+    TreeRoot::new(workspace_root).map_err(|error| {
+        PlanEnd::Failed(ReadFault::task(
+            "proposal root conversion",
+            error.to_string(),
+        ))
+    })
+}
+
+/// Compiles per-file text edits into whole-file rewrites, dropping a file
+/// whose edits change nothing.
+pub(crate) async fn compiled_rewrites(
+    workspace_root: &Path,
+    documents: Vec<(CoreProjectPath, Vec<TextEdit>)>,
+    encoding: PositionEncoding,
+    context: &ProposalContext<'_>,
+) -> Result<Vec<PlannedRewrite>, PlanEnd> {
+    let mut rewrites = Vec::with_capacity(documents.len());
+    for (path, edits) in documents {
+        let base = document_base(workspace_root, context, &path).await?;
+        refused_oversized(&path, base.len(), context.operation)?;
+        let next = rewritten_source(context, &path, &base, &edits, encoding)?;
+        refused_oversized(&path, next.len(), context.operation)?;
+        if next != base {
+            rewrites.push(PlannedRewrite {
+                path,
+                base_source: base,
+                next_source: next,
+            });
+        }
+    }
+    Ok(rewrites)
+}
+
 /// The per-file text edits one proposal carries, in path order.
 ///
 /// `documentChanges` is preferred over `changes` when both are present, as
 /// the protocol specifies. A resource operation, an edit outside the tree
 /// root, a version other than the opened document's, or a proposal past
 /// the file and edit bounds refuses.
-fn proposal_documents(
+pub(crate) fn proposal_documents(
     edit: &WorkspaceEdit,
     tree_root: &TreeRoot,
-    opened: (&CoreProjectPath, i32),
-) -> Result<Vec<(CoreProjectPath, Vec<TextEdit>)>, RenameEnd> {
+    context: &ProposalContext<'_>,
+) -> Result<Vec<(CoreProjectPath, Vec<TextEdit>)>, PlanEnd> {
     let mut documents: BTreeMap<CoreProjectPath, Vec<TextEdit>> = BTreeMap::new();
     match (&edit.document_changes, &edit.changes) {
         (Some(DocumentChanges::Edits(edits)), _) => {
-            collect_document_edits(&mut documents, tree_root, opened, edits)?;
+            collect_document_edits(&mut documents, tree_root, context, edits)?;
         }
         (Some(DocumentChanges::Operations(operations)), _) => {
-            collect_operations(&mut documents, tree_root, opened, operations)?;
+            collect_operations(&mut documents, tree_root, context, operations)?;
         }
-        (None, Some(changes)) => collect_changes(&mut documents, tree_root, changes)?,
+        (None, Some(changes)) => collect_changes(&mut documents, tree_root, context, changes)?,
         (None, None) => {}
     }
-    refused_past_bounds(&documents)?;
+    refused_past_bounds(&documents, context.operation)?;
     Ok(documents.into_iter().collect())
 }
 
@@ -527,34 +578,34 @@ fn proposal_documents(
 fn collect_document_edits(
     documents: &mut BTreeMap<CoreProjectPath, Vec<TextEdit>>,
     tree_root: &TreeRoot,
-    opened: (&CoreProjectPath, i32),
+    context: &ProposalContext<'_>,
     edits: &[TextDocumentEdit],
-) -> Result<(), RenameEnd> {
+) -> Result<(), PlanEnd> {
     for document in edits {
-        collect_document_edit(documents, tree_root, opened, document)?;
+        collect_document_edit(documents, tree_root, context, document)?;
     }
     Ok(())
 }
 
-/// Collects mixed operations, refusing every resource operation: a rename
+/// Collects mixed operations, refusing every resource operation: a
 /// proposal that creates, moves, or deletes files is not applied.
 fn collect_operations(
     documents: &mut BTreeMap<CoreProjectPath, Vec<TextEdit>>,
     tree_root: &TreeRoot,
-    opened: (&CoreProjectPath, i32),
+    context: &ProposalContext<'_>,
     operations: &[DocumentChangeOperation],
-) -> Result<(), RenameEnd> {
+) -> Result<(), PlanEnd> {
     for operation in operations {
         match operation {
             DocumentChangeOperation::Op(_) => {
-                return Err(RenameEnd::Refused(unsupported_refusal(
-                    "semantic rename (the engine proposed a file operation this release \
-                     does not apply)"
-                        .to_owned(),
-                )));
+                return Err(PlanEnd::Refused(unsupported_refusal(format!(
+                    "{} (the engine proposed a file operation this release does not \
+                     apply)",
+                    context.operation
+                ))));
             }
             DocumentChangeOperation::Edit(document) => {
-                collect_document_edit(documents, tree_root, opened, document)?;
+                collect_document_edit(documents, tree_root, context, document)?;
             }
         }
     }
@@ -569,10 +620,11 @@ fn collect_operations(
 fn collect_changes(
     documents: &mut BTreeMap<CoreProjectPath, Vec<TextEdit>>,
     tree_root: &TreeRoot,
+    context: &ProposalContext<'_>,
     changes: &std::collections::HashMap<Uri, Vec<TextEdit>>,
-) -> Result<(), RenameEnd> {
+) -> Result<(), PlanEnd> {
     for (uri, edits) in changes {
-        let path = tree_path(tree_root, uri)?;
+        let path = tree_path(tree_root, uri, context.operation)?;
         documents
             .entry(path)
             .or_default()
@@ -585,11 +637,11 @@ fn collect_changes(
 fn collect_document_edit(
     documents: &mut BTreeMap<CoreProjectPath, Vec<TextEdit>>,
     tree_root: &TreeRoot,
-    opened: (&CoreProjectPath, i32),
+    context: &ProposalContext<'_>,
     document: &TextDocumentEdit,
-) -> Result<(), RenameEnd> {
-    let path = tree_path(tree_root, &document.text_document.uri)?;
-    verified_document_version(&path, document.text_document.version, opened)?;
+) -> Result<(), PlanEnd> {
+    let path = tree_path(tree_root, &document.text_document.uri, context.operation)?;
+    verified_document_version(&path, document.text_document.version, context)?;
     let edits = documents.entry(path).or_default();
     for edit in &document.edits {
         edits.push(text_edit(edit));
@@ -612,15 +664,19 @@ fn text_edit(edit: &OneOf<TextEdit, AnnotatedTextEdit>) -> TextEdit {
 fn verified_document_version(
     path: &CoreProjectPath,
     version: Option<i32>,
-    opened: (&CoreProjectPath, i32),
-) -> Result<(), RenameEnd> {
-    let (opened_path, opened_version) = opened;
+    context: &ProposalContext<'_>,
+) -> Result<(), PlanEnd> {
+    let opened = context
+        .opened
+        .filter(|(opened_path, _)| path == *opened_path)
+        .map(|(_, opened_version)| opened_version);
     match version {
         None => Ok(()),
-        Some(version) if path == opened_path && version == opened_version => Ok(()),
-        Some(version) => Err(RenameEnd::Refused(unsupported_refusal(format!(
-            "semantic rename (the engine edited {} at document version {version}, which \
-             the server does not hold)",
+        Some(version) if opened == Some(version) => Ok(()),
+        Some(version) => Err(PlanEnd::Refused(unsupported_refusal(format!(
+            "{} (the engine edited {} at document version {version}, which the server \
+             does not hold)",
+            context.operation,
             path.as_str()
         )))),
     }
@@ -628,10 +684,14 @@ fn verified_document_version(
 
 /// The project path one proposal URI addresses, or the refusal for a URI
 /// the workspace tree cannot address.
-fn tree_path(tree_root: &TreeRoot, uri: &Uri) -> Result<CoreProjectPath, RenameEnd> {
+fn tree_path(
+    tree_root: &TreeRoot,
+    uri: &Uri,
+    operation: &'static str,
+) -> Result<CoreProjectPath, PlanEnd> {
     tree_root.project_path(uri).map_err(|error| {
-        RenameEnd::Refused(unsupported_refusal(format!(
-            "semantic rename (the engine proposed an edit outside the workspace tree: \
+        PlanEnd::Refused(unsupported_refusal(format!(
+            "{operation} (the engine proposed an edit outside the workspace tree: \
              {}: {error})",
             uri.as_str()
         )))
@@ -641,10 +701,11 @@ fn tree_path(tree_root: &TreeRoot, uri: &Uri) -> Result<CoreProjectPath, RenameE
 /// Refuses a proposal past the file or per-file edit bounds.
 fn refused_past_bounds(
     documents: &BTreeMap<CoreProjectPath, Vec<TextEdit>>,
-) -> Result<(), RenameEnd> {
+    operation: &'static str,
+) -> Result<(), PlanEnd> {
     if documents.len() > RENAME_FILES_MAX {
-        return Err(RenameEnd::Refused(unsupported_refusal(format!(
-            "semantic rename (the engine proposed edits to {} files; at most \
+        return Err(PlanEnd::Refused(unsupported_refusal(format!(
+            "{operation} (the engine proposed edits to {} files; at most \
              {RENAME_FILES_MAX} are applied)",
             documents.len()
         ))));
@@ -653,8 +714,8 @@ fn refused_past_bounds(
         .iter()
         .find(|(_, edits)| edits.len() > RENAME_FILE_EDITS_MAX);
     match oversized {
-        Some((path, edits)) => Err(RenameEnd::Refused(unsupported_refusal(format!(
-            "semantic rename (the engine proposed {} edits to {}; at most \
+        Some((path, edits)) => Err(PlanEnd::Refused(unsupported_refusal(format!(
+            "{operation} (the engine proposed {} edits to {}; at most \
              {RENAME_FILE_EDITS_MAX} are applied)",
             edits.len(),
             path.as_str()
@@ -664,37 +725,41 @@ fn refused_past_bounds(
 }
 
 /// Refuses a file past the per-file byte bound.
-fn refused_oversized(path: &CoreProjectPath, source_len: usize) -> Result<(), RenameEnd> {
+pub(crate) fn refused_oversized(
+    path: &CoreProjectPath,
+    source_len: usize,
+    operation: &'static str,
+) -> Result<(), PlanEnd> {
     if source_len <= RENAME_FILE_BYTES_MAX {
         return Ok(());
     }
-    Err(RenameEnd::Refused(unsupported_refusal(format!(
-        "semantic rename (file {} holds {source_len} bytes; at most \
+    Err(PlanEnd::Refused(unsupported_refusal(format!(
+        "{operation} (file {} holds {source_len} bytes; at most \
          {RENAME_FILE_BYTES_MAX} are rewritten)",
         path.as_str()
     ))))
 }
 
-/// The bytes one edited file compiles against: the exact bytes the engine
-/// saw for the opened target, current disk bytes for every other file.
+/// The bytes one edited file compiles against: the context's held bytes
+/// for a path it carries a base for, current disk bytes for every other
+/// file.
 async fn document_base(
     workspace_root: &Path,
-    address: &SymbolAddress,
-    target: &RenameTarget,
+    context: &ProposalContext<'_>,
     path: &CoreProjectPath,
-) -> Result<String, RenameEnd> {
-    if path == &target.path {
-        return Ok(target.indexed_source.clone());
+) -> Result<String, PlanEnd> {
+    if let Some(held) = context.bases.get(path) {
+        return Ok((*held).to_owned());
     }
     let disk = tokio::fs::read_to_string(workspace_root.join(path.as_str())).await;
     match disk {
         Ok(source) => Ok(source),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(RenameEnd::Refused(ChangeResult::refused(
+            Err(PlanEnd::Refused(ChangeResult::refused(
                 RefusalReason::UnmetPrecondition,
                 vec![failed_precondition(
                     OperationPreconditionKind::TargetExists,
-                    address,
+                    &context.addresses,
                     path,
                     PreconditionValue::Boolean { value: true },
                     PreconditionValue::Boolean { value: false },
@@ -711,13 +776,13 @@ async fn document_base(
 /// offsets stay stable; overlapping edits and positions that do not land
 /// in the base refuse.
 fn rewritten_source(
-    address: &SymbolAddress,
+    context: &ProposalContext<'_>,
     path: &CoreProjectPath,
     base: &str,
     edits: &[TextEdit],
     encoding: PositionEncoding,
-) -> Result<String, RenameEnd> {
-    let spans = edit_spans(address, path, base, edits, encoding)?;
+) -> Result<String, PlanEnd> {
+    let spans = edit_spans(context, path, base, edits, encoding)?;
     let mut next = base.to_owned();
     for (range, text) in spans.iter().rev() {
         next.replace_range(range.clone(), text);
@@ -728,20 +793,20 @@ fn rewritten_source(
 /// Each edit's byte range and replacement, sorted ascending and proven
 /// non-overlapping.
 fn edit_spans<'edits>(
-    address: &SymbolAddress,
+    context: &ProposalContext<'_>,
     path: &CoreProjectPath,
     base: &str,
     edits: &'edits [TextEdit],
     encoding: PositionEncoding,
-) -> Result<Vec<(std::ops::Range<usize>, &'edits str)>, RenameEnd> {
+) -> Result<Vec<(std::ops::Range<usize>, &'edits str)>, PlanEnd> {
     let index = LineIndex::new(base);
     let mut spans = Vec::with_capacity(edits.len());
     for edit in edits {
-        let start = converted_offset(&index, encoding, edit.range.start, address, path)?;
-        let end = converted_offset(&index, encoding, edit.range.end, address, path)?;
+        let start = converted_offset(&index, encoding, edit.range.start, context, path)?;
+        let end = converted_offset(&index, encoding, edit.range.end, context, path)?;
         if start > end {
-            return Err(RenameEnd::Refused(position_fault_refusal(
-                address,
+            return Err(PlanEnd::Refused(position_fault_refusal(
+                context,
                 path,
                 "the edit's end position precedes its start",
             )));
@@ -751,8 +816,9 @@ fn edit_spans<'edits>(
     spans.sort_by_key(|(range, _)| (range.start, range.end));
     for pair in spans.windows(2) {
         if pair[0].0.end > pair[1].0.start {
-            return Err(RenameEnd::Refused(unsupported_refusal(format!(
-                "semantic rename (the engine proposed overlapping edits to {})",
+            return Err(PlanEnd::Refused(unsupported_refusal(format!(
+                "{} (the engine proposed overlapping edits to {})",
+                context.operation,
                 path.as_str()
             ))));
         }
@@ -766,11 +832,11 @@ fn converted_offset(
     index: &LineIndex<'_>,
     encoding: PositionEncoding,
     position: Position,
-    address: &SymbolAddress,
+    context: &ProposalContext<'_>,
     path: &CoreProjectPath,
-) -> Result<usize, RenameEnd> {
+) -> Result<usize, PlanEnd> {
     index.byte_offset(encoding, position).map_err(|error| {
-        RenameEnd::Refused(position_fault_refusal(address, path, &error.to_string()))
+        PlanEnd::Refused(position_fault_refusal(context, path, &error.to_string()))
     })
 }
 
@@ -865,8 +931,8 @@ fn survivor_diagnostic(old_name: &str, path: &CoreProjectPath, offset: usize) ->
     }
 }
 
-/// One finding the rename flow raises itself, without a source location.
-fn rename_diagnostic(message: String) -> Diagnostic {
+/// One finding a plan flow raises itself, without a source location.
+pub(crate) fn plan_diagnostic(message: String) -> Diagnostic {
     Diagnostic {
         severity: Severity::Warning,
         code: None,
@@ -883,11 +949,11 @@ fn rename_diagnostic(message: String) -> Diagnostic {
 
 /// A proposal this release does not apply, with the capability detail as a
 /// warning finding.
-fn unsupported_refusal(detail: String) -> ChangeResult {
+pub(crate) fn unsupported_refusal(detail: String) -> ChangeResult {
     ChangeResult::Refused {
         reason: RefusalReason::Unsupported,
         preconditions: Vec::new(),
-        diagnostics: vec![rename_diagnostic(detail)],
+        diagnostics: vec![plan_diagnostic(detail)],
     }
 }
 
@@ -898,12 +964,14 @@ fn declined_refusal(address: &SymbolAddress, detail: String) -> ChangeResult {
         reason: RefusalReason::UnmetPrecondition,
         preconditions: vec![failed_precondition(
             OperationPreconditionKind::TargetExists,
-            address,
+            &[PreconditionAddress::Symbol {
+                symbol: address.wire_symbol(),
+            }],
             &address.path,
             PreconditionValue::Boolean { value: true },
             PreconditionValue::Boolean { value: false },
         )],
-        diagnostics: vec![rename_diagnostic(detail)],
+        diagnostics: vec![plan_diagnostic(detail)],
     }
 }
 
@@ -911,7 +979,7 @@ fn declined_refusal(address: &SymbolAddress, detail: String) -> ChangeResult {
 /// unmet `source_unchanged` condition, with the position fault as the
 /// finding.
 fn position_fault_refusal(
-    address: &SymbolAddress,
+    context: &ProposalContext<'_>,
     path: &CoreProjectPath,
     detail: &str,
 ) -> ChangeResult {
@@ -919,22 +987,22 @@ fn position_fault_refusal(
         reason: RefusalReason::UnmetPrecondition,
         preconditions: vec![failed_precondition(
             OperationPreconditionKind::SourceUnchanged,
-            address,
+            &context.addresses,
             path,
             PreconditionValue::Boolean { value: true },
             PreconditionValue::Boolean { value: false },
         )],
-        diagnostics: vec![rename_diagnostic(format!(
+        diagnostics: vec![plan_diagnostic(format!(
             "the engine's edit does not land in the source Rift holds: {detail}"
         ))],
     }
 }
 
-/// One failed condition naming the addressed declaration and the path it
-/// was checked against.
-fn failed_precondition(
+/// One failed condition naming the addressed subjects and the path it was
+/// checked against.
+pub(crate) fn failed_precondition(
     kind: OperationPreconditionKind,
-    address: &SymbolAddress,
+    addresses: &[PreconditionAddress],
     path: &CoreProjectPath,
     expected: PreconditionValue,
     observed: PreconditionValue,
@@ -942,9 +1010,7 @@ fn failed_precondition(
     OperationPrecondition::new(
         kind,
         OperationPreconditionStatus::Failed,
-        vec![PreconditionAddress::Symbol {
-            symbol: address.wire_symbol(),
-        }],
+        addresses.to_vec(),
         vec![path.as_str().to_owned()],
         expected,
         observed,
@@ -1003,10 +1069,10 @@ mod tests {
         }
     }
 
-    fn refusal(end: RenameEnd) -> ChangeResult {
+    fn refusal(end: PlanEnd) -> ChangeResult {
         match end {
-            RenameEnd::Refused(result) => result,
-            RenameEnd::Failed(error) => panic!("expected a refusal, got failure {error:?}"),
+            PlanEnd::Refused(result) => result,
+            PlanEnd::Failed(error) => panic!("expected a refusal, got failure {error:?}"),
         }
     }
 
@@ -1039,15 +1105,27 @@ mod tests {
         }
     }
 
-    fn opened_target() -> (CoreProjectPath, i32) {
-        (project_path("lib.rs"), 1)
+    /// A rename-shaped context with no held bases and nothing opened.
+    fn plain_context() -> ProposalContext<'static> {
+        ProposalContext {
+            operation: RENAME_OPERATION,
+            addresses: vec![PreconditionAddress::Symbol {
+                symbol: address().wire_symbol(),
+            }],
+            opened: None,
+            bases: BTreeMap::new(),
+        }
     }
 
     fn documents_of(
         edit: &WorkspaceEdit,
-    ) -> Result<Vec<(CoreProjectPath, Vec<TextEdit>)>, RenameEnd> {
-        let opened = opened_target();
-        proposal_documents(edit, &tree(), (&opened.0, opened.1))
+    ) -> Result<Vec<(CoreProjectPath, Vec<TextEdit>)>, PlanEnd> {
+        let opened = project_path("lib.rs");
+        let context = ProposalContext {
+            opened: Some((&opened, 1)),
+            ..plain_context()
+        };
+        proposal_documents(edit, &tree(), &context)
     }
 
     /// Builds a `changes`-form proposal; the key type is lsp-types' own.
@@ -1158,6 +1236,15 @@ mod tests {
                 .expect_err("a version on an unopened document refuses"),
         );
         assert_eq!(refusal_reason(&unopened), RefusalReason::Unsupported);
+        // An operation that opened nothing - a file move - accepts only
+        // version-free documents.
+        let nothing_opened = plain_context();
+        assert!(proposal_documents(&versioned("lib.rs", None), &tree(), &nothing_opened).is_ok());
+        let refused = refusal(
+            proposal_documents(&versioned("lib.rs", Some(1)), &tree(), &nothing_opened)
+                .expect_err("every versioned document refuses when nothing was opened"),
+        );
+        assert_eq!(refusal_reason(&refused), RefusalReason::Unsupported);
     }
 
     #[test]
@@ -1190,7 +1277,7 @@ mod tests {
             edit((1, 14), (1, 20), "flare"),
         ];
         let next = rewritten_source(
-            &address(),
+            &plain_context(),
             &project_path("lib.rs"),
             base,
             &edits,
@@ -1209,7 +1296,7 @@ mod tests {
                 .expect("the fixture line fits in u32");
         let utf8_column = u32::try_from(target).expect("the fixture line fits in u32");
         let by_utf16 = rewritten_source(
-            &address(),
+            &plain_context(),
             &project_path("lib.rs"),
             base,
             &[edit((0, utf16_column), (0, utf16_column + 6), "flare")],
@@ -1217,7 +1304,7 @@ mod tests {
         )
         .expect("the utf-16 edit compiles");
         let by_utf8 = rewritten_source(
-            &address(),
+            &plain_context(),
             &project_path("lib.rs"),
             base,
             &[edit((0, utf8_column), (0, utf8_column + 6), "flare")],
@@ -1232,7 +1319,7 @@ mod tests {
     fn crlf_sources_keep_their_endings_through_an_edit() {
         let base = "fn beacon() {}\r\nfn caller() { beacon(); }\r\n";
         let next = rewritten_source(
-            &address(),
+            &plain_context(),
             &project_path("lib.rs"),
             base,
             &[edit((1, 14), (1, 20), "flare")],
@@ -1248,7 +1335,7 @@ mod tests {
         let edits = vec![edit((0, 3), (0, 9), "flare"), edit((0, 5), (0, 7), "xx")];
         let result = refusal(
             rewritten_source(
-                &address(),
+                &plain_context(),
                 &project_path("lib.rs"),
                 base,
                 &edits,
@@ -1265,7 +1352,7 @@ mod tests {
         let base = "fn beacon() {}\n";
         let result = refusal(
             rewritten_source(
-                &address(),
+                &plain_context(),
                 &project_path("lib.rs"),
                 base,
                 &[edit((0, 9), (0, 3), "flare")],
@@ -1285,7 +1372,7 @@ mod tests {
         let base = "fn beacon() {}\n";
         let result = refusal(
             rewritten_source(
-                &address(),
+                &plain_context(),
                 &project_path("lib.rs"),
                 base,
                 &[edit((0, 90), (0, 95), "flare")],
@@ -1480,9 +1567,9 @@ mod tests {
     #[test]
     fn refused_oversized_accepts_the_bound_and_refuses_past_it() {
         let path = project_path("lib.rs");
-        assert!(refused_oversized(&path, RENAME_FILE_BYTES_MAX).is_ok());
+        assert!(refused_oversized(&path, RENAME_FILE_BYTES_MAX, RENAME_OPERATION).is_ok());
         let result = refusal(
-            refused_oversized(&path, RENAME_FILE_BYTES_MAX + 1)
+            refused_oversized(&path, RENAME_FILE_BYTES_MAX + 1, RENAME_OPERATION)
                 .expect_err("a file past the byte bound refuses"),
         );
         assert_eq!(refusal_reason(&result), RefusalReason::Unsupported);
@@ -1528,41 +1615,35 @@ mod tests {
         )
         .await
         .expect_err("a missing file is a storage failure");
-        assert!(matches!(missing, RenameEnd::Failed(_)));
+        assert!(matches!(missing, PlanEnd::Failed(_)));
     }
 
     #[tokio::test]
-    async fn document_base_serves_the_opened_bytes_and_refuses_missing_files() {
+    async fn document_base_serves_the_held_bytes_and_refuses_missing_files() {
         let directory = tempfile::tempdir().expect("fixture directory");
         let opened = "pub fn beacon() {}\n";
-        let target = target_over(opened);
-        // The opened target answers the exact bytes the engine saw, never a
+        let held_path = project_path("lib.rs");
+        let context = ProposalContext {
+            bases: BTreeMap::from([(&held_path, opened)]),
+            ..plain_context()
+        };
+        // The held base answers the exact bytes the engine saw, never a
         // fresh disk read.
         fs::write(directory.path().join("lib.rs"), "drifted\n").expect("fixture file writes");
-        let base = document_base(directory.path(), &address(), &target, &target.path)
+        let base = document_base(directory.path(), &context, &held_path)
             .await
-            .expect("the opened target compiles against its opened bytes");
+            .expect("a held path compiles against its held bytes");
         assert_eq!(base, opened);
         fs::write(directory.path().join("main.rs"), "fn caller() {}\n")
             .expect("fixture file writes");
-        let disk = document_base(
-            directory.path(),
-            &address(),
-            &target,
-            &project_path("main.rs"),
-        )
-        .await
-        .expect("another file compiles against its disk bytes");
+        let disk = document_base(directory.path(), &context, &project_path("main.rs"))
+            .await
+            .expect("another file compiles against its disk bytes");
         assert_eq!(disk, "fn caller() {}\n");
         let missing = refusal(
-            document_base(
-                directory.path(),
-                &address(),
-                &target,
-                &project_path("vanished.rs"),
-            )
-            .await
-            .expect_err("a missing edited file refuses"),
+            document_base(directory.path(), &context, &project_path("vanished.rs"))
+                .await
+                .expect_err("a missing edited file refuses"),
         );
         assert_eq!(refusal_reason(&missing), RefusalReason::UnmetPrecondition);
         assert_eq!(
@@ -1570,14 +1651,9 @@ mod tests {
             OperationPreconditionKind::TargetExists
         );
         fs::create_dir(directory.path().join("nested")).expect("fixture directory creates");
-        let unreadable = document_base(
-            directory.path(),
-            &address(),
-            &target,
-            &project_path("nested"),
-        )
-        .await
-        .expect_err("an unreadable path is a storage failure");
-        assert!(matches!(unreadable, RenameEnd::Failed(_)));
+        let unreadable = document_base(directory.path(), &context, &project_path("nested"))
+            .await
+            .expect_err("an unreadable path is a storage failure");
+        assert!(matches!(unreadable, PlanEnd::Failed(_)));
     }
 }

@@ -138,6 +138,61 @@ impl Capabilities {
     pub fn will_rename_files(&self) -> bool {
         self.will_rename_filters.is_some()
     }
+
+    /// Whether one project-relative file path matches the engine's
+    /// will-rename filters.
+    ///
+    /// At most [`WILL_RENAME_FILTERS_MAX`] filters are consulted. A filter
+    /// naming a non-`file` scheme or the folder pattern kind does not apply
+    /// to a file move, and a glob the matcher cannot compile matches
+    /// nothing. Absent filters match nothing: the capability gate, not this
+    /// check, owns that refusal.
+    #[must_use]
+    pub fn will_rename_matches(&self, path: &str) -> bool {
+        let Some(filters) = self.will_rename_filters.as_deref() else {
+            return false;
+        };
+        filters
+            .iter()
+            .take(WILL_RENAME_FILTERS_MAX)
+            .any(|filter| filter_matches(filter, path))
+    }
+}
+
+/// Most will-rename filters one match consults.
+pub const WILL_RENAME_FILTERS_MAX: usize = 64;
+
+/// Whether one file-operation filter applies to and matches a file path.
+fn filter_matches(filter: &FileOperationFilter, path: &str) -> bool {
+    if filter
+        .scheme
+        .as_deref()
+        .is_some_and(|scheme| scheme != "file")
+    {
+        return false;
+    }
+    if filter.pattern.matches == Some(lsp_types::FileOperationPatternKind::Folder) {
+        return false;
+    }
+    let ignore_case = filter
+        .pattern
+        .options
+        .as_ref()
+        .is_some_and(|options| options.ignore_case == Some(true));
+    glob_matches(&filter.pattern.glob, ignore_case, path)
+}
+
+/// Whether one LSP glob matches a slash-separated relative path.
+///
+/// `*` and `?` stay inside one path segment and `**` crosses segments, the
+/// LSP pattern grammar. A glob that does not compile matches nothing.
+fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
+    globset::GlobBuilder::new(glob)
+        .literal_separator(true)
+        .case_insensitive(ignore_case)
+        .build()
+        .ok()
+        .is_some_and(|compiled| compiled.compile_matcher().is_match(path))
 }
 
 /// What the session offers every engine.
@@ -298,6 +353,80 @@ mod tests {
         assert!(record.will_rename_files());
         assert!(record.pull_diagnostics);
         assert_eq!(record.diagnostic_identifier.as_deref(), Some("probe"));
+    }
+
+    /// A record advertising exactly these will-rename filters.
+    fn filtered(filters: Vec<lsp_types::FileOperationFilter>) -> Capabilities {
+        Capabilities {
+            will_rename_filters: Some(filters),
+            ..Capabilities::default()
+        }
+    }
+
+    fn filter(glob: &str) -> lsp_types::FileOperationFilter {
+        lsp_types::FileOperationFilter {
+            scheme: None,
+            pattern: lsp_types::FileOperationPattern {
+                glob: glob.to_owned(),
+                matches: None,
+                options: None,
+            },
+        }
+    }
+
+    #[test]
+    fn will_rename_matches_follows_the_lsp_glob_grammar() {
+        let record = filtered(vec![filter("**/*.{ts,tsx}")]);
+        assert!(record.will_rename_matches("src/App.tsx"));
+        assert!(record.will_rename_matches("index.ts"));
+        assert!(!record.will_rename_matches("src/lib.rs"));
+        let single_segment = filtered(vec![filter("*.rs")]);
+        assert!(single_segment.will_rename_matches("lib.rs"));
+        assert!(
+            !single_segment.will_rename_matches("src/lib.rs"),
+            "`*` must not cross a path segment"
+        );
+        assert!(filtered(vec![filter("**/*")]).will_rename_matches("a/b/c.py"));
+        assert!(
+            !filtered(vec![filter("**/*.[")]).will_rename_matches("lib.rs"),
+            "a glob that does not compile matches nothing"
+        );
+        assert!(
+            !Capabilities::default().will_rename_matches("lib.rs"),
+            "absent filters match nothing"
+        );
+    }
+
+    #[test]
+    fn will_rename_filters_apply_by_scheme_kind_and_case_option() {
+        let mut untitled = filter("**/*.rs");
+        untitled.scheme = Some("untitled".to_owned());
+        assert!(!filtered(vec![untitled]).will_rename_matches("lib.rs"));
+        let mut file_scheme = filter("**/*.rs");
+        file_scheme.scheme = Some("file".to_owned());
+        assert!(filtered(vec![file_scheme]).will_rename_matches("lib.rs"));
+        let mut folders = filter("**/*.rs");
+        folders.pattern.matches = Some(lsp_types::FileOperationPatternKind::Folder);
+        assert!(
+            !filtered(vec![folders]).will_rename_matches("lib.rs"),
+            "a folder filter does not apply to a file move"
+        );
+        let mut cased = filter("**/*.RS");
+        assert!(!filtered(vec![cased.clone()]).will_rename_matches("lib.rs"));
+        cased.pattern.options = Some(lsp_types::FileOperationPatternOptions {
+            ignore_case: Some(true),
+        });
+        assert!(filtered(vec![cased]).will_rename_matches("lib.rs"));
+    }
+
+    #[test]
+    fn will_rename_matches_consults_filters_only_up_to_the_bound() {
+        let mut filters = vec![filter("**/*.py"); WILL_RENAME_FILTERS_MAX];
+        filters.push(filter("**/*.rs"));
+        assert!(
+            !filtered(filters).will_rename_matches("lib.rs"),
+            "the matching filter past the bound is never consulted"
+        );
     }
 
     #[test]

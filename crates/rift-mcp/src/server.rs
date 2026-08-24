@@ -11,8 +11,8 @@ use rift_index::{
     WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::change::{
-    ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, PatchParams,
-    RenameSymbolParams, ReplaceNodeParams, ReplaceSymbolParams,
+    ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, MoveFileParams,
+    PatchParams, RenameSymbolParams, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
     CommandHook, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX,
@@ -20,11 +20,12 @@ use rift_protocol::configuration::{
 };
 use rift_protocol::error as wire;
 use rift_protocol::read::{
-    GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams, SearchResult,
+    DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams,
+    SearchResult,
 };
 use rift_server::{
-    ChangeService, EnginePool, HookStatus, ReadError, ReadFault, ReadService, RenameResolution,
-    plan_rename, run_hooks,
+    ChangeService, EnginePool, HookStatus, MoveResolution, ReadError, ReadFault, ReadService,
+    RenameResolution, engine_change_diagnostics, plan_move, plan_rename, run_hooks,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -623,6 +624,32 @@ impl RiftMcp {
         }
     }
 
+    /// Moves one visible file to a new project path. When the configured
+    /// language engine advertises will-rename requests for the file, its
+    /// reference updates land in the same atomic change; without an engine
+    /// or the capability the move still lands and the result carries a
+    /// warning that references were not updated. A refusal names the
+    /// failed precondition and leaves the workspace untouched.
+    #[tool]
+    async fn move_file(
+        &self,
+        Parameters(params): Parameters<MoveFileParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        let published = self.published_workspace(wire::ErrorPhase::Change).await?;
+        published.configuration.accepted(wire::ErrorPhase::Change)?;
+        let pool = self.engine_pool().await;
+        let resolution = plan_move(&published.reads, &pool, &self.root, &params)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
+        match resolution {
+            MoveResolution::Refused(result) => Ok(Json(result)),
+            MoveResolution::Planned(plan) => {
+                self.change(move |reads, changes| changes.apply_move(reads, &plan))
+                    .await
+            }
+        }
+    }
+
     /// Applies unified-diff hunks to workspace files atomically. Hunk
     /// context guards the change; header line numbers are hints, as with
     /// `git apply`. A `/dev/null` header creates or deletes the file.
@@ -806,6 +833,13 @@ impl RiftMcp {
     /// rather than failing the call: the write happened, and the caller
     /// must not be told otherwise.
     ///
+    /// Engine diagnostics attach here too, beside the hook verdicts' place
+    /// in the post-apply flow: once the changed workspace published, each
+    /// changed path whose engine advertises diagnostic pulls is pulled
+    /// against the published bytes, and the findings ride the summary. An
+    /// engine failure at this point is a warning on the summary, never a
+    /// failed call - the change already applied.
+    ///
     /// Dropping this future after blocking work starts does not cancel that
     /// work. The serialized operation finishes through snapshot publication
     /// before releasing its lane.
@@ -841,7 +875,45 @@ impl RiftMcp {
         if let (Some(lexical), Some(next)) = (self.lexical.as_ref(), outcome.published.as_ref()) {
             populate_lexical(lexical, next).await;
         }
-        outcome.result
+        let mut result = outcome.result?;
+        if let Json(ChangeResult::Applied { summary }) = &mut result
+            && let Some(snapshot) = self
+                .diagnostics_snapshot(outcome.published.as_ref(), summary)
+                .await
+        {
+            let engines = self.engine_pool().await;
+            summary
+                .diagnostics
+                .extend(engine_change_diagnostics(&engines, &snapshot.reads, &summary.paths).await);
+        }
+        Ok(result)
+    }
+
+    /// The snapshot engine diagnostics pull against after one applied
+    /// change: the change's own publication, or the currently published
+    /// workspace when a concurrent rebuild superseded it - the change lane
+    /// serialized the write, so that snapshot holds the changed tree, plus
+    /// whatever external writes landed after it. A change whose rebuild
+    /// failed pulls nothing: its summary already carries the stale-snapshot
+    /// warning, and current-tree reads refuse until a fresh snapshot
+    /// publishes.
+    async fn diagnostics_snapshot(
+        &self,
+        published_next: Option<&Arc<PublishedWorkspace>>,
+        summary: &ChangeSummary,
+    ) -> Option<Arc<PublishedWorkspace>> {
+        if let Some(next) = published_next {
+            return Some(Arc::clone(next));
+        }
+        let stale = DiagnosticCode::SnapshotStale.code();
+        let rebuild_failed = summary
+            .diagnostics
+            .iter()
+            .any(|finding| finding.code.as_deref() == Some(stale.as_str()));
+        if rebuild_failed {
+            return None;
+        }
+        Some(Arc::clone(&self.published.read().await.current))
     }
 
     /// One already-serialized change's outcome: the wire result, and the freshly published
@@ -994,8 +1066,9 @@ impl ServerHandler for RiftMcp {
             .with_instructions(
                 "Read and edit the current workspace: get_symbol and search find \
                  declarations, nodes lists witnessed syntax nodes at a byte position, \
-                 and replace_symbol, insert_symbol, replace_node, rename_symbol, and \
-                 patch change code atomically behind verified preconditions.",
+                 and replace_symbol, insert_symbol, replace_node, rename_symbol, \
+                 move_file, and patch change code atomically behind verified \
+                 preconditions.",
             )
     }
 }
@@ -1638,6 +1711,7 @@ mod tests {
             [
                 "get_symbol",
                 "insert_symbol",
+                "move_file",
                 "nodes",
                 "patch",
                 "rename_symbol",

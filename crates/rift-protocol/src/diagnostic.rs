@@ -60,6 +60,14 @@ pub enum DiagnosticCode {
     /// changed tree after the rename.
     #[serde(rename = "rift.rename.survivor")]
     RenameSurvivor,
+    /// A file move landed without engine reference updates: no engine serves the file's
+    /// language, or the configured engine does not cover the move.
+    #[serde(rename = "rift.move.references_not_updated")]
+    MoveReferencesNotUpdated,
+    /// The language engine could not serve diagnostics over an applied change; the
+    /// change itself landed.
+    #[serde(rename = "rift.engine.failed")]
+    EngineFailed,
 }
 
 impl DiagnosticCode {
@@ -179,5 +187,10 @@ mod tests {
             DiagnosticCode::RenameSurvivor.code(),
             "rift.rename.survivor"
         );
+        assert_eq!(
+            DiagnosticCode::MoveReferencesNotUpdated.code(),
+            "rift.move.references_not_updated"
+        );
+        assert_eq!(DiagnosticCode::EngineFailed.code(), "rift.engine.failed");
     }
 }
