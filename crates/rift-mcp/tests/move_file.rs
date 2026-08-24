@@ -6,16 +6,15 @@
 
 #![cfg(unix)]
 
+mod fake_engine;
 mod workspace_client;
 
 use std::fs;
 
+use fake_engine::{counted, engine_configuration, recorded};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use workspace_client::{
-    TestResult, call_retrying_acceptance, counted, engine_configuration, recorded,
-    served_workspace, tool_request,
-};
+use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
 fn move_request(from: &str, to: &str) -> CallToolRequestParams {
     tool_request("move_file", &json!({ "from": from, "to": to }))

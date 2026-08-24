@@ -61,6 +61,10 @@ name = "http_serve"
 path = "tests/http_serve.rs"
 
 [[test]]
+name = "live_rust_analyzer"
+path = "tests/live_rust_analyzer.rs"
+
+[[test]]
 name = "move_file"
 path = "tests/move_file.rs"
 

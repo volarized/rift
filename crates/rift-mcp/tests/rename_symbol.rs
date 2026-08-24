@@ -7,16 +7,15 @@
 
 #![cfg(unix)]
 
+mod fake_engine;
 mod workspace_client;
 
 use std::fs;
 
+use fake_engine::{counted, engine_configuration, recorded};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use workspace_client::{
-    TestResult, call_retrying_acceptance, counted, engine_configuration, recorded,
-    served_workspace, tool_request,
-};
+use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
 fn rename_request(symbol: &str, new_name: &str) -> CallToolRequestParams {
     tool_request(

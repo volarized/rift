@@ -64,6 +64,12 @@ clean:
     done
 
 
+# The live-engine suites: gated by RIFT_ENGINE_LIVE, run in CI's engines
+# job, and outside `rust-gate` so the local default gate stays hermetic.
+engine-test:
+    RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_rust_analyzer
+    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer
+
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
 
