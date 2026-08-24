@@ -8,8 +8,9 @@
 //! and an engine without the capability stays silent.
 //!
 //! The engine slot absorbs every transient condition first - a refusal the
-//! engine invites again, an engine still analyzing, an engine that died -
-//! under that engine's `[engines.<name>.retry]` and
+//! engine invites again, an engine still analyzing, an engine that died,
+//! an engine that reported nothing before it had announced any work of its
+//! own - under that engine's `[engines.<name>.retry]` and
 //! `[engines.<name>.restart]` tables. What reaches this module is either
 //! the engine's settled findings or the condition that outlasted the whole
 //! budget, and an engine that never stopped analyzing degrades to its own
@@ -216,7 +217,8 @@ fn engine_warning(engine: &str, error: &EngineError) -> Diagnostic {
         EngineFault::Analyzing { attempts } => (
             DiagnosticCode::EngineAnalyzing,
             format!(
-                "engine {engine} was still analyzing on all {attempts} attempts, so its                  findings over the applied change may be incomplete"
+                "engine {engine} was still analyzing on all {attempts} attempts, so its \
+                 findings over the applied change may be incomplete"
             ),
         ),
         _ => (

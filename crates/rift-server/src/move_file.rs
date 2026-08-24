@@ -5,7 +5,11 @@
 //! whole-file rewrites, and the move and every rewrite land through one
 //! atomic publish. Without an engine, without the will-rename capability,
 //! or with filters that do not cover the file, the move still lands and
-//! the result carries a warning that references were not updated.
+//! the result carries a warning that references were not updated. So does
+//! a move an engine answered with no edit at all while it has announced
+//! no work of its own: the slot has already asked it twice by then, and a
+//! silence from an engine that never says what it is doing is not proof
+//! that nothing needed updating.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,7 +17,7 @@ use std::path::Path;
 use lsp_types::{TextEdit, WorkspaceEdit};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
-use rift_lsp::session::{EngineError, EngineFault, EngineSession};
+use rift_lsp::session::{EngineError, EngineFault, EngineSession, proposes_no_edit};
 use rift_protocol::change::{
     ChangeResult, MoveFileParams, OperationPreconditionKind, PreconditionValue, RefusalReason,
 };
@@ -43,9 +47,9 @@ pub struct MovePlan {
     pub(crate) moved_next: String,
     /// Reference rewrites in other files, compiled from the proposal.
     pub(crate) rewrites: Vec<PlannedRewrite>,
-    /// Why the engine was not asked, when it was not; the apply attaches
-    /// it to the summary as the references-not-updated warning.
-    pub(crate) engine_skip: Option<EngineSkip>,
+    /// Why the references were not updated, when they were not; the apply
+    /// attaches it to the summary as its warning.
+    pub(crate) references_not_updated: Option<ReferencesNotUpdated>,
 }
 
 /// What planning decided: a plan ready for the change lane, or the refusal
@@ -58,9 +62,14 @@ pub enum MoveResolution {
     Refused(ChangeResult),
 }
 
-/// Why the engine was never asked for reference updates.
+/// Why the moved file's references were not updated.
+///
+/// The first three name an engine that was never asked. The fourth names
+/// one that was: it answered nothing, and it has never announced any work
+/// of its own, so nothing distinguishes that answer from the answer of an
+/// engine with nothing to update.
 #[derive(Debug)]
-pub(crate) enum EngineSkip {
+pub(crate) enum ReferencesNotUpdated {
     /// No engine claims the moved file's language.
     NoEngine {
         /// The unserved language identity segment.
@@ -76,28 +85,39 @@ pub(crate) enum EngineSkip {
         /// The engine's configured name.
         engine: String,
     },
+    /// The engine proposed no edit and has never announced any work.
+    AnsweredNothing {
+        /// The engine's configured name.
+        engine: String,
+    },
 }
 
-/// The warning an applied move carries when its references were not
-/// updated, naming why the engine was not asked.
-pub(crate) fn skip_diagnostic(skip: &EngineSkip) -> Diagnostic {
-    let reason = match skip {
-        EngineSkip::NoEngine { language_segment } => {
-            format!("no engine is configured for language {language_segment}")
-        }
-        EngineSkip::CapabilityAbsent { engine } => {
-            format!("engine {engine} does not advertise workspace/willRenameFiles")
-        }
-        EngineSkip::FilterMismatch { engine } => {
-            format!("engine {engine}'s will-rename filters do not cover the moved file")
-        }
-    };
-    let mut diagnostic = plan_diagnostic(format!(
-        "the file moved and its references were not updated: {reason}"
-    ));
-    diagnostic.severity = Severity::Warning;
-    diagnostic.code = Some(DiagnosticCode::MoveReferencesNotUpdated.code());
-    diagnostic
+impl ReferencesNotUpdated {
+    /// The warning an applied move carries, naming why its references
+    /// were not updated.
+    pub(crate) fn diagnostic(&self) -> Diagnostic {
+        let reason = match self {
+            Self::NoEngine { language_segment } => {
+                format!("no engine is configured for language {language_segment}")
+            }
+            Self::CapabilityAbsent { engine } => {
+                format!("engine {engine} does not advertise workspace/willRenameFiles")
+            }
+            Self::FilterMismatch { engine } => {
+                format!("engine {engine}'s will-rename filters do not cover the moved file")
+            }
+            Self::AnsweredNothing { engine } => format!(
+                "engine {engine} proposed none and has announced no work of its own, \
+                 so it may not have read the file yet"
+            ),
+        };
+        let mut diagnostic = plan_diagnostic(format!(
+            "the file moved and its references were not updated: {reason}"
+        ));
+        diagnostic.severity = Severity::Warning;
+        diagnostic.code = Some(DiagnosticCode::MoveReferencesNotUpdated.code());
+        diagnostic
+    }
 }
 
 /// Plans one file move: verifies both paths, asks the configured engine
@@ -143,7 +163,7 @@ async fn planned_move(
     refused_oversized(&from, source.text.len(), MOVE_OPERATION)?;
     let proposal = engine_proposal(engines, &from, &to, &source.language_segment).await?;
     match proposal {
-        EngineProposal::Skip(skip) => Ok(unedited_plan(from, to, source.text, Some(skip))),
+        EngineProposal::Nothing(reason) => Ok(unedited_plan(from, to, source.text, Some(reason))),
         EngineProposal::Answered { edit: None, .. } => {
             Ok(unedited_plan(from, to, source.text, None))
         }
@@ -165,7 +185,7 @@ fn unedited_plan(
     from: CoreProjectPath,
     to: CoreProjectPath,
     moved_source: String,
-    engine_skip: Option<EngineSkip>,
+    references_not_updated: Option<ReferencesNotUpdated>,
 ) -> MovePlan {
     MovePlan {
         from,
@@ -173,7 +193,7 @@ fn unedited_plan(
         moved_next: moved_source.clone(),
         moved_source,
         rewrites: Vec::new(),
-        engine_skip,
+        references_not_updated,
     }
 }
 
@@ -271,8 +291,9 @@ async fn verified_moved_bytes(
 
 /// What the engine phase produced for one move.
 enum EngineProposal {
-    /// The engine was not asked; the skip names why.
-    Skip(EngineSkip),
+    /// The engine contributed no reference updates; the reason rides the
+    /// applied move as its warning.
+    Nothing(ReferencesNotUpdated),
     /// The engine answered the will-rename request.
     Answered {
         edit: Option<WorkspaceEdit>,
@@ -288,6 +309,11 @@ enum MoveExchange {
     Answered {
         edit: Option<WorkspaceEdit>,
         encoding: PositionEncoding,
+        /// Whether the engine has yet to announce any work of its own.
+        /// The slot has already sent the request again once by the time
+        /// this is read, so a `true` here means the engine answered
+        /// nothing twice without ever saying what it was doing.
+        never_announced: bool,
     },
 }
 
@@ -301,22 +327,30 @@ async fn engine_proposal(
 ) -> Result<EngineProposal, PlanEnd> {
     let language = crate::rename::segment_language(language_segment);
     let Some(slot) = engines.engine_for(&language) else {
-        return Ok(EngineProposal::Skip(EngineSkip::NoEngine {
+        return Ok(EngineProposal::Nothing(ReferencesNotUpdated::NoEngine {
             language_segment: language_segment.to_owned(),
         }));
     };
+    let engine = || slot.name().to_owned();
     match exchanged_will_rename(slot, from, to).await {
-        Ok(MoveExchange::FilterMismatch) => Ok(EngineProposal::Skip(EngineSkip::FilterMismatch {
-            engine: slot.name().to_owned(),
-        })),
-        Ok(MoveExchange::Answered { edit, encoding }) => {
+        Ok(MoveExchange::FilterMismatch) => Ok(EngineProposal::Nothing(
+            ReferencesNotUpdated::FilterMismatch { engine: engine() },
+        )),
+        Ok(MoveExchange::Answered {
+            ref edit,
+            never_announced,
+            ..
+        }) if never_announced && proposes_no_edit(edit.as_ref()) => Ok(EngineProposal::Nothing(
+            ReferencesNotUpdated::AnsweredNothing { engine: engine() },
+        )),
+        Ok(MoveExchange::Answered { edit, encoding, .. }) => {
             Ok(EngineProposal::Answered { edit, encoding })
         }
         Err(error) => {
             if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
-                return Ok(EngineProposal::Skip(EngineSkip::CapabilityAbsent {
-                    engine: slot.name().to_owned(),
-                }));
+                return Ok(EngineProposal::Nothing(
+                    ReferencesNotUpdated::CapabilityAbsent { engine: engine() },
+                ));
             }
             Err(PlanEnd::Failed(ReadFault::engine(error)))
         }
@@ -356,7 +390,11 @@ async fn will_rename_on_session(
         return Ok(MoveExchange::FilterMismatch);
     }
     let edit = session.will_rename_files(from, to).await?;
-    Ok(MoveExchange::Answered { edit, encoding })
+    Ok(MoveExchange::Answered {
+        edit,
+        encoding,
+        never_announced: session.has_never_announced_work(),
+    })
 }
 
 /// Compiles the engine's proposal through the rename kernel and splits the
@@ -398,7 +436,7 @@ async fn compiled_move(
         moved_source,
         moved_next,
         rewrites,
-        engine_skip: None,
+        references_not_updated: None,
     })
 }
 
@@ -470,7 +508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_without_an_engine_carries_the_no_engine_skip() {
+    async fn plan_without_an_engine_names_the_absent_engine() {
         let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
         let resolution = plan_move(
             &reads,
@@ -486,8 +524,9 @@ mod tests {
         assert_eq!(plan.moved_next, plan.moved_source);
         assert!(plan.rewrites.is_empty());
         assert!(matches!(
-            plan.engine_skip,
-            Some(EngineSkip::NoEngine { ref language_segment }) if language_segment == "rust"
+            plan.references_not_updated,
+            Some(ReferencesNotUpdated::NoEngine { ref language_segment })
+                if language_segment == "rust"
         ));
     }
 
@@ -664,29 +703,35 @@ mod tests {
     }
 
     #[test]
-    fn skip_diagnostics_name_the_reason_and_carry_the_move_code() {
-        let skips = [
+    fn every_reason_names_itself_and_carries_the_move_code() {
+        let reasons = [
             (
-                EngineSkip::NoEngine {
+                ReferencesNotUpdated::NoEngine {
                     language_segment: "rust".to_owned(),
                 },
                 "no engine is configured for language rust",
             ),
             (
-                EngineSkip::CapabilityAbsent {
+                ReferencesNotUpdated::CapabilityAbsent {
                     engine: "fake".to_owned(),
                 },
                 "does not advertise workspace/willRenameFiles",
             ),
             (
-                EngineSkip::FilterMismatch {
+                ReferencesNotUpdated::FilterMismatch {
                     engine: "fake".to_owned(),
                 },
                 "filters do not cover the moved file",
             ),
+            (
+                ReferencesNotUpdated::AnsweredNothing {
+                    engine: "fake".to_owned(),
+                },
+                "has announced no work of its own",
+            ),
         ];
-        for (skip, expected) in skips {
-            let diagnostic = skip_diagnostic(&skip);
+        for (reason, expected) in reasons {
+            let diagnostic = reason.diagnostic();
             assert_eq!(diagnostic.severity, Severity::Warning);
             assert_eq!(
                 diagnostic.code.as_deref(),
