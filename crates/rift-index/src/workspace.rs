@@ -1342,10 +1342,14 @@ fn declaration_source(file: &IndexedFile, range: rift_syntax::ByteRange) -> &str
 }
 
 /// One lexical unit for a symbol declaration. `identity` is minted by the same
-/// [`rift_core::rust_symbol_identity`] the read service uses for that declaration's wire
+/// [`rift_core::symbol_identity`] the read service uses for that declaration's wire
 /// `SymbolId`, so a lexical hit's identity equals the id `get_symbol` returns for it.
 fn symbol_lexical_unit(file: &IndexedFile, symbol: &SyntaxSymbol) -> LexicalUnit {
-    let identity = rift_core::rust_symbol_identity(file.path().as_str(), &symbol.qualified_name);
+    let identity = rift_core::symbol_identity(
+        &file.syntax().language().identity_segment(),
+        file.path().as_str(),
+        &symbol.qualified_name,
+    );
     let content = declaration_source(file, symbol.range).to_owned();
     LexicalUnit::new(
         identity,

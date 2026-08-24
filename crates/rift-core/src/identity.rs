@@ -50,16 +50,18 @@ pub fn encode_path(value: &str) -> String {
     utf8_percent_encode(value, RIFT_PATH_ESCAPE_SET).to_string()
 }
 
-/// Mints the wire identity for one Rust symbol declaration:
-/// `rift://symbol/rust/{escaped_path}/{escaped_qualified_name}`.
+/// Mints the wire identity for one symbol declaration:
+/// `rift://symbol/{language_segment}/{escaped_path}/{escaped_qualified_name}`.
 ///
-/// The read service mints this as a declaration's `SymbolId`, and the lexical index mints
-/// the same spelling as a symbol lexical unit's identity, so a lexical hit's identity equals
-/// the id `get_symbol` returns for that declaration.
+/// `language_segment` is the declaring language's address spelling - `name`, or
+/// `name:dialect` - as `Language::identity_segment` mints it. The read service mints this as
+/// a declaration's `SymbolId`, and the lexical index mints the same spelling as a symbol
+/// lexical unit's identity, so a lexical hit's identity equals the id `get_symbol` returns
+/// for that declaration.
 #[must_use]
-pub fn rust_symbol_identity(path: &str, qualified_name: &str) -> String {
+pub fn symbol_identity(language_segment: &str, path: &str, qualified_name: &str) -> String {
     format!(
-        "rift://symbol/rust/{}/{}",
+        "rift://symbol/{language_segment}/{}/{}",
         encode_path(path),
         encode_path(qualified_name)
     )
@@ -471,7 +473,7 @@ mod tests {
         CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision, ProviderId,
         ProviderRevision, SourceResolverId, SourceResolverIdViolation, SourceRevision,
         SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
-        encode_path, rust_symbol_identity,
+        encode_path, symbol_identity,
     };
     use crate::SourcePath;
     use crate::constants::{
@@ -487,11 +489,30 @@ mod tests {
     }
 
     #[test]
-    fn rust_symbol_identity_pins_the_exact_wire_spelling_with_escaped_characters() {
-        let identity = rust_symbol_identity("src/café mod.rs", "Rift::separated name");
+    fn symbol_identity_pins_the_exact_wire_spelling_with_escaped_characters() {
+        let identity = symbol_identity("rust", "src/café mod.rs", "Rift::separated name");
         assert_eq!(
             identity,
             "rift://symbol/rust/src/caf%C3%A9%20mod.rs/Rift::separated%20name"
+        );
+    }
+
+    /// Pins a shipped rust `SymbolId` byte-for-byte: generalizing the minting
+    /// function over the language segment must not move any published rust
+    /// identity.
+    #[test]
+    fn symbol_identity_keeps_the_shipped_rust_spelling() {
+        assert_eq!(
+            symbol_identity("rust", "src/lib.rs", "Beacon"),
+            "rift://symbol/rust/src/lib.rs/Beacon"
+        );
+    }
+
+    #[test]
+    fn symbol_identity_files_a_dialect_segment_between_scheme_and_path() {
+        assert_eq!(
+            symbol_identity("typescript:tsx", "src/App.tsx", "render"),
+            "rift://symbol/typescript:tsx/src/App.tsx/render"
         );
     }
 

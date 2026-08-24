@@ -21,7 +21,7 @@ pub use identity::{
     ProviderId, ProviderRevision, RevisionError, RevisionFault, SourceResolverId,
     SourceResolverIdError, SourceResolverIdFault, SourceResolverIdViolation, SourceRevision,
     SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
-    encode_path, rust_symbol_identity,
+    encode_path, symbol_identity,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
 pub use measurement::{

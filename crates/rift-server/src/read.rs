@@ -17,7 +17,7 @@ use rift_protocol::read::{
     ReadWarning, RevisionId, SearchScope, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
     SourceUnitSpan, Symbol, SymbolId, SymbolOrigin, TextRange,
 };
-use rift_syntax::{ByteRange, SyntaxNode, SyntaxSymbol};
+use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
 
 /// One read-service failure: what was asked, and why it cannot be served.
@@ -211,7 +211,7 @@ impl ReadFault {
 /// Opaque read-service failure.
 pub type ReadError = Error<ReadFault>;
 
-/// Immutable direct-filesystem Rust read service.
+/// Immutable direct-filesystem workspace read service.
 #[derive(Debug)]
 pub struct ReadService {
     index: WorkspaceIndex,
@@ -339,7 +339,7 @@ impl ReadService {
         self.index.chunked_text_files()
     }
 
-    /// Reads Rust syntax nodes covering one UTF-8 byte position. The tree
+    /// Reads syntax nodes covering one UTF-8 byte position. The tree
     /// the nodes come from is the one this service holds; `params.rev` was
     /// already honored by building the service at that revision.
     ///
@@ -380,7 +380,7 @@ impl ReadService {
         })
     }
 
-    /// Finds Rust declarations by name.
+    /// Finds declarations by name.
     ///
     /// # Errors
     ///
@@ -481,13 +481,14 @@ pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>
 }
 
 fn wire_node(file: &IndexedFile, node: &SyntaxNode) -> Node {
+    let language = file.syntax().language();
     Node {
         id: node_id(file, node),
         symbol: symbol_for_range(file, node.range).map(|symbol| symbol_id(file, symbol)),
         unit: file_id(file.path()),
-        language: rust_language(),
-        kind: ExactKind(format!("rust.{}", node.kind)),
-        facets: node_facets(node),
+        language: language.clone(),
+        kind: wire_kind(language, &node.kind),
+        facets: language_provider(language).node_facets(&node.kind),
         range: text_range(node.range),
         regions: Vec::new(),
         parent: None,
@@ -503,17 +504,20 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
         .iter()
         .find(|node| node.range == matched.symbol.range);
     node.map_or_else(
-        || Node {
-            id: NodeId(node_address(matched.file, matched.symbol.range)),
-            symbol: Some(symbol_id(matched.file, matched.symbol)),
-            unit: file_id(matched.file.path()),
-            language: rust_language(),
-            kind: ExactKind(format!("rust.{}", matched.symbol.kind)),
-            facets: vec![NodeFacet::Declaration, NodeFacet::Definition],
-            range: text_range(matched.symbol.range),
-            regions: Vec::new(),
-            parent: None,
-            extensions: Extensions(BTreeMap::new()),
+        || {
+            let language = matched.file.syntax().language();
+            Node {
+                id: NodeId(node_address(matched.file, matched.symbol.range)),
+                symbol: Some(symbol_id(matched.file, matched.symbol)),
+                unit: file_id(matched.file.path()),
+                language: language.clone(),
+                kind: wire_kind(language, matched.symbol.kind),
+                facets: vec![NodeFacet::Declaration, NodeFacet::Definition],
+                range: text_range(matched.symbol.range),
+                regions: Vec::new(),
+                parent: None,
+                extensions: Extensions(BTreeMap::new()),
+            }
         },
         |node| wire_node(matched.file, node),
     )
@@ -521,11 +525,12 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
 
 pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
     let symbol = matched.symbol;
+    let language = matched.file.syntax().language();
     Symbol {
         id: symbol_id(matched.file, symbol),
-        language: rust_language(),
+        language: language.clone(),
         name: symbol.name.clone(),
-        kind: ExactKind(format!("rust.{}", symbol.kind)),
+        kind: wire_kind(language, symbol.kind),
         facets: symbol.facets.clone(),
         origin: SymbolOrigin {
             location: Some(SourceLocation::Project { package: None }),
@@ -533,7 +538,8 @@ pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
             unit: Some(source_unit_id(matched.file.path())),
         },
         container: symbol.container.as_ref().map(|container| {
-            SymbolId(rift_core::rust_symbol_identity(
+            SymbolId(rift_core::symbol_identity(
+                &language.identity_segment(),
                 matched.file.path().as_str(),
                 container,
             ))
@@ -576,11 +582,24 @@ fn text_range(range: ByteRange) -> TextRange {
     }
 }
 
-pub(crate) fn rust_language() -> Language {
-    Language {
-        name: "rust".to_owned(),
-        dialect: None,
-    }
+/// Composes the wire kind for one grammar fact: the language name, a dot,
+/// the provider's kind word, as in `rust.function_item`.
+fn wire_kind(language: &Language, kind: &str) -> ExactKind {
+    ExactKind(format!("{}.{kind}", language.name))
+}
+
+/// The registered provider filing facts under `language`.
+///
+/// Panics when no registered provider serves it: the index only produces
+/// documents through registered providers, so an unserved language here is a
+/// programmer invariant break, not a reachable operating state.
+fn language_provider(language: &Language) -> &'static dyn SyntaxProvider {
+    registry::provider_for_language(language).unwrap_or_else(|| {
+        panic!(
+            "an indexed document's language must have a registered syntax provider: language={}",
+            language.identity_segment()
+        )
+    })
 }
 
 pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
@@ -605,7 +624,8 @@ pub(crate) fn project_path(path: &CoreProjectPath) -> ProjectPath {
 }
 
 fn symbol_id(file: &IndexedFile, symbol: &SyntaxSymbol) -> SymbolId {
-    SymbolId(rift_core::rust_symbol_identity(
+    SymbolId(rift_core::symbol_identity(
+        &file.syntax().language().identity_segment(),
         file.path().as_str(),
         &symbol.qualified_name,
     ))
@@ -617,7 +637,8 @@ fn node_id(file: &IndexedFile, node: &SyntaxNode) -> NodeId {
 
 fn node_address(file: &IndexedFile, range: ByteRange) -> String {
     format!(
-        "rift://node/rust/{}@{}-{}#{}",
+        "rift://node/{}/{}@{}-{}#{}",
+        file.syntax().language().identity_segment(),
         rift_core::encode_path(file.path().as_str()),
         range.start,
         range.end,
@@ -736,23 +757,6 @@ fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&SyntaxSymbo
         .find(|symbol| symbol.range == range || symbol.item_range == range)
 }
 
-fn node_facets(node: &SyntaxNode) -> Vec<NodeFacet> {
-    let mut facets = Vec::new();
-    if node.kind.ends_with("_item") || node.kind.ends_with("_declaration") {
-        facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
-    }
-    if node.kind.ends_with("_expression") {
-        facets.push(NodeFacet::Expression);
-    }
-    if node.kind.ends_with("_statement") {
-        facets.push(NodeFacet::Statement);
-    }
-    if node.kind.contains("comment") {
-        facets.push(NodeFacet::Comment);
-    }
-    facets
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -760,7 +764,8 @@ mod tests {
 
     use rift_core::SourceVisibility;
     use rift_protocol::read::{
-        GetSymbolParams, NodesParams, NodesResult, ProjectPath, ProjectionId, RevisionId,
+        GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult, ProjectPath, ProjectionId,
+        RevisionId,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -1441,6 +1446,47 @@ pub fn compute() -> i32 {
             json!({ "page_index": 40, "total_pages": 2 })
         );
         Ok(())
+    }
+
+    /// The wire kind composes from the language name alone: a dialect
+    /// separates identity segments, never the kind spelling.
+    #[test]
+    fn wire_kind_joins_the_language_name_and_kind_with_a_dot() {
+        let rust = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        assert_eq!(
+            super::wire_kind(&rust, "function_item").0,
+            "rust.function_item"
+        );
+        let dialect = Language {
+            name: "typescript".to_owned(),
+            dialect: Some("tsx".to_owned()),
+        };
+        assert_eq!(super::wire_kind(&dialect, "class").0, "typescript.class");
+    }
+
+    #[test]
+    fn language_provider_routes_node_facets_through_the_registry() {
+        let rust = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        assert_eq!(
+            super::language_provider(&rust).node_facets("function_item"),
+            [NodeFacet::Declaration, NodeFacet::Definition]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must have a registered syntax provider: language=stub:mock")]
+    fn language_provider_panics_naming_an_unregistered_language() {
+        let stub = Language {
+            name: "stub".to_owned(),
+            dialect: Some("mock".to_owned()),
+        };
+        let _ = super::language_provider(&stub);
     }
 
     #[test]

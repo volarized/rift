@@ -19,11 +19,11 @@ use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::read::{
     ReadError, ReadFault, ReadService, accepted_limit, excerpt, file_id, page, project_path,
-    rust_language, source_span, validate_common, wire_symbol,
+    source_span, validate_common, wire_symbol,
 };
 
 impl ReadService {
-    /// Searches Rust declarations and source lines, optionally narrowed or extended by
+    /// Searches indexed declarations and source lines, optionally narrowed or extended by
     /// `params.paths`, merged with `lexical_matches` from the caller's lexical search-index
     /// tier. `lexical_matches` is empty when that tier is unavailable or its stamped
     /// revision no longer matches what is published - the caller decides that, this method
@@ -306,7 +306,7 @@ fn file_search_hit(file: &IndexedFile, line_index: usize, text: String) -> Searc
                     size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
                     executable: false,
                 },
-                languages: vec![rust_language()],
+                languages: vec![file.syntax().language().clone()],
                 regions: Vec::new(),
                 semantic: true,
             },
@@ -388,8 +388,13 @@ fn resolve_symbol<'a>(
     identity: &str,
 ) -> Option<(&'a IndexedFile, &'a SyntaxSymbol)> {
     let file = index.file(path)?;
+    let language_segment = file.syntax().language().identity_segment();
     let symbol = file.syntax().symbols().iter().find(|symbol| {
-        rift_core::rust_symbol_identity(file.path().as_str(), &symbol.qualified_name) == identity
+        rift_core::symbol_identity(
+            &language_segment,
+            file.path().as_str(),
+            &symbol.qualified_name,
+        ) == identity
     })?;
     Some((file, symbol))
 }
@@ -442,7 +447,8 @@ fn merge_symbol_hit(
     symbol: &SyntaxSymbol,
     score: f64,
 ) {
-    let identity = SymbolId(rift_core::rust_symbol_identity(
+    let identity = SymbolId(rift_core::symbol_identity(
+        &file.syntax().language().identity_segment(),
         file.path().as_str(),
         &symbol.qualified_name,
     ));
@@ -571,7 +577,7 @@ mod tests {
 
     use super::{
         ByteRange, File, ReadFault, ReadService, SearchHit, SearchHitTarget, SymbolMatchRank,
-        rust_language, symbol_match_score,
+        symbol_match_score,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1741,7 +1747,10 @@ pub fn compute() -> i32 {
                     id: NodeId(id.to_owned()),
                     symbol: None,
                     unit: FileId("rift://file/lib.rs".to_owned()),
-                    language: rust_language(),
+                    language: rift_protocol::read::Language {
+                        name: "rust".to_owned(),
+                        dialect: None,
+                    },
                     kind: ExactKind("rust.function_item".to_owned()),
                     facets: Vec::new(),
                     range: TextRange { start: 0, end: 1 },
