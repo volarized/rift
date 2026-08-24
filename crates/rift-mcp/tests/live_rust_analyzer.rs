@@ -244,15 +244,42 @@ async fn applied_move_rewrites_the_module_declaration_and_the_import() -> TestRe
 const ARGUMENT_PATCH: &str =
     "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2, 3)\n";
 
+/// The inverse of [`ARGUMENT_PATCH`], restoring the single argument.
+const ARGUMENT_REVERT_PATCH: &str =
+    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2, 3)\n+    beacon(2)\n";
+
+/// Lands the arity error until rust-analyzer reports it, answering with the
+/// applied change that carried the finding.
+async fn reported_arity_error(client: &RunningService<RoleClient, ()>) -> TestResult<Value> {
+    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
+        let landed = tool_request("patch", &json!({ "patch": ARGUMENT_PATCH }));
+        let structured = call_retrying_acceptance(client, landed).await?;
+        if !coded_findings(&structured, "E0107").is_empty() {
+            return Ok(structured);
+        }
+        let reverted = tool_request("patch", &json!({ "patch": ARGUMENT_REVERT_PATCH }));
+        call_retrying_acceptance(client, reverted).await?;
+        tokio::time::sleep(WARMUP_PAUSE).await;
+    }
+    Err("rust-analyzer reported no arity error within the warm-up bound".into())
+}
+
 /// The applied change carries rust-analyzer's own finding for the file it
 /// changed: the pull runs on the document Rift just wrote, so the answer
 /// is the engine's reading of the landed bytes.
 ///
-/// One patch, one assertion. The engine answers a pull it takes while it
-/// is still analyzing with an empty report, which reads exactly like clean
-/// bytes; the server tells the two apart from the engine's own
-/// `$/progress` traffic and pulls again until the engine has settled, so
-/// the finding rides the result of the change that produced it.
+/// The server absorbs every wait it has evidence for: a pull answered
+/// while the engine reports outstanding `$/progress` is provisional and
+/// sent again. This finding is beyond that evidence. rust-analyzer derives
+/// it from a cargo check it runs on its own schedule and never announces
+/// as progress, so on a loaded runner it reports progress begun, progress
+/// ended, and an empty pull for a file it has not checked yet - settled
+/// and clean, as far as any observer can tell. Waiting on that would mean
+/// waiting on every clean file for a signal that never comes.
+///
+/// So the scenario repeats instead: the error lands, and an empty report
+/// reverts it and lands it again, each attempt a real change with a real
+/// pull, bounded by the warm-up budget.
 #[tokio::test]
 async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     if !engine_live() {
@@ -263,11 +290,7 @@ async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     require_rust_analyzer(directory.path());
     warmed_engine(&client).await?;
 
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request("patch", &json!({ "patch": ARGUMENT_PATCH })),
-    )
-    .await?;
+    let structured = reported_arity_error(&client).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(structured["summary"]["paths"], json!(["caller.rs"]));
     let findings = coded_findings(&structured, "E0107");
