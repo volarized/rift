@@ -178,3 +178,33 @@ jobs:
       - run: >-
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py
+
+  # The live-engine suites against real language servers. One job owns
+  # every engine-live suite, so every engine's resolver installs here:
+  # rustup serves rust-analyzer today, and bun waits for the typescript
+  # suite. rust-analyzer needs no display and no network; it does need
+  # cargo metadata to succeed inside the fixture, and every fixture is a
+  # self-contained cargo project in a tempdir.
+  engines:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: taiki-e/install-action@v2.86.3
+        with:
+          tool: just
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+      # The component lands on the default toolchain, the one the engine
+      # child resolves: the fixtures run outside this repository, where
+      # rust-toolchain.toml no longer applies, so the step runs outside it
+      # too. Adding an installed component again is a no-op.
+      - run: rustup component add rust-analyzer
+        working-directory: ${{ runner.temp }}
+      - run: just engine-test
