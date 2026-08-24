@@ -363,10 +363,12 @@ async fn engine_exchange(
 
 /// One open-prepare-rename-close conversation on a running session.
 ///
-/// An engine that answers the prepare or the rename with a JSON-RPC error
-/// declines the request and stays serving; the document is closed before
-/// the verdict returns. A fault that ends the session propagates and skips
-/// the close, because an ended session refuses it anyway.
+/// An engine that answers the prepare or the rename with its verdict on
+/// the request declines it and stays serving; the document is closed
+/// before the verdict returns. Every other fault propagates and skips the
+/// close: a refusal the engine invites again goes back to the slot, which
+/// runs this conversation from its `didOpen` again, and a fault that ended
+/// the session would refuse the close anyway.
 async fn exchange_on_session(
     session: &mut EngineSession,
     target: &RenameTarget,
@@ -396,14 +398,32 @@ async fn exchange_on_session(
                 version,
             })
         }
-        Err(error) => {
-            if let EngineFault::Refused { message, .. } = error.fault() {
-                let detail = format!("the engine declined the rename: {message}");
+        Err(error) => match declined_by(&error) {
+            Some(declined) => {
                 session.close(&target.path).await?;
-                return Ok(EngineAnswer::Declined { detail });
+                Ok(declined)
             }
-            Err(error)
+            None => Err(error),
+        },
+    }
+}
+
+/// The engine's verdict on the request, as the decline to report.
+///
+/// Only a refusal the engine will not answer differently is a verdict.
+/// A refusal it invites again is transient, so it goes back to the slot,
+/// which sends the whole conversation again under the engine's
+/// `[engines.<name>.retry]` table; so does every fault that is not a
+/// refusal at all.
+fn declined_by(error: &EngineError) -> Option<EngineAnswer> {
+    let fault = error.fault();
+    match fault {
+        EngineFault::Refused { message, .. } if !fault.is_retryable_refusal() => {
+            Some(EngineAnswer::Declined {
+                detail: format!("the engine declined the rename: {message}"),
+            })
         }
+        _ => None,
     }
 }
 
@@ -423,14 +443,10 @@ async fn prepare_declined(
         Ok(None) => Ok(Some(EngineAnswer::Declined {
             detail: "the engine serves no rename at this declaration".to_owned(),
         })),
-        Err(error) => {
-            if let EngineFault::Refused { message, .. } = error.fault() {
-                return Ok(Some(EngineAnswer::Declined {
-                    detail: format!("the engine declined the rename: {message}"),
-                }));
-            }
-            Err(error)
-        }
+        Err(error) => match declined_by(&error) {
+            Some(declined) => Ok(Some(declined)),
+            None => Err(error),
+        },
     }
 }
 
