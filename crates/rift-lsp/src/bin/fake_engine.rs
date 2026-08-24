@@ -11,6 +11,7 @@ use std::io::{Read, StdinLock, Write};
 use std::path::PathBuf;
 
 use lsp_types::error_codes::SERVER_CANCELLED;
+use rift_lsp::correlation::METHOD_NOT_FOUND_CODE;
 use rift_lsp::framing::{Framing, MESSAGE_BYTES_MAX};
 use serde_json::{Value, json};
 
@@ -35,13 +36,15 @@ const PROGRESS_TOKEN: &str = "fake/analysis";
 /// and begins it, exactly as a language server loading a project does.
 /// `reports-progress` ends the token before it answers a rename,
 /// `analyzes-then-serves` and `refuses-while-analyzing` before the second
-/// rename each is asked for, `announces-then-answers-nothing` before the
+/// rename each is asked for, `analyzes-then-reports` before the second
+/// diagnostic pull, `announces-then-answers-nothing` before the
 /// will-rename it answers with `null`, and `never-ends-progress` never
 /// ends it at all.
 const PROGRESS_BEHAVIORS: &[&str] = &[
     "reports-progress",
     "analyzes-then-serves",
     "refuses-while-analyzing",
+    "analyzes-then-reports",
     "announces-then-answers-nothing",
     "never-ends-progress",
 ];
@@ -116,6 +119,10 @@ struct EngineState {
     root: String,
     /// Each opened document's text, by URI.
     opened: HashMap<String, String>,
+    /// Diagnostic pulls answered so far, counting the one in flight.
+    diagnostic_pulls: usize,
+    /// Will-rename requests answered so far, counting the one in flight.
+    will_renames: usize,
 }
 
 /// Reads frames and dispatches until stdin closes or the script exits.
@@ -199,8 +206,8 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
                 }),
             ),
         },
-        "workspace/willRenameFiles" => answer_will_rename(behavior, message),
-        "textDocument/diagnostic" => answer_diagnostic(behavior, id),
+        "workspace/willRenameFiles" => answer_will_rename(behavior, message, state),
+        "textDocument/diagnostic" => answer_diagnostic(behavior, id, state),
         _ => {}
     }
 }
@@ -211,52 +218,211 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
 /// how many times the engine was asked. The default answer is an edit set
 /// holding no edit, which says exactly what a `null` answer says;
 /// `announces-then-answers-nothing` ends the work it announced before
-/// giving the same nothing, so its silence is its own.
-fn answer_will_rename(behavior: &str, message: &Value) {
+/// giving that same nothing, so its silence is its own verdict, and
+/// `moves-null-then-imports` answers nothing first and the stem rename on
+/// the request after it.
+fn answer_will_rename(behavior: &str, message: &Value, state: &mut EngineState) {
     record_lifecycle("will-rename");
+    state.will_renames += 1;
     let id = &message["id"];
-    if behavior == "announces-then-answers-nothing" {
-        end_progress();
-        respond(id, &Value::Null);
-        return;
+    match behavior {
+        "parks-on-move" => park(),
+        "moves-null" => respond(id, &Value::Null),
+        "announces-then-answers-nothing" => {
+            end_progress();
+            respond(id, &Value::Null);
+        }
+        "moves-null-then-imports" if state.will_renames == 1 => respond(id, &Value::Null),
+        "moves-outside-root" => {
+            let edit = json!({"range": zero_range(), "newText": "moved"});
+            respond(
+                id,
+                &json!({"changes": {"file:///rift-elsewhere/out.rs": [edit]}}),
+            );
+        }
+        "moves-imports" | "moves-null-then-imports" => {
+            respond(id, &stem_rename_answer(message, state));
+        }
+        _ => {
+            let new_uri = message["params"]["files"][0]["newUri"].clone();
+            respond(
+                id,
+                &json!({"changes": {(new_uri.as_str().unwrap_or_default()): []}}),
+            );
+        }
     }
-    let new_uri = message["params"]["files"][0]["newUri"].clone();
-    respond(
-        id,
-        &json!({"changes": {(new_uri.as_str().unwrap_or_default()): []}}),
-    );
 }
 
 /// Answers one diagnostic pull under the selected behavior.
 ///
-/// Every pull is recorded in the lifecycle log first, so a test counts how
-/// many times the engine was asked, and `pulls-empty-then-reports` reads
-/// that count back: it answers the first pull the way an engine that has
-/// not analyzed the document does - cleanly and with nothing to say - and
-/// carries its finding on the pull after it.
-fn answer_diagnostic(behavior: &str, id: &Value) {
+/// The default is a full report with no items, so applied-change pulls in
+/// unrelated tests stay clean; the scripted behaviors return items, an
+/// unchanged report, a refusal, or death mid-request. The refusing
+/// behaviors stamp the pull's ordinal into their message, so a test reads
+/// how many times it was asked off the wire. `analyzes-then-reports`
+/// answers the first pull the way a loading engine does - cleanly and with
+/// nothing to say - and ends its progress before the pull that carries the
+/// finding; `pulls-empty-then-reports` gives the same first answer without
+/// announcing any work at all.
+fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
     record_lifecycle("diagnostic");
+    state.diagnostic_pulls += 1;
+    let pull = state.diagnostic_pulls;
     match behavior {
         "server-requests" => respond(id, &json!({"kind": "unchanged", "resultId": "1"})),
-        "pulls-empty-then-reports" if recorded_lifecycle("diagnostic") == 1 => {
-            respond(id, &json!({"kind": "full", "items": []}));
-        }
-        _ if PROGRESS_BEHAVIORS.contains(&behavior) => {
-            // An engine still loading answers cleanly and says nothing.
-            respond(id, &json!({"kind": "full", "items": []}));
-        }
-        _ => respond(
+        "happy" => respond(
             id,
             &json!({"kind": "full", "items": [diagnostic("pulled diagnostic")]}),
         ),
+        "diagnostic-severities" | "renames-word-diagnostics" => {
+            respond(id, &json!({"kind": "full", "items": severity_items()}));
+        }
+        "diagnostic-flood" => {
+            let items: Vec<Value> = (0..32)
+                .map(|index| diagnostic(&format!("flood {index}")))
+                .collect();
+            respond(id, &json!({"kind": "full", "items": items}));
+        }
+        "dies-on-diagnostic" => std::process::exit(0),
+        "cancels-first-diagnostic" if pull == 1 => refuse_pull(id, SERVER_CANCELLED, pull),
+        "cancels-first-diagnostic" => respond(
+            id,
+            &json!({"kind": "full", "items": [diagnostic(&format!("settled on pull {pull}"))]}),
+        ),
+        "analyzes-then-reports" if pull == 1 => {
+            // A pull answered mid-analysis reports nothing yet, exactly as
+            // clean bytes would.
+            respond(id, &json!({"kind": "full", "items": []}));
+        }
+        "analyzes-then-reports" => {
+            end_progress();
+            respond(
+                id,
+                &json!({"kind": "full", "items": [diagnostic("settled finding")]}),
+            );
+        }
+        "pulls-empty-then-reports" if pull == 1 => {
+            respond(id, &json!({"kind": "full", "items": []}));
+        }
+        "pulls-empty-then-reports" => respond(
+            id,
+            &json!({"kind": "full", "items": [diagnostic("settled finding")]}),
+        ),
+        "cancels-every-diagnostic" => refuse_pull(id, SERVER_CANCELLED, pull),
+        "refuses-diagnostic" => refuse_pull(id, METHOD_NOT_FOUND_CODE, pull),
+        _ => respond(id, &json!({"kind": "full", "items": []})),
     }
 }
 
+/// Refuses one diagnostic pull, naming the code and the pull's ordinal.
+fn refuse_pull(id: &Value, code: i64, pull: usize) {
+    print_message(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": format!("declined pull {pull}")},
+    }));
+}
+
+/// One item per LSP severity, plus a string and a numeric code.
+fn severity_items() -> Vec<Value> {
+    vec![
+        json!({
+            "range": zero_range(),
+            "severity": 1,
+            "code": "E100",
+            "message": "scripted error",
+        }),
+        json!({"range": zero_range(), "severity": 2, "message": "scripted warning"}),
+        json!({
+            "range": zero_range(),
+            "severity": 3,
+            "code": 7,
+            "message": "scripted information",
+        }),
+        json!({"range": zero_range(), "severity": 4, "message": "scripted hint"}),
+    ]
+}
+
+/// The stem-rename proposal for one will-rename request: every
+/// word-boundary occurrence of the old file stem becomes the new stem,
+/// across the root's `.rs` files read from disk. Edits for the moved file
+/// itself ride under its old URI.
+fn stem_rename_answer(message: &Value, state: &EngineState) -> Value {
+    let old_uri = message["params"]["files"][0]["oldUri"]
+        .as_str()
+        .unwrap_or_default();
+    let new_uri = message["params"]["files"][0]["newUri"]
+        .as_str()
+        .unwrap_or_default();
+    let old_stem = file_stem(old_uri);
+    let new_stem = file_stem(new_uri);
+    let mut changes = serde_json::Map::new();
+    for path in rust_files(&state.root) {
+        let path_uri = format!("file://{}", path.display());
+        let text = std::fs::read_to_string(&path).expect("fake engine reads sources");
+        let edits = word_edits(&text, &old_stem, &new_stem);
+        if !edits.is_empty() {
+            changes.insert(path_uri, Value::Array(edits));
+        }
+    }
+    json!({ "changes": changes })
+}
+
+/// The final path segment of one URI, without its extension.
+fn file_stem(uri: &str) -> String {
+    let name = uri.rsplit('/').next().unwrap_or_default();
+    name.rsplit_once('.')
+        .map_or(name, |(stem, _)| stem)
+        .to_owned()
+}
+
 /// The initialize result each behavior advertises.
+///
+/// The shaped arms cover the capability grid a live engine pair exhibits:
+/// `no-file-operations` advertises pulls without will-rename (the ty
+/// shape), `no-pull-diagnostics` advertises will-rename without pulls at
+/// the UTF-16 default (the typescript-language-server shape), and
+/// `python-filters` advertises will-rename filters that cover no `.rs`
+/// file.
 fn initialize_answer(behavior: &str) -> Value {
     match behavior {
         "no-rename-capability" => json!({"capabilities": {}}),
         "bad-encoding" => json!({"capabilities": {"positionEncoding": "utf-32"}}),
+        "no-file-operations" => json!({
+            "capabilities": {
+                "positionEncoding": "utf-8",
+                "renameProvider": {"prepareProvider": true},
+                "diagnosticProvider": {
+                    "identifier": "fake",
+                    "interFileDependencies": false,
+                    "workspaceDiagnostics": false,
+                },
+            },
+        }),
+        "no-pull-diagnostics" => json!({
+            "capabilities": {
+                "renameProvider": {"prepareProvider": true},
+                "workspace": {
+                    "fileOperations": {
+                        "willRename": {
+                            "filters": [{"pattern": {"glob": "**/*"}}],
+                        },
+                    },
+                },
+            },
+        }),
+        "python-filters" => json!({
+            "capabilities": {
+                "positionEncoding": "utf-8",
+                "workspace": {
+                    "fileOperations": {
+                        "willRename": {
+                            "filters": [{"pattern": {"glob": "**/*.py"}}],
+                        },
+                    },
+                },
+            },
+        }),
         _ => json!({
             "capabilities": {
                 "positionEncoding": "utf-8",
@@ -300,7 +466,7 @@ fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput, state
             );
             return;
         }
-        "renames-word" => {
+        "renames-word" | "renames-word-diagnostics" => {
             respond(&message["id"], &word_rename_answer(message, state));
             return;
         }

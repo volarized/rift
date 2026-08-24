@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "Model Context Protocol transport for Rift"
+# Every suite's helper file sits beside it in `tests/`, where Cargo's own
+# discovery would compile each helper as a test binary of its own. The
+# suites are listed below instead, and a helper is reached with
+# `mod <name>;` from each suite that uses it.
+autotests = false
 
 [lints]
 workspace = true
@@ -38,3 +43,35 @@ rift-history = { workspace = true, features = ["fixtures"] }
 jsonschema.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
+
+[[test]]
+name = "configuration_admission"
+path = "tests/configuration_admission.rs"
+
+[[test]]
+name = "engine_diagnostics"
+path = "tests/engine_diagnostics.rs"
+
+[[test]]
+name = "error_contract"
+path = "tests/error_contract.rs"
+
+[[test]]
+name = "http_serve"
+path = "tests/http_serve.rs"
+
+[[test]]
+name = "move_file"
+path = "tests/move_file.rs"
+
+[[test]]
+name = "rename_symbol"
+path = "tests/rename_symbol.rs"
+
+[[test]]
+name = "schema_export"
+path = "tests/schema_export.rs"
+
+[[test]]
+name = "surface_validation"
+path = "tests/surface_validation.rs"

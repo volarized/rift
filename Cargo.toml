@@ -29,6 +29,7 @@ diffy = "0.5.1"
 flate2 = "1.1.9"
 fs4 = "1.1.0"
 gix = { version = "0.86.0", default-features = false, features = ["revision", "sha1"] }
+globset = { version = "0.4.20", default-features = false }
 ignore = { version = "0.4.23", default-features = false }
 lsp-types = "0.97.0"
 notify = "=8.2.0"

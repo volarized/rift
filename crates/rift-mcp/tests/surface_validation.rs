@@ -119,6 +119,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
     ];
     requests.extend(patch_corpus());
+    requests.extend(move_file_corpus());
     requests.extend(revision_read_corpus());
     requests.extend(insert_symbol_file_target_corpus());
     requests.extend(lexical_search_corpus());
@@ -161,6 +162,35 @@ fn patch_corpus() -> Vec<(&'static str, Value)> {
                 "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
             }),
         ),
+    ]
+}
+
+/// `move_file` requests: an applied move into a created directory - the
+/// fixture configures no `[engines]` tables, so its summary carries the
+/// references-not-updated warning - a missing source, and an occupied
+/// destination. `fresh.rs` exists because the patch corpus created it.
+fn move_file_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "move_file",
+            json!({ "from": "fresh.rs", "to": "moved/fresh.rs" }),
+        ),
+        (
+            "move_file",
+            json!({ "from": "ghost.rs", "to": "ghost_two.rs" }),
+        ),
+        ("move_file", json!({ "from": "lib.rs", "to": "notes.txt" })),
+    ]
+}
+
+/// `move_file` requests that must fail the advertised input schema before
+/// any tool resolves them: a state path, an escaping path, and an unknown
+/// field.
+fn invalid_move_file_corpus() -> Vec<Value> {
+    vec![
+        json!({ "from": "lib.rs", "to": ".rift/x.rs" }),
+        json!({ "from": "../escape.rs", "to": "lib2.rs" }),
+        json!({ "from": "lib.rs", "to": "lib2.rs", "overwrite": true }),
     ]
 }
 
@@ -668,6 +698,24 @@ async fn insert_symbol_schema_rejects_invalid_target_combinations() -> TestResul
         assert!(
             input_validator.iter_errors(&request).next().is_some(),
             "insert_symbol request must fail its advertised schema: {request:#}"
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn move_file_schema_rejects_invalid_requests() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+    let (input_validator, _) = &validators["move_file"];
+    for request in invalid_move_file_corpus() {
+        assert!(
+            input_validator.iter_errors(&request).next().is_some(),
+            "move_file request must fail its advertised schema: {request:#}"
         );
     }
 

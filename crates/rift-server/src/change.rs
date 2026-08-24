@@ -24,9 +24,10 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource, registry};
 use sha2::{Digest as _, Sha256};
 
+use crate::move_file::MovePlan;
 use crate::patch::{self, FileRewrite, RewriteKind};
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id, node_witness};
-use crate::rename::{RenamePlan, survivor_findings};
+use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
 
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
@@ -337,19 +338,16 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(refusal) = self.rename_precondition_failure(reads, plan)? {
-            return Ok(refusal);
-        }
-        let rewrites: Vec<FileRewrite> = plan
+        let checks = plan
             .rewrites
             .iter()
-            .map(|rewrite| FileRewrite {
-                path: rewrite.path.clone(),
-                kind: RewriteKind::Modify,
-                previous_len: rewrite.base_source.len() as u64,
-                next_source: rewrite.next_source.clone(),
-            })
-            .collect();
+            .map(|rewrite| (&rewrite.path, rewrite.base_source.as_str()));
+        if let Some(refusal) =
+            self.rewrite_precondition_failure(reads, &plan.symbol_addresses(), checks)?
+        {
+            return Ok(refusal);
+        }
+        let rewrites: Vec<FileRewrite> = plan.rewrites.iter().map(modify_rewrite).collect();
         let mut result = self.apply_rewrites(reads, &rewrites)?;
         if let ChangeResult::Applied { summary } = &mut result {
             summary.diagnostics.extend(survivor_findings(reads, plan));
@@ -357,23 +355,90 @@ impl ChangeService {
         Ok(result)
     }
 
-    /// The first rename precondition that fails: a rewritten file gone from
-    /// the index, or one whose disk bytes drifted from the bytes the plan
-    /// was compiled against. Nothing when every file still matches.
-    fn rename_precondition_failure(
+    /// Verifies and writes one move plan atomically: every reference
+    /// rewrite, the destination's new file, and the source's removal land
+    /// or roll back together.
+    ///
+    /// The plan's bases are re-proven against the disk first - the same
+    /// proof `apply_rename` runs - plus the move's own conditions: the
+    /// source still served, its bytes unchanged, the destination still
+    /// absent. An applied move whose engine was skipped carries the
+    /// references-not-updated warning on its summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for a filesystem failure; a condition that no
+    /// longer holds returns a refused [`ChangeResult`] instead.
+    pub fn apply_move(
         &self,
         reads: &ReadService,
-        plan: &RenamePlan,
+        plan: &MovePlan,
+    ) -> Result<ChangeResult, ReadError> {
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let checks = std::iter::once((&plan.from, plan.moved_source.as_str())).chain(
+            plan.rewrites
+                .iter()
+                .map(|rewrite| (&rewrite.path, rewrite.base_source.as_str())),
+        );
+        if let Some(refusal) = self.rewrite_precondition_failure(reads, &[], checks)? {
+            return Ok(refusal);
+        }
+        if self.root.join(plan.to.as_str()).symlink_metadata().is_ok() {
+            return Ok(ChangeResult::refused(
+                RefusalReason::UnmetPrecondition,
+                vec![OperationPrecondition::new(
+                    OperationPreconditionKind::TargetExists,
+                    OperationPreconditionStatus::Failed,
+                    Vec::new(),
+                    vec![plan.to.as_str().to_owned()],
+                    PreconditionValue::Boolean { value: false },
+                    PreconditionValue::Boolean { value: true },
+                )],
+            ));
+        }
+        let mut rewrites: Vec<FileRewrite> = plan.rewrites.iter().map(modify_rewrite).collect();
+        rewrites.push(FileRewrite {
+            path: plan.to.clone(),
+            kind: RewriteKind::Create,
+            previous_len: 0,
+            next_source: plan.moved_next.clone(),
+        });
+        rewrites.push(FileRewrite {
+            path: plan.from.clone(),
+            kind: RewriteKind::Delete,
+            previous_len: plan.moved_source.len() as u64,
+            next_source: String::new(),
+        });
+        rewrites.sort_by(|first, second| first.path.as_str().cmp(second.path.as_str()));
+        let mut result = self.apply_rewrites(reads, &rewrites)?;
+        if let ChangeResult::Applied { summary } = &mut result
+            && let Some(reason) = &plan.references_not_updated
+        {
+            summary.diagnostics.push(reason.diagnostic());
+        }
+        Ok(result)
+    }
+
+    /// The first rewrite precondition that fails: a planned file gone from
+    /// the index, or one whose disk bytes drifted from the bytes the plan
+    /// was compiled against. Nothing when every file still matches.
+    fn rewrite_precondition_failure<'plan>(
+        &self,
+        reads: &ReadService,
+        addresses: &[PreconditionAddress],
+        checks: impl Iterator<Item = (&'plan CoreProjectPath, &'plan str)>,
     ) -> Result<Option<ChangeResult>, ReadError> {
-        for rewrite in &plan.rewrites {
-            let path = &rewrite.path;
+        for (path, base_source) in checks {
             if reads.index().file(path).is_none() {
                 return Ok(Some(ChangeResult::refused(
                     RefusalReason::UnmetPrecondition,
                     vec![OperationPrecondition::new(
                         OperationPreconditionKind::TargetExists,
                         OperationPreconditionStatus::Failed,
-                        plan.symbol_addresses(),
+                        addresses.to_vec(),
                         vec![path.as_str().to_owned()],
                         PreconditionValue::Boolean { value: true },
                         PreconditionValue::Boolean { value: false },
@@ -382,16 +447,16 @@ impl ChangeService {
             }
             let disk = fs::read_to_string(self.root.join(path.as_str()))
                 .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
-            if disk != rewrite.base_source {
+            if disk != base_source {
                 return Ok(Some(ChangeResult::refused(
                     RefusalReason::UnmetPrecondition,
                     vec![OperationPrecondition::new(
                         OperationPreconditionKind::SourceUnchanged,
                         OperationPreconditionStatus::Failed,
-                        plan.symbol_addresses(),
+                        addresses.to_vec(),
                         vec![path.as_str().to_owned()],
                         PreconditionValue::Text {
-                            value: digest_hex8(&rewrite.base_source),
+                            value: digest_hex8(base_source),
                         },
                         PreconditionValue::Text {
                             value: digest_hex8(&disk),
@@ -684,6 +749,16 @@ impl ChangeService {
                 guarantees: Vec::new(),
             },
         })
+    }
+}
+
+/// One planned rewrite as the in-place modification of its file.
+fn modify_rewrite(rewrite: &PlannedRewrite) -> FileRewrite {
+    FileRewrite {
+        path: rewrite.path.clone(),
+        kind: RewriteKind::Modify,
+        previous_len: rewrite.base_source.len() as u64,
+        next_source: rewrite.next_source.clone(),
     }
 }
 
@@ -2260,6 +2335,229 @@ mod tests {
         assert_eq!(
             preconditions[0].kind,
             OperationPreconditionKind::TargetExists
+        );
+        Ok(())
+    }
+
+    /// A move plan over the fixture's `old/hub.rs`, with an optional
+    /// reference rewrite and an optional reason its references were not
+    /// updated.
+    fn move_plan(
+        from: &str,
+        to: &str,
+        moved: (&str, &str),
+        rewrites: Vec<(&str, &str, &str)>,
+        references_not_updated: Option<crate::move_file::ReferencesNotUpdated>,
+    ) -> crate::move_file::MovePlan {
+        crate::move_file::MovePlan {
+            from: CoreProjectPath::new(from).expect("fixture path is valid"),
+            to: CoreProjectPath::new(to).expect("fixture path is valid"),
+            moved_source: moved.0.to_owned(),
+            moved_next: moved.1.to_owned(),
+            rewrites: rewrites
+                .into_iter()
+                .map(
+                    |(path, base_source, next_source)| crate::rename::PlannedRewrite {
+                        path: CoreProjectPath::new(path).expect("fixture path is valid"),
+                        base_source: base_source.to_owned(),
+                        next_source: next_source.to_owned(),
+                    },
+                )
+                .collect(),
+            references_not_updated,
+        }
+    }
+
+    #[test]
+    fn apply_move_lands_the_move_and_reference_rewrites_atomically() -> TestResult {
+        let hub = "pub fn hub() {}\n// hub module\n";
+        let caller = "mod hub;\n";
+        let (directory, reads, changes) =
+            multi_file_fixture(&[("hub.rs", hub), ("main.rs", caller)])?;
+        let plan = move_plan(
+            "hub.rs",
+            "spoke.rs",
+            (hub, "pub fn hub() {}\n// spoke module\n"),
+            vec![("main.rs", caller, "mod spoke;\n")],
+            None,
+        );
+        let summary = applied_summary(changes.apply_move(&reads, &plan)?);
+        assert_eq!(
+            summary.paths,
+            vec![
+                ProjectPath("hub.rs".to_owned()),
+                ProjectPath("main.rs".to_owned()),
+                ProjectPath("spoke.rs".to_owned()),
+            ],
+            "the summary carries the old path, the rewrite, and the new path, sorted"
+        );
+        assert_eq!(summary.edits.len(), 3);
+        assert!(
+            summary
+                .diagnostics
+                .iter()
+                .all(|finding| finding.code.as_deref() != Some("rift.move.references_not_updated")),
+            "an engine-covered move carries no skip warning: {:?}",
+            summary.diagnostics
+        );
+        assert!(!directory.path().join("hub.rs").exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("spoke.rs"))?,
+            "pub fn hub() {}\n// spoke module\n",
+            "the engine's edit to the moved file lands at the destination"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("main.rs"))?,
+            "mod spoke;\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_move_into_a_new_directory_creates_its_parents() -> TestResult {
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("hub.rs", hub)])?;
+        let reason = crate::move_file::ReferencesNotUpdated::NoEngine {
+            language_segment: "rust".to_owned(),
+        };
+        let plan = move_plan(
+            "hub.rs",
+            "nested/deep/hub.rs",
+            (hub, hub),
+            vec![],
+            Some(reason),
+        );
+        let summary = applied_summary(changes.apply_move(&reads, &plan)?);
+        let warning = summary
+            .diagnostics
+            .iter()
+            .find(|finding| finding.code.as_deref() == Some("rift.move.references_not_updated"))
+            .expect("a skipped engine must surface as the warning");
+        assert_eq!(warning.severity, rift_protocol::read::Severity::Warning);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("nested/deep/hub.rs"))?,
+            hub,
+            "missing parent directories are created on publish"
+        );
+        assert!(!directory.path().join("hub.rs").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_move_refuses_when_the_destination_appeared_after_planning() -> TestResult {
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("hub.rs", hub)])?;
+        let plan = move_plan("hub.rs", "spoke.rs", (hub, hub), vec![], None);
+        fs::write(directory.path().join("spoke.rs"), "pub fn late() {}\n")?;
+        let result = changes.apply_move(&reads, &plan)?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("an occupied destination must refuse, got {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+        assert_eq!(
+            preconditions[0].expected,
+            PreconditionValue::Boolean { value: false }
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("hub.rs"))?,
+            hub,
+            "a refusal leaves the tree untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_move_refuses_when_the_moved_bytes_drifted_after_planning() -> TestResult {
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("hub.rs", hub)])?;
+        let plan = move_plan("hub.rs", "spoke.rs", (hub, hub), vec![], None);
+        let drifted = "pub fn hub() { let _late = 1; }\n";
+        fs::write(directory.path().join("hub.rs"), drifted)?;
+        let result = changes.apply_move(&reads, &plan)?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("drifted moved bytes must refuse, got {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        assert!(!directory.path().join("spoke.rs").exists());
+        Ok(())
+    }
+
+    /// A publish failure in the middle of a move restores the original
+    /// tree: the destination's created file is removed and every rewrite
+    /// already published is restored from the index. The sealed source
+    /// directory makes the source's removal - the last publish in path
+    /// order here - fail deterministically.
+    #[cfg(unix)]
+    #[test]
+    fn apply_move_mid_publish_failure_restores_the_original_tree() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let hub = "pub fn hub() {}\n";
+        let caller = "mod hub;\n";
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("old"))?;
+        fs::write(directory.path().join("old/hub.rs"), hub)?;
+        fs::write(directory.path().join("main.rs"), caller)?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let plan = move_plan(
+            "old/hub.rs",
+            "hub.rs",
+            (hub, hub),
+            vec![("main.rs", caller, "mod moved_hub;\n")],
+            None,
+        );
+        fs::set_permissions(
+            directory.path().join("old"),
+            fs::Permissions::from_mode(0o555),
+        )?;
+        let result = changes.apply_move(&reads, &plan);
+        fs::set_permissions(
+            directory.path().join("old"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+        let error = result.expect_err("the sealed source directory must fail the publish");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation publish"),
+            "failure must name the publish operation: {error}"
+        );
+        assert!(
+            !directory.path().join("hub.rs").exists(),
+            "the created destination is rolled back"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("main.rs"))?,
+            caller,
+            "the published rewrite is restored from the index"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("old/hub.rs"))?,
+            hub,
+            "the source never left"
         );
         Ok(())
     }

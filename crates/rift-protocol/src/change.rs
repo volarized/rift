@@ -487,6 +487,28 @@ impl NewNameViolation {
     }
 }
 
+/// Moves one visible file to a new project path. When the configured language engine
+/// advertises will-rename requests for the file, the server asks it for reference
+/// updates and applies them in the same atomic change; without an engine or the
+/// capability the move still lands and the result carries a warning that references
+/// were not updated.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.14"))]
+#[schemars(extend("examples" = [
+    {
+        "from": "src/config.rs",
+        "to": "src/settings.rs"
+    }
+]))]
+pub struct MoveFileParams {
+    /// The file to move, as a project-relative path.
+    pub from: ProjectPath,
+    /// The destination path. It must not exist yet; missing parent directories are
+    /// created when the move lands.
+    pub to: ProjectPath,
+}
+
 /// Applies unified-diff hunks to workspace files atomically.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

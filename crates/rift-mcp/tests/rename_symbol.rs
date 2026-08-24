@@ -7,139 +7,31 @@
 
 #![cfg(unix)]
 
-use std::error::Error;
-use std::fs;
-use std::path::{Path, PathBuf};
+mod workspace_client;
 
-use rift_index::WorkspaceIndexLimits;
-use rift_mcp::RiftMcp;
-use rmcp::ServiceExt as _;
+use std::fs;
+
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-
-type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-
-/// The directory holding the compiled `fake_engine` binary.
-///
-/// This test binary runs from `target/<profile>/deps`, and Cargo places
-/// another crate's binary one level up. Running the suite with `rift-lsp`
-/// in the invocation - the workspace suite does - builds the binary before
-/// any test runs.
-fn fake_engine_directory() -> PathBuf {
-    let mut directory = std::env::current_exe().expect("the test binary has a path");
-    directory.pop();
-    if directory.ends_with("deps") {
-        directory.pop();
-    }
-    assert!(
-        directory.join("fake_engine").exists(),
-        "fake_engine is missing from {}: build it first with `cargo test -p rift-lsp`",
-        directory.display(),
-    );
-    directory
-}
-
-/// One `[engines.fake]` table resolving `fake_engine` through an overlaid
-/// `PATH`, claiming `rust`.
-fn engine_configuration(behavior: &str, request_timeout: &str) -> String {
-    let inherited = std::env::var("PATH").unwrap_or_default();
-    let path_overlay = format!("{}:{inherited}", fake_engine_directory().display());
-    format!(
-        "[engines.fake]\nprogram = \"fake_engine\"\narguments = [\"{behavior}\"]\n\
-         languages = [\"rust\"]\nrequest_timeout = \"{request_timeout}\"\n\n\
-         [engines.fake.environment]\nPATH = \"{path_overlay}\"\n"
-    )
-}
-
-/// The same engine table with a lifecycle log and a narrow retry budget.
-///
-/// The log is how a test counts the engine's requests: the behaviors that
-/// act once and then serve read their own count back from it, and the
-/// assertions read the same lines. The waits are held at a millisecond so
-/// the suite spends no time on them; the growing wait is proven by the
-/// policy's own unit tests.
-fn counted(configuration: &str, log: &Path, attempts: u64) -> String {
-    format!(
-        "{configuration}RIFT_FAKE_ENGINE_LIFECYCLE_LOG = \"{}\"\n\n\
-         [engines.fake.retry]\nattempts = {attempts}\ndelay = \"1ms\"\n\
-         delay_limit = \"1ms\"\n",
-        log.display()
-    )
-}
-
-/// Lines of one lifecycle event the engine recorded.
-fn recorded(log: &Path, event: &str) -> usize {
-    fs::read_to_string(log)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| *line == event)
-        .count()
-}
-
-/// Builds one workspace of `files`, optionally with an engine table, and
-/// serves it to one client.
-async fn served_workspace(
-    files: &[(&str, &str)],
-    engine: Option<String>,
-) -> TestResult<(
-    tempfile::TempDir,
-    rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    tokio::task::JoinHandle<()>,
-)> {
-    let directory = tempfile::tempdir()?;
-    for (name, source) in files {
-        fs::write(directory.path().join(name), source)?;
-    }
-    if let Some(configuration) = engine {
-        fs::write(directory.path().join("rift.toml"), configuration)?;
-    }
-    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
-    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-    let server_task = tokio::spawn(async move {
-        let service = server
-            .serve(server_transport)
-            .await
-            .expect("server must initialize");
-        service.waiting().await.expect("server must stop cleanly");
-    });
-    let client = ().serve(client_transport).await?;
-    Ok((directory, client, server_task))
-}
+use workspace_client::{
+    TestResult, call_retrying_acceptance, counted, engine_configuration, recorded,
+    served_workspace, tool_request,
+};
 
 fn rename_request(symbol: &str, new_name: &str) -> CallToolRequestParams {
-    let arguments = json!({ "symbol": symbol, "new_name": new_name })
-        .as_object()
-        .cloned()
-        .expect("rename arguments are an object");
-    CallToolRequestParams::new("rename_symbol").with_arguments(arguments)
+    tool_request(
+        "rename_symbol",
+        &json!({ "symbol": symbol, "new_name": new_name }),
+    )
 }
 
-/// Most attempts one request retries before giving up on acceptance.
-const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
-
-/// Calls the tool, retrying the refusal the server advertises as
-/// `retry: same_request`: a change the engine itself wrote to the tree can
-/// move the index between one request's snapshot and its acceptance.
-async fn call_retrying_acceptance(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    params: CallToolRequestParams,
-) -> TestResult<Value> {
-    for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
-        match client.call_tool(params.clone()).await {
-            Ok(result) => {
-                return result
-                    .structured_content
-                    .ok_or_else(|| "rename_symbol must return structured content".into());
-            }
-            Err(rmcp::ServiceError::McpError(error))
-                if error
-                    .data
-                    .as_ref()
-                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err("the server kept refusing a retryable rename request".into())
+/// One tool call expected to fail, returning its wire error payload.
+fn wire_error(error: rmcp::ServiceError) -> TestResult<Value> {
+    let rmcp::ServiceError::McpError(data) = error else {
+        return Err(format!("expected a tool error, got {error:?}").into());
+    };
+    data.data
+        .ok_or_else(|| "wire error data must be present".into())
 }
 
 /// The library and the file referencing it, both served by the engine.
@@ -377,15 +269,8 @@ async fn engine_timeout_is_a_typed_error_and_the_tree_is_untouched() -> TestResu
         .call_tool(rename_request(BEACON_SYMBOL, "flare"))
         .await
         .expect_err("a parked engine must time out as a typed error");
-    let rmcp::ServiceError::McpError(error) = error else {
-        return Err(format!("expected a tool error, got {error:?}").into());
-    };
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str);
-    assert_eq!(code, Some("temporarily_unavailable"), "{error:?}");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
     assert_eq!(
         fs::read_to_string(directory.path().join("lib.rs"))?,
         LIBRARY
@@ -543,15 +428,8 @@ async fn empty_new_name_is_a_typed_invalid_request() -> TestResult {
         .call_tool(rename_request(BEACON_SYMBOL, ""))
         .await
         .expect_err("the schema-advertised length is enforced at acceptance");
-    let rmcp::ServiceError::McpError(error) = error else {
-        return Err(format!("expected a tool error, got {error:?}").into());
-    };
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str);
-    assert_eq!(code, Some("invalid_request"), "{error:?}");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
 
     client.cancel().await?;
     server_task.await?;
@@ -570,15 +448,8 @@ async fn prepare_timeout_is_a_typed_error_and_the_tree_is_untouched() -> TestRes
         .call_tool(rename_request(BEACON_SYMBOL, "flare"))
         .await
         .expect_err("a parked prepare must time out as a typed error");
-    let rmcp::ServiceError::McpError(error) = error else {
-        return Err(format!("expected a tool error, got {error:?}").into());
-    };
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str);
-    assert_eq!(code, Some("temporarily_unavailable"), "{error:?}");
+    let wire = wire_error(error)?;
+    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
     assert_eq!(
         fs::read_to_string(directory.path().join("lib.rs"))?,
         LIBRARY
@@ -592,21 +463,6 @@ async fn prepare_timeout_is_a_typed_error_and_the_tree_is_untouched() -> TestRes
 /// The attempt bound the absorption tests state for themselves, small
 /// enough to count off the lifecycle log.
 const ABSORPTION_ATTEMPTS: u64 = 3;
-
-/// One tool call expected to fail, returning its wire error payload.
-async fn failing_wire_error(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    params: CallToolRequestParams,
-) -> TestResult<Value> {
-    let error = client
-        .call_tool(params)
-        .await
-        .expect_err("the request must be rejected");
-    let rmcp::ServiceError::McpError(data) = error else {
-        panic!("expected protocol-level McpError, got {error:?}");
-    };
-    Ok(data.data.ok_or("wire error data must be present")?)
-}
 
 /// A refusal the engine invites again never reaches the caller: the server
 /// resends the whole conversation and the rename lands.
@@ -728,7 +584,11 @@ async fn a_rename_that_never_settles_surfaces_after_the_whole_budget() -> TestRe
     )
     .await?;
 
-    let wire = failing_wire_error(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
+    let error = client
+        .call_tool(rename_request(BEACON_SYMBOL, "flare"))
+        .await
+        .expect_err("an engine that never settles must surface a typed error");
+    let wire = wire_error(error)?;
     assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
     assert_eq!(wire["retry"], json!("same_request"), "{wire:#}");
     assert_eq!(
