@@ -129,6 +129,7 @@ jobs:
 
       # Each local gate target is its own CI step.
       - run: just format
+      - run: just dashes
       - run: just generate-check
       - run: just check
       - run: just clippy

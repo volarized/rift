@@ -29,6 +29,14 @@ check:
     cargo metadata --locked --format-version 1 > /dev/null
     uv run --script scripts/check_rust_architecture.py
 
+# The em-dash ban, over every surface a reader meets: the docs pages and
+# the app shell, the prose inside the crates, the README, the artifacts
+# `just generate` writes, and the CI configuration's own comments. The
+# scanner itself is not among them: it spells the banned characters.
+dashes:
+    uv run --script scripts/check_dashes.py \
+        docs/content docs/src/app crates README.md docs/public .github
+
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -71,4 +79,4 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-rust-gate: format generate-check check clippy docs audit test release-test installer-test
+rust-gate: format dashes generate-check check clippy docs audit test release-test installer-test
