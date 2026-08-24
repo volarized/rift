@@ -1489,6 +1489,32 @@ mod tests {
         assert!(refusal_detail(&result).contains("bytes"));
     }
 
+    #[test]
+    fn name_positions_fails_when_the_offset_leaves_the_source() {
+        let Err(RenameEnd::Failed(error)) = name_positions("pub fn beacon() {}\n", 999) else {
+            panic!("an offset past the source must fail");
+        };
+        assert_eq!(error.descriptor().code(), "internal_error");
+        assert!(error.to_string().contains("rename position conversion"));
+    }
+
+    #[tokio::test]
+    async fn compiled_plan_fails_when_the_workspace_root_is_relative() {
+        let outcome = compiled_plan(
+            Path::new("relative-root"),
+            &WorkspaceEdit::default(),
+            PositionEncoding::Utf8,
+            0,
+            &address(),
+            &target_over("pub fn beacon() {}\n"),
+        )
+        .await;
+        let Err(RenameEnd::Failed(error)) = outcome else {
+            panic!("a relative workspace root must fail");
+        };
+        assert!(error.to_string().contains("rename root conversion"));
+    }
+
     fn target_over(source: &str) -> RenameTarget {
         RenameTarget {
             path: project_path("lib.rs"),
