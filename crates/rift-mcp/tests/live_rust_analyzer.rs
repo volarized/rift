@@ -18,13 +18,13 @@
 
 #![cfg(unix)]
 
-mod live;
+mod live_engine_gate;
 mod workspace_client;
 
 use std::fs;
 use std::time::{Duration, Instant};
 
-use live::{engine_live, require_rust_analyzer, rust_engine_configuration};
+use live_engine_gate::{engine_live, require_rust_analyzer, rust_engine_configuration};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};

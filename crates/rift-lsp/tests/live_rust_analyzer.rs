@@ -15,12 +15,13 @@
 
 #![cfg(unix)]
 
-#[path = "support/live.rs"]
-mod live;
+mod live_engine_gate;
 
 use std::time::{Duration, Instant};
 
-use live::{RUST_ANALYZER_PROGRAM, engine_live, require_rust_analyzer, rust_analyzer_environment};
+use live_engine_gate::{
+    RUST_ANALYZER_PROGRAM, engine_live, require_rust_analyzer, rust_analyzer_environment,
+};
 use lsp_types::FileOperationPatternKind;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};

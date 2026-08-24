@@ -4,7 +4,7 @@
 //! `[engines.<name>]` table - the scripted fake engine, or the real one -
 //! and drives the tools through a live rmcp client. Engine-specific
 //! helpers live beside this module: `fake_engine.rs` for the scripted
-//! suites, `live.rs` for the gated live suite.
+//! suites, `live_engine_gate.rs` for the gated live suite.
 
 use std::error::Error;
 use std::fs;
