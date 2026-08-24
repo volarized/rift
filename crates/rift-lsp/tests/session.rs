@@ -35,6 +35,7 @@ fn launch(behavior: &str) -> EngineLaunch {
         program: "fake_engine".to_owned(),
         arguments: vec![behavior.to_owned()],
         environment,
+        initialization_options: None,
         startup_timeout: Duration::from_secs(10),
         request_timeout: Duration::from_secs(10),
         stderr_capture_bytes: 4_096,
@@ -559,6 +560,41 @@ async fn empty_and_absolute_programs_are_refused_before_spawning() {
         refused.name(),
         ErrorName::Wire(ErrorCode::ConfigurationInvalid)
     );
+}
+
+#[tokio::test]
+async fn initialization_options_reach_the_engine_at_initialize() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let mut with_options = launch("initialization-options");
+    with_options.initialization_options = Some(serde_json::json!({ "engine": "fake" }));
+    let mut session = EngineSession::start(with_options, workspace.path())
+        .await
+        .expect("the engine accepts its initialization options");
+    let document = path("src/lib.rs");
+    session
+        .rename(
+            &document,
+            Position {
+                line: 0,
+                character: 3,
+            },
+            "renamed",
+        )
+        .await
+        .expect("the engine serves after verifying its options");
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn absent_initialization_options_fail_the_asserting_engine() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let error = EngineSession::start(launch("initialization-options"), workspace.path())
+        .await
+        .expect_err("the engine dies when its options are missing");
+    assert!(matches!(
+        error.fault(),
+        EngineFault::ConnectionClosed { .. } | EngineFault::Framing { .. }
+    ));
 }
 
 #[tokio::test]

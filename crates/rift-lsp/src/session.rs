@@ -67,6 +67,8 @@ pub struct EngineLaunch {
     pub arguments: Vec<String>,
     /// Environment entries laid over the inherited environment.
     pub environment: BTreeMap<String, String>,
+    /// Options handed to the engine in the initialize request, verbatim.
+    pub initialization_options: Option<Value>,
     /// Wall-clock bound on the initialize handshake.
     pub startup_timeout: Duration,
     /// Wall-clock bound on each later request.
@@ -317,7 +319,11 @@ impl EngineSession {
             ended: false,
         };
         if let Err(error) = session
-            .handshake(workspace_root, launch.startup_timeout)
+            .handshake(
+                workspace_root,
+                launch.startup_timeout,
+                launch.initialization_options,
+            )
             .await
         {
             session.end().await;
@@ -336,6 +342,15 @@ impl EngineSession {
     #[must_use]
     pub fn root(&self) -> &TreeRoot {
         &self.root
+    }
+
+    /// Whether the session already killed its engine.
+    ///
+    /// An ended session refuses every later operation; the holder decides
+    /// whether to start a replacement.
+    #[must_use]
+    pub fn is_ended(&self) -> bool {
+        self.ended
     }
 
     /// Opens one document with the text the caller hands in.
@@ -475,7 +490,7 @@ impl EngineSession {
     ///
     /// An unchanged or partial report answers no items; the session never
     /// sends a previous result id, so a full report is the served shape.
-    /// At most [`DOCUMENT_DIAGNOSTICS_MAX`] items come back.
+    /// At most `DOCUMENT_DIAGNOSTICS_MAX` items come back.
     ///
     /// # Errors
     ///
@@ -556,6 +571,7 @@ impl EngineSession {
         &mut self,
         workspace_root: &Path,
         startup_timeout: Duration,
+        initialization_options: Option<Value>,
     ) -> Result<(), EngineError> {
         let root_uri = self
             .root
@@ -568,6 +584,7 @@ impl EngineSession {
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             root_uri: Some(root_uri.clone()),
+            initialization_options,
             capabilities: offered(),
             workspace_folders: Some(vec![WorkspaceFolder {
                 uri: root_uri,
@@ -812,7 +829,7 @@ impl EngineSession {
 ///
 /// A publish replaces the document's earlier entry; a publish for a new
 /// document is dropped once [`PUBLISHED_DOCUMENTS_MAX`] documents are
-/// retained, and each entry keeps at most [`DOCUMENT_DIAGNOSTICS_MAX`]
+/// retained, and each entry keeps at most `DOCUMENT_DIAGNOSTICS_MAX`
 /// items.
 fn retain_published(
     record: &mut BTreeMap<ProjectPath, Vec<Diagnostic>>,

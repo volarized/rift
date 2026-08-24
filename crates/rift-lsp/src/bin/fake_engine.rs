@@ -86,6 +86,7 @@ fn serve(behavior: &str) {
     if behavior == "environment" {
         report_environment();
     }
+    wait_for_start_gate();
     let mut input = EngineInput::new();
     while let Some(message) = input.next_message() {
         dispatch(behavior, &message, &mut input);
@@ -98,6 +99,10 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput) {
     let id = &message["id"];
     match method {
         "initialize" => {
+            record_lifecycle("initialize");
+            if behavior == "initialization-options" {
+                verify_initialization_options(message);
+            }
             respond(id, &initialize_answer(behavior));
             if behavior == "happy" {
                 send_unretained_notifications();
@@ -110,6 +115,7 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput) {
         },
         "shutdown" => respond(id, &Value::Null),
         "exit" => {
+            record_lifecycle("exit");
             if behavior != "lingering" {
                 std::process::exit(0);
             }
@@ -174,6 +180,11 @@ fn initialize_answer(behavior: &str) -> Value {
 fn answer_rename(behavior: &str, message: &Value, input: &mut EngineInput) {
     match behavior {
         "exit-mid-request" => std::process::exit(0),
+        "dies-on-command" => {
+            if message["params"]["newName"] == json!("die") {
+                std::process::exit(0);
+            }
+        }
         "stderr-flood" => {
             let flood = vec![b'f'; FLOOD_BYTES];
             std::io::stderr()
@@ -294,6 +305,45 @@ fn send_unretained_notifications() {
         "method": "textDocument/publishDiagnostics",
         "params": {"uri": "file:///rift-elsewhere/out.rs", "diagnostics": []},
     }));
+}
+
+/// Parks until the start gate opens, when the gate variable names one.
+///
+/// The gate is a FIFO: reading it blocks until the test's writer opens
+/// and closes it, so a test holds every spawned engine at startup and
+/// releases them all at one deterministic moment.
+fn wait_for_start_gate() {
+    let Ok(gate) = std::env::var("RIFT_FAKE_ENGINE_START_GATE") else {
+        return;
+    };
+    let _released = std::fs::read(gate).expect("fake engine reads its start gate");
+}
+
+/// Appends one lifecycle line when the log environment variable is set.
+///
+/// A test that sets `RIFT_FAKE_ENGINE_LIFECYCLE_LOG` counts the lines to
+/// prove how many engine processes initialized and how many were asked to
+/// exit.
+fn record_lifecycle(event: &str) {
+    let Ok(path) = std::env::var("RIFT_FAKE_ENGINE_LIFECYCLE_LOG") else {
+        return;
+    };
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("fake engine opens its lifecycle log");
+    writeln!(log, "{event}").expect("fake engine appends its lifecycle log");
+}
+
+/// Dies unless the expected initialization options rode the request.
+fn verify_initialization_options(message: &Value) {
+    let options = &message["params"]["initializationOptions"];
+    assert_eq!(
+        options,
+        &json!({ "engine": "fake" }),
+        "initialization options did not arrive"
+    );
 }
 
 /// Writes the inherited environment to stderr for the policy tests.
