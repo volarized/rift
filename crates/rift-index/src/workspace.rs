@@ -1464,7 +1464,7 @@ mod tests {
             "pub struct Rift;\nimpl Rift { pub fn update() {} }\n",
         )
         .expect("fixture source");
-        fs::write(directory.path().join("README.md"), "ignored").expect("fixture prose");
+        fs::write(directory.path().join("README.txt"), "ignored").expect("fixture prose");
         directory
     }
 
@@ -1533,10 +1533,10 @@ mod tests {
         // they would a source one.
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::create_dir_all(directory.path().join("docs/generated")).expect("directories");
-        fs::write(directory.path().join(".gitignore"), "docs/ignored.md\n").expect("ignore file");
-        fs::write(directory.path().join("docs/guide.md"), "guide").expect("guide");
-        fs::write(directory.path().join("docs/ignored.md"), "ignored").expect("ignored");
-        fs::write(directory.path().join("docs/generated/gen.md"), "generated").expect("generated");
+        fs::write(directory.path().join(".gitignore"), "docs/ignored.mdx\n").expect("ignore file");
+        fs::write(directory.path().join("docs/guide.mdx"), "guide").expect("guide");
+        fs::write(directory.path().join("docs/ignored.mdx"), "ignored").expect("ignored");
+        fs::write(directory.path().join("docs/generated/gen.mdx"), "generated").expect("generated");
         fs::write(directory.path().join("notes.txt"), "notes").expect("notes");
         fs::write(directory.path().join("logo.png"), "not text").expect("non-text");
         let visibility =
@@ -1549,14 +1549,14 @@ mod tests {
         )
         .expect("source policy");
 
-        assert!(policy.includes(&directory.path().join("docs/guide.md")));
+        assert!(policy.includes(&directory.path().join("docs/guide.mdx")));
         assert!(policy.includes(&directory.path().join("notes.txt")));
         assert!(
-            !policy.includes(&directory.path().join("docs/ignored.md")),
+            !policy.includes(&directory.path().join("docs/ignored.mdx")),
             "gitignore must hide a text candidate exactly as it would a source one"
         );
         assert!(
-            !policy.includes(&directory.path().join("docs/generated/gen.md")),
+            !policy.includes(&directory.path().join("docs/generated/gen.mdx")),
             "[source] exclude must hide a text candidate exactly as it would a source one"
         );
         assert!(
@@ -2524,10 +2524,23 @@ mod tests {
 
     #[test]
     fn test_classify_path_returns_text_for_an_included_non_source_extension() {
-        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 1_024);
+        let inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
+        assert_eq!(
+            classify_path(Path::new("readme.txt"), &inclusion),
+            Some(PathClass::Text)
+        );
+    }
+
+    /// `md` sits in the default `[search.text]` extensions and is claimed by
+    /// the markdown provider: the provider wins, so a `.md` file is source,
+    /// never a second text representation.
+    #[test]
+    fn test_classify_path_source_wins_for_markdown_over_the_default_text_extensions() {
+        let inclusion = TextFileInclusion::default();
+        assert!(inclusion.includes(Path::new("readme.md")));
         assert_eq!(
             classify_path(Path::new("readme.md"), &inclusion),
-            Some(PathClass::Text)
+            Some(PathClass::Source)
         );
     }
 
@@ -2564,13 +2577,61 @@ mod tests {
             .iter()
             .map(|file| file.path().as_str())
             .collect();
-        assert_eq!(text_paths, ["docs/guide.md", "docs/notes.mdx"]);
+        assert_eq!(
+            text_paths,
+            ["docs/notes.mdx"],
+            "the markdown provider claims md, so only mdx stays a text file"
+        );
+        let source_paths: Vec<&str> = index
+            .files()
+            .iter()
+            .map(|file| file.path().as_str())
+            .collect();
+        assert_eq!(
+            source_paths,
+            ["docs/guide.md"],
+            "the visible md file is source; gitignore and [source] excludes still hide the rest"
+        );
+    }
+
+    /// One representation per file: `md` sits in the default `[search.text]`
+    /// extensions, and the markdown provider claims it, so a `.md` file is
+    /// indexed as source alone - its lexical units are its heading symbols,
+    /// never a second whole-file text unit.
+    #[test]
+    fn test_build_indexes_a_markdown_file_as_source_not_text() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(
+            directory.path().join("README.md"),
+            "# Install\n\nRun the beacon.\n",
+        )
+        .expect("markdown fixture");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("workspace index");
+        assert_eq!(index.files().len(), 1);
+        assert!(
+            index.text_files().is_empty(),
+            "the provider-claimed extension must not double-index as text"
+        );
+        let units = index.lexical_units();
+        assert_eq!(units.len(), 1, "one heading, one symbol unit: {units:#?}");
+        assert_eq!(units[0].kind(), LexicalUnitKind::Symbol);
+        assert_eq!(
+            units[0].identity(),
+            "rift://symbol/markdown/README.md/Install"
+        );
+        assert_eq!(units[0].content(), "# Install\n\nRun the beacon.\n");
     }
 
     #[test]
     fn test_build_refuses_invalid_utf8_text_file() {
         let directory = tempfile::tempdir().expect("temporary workspace");
-        fs::write(directory.path().join("invalid.md"), [0xff, 0xfe]).expect("invalid text bytes");
+        fs::write(directory.path().join("invalid.txt"), [0xff, 0xfe]).expect("invalid text bytes");
         let error = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -2588,7 +2649,7 @@ mod tests {
     fn test_build_text_files_count_toward_the_shared_file_count_bound() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::write(directory.path().join("a.rs"), "pub fn a() {}\n").expect("source");
-        fs::write(directory.path().join("b.md"), "text body").expect("text");
+        fs::write(directory.path().join("b.txt"), "text body").expect("text");
         let limits = WorkspaceIndexLimits::new(1, 1_000, 2_000, 4, 5).expect("limits");
         let error = WorkspaceIndex::build(
             directory.path(),
@@ -2606,7 +2667,7 @@ mod tests {
     #[test]
     fn test_text_files_accessor_returns_included_text_files() {
         let directory = tempfile::tempdir().expect("temporary workspace");
-        fs::write(directory.path().join("readme.md"), "hello").expect("text file");
+        fs::write(directory.path().join("readme.txt"), "hello").expect("text file");
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -2615,7 +2676,7 @@ mod tests {
         )
         .expect("workspace index");
         assert_eq!(index.text_files().len(), 1);
-        assert_eq!(index.text_files()[0].path().as_str(), "readme.md");
+        assert_eq!(index.text_files()[0].path().as_str(), "readme.txt");
         assert_eq!(index.text_files()[0].content(), "hello");
     }
 
@@ -2630,7 +2691,7 @@ mod tests {
             WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
                 .expect("fingerprint of an empty workspace");
 
-        fs::write(directory.path().join("readme.md"), "first").expect("text file");
+        fs::write(directory.path().join("readme.txt"), "first").expect("text file");
         let appeared =
             WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
                 .expect("fingerprint after the text file appears");
@@ -2639,7 +2700,7 @@ mod tests {
             "a newly appeared text file must change the fingerprint"
         );
 
-        fs::write(directory.path().join("readme.md"), "second").expect("edited text file");
+        fs::write(directory.path().join("readme.txt"), "second").expect("edited text file");
         let edited =
             WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
                 .expect("fingerprint after the text file's bytes change");
@@ -2648,7 +2709,7 @@ mod tests {
             "an edited text file's bytes must change the fingerprint"
         );
 
-        fs::remove_file(directory.path().join("readme.md")).expect("remove text file");
+        fs::remove_file(directory.path().join("readme.txt")).expect("remove text file");
         let removed =
             WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
                 .expect("fingerprint after the text file disappears");
@@ -2684,7 +2745,7 @@ mod tests {
     #[test]
     fn test_lexical_units_text_file_stem_and_content_match_the_whole_file() {
         let directory = tempfile::tempdir().expect("temporary workspace");
-        fs::write(directory.path().join("guide.md"), "guide body").expect("text file");
+        fs::write(directory.path().join("guide.txt"), "guide body").expect("text file");
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -2697,7 +2758,7 @@ mod tests {
             .iter()
             .find(|unit| unit.kind() == LexicalUnitKind::TextFile)
             .expect("the text file must produce a lexical unit");
-        assert_eq!(text_unit.identity(), "guide.md");
+        assert_eq!(text_unit.identity(), "guide.txt");
         assert_eq!(text_unit.name(), Some("guide"));
         assert_eq!(text_unit.content(), "guide body");
         assert!(
@@ -2712,8 +2773,8 @@ mod tests {
         // Five lines of four bytes each: a 10-byte chunk bound packs two lines per chunk,
         // so the eight-line file below must split into several chunk units.
         let content = "aaa\nbbb\nccc\nddd\neee\nfff\nggg\nhhh\n";
-        fs::write(directory.path().join("big.md"), content).expect("oversized text file");
-        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 10);
+        fs::write(directory.path().join("big.txt"), content).expect("oversized text file");
+        let inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 10);
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -2733,7 +2794,10 @@ mod tests {
             "an 8-line file chunked two lines at a time yields 4 units"
         );
         let identities: Vec<&str> = units.iter().map(LexicalUnit::identity).collect();
-        assert_eq!(identities, ["big.md#0", "big.md#1", "big.md#2", "big.md#3"]);
+        assert_eq!(
+            identities,
+            ["big.txt#0", "big.txt#1", "big.txt#2", "big.txt#3"]
+        );
         let rejoined: String = units.iter().map(LexicalUnit::content).collect();
         assert_eq!(
             rejoined, content,
@@ -2741,12 +2805,12 @@ mod tests {
         );
         for unit in &units {
             assert_eq!(unit.name(), Some("big"));
-            assert_eq!(unit.path().as_str(), "big.md");
+            assert_eq!(unit.path().as_str(), "big.txt");
         }
 
         let chunked = index.chunked_text_files();
         assert_eq!(chunked.len(), 1);
-        assert_eq!(chunked[0].0.as_str(), "big.md");
+        assert_eq!(chunked[0].0.as_str(), "big.txt");
         assert_eq!(chunked[0].1, 4);
     }
 

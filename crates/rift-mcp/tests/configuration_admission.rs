@@ -205,7 +205,7 @@ async fn invalid_search_text_configuration_fails_reads_typed() -> TestResult {
 #[tokio::test]
 async fn valid_search_text_configuration_serves_normally() -> TestResult {
     let directory = workspace_with(Some(VALID_TEXT_CONFIGURATION))?;
-    fs::write(directory.path().join("guide.md"), "guide body")?;
+    fs::write(directory.path().join("guide.rst"), "guide body")?;
     let client = client_for(directory.path()).await?;
 
     let served = client

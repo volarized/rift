@@ -1076,7 +1076,7 @@ mod tests {
             relevant_watch_event(
                 &watched_root,
                 &validation,
-                &event(EventKind::Modify(ModifyKind::Any), "src/guide.md")
+                &event(EventKind::Modify(ModifyKind::Any), "src/guide.txt")
             ),
             "an external edit to an included [search.text] extension must trigger a rebuild, \
              the same as a source file"
@@ -1656,15 +1656,15 @@ mod tests {
         // into more than one lexical chunk.
         let rift_toml = directory.path().join("rift.toml");
         fs::write(rift_toml, "[search.text]\nmax_chunk = \"1kb\"\n")?;
-        fs::write(directory.path().join("guide.md"), "word ".repeat(1000))?;
+        fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
         let published = stable_candidate(directory.path(), 0)?;
 
         let chunked = published.reads.chunked_text_files();
         let chunk_count = chunked
             .iter()
-            .find(|(path, _)| path.as_str() == "guide.md")
+            .find(|(path, _)| path.as_str() == "guide.txt")
             .map(|(_, count)| *count)
-            .ok_or("guide.md must be reported as chunked before population runs")?;
+            .ok_or("guide.txt must be reported as chunked before population runs")?;
         assert!(
             chunk_count > 1,
             "the oversized guide must split into more than one chunk: {chunk_count}"
@@ -1673,7 +1673,7 @@ mod tests {
         let units = published.reads.lexical_units();
         let guide_units = units
             .iter()
-            .filter(|unit| unit.path().as_str() == "guide.md")
+            .filter(|unit| unit.path().as_str() == "guide.txt")
             .count();
         assert!(
             guide_units > 1,

@@ -590,7 +590,7 @@ mod tests {
             directory.path().join("src/lib.rs"),
             "pub struct Beacon;\nimpl Beacon { pub fn signal(&self) {} }\n",
         )?;
-        fs::write(directory.path().join("README.md"), "Beacon docs")?;
+        fs::write(directory.path().join("README.txt"), "Beacon docs")?;
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -738,6 +738,38 @@ pub fn compute() -> i32 {
         assert_eq!(
             symbol["id"],
             json!("rift://symbol/typescript/routes.ts/Route")
+        );
+        Ok(())
+    }
+
+    /// Symbol hits from a markdown file carry the `markdown` language, the
+    /// composed wire kind, and an id escaping the heading text.
+    #[test]
+    fn search_symbol_hits_carry_the_markdown_language() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let notes_md = "# Beacon Notes\n\nCalibration steps.\n";
+        fs::write(directory.path().join("notes.md"), notes_md)?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service =
+            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let request = json!({
+            "query": "Beacon Notes",
+            "target": "symbol",
+            "limit": 5
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert!(!results.is_empty());
+        let symbol = &results[0]["hit"]["symbol"];
+        assert_eq!(symbol["language"], json!({ "name": "markdown" }));
+        assert_eq!(symbol["kind"], json!("markdown.heading"));
+        assert_eq!(
+            symbol["id"],
+            json!("rift://symbol/markdown/notes.md/Beacon%20Notes")
         );
         Ok(())
     }
@@ -1550,12 +1582,12 @@ pub fn compute() -> i32 {
 
     #[test]
     fn collect_lexical_hits_skips_a_text_file_path_the_index_no_longer_carries() -> TestResult {
-        // `fixture()` includes `README.md` as its only text file, so `guide.md` is a path the
-        // index never carried.
+        // `fixture()` includes `README.txt` as its only text file, so `guide.txt` is a path
+        // the index never carried.
         let (_directory, service) = fixture()?;
         let vanished = LexicalMatch::new(
-            "guide.md",
-            rift_core::ProjectPath::new("guide.md")?,
+            "guide.txt",
+            rift_core::ProjectPath::new("guide.txt")?,
             LexicalUnitKind::TextFile,
             Some("guide".to_owned()),
             -5.0,
@@ -1584,7 +1616,7 @@ pub fn compute() -> i32 {
     fn text_file_lexical_matches_dedupe_to_one_hit_at_the_best_rank() -> TestResult {
         let directory = tempfile::tempdir()?;
         let content = "intro\nsearch replace all units here\nend\n";
-        fs::write(directory.path().join("guide.md"), content)?;
+        fs::write(directory.path().join("guide.txt"), content)?;
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
         let text_inclusion = rift_core::TextFileInclusion::default();
@@ -1596,15 +1628,15 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let worse = LexicalMatch::new(
-            "guide.md#0",
-            rift_core::ProjectPath::new("guide.md")?,
+            "guide.txt#0",
+            rift_core::ProjectPath::new("guide.txt")?,
             LexicalUnitKind::TextFile,
             Some("guide".to_owned()),
             -1.0,
         );
         let better = LexicalMatch::new(
-            "guide.md#1",
-            rift_core::ProjectPath::new("guide.md")?,
+            "guide.txt#1",
+            rift_core::ProjectPath::new("guide.txt")?,
             LexicalUnitKind::TextFile,
             Some("guide".to_owned()),
             -9.0,
@@ -1634,7 +1666,7 @@ pub fn compute() -> i32 {
     )]
     fn merge_file_hit_absorbs_a_second_match_at_the_same_path_and_line() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("guide.md"), "alpha units beta\n")?;
+        fs::write(directory.path().join("guide.txt"), "alpha units beta\n")?;
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
         let text_inclusion = rift_core::TextFileInclusion::default();

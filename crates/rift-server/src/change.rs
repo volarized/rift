@@ -968,6 +968,48 @@ mod tests {
         Ok(())
     }
 
+    /// A markdown symbol id minted by `get_symbol` - heading text escaped,
+    /// nested under its ` > ` heading path - round-trips through address
+    /// parsing into an applied section rewrite, and the reparse runs through
+    /// the markdown provider.
+    #[test]
+    fn markdown_symbol_address_round_trips_from_minted_id_to_replacement() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let readme_md = "# Install\n\nIntro.\n\n## Requirements\n\n- a toolchain\n";
+        fs::write(directory.path().join("README.md"), readme_md)?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let reads = ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let changes = ChangeService::new(directory.path());
+        let request = serde_json::json!({"name": "Requirements"});
+        let params: GetSymbolParams = serde_json::from_value(request)?;
+        let hits = reads.get_symbol(&params)?.hits;
+        let minted = hits[0].symbol.id.clone();
+        assert_eq!(
+            minted.0,
+            "rift://symbol/markdown/README.md/Install%20%3E%20Requirements"
+        );
+        let replacement = ReplaceSymbolParams {
+            symbol: minted,
+            region: None,
+            body: "## Requirements\n\n- a newer toolchain\n".to_owned(),
+        };
+        let result = changes.replace_symbol(&reads, &replacement)?;
+        let summary = applied_summary(result);
+        assert!(
+            summary.diagnostics.is_empty(),
+            "the markdown provider reparses the rewritten section cleanly"
+        );
+        let written = fs::read_to_string(directory.path().join("README.md"))?;
+        assert_eq!(
+            written,
+            "# Install\n\nIntro.\n\n## Requirements\n\n- a newer toolchain\n"
+        );
+        Ok(())
+    }
+
     #[test]
     fn replace_symbol_refuses_when_disk_drifted_from_snapshot() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
@@ -1348,7 +1390,7 @@ mod tests {
             &reads,
             &InsertSymbolParams {
                 anchor: None,
-                file: Some(ProjectPath("notes/TODO.md".to_owned())),
+                file: Some(ProjectPath("notes/TODO.txt".to_owned())),
                 position: InsertPosition::Before,
                 body: "- write docs".to_owned(),
                 create_missing: true,
@@ -1357,9 +1399,9 @@ mod tests {
         let summary = applied_summary(result);
         assert!(
             summary.diagnostics.is_empty(),
-            "no provider claims md, so the change reports no reparse findings"
+            "no provider claims txt, so the change reports no reparse findings"
         );
-        let written = fs::read_to_string(directory.path().join("notes/TODO.md"))?;
+        let written = fs::read_to_string(directory.path().join("notes/TODO.txt"))?;
         assert_eq!(written, "- write docs");
         Ok(())
     }
@@ -1863,8 +1905,8 @@ mod tests {
 
     #[test]
     fn reparse_skips_a_path_no_provider_claims() -> TestResult {
-        let path = CoreProjectPath::new("notes/TODO.md")?;
-        let unit = FileId("rift://file/notes/TODO.md".to_owned());
+        let path = CoreProjectPath::new("notes/TODO.txt")?;
+        let unit = FileId("rift://file/notes/TODO.txt".to_owned());
         let diagnostics = super::reparse_diagnostics(unit, &path, "fn broken( {");
         assert!(
             diagnostics.is_empty(),

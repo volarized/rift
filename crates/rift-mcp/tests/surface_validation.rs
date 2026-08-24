@@ -157,7 +157,7 @@ fn patch_corpus() -> Vec<(&'static str, Value)> {
 
 /// Search requests only the lexical search-index tier can fully answer: a multi-word
 /// prose query merging in hits identifier search alone would not surface, and a query
-/// that only `notes.md` (included by the default `[search.text]` extensions) answers,
+/// that only `notes.txt` (included by the default `[search.text]` extensions) answers,
 /// since identifier search never reaches a non-source file.
 fn lexical_search_corpus() -> Vec<(&'static str, Value)> {
     vec![
@@ -377,8 +377,8 @@ async fn served_fixture() -> TestResult<(
     // Included into the lexical search-index tier by the default `[search.text]`
     // extensions, so the corpus can prove a text-file search hit end to end.
     fs::write(
-        directory.path().join("notes.md"),
-        "# Notes\n\nBeacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
+        directory.path().join("notes.txt"),
+        "Beacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
     )?;
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in

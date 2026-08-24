@@ -1621,15 +1621,15 @@ mod tests {
 
     /// A multi-word prose query neither identifier search path can serve: no line contains
     /// the literal phrase, and no declaration name contains it either. `scale_value`'s doc
-    /// comment supplies just the word "units" and `guide.md` supplies "replace" and "all",
+    /// comment supplies just the word "units" and `guide.txt` supplies "replace" and "all",
     /// so only the lexical search-index tier's per-term matching can produce either hit.
     #[tokio::test]
     async fn client_search_merges_lexical_symbol_and_text_file_hits() -> TestResult {
         let directory = tempfile::tempdir()?;
         let lib_rs = "/// Converts a raw measurement into base units.\npub fn scale_value(value: f64) -> f64 {\n    value * 2.0\n}\n";
         fs::write(directory.path().join("lib.rs"), lib_rs)?;
-        let guide_md = "# Guide\n\nThis document explains how to replace all safely.\n";
-        fs::write(directory.path().join("guide.md"), guide_md)?;
+        let guide_txt = "This document explains how to replace all safely.\n";
+        fs::write(directory.path().join("guide.txt"), guide_txt)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
@@ -1656,8 +1656,8 @@ mod tests {
 
         let file_hit = results
             .iter()
-            .find(|hit| hit["hit"]["target"] == "file" && hit["path"] == json!("guide.md"))
-            .ok_or_else(|| format!("guide.md text-file hit missing: {structured:#}"))?;
+            .find(|hit| hit["hit"]["target"] == "file" && hit["path"] == json!("guide.txt"))
+            .ok_or_else(|| format!("guide.txt text-file hit missing: {structured:#}"))?;
         assert_eq!(file_hit["matched_by"], json!(["content"]));
 
         let symbol_hit = results
@@ -1685,8 +1685,8 @@ mod tests {
     async fn build_recovers_from_a_corrupt_lexical_database_by_recreating_it_once() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let guide_md = "notes about the beacon subsystem\n";
-        fs::write(directory.path().join("guide.md"), guide_md)?;
+        let guide_txt = "notes about the beacon subsystem\n";
+        fs::write(directory.path().join("guide.txt"), guide_txt)?;
         let state_directory = directory.path().join(".rift");
         fs::create_dir_all(&state_directory)?;
         fs::write(state_directory.join("db"), b"not a sqlite database")?;
@@ -1717,7 +1717,7 @@ mod tests {
             .as_array()
             .ok_or("results must be an array")?;
         assert!(
-            results.iter().any(|hit| hit["path"] == json!("guide.md")),
+            results.iter().any(|hit| hit["path"] == json!("guide.txt")),
             "the recreated lexical database must be populated and serve results: {structured:#}"
         );
 
@@ -1726,7 +1726,7 @@ mod tests {
         Ok(())
     }
 
-    /// A `.md` file created after startup exists only because the change-applied rebuild
+    /// A text file created after startup exists only because the change-applied rebuild
     /// path repopulates the lexical tier; the initial population at `build` never saw it.
     #[tokio::test]
     async fn client_change_creating_a_text_file_populates_lexical_search() -> TestResult {
@@ -1741,7 +1741,7 @@ mod tests {
         });
         let client = ().serve(client_transport).await?;
 
-        let diff = "--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1 @@\n+the migration guide covers replacing every legacy unit\n";
+        let diff = "--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+the migration guide covers replacing every legacy unit\n";
         let change = client
             .call_tool(
                 CallToolRequestParams::new("patch")
@@ -1773,7 +1773,7 @@ mod tests {
             let results = structured["results"]
                 .as_array()
                 .ok_or("results must be an array")?;
-            if results.iter().any(|hit| hit["path"] == json!("notes.md")) {
+            if results.iter().any(|hit| hit["path"] == json!("notes.txt")) {
                 lexical_hit_observed = true;
                 break;
             }

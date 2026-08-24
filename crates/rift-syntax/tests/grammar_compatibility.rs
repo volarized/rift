@@ -36,6 +36,14 @@ const TYPESCRIPT_KINDS: &[&str] = &[
 /// the family.
 const ECMASCRIPT_FIELDS: &[&str] = &["name", "body", "value"];
 
+/// Node kinds the markdown rules read from the pinned block grammar,
+/// restated here so a grammar bump that renames one fails this suite before
+/// it fails extraction.
+const MARKDOWN_KINDS: &[&str] = &["section", "atx_heading", "setext_heading"];
+
+/// Grammar fields the markdown rules read from the pinned block grammar.
+const MARKDOWN_FIELDS: &[&str] = &["heading_content"];
+
 fn rust_language() -> Language {
     tree_sitter_rust::LANGUAGE.into()
 }
@@ -50,6 +58,10 @@ fn typescript_language() -> Language {
 
 fn tsx_language() -> Language {
     tree_sitter_typescript::LANGUAGE_TSX.into()
+}
+
+fn markdown_language() -> Language {
+    tree_sitter_md::LANGUAGE.into()
 }
 
 fn assert_abi_in_runtime_window(name: &str, language: &Language) {
@@ -230,6 +242,37 @@ fn test_tsx_grammar_parses_valid_and_malformed_fixtures() {
     assert!(
         malformed_tree.root_node().has_error(),
         "malformed TSX must report an error"
+    );
+}
+
+#[test]
+fn test_markdown_block_grammar_uses_supported_abi() {
+    assert_abi_in_runtime_window("markdown", &markdown_language());
+}
+
+#[test]
+fn test_markdown_block_grammar_resolves_every_read_kind_and_field() {
+    let language = markdown_language();
+    assert_kinds_resolve("markdown", &language, MARKDOWN_KINDS);
+    assert_fields_resolve("markdown", &language, MARKDOWN_FIELDS);
+}
+
+/// The block grammar accepts nearly any text as prose; the malformed
+/// fixture is the case it does refuse - an ATX heading as the file's last
+/// bytes with no trailing line ending.
+#[test]
+fn test_markdown_block_grammar_parses_valid_and_malformed_fixtures() {
+    let language = markdown_language();
+    let valid_tree = parse(&language, include_str!("fixtures/markdown/valid.md"));
+    assert!(
+        !valid_tree.root_node().has_error(),
+        "valid markdown must parse"
+    );
+
+    let malformed_tree = parse(&language, include_str!("fixtures/markdown/malformed.md"));
+    assert!(
+        malformed_tree.root_node().has_error(),
+        "an unterminated heading must report an error"
     );
 }
 

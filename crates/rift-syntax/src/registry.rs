@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use rift_protocol::read::Language;
 
 use crate::javascript::JavaScriptSyntaxProvider;
+use crate::markdown::MarkdownSyntaxProvider;
 use crate::provider::SyntaxProvider;
 use crate::rust::RustSyntaxProvider;
 use crate::typescript::TypeScriptDialect;
@@ -21,6 +22,7 @@ fn build_registry() -> Vec<Box<dyn SyntaxProvider>> {
         Box::new(JavaScriptSyntaxProvider::default()),
         Box::new(TypeScriptDialect::TypeScript.provider()),
         Box::new(TypeScriptDialect::Tsx.provider()),
+        Box::new(MarkdownSyntaxProvider::default()),
     ]
 }
 
@@ -149,7 +151,24 @@ mod tests {
 
     #[test]
     fn test_source_file_extensions_union_lists_every_declared_extension() {
-        assert_eq!(source_file_extensions(), ["rs", "js", "jsx", "ts", "tsx"]);
+        assert_eq!(
+            source_file_extensions(),
+            ["rs", "js", "jsx", "ts", "tsx", "md"]
+        );
+    }
+
+    #[test]
+    fn test_provider_for_extension_serves_markdown() {
+        let provider = provider_for_extension("md").expect("the markdown provider claims md");
+        assert_eq!(provider.language().name, "markdown");
+        assert_eq!(provider.language().dialect, None);
+        let language = Language {
+            name: "markdown".to_owned(),
+            dialect: None,
+        };
+        let by_language =
+            provider_for_language(&language).expect("the markdown provider serves markdown");
+        assert_eq!(by_language.extensions(), ["md"]);
     }
 
     #[test]

@@ -1437,7 +1437,7 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// One workspace holding all four shipped source languages.
+    /// One workspace holding every shipped source language.
     fn multi_language_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
@@ -1454,6 +1454,8 @@ pub fn compute() -> i32 {
             directory.path().join("src/banner.js"),
             "export function banner() { return 1; }\n",
         )?;
+        let guide_md = "# Beacon Guide\n\nHow the beacon works.\n";
+        fs::write(directory.path().join("src/guide.md"), guide_md)?;
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -1636,6 +1638,115 @@ pub fn compute() -> i32 {
             .filter_map(|version| version["summary"].as_str())
             .collect();
         assert_eq!(summaries, ["grow lookup body", "introduce lookup"]);
+        Ok(())
+    }
+
+    /// A markdown heading answers `get_symbol` like any declaration: the
+    /// composed wire kind, empty facets, an id escaping the heading text,
+    /// and the whole section as the source excerpt.
+    #[test]
+    fn get_symbol_finds_a_markdown_heading_beside_other_languages() -> TestResult {
+        let (_directory, service) = multi_language_fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon Guide"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let symbol = &value["hits"][0]["symbol"];
+        assert_eq!(symbol["language"], json!({ "name": "markdown" }));
+        assert_eq!(symbol["kind"], json!("markdown.heading"));
+        assert_eq!(symbol["facets"], json!([]));
+        assert_eq!(
+            symbol["id"],
+            json!("rift://symbol/markdown/src/guide.md/Beacon%20Guide")
+        );
+        assert_eq!(
+            value["hits"][0]["source"]["text"],
+            "# Beacon Guide\n\nHow the beacon works.\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_serve_a_markdown_file_under_the_markdown_wire_kinds() -> TestResult {
+        let (directory, service) = multi_language_fixture()?;
+        let source = fs::read_to_string(directory.path().join("src/guide.md"))?;
+        let position = source
+            .find("beacon works")
+            .ok_or("fixture must contain the prose line")? as u64;
+        let params = NodesParams {
+            path: ProjectPath("src/guide.md".to_owned()),
+            position,
+            projection: None,
+            rev: None,
+        };
+        let value = serde_json::to_value(service.nodes(params)?)?;
+        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
+        assert!(!nodes.is_empty());
+        assert!(
+            nodes.iter().all(|node| {
+                node["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("markdown."))
+            }),
+            "every wire kind composes from the language name: {nodes:#?}"
+        );
+        let section = nodes
+            .iter()
+            .find(|node| node["kind"] == "markdown.section")
+            .ok_or("position sits inside the heading's section")?;
+        assert_eq!(section["language"], json!({ "name": "markdown" }));
+        assert_eq!(section["facets"], json!(["declaration"]));
+        let section_id = section["id"].as_str().unwrap_or_default();
+        assert!(
+            section_id.starts_with("rift://node/markdown/"),
+            "a markdown node address files under the markdown segment: {section_id}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node["kind"] == "markdown.paragraph"),
+            "position sits inside the prose paragraph: {nodes:#?}"
+        );
+        Ok(())
+    }
+
+    /// One heading introduced and then content-edited across two commits;
+    /// the timeline classifies both through the markdown provider.
+    #[test]
+    fn markdown_symbol_history_lists_the_committed_timeline() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        let introduced = "# Install\n\nRun the beacon.\n";
+        fs::write(directory.path().join("docs.md"), introduced)?;
+        rift_history::fixture::commit_all(directory.path(), "introduce install guide");
+        let grown = "# Install\n\nRun the beacon twice.\n";
+        fs::write(directory.path().join("docs.md"), grown)?;
+        rift_history::fixture::commit_all(directory.path(), "grow install guide");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service =
+            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let request = json!({"name": "Install", "include_history": true});
+        let params: GetSymbolParams = serde_json::from_value(request)?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let history = &value["hits"][0]["history"];
+        assert_eq!(
+            history["symbol"],
+            json!("rift://symbol/markdown/docs.md/Install")
+        );
+        let versions = history["versions"]
+            .as_array()
+            .ok_or("history must carry versions")?;
+        let kinds: Vec<&str> = versions
+            .iter()
+            .filter_map(|version| version["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["body_changed", "introduced"]);
+        let summaries: Vec<&str> = versions
+            .iter()
+            .filter_map(|version| version["summary"].as_str())
+            .collect();
+        assert_eq!(summaries, ["grow install guide", "introduce install guide"]);
         Ok(())
     }
 
