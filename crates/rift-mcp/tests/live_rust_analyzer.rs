@@ -221,6 +221,39 @@ async fn applied_move_rewrites_the_module_declaration_and_the_import() -> TestRe
 const ARGUMENT_PATCH: &str =
     "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2, 3)\n";
 
+/// The inverse of [`ARGUMENT_PATCH`], restoring the single argument.
+const ARGUMENT_REVERT_PATCH: &str =
+    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2, 3)\n+    beacon(2)\n";
+
+/// Lands the arity error until rust-analyzer reports it, and answers with
+/// the applied change that carried the finding.
+///
+/// The engine's analysis warms after the resolution the rename probe waits
+/// on, and a pull answered before the changed file is analyzed comes back
+/// as an empty report. An empty report is what clean bytes answer too, so
+/// the server cannot resend it - only a refusal is retryable. Each attempt
+/// here is therefore a fresh change: the error lands, and an empty answer
+/// reverts it so the next attempt lands it again and pulls afresh.
+async fn reported_arity_error(client: &RunningService<RoleClient, ()>) -> TestResult<Value> {
+    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
+        let structured = call_retrying_acceptance(
+            client,
+            tool_request("patch", &json!({ "patch": ARGUMENT_PATCH })),
+        )
+        .await?;
+        if !coded_findings(&structured, "E0107").is_empty() {
+            return Ok(structured);
+        }
+        call_retrying_acceptance(
+            client,
+            tool_request("patch", &json!({ "patch": ARGUMENT_REVERT_PATCH })),
+        )
+        .await?;
+        tokio::time::sleep(WARMUP_PAUSE).await;
+    }
+    Err("rust-analyzer reported no arity error within the warm-up bound".into())
+}
+
 /// The applied change carries rust-analyzer's own finding for the file it
 /// changed: the pull runs on the document Rift just wrote, so the answer
 /// is the engine's reading of the landed bytes.
@@ -234,11 +267,7 @@ async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     require_rust_analyzer(directory.path());
     warmed_engine(&client).await?;
 
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request("patch", &json!({ "patch": ARGUMENT_PATCH })),
-    )
-    .await?;
+    let structured = reported_arity_error(&client).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(structured["summary"]["paths"], json!(["caller.rs"]));
     let findings = coded_findings(&structured, "E0107");
