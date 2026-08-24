@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "Generic LSP stdio client for Rift language engines"
+# Every suite's helper file sits beside it in `tests/`, where Cargo's own
+# discovery would compile each helper as a test binary of its own. The
+# suites are listed below instead, and a helper is reached with
+# `mod <name>;` from each suite that uses it.
+autotests = false
 
 [lints]
 workspace = true
@@ -21,3 +26,15 @@ tokio = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "live_rust_analyzer"
+path = "tests/live_rust_analyzer.rs"
+
+[[test]]
+name = "live_typescript"
+path = "tests/live_typescript.rs"
+
+[[test]]
+name = "session"
+path = "tests/session.rs"

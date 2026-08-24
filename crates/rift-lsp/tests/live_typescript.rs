@@ -16,21 +16,19 @@
 
 #![cfg(unix)]
 
-#[path = "support/live.rs"]
-mod live;
-#[path = "support/live_typescript.rs"]
-mod live_typescript;
+mod live_engine_gate;
+mod typescript_engine;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use live::engine_live;
-use live_typescript::{
-    BUNX_PROGRAM, LANGUAGE_SERVER_PACKAGE, install_typescript_engine, typescript_package_files,
-};
+use live_engine_gate::engine_live;
 use lsp_types::FileOperationPatternKind;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};
+use typescript_engine::{
+    BUNX_PROGRAM, LANGUAGE_SERVER_PACKAGE, install_typescript_engine, typescript_package_files,
+};
 
 /// The live launch. The engine answers initialize in tens of milliseconds
 /// once `bunx` has resolved the package, so the bounds carry a cold

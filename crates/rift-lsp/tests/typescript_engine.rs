@@ -27,11 +27,11 @@ pub(crate) fn typescript_package_files() -> [(&'static str, &'static str); 2] {
     [
         (
             "package.json",
-            include_str!("../../../rift-mcp/tests/fixtures/typescript/package.json"),
+            include_str!("../../rift-mcp/tests/fixtures/typescript/package.json"),
         ),
         (
             "bun.lock",
-            include_str!("../../../rift-mcp/tests/fixtures/typescript/bun.lock"),
+            include_str!("../../rift-mcp/tests/fixtures/typescript/bun.lock"),
         ),
     ]
 }
