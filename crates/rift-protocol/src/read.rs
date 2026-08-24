@@ -538,6 +538,21 @@ pub struct Language {
     pub dialect: Option<String>,
 }
 
+impl Language {
+    /// The segment a `SymbolId` or `NodeId` files this identity under.
+    ///
+    /// `name` alone, or `name:dialect` when a dialect is set - the two
+    /// spellings the `SymbolId` and `NodeId` patterns advertise after their
+    /// `rift://symbol/` and `rift://node/` prefixes.
+    #[must_use]
+    pub fn identity_segment(&self) -> String {
+        match &self.dialect {
+            Some(dialect) => format!("{}:{dialect}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
 /// A byte range of one file and the language used to parse it. The owner of `App.svelte`
 /// can mark its script block as TypeScript. A generated file records ranges in its own byte
 /// coordinates.
@@ -1640,7 +1655,7 @@ pub struct TypeExpression {
 #[cfg(test)]
 mod tests {
     use super::{
-        Digest, GetSymbolParams, PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX, RevisionId,
+        Digest, GetSymbolParams, Language, PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX, RevisionId,
         RevisionIdViolation, SourceUnitId,
     };
     use schemars::schema_for;
@@ -1707,6 +1722,24 @@ mod tests {
                 json!(label)
             );
         }
+    }
+
+    #[test]
+    fn identity_segment_is_the_name_when_no_dialect_is_set() {
+        let language = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        assert_eq!(language.identity_segment(), "rust");
+    }
+
+    #[test]
+    fn identity_segment_joins_name_and_dialect_with_a_colon() {
+        let language = Language {
+            name: "typescript".to_owned(),
+            dialect: Some("tsx".to_owned()),
+        };
+        assert_eq!(language.identity_segment(), "typescript:tsx");
     }
 
     #[test]

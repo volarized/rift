@@ -18,10 +18,10 @@ use rift_protocol::change::{
     PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::read::{
-    Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Severity,
-    SourceSpan, TextRange,
+    Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Language,
+    Severity, SourceSpan, TextRange,
 };
-use rift_syntax::{ByteRange, RustSyntaxProvider, SyntaxProvider, SyntaxSource};
+use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource, registry};
 use sha2::{Digest as _, Sha256};
 
 use crate::patch::{self, FileRewrite, RewriteKind};
@@ -132,13 +132,12 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (path, qualified_name) = parse_symbol_address(&params.symbol.0)?;
-        let resolution =
-            self.resolve_symbol_spans(reads, &path, &qualified_name, |range| ChangePlan {
-                path: path.clone(),
-                range,
-                text: params.body.clone(),
-            })?;
+        let address = parse_symbol_address(&params.symbol.0)?;
+        let resolution = self.resolve_symbol_spans(reads, &address, |range| ChangePlan {
+            path: address.path.clone(),
+            range,
+            text: params.body.clone(),
+        })?;
         self.conclude(reads, resolution)
     }
 
@@ -179,15 +178,15 @@ impl ChangeService {
         position: InsertPosition,
         body: &str,
     ) -> Result<ChangeResult, ReadError> {
-        let (path, qualified_name) = parse_symbol_address(anchor)?;
+        let address = parse_symbol_address(anchor)?;
         let body = body.to_owned();
-        let resolution = self.resolve_symbol_spans(reads, &path, &qualified_name, |range| {
+        let resolution = self.resolve_symbol_spans(reads, &address, |range| {
             let (at, text) = match position {
                 InsertPosition::Before => (range.start, format!("{body}\n\n")),
                 InsertPosition::After => (range.end, format!("\n\n{body}")),
             };
             ChangePlan {
-                path: path.clone(),
+                path: address.path.clone(),
                 range: ByteRange { start: at, end: at },
                 text,
             }
@@ -282,6 +281,7 @@ impl ChangeService {
                 )],
             ));
         };
+        verified_address_language("node", &address.language_segment, file.syntax())?;
         let observed_witness = node_witness(file.source(), address.range);
         if observed_witness != address.witness {
             return Ok(ChangeResult::refused(
@@ -474,15 +474,16 @@ impl ChangeService {
     fn resolve_symbol_spans(
         &self,
         reads: &ReadService,
-        path: &CoreProjectPath,
-        qualified_name: &str,
+        address: &SymbolAddress,
         plan: impl Fn(ByteRange) -> ChangePlan,
     ) -> Result<Resolution, ReadError> {
+        let path = &address.path;
         let symbol_address = || {
             vec![PreconditionAddress::Symbol {
-                symbol: rift_protocol::read::SymbolId(rift_core::rust_symbol_identity(
+                symbol: rift_protocol::read::SymbolId(rift_core::symbol_identity(
+                    &address.language_segment,
                     path.as_str(),
-                    qualified_name,
+                    &address.qualified_name,
                 )),
             }]
         };
@@ -499,11 +500,12 @@ impl ChangeService {
                 )],
             });
         };
+        verified_address_language("symbol", &address.language_segment, file.syntax())?;
         let spans: Vec<ByteRange> = file
             .syntax()
             .symbols()
             .iter()
-            .filter(|symbol| symbol.qualified_name == qualified_name)
+            .filter(|symbol| symbol.qualified_name == address.qualified_name)
             .map(|symbol| symbol.range)
             .collect();
         match spans.as_slice() {
@@ -661,36 +663,57 @@ fn spliced_at_file_edge(existing: &str, position: InsertPosition, body: &str) ->
 /// A parsed witnessed node address.
 #[derive(Debug)]
 struct NodeAddress {
+    language_segment: String,
     path: CoreProjectPath,
     range: ByteRange,
     witness: String,
 }
 
-/// Splits `rift://symbol/rust/<path>/<qualified-name>` into its decoded
-/// parts.
-fn parse_symbol_address(address: &str) -> Result<(CoreProjectPath, String), ReadError> {
+/// A parsed symbol address: the language segment it files under, and its
+/// decoded path and qualified name.
+#[derive(Debug)]
+struct SymbolAddress {
+    language_segment: String,
+    path: CoreProjectPath,
+    qualified_name: String,
+}
+
+/// Splits `rift://symbol/<language>/<path>/<qualified-name>` into its
+/// decoded parts. The language segment is taken as spelled; resolution
+/// verifies it against the addressed file's document.
+fn parse_symbol_address(address: &str) -> Result<SymbolAddress, ReadError> {
     let malformed = || ReadFault::invalid("symbol", "not a rift symbol address");
     let remainder = address
-        .strip_prefix("rift://symbol/rust/")
+        .strip_prefix("rift://symbol/")
         .ok_or_else(malformed)?;
+    let (language_segment, remainder) = remainder.split_once('/').ok_or_else(malformed)?;
+    if language_segment.is_empty() {
+        return Err(malformed());
+    }
     let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or_else(malformed)?;
     let path = decoded(encoded_path).ok_or_else(malformed)?;
     let qualified_name = decoded(encoded_name).ok_or_else(malformed)?;
     let path = CoreProjectPath::new(path).map_err(|error| {
         ReadFault::invalid("symbol", rift_core::fault_label(&error.fault().violation()))
     })?;
-    Ok((path, qualified_name))
+    Ok(SymbolAddress {
+        language_segment: language_segment.to_owned(),
+        path,
+        qualified_name,
+    })
 }
 
 impl std::str::FromStr for NodeAddress {
     type Err = ReadError;
 
-    /// Parses `rift://node/rust/<path>@<start>-<end>#<witness>`.
+    /// Parses `rift://node/<language>/<path>@<start>-<end>#<witness>`.
     fn from_str(address: &str) -> Result<Self, Self::Err> {
         let malformed = || ReadFault::invalid("node", "not a witnessed rift node address");
-        let remainder = address
-            .strip_prefix("rift://node/rust/")
-            .ok_or_else(malformed)?;
+        let remainder = address.strip_prefix("rift://node/").ok_or_else(malformed)?;
+        let (language_segment, remainder) = remainder.split_once('/').ok_or_else(malformed)?;
+        if language_segment.is_empty() {
+            return Err(malformed());
+        }
         let (located, witness) = remainder.rsplit_once('#').ok_or_else(malformed)?;
         let (encoded_path, span) = located.rsplit_once('@').ok_or_else(malformed)?;
         let (start, end) = span.split_once('-').ok_or_else(malformed)?;
@@ -704,11 +727,37 @@ impl std::str::FromStr for NodeAddress {
             ReadFault::invalid("node", rift_core::fault_label(&error.fault().violation()))
         })?;
         Ok(Self {
+            language_segment: language_segment.to_owned(),
             path,
             range: ByteRange { start, end },
             witness: witness.to_owned(),
         })
     }
+}
+
+/// Verifies an address's language segment against the addressed file's
+/// document, once the file has resolved.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] naming both spellings when they differ: an address
+/// filed under one language cannot act on a document filed under another.
+fn verified_address_language(
+    field: &'static str,
+    language_segment: &str,
+    document: &SyntaxDocument,
+) -> Result<(), ReadError> {
+    let document_segment = document.language().identity_segment();
+    if language_segment == document_segment {
+        return Ok(());
+    }
+    Err(ReadFault::invalid(
+        field,
+        format!(
+            "address language {language_segment} does not match the indexed \
+             language {document_segment}"
+        ),
+    ))
 }
 
 fn decoded(encoded: &str) -> Option<String> {
@@ -729,15 +778,20 @@ fn change_id(path: &str, next_source: &str) -> ChangeId {
 /// A change that breaks the syntax still lands - the tree is the caller's -
 /// but the result says so instead of leaving the discovery to the next read.
 /// `unit` names the changed file even when it has no prior index entry, as
-/// for a file a patch just created.
+/// for a file a patch just created. The registry selects the parsing
+/// provider by the path's extension; a path no provider claims has no
+/// grammar to check against and contributes no findings.
 fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Vec<Diagnostic> {
-    let provider = RustSyntaxProvider::default();
-    let parsed = provider.analyze(SyntaxSource { path, text: source });
-    match parsed {
+    let Some(provider) = path_extension(path).and_then(registry::provider_for_extension) else {
+        return Vec::new();
+    };
+    let language = provider.language();
+    match provider.analyze(SyntaxSource { path, text: source }) {
         Err(error) => vec![change_diagnostic(
             unit,
             format!("the changed file no longer parses within bounds: {error}"),
             None,
+            language.clone(),
         )],
         Ok(document) => document
             .nodes()
@@ -749,16 +803,25 @@ fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Ve
                     unit.clone(),
                     "the parser marked this region erroneous after the change".to_owned(),
                     Some(node.range),
+                    language.clone(),
                 )
             })
             .collect(),
     }
 }
 
+/// The extension of `path`'s final segment, without its leading dot.
+fn path_extension(path: &CoreProjectPath) -> Option<&str> {
+    Path::new(path.as_str())
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+}
+
 fn change_diagnostic(
     unit: rift_protocol::read::FileId,
     message: String,
     range: Option<ByteRange>,
+    language: Language,
 ) -> Diagnostic {
     Diagnostic {
         severity: Severity::Error,
@@ -776,10 +839,7 @@ fn change_diagnostic(
         reliability: DiagnosticReliability::Recovered,
         continuation: DiagnosticContinuation::Unknown,
         extensions: Extensions(std::collections::BTreeMap::new()),
-        language: Some(rift_protocol::read::Language {
-            name: "rust".to_owned(),
-            dialect: None,
-        }),
+        language: Some(language),
     }
 }
 
@@ -789,6 +849,7 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, Barrier};
 
+    use rift_core::ProjectPath as CoreProjectPath;
     use rift_core::SourceVisibility;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
@@ -796,7 +857,7 @@ mod tests {
         PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams,
         ReplaceSymbolParams,
     };
-    use rift_protocol::read::{NodeId, NodesParams, ProjectPath, SymbolId};
+    use rift_protocol::read::{FileId, Language, NodeId, NodesParams, ProjectPath, SymbolId};
     use rift_syntax::ByteRange;
 
     use super::ChangeService;
@@ -1244,7 +1305,11 @@ mod tests {
                 create_missing: true,
             },
         )?;
-        applied_summary(result);
+        let summary = applied_summary(result);
+        assert!(
+            summary.diagnostics.is_empty(),
+            "no provider claims md, so the change reports no reparse findings"
+        );
         let written = fs::read_to_string(directory.path().join("notes/TODO.md"))?;
         assert_eq!(written, "- write docs");
         Ok(())
@@ -1653,6 +1718,124 @@ mod tests {
         assert!(
             error.to_string().contains("violation"),
             "message must name the broken rule: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_address_round_trips_the_rust_segment_through_mint_and_parse() -> TestResult {
+        let minted = rift_core::symbol_identity("rust", "lib.rs", "beacon");
+        assert_eq!(minted, symbol("beacon").0);
+        let parsed = super::parse_symbol_address(&minted)?;
+        assert_eq!(parsed.language_segment, "rust");
+        assert_eq!(parsed.path.as_str(), "lib.rs");
+        assert_eq!(parsed.qualified_name, "beacon");
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_address_round_trips_a_dialect_segment_through_mint_and_parse() -> TestResult {
+        let minted = rift_core::symbol_identity("typescript:tsx", "src/App.tsx", "render");
+        let parsed = super::parse_symbol_address(&minted)?;
+        assert_eq!(parsed.language_segment, "typescript:tsx");
+        assert_eq!(parsed.path.as_str(), "src/App.tsx");
+        assert_eq!(parsed.qualified_name, "render");
+        Ok(())
+    }
+
+    #[test]
+    fn node_address_parses_the_language_segment_for_name_and_dialect_forms() -> TestResult {
+        let rust: super::NodeAddress = "rift://node/rust/lib.rs@0-4#aaaaaaaa".parse()?;
+        assert_eq!(rust.language_segment, "rust");
+        assert_eq!(rust.path.as_str(), "lib.rs");
+        let dialect: super::NodeAddress =
+            "rift://node/typescript:tsx/src/App.tsx@0-4#aaaaaaaa".parse()?;
+        assert_eq!(dialect.language_segment, "typescript:tsx");
+        assert_eq!(dialect.path.as_str(), "src/App.tsx");
+        Ok(())
+    }
+
+    #[test]
+    fn addresses_with_an_empty_language_segment_are_malformed() {
+        let symbol_error = super::parse_symbol_address("rift://symbol//lib.rs/beacon")
+            .expect_err("an empty language segment must be malformed");
+        assert_eq!(symbol_error.descriptor().code(), "invalid_request");
+        let node_error = "rift://node//lib.rs@0-4#aaaaaaaa"
+            .parse::<super::NodeAddress>()
+            .expect_err("an empty language segment must be malformed");
+        assert_eq!(node_error.descriptor().code(), "invalid_request");
+    }
+
+    #[test]
+    fn replace_symbol_refuses_an_address_language_that_mismatches_the_document() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let error = changes
+            .replace_symbol(
+                &reads,
+                &ReplaceSymbolParams {
+                    symbol: SymbolId("rift://symbol/typescript/lib.rs/beacon".to_owned()),
+                    region: None,
+                    body: "pub fn beacon() {}".to_owned(),
+                },
+            )
+            .expect_err("a mismatched address language must be refused as invalid");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error
+                .to_string()
+                .contains("address language typescript does not match the indexed language rust"),
+            "message must name both languages: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_node_refuses_an_address_language_that_mismatches_the_document() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let error = changes
+            .replace_node(
+                &reads,
+                &ReplaceNodeParams {
+                    node: NodeId("rift://node/typescript/lib.rs@0-5#aaaaaaaa".to_owned()),
+                    region: None,
+                    body: "x".to_owned(),
+                },
+            )
+            .expect_err("a mismatched address language must be refused as invalid");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error
+                .to_string()
+                .contains("address language typescript does not match the indexed language rust"),
+            "message must name both languages: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reparse_skips_a_path_no_provider_claims() -> TestResult {
+        let path = CoreProjectPath::new("notes/TODO.md")?;
+        let unit = FileId("rift://file/notes/TODO.md".to_owned());
+        let diagnostics = super::reparse_diagnostics(unit, &path, "fn broken( {");
+        assert!(
+            diagnostics.is_empty(),
+            "an unclaimed extension has no grammar, so no findings"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reparse_stamps_findings_with_the_claiming_provider_language() -> TestResult {
+        let path = CoreProjectPath::new("lib.rs")?;
+        let unit = FileId("rift://file/lib.rs".to_owned());
+        let diagnostics = super::reparse_diagnostics(unit, &path, "fn broken( {");
+        assert!(!diagnostics.is_empty(), "broken rust must report findings");
+        assert_eq!(
+            diagnostics[0].language,
+            Some(Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            })
         );
         Ok(())
     }

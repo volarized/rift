@@ -217,7 +217,7 @@ async fn open_lexical_index(
     }
 }
 
-/// Rust workspace MCP server: reads serve an immutable snapshot, changes
+/// Workspace MCP server: reads serve an immutable snapshot, changes
 /// write the workspace and swap in a fresh snapshot.
 ///
 /// Clones share every piece of server state. The HTTP transport clones one
@@ -364,7 +364,7 @@ impl RiftMcp {
             .server_configuration()
     }
 
-    /// Finds Rust declarations and their source by exact symbol name. Each hit
+    /// Finds declarations and their source by exact symbol name. Each hit
     /// carries the declaration and its source excerpt; `include_body: false` omits
     /// both. `rev` serves the lookup from a version-control revision instead of
     /// the current tree. Use `search` when the name is not exactly known.
@@ -378,7 +378,7 @@ impl RiftMcp {
             .await
     }
 
-    /// Searches indexed Rust declarations and source lines by lexical `query`, merged with
+    /// Searches indexed declarations and source lines by lexical `query`, merged with
     /// full-text matches from included `[search.text]` files and declaration bodies. `rev`
     /// searches a version-control revision instead of the current tree. Use `get_symbol`
     /// when the declaration name is known.
