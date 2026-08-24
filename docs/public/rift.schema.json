@@ -199,6 +199,78 @@
       "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
       "type": "string"
     },
+    "EngineConfiguration": {
+      "additionalProperties": false,
+      "description": "One `[engines.<name>]` table: an external LSP server Rift may start.\n\nThe key is the engine's name, a lowercase word in the language-name\ncharset. Rift starts the engine on the first request for a language it\nserves, speaks LSP to it over stdio, and reuses the running engine\nacross requests. The engine never writes: it proposes edits, and Rift\napplies them through its own change path.",
+      "properties": {
+        "arguments": {
+          "default": [],
+          "description": "The program's literal arguments, in order. May be empty.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Environment values added on top of the environment the server\ninherited.",
+          "type": "object"
+        },
+        "initialization_options": {
+          "description": "Options handed to the engine at initialize. Must be a JSON object\nwhen present; the engine defines its meaning."
+        },
+        "languages": {
+          "description": "The languages this engine serves: a language name, or `name:dialect`\nto pin a dialect. Each segment belongs to at most one engine across\nthe whole `[engines]` table. A segment no syntax provider knows is\naccepted: an engine may serve languages the syntax tier does not.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "output_limit": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4kb",
+          "description": "Bytes of the engine's standard error Rift keeps, 1kb to 8mb. The\nfull size is still reported.",
+          "rift:range": {
+            "max": "8mb",
+            "min": "1kb"
+          }
+        },
+        "program": {
+          "description": "The executable Rift starts inside the workspace root. An absolute\npath is refused; the name resolves through `PATH`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "1m",
+          "description": "Wall-clock bound on each later engine request, 1s to 10m.",
+          "rift:range": {
+            "max": "10m",
+            "min": "1s"
+          }
+        },
+        "startup_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "Wall-clock bound on the engine's initialize handshake, 1s to 10m.",
+          "rift:range": {
+            "max": "10m",
+            "min": "1s"
+          }
+        }
+      },
+      "required": [
+        "program",
+        "languages"
+      ],
+      "type": "object"
+    },
     "ExecutionConfiguration": {
       "additionalProperties": false,
       "description": "The `[execution]` table. `execute` stays off until `allow` names the\nlanguages caller-provided code may run as.",
@@ -599,6 +671,14 @@
   "additionalProperties": false,
   "description": "The whole `rift.toml`. Every table is optional and defaults to the\nbehavior documented on it; any key outside these definitions refuses the\nfile as `configuration_invalid`.",
   "properties": {
+    "engines": {
+      "additionalProperties": {
+        "$ref": "#/$defs/EngineConfiguration"
+      },
+      "default": {},
+      "description": "Language engines keyed by name: each `[engines.<name>]` table names\nan external LSP server and the languages it serves.",
+      "type": "object"
+    },
     "execution": {
       "$ref": "#/$defs/ExecutionConfiguration",
       "default": {

@@ -56,6 +56,34 @@ pub const HOOK_OUTPUT_BYTES_MAX: u64 = 4_096;
 pub const HOOK_GUARANTEES_MAX: usize = 16;
 /// Bytes one guarantee's `detail` may hold, at most.
 pub const HOOK_GUARANTEE_DETAIL_BYTES_MAX: usize = 1_024;
+/// Configured language engines one workspace may declare, at most.
+pub const ENGINES_MAX: usize = 16;
+/// Entries one engine's `arguments` may hold, at most.
+pub const ENGINE_ARGUMENTS_MAX: usize = 64;
+/// Bytes one engine argument may hold, at most.
+pub const ENGINE_ARGUMENT_BYTES_MAX: usize = 4_096;
+/// Entries one engine's `environment` may hold, at most.
+pub const ENGINE_ENVIRONMENT_ENTRIES_MAX: usize = 64;
+/// Entries one engine's `languages` may hold, at most.
+pub const ENGINE_LANGUAGES_MAX: usize = 16;
+/// Milliseconds one engine may take to initialize, at least: one second.
+pub const ENGINE_STARTUP_TIMEOUT_MS_MIN: u64 = 1_000;
+/// Milliseconds one engine may take to initialize, at most: ten minutes.
+pub const ENGINE_STARTUP_TIMEOUT_MS_MAX: u64 = 600_000;
+/// Milliseconds `engines.startup_timeout` holds when the key is absent.
+const ENGINE_STARTUP_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+/// Milliseconds one engine request may run, at least: one second.
+pub const ENGINE_REQUEST_TIMEOUT_MS_MIN: u64 = 1_000;
+/// Milliseconds one engine request may run, at most: ten minutes.
+pub const ENGINE_REQUEST_TIMEOUT_MS_MAX: u64 = 600_000;
+/// Milliseconds `engines.request_timeout` holds when the key is absent.
+const ENGINE_REQUEST_TIMEOUT_MS_DEFAULT: u64 = 60_000;
+/// Bytes of each engine's standard error Rift keeps, at least.
+pub const ENGINE_OUTPUT_BYTES_MIN: u64 = 1_024;
+/// Bytes of each engine's standard error Rift keeps, at most.
+pub const ENGINE_OUTPUT_BYTES_MAX: u64 = 8 << 20;
+/// Bytes `engines.output_limit` holds when the key is absent.
+const ENGINE_OUTPUT_BYTES_DEFAULT: u64 = 4_096;
 
 /// The spelling a [`ByteSize`] value must match.
 const BYTE_SIZE_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:b|kb|mb|gb|tb)$";
@@ -319,6 +347,9 @@ pub struct WorkspaceConfiguration {
     /// applies.
     #[schemars(length(max = 32))]
     pub hooks: Vec<CommandHook>,
+    /// Language engines keyed by name: each `[engines.<name>]` table names
+    /// an external LSP server and the languages it serves.
+    pub engines: BTreeMap<String, EngineConfiguration>,
 }
 
 impl WorkspaceConfiguration {
@@ -344,6 +375,7 @@ impl WorkspaceConfiguration {
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
             .or_else(|| hooks_violation(&self.hooks))
+            .or_else(|| engines_violation(&self.engines))
     }
 }
 
@@ -926,6 +958,63 @@ pub enum GuaranteeKind {
     BehaviorChecked,
 }
 
+/// One `[engines.<name>]` table: an external LSP server Rift may start.
+///
+/// The key is the engine's name, a lowercase word in the language-name
+/// charset. Rift starts the engine on the first request for a language it
+/// serves, speaks LSP to it over stdio, and reuses the running engine
+/// across requests. The engine never writes: it proposes edits, and Rift
+/// applies them through its own change path.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_engine_ranges)]
+pub struct EngineConfiguration {
+    /// The executable Rift starts inside the workspace root. An absolute
+    /// path is refused; the name resolves through `PATH`.
+    #[schemars(length(min = 1))]
+    pub program: String,
+    /// The program's literal arguments, in order. May be empty.
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    pub arguments: Vec<String>,
+    /// Environment values added on top of the environment the server
+    /// inherited.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// The languages this engine serves: a language name, or `name:dialect`
+    /// to pin a dialect. Each segment belongs to at most one engine across
+    /// the whole `[engines]` table. A segment no syntax provider knows is
+    /// accepted: an engine may serve languages the syntax tier does not.
+    #[schemars(length(min = 1, max = 16))]
+    pub languages: Vec<String>,
+    /// Options handed to the engine at initialize. Must be a JSON object
+    /// when present; the engine defines its meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_options: Option<serde_json::Value>,
+    /// Wall-clock bound on the engine's initialize handshake, 1s to 10m.
+    #[serde(default = "default_engine_startup_timeout")]
+    pub startup_timeout: Duration,
+    /// Wall-clock bound on each later engine request, 1s to 10m.
+    #[serde(default = "default_engine_request_timeout")]
+    pub request_timeout: Duration,
+    /// Bytes of the engine's standard error Rift keeps, 1kb to 8mb. The
+    /// full size is still reported.
+    #[serde(default = "default_engine_output_limit")]
+    pub output_limit: ByteSize,
+}
+
+fn default_engine_startup_timeout() -> Duration {
+    Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_DEFAULT)
+}
+
+fn default_engine_request_timeout() -> Duration {
+    Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_DEFAULT)
+}
+
+fn default_engine_output_limit() -> ByteSize {
+    ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_DEFAULT)
+}
+
 /// The first bound a configuration file breaks. Field paths name keys as
 /// the file spells them, so the refusal points at the line to fix.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -994,6 +1083,64 @@ pub enum ConfigurationViolation {
         /// The rejected key.
         key: String,
     },
+    /// An `[engines.<name>]` key is not a lowercase word in the
+    /// language-name charset.
+    EngineNameInvalid {
+        /// The rejected engine name.
+        name: String,
+    },
+    /// An engine's `program` is empty, so there is nothing to start.
+    EngineProgramEmpty {
+        /// The engine missing its executable.
+        engine: String,
+    },
+    /// An engine names its executable by absolute path, which would escape
+    /// the workspace's `PATH` policy.
+    EngineExecutableAbsolute {
+        /// The engine naming the executable.
+        engine: String,
+        /// The refused executable path.
+        program: String,
+    },
+    /// An engine argument exceeds [`ENGINE_ARGUMENT_BYTES_MAX`] bytes.
+    EngineArgumentOversized {
+        /// The engine declaring the argument.
+        engine: String,
+        /// The oversized argument's length in bytes.
+        bytes: u64,
+    },
+    /// An engine environment key is empty, or carries `=` or a NUL byte.
+    EngineEnvironmentKeyInvalid {
+        /// The engine declaring the entry.
+        engine: String,
+        /// The rejected key.
+        key: String,
+    },
+    /// An engine's `languages` list is empty, so no request could reach it.
+    EngineLanguagesEmpty {
+        /// The engine serving no language.
+        engine: String,
+    },
+    /// An engine `languages` entry is not `name` or `name:dialect`.
+    EngineLanguageInvalid {
+        /// The engine declaring the entry.
+        engine: String,
+        /// The rejected entry.
+        language: String,
+    },
+    /// Two engine `languages` entries claim one language identity segment,
+    /// so a request for it could not pick an engine.
+    EngineLanguageDuplicate {
+        /// The engine claiming the segment again.
+        engine: String,
+        /// The language identity segment claimed twice.
+        language: String,
+    },
+    /// An engine's `initialization_options` value is not a JSON object.
+    EngineInitializationOptionsNotObject {
+        /// The engine declaring the options.
+        engine: String,
+    },
     /// A `source.include` or `source.exclude` entry breaks the forward-slash-only path-pattern
     /// contract: it is empty, absolute, carries a backslash or control character, or a `.` or
     /// `..` segment.
@@ -1048,6 +1195,27 @@ impl ConfigurationViolation {
             }
             Self::HookEnvironmentKeyInvalid { id, key } => {
                 vec![("id", id.clone()), ("key", key.clone())]
+            }
+            Self::EngineNameInvalid { name } => vec![("name", name.clone())],
+            Self::EngineProgramEmpty { engine }
+            | Self::EngineLanguagesEmpty { engine }
+            | Self::EngineInitializationOptionsNotObject { engine } => {
+                vec![("engine", engine.clone())]
+            }
+            Self::EngineExecutableAbsolute { engine, program } => {
+                vec![("engine", engine.clone()), ("program", program.clone())]
+            }
+            Self::EngineArgumentOversized { engine, bytes } => vec![
+                ("engine", engine.clone()),
+                ("bytes", bytes.to_string()),
+                ("bytes_max", ENGINE_ARGUMENT_BYTES_MAX.to_string()),
+            ],
+            Self::EngineEnvironmentKeyInvalid { engine, key } => {
+                vec![("engine", engine.clone()), ("key", key.clone())]
+            }
+            Self::EngineLanguageInvalid { engine, language }
+            | Self::EngineLanguageDuplicate { engine, language } => {
+                vec![("engine", engine.clone()), ("language", language.clone())]
             }
             Self::PathPatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
@@ -1247,6 +1415,174 @@ fn is_absolute_program(program: &str) -> bool {
     }
 }
 
+/// The first violated engine bound, engines in name order.
+///
+/// One claim set spans the whole table, so a language identity segment
+/// repeated within one engine or across two engines is refused either way.
+fn engines_violation(
+    engines: &BTreeMap<String, EngineConfiguration>,
+) -> Option<ConfigurationViolation> {
+    if engines.len() > ENGINES_MAX {
+        return out_of_range("engines", engines.len() as u64, 0, ENGINES_MAX as u64);
+    }
+    let mut claimed = std::collections::BTreeSet::new();
+    for (name, engine) in engines {
+        if !is_language_word(name) {
+            return Some(ConfigurationViolation::EngineNameInvalid { name: name.clone() });
+        }
+        if let Some(violation) = engine_violation(name, engine) {
+            return Some(violation);
+        }
+        for language in &engine.languages {
+            if !claimed.insert(language.as_str()) {
+                return Some(ConfigurationViolation::EngineLanguageDuplicate {
+                    engine: name.clone(),
+                    language: language.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The first bound one engine breaks, rules in key order.
+fn engine_violation(name: &str, engine: &EngineConfiguration) -> Option<ConfigurationViolation> {
+    engine_program_violation(name, engine)
+        .or_else(|| engine_arguments_violation(name, engine))
+        .or_else(|| engine_environment_violation(name, engine))
+        .or_else(|| engine_languages_violation(name, engine))
+        .or_else(|| engine_options_violation(name, engine))
+        .or_else(|| engine_bounds_violation(engine))
+}
+
+/// The rules on what the engine runs: a present, non-absolute program.
+fn engine_program_violation(
+    name: &str,
+    engine: &EngineConfiguration,
+) -> Option<ConfigurationViolation> {
+    if engine.program.is_empty() {
+        return Some(ConfigurationViolation::EngineProgramEmpty {
+            engine: name.to_owned(),
+        });
+    }
+    is_absolute_program(&engine.program).then(|| ConfigurationViolation::EngineExecutableAbsolute {
+        engine: name.to_owned(),
+        program: engine.program.clone(),
+    })
+}
+
+/// The `arguments` rules: a bounded count, then bounded entry sizes.
+fn engine_arguments_violation(
+    name: &str,
+    engine: &EngineConfiguration,
+) -> Option<ConfigurationViolation> {
+    first_out_of_range([(
+        "engines.arguments",
+        engine.arguments.len() as u64,
+        0,
+        ENGINE_ARGUMENTS_MAX as u64,
+    )])
+    .or_else(|| {
+        let oversized = engine
+            .arguments
+            .iter()
+            .find(|argument| argument.len() > ENGINE_ARGUMENT_BYTES_MAX)?;
+        Some(ConfigurationViolation::EngineArgumentOversized {
+            engine: name.to_owned(),
+            bytes: oversized.len() as u64,
+        })
+    })
+}
+
+/// The `environment` rules: a bounded count, then every entry's key.
+fn engine_environment_violation(
+    name: &str,
+    engine: &EngineConfiguration,
+) -> Option<ConfigurationViolation> {
+    first_out_of_range([(
+        "engines.environment",
+        engine.environment.len() as u64,
+        0,
+        ENGINE_ENVIRONMENT_ENTRIES_MAX as u64,
+    )])
+    .or_else(|| {
+        let key = engine
+            .environment
+            .keys()
+            .find(|key| !is_environment_key(key))?;
+        Some(ConfigurationViolation::EngineEnvironmentKeyInvalid {
+            engine: name.to_owned(),
+            key: key.clone(),
+        })
+    })
+}
+
+/// The `languages` rules: at least one entry, a bounded count, and each
+/// entry a language identity segment.
+fn engine_languages_violation(
+    name: &str,
+    engine: &EngineConfiguration,
+) -> Option<ConfigurationViolation> {
+    if engine.languages.is_empty() {
+        return Some(ConfigurationViolation::EngineLanguagesEmpty {
+            engine: name.to_owned(),
+        });
+    }
+    first_out_of_range([(
+        "engines.languages",
+        engine.languages.len() as u64,
+        1,
+        ENGINE_LANGUAGES_MAX as u64,
+    )])
+    .or_else(|| {
+        let invalid = engine
+            .languages
+            .iter()
+            .find(|language| !is_language_selector(language))?;
+        Some(ConfigurationViolation::EngineLanguageInvalid {
+            engine: name.to_owned(),
+            language: invalid.clone(),
+        })
+    })
+}
+
+/// The `initialization_options` rule: one JSON object, when present.
+fn engine_options_violation(
+    name: &str,
+    engine: &EngineConfiguration,
+) -> Option<ConfigurationViolation> {
+    let options = engine.initialization_options.as_ref()?;
+    (!options.is_object()).then(
+        || ConfigurationViolation::EngineInitializationOptionsNotObject {
+            engine: name.to_owned(),
+        },
+    )
+}
+
+/// The numeric bounds one engine carries, as a table in key order.
+fn engine_bounds_violation(engine: &EngineConfiguration) -> Option<ConfigurationViolation> {
+    first_out_of_range([
+        (
+            "engines.startup_timeout",
+            engine.startup_timeout.milliseconds(),
+            ENGINE_STARTUP_TIMEOUT_MS_MIN,
+            ENGINE_STARTUP_TIMEOUT_MS_MAX,
+        ),
+        (
+            "engines.request_timeout",
+            engine.request_timeout.milliseconds(),
+            ENGINE_REQUEST_TIMEOUT_MS_MIN,
+            ENGINE_REQUEST_TIMEOUT_MS_MAX,
+        ),
+        (
+            "engines.output_limit",
+            engine.output_limit.bytes(),
+            ENGINE_OUTPUT_BYTES_MIN,
+            ENGINE_OUTPUT_BYTES_MAX,
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1267,6 +1603,29 @@ mod tests {
             output_limit: ByteSize::from_bytes(4_096),
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
+        }
+    }
+
+    fn engine() -> EngineConfiguration {
+        EngineConfiguration {
+            program: "uvx".to_owned(),
+            arguments: vec!["ty".to_owned(), "server".to_owned()],
+            environment: BTreeMap::new(),
+            languages: vec!["python".to_owned()],
+            initialization_options: None,
+            startup_timeout: Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_DEFAULT),
+            request_timeout: Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_DEFAULT),
+            output_limit: ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_DEFAULT),
+        }
+    }
+
+    fn engines(entries: Vec<(&str, EngineConfiguration)>) -> WorkspaceConfiguration {
+        WorkspaceConfiguration {
+            engines: entries
+                .into_iter()
+                .map(|(name, engine)| (name.to_owned(), engine))
+                .collect(),
+            ..WorkspaceConfiguration::default()
         }
     }
 
@@ -1422,6 +1781,7 @@ mod tests {
         assert!(configuration.source.exclude.is_empty());
         assert!(configuration.source.respect_gitignore);
         assert!(configuration.hooks.is_empty());
+        assert!(configuration.engines.is_empty());
         assert_eq!(configuration.validate(), Ok(()));
     }
 
@@ -1435,6 +1795,9 @@ mod tests {
             json!({ "search": { "unknown": "x" } }),
             json!({ "search": { "text": { "unknown": "x" } } }),
             json!({ "source": { "unknown": "x" } }),
+            json!({ "engines": { "ty": {
+                "program": "uvx", "languages": ["python"], "unknown": 1,
+            } } }),
         ];
         for case in cases {
             assert!(
@@ -2078,6 +2441,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one data row per violation variant")]
     fn test_every_violation_variant_carries_its_evidence() {
         let id = || "tests".to_owned();
         let cases = [
@@ -2141,6 +2505,78 @@ mod tests {
                 },
                 vec![("extension", "md".to_owned())],
             ),
+            (
+                ConfigurationViolation::EngineNameInvalid {
+                    name: "Ty".to_owned(),
+                },
+                vec![("name", "Ty".to_owned())],
+            ),
+            (
+                ConfigurationViolation::EngineProgramEmpty {
+                    engine: "ty".to_owned(),
+                },
+                vec![("engine", "ty".to_owned())],
+            ),
+            (
+                ConfigurationViolation::EngineLanguagesEmpty {
+                    engine: "ty".to_owned(),
+                },
+                vec![("engine", "ty".to_owned())],
+            ),
+            (
+                ConfigurationViolation::EngineInitializationOptionsNotObject {
+                    engine: "ty".to_owned(),
+                },
+                vec![("engine", "ty".to_owned())],
+            ),
+            (
+                ConfigurationViolation::EngineExecutableAbsolute {
+                    engine: "ty".to_owned(),
+                    program: "/usr/bin/ty".to_owned(),
+                },
+                vec![
+                    ("engine", "ty".to_owned()),
+                    ("program", "/usr/bin/ty".to_owned()),
+                ],
+            ),
+            (
+                ConfigurationViolation::EngineArgumentOversized {
+                    engine: "ty".to_owned(),
+                    bytes: 5_000,
+                },
+                vec![
+                    ("engine", "ty".to_owned()),
+                    ("bytes", "5000".to_owned()),
+                    ("bytes_max", ENGINE_ARGUMENT_BYTES_MAX.to_string()),
+                ],
+            ),
+            (
+                ConfigurationViolation::EngineEnvironmentKeyInvalid {
+                    engine: "ty".to_owned(),
+                    key: "BAD=KEY".to_owned(),
+                },
+                vec![("engine", "ty".to_owned()), ("key", "BAD=KEY".to_owned())],
+            ),
+            (
+                ConfigurationViolation::EngineLanguageInvalid {
+                    engine: "ty".to_owned(),
+                    language: "Python".to_owned(),
+                },
+                vec![
+                    ("engine", "ty".to_owned()),
+                    ("language", "Python".to_owned()),
+                ],
+            ),
+            (
+                ConfigurationViolation::EngineLanguageDuplicate {
+                    engine: "b".to_owned(),
+                    language: "python".to_owned(),
+                },
+                vec![
+                    ("engine", "b".to_owned()),
+                    ("language", "python".to_owned()),
+                ],
+            ),
         ];
         for (violation, expected) in cases {
             assert_eq!(violation.evidence(), expected, "{violation:?}");
@@ -2164,6 +2600,427 @@ mod tests {
             configuration.validate(),
             Err(ConfigurationViolation::LimitOutOfRange { field: "hooks", .. })
         ));
+    }
+
+    #[test]
+    fn test_engine_table_defaults_apply_to_the_optional_keys() {
+        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
+            "engines": { "ty": { "program": "uvx", "languages": ["python"] } }
+        }))
+        .expect("a minimal engine table must deserialize");
+        let engine = &configuration.engines["ty"];
+        assert!(engine.arguments.is_empty());
+        assert!(engine.environment.is_empty());
+        assert_eq!(engine.initialization_options, None);
+        assert_eq!(
+            engine.startup_timeout,
+            Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_DEFAULT)
+        );
+        assert_eq!(
+            engine.request_timeout,
+            Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_DEFAULT)
+        );
+        assert_eq!(
+            engine.output_limit,
+            ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_DEFAULT)
+        );
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_engine_table_requires_program_and_languages() {
+        for trimmed in [
+            json!({ "languages": ["python"] }),
+            json!({ "program": "uvx" }),
+        ] {
+            let table = json!({ "engines": { "ty": trimmed } });
+            assert!(
+                serde_json::from_value::<WorkspaceConfiguration>(table.clone()).is_err(),
+                "{table} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_two_engine_table_round_trips_with_exact_wire_names() {
+        let mut typescript = engine();
+        typescript.program = "bunx".to_owned();
+        typescript.arguments = vec![
+            "typescript-language-server".to_owned(),
+            "--stdio".to_owned(),
+        ];
+        typescript.languages = vec!["typescript".to_owned(), "typescript:tsx".to_owned()];
+        typescript.initialization_options = Some(json!({ "tsserver": { "logVerbosity": "off" } }));
+        let configuration = engines(vec![("ty", engine()), ("typescript", typescript)]);
+        assert_eq!(configuration.validate(), Ok(()));
+        let value = serde_json::to_value(&configuration).expect("serialize");
+        assert_eq!(value["engines"]["ty"]["startup_timeout"], json!("30s"));
+        assert_eq!(value["engines"]["ty"]["request_timeout"], json!("1m"));
+        assert_eq!(value["engines"]["ty"]["output_limit"], json!("4kb"));
+        assert_eq!(
+            value["engines"]["typescript"]["languages"],
+            json!(["typescript", "typescript:tsx"])
+        );
+        let round_tripped: WorkspaceConfiguration =
+            serde_json::from_value(value).expect("deserialize");
+        assert_eq!(round_tripped, configuration);
+    }
+
+    /// One way to break an engine bound, and the check its refusal must
+    /// pass.
+    type EngineBoundCase = (
+        fn(&mut EngineConfiguration),
+        fn(&ConfigurationViolation) -> bool,
+    );
+
+    /// Proves each broken engine is refused with the expected violation,
+    /// and that the matcher rejects an unrelated one.
+    fn assert_engines_refused<const CASES: usize>(break_and_expect: [EngineBoundCase; CASES]) {
+        let unrelated = ConfigurationViolation::HookIdDuplicate {
+            id: "unrelated".to_owned(),
+        };
+        for (break_bound, expected) in break_and_expect {
+            let mut broken = engine();
+            break_bound(&mut broken);
+            let configuration = engines(vec![("ty", broken)]);
+            let violation = configuration
+                .validate()
+                .expect_err("the broken engine must be refused");
+            assert!(expected(&violation), "unexpected violation {violation:?}");
+            assert!(
+                !expected(&unrelated),
+                "the matcher must reject an unrelated violation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_engine_command_rules_are_enforced() {
+        let break_and_expect: [EngineBoundCase; 3] = [
+            (
+                |engine| engine.program = String::new(),
+                |violation| matches!(violation, ConfigurationViolation::EngineProgramEmpty { .. }),
+            ),
+            (
+                |engine| engine.program = "/usr/bin/ty".to_owned(),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::EngineExecutableAbsolute { .. }
+                    )
+                },
+            ),
+            (
+                |engine| engine.program = "C:\\tools\\ty.exe".to_owned(),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::EngineExecutableAbsolute { .. }
+                    )
+                },
+            ),
+        ];
+        assert_engines_refused(break_and_expect);
+    }
+
+    #[test]
+    fn test_engine_language_rules_are_enforced() {
+        let break_and_expect: [EngineBoundCase; 4] = [
+            (
+                |engine| engine.languages = Vec::new(),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::EngineLanguagesEmpty { .. }
+                    )
+                },
+            ),
+            (
+                |engine| engine.languages = vec!["Python".to_owned()],
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::EngineLanguageInvalid { .. }
+                    )
+                },
+            ),
+            (
+                |engine| engine.languages = vec!["sql:".to_owned()],
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::EngineLanguageInvalid { .. }
+                    )
+                },
+            ),
+            (
+                |engine| engine.languages = vec!["python".to_owned(), "python".to_owned()],
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::EngineLanguageDuplicate { .. }
+                    )
+                },
+            ),
+        ];
+        assert_engines_refused(break_and_expect);
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one data row per engine bound")]
+    fn test_engine_bounds_are_enforced() {
+        let break_and_expect: [EngineBoundCase; 9] = [
+            (
+                |engine| engine.arguments = vec![String::new(); ENGINE_ARGUMENTS_MAX + 1],
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.arguments",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| engine.arguments = vec!["x".repeat(ENGINE_ARGUMENT_BYTES_MAX + 1)],
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::EngineArgumentOversized { .. }
+                    )
+                },
+            ),
+            (
+                |engine| {
+                    engine.environment = (0..=ENGINE_ENVIRONMENT_ENTRIES_MAX)
+                        .map(|index| (format!("KEY_{index}"), "1".to_owned()))
+                        .collect();
+                },
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.environment",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| {
+                    engine.environment = [("BAD=KEY".to_owned(), "1".to_owned())].into();
+                },
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::EngineEnvironmentKeyInvalid { .. }
+                    )
+                },
+            ),
+            (
+                |engine| {
+                    engine.languages = (0..=ENGINE_LANGUAGES_MAX)
+                        .map(|index| format!("language{index}"))
+                        .collect();
+                },
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.languages",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| {
+                    engine.startup_timeout =
+                        Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MIN - 1);
+                },
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.startup_timeout",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| {
+                    engine.request_timeout =
+                        Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MAX + 1);
+                },
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.request_timeout",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| engine.output_limit = ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MIN - 1),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.output_limit",
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                |engine| engine.output_limit = ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MAX + 1),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange {
+                            field: "engines.output_limit",
+                            ..
+                        }
+                    )
+                },
+            ),
+        ];
+        assert_engines_refused(break_and_expect);
+    }
+
+    #[test]
+    fn test_engine_bounds_accept_their_edges() {
+        let mut edged = engine();
+        edged.arguments = vec!["x".repeat(ENGINE_ARGUMENT_BYTES_MAX); ENGINE_ARGUMENTS_MAX];
+        edged.environment = (0..ENGINE_ENVIRONMENT_ENTRIES_MAX)
+            .map(|index| (format!("KEY_{index}"), "1".to_owned()))
+            .collect();
+        edged.languages = (0..ENGINE_LANGUAGES_MAX)
+            .map(|index| format!("language{index}"))
+            .collect();
+        edged.startup_timeout = Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MAX);
+        edged.request_timeout = Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MIN);
+        edged.output_limit = ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MAX);
+        assert_eq!(engines(vec![("ty", edged)]).validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_engine_name_key_charset_is_checked() {
+        for name in ["Ty", "spaced name", "", ":python", "9ty"] {
+            let configuration = engines(vec![(name, engine())]);
+            assert_eq!(
+                configuration.validate(),
+                Err(ConfigurationViolation::EngineNameInvalid {
+                    name: name.to_owned(),
+                }),
+                "{name:?} must be refused"
+            );
+        }
+        for name in ["ty", "typescript", "engine-2", "rust.analyzer"] {
+            let configuration = engines(vec![(name, engine())]);
+            assert_eq!(
+                configuration.validate(),
+                Ok(()),
+                "{name:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cross_engine_language_duplicates_name_the_colliding_segment() {
+        let mut second = engine();
+        second.program = "pyright".to_owned();
+        let configuration = engines(vec![("a", engine()), ("b", second)]);
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::EngineLanguageDuplicate {
+                engine: "b".to_owned(),
+                language: "python".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_engine_initialization_options_must_be_an_object() {
+        for options in [json!([1]), json!("text"), json!(7), json!(true)] {
+            let mut broken = engine();
+            broken.initialization_options = Some(options.clone());
+            assert_eq!(
+                engines(vec![("ty", broken)]).validate(),
+                Err(
+                    ConfigurationViolation::EngineInitializationOptionsNotObject {
+                        engine: "ty".to_owned(),
+                    }
+                ),
+                "{options} must be refused"
+            );
+        }
+        let mut accepted = engine();
+        accepted.initialization_options = Some(json!({ "settings": {} }));
+        assert_eq!(engines(vec![("ty", accepted)]).validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_engine_count_above_the_cap_is_refused() {
+        let entries: Vec<(String, EngineConfiguration)> = (0..=ENGINES_MAX)
+            .map(|index| {
+                let mut numbered = engine();
+                numbered.languages = vec![format!("language{index}")];
+                (format!("engine{index}"), numbered)
+            })
+            .collect();
+        let configuration = WorkspaceConfiguration {
+            engines: entries.into_iter().collect(),
+            ..WorkspaceConfiguration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "engines",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_engine_schema_bounds_and_defaults_equal_the_enforced_constants() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let engine = &schema["$defs"]["EngineConfiguration"]["properties"];
+        let cases = [
+            ("program min", &engine["program"]["minLength"], json!(1)),
+            (
+                "arguments max",
+                &engine["arguments"]["maxItems"],
+                json!(ENGINE_ARGUMENTS_MAX),
+            ),
+            ("languages min", &engine["languages"]["minItems"], json!(1)),
+            (
+                "languages max",
+                &engine["languages"]["maxItems"],
+                json!(ENGINE_LANGUAGES_MAX),
+            ),
+            (
+                "startup timeout default",
+                &engine["startup_timeout"]["default"],
+                json!("30s"),
+            ),
+            (
+                "request timeout default",
+                &engine["request_timeout"]["default"],
+                json!("1m"),
+            ),
+            (
+                "output limit default",
+                &engine["output_limit"]["default"],
+                json!("4kb"),
+            ),
+        ];
+        assert_schema_bounds(&cases);
     }
 
     #[test]
