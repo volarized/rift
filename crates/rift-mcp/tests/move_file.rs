@@ -6,15 +6,16 @@
 
 #![cfg(unix)]
 
+#[path = "support/fake_engine.rs"]
+mod fake_engine;
 mod support;
 
 use std::fs;
 
+use fake_engine::engine_configuration;
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use support::{
-    TestResult, call_retrying_acceptance, engine_configuration, served_workspace, tool_request,
-};
+use support::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
 fn move_request(from: &str, to: &str) -> CallToolRequestParams {
     tool_request("move_file", &json!({ "from": from, "to": to }))

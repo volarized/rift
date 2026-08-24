@@ -1,0 +1,13 @@
+# The live fixture's manifest, copied into a tempdir before the engine
+# starts. The empty `[workspace]` table stops cargo climbing out of the
+# tempdir, and the flat `[lib]` path keeps every module file beside it.
+[package]
+name = "rift_live_fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[workspace]
