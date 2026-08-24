@@ -8,6 +8,7 @@
 
 use std::error::Error;
 use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
@@ -17,16 +18,50 @@ use serde_json::{Value, json};
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+/// One served workspace: the directory that holds it, the client speaking
+/// to it, and the task serving it.
+pub(crate) type ServedWorkspace = (
+    tempfile::TempDir,
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+);
+
 /// Builds one workspace of `files`, optionally with an engine table, and
 /// serves it to one client.
 pub(crate) async fn served_workspace(
     files: &[(&str, &str)],
     engine: Option<String>,
-) -> TestResult<(
-    tempfile::TempDir,
-    rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    tokio::task::JoinHandle<()>,
-)> {
+) -> TestResult<ServedWorkspace> {
+    let directory = laid_out_workspace(files, engine)?;
+    let (client, server_task) = served_root(directory.path()).await?;
+    Ok((directory, client, server_task))
+}
+
+/// The same workspace, served under a root spelled relative to the process
+/// working directory.
+///
+/// This is the spelling the CLI hands the server: `rift mcp` and
+/// `rift server start` both serve the working directory, which they name
+/// `.`. Reads and writes below the root resolve against that directory
+/// either way, so only the engine tier can tell the two spellings apart -
+/// it is addressed in `file://` URIs, which carry no working directory.
+/// A test cannot change the process directory without disturbing the
+/// suites running beside it, so it spells the same relative form the long
+/// way, as `..` segments down to the filesystem root and back up.
+pub(crate) async fn served_relative_workspace(
+    files: &[(&str, &str)],
+    engine: Option<String>,
+) -> TestResult<ServedWorkspace> {
+    let directory = laid_out_workspace(files, engine)?;
+    let (client, server_task) = served_root(&relative_spelling(directory.path())?).await?;
+    Ok((directory, client, server_task))
+}
+
+/// One temporary workspace holding `files` and, when given, a `rift.toml`.
+fn laid_out_workspace(
+    files: &[(&str, &str)],
+    engine: Option<String>,
+) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     for (name, source) in files {
         fs::write(directory.path().join(name), source)?;
@@ -34,7 +69,17 @@ pub(crate) async fn served_workspace(
     if let Some(configuration) = engine {
         fs::write(directory.path().join("rift.toml"), configuration)?;
     }
-    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+    Ok(directory)
+}
+
+/// Serves the workspace at `root` to one client over an in-process duplex.
+async fn served_root(
+    root: &Path,
+) -> TestResult<(
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server
@@ -44,7 +89,21 @@ pub(crate) async fn served_workspace(
         service.waiting().await.expect("server must stop cleanly");
     });
     let client = ().serve(client_transport).await?;
-    Ok((directory, client, server_task))
+    Ok((client, server_task))
+}
+
+/// The path from the process working directory to `target`, as one `..`
+/// segment per directory above the working directory followed by the
+/// target's own segments.
+fn relative_spelling(target: &Path) -> TestResult<PathBuf> {
+    let named = |component: &Component<'_>| matches!(component, Component::Normal(_));
+    let current = std::env::current_dir()?;
+    let mut spelling = PathBuf::new();
+    for _ in current.components().filter(named) {
+        spelling.push("..");
+    }
+    spelling.extend(target.components().filter(named));
+    Ok(spelling)
 }
 
 /// One tool call's request parameters from a JSON argument object.

@@ -44,7 +44,9 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use rust_engine::{require_rust_analyzer, rust_engine_configuration};
 use serde_json::{Value, json};
-use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
+use workspace_client::{
+    TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
+};
 
 /// The cargo project: a manifest, a crate root, the `hub` module holding
 /// the declaration, and the `caller` module importing and calling it. The
@@ -135,13 +137,19 @@ async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
 
 /// The engine resolves every reference itself, so the rewrite covers both
 /// files and the word-boundary sweep finds no survivor to report.
+///
+/// The workspace is served under a root spelled relative to the process
+/// working directory, the spelling `rift mcp` and `rift server start` hand
+/// the server. A real engine is the strictest witness that the spelling
+/// reaches it resolved: rust-analyzer answers in `file://` URIs of its own
+/// making, and every one of them must fall under the root Rift named.
 #[tokio::test]
 async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
     let (directory, client, server_task) =
-        served_workspace(&project(), Some(rust_engine_configuration())).await?;
+        served_relative_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
 
     let structured = call_retrying_acceptance(&client, rename_request("flare")).await?;

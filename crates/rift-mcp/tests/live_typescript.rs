@@ -29,7 +29,9 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
 use typescript_engine::{install_typescript_engine, typescript_engine_configuration};
-use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
+use workspace_client::{
+    TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
+};
 
 /// The manifest and lockfile `bun install --frozen-lockfile` reads.
 const PACKAGE: &str = include_str!("fixtures/typescript/package.json");
@@ -83,6 +85,25 @@ async fn served_project() -> TestResult<(
 )> {
     let (directory, client, server_task) =
         served_workspace(&project(), Some(typescript_engine_configuration())).await?;
+    install_typescript_engine(directory.path());
+    Ok((directory, client, server_task))
+}
+
+/// The same project, served under a root spelled relative to the process
+/// working directory - the spelling `rift mcp` and `rift server start`
+/// hand the server.
+///
+/// This engine reaches the boundary from the other side: it answers in
+/// UTF-16 positions and in `file://` URIs it normalizes itself, so a root
+/// that is not resolved has one more way to go unmatched here than it does
+/// against rust-analyzer.
+async fn served_relative_project() -> TestResult<(
+    tempfile::TempDir,
+    RunningService<RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (directory, client, server_task) =
+        served_relative_workspace(&project(), Some(typescript_engine_configuration())).await?;
     install_typescript_engine(directory.path());
     Ok((directory, client, server_task))
 }
@@ -165,7 +186,7 @@ async fn applied_rename_rewrites_the_module_the_importer_and_the_component() -> 
     if !engine_live() {
         return Ok(());
     }
-    let (directory, client, server_task) = served_project().await?;
+    let (directory, client, server_task) = served_relative_project().await?;
 
     let structured =
         call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;

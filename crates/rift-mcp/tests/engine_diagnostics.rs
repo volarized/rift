@@ -16,7 +16,9 @@ use std::fs;
 use fake_engine::{counted, engine_configuration, recorded};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
+use workspace_client::{
+    TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
+};
 
 const LIBRARY: &str = "pub fn beacon() {}\n";
 
@@ -100,6 +102,38 @@ async fn applied_replace_gains_mapped_findings_for_each_severity() -> TestResult
     assert!(
         numeric.get("code").is_none_or(Value::is_null),
         "numeric codes drop: {numeric:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A change applied in a workspace served under the CLI's own root
+/// spelling still carries the engine's findings.
+///
+/// The pull addresses the changed file by `file://` URI, which carries no
+/// working directory: with the root left relative the pull could not be
+/// addressed at all, and a change that applied cleanly would have reported
+/// no findings for a file the engine had judged.
+#[tokio::test]
+async fn applied_replace_under_a_relative_root_gains_the_engine_findings() -> TestResult {
+    let (_directory, client, server_task) = served_relative_workspace(
+        &[("lib.rs", LIBRARY)],
+        Some(engine_configuration("diagnostic-severities", "20s")),
+    )
+    .await?;
+
+    let structured = call_retrying_acceptance(
+        &client,
+        replace_request("pub fn beacon() -> u8 {\n    7\n}"),
+    )
+    .await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert_eq!(engine_findings(&structured).len(), 4, "{structured:#}");
+    assert!(
+        engine_warnings(&structured).is_empty(),
+        "an addressed engine never degrades to a warning: {structured:#}"
     );
 
     client.cancel().await?;

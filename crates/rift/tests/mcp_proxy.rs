@@ -52,16 +52,69 @@ const SERVED_TOOL_NAMES: [&str; 9] = [
 /// Serializes the tests: the served port range is machine-global.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The declaration every fixture serves, and the file referencing it.
+const LIBRARY: &str = "pub fn beacon() {}\n";
+const CALLER: &str = "pub fn caller() { beacon(); }\n";
+
+/// The symbol address of that declaration.
+const BEACON_SYMBOL: &str = "rift://symbol/rust/lib.rs/beacon";
+
+/// The moved module and the file naming it.
+const HUB: &str = "pub fn hub() {}\n// hub module\n";
+const HUB_CALLER: &str = "mod hub;\n";
+
 /// A workspace fixture: one Rust source and a `rift.toml` whose
 /// `[server]` idle timeout reaps any orphaned server within a minute.
 fn workspace() -> TestResult<tempfile::TempDir> {
+    laid_out_workspace(&[("lib.rs", LIBRARY)], "")
+}
+
+/// The same fixture with an `[engines.fake]` table appended, serving
+/// `rust` through the scripted engine under `behavior`.
+fn engine_workspace(behavior: &str, files: &[(&str, &str)]) -> TestResult<tempfile::TempDir> {
+    laid_out_workspace(files, &engine_table(behavior)?)
+}
+
+/// One fixture workspace holding `files` and a `rift.toml` carrying the
+/// orphan-safety idle timeout plus `engine`.
+fn laid_out_workspace(files: &[(&str, &str)], engine: &str) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
-    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    for (name, source) in files {
+        fs::write(directory.path().join(name), source)?;
+    }
     fs::write(
         directory.path().join("rift.toml"),
-        "[server]\nidle_timeout = \"60s\"\n",
+        format!("[server]\nidle_timeout = \"60s\"\n{engine}"),
     )?;
     Ok(directory)
+}
+
+/// One `[engines.fake]` table resolving the scripted engine Cargo builds
+/// beside the `rift` binary under test.
+///
+/// `program` refuses an absolute path, so the table resolves the binary
+/// the way an operator's does: by name, through a `PATH` it overlays on
+/// the environment the server hands the engine.
+fn engine_table(behavior: &str) -> TestResult<String> {
+    let program = format!("fake_engine{}", std::env::consts::EXE_SUFFIX);
+    let directory = Path::new(env!("CARGO_BIN_EXE_rift"))
+        .parent()
+        .ok_or("the rift binary under test has a directory")?;
+    if !directory.join(&program).exists() {
+        return Err(format!(
+            "{program} is missing from {}: build it with `cargo test --workspace --all-targets`",
+            directory.display()
+        )
+        .into());
+    }
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let overlay = format!("{}{separator}{inherited}", directory.display()).replace('\\', "\\\\");
+    Ok(format!(
+        "\n[engines.fake]\nprogram = \"fake_engine\"\narguments = [\"{behavior}\"]\n\
+         languages = [\"rust\"]\nrequest_timeout = \"20s\"\n\n\
+         [engines.fake.environment]\nPATH = \"{overlay}\"\n"
+    ))
 }
 
 /// Stops the fixture's server when a test unwinds, best effort.
@@ -177,19 +230,40 @@ fn arguments(value: &serde_json::Value) -> TestResult<serde_json::Map<String, se
         .ok_or_else(|| "tool arguments must be an object".into())
 }
 
+/// Most attempts one proxied call spends on a retryable refusal.
+const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
+
+/// One proxied tool call returning its structured result, retrying the
+/// refusal the server advertises as `retry: same_request`: an applied
+/// change moves the index, and a request whose snapshot predates the move
+/// is refused rather than served stale.
+async fn proxied_call(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    call_arguments: &serde_json::Value,
+) -> TestResult<serde_json::Value> {
+    for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
+        let params = CallToolRequestParams::new(name).with_arguments(arguments(call_arguments)?);
+        match within(name, client.call_tool(params)).await? {
+            Ok(called) => {
+                return called
+                    .structured_content
+                    .ok_or_else(|| format!("{name} must return structured content").into());
+            }
+            Err(rmcp::ServiceError::McpError(error))
+                if error
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(format!("the server kept refusing {name}").into())
+}
+
 /// One proxied `get_symbol` round trip for the fixture's `beacon` symbol.
 async fn beacon_lookup(client: &RunningService<RoleClient, ()>) -> TestResult<serde_json::Value> {
-    let called = within(
-        "a proxied get_symbol round trip",
-        client.call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
-        ),
-    )
-    .await??;
-    called
-        .structured_content
-        .ok_or_else(|| "get_symbol must return structured content".into())
+    proxied_call(client, "get_symbol", &json!({"name": "beacon"})).await
 }
 
 fn assert_beacon(lookup: &serde_json::Value) {
@@ -455,5 +529,121 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
         !stderr.contains(&root.display().to_string()),
         "tracing exposed the workspace root: {stderr}"
     );
+    Ok(())
+}
+
+/// The engine tier answers through the proxy, against the root the CLI
+/// serves.
+///
+/// `rift mcp` and `rift server start` serve the process working directory,
+/// which they name `.`. Reads and writes below the root resolve against
+/// that directory, so they cannot tell one spelling from another; the
+/// engine is addressed in `file://` URIs, which carry no working
+/// directory, so it is the one caller that can. Every test below drives
+/// the real binary against a real detached server, the way an agent
+/// reaches Rift.
+#[tokio::test]
+async fn proxied_rename_symbol_rewrites_every_referencing_file() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let directory = engine_workspace("renames-word", &[("lib.rs", LIBRARY), ("main.rs", CALLER)])?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client(root).await?;
+    let structured = proxied_call(
+        &client,
+        "rename_symbol",
+        &json!({ "symbol": BEACON_SYMBOL, "new_name": "flare" }),
+    )
+    .await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert_eq!(
+        fs::read_to_string(root.join("lib.rs"))?,
+        "pub fn flare() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("main.rs"))?,
+        "pub fn caller() { flare(); }\n"
+    );
+
+    client.cancel().await?;
+    let stopped = run_rift(root, &["server", "stop"]).await?;
+    require_success(&stopped, "stop after the rename session")?;
+    Ok(())
+}
+
+/// The engine's reference rewrite lands through the proxy too, and the
+/// move carries no warning.
+#[tokio::test]
+async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let directory = engine_workspace("moves-imports", &[("hub.rs", HUB), ("main.rs", HUB_CALLER)])?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client(root).await?;
+    let structured = proxied_call(
+        &client,
+        "move_file",
+        &json!({ "from": "hub.rs", "to": "spoke.rs" }),
+    )
+    .await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let warned = structured["summary"]["diagnostics"]
+        .as_array()
+        .is_some_and(|findings| {
+            findings
+                .iter()
+                .any(|finding| finding["code"] == json!("rift.move.references_not_updated"))
+        });
+    assert!(
+        !warned,
+        "an engine-covered move carries no warning: {structured:#}"
+    );
+    assert!(!root.join("hub.rs").exists());
+    assert_eq!(fs::read_to_string(root.join("main.rs"))?, "mod spoke;\n");
+
+    client.cancel().await?;
+    let stopped = run_rift(root, &["server", "stop"]).await?;
+    require_success(&stopped, "stop after the move session")?;
+    Ok(())
+}
+
+/// A change applied through the proxy carries the engine's findings, and
+/// never the warning an unreachable engine degrades to.
+#[tokio::test]
+async fn proxied_change_carries_the_engine_findings() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let directory = engine_workspace("diagnostic-severities", &[("lib.rs", LIBRARY)])?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client(root).await?;
+    let structured = proxied_call(
+        &client,
+        "replace_symbol",
+        &json!({ "symbol": BEACON_SYMBOL, "body": "pub fn beacon() -> u8 {\n    7\n}" }),
+    )
+    .await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let findings = structured["summary"]["diagnostics"]
+        .as_array()
+        .ok_or("the summary must carry findings")?;
+    let engine_findings = findings
+        .iter()
+        .filter(|finding| finding["language"]["name"] == json!("rust"))
+        .count();
+    assert_eq!(engine_findings, 4, "{structured:#}");
+    let degraded = findings
+        .iter()
+        .any(|finding| finding["code"] == json!("rift.engine.failed"));
+    assert!(
+        !degraded,
+        "an addressed engine never degrades to a warning: {structured:#}"
+    );
+
+    client.cancel().await?;
+    let stopped = run_rift(root, &["server", "stop"]).await?;
+    require_success(&stopped, "stop after the diagnostics session")?;
     Ok(())
 }
