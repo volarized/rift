@@ -1006,8 +1006,10 @@ pub struct EngineConfiguration {
     /// full size is still reported.
     #[serde(default = "default_engine_output_limit")]
     pub output_limit: ByteSize,
-    /// How a refusal this engine invites again is resent: the attempt
-    /// bound and the growing wait between attempts.
+    /// How often Rift sends this engine the same request again while its
+    /// answer stays unsettled - a refusal the engine invites again, or an
+    /// answer it gave while still analyzing - and how the waits between
+    /// those attempts grow.
     #[serde(default)]
     pub retry: RetryPolicy,
     /// How often Rift replaces this engine on its own, and over what
