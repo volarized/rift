@@ -1,101 +1,21 @@
+//! Rust syntax facts from the pinned tree-sitter-rust grammar.
+
 mod attachment;
 
-use rift_core::ProjectPath;
-use rift_core::constants::RUST_SOURCE_BYTES_MAX_DEFAULT;
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
-use serde::Serialize;
-use tree_sitter::{
-    Node, Parser, Query as TreeSitterQuery, QueryCursor, QueryError, StreamingIterator,
+use rift_core::Error;
+use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
+use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
+
+use crate::document::{ByteRange, SyntaxDocument};
+use crate::extract::{self, Declaration, GrammarRules};
+use crate::failure::{SyntaxBound, SyntaxError, SyntaxFault, incompatible_grammar, invalid_query};
+use crate::provider::{
+    SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
 };
 
-const SYNTAX_NODES_MAX_DEFAULT: usize = 250_000;
-const SYNTAX_DEPTH_MAX_DEFAULT: usize = 512;
-
-/// Half-open UTF-8 byte range.
+/// Rust declaration kind emitted by the Tree-sitter provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ByteRange {
-    /// First included byte.
-    pub start: u64,
-    /// First excluded byte.
-    pub end: u64,
-}
-
-impl ByteRange {
-    fn from_node(node: Node<'_>) -> Result<Self, RustSyntaxError> {
-        let start =
-            u64::try_from(node.start_byte()).map_err(|source| position_overflow(node, source))?;
-        let end =
-            u64::try_from(node.end_byte()).map_err(|source| position_overflow(node, source))?;
-        Ok(Self { start, end })
-    }
-
-    /// Reports whether byte position belongs to range.
-    #[must_use]
-    pub const fn contains(self, position: u64) -> bool {
-        self.start <= position && position < self.end
-    }
-}
-
-/// Rust source accepted to sans-I/O syntax analysis.
-#[derive(Debug, Clone, Copy)]
-pub struct RustSource<'a> {
-    /// Canonical project-relative path.
-    pub path: &'a ProjectPath,
-    /// UTF-8 source text.
-    pub text: &'a str,
-}
-
-/// Bounded Rust syntax acceptance limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::struct_field_names)]
-pub struct RustSyntaxLimits {
-    source_bytes_max: usize,
-    syntax_nodes_max: usize,
-    syntax_depth_max: usize,
-}
-
-impl RustSyntaxLimits {
-    /// Constructs positive syntax bounds.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RustSyntaxError`] naming the first zero bound.
-    pub fn new(
-        source_bytes_max: usize,
-        syntax_nodes_max: usize,
-        syntax_depth_max: usize,
-    ) -> Result<Self, RustSyntaxError> {
-        let bounds = [
-            (source_bytes_max, RustSyntaxBound::SourceBytesMax),
-            (syntax_nodes_max, RustSyntaxBound::SyntaxNodesMax),
-            (syntax_depth_max, RustSyntaxBound::SyntaxDepthMax),
-        ];
-        for (value, bound) in bounds {
-            if value == 0 {
-                return Err(Error::new(RustSyntaxFault::ZeroLimit { bound }));
-            }
-        }
-        Ok(Self {
-            source_bytes_max,
-            syntax_nodes_max,
-            syntax_depth_max,
-        })
-    }
-}
-
-impl Default for RustSyntaxLimits {
-    fn default() -> Self {
-        Self {
-            source_bytes_max: RUST_SOURCE_BYTES_MAX_DEFAULT,
-            syntax_nodes_max: SYNTAX_NODES_MAX_DEFAULT,
-            syntax_depth_max: SYNTAX_DEPTH_MAX_DEFAULT,
-        }
-    }
-}
-
-/// Rust declaration kind emitted by Tree-sitter provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RustSymbolKind {
+enum RustSymbolKind {
     /// Function or method.
     Function,
     /// Structure.
@@ -116,14 +36,55 @@ pub enum RustSymbolKind {
     Macro,
 }
 
-/// Tree-sitter grammar node kind interpreted by this crate.
+impl RustSymbolKind {
+    /// The provider kind word behind the wire kind `rust.{word}`.
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Trait => "trait",
+            Self::TypeAlias => "type_alias",
+            Self::Constant => "constant",
+            Self::Static => "static",
+            Self::Module => "module",
+            Self::Macro => "macro",
+        }
+    }
+
+    /// Portable facets for this kind, before visibility adds `Public`.
+    fn facets(self) -> Vec<SymbolFacet> {
+        match self {
+            Self::Function => vec![SymbolFacet::Value, SymbolFacet::Callable],
+            Self::Struct | Self::Enum | Self::Trait => vec![SymbolFacet::Type],
+            Self::TypeAlias => vec![SymbolFacet::Type, SymbolFacet::Alias],
+            Self::Module => vec![SymbolFacet::Namespace, SymbolFacet::Module],
+            Self::Macro => vec![SymbolFacet::Macro],
+            Self::Constant | Self::Static => vec![SymbolFacet::Value],
+        }
+    }
+
+    /// The grammar field spanning this kind's implementation part; `None`
+    /// for a kind whose grammar declares no body or value field.
+    const fn body_field(self) -> Option<RustGrammarField> {
+        match self {
+            Self::Function | Self::Struct | Self::Enum | Self::Trait | Self::Module => {
+                Some(RustGrammarField::Body)
+            }
+            Self::Constant | Self::Static => Some(RustGrammarField::Value),
+            Self::TypeAlias | Self::Macro => None,
+        }
+    }
+}
+
+/// Tree-sitter grammar node kind interpreted by this module.
 ///
 /// Vocabulary comes from the `node-types.json` of the pinned
 /// tree-sitter-rust 0.24.2 grammar. The grammar defines many more kinds;
-/// only the ones this crate reads are listed, so conversion from an
+/// only the ones this module reads are listed, so conversion from an
 /// arbitrary kind string is fallible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustGrammarNodeKind {
+enum RustGrammarNodeKind {
     /// `const_item` declaration.
     ConstItem,
     /// `enum_item` declaration.
@@ -150,7 +111,7 @@ pub enum RustGrammarNodeKind {
 
 impl RustGrammarNodeKind {
     /// Every interpreted kind, ordered by grammar spelling.
-    pub const ALL: [Self; 11] = [
+    const ALL: [Self; 11] = [
         Self::ConstItem,
         Self::EnumItem,
         Self::FunctionItem,
@@ -165,8 +126,7 @@ impl RustGrammarNodeKind {
     ];
 
     /// Returns grammar spelling from tree-sitter-rust `node-types.json`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::ConstItem => "const_item",
             Self::EnumItem => "enum_item",
@@ -206,15 +166,15 @@ impl RustGrammarNodeKind {
 }
 
 impl std::str::FromStr for RustGrammarNodeKind {
-    type Err = RustSyntaxError;
+    type Err = SyntaxError;
 
     fn from_str(kind: &str) -> Result<Self, Self::Err> {
         Self::from_kind(kind)
-            .ok_or_else(|| Error::new(RustSyntaxFault::UnknownNodeKind { kind: kind.into() }))
+            .ok_or_else(|| Error::new(SyntaxFault::UnknownNodeKind { kind: kind.into() }))
     }
 }
 
-/// Grammar field name this crate reads, from tree-sitter-rust 0.24.2
+/// Grammar field name this module reads, from tree-sitter-rust 0.24.2
 /// `node-types.json`.
 #[derive(Debug, Clone, Copy)]
 enum RustGrammarField {
@@ -222,6 +182,10 @@ enum RustGrammarField {
     Name,
     /// `type` field on `impl_item`.
     Type,
+    /// `body` field on block-bodied declaration items.
+    Body,
+    /// `value` field on `const_item` and `static_item`.
+    Value,
 }
 
 impl RustGrammarField {
@@ -229,13 +193,15 @@ impl RustGrammarField {
         match self {
             Self::Name => "name",
             Self::Type => "type",
+            Self::Body => "body",
+            Self::Value => "value",
         }
     }
 }
 
 /// Authored visibility of one Rust declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RustVisibility {
+enum RustVisibility {
     /// Declaration has no visibility modifier.
     Private,
     /// Declaration uses `pub`.
@@ -251,32 +217,22 @@ impl RustVisibility {
     /// such as `pub(crate)` or `pub(in path)` stays verbatim in
     /// [`RustVisibility::Restricted`]. Declarations without a modifier never
     /// reach this conversion and stay [`RustVisibility::Private`].
-    #[must_use]
-    pub fn from_authored(text: &str) -> Self {
+    fn from_authored(text: &str) -> Self {
         match text {
             "pub" => Self::Public,
             restricted => Self::Restricted(restricted.into()),
         }
     }
-}
 
-/// One named Rust declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RustSymbol {
-    /// Declared short name.
-    pub name: String,
-    /// Module/type-qualified name within file.
-    pub qualified_name: String,
-    /// Declaration category.
-    pub kind: RustSymbolKind,
-    /// Authored declaration visibility.
-    pub visibility: RustVisibility,
-    /// Complete declaration byte range, extended over attached outer
-    /// attributes and outer doc comments.
-    pub range: ByteRange,
-    /// The item node's own byte range, excluding any attached outer
-    /// attributes and doc comments. Equal to `range` when nothing attaches.
-    pub item_range: ByteRange,
+    /// The authored spelling served on the wire: `private`, `pub`, or the
+    /// restricted form verbatim.
+    fn authored(&self) -> String {
+        match self {
+            Self::Private => "private".into(),
+            Self::Public => "pub".into(),
+            Self::Restricted(authored) => authored.clone(),
+        }
+    }
 }
 
 /// One bounded match produced by a Rift-owned Rust query.
@@ -299,9 +255,9 @@ impl RustQuery {
     ///
     /// # Errors
     ///
-    /// Returns [`RustSyntaxError`] when query cannot compile.
-    pub fn new(source: &str) -> Result<Self, RustSyntaxError> {
-        let language = rust_language();
+    /// Returns [`SyntaxError`] when query cannot compile.
+    pub fn new(source: &str) -> Result<Self, SyntaxError> {
+        let language = rust_grammar();
         let inner = TreeSitterQuery::new(&language, source)
             .map_err(|error| invalid_query(source, error))?;
         Ok(Self { inner })
@@ -323,372 +279,51 @@ impl RustQuery {
     ///
     /// # Errors
     ///
-    /// Returns [`RustSyntaxError`] for zero bound, incompatible grammar,
+    /// Returns [`SyntaxError`] for zero bound, incompatible grammar,
     /// cancellation, oversized source, or capture overflow.
     pub fn captures(
         &self,
         source: &str,
         captures_max: usize,
-    ) -> Result<Vec<RustQueryCapture>, RustSyntaxError> {
+    ) -> Result<Vec<RustQueryCapture>, SyntaxError> {
         if captures_max == 0 {
-            return Err(Error::new(RustSyntaxFault::ZeroLimit {
-                bound: RustSyntaxBound::CapturesMax,
+            return Err(Error::new(SyntaxFault::ZeroLimit {
+                bound: SyntaxBound::CapturesMax,
             }));
         }
-        if source.len() > RUST_SOURCE_BYTES_MAX_DEFAULT {
-            return Err(Error::new(RustSyntaxFault::SourceTooLarge {
+        if source.len() > RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT {
+            return Err(Error::new(SyntaxFault::SourceTooLarge {
                 path: None,
                 source_bytes: source.len(),
-                source_bytes_max: RUST_SOURCE_BYTES_MAX_DEFAULT,
+                source_bytes_max: RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
             }));
         }
         let mut parser = rust_parser()?;
         let tree = parser
             .parse(source, None)
-            .ok_or_else(|| Error::new(RustSyntaxFault::ParseCancelled { path: None }))?;
+            .ok_or_else(|| Error::new(SyntaxFault::ParseCancelled { path: None }))?;
         let mut cursor = QueryCursor::new();
         let mut query_captures = cursor.captures(&self.inner, tree.root_node(), source.as_bytes());
         let mut captures = Vec::new();
         while let Some((query_match, capture_index)) = query_captures.next() {
             if captures.len() >= captures_max {
-                return Err(Error::new(RustSyntaxFault::TooManyCaptures {
-                    captures_max,
-                }));
+                return Err(Error::new(SyntaxFault::TooManyCaptures { captures_max }));
             }
             let capture = query_match.captures[*capture_index];
             captures.push(RustQueryCapture {
                 name: self.inner.capture_names()[capture.index as usize].into(),
-                range: ByteRange::from_node(capture.node)?,
+                range: extract::byte_range(capture.node)?,
             });
         }
         Ok(captures)
     }
 }
 
-/// One named Tree-sitter node.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RustNode {
-    /// Grammar node kind.
-    pub kind: String,
-    /// Node byte range.
-    pub range: ByteRange,
-    /// Parent index in document node vector.
-    pub parent: Option<usize>,
-    /// Whether parser marked node erroneous or missing.
-    pub has_error: bool,
-}
-
-/// Immutable syntax facts for one Rust source.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RustSyntaxDocument {
-    path: ProjectPath,
-    nodes: Vec<RustNode>,
-    symbols: Vec<RustSymbol>,
-    has_errors: bool,
-}
-
-impl RustSyntaxDocument {
-    /// Returns source path.
-    #[must_use]
-    pub const fn path(&self) -> &ProjectPath {
-        &self.path
-    }
-
-    /// Returns every named syntax node in pre-order.
-    #[must_use]
-    pub fn nodes(&self) -> &[RustNode] {
-        &self.nodes
-    }
-
-    /// Returns extracted declarations in source order.
-    #[must_use]
-    pub fn symbols(&self) -> &[RustSymbol] {
-        &self.symbols
-    }
-
-    /// Reports whether parser observed malformed syntax.
-    #[must_use]
-    pub const fn has_errors(&self) -> bool {
-        self.has_errors
-    }
-
-    /// Returns nodes covering byte position, outermost first.
-    #[must_use]
-    pub fn nodes_at(&self, position: u64) -> Vec<&RustNode> {
-        self.nodes
-            .iter()
-            .filter(|node| node.range.contains(position))
-            .collect()
-    }
-}
-
-/// Stable Rust syntax failure classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RustSyntaxViolation {
-    /// Limit was configured as zero.
-    ZeroLimit,
-    /// Source exceeds byte bound.
-    SourceTooLarge,
-    /// Syntax tree exceeds node bound.
-    TooManyNodes,
-    /// Syntax tree exceeds depth bound.
-    TooDeep,
-    /// Grammar cannot be loaded by runtime.
-    IncompatibleGrammar,
-    /// Parser produced no tree.
-    ParseCancelled,
-    /// Platform position cannot fit wire width.
-    PositionOverflow,
-    /// Query is invalid for pinned Rust grammar.
-    InvalidQuery,
-    /// Query produced more captures than accepted.
-    TooManyCaptures,
-    /// Node kind is outside interpreted grammar vocabulary.
-    UnknownNodeKind,
-}
-
-/// Configurable Rust syntax bound named in diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RustSyntaxBound {
-    /// Accepted source bytes.
-    SourceBytesMax,
-    /// Accepted syntax nodes.
-    SyntaxNodesMax,
-    /// Accepted syntax depth.
-    SyntaxDepthMax,
-    /// Accepted query captures.
-    CapturesMax,
-}
-
-/// Failure kind behind one [`RustSyntaxError`].
-///
-/// `path` is `None` when the failing source reached [`RustQuery::captures`],
-/// which accepts raw text without a project path.
-#[derive(Debug, PartialEq, Eq)]
-pub enum RustSyntaxFault {
-    /// Limit was configured as zero.
-    ZeroLimit {
-        /// Bound configured as zero.
-        bound: RustSyntaxBound,
-    },
-    /// Source exceeds byte bound.
-    SourceTooLarge {
-        /// Failing source path.
-        path: Option<ProjectPath>,
-        /// Observed source bytes.
-        source_bytes: usize,
-        /// Configured byte bound.
-        source_bytes_max: usize,
-    },
-    /// Syntax tree exceeds node bound.
-    TooManyNodes {
-        /// Failing source path.
-        path: ProjectPath,
-        /// Configured node bound.
-        syntax_nodes_max: usize,
-    },
-    /// Syntax tree exceeds depth bound.
-    TooDeep {
-        /// Failing source path.
-        path: ProjectPath,
-        /// Configured depth bound.
-        syntax_depth_max: usize,
-    },
-    /// Grammar cannot be loaded by runtime.
-    IncompatibleGrammar {
-        /// ABI version compiled into grammar.
-        grammar_abi_version: usize,
-        /// Oldest ABI version runtime accepts.
-        runtime_abi_min: usize,
-        /// Newest ABI version runtime accepts.
-        runtime_abi_max: usize,
-    },
-    /// Parser produced no tree.
-    ParseCancelled {
-        /// Failing source path.
-        path: Option<ProjectPath>,
-    },
-    /// Platform position cannot fit wire width.
-    PositionOverflow {
-        /// Grammar kind of overflowing node.
-        node_kind: &'static str,
-        /// Node start byte.
-        start_byte: usize,
-        /// Node end byte.
-        end_byte: usize,
-        /// Failed integer conversion.
-        source: std::num::TryFromIntError,
-    },
-    /// Query is invalid for pinned Rust grammar.
-    InvalidQuery {
-        /// One-based failing line number.
-        line_number: usize,
-        /// Failing query line text.
-        line_text: String,
-        /// Underlying Tree-sitter rejection.
-        source: QueryError,
-    },
-    /// Query produced more captures than accepted.
-    TooManyCaptures {
-        /// Configured capture bound.
-        captures_max: usize,
-    },
-    /// Node kind is outside interpreted grammar vocabulary.
-    UnknownNodeKind {
-        /// Unrecognized grammar kind string.
-        kind: String,
-    },
-}
-
-impl RustSyntaxFault {
-    /// Returns stable failure classification.
-    #[must_use]
-    pub const fn violation(&self) -> RustSyntaxViolation {
-        match self {
-            Self::ZeroLimit { .. } => RustSyntaxViolation::ZeroLimit,
-            Self::SourceTooLarge { .. } => RustSyntaxViolation::SourceTooLarge,
-            Self::TooManyNodes { .. } => RustSyntaxViolation::TooManyNodes,
-            Self::TooDeep { .. } => RustSyntaxViolation::TooDeep,
-            Self::IncompatibleGrammar { .. } => RustSyntaxViolation::IncompatibleGrammar,
-            Self::ParseCancelled { .. } => RustSyntaxViolation::ParseCancelled,
-            Self::PositionOverflow { .. } => RustSyntaxViolation::PositionOverflow,
-            Self::InvalidQuery { .. } => RustSyntaxViolation::InvalidQuery,
-            Self::TooManyCaptures { .. } => RustSyntaxViolation::TooManyCaptures,
-            Self::UnknownNodeKind { .. } => RustSyntaxViolation::UnknownNodeKind,
-        }
-    }
-}
-
-impl Fault for RustSyntaxFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::ZeroLimit { .. } => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
-            Self::SourceTooLarge { .. }
-            | Self::TooManyNodes { .. }
-            | Self::TooDeep { .. }
-            | Self::TooManyCaptures { .. } => ErrorName::Wire(ErrorCode::LimitExceeded),
-            Self::ParseCancelled { .. } => ErrorName::Wire(ErrorCode::Cancelled),
-            Self::IncompatibleGrammar { .. }
-            | Self::PositionOverflow { .. }
-            | Self::InvalidQuery { .. }
-            | Self::UnknownNodeKind { .. } => ErrorName::Wire(ErrorCode::InternalError),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::ZeroLimit { bound } => {
-                vec![ErrorContext::new("bound", fault_label(bound))]
-            }
-            Self::SourceTooLarge {
-                path,
-                source_bytes,
-                source_bytes_max,
-            } => vec![
-                ErrorContext::new(
-                    "path",
-                    path.as_ref()
-                        .map_or_else(|| "<raw text>".to_string(), ToString::to_string),
-                ),
-                ErrorContext::new("source_bytes", source_bytes.to_string()),
-                ErrorContext::new("source_bytes_max", source_bytes_max.to_string()),
-            ],
-            Self::TooManyNodes {
-                path,
-                syntax_nodes_max,
-            } => vec![
-                ErrorContext::new("path", path.to_string()),
-                ErrorContext::new("syntax_nodes_max", syntax_nodes_max.to_string()),
-            ],
-            Self::TooDeep {
-                path,
-                syntax_depth_max,
-            } => vec![
-                ErrorContext::new("path", path.to_string()),
-                ErrorContext::new("syntax_depth_max", syntax_depth_max.to_string()),
-            ],
-            Self::IncompatibleGrammar {
-                grammar_abi_version,
-                runtime_abi_min,
-                runtime_abi_max,
-            } => vec![
-                ErrorContext::new("grammar_abi_version", grammar_abi_version.to_string()),
-                ErrorContext::new("runtime_abi_min", runtime_abi_min.to_string()),
-                ErrorContext::new("runtime_abi_max", runtime_abi_max.to_string()),
-            ],
-            Self::ParseCancelled { path } => path.as_ref().map_or_else(Vec::new, |path| {
-                vec![ErrorContext::new("path", path.to_string())]
-            }),
-            Self::PositionOverflow {
-                node_kind,
-                start_byte,
-                end_byte,
-                source: _,
-            } => vec![
-                ErrorContext::new("node_kind", *node_kind),
-                ErrorContext::new("start_byte", start_byte.to_string()),
-                ErrorContext::new("end_byte", end_byte.to_string()),
-            ],
-            Self::InvalidQuery {
-                line_number,
-                line_text,
-                source: _,
-            } => vec![
-                ErrorContext::new("line_number", line_number.to_string()),
-                ErrorContext::new("line_text", line_text.clone()),
-            ],
-            Self::TooManyCaptures { captures_max } => {
-                vec![ErrorContext::new("captures_max", captures_max.to_string())]
-            }
-            Self::UnknownNodeKind { kind } => {
-                vec![ErrorContext::new("node_kind", kind.clone())]
-            }
-        }
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PositionOverflow { source, .. } => Some(source),
-            Self::InvalidQuery { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-/// Opaque Rust syntax failure.
-pub type RustSyntaxError = Error<RustSyntaxFault>;
-
-fn incompatible_grammar(language: &tree_sitter::Language) -> RustSyntaxError {
-    Error::new(RustSyntaxFault::IncompatibleGrammar {
-        grammar_abi_version: language.abi_version(),
-        runtime_abi_min: tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,
-        runtime_abi_max: tree_sitter::LANGUAGE_VERSION,
-    })
-}
-
-fn position_overflow(node: Node<'_>, source: std::num::TryFromIntError) -> RustSyntaxError {
-    Error::new(RustSyntaxFault::PositionOverflow {
-        node_kind: node.kind(),
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        source,
-    })
-}
-
-fn invalid_query(query_source: &str, source: QueryError) -> RustSyntaxError {
-    Error::new(RustSyntaxFault::InvalidQuery {
-        line_number: source.row + 1,
-        line_text: query_source.lines().nth(source.row).unwrap_or("").into(),
-        source,
-    })
-}
-
 /// Bounded Tree-sitter Rust fact provider.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RustSyntaxProvider {
-    limits: RustSyntaxLimits,
+    language: Language,
+    limits: SyntaxLimits,
 }
 
 impl RustSyntaxProvider {
@@ -696,124 +331,152 @@ impl RustSyntaxProvider {
     /// includes a file as source only when some shipped provider declares its extension.
     pub const SOURCE_EXTENSIONS: &'static [&'static str] = &["rs"];
 
+    /// Default maximum bytes this provider accepts from one Rust source.
+    pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
+
     /// Constructs provider with explicit bounds.
     #[must_use]
-    pub const fn new(limits: RustSyntaxLimits) -> Self {
-        Self { limits }
+    pub fn new(limits: SyntaxLimits) -> Self {
+        Self {
+            language: Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            },
+            limits,
+        }
+    }
+}
+
+/// The Rust provider's declared default bounds, proven positive at compile
+/// time.
+const RUST_SYNTAX_LIMITS_DEFAULT: SyntaxLimits = SyntaxLimits::declared(
+    RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
+    SYNTAX_NODES_MAX_DEFAULT,
+    SYNTAX_DEPTH_MAX_DEFAULT,
+);
+
+impl Default for RustSyntaxProvider {
+    fn default() -> Self {
+        Self::new(RUST_SYNTAX_LIMITS_DEFAULT)
+    }
+}
+
+impl SyntaxProvider for RustSyntaxProvider {
+    fn language(&self) -> &Language {
+        &self.language
     }
 
-    /// Parses source and extracts named nodes and declarations.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RustSyntaxError`] for incompatible grammar, cancellation, or exceeded bound.
-    pub fn analyze(&self, source: RustSource<'_>) -> Result<RustSyntaxDocument, RustSyntaxError> {
-        if source.text.len() > self.limits.source_bytes_max {
-            return Err(Error::new(RustSyntaxFault::SourceTooLarge {
+    fn extensions(&self) -> &'static [&'static str] {
+        Self::SOURCE_EXTENSIONS
+    }
+
+    fn source_bytes_max(&self) -> usize {
+        self.limits.source_bytes_max()
+    }
+
+    fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+        if source.text.len() > self.limits.source_bytes_max() {
+            return Err(Error::new(SyntaxFault::SourceTooLarge {
                 path: Some(source.path.clone()),
                 source_bytes: source.text.len(),
-                source_bytes_max: self.limits.source_bytes_max,
+                source_bytes_max: self.limits.source_bytes_max(),
             }));
         }
         let mut parser = rust_parser()?;
         let tree = parser.parse(source.text, None).ok_or_else(|| {
-            Error::new(RustSyntaxFault::ParseCancelled {
+            Error::new(SyntaxFault::ParseCancelled {
                 path: Some(source.path.clone()),
             })
         })?;
-        let (nodes, symbols) = self.extract(tree.root_node(), source)?;
-        Ok(RustSyntaxDocument {
-            path: source.path.clone(),
+        let (nodes, symbols) =
+            extract::extract(tree.root_node(), source, self.limits, &RustGrammarRules)?;
+        Ok(SyntaxDocument::new(
+            self.language.clone(),
+            source.path.clone(),
             nodes,
             symbols,
-            has_errors: tree.root_node().has_error(),
-        })
+            tree.root_node().has_error(),
+        ))
     }
 
-    fn extract(
-        &self,
-        root: Node<'_>,
-        source: RustSource<'_>,
-    ) -> Result<(Vec<RustNode>, Vec<RustSymbol>), RustSyntaxError> {
-        let text = source.text;
-        let mut nodes = Vec::new();
-        let mut symbols = Vec::new();
-        let mut pending = vec![(root, None, String::new(), 0_usize)];
-        while let Some((node, parent, qualification, depth)) = pending.pop() {
-            if depth > self.limits.syntax_depth_max {
-                return Err(Error::new(RustSyntaxFault::TooDeep {
-                    path: source.path.clone(),
-                    syntax_depth_max: self.limits.syntax_depth_max,
-                }));
-            }
-            assert!(
-                nodes.len() < self.limits.syntax_nodes_max,
-                "the enqueue guard must keep the walker below the node bound: \
-                 nodes={}, syntax_nodes_max={}",
-                nodes.len(),
-                self.limits.syntax_nodes_max,
-            );
-
-            let node_index = nodes.len();
-            let range = ByteRange::from_node(node)?;
-            nodes.push(RustNode {
-                kind: node.kind().into(),
-                range,
-                parent,
-                has_error: node.is_error() || node.is_missing(),
-            });
-
-            let name = declaration_name(node, text);
-            if let Some((name, kind)) = name.as_ref() {
-                symbols.push(RustSymbol {
-                    name: name.clone(),
-                    qualified_name: qualify(&qualification, name),
-                    kind: *kind,
-                    visibility: declaration_visibility(node, text),
-                    range: symbol_range(node, text, range)?,
-                    item_range: range,
-                });
-            }
-            let child_qualification = container_name(node, text).map_or_else(
-                || qualification.clone(),
-                |name| qualify(&qualification, &name),
-            );
-
-            for child_index in (0..node.child_count()).rev() {
-                let Some(child) = node.child(child_index) else {
-                    continue;
-                };
-                if !child.is_named() {
-                    continue;
-                }
-                if pending.len() + nodes.len() >= self.limits.syntax_nodes_max {
-                    return Err(self.too_many_nodes(source));
-                }
-                pending.push((
-                    child,
-                    Some(node_index),
-                    child_qualification.clone(),
-                    depth + 1,
-                ));
-            }
+    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+        let mut facets = Vec::new();
+        if kind.ends_with("_item") || kind.ends_with("_declaration") {
+            facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
         }
-        Ok((nodes, symbols))
-    }
-
-    fn too_many_nodes(&self, source: RustSource<'_>) -> RustSyntaxError {
-        Error::new(RustSyntaxFault::TooManyNodes {
-            path: source.path.clone(),
-            syntax_nodes_max: self.limits.syntax_nodes_max,
-        })
+        if kind.ends_with("_expression") {
+            facets.push(NodeFacet::Expression);
+        }
+        if kind.ends_with("_statement") {
+            facets.push(NodeFacet::Statement);
+        }
+        if kind.contains("comment") {
+            facets.push(NodeFacet::Comment);
+        }
+        facets
     }
 }
 
-fn rust_language() -> tree_sitter::Language {
+/// tree-sitter-rust's decisions for the shared bounded walk.
+#[derive(Debug)]
+struct RustGrammarRules;
+
+impl GrammarRules for RustGrammarRules {
+    fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
+        let Some(kind) =
+            RustGrammarNodeKind::from_kind(node.kind()).and_then(RustGrammarNodeKind::symbol_kind)
+        else {
+            return Ok(None);
+        };
+        let Some(name) = declaration_name(node, text) else {
+            return Ok(None);
+        };
+        let visibility = declaration_visibility(node, text);
+        Ok(Some(Declaration {
+            name,
+            kind: kind.word(),
+            facets: declaration_facets(kind, &visibility),
+            visibility: Some(visibility.authored()),
+            body_range: body_range(node, kind)?,
+        }))
+    }
+
+    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
+        match RustGrammarNodeKind::from_kind(node.kind())? {
+            RustGrammarNodeKind::ModItem
+            | RustGrammarNodeKind::StructItem
+            | RustGrammarNodeKind::EnumItem
+            | RustGrammarNodeKind::TraitItem => {
+                let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
+                text.get(name.byte_range()).map(Into::into)
+            }
+            RustGrammarNodeKind::ImplItem => {
+                let item = node.child_by_field_name(RustGrammarField::Type.as_str())?;
+                text.get(item.byte_range())
+                    .map(|value| value.split_whitespace().collect::<String>())
+            }
+            _ => None,
+        }
+    }
+
+    /// A declaration's start, extended over its attached outer attributes
+    /// and outer doc comments so the whole declaration - not just the item
+    /// node - is what `replace_symbol` and `insert_symbol` act on.
+    fn declaration_start(&self, node: Node<'_>, text: &str) -> usize {
+        attachment::declaration_start(node, text)
+    }
+
+    fn qualification_separator(&self) -> &'static str {
+        "::"
+    }
+}
+
+fn rust_grammar() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
 
-fn rust_parser() -> Result<Parser, RustSyntaxError> {
-    let language = rust_language();
+fn rust_parser() -> Result<Parser, SyntaxError> {
+    let language = rust_grammar();
     let mut parser = Parser::new();
     parser
         .set_language(&language)
@@ -821,33 +484,9 @@ fn rust_parser() -> Result<Parser, RustSyntaxError> {
     Ok(parser)
 }
 
-impl Default for RustSyntaxProvider {
-    fn default() -> Self {
-        Self::new(RustSyntaxLimits::default())
-    }
-}
-
-fn declaration_name(node: Node<'_>, text: &str) -> Option<(String, RustSymbolKind)> {
-    let kind = RustGrammarNodeKind::from_kind(node.kind())?.symbol_kind()?;
+fn declaration_name(node: Node<'_>, text: &str) -> Option<String> {
     let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
-    text.get(name.byte_range())
-        .map(|value| (value.into(), kind))
-}
-
-/// A declaration's span, extended over its attached outer attributes and
-/// outer doc comments so the whole declaration - not just the item node -
-/// is what `replace_symbol` and `insert_symbol` act on.
-fn symbol_range(
-    node: Node<'_>,
-    text: &str,
-    item_range: ByteRange,
-) -> Result<ByteRange, RustSyntaxError> {
-    let start = attachment::declaration_start(node, text);
-    let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
-    Ok(ByteRange {
-        start,
-        end: item_range.end,
-    })
+    text.get(name.byte_range()).map(Into::into)
 }
 
 fn declaration_visibility(node: Node<'_>, text: &str) -> RustVisibility {
@@ -858,67 +497,201 @@ fn declaration_visibility(node: Node<'_>, text: &str) -> RustVisibility {
         .map_or(RustVisibility::Private, RustVisibility::from_authored)
 }
 
-fn container_name(node: Node<'_>, text: &str) -> Option<String> {
-    match RustGrammarNodeKind::from_kind(node.kind())? {
-        RustGrammarNodeKind::ModItem
-        | RustGrammarNodeKind::StructItem
-        | RustGrammarNodeKind::EnumItem
-        | RustGrammarNodeKind::TraitItem => {
-            let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
-            text.get(name.byte_range()).map(Into::into)
-        }
-        RustGrammarNodeKind::ImplItem => {
-            let item = node.child_by_field_name(RustGrammarField::Type.as_str())?;
-            text.get(item.byte_range())
-                .map(|value| value.split_whitespace().collect::<String>())
-        }
-        _ => None,
+fn declaration_facets(kind: RustSymbolKind, visibility: &RustVisibility) -> Vec<SymbolFacet> {
+    let mut facets = kind.facets();
+    if visibility == &RustVisibility::Public {
+        facets.push(SymbolFacet::Public);
     }
+    facets
 }
 
-fn qualify(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
-        name.into()
-    } else {
-        format!("{parent}::{name}")
-    }
+/// The implementation part of one declaration: its grammar `body` or `value`
+/// field's span. `None` when the kind declares no such field, or when this
+/// node omits it - a unit struct, a `mod name;`, a valueless trait constant.
+fn body_range(node: Node<'_>, kind: RustSymbolKind) -> Result<Option<ByteRange>, SyntaxError> {
+    let Some(field) = kind.body_field() else {
+        return Ok(None);
+    };
+    let Some(body) = node.child_by_field_name(field.as_str()) else {
+        return Ok(None);
+    };
+    extract::byte_range(body).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use std::error::Error;
 
+    use rift_core::{ErrorCode, ErrorContext, ErrorName, ProjectPath};
+
     use super::*;
+    use crate::failure::{SyntaxViolation, position_overflow};
 
     fn path() -> ProjectPath {
         ProjectPath::new("src/lib.rs").expect("valid fixture path")
     }
 
-    #[test]
-    fn test_provider_extracts_nested_rust_declarations_and_byte_nodes() {
-        let text = "pub mod café {\r\npub(crate) struct Item;\r\nimpl Item { fn load() {} }\r\n}";
-        let document = RustSyntaxProvider::default()
-            .analyze(RustSource {
+    fn analyze(text: &str) -> SyntaxDocument {
+        RustSyntaxProvider::default()
+            .analyze(SyntaxSource {
                 path: &path(),
                 text,
             })
-            .expect("Rust fixture must parse");
+            .expect("Rust fixture must parse")
+    }
+
+    #[test]
+    fn test_provider_extracts_nested_rust_declarations_and_byte_nodes() {
+        let text = "pub mod café {\r\npub(crate) struct Item;\r\nimpl Item { fn load() {} }\r\n}";
+        let document = analyze(text);
         let names = document
             .symbols()
             .iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["café", "café::Item", "café::Item::load"]);
-        assert_eq!(document.symbols()[0].visibility, RustVisibility::Public);
+        assert_eq!(document.symbols()[0].visibility.as_deref(), Some("pub"));
         assert_eq!(
-            document.symbols()[1].visibility,
-            RustVisibility::Restricted("pub(crate)".into())
+            document.symbols()[1].visibility.as_deref(),
+            Some("pub(crate)")
         );
-        assert_eq!(document.symbols()[2].visibility, RustVisibility::Private);
+        assert_eq!(document.symbols()[2].visibility.as_deref(), Some("private"));
         assert_eq!(document.path(), &path());
+        assert_eq!(document.language().name, "rust");
         let load = text.find("load").expect("fixture contains method") as u64;
         assert!(document.nodes_at(load).len() >= 3);
         assert!(!document.has_errors());
+    }
+
+    #[test]
+    fn test_document_container_names_the_containing_scope_or_none_at_top_level() {
+        let text = "pub mod café {\npub struct Item;\nimpl Item { fn load() {} }\n}";
+        let document = analyze(text);
+        let containers = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.container.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(containers, [None, Some("café"), Some("café::Item")]);
+    }
+
+    #[test]
+    fn test_document_kind_words_cover_every_declaration_kind() {
+        let text = "fn f() {}\nstruct S;\nenum E {}\ntrait T {}\ntype A = u8;\n\
+                    const C: u8 = 0;\nstatic G: u8 = 0;\nmod m {}\nmacro_rules! q { () => {}; }";
+        let document = analyze(text);
+        let kinds = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "function",
+                "struct",
+                "enum",
+                "trait",
+                "type_alias",
+                "constant",
+                "static",
+                "module",
+                "macro",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_document_facets_render_kind_categories_and_public_visibility() {
+        let document =
+            analyze("pub fn f() {}\ntype A = u8;\nmod m {}\nmacro_rules! q { () => {}; }");
+        let facets = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.facets.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facets,
+            [
+                vec![
+                    SymbolFacet::Value,
+                    SymbolFacet::Callable,
+                    SymbolFacet::Public
+                ],
+                vec![SymbolFacet::Type, SymbolFacet::Alias],
+                vec![SymbolFacet::Namespace, SymbolFacet::Module],
+                vec![SymbolFacet::Macro],
+            ]
+        );
+    }
+
+    /// Every declaration kind whose grammar declares a body or value field
+    /// carries `body_range`; a kind or node without one carries `None`.
+    #[test]
+    fn test_document_body_range_present_exactly_where_the_grammar_declares_one() {
+        let text = "fn f() { 1; }\nstruct S { x: u8 }\nstruct Unit;\nenum E { A }\n\
+                    trait T { fn t(&self); }\nmod m { fn inner() {} }\nmod declared;\n\
+                    const C: u8 = 7;\nstatic G: u8 = 9;\ntype A = u8;\n\
+                    macro_rules! q { () => {}; }";
+        let document = analyze(text);
+        let spans = document
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.body_range.is_some()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spans,
+            [
+                ("f", true),
+                ("S", true),
+                ("Unit", false),
+                ("E", true),
+                ("T", true),
+                ("m", true),
+                ("inner", true),
+                ("declared", false),
+                ("C", true),
+                ("G", true),
+                ("A", false),
+                ("q", false),
+            ]
+        );
+        let function = &document.symbols()[0];
+        let body = function.body_range.expect("fn f owns a body");
+        let start = usize::try_from(body.start).expect("fixture span fits usize");
+        let end = usize::try_from(body.end).expect("fixture span fits usize");
+        assert_eq!(&text[start..end], "{ 1; }");
+    }
+
+    #[test]
+    fn test_provider_node_facets_classify_declaration_expression_statement_and_comment() {
+        let provider = RustSyntaxProvider::default();
+        assert_eq!(
+            provider.node_facets("function_item"),
+            [NodeFacet::Declaration, NodeFacet::Definition]
+        );
+        assert_eq!(
+            provider.node_facets("binary_expression"),
+            [NodeFacet::Expression]
+        );
+        assert_eq!(
+            provider.node_facets("expression_statement"),
+            [NodeFacet::Statement]
+        );
+        assert_eq!(provider.node_facets("line_comment"), [NodeFacet::Comment]);
+        assert_eq!(provider.node_facets("identifier"), []);
+    }
+
+    #[test]
+    fn test_provider_declares_language_extensions_and_byte_bound() {
+        let provider = RustSyntaxProvider::default();
+        assert_eq!(provider.language().name, "rust");
+        assert_eq!(provider.language().dialect, None);
+        assert_eq!(provider.extensions(), ["rs"]);
+        assert_eq!(
+            provider.source_bytes_max(),
+            RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
+        );
     }
 
     #[test]
@@ -939,25 +712,20 @@ mod tests {
                 .expect_err("capture overflow must fail")
                 .fault()
                 .violation(),
-            RustSyntaxViolation::TooManyCaptures
+            SyntaxViolation::TooManyCaptures
         );
         assert_eq!(
             RustQuery::new("(missing_node) @rift.name")
                 .expect_err("invalid node kind must fail")
                 .fault()
                 .violation(),
-            RustSyntaxViolation::InvalidQuery
+            SyntaxViolation::InvalidQuery
         );
     }
 
     #[test]
     fn test_provider_reports_malformed_tree_without_dropping_facts() {
-        let document = RustSyntaxProvider::default()
-            .analyze(RustSource {
-                path: &path(),
-                text: "fn broken( {",
-            })
-            .expect("Tree-sitter returns recoverable malformed tree");
+        let document = analyze("fn broken( {");
         assert!(document.has_errors());
         assert!(!document.nodes().is_empty());
     }
@@ -965,74 +733,44 @@ mod tests {
     #[test]
     fn test_provider_enforces_source_node_depth_and_positive_limits() {
         assert_eq!(
-            RustSyntaxLimits::new(0, 1, 1)
+            SyntaxLimits::new(0, 1, 1)
                 .expect_err("zero limit")
                 .fault()
                 .violation(),
-            RustSyntaxViolation::ZeroLimit,
+            SyntaxViolation::ZeroLimit,
         );
         let source_error =
-            RustSyntaxProvider::new(RustSyntaxLimits::new(3, 10, 10).expect("positive limits"))
-                .analyze(RustSource {
+            RustSyntaxProvider::new(SyntaxLimits::new(3, 10, 10).expect("positive limits"))
+                .analyze(SyntaxSource {
                     path: &path(),
                     text: "fn x() {}",
                 })
                 .expect_err("source bound");
         assert_eq!(
             source_error.fault().violation(),
-            RustSyntaxViolation::SourceTooLarge
+            SyntaxViolation::SourceTooLarge
         );
 
         let node_error =
-            RustSyntaxProvider::new(RustSyntaxLimits::new(100, 1, 10).expect("positive limits"))
-                .analyze(RustSource {
+            RustSyntaxProvider::new(SyntaxLimits::new(100, 1, 10).expect("positive limits"))
+                .analyze(SyntaxSource {
                     path: &path(),
                     text: "fn x() {}",
                 })
                 .expect_err("node bound");
         assert_eq!(
             node_error.fault().violation(),
-            RustSyntaxViolation::TooManyNodes
+            SyntaxViolation::TooManyNodes
         );
 
         let depth_error =
-            RustSyntaxProvider::new(RustSyntaxLimits::new(100, 20, 1).expect("positive limits"))
-                .analyze(RustSource {
+            RustSyntaxProvider::new(SyntaxLimits::new(100, 20, 1).expect("positive limits"))
+                .analyze(SyntaxSource {
                     path: &path(),
                     text: "fn x() { { 1 } }",
                 })
                 .expect_err("depth bound");
-        assert_eq!(
-            depth_error.fault().violation(),
-            RustSyntaxViolation::TooDeep
-        );
-    }
-
-    #[test]
-    fn test_provider_classifies_every_declaration_kind() {
-        let text = "enum E {}\ntrait T {}\ntype A = u8;\nconst C: u8 = 0;\nstatic S: u8 = 0;\nmacro_rules! m { () => {}; }";
-        let document = RustSyntaxProvider::default()
-            .analyze(RustSource {
-                path: &path(),
-                text,
-            })
-            .expect("Rust fixture must parse");
-        let kinds = document
-            .symbols()
-            .iter()
-            .map(|symbol| symbol.kind)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kinds,
-            [
-                RustSymbolKind::Enum,
-                RustSymbolKind::Trait,
-                RustSymbolKind::TypeAlias,
-                RustSymbolKind::Constant,
-                RustSymbolKind::Static,
-                RustSymbolKind::Macro,
-            ]
-        );
+        assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
     }
 
     #[test]
@@ -1048,10 +786,7 @@ mod tests {
         let error = "flumph_item"
             .parse::<RustGrammarNodeKind>()
             .expect_err("unknown kind");
-        assert_eq!(
-            error.fault().violation(),
-            RustSyntaxViolation::UnknownNodeKind
-        );
+        assert_eq!(error.fault().violation(), SyntaxViolation::UnknownNodeKind);
         assert_eq!(
             error.descriptor().name(),
             ErrorName::Wire(ErrorCode::InternalError)
@@ -1077,9 +812,9 @@ mod tests {
     #[test]
     fn test_zero_limit_error_names_offending_bound_and_configuration_site() {
         let cases = [
-            (RustSyntaxLimits::new(0, 1, 1), "source_bytes_max"),
-            (RustSyntaxLimits::new(1, 0, 1), "syntax_nodes_max"),
-            (RustSyntaxLimits::new(1, 1, 0), "syntax_depth_max"),
+            (SyntaxLimits::new(0, 1, 1), "source_bytes_max"),
+            (SyntaxLimits::new(1, 0, 1), "syntax_nodes_max"),
+            (SyntaxLimits::new(1, 1, 0), "syntax_depth_max"),
         ];
         for (result, bound_name) in cases {
             let error = result.expect_err("zero bound");
@@ -1099,7 +834,7 @@ mod tests {
         let error = query
             .captures("fn a() {}", 0)
             .expect_err("zero captures_max");
-        assert_eq!(error.fault().violation(), RustSyntaxViolation::ZeroLimit);
+        assert_eq!(error.fault().violation(), SyntaxViolation::ZeroLimit);
         assert_eq!(
             error.to_string(),
             "the workspace configuration failed validation: bound captures_max; \
@@ -1109,13 +844,12 @@ mod tests {
 
     #[test]
     fn test_source_too_large_error_reports_sizes_path_and_limit_origin() {
-        let error =
-            RustSyntaxProvider::new(RustSyntaxLimits::new(3, 10, 10).expect("positive limits"))
-                .analyze(RustSource {
-                    path: &path(),
-                    text: "fn x() {}",
-                })
-                .expect_err("source bound");
+        let error = RustSyntaxProvider::new(SyntaxLimits::new(3, 10, 10).expect("positive limits"))
+            .analyze(SyntaxSource {
+                path: &path(),
+                text: "fn x() {}",
+            })
+            .expect_err("source bound");
         assert_eq!(
             error.descriptor().name(),
             ErrorName::Wire(ErrorCode::LimitExceeded)
@@ -1129,12 +863,9 @@ mod tests {
         );
 
         let query = RustQuery::new("(function_item) @rift.item").expect("valid Rust query");
-        let oversized = "a".repeat(RUST_SOURCE_BYTES_MAX_DEFAULT + 1);
+        let oversized = "a".repeat(RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT + 1);
         let error = query.captures(&oversized, 1).expect_err("oversized source");
-        assert_eq!(
-            error.fault().violation(),
-            RustSyntaxViolation::SourceTooLarge
-        );
+        assert_eq!(error.fault().violation(), SyntaxViolation::SourceTooLarge);
         assert_eq!(
             error.to_string(),
             format!(
@@ -1142,8 +873,8 @@ mod tests {
                  path <raw text>, source_bytes {bytes}, source_bytes_max {max}; \
                  resize the request below the named limit, or raise that limit \
                  in the workspace configuration",
-                bytes = RUST_SOURCE_BYTES_MAX_DEFAULT + 1,
-                max = RUST_SOURCE_BYTES_MAX_DEFAULT,
+                bytes = RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT + 1,
+                max = RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
             )
         );
     }
@@ -1151,8 +882,8 @@ mod tests {
     #[test]
     fn test_tree_bound_errors_report_path_and_configured_limit() {
         let node_error =
-            RustSyntaxProvider::new(RustSyntaxLimits::new(100, 1, 10).expect("positive limits"))
-                .analyze(RustSource {
+            RustSyntaxProvider::new(SyntaxLimits::new(100, 1, 10).expect("positive limits"))
+                .analyze(SyntaxSource {
                     path: &path(),
                     text: "fn x() {}",
                 })
@@ -1166,8 +897,8 @@ mod tests {
         );
 
         let depth_error =
-            RustSyntaxProvider::new(RustSyntaxLimits::new(100, 20, 1).expect("positive limits"))
-                .analyze(RustSource {
+            RustSyntaxProvider::new(SyntaxLimits::new(100, 20, 1).expect("positive limits"))
+                .analyze(SyntaxSource {
                     path: &path(),
                     text: "fn x() { { 1 } }",
                 })
@@ -1230,9 +961,9 @@ mod tests {
         ];
         for (query, kind) in cases {
             let error = RustQuery::new(query).expect_err("query must be rejected");
-            assert_eq!(error.fault().violation(), RustSyntaxViolation::InvalidQuery);
+            assert_eq!(error.fault().violation(), SyntaxViolation::InvalidQuery);
             match error.fault() {
-                RustSyntaxFault::InvalidQuery { source, .. } => {
+                SyntaxFault::InvalidQuery { source, .. } => {
                     assert_eq!(source.kind, kind, "classifies {query}");
                 }
                 other => panic!("expected InvalidQuery, got {other:?}"),
@@ -1242,10 +973,10 @@ mod tests {
 
     #[test]
     fn test_runtime_only_errors_render_full_context() {
-        let grammar = incompatible_grammar(&rust_language());
+        let grammar = incompatible_grammar(&rust_grammar());
         assert_eq!(
             grammar.fault().violation(),
-            RustSyntaxViolation::IncompatibleGrammar
+            SyntaxViolation::IncompatibleGrammar
         );
         assert_eq!(
             grammar.descriptor().name(),
@@ -1257,17 +988,16 @@ mod tests {
                 "the server failed in a way it did not classify: \
                  grammar_abi_version {abi}, runtime_abi_min {min}, runtime_abi_max {max}; \
                  retry once, and report the full message if the failure repeats",
-                abi = rust_language().abi_version(),
+                abi = rust_grammar().abi_version(),
                 min = tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,
                 max = tree_sitter::LANGUAGE_VERSION,
             )
         );
 
-        let cancelled =
-            RustSyntaxError::new(RustSyntaxFault::ParseCancelled { path: Some(path()) });
+        let cancelled = SyntaxError::new(SyntaxFault::ParseCancelled { path: Some(path()) });
         assert_eq!(
             cancelled.fault().violation(),
-            RustSyntaxViolation::ParseCancelled
+            SyntaxViolation::ParseCancelled
         );
         assert_eq!(
             cancelled.descriptor().name(),
@@ -1279,7 +1009,7 @@ mod tests {
             "the request was cancelled before it completed: path src/lib.rs; \
              resend the request if the result is still needed"
         );
-        let cancelled_query = RustSyntaxError::new(RustSyntaxFault::ParseCancelled { path: None });
+        let cancelled_query = SyntaxError::new(SyntaxFault::ParseCancelled { path: None });
         assert_eq!(
             cancelled_query.to_string(),
             "the request was cancelled before it completed; \
@@ -1294,7 +1024,7 @@ mod tests {
         );
         assert_eq!(
             overflow.fault().violation(),
-            RustSyntaxViolation::PositionOverflow
+            SyntaxViolation::PositionOverflow
         );
         assert_eq!(
             overflow.descriptor().name(),
@@ -1316,7 +1046,7 @@ mod tests {
             .expect_err("unregistered kind");
         assert_eq!(
             unknown.fault().violation(),
-            RustSyntaxViolation::UnknownNodeKind
+            SyntaxViolation::UnknownNodeKind
         );
         assert_eq!(unknown.descriptor().code(), "internal_error");
         assert_eq!(
@@ -1324,8 +1054,8 @@ mod tests {
             vec![ErrorContext::new("node_kind", "bogus")]
         );
 
-        let zero = RustSyntaxLimits::new(0, 1, 1).expect_err("zero source bound");
-        assert_eq!(zero.fault().violation(), RustSyntaxViolation::ZeroLimit);
+        let zero = SyntaxLimits::new(0, 1, 1).expect_err("zero source bound");
+        assert_eq!(zero.fault().violation(), SyntaxViolation::ZeroLimit);
         assert_eq!(zero.descriptor().code(), "configuration_invalid");
         assert_eq!(
             zero.context(),

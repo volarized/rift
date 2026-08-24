@@ -15,7 +15,7 @@ use rift_protocol::read::{
     File, FileContent, MatchedField, PathPattern, PathSelector, SearchHit, SearchHitTarget,
     SearchParams, SearchParamsTarget, SearchResult, SymbolId,
 };
-use rift_syntax::{ByteRange, RustSymbol};
+use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::read::{
     ReadError, ReadFault, ReadService, accepted_limit, excerpt, file_id, page, project_path,
@@ -386,7 +386,7 @@ fn resolve_symbol<'a>(
     index: &'a WorkspaceIndex,
     path: &ProjectPath,
     identity: &str,
-) -> Option<(&'a IndexedFile, &'a RustSymbol)> {
+) -> Option<(&'a IndexedFile, &'a SyntaxSymbol)> {
     let file = index.file(path)?;
     let symbol = file.syntax().symbols().iter().find(|symbol| {
         rift_core::rust_symbol_identity(file.path().as_str(), &symbol.qualified_name) == identity
@@ -439,7 +439,7 @@ fn locate_query_line(content: &str, query: &str) -> (u64, ByteRange, String) {
 fn merge_symbol_hit(
     results: &mut Vec<SearchHit>,
     file: &IndexedFile,
-    symbol: &RustSymbol,
+    symbol: &SyntaxSymbol,
     score: f64,
 ) {
     let identity = SymbolId(rift_core::rust_symbol_identity(
@@ -1421,7 +1421,7 @@ pub fn compute() -> i32 {
         service: &'a ReadService,
         path: &str,
         name: &str,
-    ) -> TestResult<(&'a rift_index::IndexedFile, &'a rift_syntax::RustSymbol)> {
+    ) -> TestResult<(&'a rift_index::IndexedFile, &'a rift_syntax::SyntaxSymbol)> {
         let file = service
             .index()
             .file(&rift_core::ProjectPath::new(path)?)

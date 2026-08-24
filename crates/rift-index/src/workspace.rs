@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, Walk, WalkBuilder};
 use rift_core::constants::{
-    READ_RESULTS_MAX_DEFAULT, RUST_SOURCE_BYTES_MAX_DEFAULT, WORKSPACE_BYTES_MAX_DEFAULT,
-    WORKSPACE_CONFIGURATION_FILE, WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
-    WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
+    READ_RESULTS_MAX_DEFAULT, WORKSPACE_BYTES_MAX_DEFAULT, WORKSPACE_CONFIGURATION_FILE,
+    WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
+    WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
     CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
@@ -16,8 +16,7 @@ use rift_core::{
 };
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{
-    RustNode, RustSource, RustSymbol, RustSyntaxDocument, RustSyntaxError, RustSyntaxProvider,
-    SOURCE_FILE_EXTENSIONS,
+    SyntaxDocument, SyntaxError, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol, registry,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -111,7 +110,7 @@ impl Default for WorkspaceIndexLimits {
     fn default() -> Self {
         Self {
             files_max: WORKSPACE_FILES_MAX_DEFAULT,
-            file_bytes_max: RUST_SOURCE_BYTES_MAX_DEFAULT,
+            file_bytes_max: registry::file_bytes_max_default(),
             workspace_bytes_max: WORKSPACE_BYTES_MAX_DEFAULT,
             directory_depth_max: WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
             results_max: READ_RESULTS_MAX_DEFAULT,
@@ -189,7 +188,7 @@ impl WorkspaceIndexFault {
 }
 
 impl Fault for WorkspaceIndexFault {
-    /// A syntax failure delegates to the underlying [`RustSyntaxError`]'s
+    /// A syntax failure delegates to the underlying [`SyntaxError`]'s
     /// identity when the source downcasts to one.
     fn name(&self) -> ErrorName {
         match self.violation {
@@ -212,7 +211,7 @@ impl Fault for WorkspaceIndexFault {
             WorkspaceIndexViolation::Syntax => self
                 .source
                 .as_deref()
-                .and_then(|source| source.downcast_ref::<RustSyntaxError>())
+                .and_then(|source| source.downcast_ref::<SyntaxError>())
                 .map_or_else(
                     || ErrorName::Wire(ErrorCode::InternalError),
                     |error| error.descriptor().name(),
@@ -281,7 +280,7 @@ pub(crate) fn index_error_caused_by(
 pub struct IndexedFile {
     path: ProjectPath,
     source: String,
-    syntax: RustSyntaxDocument,
+    syntax: SyntaxDocument,
 }
 
 impl IndexedFile {
@@ -299,7 +298,7 @@ impl IndexedFile {
 
     /// Returns syntax facts.
     #[must_use]
-    pub const fn syntax(&self) -> &RustSyntaxDocument {
+    pub const fn syntax(&self) -> &SyntaxDocument {
         &self.syntax
     }
 }
@@ -333,7 +332,7 @@ pub struct SymbolMatch<'a> {
     /// Containing file.
     pub file: &'a IndexedFile,
     /// Matched declaration.
-    pub symbol: &'a RustSymbol,
+    pub symbol: &'a SyntaxSymbol,
     /// Stable semantic match priority.
     pub rank: SymbolMatchRank,
 }
@@ -530,11 +529,11 @@ impl WorkspaceIndex {
         let root = canonical_root(root)?;
         let composition = composition()?;
         let classified = discover(&root, limits, visibility, text_inclusion)?;
-        let parser = RustSyntaxProvider::default();
         let mut workspace_bytes = 0_usize;
         let mut files = Vec::with_capacity(classified.source.len());
         for path in classified.source {
-            let file = read_file(&root, &path, &parser, limits, &mut workspace_bytes)?;
+            let provider = syntax_provider_for(&path);
+            let file = read_file(&root, &path, provider, limits, &mut workspace_bytes)?;
             files.push(file);
         }
         let mut text_files = Vec::with_capacity(classified.text.len());
@@ -689,7 +688,7 @@ impl WorkspaceIndex {
 
     /// Returns syntax nodes covering byte position.
     #[must_use]
-    pub fn nodes(&self, path: &ProjectPath, position: u64) -> Option<Vec<&RustNode>> {
+    pub fn nodes(&self, path: &ProjectPath, position: u64) -> Option<Vec<&SyntaxNode>> {
         self.file(path).map(|file| file.syntax().nodes_at(position))
     }
 
@@ -720,7 +719,6 @@ impl WorkspaceIndex {
             return Ok(Vec::new());
         }
         let matcher = PathMatcher::build(&self.root, force_include, &[])?;
-        let parser = RustSyntaxProvider::default();
         let mut extra_bytes = 0_usize;
         let mut files = Vec::new();
         let walker = source_walk(
@@ -763,7 +761,7 @@ impl WorkspaceIndex {
             files.push(read_file(
                 &self.root,
                 path,
-                &parser,
+                syntax_provider_for(path),
                 self.limits,
                 &mut extra_bytes,
             )?);
@@ -1141,12 +1139,29 @@ fn hard_floor_includes_path(root: &Path, path: &Path) -> bool {
 }
 
 /// Whether `path`'s extension is one some shipped syntax provider declares
-/// ([`rift_syntax::SOURCE_FILE_EXTENSIONS`]): the walk includes exactly what a provider can
+/// ([`registry::source_file_extensions`]): the walk includes exactly what a provider can
 /// parse, so a new grammar joins the scan by declaring its extensions on its provider.
 pub(crate) fn has_source_extension(path: &Path) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
-        .is_some_and(|extension| SOURCE_FILE_EXTENSIONS.contains(&extension))
+        .is_some_and(|extension| registry::source_file_extensions().contains(&extension))
+}
+
+/// The registered provider for one path the extension gate already accepted.
+///
+/// # Panics
+///
+/// Panics when no provider claims the extension: a path reaches this lookup
+/// only after [`has_source_extension`] proved some provider claims it, so a
+/// miss is a programmer error in the gate, not a reachable input.
+pub(crate) fn syntax_provider_for(path: &Path) -> &'static dyn SyntaxProvider {
+    let extension = path.extension().and_then(OsStr::to_str).unwrap_or_default();
+    registry::provider_for_extension(extension).unwrap_or_else(|| {
+        unreachable!(
+            "an included source path must name a provider-claimed extension: path={}",
+            path.display()
+        )
+    })
 }
 
 fn is_ignored_directory(name: &OsStr) -> bool {
@@ -1174,7 +1189,7 @@ fn walk_error(root: &Path, error: ignore::Error) -> WorkspaceIndexError {
 fn read_file(
     root: &Path,
     path: &Path,
-    parser: &RustSyntaxProvider,
+    provider: &dyn SyntaxProvider,
     limits: WorkspaceIndexLimits,
     workspace_bytes: &mut usize,
 ) -> Result<IndexedFile, WorkspaceIndexError> {
@@ -1185,7 +1200,7 @@ fn read_file(
         index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
     })?;
     let project_path = relative_path(relative)?;
-    included_file(project_path, bytes, path, parser, limits, workspace_bytes)
+    included_file(project_path, bytes, path, provider, limits, workspace_bytes)
 }
 
 /// Includes one source file's bytes in an index, whatever supplied them: the
@@ -1196,7 +1211,7 @@ pub(crate) fn included_file(
     project_path: ProjectPath,
     bytes: Vec<u8>,
     context_path: &Path,
-    parser: &RustSyntaxProvider,
+    provider: &dyn SyntaxProvider,
     limits: WorkspaceIndexLimits,
     workspace_bytes: &mut usize,
 ) -> Result<IndexedFile, WorkspaceIndexError> {
@@ -1222,8 +1237,8 @@ pub(crate) fn included_file(
             error,
         )
     })?;
-    let syntax = parser
-        .analyze(RustSource {
+    let syntax = provider
+        .analyze(SyntaxSource {
             path: &project_path,
             text: &source,
         })
@@ -1300,7 +1315,7 @@ fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
     })
 }
 
-fn symbol_rank(symbol: &RustSymbol, query: &str) -> SymbolMatchRank {
+fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> SymbolMatchRank {
     let qualified = symbol.qualified_name.to_lowercase();
     if qualified == query {
         SymbolMatchRank::QualifiedExact
@@ -1329,7 +1344,7 @@ fn declaration_source(file: &IndexedFile, range: rift_syntax::ByteRange) -> &str
 /// One lexical unit for a symbol declaration. `identity` is minted by the same
 /// [`rift_core::rust_symbol_identity`] the read service uses for that declaration's wire
 /// `SymbolId`, so a lexical hit's identity equals the id `get_symbol` returns for it.
-fn symbol_lexical_unit(file: &IndexedFile, symbol: &RustSymbol) -> LexicalUnit {
+fn symbol_lexical_unit(file: &IndexedFile, symbol: &SyntaxSymbol) -> LexicalUnit {
     let identity = rift_core::rust_symbol_identity(file.path().as_str(), &symbol.qualified_name);
     let content = declaration_source(file, symbol.range).to_owned();
     LexicalUnit::new(
@@ -1433,7 +1448,7 @@ fn new_text_lexical_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift_syntax::RustSyntaxLimits;
+    use rift_syntax::{RustSyntaxProvider, SyntaxLimits};
     #[cfg(unix)]
     use std::os::unix::fs as unix_fs;
 
@@ -2176,7 +2191,7 @@ mod tests {
         let limits = WorkspaceIndexLimits::default();
         let mut bytes = 0;
         let strict_parser =
-            RustSyntaxProvider::new(RustSyntaxLimits::new(1, 1, 1).expect("positive bounds"));
+            RustSyntaxProvider::new(SyntaxLimits::new(1, 1, 1).expect("positive bounds"));
         let source_path = directory.path().join("src/lib.rs");
         let syntax_error = read_file(
             directory.path(),

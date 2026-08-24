@@ -2881,6 +2881,7 @@ name = "rift-syntax"
 version = "0.0.12"
 dependencies = [
  "rift-core",
+ "rift-protocol",
  "rift-provider",
  "serde",
  "tree-sitter",

@@ -521,7 +521,7 @@ pub struct GetSymbolResult {
 
 /// A language name and its optional dialect. The pair is the identity facts are filed under,
 /// so `sql` and `sql:postgresql` are two languages with two symbol spaces.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Language {
     /// The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and

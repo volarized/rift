@@ -42,6 +42,7 @@ EXPECTED_EDGES = {
     "rift-server -> rift-provider",
     "rift-server -> rift-syntax",
     "rift-syntax -> rift-core",
+    "rift-syntax -> rift-protocol",
     "rift-syntax -> rift-provider",
 }
 
