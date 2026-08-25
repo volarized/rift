@@ -9,6 +9,8 @@
 //! precondition and an unsupported file-level change - plus a live witnessed
 //! `replace_node` that lands after the walk.
 
+mod hermetic_search;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
@@ -354,19 +356,41 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 }
 
 /// Proves one tool result carries no oversized digest and no non-project source-unit
-/// resolver, that every `search` hit names its project-relative path, and that every
-/// read result carries empty `warnings`: the live server resolves one published
-/// workspace per request, so no request can observe a lagging index.
+/// resolver, that every `search` hit names its project-relative path, and that a read
+/// result warns only what it is entitled to.
+///
+/// `get_symbol` and `nodes` carry empty `warnings`: the live server resolves one published
+/// workspace per request, so no request can observe a lagging index, and neither tool
+/// consults the search index at all.
+///
+/// `search` does consult it, and the search tier is prepared behind the answers, so this
+/// fixture's default `[search.semantic]` table legitimately produces
+/// `semantic_index_preparing` while the corpus runs. What it must never produce is
+/// `lexical_ranking_unavailable`: that warning is reserved for a tier that will not answer
+/// without operator action, and one that fired in ordinary operation would be one every
+/// caller learned to ignore.
 fn assert_wire_hygiene(name: &str, structured: &Value) {
     let context = format!("{name} result");
     assert_no_bare_sha256_digest(structured, &context);
     assert_source_unit_ids_use_project_resolver(structured, &context);
-    if matches!(name, "get_symbol" | "search" | "nodes") {
+    if matches!(name, "get_symbol" | "nodes") {
         assert_eq!(
             structured["warnings"],
             json!([]),
             "a live {name} result must carry empty warnings: {structured:#}"
         );
+    }
+    if name == "search"
+        && let Some(warnings) = structured["warnings"].as_array()
+    {
+        for warning in warnings {
+            assert_ne!(
+                warning["code"],
+                json!("lexical_ranking_unavailable"),
+                "an ordinary search must never spend the operator-action warning: \
+                 {structured:#}"
+            );
+        }
     }
     if name == "search"
         && let Some(results) = structured["results"].as_array()
@@ -433,6 +457,10 @@ async fn served_fixture() -> TestResult<(
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
@@ -836,7 +864,8 @@ async fn hooked_change_carries_validated_guarantees_and_findings() -> TestResult
     fs::write(directory.path().join("lib.rs"), "pub fn beacon_one() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        r#"
+        hermetic_search::SEMANTIC_DISABLED.to_owned()
+            + r#"
 [[hooks]]
 type = "command"
 id = "echoes"
