@@ -5,12 +5,12 @@
 //! store itself. One `search` runs both tiers and fuses what they returned.
 //!
 //! Nothing here knows what a server is. The caller drives
-//! [`SearchIndex::prepare`], [`SearchIndex::build`], and
-//! [`SearchIndex::refresh`] on whatever task it likes. The encoder's forward
-//! pass does not run on the calling task: candle would hold a runtime worker
-//! for the length of a batch, so every call into the encoder goes through
-//! `tokio::task::spawn_blocking` and the runtime's workers stay free for
-//! whatever else the caller is serving.
+//! [`SearchIndex::prepare`], [`SearchIndex::replace_lexical`], and
+//! [`SearchIndex::embed_described`] on whatever task it likes. The encoder's
+//! forward pass does not run on the calling task: candle would hold a runtime
+//! worker for the length of a batch, so every call into the encoder goes
+//! through `tokio::task::spawn_blocking` and the runtime's workers stay free
+//! for whatever else the caller is serving.
 //!
 //! What the semantic tier can answer right now is [`SemanticReadiness`]. This
 //! crate reports it and stops there: the wire warning a caller attaches to a
@@ -418,8 +418,7 @@ type Corpus = Vec<StoredVector>;
 /// from and the lexical store keys on a unit identity, so neither of them can
 /// answer which unit a vector belongs to. The pass that embeds holds that map
 /// in memory and publishes it whole, which is why a semantic ranking answers
-/// only after a [`SearchIndex::build`] or [`SearchIndex::refresh`] in this
-/// process.
+/// only after a [`SearchIndex::embed_described`] in this process.
 ///
 /// The vectors themselves are held beside that map, and the pass publishes the
 /// two together. Reading them back per query instead cost one `SELECT` over
