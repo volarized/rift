@@ -625,6 +625,7 @@
           "default": {
             "batch_declarations": 32,
             "candidates": 200,
+            "candidates_per_file": 3,
             "disabled": false,
             "download_attempts": 3,
             "download_timeout": "5m",
@@ -668,6 +669,14 @@
           "description": "Declarations the semantic ranking returns before the two rankings are\nfused, 1 to 1000.",
           "format": "uint64",
           "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "candidates_per_file": {
+          "default": 3,
+          "description": "Declarations one file may contribute to the semantic ranking before\nthe rest of its declarations are dropped, 1 to 64. Without the bound\none file whose declarations all rank well fills `candidates` on its\nown, and no other file reaches the candidate list however well it\nwould have ranked.",
+          "format": "uint64",
+          "maximum": 64,
           "minimum": 1,
           "type": "integer"
         },
@@ -928,6 +937,7 @@
         "semantic": {
           "batch_declarations": 32,
           "candidates": 200,
+          "candidates_per_file": 3,
           "disabled": false,
           "download_attempts": 3,
           "download_timeout": "5m",
