@@ -8,8 +8,8 @@ use rift_core::{
 };
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    IndexedFile, SymbolMatch, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
-    WorkspaceIndexLimits,
+    FileDigest, IndexedFile, PathChanges, SymbolMatch, WorkspaceDigests, WorkspaceFingerprint,
+    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
@@ -267,7 +267,7 @@ impl ReadService {
                 ReadFault::index(source)
             })?;
         let revisions = captured_revisions(&index);
-        span.record("files_count", index.files().len());
+        span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
         Ok(Self {
@@ -275,6 +275,61 @@ impl ReadService {
             revisions,
             revision: None,
             history,
+        })
+    }
+
+    /// Every file's digest this snapshot indexed, in project-path order.
+    ///
+    /// A request that captured the tree itself compares its capture with this to name the
+    /// files that moved, instead of asking for the whole workspace.
+    #[must_use]
+    pub fn workspace_digests(&self) -> WorkspaceDigests {
+        self.index.digests()
+    }
+
+    /// The digest of the bytes this snapshot indexed at `path`, or nothing when it indexes
+    /// no file there.
+    ///
+    /// This is what resolves an observation into a change set: a caller hashes the path's
+    /// current bytes and compares them with what this snapshot holds.
+    #[must_use]
+    pub fn file_digest(&self, path: &CoreProjectPath) -> Option<FileDigest> {
+        self.index.digest(path)
+    }
+
+    /// Builds the next snapshot by reading only the paths `changes` names, sharing every
+    /// other file with this one.
+    ///
+    /// The history configuration and the served revision carry over: an incremental
+    /// rebuild answers for the same workspace tree this snapshot did, with the named files
+    /// replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a named path cannot be read or indexed within bounds.
+    pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, ReadError> {
+        let span = tracing::info_span!(
+            "index.build",
+            component = "index",
+            changed_count = changes.len(),
+            files_count = tracing::field::Empty,
+            tree_revision = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let index = self.index.rebuilt(changes).map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
+        let revisions = captured_revisions(&index);
+        span.record("files_count", index.file_count());
+        span.record("tree_revision", revisions.wire_tree_revision());
+        span.record("outcome", "ok");
+        Ok(Self {
+            index,
+            revisions,
+            revision: self.revision.clone(),
+            history: self.history.clone(),
         })
     }
 
@@ -742,6 +797,11 @@ impl CapturedRevisions {
     }
 }
 
+/// Separates one path from its content digest in tree-revision material.
+const TREE_REVISION_PATH_SEPARATOR: u8 = 0;
+/// Separates adjacent files in tree-revision material.
+const TREE_REVISION_FILE_SEPARATOR: u8 = 0xff;
+
 /// The revisions one read service captures at build time. The captured tree
 /// and the indexed tree both derive from the one index the service holds, so
 /// a service built here observes them equal; `CapturedRevisions::warnings`
@@ -755,13 +815,17 @@ fn captured_revisions(index: &WorkspaceIndex) -> CapturedRevisions {
     }
 }
 
+/// Folds the index's own files, in project-path order, absorbing each file's content
+/// digest rather than its bytes. The index already carries that digest from the bytes it
+/// read, so a rebuild that replaced one file pays one hash update per file instead of
+/// rehashing every source it shared with the previous publication.
 fn workspace_digest(index: &WorkspaceIndex) -> String {
     let mut hasher = Sha256::new();
     for file in index.files() {
         hasher.update(file.path().as_str().as_bytes());
-        hasher.update([0]);
-        hasher.update(file.source().as_bytes());
-        hasher.update([0xff]);
+        hasher.update([TREE_REVISION_PATH_SEPARATOR]);
+        hasher.update(file.digest().as_bytes());
+        hasher.update([TREE_REVISION_FILE_SEPARATOR]);
     }
     format!("{:x}", hasher.finalize())
 }

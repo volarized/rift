@@ -5,10 +5,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
-use rift_core::{SourceVisibility, TextFileInclusion};
-use rift_index::{
-    LexicalIndexLimits, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
-};
+use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility};
+use rift_index::{LexicalIndexLimits, PathChanges, WorkspaceIndexLimits, capture_digests};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, MoveFileParams,
     PatchParams, RenameSymbolParams, ReplaceNodeParams, ReplaceSymbolParams,
@@ -42,8 +40,8 @@ use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagno
 use crate::validation::{
     ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, INDEX_FRESHNESS_TIMEOUT, IndexState,
     IndexSupervisor, IndexSupervisorContext, IndexValidation, PopulationLane, PublishedWorkspace,
-    RebuildOutcome, configuration_fingerprint, initial_workspace, publish_rebuild,
-    run_index_supervisor, workspace_watcher,
+    RebuildOutcome, WorkspaceCandidate, build_workspace_candidate, configuration_fingerprint,
+    initial_workspace, publish_rebuild, run_index_supervisor, workspace_watcher,
 };
 
 /// Overfetches ranked units beyond the caller's requested `limit` before the identifier and
@@ -563,6 +561,37 @@ enum StoreRevision {
     Absent,
 }
 
+/// The paths one applied change asks the next snapshot to reparse, or nothing when that
+/// snapshot has to read every visible file.
+///
+/// A change names what it wrote, so an ordinary change reparses exactly those files. Three
+/// cases read everything instead: a workspace that declares hooks, because a hook runs
+/// after the change lands and may write anything; a written path that decides what the
+/// workspace includes, because `rift.toml` and every `.gitignore` reshape the whole file
+/// set; and a wire path the index cannot key, which is covered rather than narrowed away.
+fn changed_paths_to_reparse(
+    root: &Path,
+    current: &PublishedWorkspace,
+    configuration: &WorkspaceConfiguration,
+    summary: &ChangeSummary,
+) -> Option<Vec<CoreProjectPath>> {
+    if !configuration.hooks.is_empty() {
+        return None;
+    }
+    let mut paths = Vec::with_capacity(summary.paths.len());
+    for path in &summary.paths {
+        let path = CoreProjectPath::new(&path.0).ok()?;
+        if current
+            .source_policy
+            .decides_inclusion(&root.join(path.as_str()))
+        {
+            return None;
+        }
+        paths.push(path);
+    }
+    Some(paths)
+}
+
 /// Places the search store's stamp against the tree revision `published` answers under.
 ///
 /// A store carrying no stamp has never held a tree: its startup population did not land.
@@ -758,7 +787,7 @@ impl RiftMcp {
                 .map_err(|error| ReadFault::task("configuration acceptance", error.to_string()))?;
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
-        let (validation, invalidations) = IndexValidation::new();
+        let (validation, invalidations) = IndexValidation::new(limits.files_max());
         let watch_root = root.clone();
         let watch_validation = Arc::clone(&validation);
         let watcher = blocking
@@ -1208,7 +1237,13 @@ impl RiftMcp {
         }
     }
 
-    /// Reconciles native observations with an exact request-time fingerprint.
+    /// Reconciles native observations with an exact request-time capture of the tree.
+    ///
+    /// The capture reads every visible file to decide whether the publication still answers
+    /// for this request, so it already knows which files moved. A request that finds the
+    /// tree ahead of the publication names those files, and the rebuild it waits for
+    /// reparses them alone; only a moved `rift.toml` and a capture that failed ask for the
+    /// whole workspace.
     async fn reconcile_workspace(
         &self,
         phase: wire::ErrorPhase,
@@ -1222,10 +1257,9 @@ impl RiftMcp {
             let capture = self
                 .blocking
                 .run("workspace fingerprint", move || {
-                    let fingerprint =
-                        WorkspaceFingerprint::capture(&root, limits, &visibility, &text_inclusion)
-                            .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
-                    Ok((fingerprint, configuration_fingerprint(&root)))
+                    let digests = capture_digests(&root, limits, &visibility, &text_inclusion)
+                        .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+                    Ok((digests, configuration_fingerprint(&root)))
                 })
                 .instrument(tracing::debug_span!(
                     "index.reconcile",
@@ -1234,23 +1268,31 @@ impl RiftMcp {
                     epoch = current.epoch
                 ))
                 .await;
-            let (fingerprint, configuration_fingerprint) = match capture {
+            let (digests, configuration_fingerprint) = match capture {
                 Ok(capture) => capture,
                 Err(error) => {
-                    let _ = self.validation.observe();
+                    let _ = self.validation.observe_whole_workspace();
                     return Err(error.tool_error(phase));
                 }
             };
             let configuration_matches =
                 current.configuration.fingerprint == configuration_fingerprint;
             let epoch_matches = current.epoch == self.validation.observed_epoch();
-            if fingerprint == current.fingerprint && configuration_matches && epoch_matches {
+            if digests.fingerprint() == current.fingerprint
+                && configuration_matches
+                && epoch_matches
+            {
                 current.configuration.accepted(phase)?;
                 return Ok(current);
             }
-            self.validation
-                .observe()
-                .map_err(|error| error.tool_error(phase))?;
+            let observed = if configuration_matches {
+                let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
+                self.validation
+                    .observe_paths(changes.iter().map(|(path, _)| path.clone()))
+            } else {
+                self.validation.observe_whole_workspace()
+            };
+            observed.map_err(|error| error.tool_error(phase))?;
         }
         Err(ReadFault::unavailable(
             "current workspace read",
@@ -1442,60 +1484,59 @@ impl RiftMcp {
     /// first. Returns the freshly published workspace only when publication actually
     /// happened; every failure rides `summary` as a diagnostic instead of failing the call,
     /// since the write already landed.
+    ///
+    /// The change names the paths it wrote, so an ordinary change reparses exactly those
+    /// files. A workspace that declares hooks reads every visible file instead: a hook runs
+    /// after the change lands and may write anything, and the snapshot this call publishes
+    /// has to carry whatever it wrote.
     fn rebuild_after_applied_change(
         root: &Path,
         limits: WorkspaceIndexLimits,
         published: &RwLock<IndexState>,
         validation: &IndexValidation,
         configuration: &WorkspaceConfiguration,
-        current: &PublishedWorkspace,
+        current: &Arc<PublishedWorkspace>,
         summary: &mut ChangeSummary,
     ) -> Option<Arc<PublishedWorkspace>> {
-        let epoch = match validation.observe() {
-            Ok(epoch) => epoch,
-            Err(error) => {
-                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                return None;
-            }
+        let observed = match changed_paths_to_reparse(root, current, configuration, summary) {
+            Some(paths) => validation.observe_paths(paths),
+            None => validation.observe_whole_workspace(),
         };
+        if let Err(error) = observed {
+            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+            return None;
+        }
         Self::attach_hook_verdicts(root, &configuration.hooks, summary);
-        let visibility = SourceVisibility::from(&configuration.source);
-        let text_inclusion = TextFileInclusion::from(&configuration.search);
-        let history = configuration.providers.history.clone();
-        let rebuilt = match ReadService::build(root, limits, &visibility, &text_inclusion, history)
-        {
-            Ok(rebuilt) => rebuilt,
-            Err(error) => {
-                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                return None;
-            }
-        };
-        let fingerprint = rebuilt.workspace_fingerprint().clone();
-        let source_policy =
-            match WorkspaceSourcePolicy::build(root, limits, &visibility, &text_inclusion) {
-                Ok(policy) => Arc::new(policy),
-                Err(error) => {
-                    let error = ReadError::from(ReadFault::Index(error));
-                    summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                    return None;
-                }
-            };
         if current.configuration.fingerprint != configuration_fingerprint(root) {
             let error = ReadFault::unavailable(
                 "workspace change",
                 "configuration changed during snapshot rebuild",
             );
-            let _ = validation.observe();
+            let _ = validation.observe_whole_workspace();
             summary.diagnostics.push(stale_snapshot_diagnostic(&error));
             return None;
         }
-        let next = Arc::new(PublishedWorkspace {
-            reads: Arc::new(rebuilt),
-            configuration: current.configuration.clone(),
-            fingerprint,
-            source_policy,
-            epoch,
-        });
+        let mut request = validation.take_pending();
+        request.previous = Some(Arc::clone(current));
+        let epoch = request.epoch;
+        let candidate = match build_workspace_candidate(root, limits, &request) {
+            Ok(WorkspaceCandidate::Stable(candidate)) => candidate,
+            Ok(WorkspaceCandidate::ConfigurationChanged) => {
+                let error = ReadFault::unavailable(
+                    "workspace change",
+                    "configuration changed during snapshot rebuild",
+                );
+                let _ = validation.observe_whole_workspace();
+                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                return None;
+            }
+            Err(error) => {
+                validation.restore_pending(request.work);
+                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                return None;
+            }
+        };
+        let next = candidate;
         if publish_rebuild(published, validation, Arc::clone(&next)) == RebuildOutcome::Published {
             tracing::info!(
                 component = "index",
@@ -1572,6 +1613,8 @@ mod tests {
     use rmcp::model::{CallToolRequestParams, ErrorCode};
     use serde_json::json;
 
+    use crate::validation::RebuildRequest;
+
     use super::{BlockingExecutor, ChangeLane, Parameters, RiftMcp};
     use crate::validation::{
         ConfigurationState, IndexState, IndexValidation, PublishedWorkspace, WorkspaceCandidate,
@@ -1616,7 +1659,11 @@ mod tests {
     }
 
     fn stable_candidate(root: &std::path::Path, epoch: u64) -> TestResult<Arc<PublishedWorkspace>> {
-        match build_workspace_candidate(root, WorkspaceIndexLimits::default(), epoch)? {
+        match build_workspace_candidate(
+            root,
+            WorkspaceIndexLimits::default(),
+            &RebuildRequest::initial(epoch),
+        )? {
             WorkspaceCandidate::Stable(candidate) => Ok(candidate),
             WorkspaceCandidate::ConfigurationChanged => {
                 Err("fixture configuration must remain stable".into())
@@ -2146,7 +2193,8 @@ mod tests {
             }),
             failure: None,
         });
-        let (validation, _invalidations) = IndexValidation::new();
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let changes = ChangeService::new(directory.path());
         let operation_called = AtomicBool::new(false);
 
@@ -2738,9 +2786,10 @@ pub fn beacon() -> u64 {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, _receiver) = IndexValidation::new();
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         validation
-            .observe()
+            .observe_whole_workspace()
             .map_err(|error| format!("observation must land: {error:?}"))?;
         let published = tokio::sync::RwLock::new(IndexState {
             current: candidate,
@@ -2774,7 +2823,8 @@ pub fn beacon() -> u64 {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, receiver) = IndexValidation::new();
+        let (validation, receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         drop(receiver);
         let published = tokio::sync::RwLock::new(IndexState {
             current: candidate,
@@ -2818,7 +2868,8 @@ pub fn beacon() -> u64 {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, _receiver) = IndexValidation::new();
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let published = tokio::sync::RwLock::new(IndexState {
             current: candidate,
             failure: None,
@@ -2868,7 +2919,8 @@ pub fn beacon() -> u64 {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, _receiver) = IndexValidation::new();
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let published = tokio::sync::RwLock::new(IndexState {
             current: candidate,
             failure: None,
@@ -2898,7 +2950,13 @@ pub fn beacon() -> u64 {
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
                         id: ChangeId("0123abcd".to_owned()),
-                        paths: Vec::new(),
+                        // A written `.gitignore` decides what the workspace includes, so
+                        // this change asks for the whole workspace and its `[source]`
+                        // policy is compiled again.
+                        paths: vec![
+                            rift_protocol::read::ProjectPath(".gitignore".to_owned()),
+                            rift_protocol::read::ProjectPath("nested/.gitignore".to_owned()),
+                        ],
                         edits: Vec::new(),
                         diagnostics: Vec::new(),
                         guarantees: Vec::new(),
@@ -2938,7 +2996,7 @@ pub fn beacon() -> u64 {
         let lane_guard = server.change_lane.entry.lock().await;
         let epoch = server
             .validation
-            .observe()
+            .observe_whole_workspace()
             .map_err(|error| format!("observation must land: {error:?}"))?;
         let published = Arc::clone(&server.published);
         let validation = Arc::clone(&server.validation);
