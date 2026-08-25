@@ -15,12 +15,16 @@
 mod document;
 mod encoder;
 mod error;
+mod fusion;
+mod similarity;
 
 pub use document::{
     DOCUMENT_SOURCE_BYTES_MAX, Declaration, Document, DocumentDigest, digests, document,
 };
 pub use encoder::{Encoder, EncoderLimits, ModelFiles};
 pub use error::{SearchError, SearchFault, SearchViolation};
+pub use fusion::{DeclarationMatch, FusedRank, Ranking, best_per_file, fuse, spread_per_file};
+pub use similarity::{SemanticMatch, nearest};
 
 /// Compile-time marker for search-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

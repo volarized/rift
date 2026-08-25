@@ -3503,6 +3503,7 @@ dependencies = [
  "data-encoding",
  "rayon",
  "rift-core",
+ "rift-index",
  "serde",
  "serde_json",
  "sha2",

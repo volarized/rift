@@ -17,6 +17,7 @@ candle-transformers.workspace = true
 data-encoding.workspace = true
 rayon.workspace = true
 rift-core.workspace = true
+rift-index.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
