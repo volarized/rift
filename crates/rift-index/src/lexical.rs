@@ -87,6 +87,11 @@ CREATE VIRTUAL TABLE lexical_units_fts USING fts5(identity UNINDEXED, name, cont
 -- #[toasty::breakpoint]
 CREATE INDEX semantic_vectors_model ON semantic_vectors(model)",
     ),
+    MigrationFile::new(
+        3,
+        "lexical_units_path",
+        "CREATE INDEX lexical_units_path ON lexical_units(path)",
+    ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
 
