@@ -407,6 +407,9 @@ enum Embedding {
 /// The digest-to-unit map the semantic tier ranks through.
 type Addresses = BTreeMap<String, UnitAddress>;
 
+/// The vectors the semantic tier scans, as one pass read them back.
+type Corpus = Vec<StoredVector>;
+
 /// Both search tiers over one database file.
 ///
 /// The vector store keys on the digest of the text a declaration was embedded
@@ -415,6 +418,16 @@ type Addresses = BTreeMap<String, UnitAddress>;
 /// in memory and publishes it whole, which is why a semantic ranking answers
 /// only after a [`SearchIndex::build`] or [`SearchIndex::refresh`] in this
 /// process.
+///
+/// The vectors themselves are held beside that map, and the pass publishes the
+/// two together. Reading them back per query instead cost one `SELECT` over
+/// every row this workspace embedded and one decode of every blob it returned,
+/// paid before a single row was scored and paid again for the next query. What
+/// holding them costs is the ceiling the operator already set:
+/// `search.semantic.max_vectors` vectors, each as wide as the encoder's
+/// dimension, held for as long as this index is open. The store stays the
+/// record: a restart reads the corpus back once, in the first pass, rather
+/// than embedding it again.
 #[derive(Debug)]
 pub struct SearchIndex {
     lexical: LexicalSearchIndex,
@@ -422,6 +435,7 @@ pub struct SearchIndex {
     model: Mutex<Option<Arc<LoadedModel>>>,
     readiness: Mutex<SemanticReadiness>,
     addresses: Mutex<Arc<Addresses>>,
+    corpus: Mutex<Arc<Corpus>>,
     limits: SearchIndexLimits,
 }
 
@@ -456,6 +470,7 @@ impl SearchIndex {
             model: Mutex::new(None),
             readiness: Mutex::new(limits.initial_readiness()),
             addresses: Mutex::new(Arc::new(Addresses::new())),
+            corpus: Mutex::new(Arc::new(Corpus::new())),
             limits,
         })
     }
@@ -463,8 +478,9 @@ impl SearchIndex {
     /// Loads the encoder, so the semantic tier can answer.
     ///
     /// Runs the acquisition the caller configured, then drops every vector
-    /// another model wrote: two models address different spaces, and rows the
-    /// previous one left can never be read again.
+    /// another model wrote and clears the held corpus with them: two models
+    /// address different spaces, and rows the previous one left can never be
+    /// read again.
     ///
     /// A disabled tier acquires nothing and answers `Ok`. A tier already
     /// marked [`SemanticReadiness::Unavailable`] stays that way, so one
@@ -565,7 +581,7 @@ impl SearchIndex {
     /// Runs both tiers and fuses them.
     ///
     /// The lexical tier always runs. The semantic tier runs when its readiness
-    /// says it answers and the store holds vectors this index can address.
+    /// says it answers and a pass has published a corpus to scan.
     /// Both rankings go to [`fuse`]: a tier that returned nothing contributes
     /// no ranking, and one ranking fused alone is still the fused score, so
     /// two queries' scores mean the same thing.
@@ -632,13 +648,22 @@ impl SearchIndex {
         })
     }
 
-    /// Holds the loaded model and drops every vector another model wrote.
+    /// Holds the loaded model, drops every vector another model wrote, and
+    /// empties the held corpus.
+    ///
+    /// The corpus goes because whatever is in it was embedded by the model
+    /// this index held before: scoring a query this encoder embedded against
+    /// another encoder's vectors ranks two spaces against each other. The
+    /// emptying lands before the new model does, so no query can read this
+    /// model beside the previous one's vectors; the next pass reads the corpus
+    /// back under the model held here.
     async fn hold(&self, model: LoadedModel) -> Result<(), SearchError> {
         let _dropped = self
             .vectors
             .prune_other_models(&model.identity)
             .await
             .map_err(store_failed)?;
+        self.publish_corpus(Corpus::new());
         let mut held = self.model.lock().unwrap_or_else(PoisonError::into_inner);
         *held = Some(Arc::new(model));
         Ok(())
@@ -663,8 +688,19 @@ impl SearchIndex {
         self.embed(&model, described, embedding).await
     }
 
-    /// Embeds what this pass owes, prunes what it orphaned, and reports how
-    /// far it got.
+    /// Embeds what this pass owes, prunes what it orphaned, reads the corpus
+    /// back, and reports how far it got.
+    ///
+    /// The corpus is read from the store rather than kept from what this pass
+    /// embedded, because a refresh embeds only what was missing: everything a
+    /// previous pass wrote is a vector this one never saw. One read per pass
+    /// is what the query path no longer pays per query.
+    ///
+    /// # Cancel safety
+    ///
+    /// A pass publishes the address map and the corpus once, after it has
+    /// embedded and pruned, so a dropped future leaves the previous pair
+    /// serving rather than a half-built one.
     async fn embed(
         &self,
         model: &Arc<LoadedModel>,
@@ -686,9 +722,30 @@ impl SearchIndex {
             .prune_absent(&model.identity, &live)
             .await
             .map_err(store_failed)?;
-        self.publish(&documents);
+        let corpus = self.read_corpus(model).await?;
+        self.publish(&documents, corpus);
         self.set_readiness(reached(as_count(documents.len()), total));
         Ok(())
+    }
+
+    /// The vectors this model holds, read back for the semantic tier to scan.
+    ///
+    /// The read stops at `max_vectors`, the same ceiling `documents` cuts the
+    /// described set to, because this is what the index goes on holding: a
+    /// corpus is `max_vectors` vectors of the encoder's dimension in memory,
+    /// and an operator who raises the key raises that. The prune this pass
+    /// just ran already left the store at that ceiling, so the cut answers
+    /// only a store another index wrote to under a wider one: it drops the
+    /// tail of the digest order rather than refusing the pass.
+    async fn read_corpus(&self, model: &LoadedModel) -> Result<Corpus, SearchError> {
+        self.vectors
+            .vectors(
+                &model.identity,
+                model.encoder.dimension(),
+                as_usize(self.limits.max_vectors),
+            )
+            .await
+            .map_err(store_failed)
     }
 
     /// Embeds `wanted` in passes of `batch_declarations`, storing each pass
@@ -727,24 +784,28 @@ impl SearchIndex {
 
     /// The semantic ranking, or nothing when the tier cannot answer.
     ///
-    /// A digest the address map does not name is skipped: the store holds
-    /// vectors from before this process opened it, and until a pass publishes
-    /// the map there is no unit to rank them as.
+    /// The scan runs over the corpus the last pass published, and the query
+    /// path reads no vector row of its own: doing that cost one `SELECT` over
+    /// every stored vector and one decode of every blob it returned, per
+    /// query. A held corpus with nothing in it ranks nothing, which is the
+    /// answer this gave when the store held nothing.
+    ///
+    /// A digest the address map does not name is skipped: a pass publishes the
+    /// corpus and the map together, and a digest in only one of them has no
+    /// unit to rank it as.
     ///
     /// One `tokio::task::spawn_blocking` call carries both the query's forward
-    /// pass and the cosine scan over every stored vector. Neither may hold a
+    /// pass and the cosine scan over the held corpus. Neither may hold a
     /// runtime worker while another request waits, and running the two under
-    /// one call schedules the work once rather than twice.
+    /// one call schedules the work once rather than twice. The corpus travels
+    /// into that call as the `Arc` this index holds, so the scan borrows the
+    /// vectors rather than copying them.
     async fn semantic(&self, query: &str) -> Result<Vec<UnitAddress>, SearchError> {
         let Some(model) = self.serving_model() else {
             return Ok(Vec::new());
         };
-        let stored = self
-            .vectors
-            .vectors(&model.identity, model.encoder.dimension())
-            .await
-            .map_err(store_failed)?;
-        if stored.is_empty() {
+        let corpus = self.corpus();
+        if corpus.is_empty() {
             return Ok(Vec::new());
         }
         let addresses = self.addresses();
@@ -752,7 +813,7 @@ impl SearchIndex {
         let asked = query.to_owned();
         let matched = tokio::task::spawn_blocking(move || {
             let embedded = model.encoder.embed_query(&asked)?;
-            nearest(&embedded, &stored, depth)
+            nearest(&embedded, &corpus, depth)
         })
         .await
         .map_err(task_failed)??;
@@ -802,17 +863,37 @@ impl SearchIndex {
         Arc::clone(&held)
     }
 
-    /// Publishes the map this pass built, replacing the previous one whole.
-    fn publish(&self, documents: &[UnitDocument]) {
+    /// The published corpus the semantic tier scans.
+    fn corpus(&self) -> Arc<Corpus> {
+        let held = self.corpus.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(&held)
+    }
+
+    /// Publishes what this pass built: the corpus, then the map that says
+    /// which unit each of its vectors belongs to, each replacing the previous
+    /// one whole.
+    ///
+    /// The two are held apart, so a query that reads between the two swaps
+    /// reads this pass's corpus against the previous pass's map. Nothing is
+    /// mispaired by that: a digest only one of the two names is skipped, and
+    /// the next query reads both from this pass.
+    fn publish(&self, documents: &[UnitDocument], corpus: Corpus) {
         let addresses: Addresses = documents
             .iter()
             .map(|one| (one.digest.clone(), one.address.clone()))
             .collect();
+        self.publish_corpus(corpus);
         let mut held = self
             .addresses
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         *held = Arc::new(addresses);
+    }
+
+    /// Publishes the corpus the semantic tier scans from here on.
+    fn publish_corpus(&self, corpus: Corpus) {
+        let mut held = self.corpus.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = Arc::new(corpus);
     }
 
     /// Records that a pass embedded nothing, without clearing a tier that is

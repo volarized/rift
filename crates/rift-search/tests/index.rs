@@ -1,7 +1,7 @@
 //! Both tiers behind one index, against a model built in the test, so no suite
 //! touches the network.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -42,6 +42,9 @@ const MARK: f32 = 7.0;
 /// The tree revision every pass in these suites stamps unless it states
 /// another.
 const REVISION: &str = "rev-one";
+
+/// A row bound no suite here reaches, so a read answers with every row.
+const EVERY: usize = usize::MAX;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -272,7 +275,7 @@ async fn store(root: &Path) -> Fallible<SemanticVectorStore> {
 async fn stored(root: &Path, name: &str) -> Fallible<Vec<StoredVector>> {
     Ok(store(root)
         .await?
-        .vectors(&model_identity(root, name), HIDDEN)
+        .vectors(&model_identity(root, name), HIDDEN, EVERY)
         .await?)
 }
 
@@ -296,6 +299,17 @@ fn is_marked(vectors: &[StoredVector], digest: &str) -> bool {
         .iter()
         .filter(|stored| stored.digest() == digest)
         .any(|stored| stored.values().iter().all(|value| *value == MARK))
+}
+
+/// Deletes every vector one model holds, through a second handle on the same
+/// database, so the index under test never learns the rows have gone.
+async fn drop_stored_vectors(root: &Path, name: &str) -> TestResult {
+    let dropped = store(root)
+        .await?
+        .prune_absent(&model_identity(root, name), &BTreeSet::new())
+        .await?;
+    assert!(dropped > 0, "the pass left rows to delete");
+    Ok(())
 }
 
 /// The order the lexical tier alone puts a query in.
@@ -916,6 +930,142 @@ async fn a_model_change_drops_the_vectors_the_previous_model_wrote() -> TestResu
         .build(fixture.units(), &fixture.described(), REVISION)
         .await?;
     assert_eq!(stored(root.path(), "other").await?.len(), 2);
+    Ok(())
+}
+
+/// A query reads no vector row. What proves it is the store: the rows one pass
+/// wrote are deleted underneath the index, and the same query answers with the
+/// same units afterwards, so what it ranked was the corpus that pass published.
+#[tokio::test]
+async fn a_query_ranks_from_the_held_corpus_after_the_stored_rows_are_gone() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+    let fixture = two()?;
+    index
+        .build(fixture.units(), &fixture.described(), REVISION)
+        .await?;
+    assert!(
+        lexical_order(root.path(), "search", 10).await?.is_empty(),
+        "the query shares no token with either unit, so only the semantic tier can answer it"
+    );
+    let answered = index.search("search", 10).await?;
+    let ranked = placed(&answered);
+    assert_eq!(ranked, [("one", "src/one.rs"), ("two", "src/two.rs")]);
+
+    drop_stored_vectors(root.path(), "model").await?;
+    assert!(
+        stored(root.path(), "model").await?.is_empty(),
+        "no vector row is left for a query to read"
+    );
+    assert_eq!(
+        placed(&index.search("search", 10).await?),
+        ranked,
+        "the ranking still answers, so the query path never read the vector table"
+    );
+    Ok(())
+}
+
+/// A refresh embeds only what the store was missing, so the corpus it
+/// publishes has to come from the store rather than from what it embedded.
+#[tokio::test]
+async fn a_refresh_publishes_what_it_embedded_beside_what_the_build_left() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+    let built = vec![unit("one", "src/one.rs", "load_config", "fn load config")?];
+    let carried = Declaration::new("fn", "load_config").source("fn load config");
+    index
+        .build(&built, &described(&built, &[carried]), REVISION)
+        .await?;
+
+    let units = vec![
+        unit("one", "src/one.rs", "load_config", "fn load config")?,
+        unit("three", "src/three.rs", "read_index", "fn read index")?,
+    ];
+    let arrived = Declaration::new("fn", "read_index").source("fn read index");
+    index
+        .refresh(&units, &described(&units, &[carried, arrived]), REVISION)
+        .await?;
+    assert_eq!(
+        stored(root.path(), "model").await?.len(),
+        2,
+        "the refresh embedded the declaration that arrived and kept the one that stayed"
+    );
+
+    drop_stored_vectors(root.path(), "model").await?;
+    assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
+    assert_eq!(
+        placed(&index.search("search", 10).await?),
+        [("one", "src/one.rs"), ("three", "src/three.rs")],
+        "the corpus the refresh published holds the vector it never embedded itself"
+    );
+    Ok(())
+}
+
+/// Two models address different spaces, so a query this encoder embedded may
+/// never be scored against the previous encoder's vectors.
+#[tokio::test]
+async fn a_model_change_leaves_none_of_the_previous_models_vectors_held() -> TestResult {
+    let root = workspace()?;
+    write_model(&root.path().join("other"))?;
+    let index = prepared(root.path(), limits()).await?;
+    let fixture = two()?;
+    index
+        .build(fixture.units(), &fixture.described(), REVISION)
+        .await?;
+    assert_eq!(
+        placed(&index.search("search", 10).await?),
+        [("one", "src/one.rs"), ("two", "src/two.rs")]
+    );
+
+    index
+        .prepare(&model_source(root.path(), "other")?, acquisition_limits())
+        .await?;
+    assert!(
+        index.search("search", 10).await?.is_empty(),
+        "the corpus the previous model filled is held nowhere, and the lexical tier cannot answer this query"
+    );
+    assert_eq!(
+        identities(&index.search("load config", 10).await?),
+        ["one"],
+        "the lexical tier keeps answering"
+    );
+
+    index
+        .build(fixture.units(), &fixture.described(), REVISION)
+        .await?;
+    assert_eq!(
+        placed(&index.search("search", 10).await?),
+        [("one", "src/one.rs"), ("two", "src/two.rs")],
+        "a pass under the model now held publishes a corpus of its own"
+    );
+    Ok(())
+}
+
+/// What the index holds between passes is bounded by the same ceiling the pass
+/// cuts the described set to, so the memory one index spends on vectors is the
+/// number the operator set and not what the file happens to hold.
+#[tokio::test]
+async fn the_held_corpus_stops_at_the_vector_bound() -> TestResult {
+    let root = workspace()?;
+    let bounded = SearchIndexLimits::builder(lexical_limits())
+        .batch_declarations(2)
+        .max_tokens(16)
+        .max_vectors(1)
+        .build();
+    let index = prepared(root.path(), bounded).await?;
+    let fixture = two()?;
+    index
+        .build(fixture.units(), &fixture.described(), REVISION)
+        .await?;
+    assert_eq!(stored(root.path(), "model").await?.len(), 1);
+
+    drop_stored_vectors(root.path(), "model").await?;
+    assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
+    assert_eq!(
+        identities(&index.search("search", 10).await?),
+        ["one"],
+        "the corpus carries the one vector the bound left room for, and no more"
+    );
     Ok(())
 }
 
