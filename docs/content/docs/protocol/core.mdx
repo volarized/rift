@@ -174,8 +174,8 @@ effects the change had, the diagnostics it produced, and
 hook established.
 
 When resolution yields no edits, the server returns a
-[`RefusalReason`](/docs/protocol/reference#RefusalReason) - `ambiguous_target`,
-`unmet_precondition`, or `unsupported` - and leaves the targeted tree unchanged. When it yields edits, the
+[`RefusalReason`](/docs/protocol/reference#RefusalReason) - `unmet_precondition` or
+`unsupported` - and leaves the targeted tree unchanged. When it yields edits, the
 change lands carrying its [`Advisory`](/docs/protocol/reference#Advisory) list - the
 concerns providers and hooks attached to exactly this change. A checked advisory is a verdict
 the emitter verified itself; an open warning carries the instruction that settles it.
