@@ -214,7 +214,7 @@ impl PathPatternViolation {
 
 /// Classifies one path-pattern value against the rules [`PathPattern`]'s schema advertises.
 /// Arms are ordered by precedence: the first matching rule names the violation.
-fn path_pattern_violation(value: &str) -> Option<PathPatternViolation> {
+pub(crate) fn path_pattern_violation(value: &str) -> Option<PathPatternViolation> {
     match value.as_bytes() {
         [] => Some(PathPatternViolation::Empty),
         [b'/', ..] => Some(PathPatternViolation::Absolute),
