@@ -623,7 +623,6 @@
             "max_tokens": 256,
             "max_vectors": 200000,
             "model": "BAAI/bge-small-en-v1.5",
-            "revision": "main",
             "weight": 0.3
           },
           "description": "The embedding model that adds semantic ranking, and the bounds its\npreparation runs under."
@@ -703,14 +702,7 @@
         },
         "model": {
           "default": "BAAI/bge-small-en-v1.5",
-          "description": "The embedding model: a Hugging Face repository identifier such as\n`BAAI/bge-small-en-v1.5`, or a workspace-relative directory holding the\nweights. Vectors are stored per model, so changing the value embeds the\nworkspace again.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "revision": {
-          "default": "main",
-          "description": "The model revision fetched from the hub: a branch, tag, or commit. It is\nignored when `model` names a directory.",
+          "description": "The embedding model: a Hugging Face repository identifier such as\n`BAAI/bge-small-en-v1.5`, the same identifier with a pinned model\nrevision after `@`, or a workspace-relative directory holding the\nweights. Vectors are stored per model, so changing the value embeds the\nworkspace again.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -912,7 +904,6 @@
           "max_tokens": 256,
           "max_vectors": 200000,
           "model": "BAAI/bge-small-en-v1.5",
-          "revision": "main",
           "weight": 0.3
         },
         "text": {

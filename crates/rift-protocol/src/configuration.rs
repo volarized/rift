@@ -754,8 +754,12 @@ fn model_violation(
 }
 
 /// Whether `character` may appear in an embedding model identifier.
+///
+/// The charset spans the three forms `search.semantic.model` accepts: a hub
+/// repository identifier, that identifier with a model revision pinned after
+/// `@`, and a workspace-relative directory.
 fn is_model_identifier_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/' | '@')
 }
 
 /// The `[search.lexical]` table: what the lexical ranking contributes to a
@@ -801,17 +805,13 @@ pub struct SemanticSearchConfiguration {
     #[serde(default = "default_semantic_weight")]
     pub weight: f64,
     /// The embedding model: a Hugging Face repository identifier such as
-    /// `BAAI/bge-small-en-v1.5`, or a workspace-relative directory holding the
+    /// `BAAI/bge-small-en-v1.5`, the same identifier with a pinned model
+    /// revision after `@`, or a workspace-relative directory holding the
     /// weights. Vectors are stored per model, so changing the value embeds the
     /// workspace again.
     #[schemars(length(min = 1, max = 128))]
     #[serde(default = "default_semantic_model")]
     pub model: String,
-    /// The model revision fetched from the hub: a branch, tag, or commit. It is
-    /// ignored when `model` names a directory.
-    #[schemars(length(min = 1, max = 128))]
-    #[serde(default = "default_semantic_revision")]
-    pub revision: String,
     /// Wall-clock budget one model download has, 10s to 1h.
     #[serde(default = "default_semantic_download_timeout")]
     pub download_timeout: Duration,
@@ -850,7 +850,6 @@ impl Default for SemanticSearchConfiguration {
             disabled: false,
             weight: SEMANTIC_WEIGHT_DEFAULT,
             model: default_semantic_model(),
-            revision: default_semantic_revision(),
             download_timeout: default_semantic_download_timeout(),
             download_attempts: SEMANTIC_DOWNLOAD_ATTEMPTS_DEFAULT,
             batch_declarations: SEMANTIC_BATCH_DECLARATIONS_DEFAULT,
@@ -862,21 +861,14 @@ impl Default for SemanticSearchConfiguration {
 }
 
 impl SemanticSearchConfiguration {
-    /// The model and revision identifier rules, then this table's numeric
-    /// bounds, in key order.
+    /// The model identifier rule, then this table's numeric bounds, in key
+    /// order.
     fn violation(&self) -> Option<ConfigurationViolation> {
         model_violation(
             "search.semantic.model",
             &self.model,
             SEMANTIC_MODEL_BYTES_MAX,
         )
-        .or_else(|| {
-            model_violation(
-                "search.semantic.revision",
-                &self.revision,
-                SEMANTIC_REVISION_BYTES_MAX,
-            )
-        })
         .or_else(|| {
             first_out_of_range([
                 (
@@ -932,10 +924,6 @@ pub const SEARCH_WEIGHT_SUM_TOLERANCE: f64 = 1e-9;
 /// dimensions, MIT, and a plain BERT encoder that runs without a C++
 /// toolchain.
 pub const SEMANTIC_MODEL_DEFAULT: &str = "BAAI/bge-small-en-v1.5";
-/// `search.semantic.revision` when the key is absent.
-pub const SEMANTIC_REVISION_DEFAULT: &str = "main";
-/// Bytes `search.semantic.revision` may hold, at most.
-pub const SEMANTIC_REVISION_BYTES_MAX: usize = 128;
 /// Milliseconds `search.semantic.download_timeout` may hold, at least.
 pub const SEMANTIC_DOWNLOAD_TIMEOUT_MS_MIN: u64 = 10_000;
 /// Milliseconds `search.semantic.download_timeout` may hold, at most: one hour.
@@ -985,10 +973,6 @@ fn default_semantic_weight() -> f64 {
 
 fn default_semantic_model() -> String {
     SEMANTIC_MODEL_DEFAULT.to_owned()
-}
-
-fn default_semantic_revision() -> String {
-    SEMANTIC_REVISION_DEFAULT.to_owned()
 }
 
 fn default_semantic_download_timeout() -> Duration {
@@ -2135,7 +2119,10 @@ mod tests {
         assert!(is_weight(semantic.weight, SEMANTIC_WEIGHT_DEFAULT));
         assert!(!semantic.disabled);
         assert_eq!(semantic.model, SEMANTIC_MODEL_DEFAULT);
-        assert_eq!(semantic.revision, SEMANTIC_REVISION_DEFAULT);
+        assert!(is_weight(
+            configuration.search.lexical.weight + semantic.weight,
+            1.0
+        ));
         assert_eq!(semantic.download_timeout, Duration::from_millis(300_000));
         assert_eq!(semantic.download_attempts, 3);
         assert_eq!(semantic.batch_declarations, 32);
@@ -2438,27 +2425,33 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_model_and_revision_identifiers_are_checked() {
+    fn test_semantic_model_identifier_is_checked() {
         let mut configuration = WorkspaceConfiguration::default();
-        configuration.search.semantic.model = "models/bge-small".to_owned();
-        assert_eq!(configuration.validate(), Ok(()));
-        configuration.search.semantic.model = "spaced out".to_owned();
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::SemanticModelInvalid {
-                field: "search.semantic.model",
-                ..
-            })
-        ));
-        configuration.search.semantic.model = default_semantic_model();
-        configuration.search.semantic.revision = String::new();
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::SemanticModelInvalid {
-                field: "search.semantic.revision",
-                ..
-            })
-        ));
+        for accepted in [
+            "models/bge-small",
+            "BAAI/bge-small-en-v1.5",
+            "BAAI/bge-small-en-v1.5@5c38ec7",
+        ] {
+            configuration.search.semantic.model = accepted.to_owned();
+            assert_eq!(
+                configuration.validate(),
+                Ok(()),
+                "{accepted} must be accepted"
+            );
+        }
+        for rejected in ["", "spaced out", &"a".repeat(SEMANTIC_MODEL_BYTES_MAX + 1)] {
+            configuration.search.semantic.model = rejected.to_owned();
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::SemanticModelInvalid {
+                        field: "search.semantic.model",
+                        ..
+                    })
+                ),
+                "{rejected:?} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -2734,7 +2727,7 @@ mod tests {
             Duration::from_millis(300_000)
         );
         assert_eq!(
-            configuration.search.semantic.revision, SEMANTIC_REVISION_DEFAULT,
+            configuration.search.semantic.model, SEMANTIC_MODEL_DEFAULT,
             "an omitted key keeps its default while its siblings are set"
         );
         assert_eq!(configuration.validate(), Ok(()));
@@ -3698,9 +3691,9 @@ mod tests {
                 json!(SEMANTIC_MODEL_BYTES_MAX),
             ),
             (
-                "revision max",
-                &semantic["revision"]["maxLength"],
-                json!(SEMANTIC_REVISION_BYTES_MAX),
+                "semantic disabled default",
+                &semantic["disabled"]["default"],
+                json!(false),
             ),
             (
                 "lexical weight min",
