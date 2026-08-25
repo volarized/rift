@@ -750,16 +750,6 @@ pub(crate) fn watch_event_impact(
         .fold(WatchImpact::None, WatchImpact::absorb)
 }
 
-/// Whether one native event can change visible Rust source or its policy.
-#[cfg(test)]
-pub(crate) fn relevant_watch_event(
-    root: &Path,
-    validation: &IndexValidation,
-    event: &Event,
-) -> bool {
-    watch_event_impact(root, validation, event) != WatchImpact::None
-}
-
 /// Rejects paths below Rift's hard-floor directories.
 pub(crate) fn hard_floor_includes_watch_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
@@ -1714,7 +1704,7 @@ mod tests {
         BlockingExecutor, ChangeSet, ConfigurationFingerprint, ConfigurationState, IndexState,
         IndexValidation, LexicalLane, PathChanges, PopulationLane, PublishedWorkspace,
         RebuildOutcome, RebuildRequest, WorkspaceCandidate, build_workspace_candidate,
-        publish_rebuild, publish_rebuild_after, record_rebuild_failure, relevant_watch_event,
+        publish_rebuild, publish_rebuild_after, record_rebuild_failure,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1856,70 +1846,92 @@ mod tests {
         validation.install_source_policy(Arc::new(policy));
         let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
 
-        assert!(relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Modify(ModifyKind::Any), "src/lib.rs")
-        ));
-        assert!(
-            relevant_watch_event(
-                &watched_root,
-                &validation,
-                &event(EventKind::Modify(ModifyKind::Any), "src/guide.txt")
+        let source_path = |path: &str| -> TestResult<super::WatchImpact> {
+            Ok(super::WatchImpact::Paths(vec![
+                rift_core::ProjectPath::new(path)?,
+            ]))
+        };
+        let expectations: Vec<(EventKind, &str, super::WatchImpact, &str)> = vec![
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "src/lib.rs",
+                source_path("src/lib.rs")?,
+                "a visible source file names itself",
             ),
-            "an external edit to an included [search.text] extension must trigger a rebuild, \
-             the same as a source file"
-        );
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Modify(ModifyKind::Any), "src/generated/code.rs")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Modify(ModifyKind::Any), "src/ignored.rs")
-        ));
-        assert!(relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Remove(RemoveKind::Folder), "src")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Create(CreateKind::Folder), "examples")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Remove(RemoveKind::Folder), "src/generated")
-        ));
-        assert!(relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Modify(ModifyKind::Any), ".gitignore")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Modify(ModifyKind::Any), "examples/.gitignore")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Modify(ModifyKind::Any), "src/rift.toml")
-        ));
-        assert!(!relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Modify(ModifyKind::Any), "target/.gitignore")
-        ));
-        assert!(relevant_watch_event(
-            &watched_root,
-            &validation,
-            &event(EventKind::Modify(ModifyKind::Any), "rift.toml")
-        ));
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "src/guide.txt",
+                source_path("src/guide.txt")?,
+                "an included [search.text] extension is read again like a source file",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "src/generated/code.rs",
+                super::WatchImpact::None,
+                "an excluded path changes nothing the index holds",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "src/ignored.rs",
+                super::WatchImpact::None,
+                "a path the workspace's .gitignore excludes changes nothing",
+            ),
+            (
+                EventKind::Remove(RemoveKind::Folder),
+                "src",
+                super::WatchImpact::WholeWorkspace,
+                "a visible directory that disappears takes an unknown set of files with it",
+            ),
+            (
+                EventKind::Create(CreateKind::Folder),
+                "examples",
+                super::WatchImpact::None,
+                "a directory outside the visible globs holds nothing to read",
+            ),
+            (
+                EventKind::Remove(RemoveKind::Folder),
+                "src/generated",
+                super::WatchImpact::None,
+                "an excluded directory holds nothing to read",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                ".gitignore",
+                super::WatchImpact::WholeWorkspace,
+                "the workspace's ignore file decides what is included",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "examples/.gitignore",
+                super::WatchImpact::None,
+                "an ignore file under an invisible directory decides nothing",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "src/rift.toml",
+                super::WatchImpact::None,
+                "only the root configuration file is the workspace's",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "target/.gitignore",
+                super::WatchImpact::None,
+                "the hard floor refuses target/ before any policy is consulted",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "rift.toml",
+                super::WatchImpact::WholeWorkspace,
+                "the configuration file decides what is included",
+            ),
+        ];
+        for (kind, path, expected, reason) in expectations {
+            assert_eq!(
+                super::watch_event_impact(&watched_root, &validation, &event(kind, path)),
+                expected,
+                "{path}: {reason}"
+            );
+        }
         Ok(())
     }
 
@@ -2402,7 +2414,11 @@ mod tests {
         let root = std::path::Path::new("/rift-workspace");
         let path = root.join("lib.rs");
         let event = Event::new(EventKind::Access(AccessKind::Any)).add_path(path.clone());
-        assert!(!relevant_watch_event(root, &validation, &event));
+        assert_eq!(
+            super::watch_event_impact(root, &validation, &event),
+            super::WatchImpact::None,
+            "an access event never reaches the inclusion predicate"
+        );
         assert_eq!(
             super::watch_path_impact(root, &validation, EventKind::Access(AccessKind::Any), &path),
             super::WatchImpact::None
