@@ -11,6 +11,7 @@ use rift_index::{
 };
 use tempfile::TempDir;
 use toasty::Db;
+use toasty::stmt::Type;
 use toasty_driver_sqlite::Sqlite;
 
 /// Builds one text-file unit; its identity is its own path, per convention.
@@ -819,5 +820,31 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
     );
     assert_eq!(reopened.search("betatwo", 8).await?.len(), 1);
     assert!(reopened.search("alphaone", 8).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_deletes_one_path_through_its_own_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    drop(index);
+
+    // `apply` deletes by path on every incremental publication, so the planner
+    // has to reach those rows through `lexical_units_path` rather than scanning
+    // every unit the workspace indexed.
+    let probe_database = open_concurrent_probe(&path).await?;
+    let mut probe_connection = probe_database.connection().await?;
+    let rows = toasty::sql::query("EXPLAIN QUERY PLAN DELETE FROM lexical_units WHERE path = ?1")
+        .bind("src/lib.rs".to_owned())
+        .column_types([Type::I64, Type::I64, Type::I64, Type::String])
+        .exec(&mut probe_connection)
+        .await?;
+    let plan = format!("{rows:?}");
+    assert!(
+        plan.contains("lexical_units_path"),
+        "a per-path delete must use the path index: plan={plan}"
+    );
     Ok(())
 }
