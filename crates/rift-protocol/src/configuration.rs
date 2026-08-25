@@ -898,6 +898,14 @@ pub struct SemanticSearchConfiguration {
     #[schemars(range(min = 1, max = 1000))]
     #[serde(default = "default_semantic_candidates")]
     pub candidates: u64,
+    /// Declarations one file may contribute to the semantic ranking before
+    /// the rest of its declarations are dropped, 1 to 64. Without the bound
+    /// one file whose declarations all rank well fills `candidates` on its
+    /// own, and no other file reaches the candidate list however well it
+    /// would have ranked.
+    #[schemars(range(min = 1, max = 64))]
+    #[serde(default = "default_semantic_candidates_per_file")]
+    pub candidates_per_file: u64,
     /// Vectors the workspace may hold, 1000 to 1000000. Embedding stops at the
     /// bound and the search warning says so; each vector costs the model's
     /// dimension in single-precision floats.
@@ -918,6 +926,7 @@ impl Default for SemanticSearchConfiguration {
             batch_declarations: SEMANTIC_BATCH_DECLARATIONS_DEFAULT,
             max_tokens: SEMANTIC_MAX_TOKENS_DEFAULT,
             candidates: SEMANTIC_CANDIDATES_DEFAULT,
+            candidates_per_file: SEMANTIC_CANDIDATES_PER_FILE_DEFAULT,
             max_vectors: SEMANTIC_MAX_VECTORS_DEFAULT,
         }
     }
@@ -964,6 +973,12 @@ impl SemanticSearchConfiguration {
                     self.candidates,
                     SEMANTIC_CANDIDATES_MIN,
                     SEMANTIC_CANDIDATES_MAX,
+                ),
+                (
+                    "search.semantic.candidates_per_file",
+                    self.candidates_per_file,
+                    SEMANTIC_CANDIDATES_PER_FILE_MIN,
+                    SEMANTIC_CANDIDATES_PER_FILE_MAX,
                 ),
                 (
                     "search.semantic.max_vectors",
@@ -1023,6 +1038,12 @@ pub const SEMANTIC_CANDIDATES_MIN: u64 = 1;
 pub const SEMANTIC_CANDIDATES_MAX: u64 = 1_000;
 /// `search.semantic.candidates` when the key is absent.
 const SEMANTIC_CANDIDATES_DEFAULT: u64 = 200;
+/// `search.semantic.candidates_per_file` accepted, at least.
+pub const SEMANTIC_CANDIDATES_PER_FILE_MIN: u64 = 1;
+/// `search.semantic.candidates_per_file` accepted, at most.
+pub const SEMANTIC_CANDIDATES_PER_FILE_MAX: u64 = 64;
+/// `search.semantic.candidates_per_file` when the key is absent.
+const SEMANTIC_CANDIDATES_PER_FILE_DEFAULT: u64 = 3;
 /// `search.semantic.max_vectors` accepted, at least.
 pub const SEMANTIC_MAX_VECTORS_MIN: u64 = 1_000;
 /// `search.semantic.max_vectors` accepted, at most.
@@ -1064,6 +1085,10 @@ fn default_semantic_max_tokens() -> u64 {
 
 fn default_semantic_candidates() -> u64 {
     SEMANTIC_CANDIDATES_DEFAULT
+}
+
+fn default_semantic_candidates_per_file() -> u64 {
+    SEMANTIC_CANDIDATES_PER_FILE_DEFAULT
 }
 
 fn default_semantic_max_vectors() -> u64 {
@@ -2201,6 +2226,7 @@ mod tests {
         assert_eq!(semantic.batch_declarations, 32);
         assert_eq!(semantic.max_tokens, 256);
         assert_eq!(semantic.candidates, 200);
+        assert_eq!(semantic.candidates_per_file, 3);
         assert_eq!(semantic.max_vectors, 200_000);
         assert_eq!(configuration.search.pool_slots, 4);
         assert_eq!(configuration.search.fusion_k, 60);
@@ -2685,7 +2711,7 @@ mod tests {
 
     #[test]
     fn test_semantic_numeric_bounds_are_enforced() {
-        let cases: [SemanticBoundCase; 6] = [
+        let cases: [SemanticBoundCase; 7] = [
             ("search.semantic.download_timeout", |semantic| {
                 semantic.download_timeout =
                     Duration::from_millis(SEMANTIC_DOWNLOAD_TIMEOUT_MS_MAX + 1);
@@ -2701,6 +2727,9 @@ mod tests {
             }),
             ("search.semantic.candidates", |semantic| {
                 semantic.candidates = SEMANTIC_CANDIDATES_MAX + 1;
+            }),
+            ("search.semantic.candidates_per_file", |semantic| {
+                semantic.candidates_per_file = SEMANTIC_CANDIDATES_PER_FILE_MAX + 1;
             }),
             ("search.semantic.max_vectors", |semantic| {
                 semantic.max_vectors = SEMANTIC_MAX_VECTORS_MIN - 1;
@@ -2733,6 +2762,56 @@ mod tests {
             configuration.validate(),
             Err(ConfigurationViolation::LimitOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn test_semantic_candidates_per_file_parses_and_keeps_its_default() {
+        let configured: WorkspaceConfiguration = serde_json::from_value(json!({
+            "search": { "semantic": { "candidates_per_file": 8 } }
+        }))
+        .expect("the key must parse");
+        assert_eq!(configured.search.semantic.candidates_per_file, 8);
+        assert_eq!(
+            configured.search.semantic.candidates,
+            SEMANTIC_CANDIDATES_DEFAULT
+        );
+        assert_eq!(configured.validate(), Ok(()));
+        let omitted: WorkspaceConfiguration = serde_json::from_value(json!({
+            "search": { "semantic": { "candidates": 100 } }
+        }))
+        .expect("an omitted key must keep its default");
+        assert_eq!(
+            omitted.search.semantic.candidates_per_file,
+            SEMANTIC_CANDIDATES_PER_FILE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn test_semantic_candidates_per_file_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for accepted in [
+            SEMANTIC_CANDIDATES_PER_FILE_MIN,
+            SEMANTIC_CANDIDATES_PER_FILE_MAX,
+        ] {
+            configuration.search.semantic.candidates_per_file = accepted;
+            assert_eq!(configuration.validate(), Ok(()), "{accepted} is in range");
+        }
+        for refused in [
+            SEMANTIC_CANDIDATES_PER_FILE_MIN - 1,
+            SEMANTIC_CANDIDATES_PER_FILE_MAX + 1,
+        ] {
+            configuration.search.semantic.candidates_per_file = refused;
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "search.semantic.candidates_per_file",
+                        ..
+                    })
+                ),
+                "candidates_per_file {refused} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -3903,17 +3982,6 @@ mod tests {
                 &search["fusion_k"]["maximum"],
                 json!(SEARCH_FUSION_K_MAX),
             ),
-            ("model min", &semantic["model"]["minLength"], json!(1)),
-            (
-                "model max",
-                &semantic["model"]["maxLength"],
-                json!(SEMANTIC_MODEL_BYTES_MAX),
-            ),
-            (
-                "semantic disabled default",
-                &semantic["disabled"]["default"],
-                json!(false),
-            ),
             (
                 "lexical weight min",
                 &lexical["weight"]["minimum"],
@@ -3933,6 +4001,27 @@ mod tests {
                 "semantic weight max",
                 &semantic["weight"]["maximum"],
                 json!(1.0),
+            ),
+        ];
+        assert_schema_bounds(&cases);
+    }
+
+    #[test]
+    fn test_semantic_schema_bounds_equal_the_enforced_constants() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let semantic = &schema["$defs"]["SemanticSearchConfiguration"]["properties"];
+        let cases = [
+            ("model min", &semantic["model"]["minLength"], json!(1)),
+            (
+                "model max",
+                &semantic["model"]["maxLength"],
+                json!(SEMANTIC_MODEL_BYTES_MAX),
+            ),
+            (
+                "semantic disabled default",
+                &semantic["disabled"]["default"],
+                json!(false),
             ),
             (
                 "download attempts min",
@@ -3973,6 +4062,16 @@ mod tests {
                 "candidates max",
                 &semantic["candidates"]["maximum"],
                 json!(SEMANTIC_CANDIDATES_MAX),
+            ),
+            (
+                "candidates per file min",
+                &semantic["candidates_per_file"]["minimum"],
+                json!(SEMANTIC_CANDIDATES_PER_FILE_MIN),
+            ),
+            (
+                "candidates per file max",
+                &semantic["candidates_per_file"]["maximum"],
+                json!(SEMANTIC_CANDIDATES_PER_FILE_MAX),
             ),
             (
                 "max vectors min",
