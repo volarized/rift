@@ -331,6 +331,13 @@ more than a read is willing to wait, so vectors are refreshed after the index pu
 search whose vectors are still being written ranks lexically and reports the tier's readiness in
 `warnings`.
 
+Both tiers answer under one tree revision: the full-text store reads its stamp and its rows in
+one transaction, and the vectors a pass published carry the tree they were described for. A store
+that has moved past the tree a request captured returns nothing, and the request captures the
+publication the store already answers for. What a caller is told about is a tier that will not
+answer at all - one that refused to load, or holds no indexed tree - which raises
+`lexical_ranking_unavailable`.
+
 ### Search
 
 [`search`](/docs/protocol/mcp#tool-search) is for reads where the exact name isn't known.

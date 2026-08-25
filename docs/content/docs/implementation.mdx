@@ -150,11 +150,19 @@ The lexical index's tables:
 
 - `lexical_units` - one row per indexed unit: a code symbol, or a text file split into chunks
   past the [`[search.text]`](/docs/configuration#search) chunk bound.
-- `lexical_index_state` - stamps the set with the tree revision that published it; a search
-  request trusts the store only when that stamp equals the tree revision the read captured.
+- `lexical_index_state` - stamps the set with the tree revision that published it. One read
+  transaction reads that stamp and runs the query, so a commit landing between the two cannot
+  slip another tree's rows into an answer. A store holding another tree returns no rows at all:
+  the request captured a publication that has since been superseded, and it recaptures rather
+  than ranking rows it cannot place.
 - `lexical_units_fts` - the [FTS5](https://www.sqlite.org/fts5.html) virtual table over `name`
   and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25`
   with per-column weights, comparable only within one search.
+
+A rebuild that named its files deletes and reinserts exactly those paths, which is why
+`lexical_units` carries an index on `path`. Every named path is replaced, added ones included:
+two rebuilds captured from one publication both write what they read, and the second leaves what
+the first left.
 
 Search is a layered configuration: the default is this full-text store alone, and
 [`[search.semantic]`](/docs/configuration#search) adds the vector store below, whose ranking
@@ -196,7 +204,12 @@ machine its memory.
 
 The vectors go in `semantic_vectors`, in the same `.rift/db`. A row is addressed by the model
 that produced it and the digest of the text it came from, so a declaration that moves or is
-renamed resolves to the row already stored and a refresh embeds only what changed. Values are
+renamed resolves to the row already stored and a refresh embeds only what changed.
+
+A pass publishes its vectors, the map that places each of them on a unit, and the tree revision
+they were described for as one value. A query reads all three or none: a corpus described for a
+tree other than the one the request captured ranks nothing, so a workspace published moments ago
+is answered by the full-text tier alone until the pass for that tree lands. Values are
 little-endian single precision with no header, so a row is a slice; a row whose stored width
 differs from the loaded model's is skipped, which invalidates a checkpoint that changed shape
 rather than reading it as noise.

@@ -985,12 +985,11 @@ pub enum ReadWarning {
     },
     /// The full-text tier is not answering, so the answer came from identifier matching
     /// alone. Ranking reaches what a name match reaches and no further, and a query
-    /// phrased as prose finds nothing. `stale_index` covers a store that lags the tree,
-    /// including the window between a publication and the repopulation that follows it;
-    /// this covers a tier that refused to load and will not answer without operator
-    /// action, which a caller cannot otherwise tell from a tier that searched and found
-    /// nothing. A transient lag never raises this warning: one that fired in ordinary
-    /// operation would be one every caller learned to ignore.
+    /// phrased as prose finds nothing. The tier is read under the tree revision the answer
+    /// was computed from, so a tier holding another tree is recaptured rather than warned
+    /// about; this covers a tier that refused to load, or that holds no indexed tree at
+    /// all, and will not answer without operator action - which a caller cannot otherwise
+    /// tell from a tier that searched and found nothing.
     LexicalRankingUnavailable {
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
