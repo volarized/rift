@@ -50,9 +50,6 @@ pub enum RefusalReason {
     /// `preconditions`.
     #[serde(rename = "unmet_precondition")]
     UnmetPrecondition,
-    /// The address resolves to several targets. Narrow it and ask again.
-    #[serde(rename = "ambiguous_target")]
-    AmbiguousTarget,
 }
 
 /// A filesystem effect described before Rift performs it. Edits in one set share one input
@@ -430,8 +427,7 @@ pub const RENAME_NEW_NAME_BYTES_MAX: usize = 256;
 /// The engine proposes the edits; the server verifies each one against the tree and
 /// writes them atomically, then reports surviving occurrences of the old name as
 /// warnings. Refused as `unsupported` when no engine serves the declaration's language,
-/// `unmet_precondition` when the engine declines the rename or the source drifted, and
-/// `ambiguous_target` when the address resolves to several declarations.
+/// and `unmet_precondition` when the engine declines the rename or the source drifted.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.14"))]
