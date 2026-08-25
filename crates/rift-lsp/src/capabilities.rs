@@ -205,6 +205,13 @@ fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
 /// doing: the protocol forbids server-initiated progress unless the client
 /// declares it, so without this entry an engine loading a project reports
 /// nothing and every answer it gives while loading reads as settled.
+///
+/// `textDocument.diagnostic.dynamicRegistration` is what makes an engine
+/// advertise `diagnostic_provider` at all when its own pull-diagnostics
+/// support is conditional on that flag: tombi, the TOML engine, sets
+/// `diagnostic_provider` only when the client declares dynamic
+/// registration, so without this entry its pull-diagnostics chain never
+/// closes.
 #[must_use]
 pub fn offered() -> ClientCapabilities {
     ClientCapabilities {
@@ -231,7 +238,10 @@ pub fn offered() -> ClientCapabilities {
                 prepare_support: Some(true),
                 ..RenameClientCapabilities::default()
             }),
-            diagnostic: Some(DiagnosticClientCapabilities::default()),
+            diagnostic: Some(DiagnosticClientCapabilities {
+                dynamic_registration: Some(true),
+                ..DiagnosticClientCapabilities::default()
+            }),
             ..TextDocumentClientCapabilities::default()
         }),
         window: Some(WindowClientCapabilities {
@@ -463,6 +473,17 @@ mod tests {
             window.work_done_progress,
             Some(true),
             "an engine only reports its work when the client declares this"
+        );
+        let diagnostic = offered
+            .text_document
+            .expect("text document capabilities are offered")
+            .diagnostic
+            .expect("diagnostic capabilities are offered");
+        assert_eq!(
+            diagnostic.dynamic_registration,
+            Some(true),
+            "an engine that gates diagnostic_provider on dynamic \
+             registration only advertises it when the client declares this"
         );
     }
 }

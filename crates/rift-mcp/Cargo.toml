@@ -70,6 +70,10 @@ name = "live_semantic_search"
 path = "tests/live_semantic_search.rs"
 
 [[test]]
+name = "live_toml"
+path = "tests/live_toml.rs"
+
+[[test]]
 name = "live_typescript"
 path = "tests/live_typescript.rs"
 
