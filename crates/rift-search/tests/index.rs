@@ -942,6 +942,39 @@ async fn a_store_refusal_carries_the_stores_own_violation() -> TestResult {
     Ok(())
 }
 
+/// A bound the store enforced reaches the caller as that bound.
+///
+/// Flattening every store refusal into this tier's own violation told a caller
+/// sending too many query terms that the server had failed, when the caller
+/// could have shortened the query. The registry identity and the limit
+/// evidence travel with the failure so the answer stays actionable.
+#[tokio::test]
+async fn a_store_bound_keeps_its_registry_identity_and_its_limit_evidence() -> TestResult {
+    let root = workspace()?;
+    let narrow = SearchIndexLimits::builder(LexicalIndexLimits::new(1, 1 << 20, 32, 64, 4, 1_000))
+        .disable_semantic()
+        .build();
+    let index = opened(root.path(), narrow).await?;
+    let fixture = two()?;
+    let error = index
+        .build(fixture.units(), &fixture.described(), REVISION)
+        .await
+        .expect_err("two units pass the one-unit bound");
+
+    let descriptor = error.descriptor();
+    assert_eq!(
+        descriptor.code(),
+        "limit_exceeded",
+        "the store's own classification reaches the caller, not this tier's"
+    );
+    let evidence = rift_core::Fault::limit_evidence(error.fault())
+        .expect("a limit refusal states the bound and what the request needed");
+    assert_eq!(evidence.field, "units_max");
+    assert_eq!(evidence.limit, 1);
+    assert_eq!(evidence.required, 2);
+    Ok(())
+}
+
 #[tokio::test]
 async fn opening_a_store_that_cannot_be_created_is_refused() -> TestResult {
     let root = tempfile::tempdir()?;

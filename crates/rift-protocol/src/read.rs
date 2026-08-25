@@ -956,8 +956,10 @@ pub enum ReadWarning {
     },
     /// The semantic ranking is still being built, so the answer was ranked lexically
     /// alone. A query that shares no token with the code it describes reaches nothing
-    /// until every declaration carries a vector; the counts state how far that has got,
-    /// and `ready_in` estimates the wait from the rate the pass has held so far.
+    /// until every declaration carries a vector; the counts state how far that has got.
+    /// `ready_in` is an estimate the server derives from how large the workspace is and
+    /// how much of it is embedded, not a measurement of this machine, so a caller may
+    /// report it and must not schedule against it.
     SemanticIndexPreparing {
         /// Declarations that already carry a vector.
         prepared: u64,
@@ -981,9 +983,12 @@ pub enum ReadWarning {
     },
     /// The full-text tier is not answering, so the answer came from identifier matching
     /// alone. Ranking reaches what a name match reaches and no further, and a query
-    /// phrased as prose finds nothing. `stale_index` covers an index that lags the tree;
-    /// this covers a tier that refused to load, which a caller cannot otherwise tell from
-    /// a tier that searched and found nothing.
+    /// phrased as prose finds nothing. `stale_index` covers a store that lags the tree,
+    /// including the window between a publication and the repopulation that follows it;
+    /// this covers a tier that refused to load and will not answer without operator
+    /// action, which a caller cannot otherwise tell from a tier that searched and found
+    /// nothing. A transient lag never raises this warning: one that fired in ordinary
+    /// operation would be one every caller learned to ignore.
     LexicalRankingUnavailable {
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]

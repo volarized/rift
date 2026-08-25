@@ -958,11 +958,10 @@ fn model_identity(source: &ModelSource) -> String {
 /// One store failure, with that store's own violation riding as the cause.
 fn store_failed(source: LexicalIndexError) -> SearchError {
     let subject = source.to_string();
-    SearchError::new(
-        SearchFault::new(SearchViolation::StoreFailed)
-            .about(subject)
-            .caused_by(source),
-    )
+    let fault = SearchFault::new(SearchViolation::StoreFailed)
+        .about(subject)
+        .carrying(source.fault());
+    SearchError::new(fault.caused_by(source))
 }
 
 /// Declarations one pass takes, never zero: a pass of nothing divides the
