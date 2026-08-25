@@ -365,10 +365,12 @@ source-node evidence, derivation, and the direction Rift followed it.
 
 The lexical ranking answers a query that shares a token with the code. A query that shares
 none - a description of what a declaration does, in the words a bug report would use - reaches
-nothing lexically, and no amount of ranking repairs that, because the words are not there. An
-embedding puts the query and the declaration in one space, so a paraphrase finds code it has
-no word in common with. It replaces nothing: whenever the caller quotes a real name, the
-lexical ranking is the stronger side, and the embedding is measurably worse at exactly that.
+nothing lexically, and no amount of ranking repairs that, because the words are not there.
+
+An embedding puts the query and the declaration in one space, so a paraphrase finds code it
+has no word in common with. It replaces nothing. A caller who quotes a real name - a symbol, a
+configuration key, a line from a traceback - has handed the lexical ranking an exact token to
+score, while the embedding maps that name into a space where its near neighbours crowd it.
 
 A declaration is embedded as its own source under its qualified name. The name carries the
 module the source doesn't state; the source carries the identifiers and documentation an
