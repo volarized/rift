@@ -39,9 +39,10 @@ use tracing::Instrument as _;
 use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
 use crate::validation::{
     ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, INDEX_FRESHNESS_TIMEOUT, IndexState,
-    IndexSupervisor, IndexSupervisorContext, IndexValidation, PopulationLane, PublishedWorkspace,
-    RebuildOutcome, WorkspaceCandidate, build_workspace_candidate, configuration_fingerprint,
-    initial_workspace, publish_rebuild, run_index_supervisor, workspace_watcher,
+    IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalLane, LexicalWrite,
+    PendingWork, PopulationLane, PublishedWorkspace, RebuildOutcome, WorkspaceCandidate,
+    build_workspace_candidate, configuration_fingerprint, finish_rebuild, initial_workspace,
+    lexical_write, run_index_supervisor, workspace_watcher,
 };
 
 /// Overfetches ranked units beyond the caller's requested `limit` before the identifier and
@@ -739,26 +740,41 @@ pub struct RiftMcp {
     /// no index open there is no store to populate. A landed change hands its
     /// publication here and returns, rather than awaiting the pass itself.
     population: Option<PopulationLane>,
+    /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
+    /// through it before its snapshot becomes current.
+    lexical: Option<LexicalLane>,
     engines: Arc<EngineHold>,
     tool_router: ToolRouter<Self>,
 }
 
 /// One already-serialized change's outcome, threaded out of the blocking executor so the
-/// async `change` method hands exactly the workspace this change published to the
-/// population lane, without a second, possibly-superseded read of shared state.
+/// async `change` method commits and publishes exactly the candidate this change built,
+/// without a second, possibly-superseded read of shared state.
 struct SerializedChange {
     result: Result<Json<ChangeResult>, ErrorData>,
-    published: Option<Arc<PublishedWorkspace>>,
+    candidate: Option<AppliedCandidate>,
 }
 
 impl SerializedChange {
-    /// A refusal or a diagnostic-only outcome: no fresh snapshot to populate.
+    /// A refusal or a diagnostic-only outcome: no candidate to commit or publish.
     const fn wire(result: Result<Json<ChangeResult>, ErrorData>) -> Self {
         Self {
             result,
-            published: None,
+            candidate: None,
         }
     }
+}
+
+/// The candidate one landed change built, waiting for its lexical commit and its
+/// publication.
+///
+/// The change lane is released before the commit awaits, so this carries everything the
+/// publication check needs rather than reading shared state again.
+struct AppliedCandidate {
+    published: Arc<PublishedWorkspace>,
+    write: LexicalWrite,
+    work: PendingWork,
+    epoch: u64,
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
@@ -800,7 +816,8 @@ impl RiftMcp {
                 operation = "watch.setup"
             ))
             .await?;
-        let published = initial_workspace(&root, limits, &validation, &blocking).await?;
+        let (published, lexical_write) =
+            initial_workspace(&root, limits, &validation, &blocking).await?;
         // The search database lives under the workspace's own `.rift` directory, so it
         // opens only once the workspace root itself is proven real by a successful initial
         // scan - never before, or a missing root would be silently fabricated by creating
@@ -816,12 +833,19 @@ impl RiftMcp {
             .flatten();
         let search_limits = search_index_limits(&search_configuration, acquisition.as_ref());
         let search_index = open_search_index(&root, search_limits).await;
-        // The lane runs the run's first pass, which establishes the vector set: a store
-        // found on disk was written by an earlier process, possibly under another model.
-        // Awaiting that pass here held the first answer for around fifteen seconds on a
-        // real workspace, and a search arriving before it lands is already answered - the
-        // store carries no stamp yet, so the answer is ranked by identifier matching alone
-        // and says so.
+        // The lexical set commits before this snapshot becomes current, so the first
+        // request to reach the server reads rows stamped with the tree revision it
+        // captured. Embedding does not: the population lane runs the run's first pass
+        // afterwards, which establishes the vector set, because a store found on disk was
+        // written by an earlier process, possibly under another model. Awaiting that pass
+        // here held the first answer for around fifteen seconds on a real workspace.
+        let lexical = search_index
+            .as_ref()
+            .map(|index| LexicalLane::spawn(Arc::clone(index), validation.cancellation.clone()));
+        if let Some(lane) = lexical.as_ref() {
+            lane.commit(lexical_write, published.reads.tree_revision())
+                .await?;
+        }
         let population = search_index
             .as_ref()
             .map(|index| PopulationLane::spawn(Arc::clone(index), validation.cancellation.clone()));
@@ -844,6 +868,7 @@ impl RiftMcp {
                 validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
                 population: population.clone(),
+                lexical: lexical.clone(),
             },
         ));
         let mut task = validation.task.lock().await;
@@ -876,6 +901,7 @@ impl RiftMcp {
             blocking,
             search_index,
             population,
+            lexical,
             engines,
             tool_router: Self::tool_router(),
         })
@@ -1391,13 +1417,19 @@ impl RiftMcp {
             })
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        if let (Some(lane), Some(next)) = (self.population.as_ref(), outcome.published.as_ref()) {
+        let mut result = outcome.result?;
+        let published_next = match (&mut result, outcome.candidate) {
+            (Json(ChangeResult::Applied { summary }), Some(candidate)) => {
+                self.publish_applied_change(candidate, summary).await
+            }
+            _ => None,
+        };
+        if let (Some(lane), Some(next)) = (self.population.as_ref(), published_next.as_ref()) {
             lane.request(Arc::clone(next));
         }
-        let mut result = outcome.result?;
         if let Json(ChangeResult::Applied { summary }) = &mut result
             && let Some(snapshot) = self
-                .diagnostics_snapshot(outcome.published.as_ref(), summary)
+                .diagnostics_snapshot(published_next.as_ref(), summary)
                 .await
         {
             let engines = self.engine_pool().await;
@@ -1406,6 +1438,62 @@ impl RiftMcp {
                 .extend(engine_change_diagnostics(&engines, &snapshot.reads, &summary.paths).await);
         }
         Ok(result)
+    }
+
+    /// Commits one landed change's lexical rows and publishes its snapshot, in that order.
+    ///
+    /// A request that captures this publication has to find the store already holding its
+    /// tree, so the commit runs before the swap. The change lane is released by now, which
+    /// is what lets the commit await; the publication check takes the observation lane
+    /// again, so a candidate superseded while the transaction ran cannot become current.
+    ///
+    /// Every failure rides `summary` as a diagnostic rather than failing the call: the
+    /// write already landed, and the caller must not be told otherwise. Current-tree reads
+    /// then meet the recorded freshness failure until a later observation publishes.
+    async fn publish_applied_change(
+        &self,
+        candidate: AppliedCandidate,
+        summary: &mut ChangeSummary,
+    ) -> Option<Arc<PublishedWorkspace>> {
+        let AppliedCandidate {
+            published,
+            write,
+            work,
+            epoch,
+        } = candidate;
+        if let Some(lane) = self.lexical.as_ref()
+            && let Err(error) = lane.commit(write, published.reads.tree_revision()).await
+        {
+            self.validation.restore_pending(work);
+            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+            return None;
+        }
+        let state = Arc::clone(&self.published);
+        let validation = Arc::clone(&self.validation);
+        let publishing = Arc::clone(&published);
+        let outcome = self
+            .blocking
+            .run("workspace change publication", move || {
+                Ok(finish_rebuild(&state, &validation, publishing, work, epoch))
+            })
+            .await;
+        match outcome {
+            Ok(RebuildOutcome::Published) => {
+                tracing::info!(
+                    component = "index",
+                    operation = "index.publish",
+                    trigger = "rift_change",
+                    epoch,
+                    "index snapshot published"
+                );
+                Some(published)
+            }
+            Ok(RebuildOutcome::Superseded) => None,
+            Err(error) => {
+                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
+                None
+            }
+        }
     }
 
     /// The snapshot engine diagnostics pull against after one applied
@@ -1461,11 +1549,10 @@ impl RiftMcp {
             Err(error) => return Ok(SerializedChange::wire(Err(error))),
         };
         let mut result = operation(&current.reads, changes)?;
-        let published_next = if let ChangeResult::Applied { summary } = &mut result {
+        let candidate = if let ChangeResult::Applied { summary } = &mut result {
             Self::rebuild_after_applied_change(
                 root,
                 limits,
-                published,
                 validation,
                 &configuration,
                 &current,
@@ -1476,14 +1563,13 @@ impl RiftMcp {
         };
         Ok(SerializedChange {
             result: Ok(Json(result)),
-            published: published_next,
+            candidate,
         })
     }
 
-    /// Rebuilds and publishes the snapshot after one landed change, running its hooks
-    /// first. Returns the freshly published workspace only when publication actually
-    /// happened; every failure rides `summary` as a diagnostic instead of failing the call,
-    /// since the write already landed.
+    /// Rebuilds the snapshot after one landed change, running its hooks first, and returns
+    /// the candidate for the caller to commit and publish. Every failure rides `summary` as
+    /// a diagnostic instead of failing the call, since the write already landed.
     ///
     /// The change names the paths it wrote, so an ordinary change reparses exactly those
     /// files. A workspace that declares hooks reads every visible file instead: a hook runs
@@ -1492,12 +1578,11 @@ impl RiftMcp {
     fn rebuild_after_applied_change(
         root: &Path,
         limits: WorkspaceIndexLimits,
-        published: &RwLock<IndexState>,
         validation: &IndexValidation,
         configuration: &WorkspaceConfiguration,
         current: &Arc<PublishedWorkspace>,
         summary: &mut ChangeSummary,
-    ) -> Option<Arc<PublishedWorkspace>> {
+    ) -> Option<AppliedCandidate> {
         let observed = match changed_paths_to_reparse(root, current, configuration, summary) {
             Some(paths) => validation.observe_paths(paths),
             None => validation.observe_whole_workspace(),
@@ -1520,7 +1605,18 @@ impl RiftMcp {
         request.previous = Some(Arc::clone(current));
         let epoch = request.epoch;
         let candidate = match build_workspace_candidate(root, limits, &request) {
-            Ok(WorkspaceCandidate::Stable(candidate)) => candidate,
+            Ok(WorkspaceCandidate::Stable {
+                published,
+                change_set,
+            }) => {
+                let write = lexical_write(&published, &change_set);
+                AppliedCandidate {
+                    published,
+                    write,
+                    work: request.work,
+                    epoch,
+                }
+            }
             Ok(WorkspaceCandidate::ConfigurationChanged) => {
                 let error = ReadFault::unavailable(
                     "workspace change",
@@ -1536,19 +1632,7 @@ impl RiftMcp {
                 return None;
             }
         };
-        let next = candidate;
-        if publish_rebuild(published, validation, Arc::clone(&next)) == RebuildOutcome::Published {
-            tracing::info!(
-                component = "index",
-                operation = "index.publish",
-                trigger = "rift_change",
-                epoch,
-                "index snapshot published"
-            );
-            validation.changed.notify_waiters();
-            return Some(next);
-        }
-        None
+        Some(candidate)
     }
 
     /// Runs the configured hooks over one applied change and attaches what
@@ -1664,7 +1748,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &RebuildRequest::initial(epoch),
         )? {
-            WorkspaceCandidate::Stable(candidate) => Ok(candidate),
+            WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
                 Err("fixture configuration must remain stable".into())
             }
@@ -2209,7 +2293,7 @@ mod tests {
                 panic!("invalid configuration must stop before operation")
             },
         )?;
-        assert!(outcome.published.is_none());
+        assert!(outcome.candidate.is_none());
         let Err(error) = outcome.result else {
             panic!("invalid configuration must refuse change");
         };
@@ -2546,7 +2630,7 @@ mod tests {
     /// thousand lexical units in that pass, so the pass is real work next to the one
     /// in-process call that follows `build`.
     #[tokio::test]
-    async fn build_returns_before_the_population_lane_runs_the_first_pass() -> TestResult {
+    async fn build_answers_from_a_store_that_already_holds_its_tree() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(
@@ -2556,17 +2640,18 @@ mod tests {
         super::hermetic_workspace(directory.path(), "[search.text]\nmax_chunk = \"1kb\"\n")?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
 
-        let pending = run_search(&server, "legacy sensor").await?;
+        // The lexical set commits before the snapshot becomes current, so the very first
+        // request reads rows stamped with the tree it captured - no lag window, and no
+        // identifier-only answer while a pass catches up.
+        let first = run_search(&server, "legacy sensor").await?;
         assert!(
-            !store_ranked(&pending),
-            "build must return while the first pass is still running: {pending:#?}"
+            store_ranked(&first),
+            "the first answer must be ranked by a store that already holds this tree: \
+             {first:#?}"
         );
-
-        // The lane does run that pass, and the same query is then ranked by the store.
-        let ranked = search_after_population(&server, "legacy sensor").await?;
         assert!(
-            !ranked.results.is_empty(),
-            "the first pass must leave the published unit set searchable: {ranked:#?}"
+            !first.results.is_empty(),
+            "the committed unit set must be searchable: {first:#?}"
         );
         Ok(())
     }
@@ -2804,7 +2889,7 @@ pub fn beacon() -> u64 {
             &changes,
             |_, _| panic!("a moved index must refuse before the operation runs"),
         )?;
-        assert!(outcome.published.is_none());
+        assert!(outcome.candidate.is_none());
         let Err(error) = outcome.result else {
             panic!("a moved index must refuse the change");
         };
@@ -2849,7 +2934,7 @@ pub fn beacon() -> u64 {
                 })
             },
         )?;
-        assert!(outcome.published.is_none());
+        assert!(outcome.candidate.is_none());
         let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
             panic!("the applied change must survive a lost observation");
         };
@@ -2898,7 +2983,7 @@ pub fn beacon() -> u64 {
                 })
             },
         )?;
-        assert!(outcome.published.is_none());
+        assert!(outcome.candidate.is_none());
         let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
             panic!("the applied change must survive a moved configuration");
         };
@@ -3323,12 +3408,14 @@ pub fn beacon() -> u64 {
                 .build();
         let database = directory.join("search.db");
         let index = rift_search::SearchIndex::open(&database, limits).await?;
-        crate::validation::populate_search(
-            &index,
-            &published,
-            crate::validation::SearchPass::Build,
-        )
-        .await;
+        // The lexical set is what a store revision reports on, and it commits before a
+        // candidate publishes rather than in a pass behind it.
+        index
+            .replace_lexical(
+                &published.reads.lexical_units(),
+                published.reads.tree_revision(),
+            )
+            .await?;
         Ok((published, index))
     }
 

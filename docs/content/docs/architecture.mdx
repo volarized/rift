@@ -321,11 +321,15 @@ indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) i
 persist in the workspace database at `.rift/db`, stamped with the tree revision that published
 them.
 
-A search request serves lexical matches only when that stamp equals the tree revision the read
-captured - the two disagree while a rebuild is still catching up, or after one failed outright.
-When they disagree, the request falls back to identifier and source-line matching instead of
-returning a hit the tree has already moved past, and a `stale_index` entry in `warnings` reports
-the disagreeing revisions.
+Those units are written before the rebuilt index becomes current, in one transaction with the
+stamp. A read that captures a tree therefore finds the database already holding it, and a rebuild
+whose transaction refuses publishes nothing: the previous index stays current, and the read meets
+the recorded failure rather than an index the database does not hold.
+
+The semantic tier's vectors are not part of that transaction. Embedding one declaration can cost
+more than a read is willing to wait, so vectors are refreshed after the index publishes, and a
+search whose vectors are still being written ranks lexically and reports the tier's readiness in
+`warnings`.
 
 ### Search
 

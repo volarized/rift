@@ -16,15 +16,15 @@ use rift_core::constants::{
 };
 use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::{
-    ChangeSet, FileDigest, PathChanges, WorkspaceFingerprint, WorkspaceIndexLimits,
-    WorkspaceSourcePolicy,
+    ChangeSet, FileDigest, LexicalChange, LexicalUnit, PathChanges, WorkspaceFingerprint,
+    WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
     EngineConfiguration, HistoryConfiguration, SearchConfiguration, ServerConfiguration,
     WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
-use rift_search::{Embedding, SearchIndex};
+use rift_search::{Embedding, SearchError, SearchIndex};
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ReadError, ReadFault, ReadService,
     load_configuration,
@@ -286,6 +286,10 @@ pub(crate) struct IndexSupervisorContext {
     /// The workspace's population lane, absent when the search index could not be opened
     /// at startup.
     pub(crate) population: Option<PopulationLane>,
+    /// The workspace's lexical lane, absent exactly when the population lane is: with no
+    /// index open there is no store to commit to, and `search` reports the tier
+    /// unavailable for the life of this server.
+    pub(crate) lexical: Option<LexicalLane>,
 }
 
 /// The last acceptance of the workspace's `rift.toml`, kept with the file
@@ -810,13 +814,18 @@ pub(crate) fn watch_path_impact(
         })
 }
 
-/// Builds the first snapshot while rejecting concurrent filesystem movement.
+/// Builds the first snapshot while rejecting concurrent filesystem movement, and returns
+/// what the lexical index owes for it.
+///
+/// The write is not committed here: the search database lives under the workspace's own
+/// `.rift` directory, which opens only once this scan proves the root real. The caller
+/// commits it before it installs the snapshot as current.
 pub(crate) async fn initial_workspace(
     root: &Path,
     limits: WorkspaceIndexLimits,
     validation: &IndexValidation,
     blocking: &BlockingExecutor,
-) -> Result<Arc<PublishedWorkspace>, ReadError> {
+) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
     initial_workspace_with(
         root,
         limits,
@@ -847,7 +856,7 @@ pub(crate) async fn initial_workspace_with(
     validation: &IndexValidation,
     blocking: &BlockingExecutor,
     capture: impl CaptureWorkspace + Clone + Send + 'static,
-) -> Result<Arc<PublishedWorkspace>, ReadError> {
+) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
     for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
         let request = validation.take_pending();
         let epoch = request.epoch;
@@ -862,11 +871,21 @@ pub(crate) async fn initial_workspace_with(
         let attempt_capture = capture.clone();
         let built = blocking
             .run("initial index build", move || {
-                attempt_capture(&build_root, limits, &RebuildRequest::initial(epoch))
+                let candidate =
+                    attempt_capture(&build_root, limits, &RebuildRequest::initial(epoch))?;
+                let WorkspaceCandidate::Stable {
+                    published,
+                    change_set,
+                } = candidate
+                else {
+                    return Ok(None);
+                };
+                let write = lexical_write(&published, &change_set);
+                Ok(Some((published, write)))
             })
             .instrument(span)
             .await?;
-        let WorkspaceCandidate::Stable(built) = built else {
+        let Some((built, write)) = built else {
             continue;
         };
         let stable_epoch = validation.observed_epoch() == epoch;
@@ -889,7 +908,7 @@ pub(crate) async fn initial_workspace_with(
                 epoch,
                 "index snapshot published"
             );
-            return Ok(built);
+            return Ok((built, write));
         }
     }
     Err(ReadFault::unavailable(
@@ -900,8 +919,15 @@ pub(crate) async fn initial_workspace_with(
 
 /// Result of one bounded workspace candidate capture.
 pub(crate) enum WorkspaceCandidate {
-    /// Index, configuration, and source policy share one stable capture.
-    Stable(Arc<PublishedWorkspace>),
+    /// Index, configuration, and source policy share one stable capture, alongside the
+    /// change set that produced it - which is what the lexical index applies before this
+    /// candidate publishes.
+    Stable {
+        /// The candidate publication.
+        published: Arc<PublishedWorkspace>,
+        /// What this candidate replaced, in the shape the lexical index consumes.
+        change_set: ChangeSet,
+    },
     /// Configuration moved during capture.
     ConfigurationChanged,
 }
@@ -919,20 +945,41 @@ pub(crate) fn build_workspace_candidate(
     request: &RebuildRequest,
 ) -> Result<WorkspaceCandidate, ReadError> {
     let configuration = ConfigurationState::accept(root);
-    let candidate = match request.change_set(root, &configuration) {
+    let change_set = request.change_set(root, &configuration);
+    let candidate = match &change_set {
         ChangeSet::Full => whole_workspace_candidate(root, limits, configuration, request.epoch)?,
         ChangeSet::Incremental(changes) => {
             let previous = request
                 .previous
                 .as_ref()
                 .unwrap_or_else(|| unreachable!("an incremental change set names a publication"));
-            shared_workspace_candidate(previous, &changes, request.epoch)?
+            shared_workspace_candidate(previous, changes, request.epoch)?
         }
     };
     if candidate.configuration.fingerprint != configuration_fingerprint(root) {
         return Ok(WorkspaceCandidate::ConfigurationChanged);
     }
-    Ok(WorkspaceCandidate::Stable(Arc::new(candidate)))
+    Ok(WorkspaceCandidate::Stable {
+        published: Arc::new(candidate),
+        change_set,
+    })
+}
+
+/// What one candidate owes the lexical index before it publishes.
+///
+/// A whole rebuild cannot name the difference against the stored set, so it replaces that
+/// set; a change set names exactly the paths whose rows move. Deriving the units is the
+/// candidate's own work, so it runs beside the parse rather than inside the commit.
+pub(crate) fn lexical_write(
+    published: &PublishedWorkspace,
+    change_set: &ChangeSet,
+) -> LexicalWrite {
+    match change_set {
+        ChangeSet::Full => LexicalWrite::Whole(published.reads.lexical_units()),
+        ChangeSet::Incremental(changes) => {
+            LexicalWrite::Change(published.reads.lexical_change(changes))
+        }
+    }
 }
 
 /// Scans every visible file, compiling the `[source]` policy the accepted configuration
@@ -994,42 +1041,29 @@ fn shared_workspace_candidate(
     })
 }
 
-/// Which pass one population runs over the vector store.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SearchPass {
-    /// Every declaration is embedded again, whatever the store already holds.
-    Build,
-    /// Only declarations the store has no vector for are embedded.
-    Refresh,
-}
-
-/// Derives `published`'s lexical units and the declarations that describe them, and replaces
-/// the search index's whole unit set with them, stamped with the same tree revision
-/// `published`'s wire answers report - the exact string a search request compares its
-/// query-time index revision against before trusting that ranking.
+/// Embeds the declarations `published` describes, so the semantic tier ranks the tree the
+/// lexical index already holds.
 ///
-/// Startup passes [`SearchPass::Build`] and every later call passes [`SearchPass::Refresh`].
-/// A store this process found on disk was written by an earlier one, possibly under another
-/// model, so the first pass of a run establishes the vector set rather than trusting it.
-/// Later passes embed only what is missing, because a vector costs an embedding pass and a
-/// declaration whose own bytes did not change keeps the vector already stored.
+/// The lexical set is not written here. It commits before `published` becomes current, so a
+/// request that captured this publication reads rows stamped with its own tree revision;
+/// embedding runs after, because one declaration's vector can cost more than the whole
+/// freshness wait a request is bounded by.
 ///
-/// Population failure is a warning, never a request failure: the search-time revision guard
-/// keeps served results honest whether or not this population landed, and the next
-/// successful rebuild repopulates regardless.
+/// `Embedding::Every` establishes the vector set and `Embedding::Missing` trusts what is
+/// stored. A store this process found on disk was written by an earlier one, possibly under
+/// another model, so the first pass of a run establishes rather than trusts.
+///
+/// Population failure is a warning, never a request failure: the semantic tier reports its
+/// own readiness, and the next successful publication asks for another pass.
 ///
 /// # Cancel safety
 ///
-/// The unit-set replacement runs inside one `SQLite` transaction. Dropping this future
-/// before that transaction commits leaves the previously indexed units and tree-revision
-/// stamp fully intact - never partially overwritten. That stamp then no longer names the
-/// tree revision this call was populating for, so the search-time revision guard serves
-/// identifier-only results until the next successful publication repopulates the index.
-/// Dropping it during embedding keeps every vector already written.
+/// Dropping this future keeps every vector already written, and the next pass embeds what
+/// is still missing.
 pub(crate) async fn populate_search(
     index: &SearchIndex,
     published: &PublishedWorkspace,
-    pass: SearchPass,
+    embedding: Embedding,
 ) {
     for (path, chunks) in published.reads.chunked_text_files() {
         tracing::warn!(
@@ -1043,25 +1077,162 @@ pub(crate) async fn populate_search(
     }
     let units = published.reads.lexical_units();
     let described = published.reads.described_units(&units);
-    let tree_revision = published.reads.tree_revision();
-    let embedding = match pass {
-        SearchPass::Build => Embedding::Every,
-        SearchPass::Refresh => Embedding::Missing,
-    };
-    let populated = match index.replace_lexical(&units, tree_revision).await {
-        Ok(()) => index.embed_described(&described, embedding).await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = populated {
+    if let Err(error) = index.embed_described(&described, embedding).await {
         tracing::warn!(
             component = "search",
             operation = "search.populate",
-            tree_revision,
+            tree_revision = published.reads.tree_revision(),
             error = %error,
-            "search index population failed; identifier search continues to serve results \
-             until the next successful rebuild repopulates it"
+            "the semantic tier could not embed this publication; the full-text tier keeps \
+             answering until a later pass lands"
         );
     }
+}
+
+/// Deadline for one rebuild to reach the lexical owner and hear its transaction end.
+///
+/// A rebuild waits inside the same freshness window a request waits in, so a stuck owner
+/// cannot hold publication past the deadline the caller is already bounded by.
+pub(crate) const LEXICAL_COMMIT_TIMEOUT: Duration = INDEX_FRESHNESS_TIMEOUT;
+/// Commits the lexical owner accepts before a rebuild waits for capacity.
+pub(crate) const LEXICAL_COMMITS_MAX: usize = 4;
+
+/// What one lexical commit writes.
+#[derive(Debug)]
+pub(crate) enum LexicalWrite {
+    /// The whole unit set, replacing whatever is stored.
+    Whole(Vec<LexicalUnit>),
+    /// Only the units one change set names.
+    Change(LexicalChange),
+}
+
+impl LexicalWrite {
+    /// Whether this write would leave the stored set exactly as it is, so the rebuild owes
+    /// the store nothing and publishes without opening a transaction.
+    ///
+    /// Only an empty change set reaches this: it shares its predecessor's snapshot, so the
+    /// stamp already names the tree revision the candidate answers under.
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Whole(_) => false,
+            Self::Change(change) => change.is_empty(),
+        }
+    }
+}
+
+/// One commit request: what to write, the tree revision to stamp, and where the reply goes.
+struct LexicalCommit {
+    write: LexicalWrite,
+    tree_revision: String,
+    reply: tokio::sync::oneshot::Sender<Result<(), SearchError>>,
+}
+
+/// The lexical lane: one long-lived task owning every write to the lexical index, and the
+/// handle a rebuild commits through.
+///
+/// The lexical transaction is part of publication, and vector embedding is not: a lexical
+/// row costs one delete and one insert batch, while embedding one declaration can run for
+/// longer than the freshness wait a request is bounded by. Splitting the two at the commit
+/// is what lets a current-tree request wait for the store to hold its tree without also
+/// waiting for model inference.
+///
+/// One owner serializes the writes. The change lane is released before a rebuild awaits its
+/// commit, so two rebuilds can reach the store at once, and `SQLite` would otherwise meet
+/// them as write contention rather than as an order.
+#[derive(Clone, Debug)]
+pub(crate) struct LexicalLane {
+    commits: mpsc::Sender<LexicalCommit>,
+}
+
+impl LexicalLane {
+    /// Spawns the lane's task over `index` and returns the handle a rebuild commits on.
+    ///
+    /// The task ends when the server does, racing the same cancellation token the index
+    /// supervisor runs under. A commit in flight when that happens is answered with the
+    /// closed-queue failure, so no rebuild waits on an owner that has gone.
+    pub(crate) fn spawn(index: Arc<SearchIndex>, cancellation: CancellationToken) -> Self {
+        let (commits, mut requests) = mpsc::channel::<LexicalCommit>(LEXICAL_COMMITS_MAX);
+        tokio::spawn(async move {
+            loop {
+                let received = tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    received = requests.recv() => received,
+                };
+                let Some(commit) = received else {
+                    return;
+                };
+                let written = match &commit.write {
+                    LexicalWrite::Whole(units) => {
+                        index.replace_lexical(units, &commit.tree_revision).await
+                    }
+                    LexicalWrite::Change(change) => {
+                        index.apply_lexical(change, &commit.tree_revision).await
+                    }
+                };
+                let _ = commit.reply.send(written);
+            }
+        });
+        Self { commits }
+    }
+
+    /// Commits `write`, stamps `tree_revision`, and returns once that transaction has
+    /// ended.
+    ///
+    /// A write that changes nothing returns without a transaction: the stored stamp already
+    /// names the tree revision the candidate answers under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the owner has ended, when the transaction failed, or when
+    /// the commit did not reach the store within [`LEXICAL_COMMIT_TIMEOUT`]. Every one of
+    /// them leaves the previously indexed units and stamp intact, and the rebuild that
+    /// asked does not publish.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future before the reply arrives leaves the owner's transaction to
+    /// finish on its own; that transaction either commits whole or rolls back whole.
+    pub(crate) async fn commit(
+        &self,
+        write: LexicalWrite,
+        tree_revision: &str,
+    ) -> Result<(), ReadError> {
+        if write.is_empty() {
+            return Ok(());
+        }
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        let commit = LexicalCommit {
+            write,
+            tree_revision: tree_revision.to_owned(),
+            reply,
+        };
+        let sent = tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT, self.commits.send(commit));
+        match sent.await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(lexical_unavailable("the lexical owner has ended")),
+            Err(_) => {
+                return Err(lexical_unavailable(
+                    "the lexical commit queue stayed full past the freshness deadline",
+                ));
+            }
+        }
+        match tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT, answered).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(ReadFault::unavailable(
+                "lexical index commit",
+                error.to_string(),
+            )),
+            Ok(Err(_)) => Err(lexical_unavailable("the lexical owner dropped this commit")),
+            Err(_) => Err(lexical_unavailable(
+                "the lexical transaction did not end within the freshness deadline",
+            )),
+        }
+    }
+}
+
+/// One lexical commit that could not reach the store, as the rebuild reports it.
+fn lexical_unavailable(detail: &str) -> ReadError {
+    ReadFault::unavailable("lexical index commit", detail)
 }
 
 /// The population lane: one long-lived task owning every search index population, and the
@@ -1090,11 +1261,10 @@ pub(crate) struct PopulationLane {
 impl PopulationLane {
     /// Spawns the lane's task over `index` and returns the handle a caller requests on.
     ///
-    /// The task runs [`SearchPass::Build`] first and [`SearchPass::Refresh`] for every pass
-    /// after it, which is the order startup used to establish by itself: a store this
-    /// process found on disk was written by an earlier one, possibly under another model,
-    /// so the run's first pass establishes the vector set and later passes trust what is
-    /// stored.
+    /// The task runs [`Embedding::Every`] first and [`Embedding::Missing`] for every pass
+    /// after it: a store this process found on disk was written by an earlier one, possibly
+    /// under another model, so the run's first pass establishes the vector set and later
+    /// passes trust what is stored.
     ///
     /// The task ends when the server does. It races the same cancellation token the index
     /// supervisor runs under, which the last server clone's drop guard cancels. Cancelling
@@ -1104,7 +1274,7 @@ impl PopulationLane {
         let settled = Arc::new(AtomicBool::new(false));
         let reached = Arc::clone(&settled);
         tokio::spawn(async move {
-            let mut pass = SearchPass::Build;
+            let mut embedding = Embedding::Every;
             loop {
                 let received = tokio::select! {
                     () = cancellation.cancelled() => return,
@@ -1119,9 +1289,9 @@ impl PopulationLane {
                 };
                 tokio::select! {
                     () = cancellation.cancelled() => return,
-                    () = populate_search(&index, &published, pass) => {}
+                    () = populate_search(&index, &published, embedding) => {}
                 }
-                pass = SearchPass::Refresh;
+                embedding = Embedding::Missing;
                 reached.store(true, Ordering::Release);
             }
         });
@@ -1189,15 +1359,10 @@ pub(crate) async fn run_index_supervisor(
     mut invalidations: mpsc::Receiver<()>,
     context: IndexSupervisorContext,
 ) {
-    let IndexSupervisorContext {
-        root,
-        limits,
-        published,
-        change_lane,
-        validation,
-        blocking,
-        population,
-    } = context;
+    let validation = Arc::clone(&context.validation);
+    let published = Arc::clone(&context.published);
+    let blocking = context.blocking.clone();
+    let population = context.population.clone();
     loop {
         let received = tokio::select! {
             () = validation.cancellation.cancelled() => false,
@@ -1219,22 +1384,14 @@ pub(crate) async fn run_index_supervisor(
             whole_workspace = request.work.covers_whole_workspace(),
             "filesystem invalidations coalesced"
         );
-        let result = rebuild_workspace(
-            root.clone(),
-            limits,
-            Arc::clone(&published),
-            Arc::clone(&change_lane),
-            Arc::clone(&validation),
-            blocking.clone(),
-            request,
-        )
-        .instrument(tracing::info_span!(
-            "index.build",
-            component = "index",
-            trigger = "filesystem",
-            epoch
-        ))
-        .await;
+        let result = rebuild_workspace(&context, request)
+            .instrument(tracing::info_span!(
+                "index.build",
+                component = "index",
+                trigger = "filesystem",
+                epoch
+            ))
+            .await;
         match result {
             Ok(RebuildOutcome::Published) => {
                 if let Some(lane) = population.as_ref() {
@@ -1272,51 +1429,119 @@ pub(crate) async fn run_index_supervisor(
     }
 }
 
-/// Rebuilds and atomically publishes only a still-current candidate.
+/// Rebuilds, commits the lexical index, and atomically publishes only a still-current
+/// candidate.
+///
+/// The three run as separate operations. The candidate is captured with the change lane
+/// held, so no workspace mutation lands inside it. The lane is released before the lexical
+/// transaction, because that transaction awaits and no lock guard may cross an await. The
+/// final publication check then takes the same linearization point filesystem observation
+/// takes, so a candidate superseded while its transaction ran cannot become current.
+///
+/// A superseded candidate may already have committed its rows. Its workspace never
+/// publishes, pending requests keep waiting because the observed epoch still differs from
+/// the published one, and the next current change set replaces those rows.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when the capture fails, or when the lexical commit does not reach
+/// the store. A failed commit leaves the previous rows and stamp intact and publishes
+/// nothing, so a current-tree request meets the recorded rebuild failure rather than an
+/// index the store does not hold.
+///
+/// # Cancel safety
+///
+/// Dropping this future after the capture starts does not cancel it: the serialized
+/// operation finishes before releasing its lane. Dropping it during the commit leaves the
+/// owner's transaction to finish, whole or not at all.
 pub(crate) async fn rebuild_workspace(
-    root: PathBuf,
-    limits: WorkspaceIndexLimits,
-    published: Arc<RwLock<IndexState>>,
-    change_lane: Arc<ChangeLane>,
-    validation: Arc<IndexValidation>,
-    blocking: BlockingExecutor,
+    context: &IndexSupervisorContext,
     request: RebuildRequest,
 ) -> Result<RebuildOutcome, ReadError> {
-    blocking
+    let epoch = request.epoch;
+    let root = context.root.clone();
+    let limits = context.limits;
+    let published = Arc::clone(&context.published);
+    let validation = Arc::clone(&context.validation);
+    let blocking = context.blocking.clone();
+    let captured_state = Arc::clone(&published);
+    let captured_validation = Arc::clone(&validation);
+    let change_lane = Arc::clone(&context.change_lane);
+    let captured = blocking
         .run("filesystem index rebuild", move || {
-            rebuild_workspace_blocking(
+            capture_rebuild(
                 &root,
                 limits,
-                &published,
+                &captured_state,
                 &change_lane,
-                &validation,
+                &captured_validation,
                 request,
             )
+        })
+        .await?;
+    let CapturedRebuild::Candidate {
+        published: candidate,
+        write,
+        work,
+    } = captured
+    else {
+        return Ok(RebuildOutcome::Superseded);
+    };
+    if let Some(lane) = context.lexical.as_ref()
+        && let Err(error) = lane.commit(write, candidate.reads.tree_revision()).await
+    {
+        validation.restore_pending(work);
+        return Err(error);
+    }
+    blocking
+        .run("filesystem index publication", move || {
+            Ok(finish_rebuild(
+                &published,
+                &validation,
+                candidate,
+                work,
+                epoch,
+            ))
         })
         .await
 }
 
-/// Runs one serialized filesystem rebuild on blocking executor.
-pub(crate) fn rebuild_workspace_blocking(
+/// What one capture leaves for the commit and the publication that follow it.
+pub(crate) enum CapturedRebuild {
+    /// A stable candidate, what it owes the lexical index, and the observation it answers.
+    Candidate {
+        /// The candidate publication.
+        published: Arc<PublishedWorkspace>,
+        /// What the lexical index applies before that candidate publishes.
+        write: LexicalWrite,
+        /// The observation's work, returned to the supervisor when nothing publishes.
+        work: PendingWork,
+    },
+    /// The observation was already superseded, or configuration moved during the capture.
+    Superseded,
+}
+
+/// Captures one candidate while the mutation lane is held.
+pub(crate) fn capture_rebuild(
     root: &Path,
     limits: WorkspaceIndexLimits,
     published: &RwLock<IndexState>,
     change_lane: &ChangeLane,
     validation: &IndexValidation,
     request: RebuildRequest,
-) -> Result<RebuildOutcome, ReadError> {
-    change_lane.run(|| rebuild_workspace_serialized(root, limits, published, validation, request))
+) -> Result<CapturedRebuild, ReadError> {
+    change_lane.run(|| capture_rebuild_serialized(root, limits, published, validation, request))
 }
 
-/// Rebuilds workspace while mutation lane is held.
-pub(crate) fn rebuild_workspace_serialized(
+/// Captures one candidate with the mutation lane already held.
+pub(crate) fn capture_rebuild_serialized(
     root: &Path,
     limits: WorkspaceIndexLimits,
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
     request: RebuildRequest,
-) -> Result<RebuildOutcome, ReadError> {
-    rebuild_workspace_serialized_with(
+) -> Result<CapturedRebuild, ReadError> {
+    capture_rebuild_with(
         root,
         limits,
         published,
@@ -1326,14 +1551,14 @@ pub(crate) fn rebuild_workspace_serialized(
     )
 }
 
-/// Runs one serialized rebuild over an injectable capture, so tests can
-/// force each superseded arm deterministically instead of racing the scan.
+/// Runs one serialized capture over an injectable candidate builder, so tests can force
+/// each superseded arm deterministically instead of racing the scan.
 ///
-/// An attempt that does not publish returns its observation's work to the supervisor:
+/// An attempt that captures nothing returns its observation's work to the supervisor:
 /// publication is the acknowledgement that lets those paths be dropped, so a superseded
 /// candidate leaves the next rebuild owing exactly what this one owed plus whatever landed
 /// while it ran.
-pub(crate) fn rebuild_workspace_serialized_with(
+pub(crate) fn capture_rebuild_with(
     root: &Path,
     limits: WorkspaceIndexLimits,
     published: &RwLock<IndexState>,
@@ -1344,11 +1569,10 @@ pub(crate) fn rebuild_workspace_serialized_with(
         WorkspaceIndexLimits,
         &RebuildRequest,
     ) -> Result<WorkspaceCandidate, ReadError>,
-) -> Result<RebuildOutcome, ReadError> {
-    let epoch = request.epoch;
-    if !accept_rebuild(validation, epoch)? {
+) -> Result<CapturedRebuild, ReadError> {
+    if !accept_rebuild(validation, request.epoch)? {
         validation.restore_pending(request.work);
-        return Ok(RebuildOutcome::Superseded);
+        return Ok(CapturedRebuild::Superseded);
     }
     request.previous = Some(published.blocking_read().snapshot().0);
     let candidate = match capture(root, limits, &request) {
@@ -1358,19 +1582,40 @@ pub(crate) fn rebuild_workspace_serialized_with(
             return Err(error);
         }
     };
-    let WorkspaceCandidate::Stable(candidate) = candidate else {
+    let WorkspaceCandidate::Stable {
+        published: candidate,
+        change_set,
+    } = candidate
+    else {
         let _ = validation.observe_whole_workspace();
-        return Ok(RebuildOutcome::Superseded);
+        return Ok(CapturedRebuild::Superseded);
     };
+    let write = lexical_write(&candidate, &change_set);
+    Ok(CapturedRebuild::Candidate {
+        published: candidate,
+        write,
+        work: request.work,
+    })
+}
+
+/// Publishes one committed candidate, or returns its observation's work when the tree moved
+/// underneath it.
+pub(crate) fn finish_rebuild(
+    published: &RwLock<IndexState>,
+    validation: &IndexValidation,
+    candidate: Arc<PublishedWorkspace>,
+    work: PendingWork,
+    epoch: u64,
+) -> RebuildOutcome {
     let outcome = publish_rebuild(published, validation, candidate);
     match outcome {
         RebuildOutcome::Published => {
             trace_publication(epoch);
             validation.changed.notify_waiters();
         }
-        RebuildOutcome::Superseded => validation.restore_pending(request.work),
+        RebuildOutcome::Superseded => validation.restore_pending(work),
     }
-    Ok(outcome)
+    outcome
 }
 
 /// Refuses rebuild when watcher failed or candidate epoch already moved.
@@ -1459,16 +1704,17 @@ mod tests {
     use notify::{Event, EventKind};
     use rift_core::{SourceVisibility, TextFileInclusion};
     use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits, WorkspaceSourcePolicy};
+    use rift_protocol::configuration::ServerConfiguration;
     use rift_search::{SearchIndex, SearchIndexLimits, SemanticReadiness};
     use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ConfigurationFingerprint, ConfigurationState, IndexState, IndexValidation, PopulationLane,
-        PublishedWorkspace, RebuildOutcome, RebuildRequest, SearchPass, WorkspaceCandidate,
-        build_workspace_candidate, populate_search, publish_rebuild, publish_rebuild_after,
-        record_rebuild_failure, relevant_watch_event,
+        BlockingExecutor, ChangeSet, ConfigurationFingerprint, ConfigurationState, IndexState,
+        IndexValidation, LexicalLane, PathChanges, PopulationLane, PublishedWorkspace,
+        RebuildOutcome, RebuildRequest, WorkspaceCandidate, build_workspace_candidate,
+        publish_rebuild, publish_rebuild_after, record_rebuild_failure, relevant_watch_event,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1479,7 +1725,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             &RebuildRequest::initial(epoch),
         )? {
-            WorkspaceCandidate::Stable(candidate) => Ok(candidate),
+            WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
                 Err("fixture configuration must remain stable".into())
             }
@@ -2064,14 +2310,14 @@ mod tests {
         // The observation this attempt answers for is already superseded, so it publishes
         // nothing and owes its paths back.
         validation.observe_paths([rift_core::ProjectPath::new("other.rs")?])?;
-        let outcome = super::rebuild_workspace_serialized(
+        let outcome = super::capture_rebuild_serialized(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &state,
             &validation,
             request,
         )?;
-        assert_eq!(outcome, RebuildOutcome::Superseded);
+        assert!(matches!(outcome, super::CapturedRebuild::Superseded));
 
         let next = validation.take_pending();
         let paths: Vec<&str> = next
@@ -2098,8 +2344,10 @@ mod tests {
             previous: Some(Arc::clone(&previous)),
         };
 
-        let WorkspaceCandidate::Stable(candidate) =
-            build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
+        let WorkspaceCandidate::Stable {
+            published: candidate,
+            ..
+        } = build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -2127,8 +2375,10 @@ mod tests {
             previous: Some(Arc::clone(&previous)),
         };
 
-        let WorkspaceCandidate::Stable(candidate) =
-            build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
+        let WorkspaceCandidate::Stable {
+            published: candidate,
+            ..
+        } = build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -2217,14 +2467,14 @@ mod tests {
             current: candidate,
             failure: None,
         });
-        let outcome = super::rebuild_workspace_serialized(
+        let outcome = super::capture_rebuild_serialized(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &state,
             &validation,
             RebuildRequest::initial(7),
         )?;
-        assert_eq!(outcome, RebuildOutcome::Superseded);
+        assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         Ok(())
     }
 
@@ -2239,7 +2489,7 @@ mod tests {
             current: candidate,
             failure: None,
         });
-        let outcome = super::rebuild_workspace_serialized_with(
+        let outcome = super::capture_rebuild_with(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &state,
@@ -2247,7 +2497,7 @@ mod tests {
             RebuildRequest::initial(0),
             |_, _, _| Ok(WorkspaceCandidate::ConfigurationChanged),
         )?;
-        assert_eq!(outcome, RebuildOutcome::Superseded);
+        assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         assert_eq!(
             validation.observed_epoch(),
             1,
@@ -2282,6 +2532,7 @@ mod tests {
                 validation: Arc::clone(&validation),
                 blocking,
                 population: None,
+                lexical: None,
             },
         ));
         let notified = validation.changed.notified();
@@ -2340,6 +2591,7 @@ mod tests {
                 validation: Arc::clone(&validation),
                 blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
                 population: None,
+                lexical: None,
             },
         ));
         let notified = validation.changed.notified();
@@ -2408,7 +2660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn populate_search_persists_every_chunk_of_an_oversized_text_file() -> TestResult {
+    async fn a_commit_persists_every_chunk_of_an_oversized_text_file() -> TestResult {
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_writer(std::io::sink)
@@ -2428,7 +2680,7 @@ mod tests {
             .iter()
             .find(|(path, _)| path.as_str() == "guide.txt")
             .map(|(_, count)| *count)
-            .ok_or("guide.txt must be reported as chunked before population runs")?;
+            .ok_or("guide.txt must be reported as chunked before the commit runs")?;
         assert!(
             chunk_count > 1,
             "the oversized guide must split into more than one chunk: {chunk_count}"
@@ -2444,14 +2696,19 @@ mod tests {
             "the oversized file must contribute more than one lexical unit: {guide_units}"
         );
 
-        let index = search_index(&directory.path().join("search.db")).await?;
-        populate_search(&index, &published, SearchPass::Build).await;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(Arc::clone(&index), cancellation.clone());
+        lane.commit(
+            super::lexical_write(&published, &ChangeSet::Full),
+            published.reads.tree_revision(),
+        )
+        .await?;
 
-        let stamped = index.tree_revision().await?;
         assert_eq!(
-            stamped.as_deref(),
+            index.tree_revision().await?.as_deref(),
             Some(published.reads.tree_revision()),
-            "population must succeed and stamp the published tree revision, not merely warn"
+            "the commit must succeed and stamp the published tree revision, not merely warn"
         );
         let ranked = index.search("word", 64).await?;
         for unit in units
@@ -2464,29 +2721,268 @@ mod tests {
                 unit.identity()
             );
         }
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// One rebuild driven the way the supervisor drives it, over its own blocking executor.
+    async fn rebuilt_through(
+        root: &std::path::Path,
+        state: &Arc<RwLock<IndexState>>,
+        validation: &Arc<IndexValidation>,
+        lexical: Option<LexicalLane>,
+    ) -> Result<RebuildOutcome, rift_server::ReadError> {
+        let request = validation.take_pending();
+        let context = super::IndexSupervisorContext {
+            root: root.to_path_buf(),
+            limits: WorkspaceIndexLimits::default(),
+            published: Arc::clone(state),
+            change_lane: Arc::new(crate::server::ChangeLane::default()),
+            validation: Arc::clone(validation),
+            blocking: BlockingExecutor::for_configuration(&ServerConfiguration::default()),
+            population: None,
+            lexical,
+        };
+        super::rebuild_workspace(&context, request).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_published_rebuild_has_already_committed_its_rows() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn firstbeta() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let first = stable_candidate(directory.path(), 0)?;
+        let state = Arc::new(RwLock::new(IndexState {
+            current: Arc::clone(&first),
+            failure: None,
+        }));
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(Arc::clone(&index), cancellation.clone());
+        lane.commit(
+            super::lexical_write(&first, &ChangeSet::Full),
+            first.reads.tree_revision(),
+        )
+        .await?;
+
+        fs::write(directory.path().join("lib.rs"), "pub fn secondgamma() {}\n")?;
+        validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let outcome =
+            rebuilt_through(directory.path(), &state, &validation, Some(lane.clone())).await?;
+
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let current = Arc::clone(&state.read().await.current);
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(current.reads.tree_revision()),
+            "the store holds the published tree the moment that tree becomes current"
+        );
+        assert!(
+            !index.search("secondgamma", 8).await?.is_empty(),
+            "the published tree's units are searchable as soon as it publishes"
+        );
+        cancellation.cancel();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_lexical_commit_leaves_the_previous_publication_current() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn firstbeta() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let first = stable_candidate(directory.path(), 0)?;
+        let state = Arc::new(RwLock::new(IndexState {
+            current: Arc::clone(&first),
+            failure: None,
+        }));
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(Arc::clone(&index), cancellation.clone());
+        lane.commit(
+            super::lexical_write(&first, &ChangeSet::Full),
+            first.reads.tree_revision(),
+        )
+        .await?;
+
+        // The owner ends, so the next commit cannot reach the store at all.
+        cancellation.cancel();
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            if lane.commits.is_closed() {
+                break;
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+
+        fs::write(directory.path().join("lib.rs"), "pub fn secondgamma() {}\n")?;
+        validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let error = rebuilt_through(directory.path(), &state, &validation, Some(lane))
+            .await
+            .expect_err("a rebuild whose commit cannot land must not publish");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+
+        assert!(
+            Arc::ptr_eq(&state.read().await.current, &first),
+            "the previous publication stays current when the commit failed"
+        );
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(first.reads.tree_revision()),
+            "the previously stamped revision stays intact"
+        );
+        let next = validation.take_pending();
+        assert_eq!(
+            next.work
+                .paths()
+                .map(rift_core::ProjectPath::as_str)
+                .collect::<Vec<_>>(),
+            vec!["lib.rs"],
+            "the failed attempt returns its paths to the next rebuild"
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn both_passes_populate_the_index_and_stamp_the_published_revision() -> TestResult {
+    async fn a_whole_commit_stamps_the_published_revision_and_leaves_units_searchable() -> TestResult
+    {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let published = stable_candidate(directory.path(), 0)?;
-        let index = search_index(&directory.path().join("search.db")).await?;
-        for pass in [SearchPass::Build, SearchPass::Refresh] {
-            populate_search(&index, &published, pass).await;
-            let stamped = index.tree_revision().await?;
-            assert_eq!(
-                stamped.as_deref(),
-                Some(published.reads.tree_revision()),
-                "the {pass:?} pass must stamp the published tree revision"
-            );
-            let ranked = index.search("beacon", 8).await?;
-            assert!(
-                !ranked.is_empty(),
-                "the {pass:?} pass must leave the unit set searchable"
-            );
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(Arc::clone(&index), cancellation.clone());
+
+        let write = super::lexical_write(&published, &ChangeSet::Full);
+        lane.commit(write, published.reads.tree_revision()).await?;
+
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(published.reads.tree_revision()),
+            "the commit stamps the tree revision the candidate answers under"
+        );
+        assert!(
+            !index.search("beacon", 8).await?.is_empty(),
+            "the commit leaves the published unit set searchable"
+        );
+        cancellation.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_change_commit_replaces_one_path_and_keeps_every_other_unit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
+        fs::write(directory.path().join("moved.rs"), "pub fn firstbeta() {}\n")?;
+        let first = stable_candidate(directory.path(), 0)?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(Arc::clone(&index), cancellation.clone());
+        lane.commit(
+            super::lexical_write(&first, &ChangeSet::Full),
+            first.reads.tree_revision(),
+        )
+        .await?;
+
+        fs::write(
+            directory.path().join("moved.rs"),
+            "pub fn secondgamma() {}\n",
+        )?;
+        let request = super::RebuildRequest {
+            epoch: 1,
+            work: super::PendingWork::naming([rift_core::ProjectPath::new("moved.rs")?]),
+            previous: Some(Arc::clone(&first)),
+        };
+        let WorkspaceCandidate::Stable {
+            published: second,
+            change_set,
+        } = build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
+        else {
+            return Err("a stable fixture must build a stable candidate".into());
+        };
+        lane.commit(
+            super::lexical_write(&second, &change_set),
+            second.reads.tree_revision(),
+        )
+        .await?;
+
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(second.reads.tree_revision()),
+            "the change commit stamps the revision its candidate answers under"
+        );
+        assert!(
+            !index.search("secondgamma", 8).await?.is_empty(),
+            "the changed path's new units are searchable"
+        );
+        assert!(
+            index.search("firstbeta", 8).await?.is_empty(),
+            "the changed path's previous units are gone"
+        );
+        assert!(
+            !index.search("keptalpha", 8).await?.is_empty(),
+            "a path the change set never named keeps its units"
+        );
+        cancellation.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_empty_change_commit_leaves_the_stored_revision_as_it_was() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(Arc::clone(&index), cancellation.clone());
+
+        let empty =
+            super::lexical_write(&published, &ChangeSet::Incremental(PathChanges::default()));
+        assert!(
+            empty.is_empty(),
+            "a change set naming nothing writes nothing"
+        );
+        lane.commit(empty, published.reads.tree_revision()).await?;
+        assert_eq!(
+            index.tree_revision().await?,
+            None,
+            "a write that changes nothing opens no transaction"
+        );
+        cancellation.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_commit_after_the_lexical_owner_ended_refuses_rather_than_waiting() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(Arc::clone(&index), cancellation.clone());
+        cancellation.cancel();
+        // The owner holds the channel's only receiver, so a closed channel is the one
+        // observable end of the lane.
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            if lane.commits.is_closed() {
+                break;
+            }
+            tokio::time::sleep(LANE_POLL).await;
         }
+
+        let error = lane
+            .commit(
+                super::lexical_write(&published, &ChangeSet::Full),
+                published.reads.tree_revision(),
+            )
+            .await
+            .expect_err("a commit to an ended owner must refuse");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(
+            index.tree_revision().await?,
+            None,
+            "a refused commit leaves the store as it was"
+        );
         Ok(())
     }
 
@@ -2501,18 +2997,35 @@ mod tests {
     /// # Errors
     ///
     /// Returns the stamp the store still carried once the bound runs out.
-    async fn stamped_within_bound(index: &SearchIndex, revision: &str) -> TestResult {
-        let mut stamped = index.tree_revision().await?;
+    /// One index whose semantic tier is enabled but holds no model, so a pass records the
+    /// declaration count it was handed as its readiness rather than embedding anything.
+    ///
+    /// That count is the population lane's observable: with the tier disabled a pass leaves
+    /// no trace at all, and the lexical stamp now belongs to the lexical lane.
+    async fn counting_index(database: &std::path::Path) -> TestResult<SearchIndex> {
+        let limits = SearchIndexLimits::builder(LexicalIndexLimits::default()).build();
+        let index = SearchIndex::open(database, limits).await?;
+        assert_eq!(
+            index.readiness(),
+            SemanticReadiness::Preparing {
+                prepared: 0,
+                total: 0
+            }
+        );
+        Ok(index)
+    }
+
+    /// Waits until the lane's readiness names `total` declarations.
+    async fn described_within_bound(index: &SearchIndex, total: u64) -> TestResult {
         for _attempt in 0..LANE_ATTEMPTS_MAX {
-            if stamped.as_deref() == Some(revision) {
+            if index.readiness() == (SemanticReadiness::Preparing { prepared: 0, total }) {
                 return Ok(());
             }
             tokio::time::sleep(LANE_POLL).await;
-            stamped = index.tree_revision().await?;
         }
         Err(format!(
-            "the lane never stamped tree revision {revision}; the store still carries \
-             {stamped:?}"
+            "the lane never recorded {total} declarations; readiness is {:?}",
+            index.readiness()
         )
         .into())
     }
@@ -2522,15 +3035,17 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let published = stable_candidate(directory.path(), 0)?;
-        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let index = Arc::new(counting_index(&directory.path().join("search.db")).await?);
         let cancellation = CancellationToken::new();
         let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
 
+        let units = published.reads.lexical_units();
+        let described = published.reads.described_units(&units).len() as u64;
         lane.request(Arc::clone(&published));
-        stamped_within_bound(&index, published.reads.tree_revision()).await?;
+        described_within_bound(&index, described).await?;
         assert!(
-            !index.search("beacon", 8).await?.is_empty(),
-            "the lane's pass must leave the published unit set searchable"
+            lane.has_settled(),
+            "the lane reports the pass it ran as settled"
         );
 
         cancellation.cancel();
@@ -2554,13 +3069,15 @@ mod tests {
             newest.reads.tree_revision(),
             "the fixture must actually move the tree revision"
         );
-        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let index = Arc::new(counting_index(&directory.path().join("search.db")).await?);
         let cancellation = CancellationToken::new();
         let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
 
+        let units = newest.reads.lexical_units();
+        let described = newest.reads.described_units(&units).len() as u64;
         lane.request(Arc::clone(&earlier));
         lane.request(Arc::clone(&newest));
-        stamped_within_bound(&index, newest.reads.tree_revision()).await?;
+        described_within_bound(&index, described).await?;
 
         cancellation.cancel();
         Ok(())
@@ -2574,11 +3091,13 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let earlier = stable_candidate(directory.path(), 0)?;
-        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let index = Arc::new(counting_index(&directory.path().join("search.db")).await?);
         let cancellation = CancellationToken::new();
         let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
+        let units = earlier.reads.lexical_units();
+        let described = earlier.reads.described_units(&units).len() as u64;
         lane.request(Arc::clone(&earlier));
-        stamped_within_bound(&index, earlier.reads.tree_revision()).await?;
+        described_within_bound(&index, described).await?;
 
         cancellation.cancel();
         for _attempt in 0..LANE_ATTEMPTS_MAX {
@@ -2592,13 +3111,19 @@ mod tests {
             "the lane's task must end with the cancellation it races"
         );
 
-        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn lantern() {}\npub fn beacon() {}\n",
+        )?;
         let newest = stable_candidate(directory.path(), 1)?;
         lane.request(Arc::clone(&newest));
         assert_eq!(
-            index.tree_revision().await?.as_deref(),
-            Some(earlier.reads.tree_revision()),
-            "a request the ended lane refused must leave the previous pass's stamp alone"
+            index.readiness(),
+            SemanticReadiness::Preparing {
+                prepared: 0,
+                total: described
+            },
+            "a request the ended lane refused must leave the previous pass's readiness alone"
         );
         Ok(())
     }
@@ -2662,6 +3187,7 @@ mod tests {
                 validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
                 population: None,
+                lexical: None,
             },
         ));
 
