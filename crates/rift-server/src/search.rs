@@ -95,13 +95,14 @@ impl ReadService {
     /// Derives the lexical write one change set owes: the paths whose stored units go, and
     /// the units this snapshot derived for the paths it read.
     ///
-    /// A modified path appears in both halves - its stored units are deleted and its new
-    /// ones inserted - and a removed path appears only in the first, because this snapshot
-    /// holds no file to derive from.
+    /// Every named path is replaced, so a path this snapshot read appears in both halves
+    /// and one it found gone appears only in the first. Replacing rather than adding is
+    /// what lets the same change set be written twice: two rebuilds captured from one
+    /// publication both write what they read, and the second leaves what the first left.
     #[must_use]
     pub fn lexical_change(&self, changes: &PathChanges) -> LexicalChange {
         LexicalChange::new(
-            changes.dropped().cloned().collect(),
+            changes.paths().cloned().collect(),
             self.index().lexical_units_for(changes.indexed()),
         )
     }
