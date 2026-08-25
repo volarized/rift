@@ -146,9 +146,30 @@ The lexical index's tables:
   with per-column weights, comparable only within one search.
 
 Search is a layered configuration: the default is this full-text store alone, and
-[`[search.semantic]`](/docs/configuration#search) adds a per-model vector store whose cosine
-similarity the server fuses into the lexical score - the layering the
-[architecture](/docs/architecture#search) page describes.
+[`[search.semantic]`](/docs/configuration#search) adds the vector store below, whose ranking
+the server fuses with this one by reciprocal rank.
+
+## Semantic search
+
+<VersionBadge version="planned" />
+
+`rift-search` owns the tier. It loads a BERT checkpoint with
+[candle](https://github.com/huggingface/candle) and runs the encoder in the server's own
+process, so answering a query touches neither the network nor a subprocess.
+
+Weights are read through candle's safetensors loader rather than its memory-mapped
+constructor: mapping is an unsafe call, and this workspace forbids authored `unsafe`. The cost
+is that a load holds the file's bytes once while the tensors are built.
+
+Vectors are pooled from the CLS position and normalized to unit length, which is how the
+default checkpoint was trained. A retrieval query carries the prefix that checkpoint was
+trained with, applied where the query enters rather than left to each caller; a document
+carries none.
+
+Passes run one at a time, bounded by
+[`batch_declarations` and `max_tokens`](/docs/configuration#search). Attention memory grows
+with the square of the token window, and candle's kernels already spread one pass across the
+thread pool, so running several at once buys nothing and costs the machine its memory.
 
 ## Language providers
 
