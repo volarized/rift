@@ -702,7 +702,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got,\nand `ready_in` estimates the wait from the rate the pass has held so far.",
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got.\n`ready_in` is an estimate the server derives from how large the workspace is and\nhow much of it is embedded, not a measurement of this machine, so a caller may\nreport it and must not schedule against it.",
                 "properties": {
                   "code": {
                     "const": "semantic_index_preparing",
@@ -721,7 +721,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -761,7 +761,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers an index that lags the tree;\nthis covers a tier that refused to load, which a caller cannot otherwise tell from\na tier that searched and found nothing.",
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers a store that lags the tree,\nincluding the window between a publication and the repopulation that follows it;\nthis covers a tier that refused to load and will not answer without operator\naction, which a caller cannot otherwise tell from a tier that searched and found\nnothing. A transient lag never raises this warning: one that fired in ordinary\noperation would be one every caller learned to ignore.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
@@ -4166,7 +4166,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got,\nand `ready_in` estimates the wait from the rate the pass has held so far.",
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got.\n`ready_in` is an estimate the server derives from how large the workspace is and\nhow much of it is embedded, not a measurement of this machine, so a caller may\nreport it and must not schedule against it.",
                 "properties": {
                   "code": {
                     "const": "semantic_index_preparing",
@@ -4185,7 +4185,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -4225,7 +4225,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers an index that lags the tree;\nthis covers a tier that refused to load, which a caller cannot otherwise tell from\na tier that searched and found nothing.",
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers a store that lags the tree,\nincluding the window between a publication and the repopulation that follows it;\nthis covers a tier that refused to load and will not answer without operator\naction, which a caller cannot otherwise tell from a tier that searched and found\nnothing. A transient lag never raises this warning: one that fired in ordinary\noperation would be one every caller learned to ignore.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
@@ -10202,7 +10202,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got,\nand `ready_in` estimates the wait from the rate the pass has held so far.",
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got.\n`ready_in` is an estimate the server derives from how large the workspace is and\nhow much of it is embedded, not a measurement of this machine, so a caller may\nreport it and must not schedule against it.",
                 "properties": {
                   "code": {
                     "const": "semantic_index_preparing",
@@ -10221,7 +10221,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -10261,7 +10261,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers an index that lags the tree;\nthis covers a tier that refused to load, which a caller cannot otherwise tell from\na tier that searched and found nothing.",
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers a store that lags the tree,\nincluding the window between a publication and the repopulation that follows it;\nthis covers a tier that refused to load and will not answer without operator\naction, which a caller cannot otherwise tell from a tier that searched and found\nnothing. A transient lag never raises this warning: one that fired in ordinary\noperation would be one every caller learned to ignore.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
