@@ -200,6 +200,7 @@ download_attempts = 3
 batch_declarations = 32
 max_tokens = 256
 candidates = 200
+candidates_per_file = 3
 max_vectors = 200000
 ```
 
@@ -223,7 +224,10 @@ max_vectors = 200000
   attention memory grows with the square of the token window, so a raised window wants a
   lowered batch
 - `candidates` bounds how many declarations the semantic ranking returns before the two
-  rankings are fused, 1 to 1000
+  rankings are fused, 1 to 1000, and `candidates_per_file` bounds any one file's share of them
+- `candidates_per_file` bounds how many declarations one file contributes to that list, 1 to
+  64; the rest of the file's declarations are dropped, so one file whose declarations all rank
+  well can't fill the list on its own and leave every other file unreachable
 - `max_vectors` bounds how many vectors the workspace holds, 1000 to 1000000; each vector
   costs the model's dimension in single-precision floats
 
