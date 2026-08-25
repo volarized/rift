@@ -54,10 +54,11 @@ const LEXICAL_CONTENT_RANK_WEIGHT: f64 = 1.0;
 /// Primary key of the single `lexical_index_state` row this adapter maintains.
 const LEXICAL_INDEX_STATE_ID: i64 = 1;
 
-const MIGRATION_FILES: &[MigrationFile] = &[MigrationFile::new(
-    1,
-    "lexical_schema",
-    "CREATE TABLE lexical_units(
+const MIGRATION_FILES: &[MigrationFile] = &[
+    MigrationFile::new(
+        1,
+        "lexical_schema",
+        "CREATE TABLE lexical_units(
         identity TEXT PRIMARY KEY NOT NULL,
         path TEXT NOT NULL,
         kind TEXT NOT NULL,
@@ -72,13 +73,29 @@ CREATE TABLE lexical_index_state(
     )
 -- #[toasty::breakpoint]
 CREATE VIRTUAL TABLE lexical_units_fts USING fts5(identity UNINDEXED, name, content)",
-)];
-const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
+    ),
+    MigrationFile::new(
+        2,
+        "semantic_vectors",
+        "CREATE TABLE semantic_vectors(
+        identity TEXT PRIMARY KEY NOT NULL,
+        model TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        dimension BIGINT NOT NULL,
+        vector BLOB NOT NULL
+    )
+-- #[toasty::breakpoint]
+CREATE INDEX semantic_vectors_model ON semantic_vectors(model)",
+    ),
+];
+pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
 
 /// Unit granularity the lexical tier indexes.
 ///
-/// A later dense-ranking layer attaches per-unit vectors keyed by the same
-/// `identity`, regardless of which kind produced the unit.
+/// The semantic tier stores its vectors in the same database, addressed by the
+/// digest of the text they were embedded from rather than by a unit identity:
+/// a declaration that moves or is renamed keeps its text, so it keeps its
+/// vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LexicalUnitKind {
@@ -484,7 +501,7 @@ fn limit_count(count: usize) -> u64 {
 }
 
 /// Maps one Toasty operating failure onto [`LexicalIndexViolation::Storage`].
-fn storage_error(source: toasty::Error) -> LexicalIndexError {
+pub(crate) fn storage_error(source: toasty::Error) -> LexicalIndexError {
     lexical_error_caused_by(LexicalIndexViolation::Storage, None, source)
 }
 
@@ -587,7 +604,7 @@ fn identifier_expansion(name: &str) -> String {
 
 /// Widens a `u32` domain bound into `usize` for in-memory comparisons; `u32`
 /// always fits `usize` on every platform Rift targets.
-fn bound_as_usize(bound: u32) -> usize {
+pub(crate) fn bound_as_usize(bound: u32) -> usize {
     usize::try_from(bound).unwrap_or_else(|_| {
         unreachable!("u32 bound must fit usize on supported platforms: bound={bound}")
     })
