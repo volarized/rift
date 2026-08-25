@@ -126,7 +126,7 @@ processes still inside.
 />
 
 One [SQLite](https://www.sqlite.org/) database at `.rift/db` holds every store Rift persists
-for the workspace - today, the lexical index. The server lock, projection directories, and
+for the workspace - today, the lexical index and the semantic tier's vectors. The server lock, projection directories, and
 execution copies stay separate entries under `.rift`; the database carries stores that are
 rows, not trees. Access goes through [Toasty](https://github.com/tokio-rs/toasty) models; the
 full-text surface is raw SQL, because Toasty 0.10 has no typed virtual-table or `MATCH` API,
@@ -146,9 +146,46 @@ The lexical index's tables:
   with per-column weights, comparable only within one search.
 
 Search is a layered configuration: the default is this full-text store alone, and
-[`[search.semantic]`](/docs/configuration#search) adds a per-model vector store whose cosine
-similarity the server fuses into the lexical score - the layering the
-[architecture](/docs/architecture#search) page describes.
+[`[search.semantic]`](/docs/configuration#search) adds the vector store below, whose ranking
+the server fuses with this one by reciprocal rank.
+
+## Semantic search
+
+<VersionBadge version="planned" />
+
+`rift-search` owns the tier. It loads a BERT checkpoint with
+[candle](https://github.com/huggingface/candle) and runs the encoder in the server's own
+process, so answering a query touches neither the network nor a subprocess.
+
+Weights are read through candle's safetensors loader rather than its memory-mapped
+constructor: mapping is an unsafe call, and this workspace forbids authored `unsafe`. The cost
+is that a load holds the file's bytes once while the tensors are built.
+
+Vectors are pooled from the CLS position and normalized to unit length, which is how the
+default checkpoint was trained. A retrieval query carries the prefix that checkpoint was
+trained with, applied where the query enters rather than left to each caller; a document
+carries none.
+
+Passes run one at a time, bounded by
+[`batch_declarations` and `max_tokens`](/docs/configuration#search). Attention memory grows
+with the square of the token window, and candle's kernels already spread one pass across the
+thread pool, so running several at once buys nothing and costs the machine its memory.
+
+The vectors go in `semantic_vectors`, in the same `.rift/db`. A row is addressed by the model
+that produced it and the digest of the text it came from, so a declaration that moves or is
+renamed resolves to the row already stored and a refresh embeds only what changed. Values are
+little-endian single precision with no header, so a row is a slice; a row whose stored width
+differs from the loaded model's is skipped, which invalidates a checkpoint that changed shape
+rather than reading it as noise.
+
+Two sweeps keep the table bounded: one drops what the previous model wrote when
+[`model`](/docs/configuration#search) changes, the other drops digests no live declaration
+addresses. [`max_vectors`](/docs/configuration#search) bounds what the table may hold at all.
+
+The vector table joins the lexical index's migration set rather than opening a second database
+handle with its own. Toasty records applied migrations in one `__toasty_migrations` table per
+file, so two independent sets on one file would interleave their ids; one set covers both
+tiers, and each store applies the same idempotent set whatever order the two open in.
 
 ## Language providers
 
