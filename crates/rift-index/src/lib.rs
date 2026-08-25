@@ -4,6 +4,7 @@ mod chunk;
 mod glob;
 mod lexical;
 mod revision;
+mod vector;
 mod workspace;
 
 pub use glob::PathMatcher;
@@ -11,6 +12,7 @@ pub use lexical::{
     LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch,
     LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
 };
+pub use vector::{SemanticVectorStore, StoredVector};
 pub use workspace::{
     IndexedFile, SymbolMatch, SymbolMatchRank, TextSourceFile, WorkspaceFingerprint,
     WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits,
