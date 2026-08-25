@@ -19,6 +19,12 @@ pub enum SearchViolation {
     EncodeFailed,
     /// One call handed the encoder more texts than its bound allows.
     TextLimit,
+    /// A query vector and a stored vector are not of one width.
+    VectorWidthMismatch,
+    /// Fusion was handed shares that cannot carry a score.
+    RankingWeightsInvalid,
+    /// Fusion was handed a rank constant outside the accepted range.
+    FusionConstantInvalid,
 }
 
 impl SearchViolation {
@@ -28,7 +34,10 @@ impl SearchViolation {
             Self::ModelFileMissing => ErrorName::Wire(ErrorCode::ResourceNotFound),
             Self::ModelConfigurationInvalid
             | Self::TokenizerUnreadable
-            | Self::WeightsUnreadable => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
+            | Self::WeightsUnreadable
+            | Self::VectorWidthMismatch
+            | Self::RankingWeightsInvalid
+            | Self::FusionConstantInvalid => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
             Self::EncodeFailed => ErrorName::Wire(ErrorCode::InternalError),
             Self::TextLimit => ErrorName::Wire(ErrorCode::LimitExceeded),
         }
@@ -135,6 +144,21 @@ mod tests {
                 SearchViolation::TextLimit,
                 ErrorCode::LimitExceeded,
                 "text_limit",
+            ),
+            (
+                SearchViolation::VectorWidthMismatch,
+                ErrorCode::ConfigurationInvalid,
+                "vector_width_mismatch",
+            ),
+            (
+                SearchViolation::RankingWeightsInvalid,
+                ErrorCode::ConfigurationInvalid,
+                "ranking_weights_invalid",
+            ),
+            (
+                SearchViolation::FusionConstantInvalid,
+                ErrorCode::ConfigurationInvalid,
+                "fusion_constant_invalid",
             ),
         ];
         for (violation, code, label) in cases {
