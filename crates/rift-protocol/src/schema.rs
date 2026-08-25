@@ -303,6 +303,26 @@ pub fn declare_search_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`SemanticSearchConfiguration`](crate::configuration::SemanticSearchConfiguration)
+/// states its `Duration` bounds as `rift:range` on the key: schema validation alone cannot
+/// compare `"5m"` against a ceiling, so the server enforces the bounds at load and the
+/// schema carries them for readers.
+pub fn declare_semantic_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        Duration, SEMANTIC_DOWNLOAD_TIMEOUT_MS_MAX, SEMANTIC_DOWNLOAD_TIMEOUT_MS_MIN,
+        SemanticSearchConfiguration,
+    };
+    annotate_property(
+        schema,
+        property!(SemanticSearchConfiguration, download_timeout),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(SEMANTIC_DOWNLOAD_TIMEOUT_MS_MIN),
+            &Duration::from_millis(SEMANTIC_DOWNLOAD_TIMEOUT_MS_MAX),
+        ),
+    );
+}
+
 /// A [`TextSearchConfiguration`](crate::configuration::TextSearchConfiguration) states its
 /// `ByteSize` ceiling as `rift:range` on the key: schema validation alone cannot compare
 /// `"1mb"` against a ceiling, so the server enforces the bound at load and the schema carries

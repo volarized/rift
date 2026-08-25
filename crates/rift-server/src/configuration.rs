@@ -126,7 +126,9 @@ fn accept_configuration(raw: &str) -> Result<WorkspaceConfiguration, Configurati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift_protocol::configuration::{ByteSize, ChangedPaths, Determinism, HookKind};
+    use rift_protocol::configuration::{
+        ByteSize, ChangedPaths, Determinism, HookKind, SemanticSource,
+    };
 
     /// The `[[hooks]]` example the configuration docs show, keys complete.
     const DOCUMENTED_HOOK: &str = r#"
@@ -177,8 +179,14 @@ max_concurrent = 2
 enabled = true
 max_revisions = 500
 
-[search]
-embedding = "potion-retrieval-32M"
+[search.lexical]
+weight = 0.6
+
+[search.semantic]
+weight = 0.4
+source = "hf"
+model = "BAAI/bge-small-en-v1.5"
+download_timeout = "5m"
 {DOCUMENTED_HOOK}
 "#
         );
@@ -190,9 +198,12 @@ embedding = "potion-retrieval-32M"
             configuration.execution.max_code,
             ByteSize::from_bytes(16 << 10)
         );
+        assert!((configuration.search.lexical.weight - 0.6).abs() < f64::EPSILON);
+        assert!((configuration.search.semantic.weight - 0.4).abs() < f64::EPSILON);
+        assert_eq!(configuration.search.semantic.source, SemanticSource::Hf);
         assert_eq!(
-            configuration.search.embedding.as_deref(),
-            Some("potion-retrieval-32M")
+            configuration.search.semantic.model,
+            "BAAI/bge-small-en-v1.5"
         );
         let hook = &configuration.hooks[0];
         assert_eq!(hook.id, "tests");
@@ -201,6 +212,15 @@ embedding = "potion-retrieval-32M"
         assert_eq!(hook.arguments, ["test"]);
         assert_eq!(hook.changed_paths, ChangedPaths::None);
         assert_eq!(hook.determinism, Determinism::Deterministic);
+    }
+
+    #[test]
+    fn test_semantic_candidate_bounds_parse_from_toml() {
+        let configuration =
+            accept_configuration("[search.semantic]\ncandidates = 100\ncandidates_per_file = 8\n")
+                .expect("both candidate bounds must be accepted");
+        assert_eq!(configuration.search.semantic.candidates, 100);
+        assert_eq!(configuration.search.semantic.candidates_per_file, 8);
     }
 
     /// The repository's own `rift.toml`, exercised so the committed file accepts cleanly

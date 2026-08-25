@@ -145,8 +145,8 @@ The lexical index's tables:
   and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25`
   with per-column weights, comparable only within one search.
 
-Search is a layered configuration: the default is this full-text store alone, and naming a model
-in [`search.embedding`](/docs/configuration#search) adds a per-model vector store whose cosine
+Search is a layered configuration: the default is this full-text store alone, and
+[`[search.semantic]`](/docs/configuration#search) adds a per-model vector store whose cosine
 similarity the server fuses into the lexical score - the layering the
 [architecture](/docs/architecture#search) page describes.
 
