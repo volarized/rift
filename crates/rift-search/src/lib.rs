@@ -31,6 +31,7 @@ pub use index::{
     DescribedUnit, Embedding, RankedUnit, SearchIndex, SearchIndexLimits, SearchIndexLimitsBuilder,
     SemanticReadiness,
 };
+pub use rift_index::RevisionScoped;
 pub use similarity::{SemanticMatch, nearest};
 
 /// Compile-time marker for search-layer ownership.

@@ -26,7 +26,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use rift_core::ProjectPath;
 use rift_index::{
     LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalMatch, LexicalSearchIndex,
-    LexicalUnit, LexicalUnitKind, SemanticVectorStore, StoredVector,
+    LexicalUnit, LexicalUnitKind, RevisionScoped, SemanticVectorStore, StoredVector,
 };
 
 use crate::acquisition::{AcquisitionLimits, ModelSource, acquire};
@@ -412,6 +412,21 @@ type Addresses = BTreeMap<String, UnitAddress>;
 /// The vectors the semantic tier scans, as one pass read them back.
 type Corpus = Vec<StoredVector>;
 
+/// What one embedding pass published: the vectors it read back, the map that places each
+/// of them on a unit, and the tree revision the declarations behind them were described
+/// for.
+///
+/// The three are held as one value because a query needs all three to agree. Vectors read
+/// against another pass's map place a digest on the wrong unit, and either read against a
+/// tree they were not described for ranks declarations the published workspace no longer
+/// holds.
+#[derive(Debug)]
+struct HeldCorpus {
+    tree_revision: String,
+    addresses: Addresses,
+    vectors: Corpus,
+}
+
 /// Both search tiers over one database file.
 ///
 /// The vector store keys on the digest of the text a declaration was embedded
@@ -444,8 +459,7 @@ pub struct SearchIndex {
     vectors: SemanticVectorStore,
     model: Mutex<Option<Arc<LoadedModel>>>,
     readiness: Mutex<SemanticReadiness>,
-    addresses: Mutex<Arc<Addresses>>,
-    corpus: Mutex<Arc<Corpus>>,
+    held: Mutex<Option<Arc<HeldCorpus>>>,
     limits: SearchIndexLimits,
 }
 
@@ -480,8 +494,7 @@ impl SearchIndex {
             vectors,
             model: Mutex::new(None),
             readiness: Mutex::new(limits.initial_readiness()),
-            addresses: Mutex::new(Arc::new(Addresses::new())),
-            corpus: Mutex::new(Arc::new(Corpus::new())),
+            held: Mutex::new(None),
             limits,
         })
     }
@@ -599,12 +612,14 @@ impl SearchIndex {
         &self,
         described: &[DescribedUnit<'_>],
         embedding: Embedding,
+        tree_revision: &str,
     ) -> Result<(), SearchError> {
         let Some(model) = self.serving_model() else {
             self.note_nothing_embedded(described.len());
             return Ok(());
         };
-        self.embed(&model, described, embedding).await
+        self.embed(&model, described, embedding, tree_revision)
+            .await
     }
 
     /// Runs both tiers and fuses them.
@@ -627,18 +642,33 @@ impl SearchIndex {
     /// # Cancel safety
     ///
     /// Cancellation performs no writes; both tiers issue read-only queries.
-    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<RankedUnit>, SearchError> {
-        if query.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let lexical = self
+    pub async fn search(
+        &self,
+        tree_revision: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<RevisionScoped<Vec<RankedUnit>>, SearchError> {
+        let lexical = match self
             .lexical
-            .search(query, limit)
+            .search(tree_revision, query, limit)
             .await
-            .map_err(store_failed)?;
-        let semantic = self.semantic(query).await?;
+            .map_err(store_failed)?
+        {
+            RevisionScoped::Matched(matches) => matches,
+            RevisionScoped::OtherRevision(stored) => {
+                return Ok(RevisionScoped::OtherRevision(stored));
+            }
+            RevisionScoped::NoRevision => return Ok(RevisionScoped::NoRevision),
+        };
+        if query.trim().is_empty() {
+            return Ok(RevisionScoped::Matched(Vec::new()));
+        }
+        let semantic = self.semantic(query, tree_revision).await?;
         let fused = self.fused(&lexical, &semantic, limit)?;
-        Ok(ranked(&fused, &directory(&lexical, &semantic)))
+        Ok(RevisionScoped::Matched(ranked(
+            &fused,
+            &directory(&lexical, &semantic),
+        )))
     }
 
     /// What the semantic tier can answer right now.
@@ -691,7 +721,7 @@ impl SearchIndex {
         let pruned = self.vectors.prune_other_models(&model.identity).await;
         drop(writing);
         let _dropped = pruned.map_err(store_failed)?;
-        self.publish_corpus(Corpus::new());
+        self.publish_held(None);
         let mut held = self.model.lock().unwrap_or_else(PoisonError::into_inner);
         *held = Some(Arc::new(model));
         Ok(())
@@ -715,6 +745,7 @@ impl SearchIndex {
         model: &Arc<LoadedModel>,
         described: &[DescribedUnit<'_>],
         embedding: Embedding,
+        tree_revision: &str,
     ) -> Result<(), SearchError> {
         let total = as_count(described.len());
         let documents = documents(described, as_usize(total.min(self.limits.max_vectors)));
@@ -731,7 +762,7 @@ impl SearchIndex {
         drop(writing);
         let _pruned = pruned.map_err(store_failed)?;
         let corpus = self.read_corpus(model).await?;
-        self.publish(&documents, corpus);
+        self.publish(&documents, corpus, tree_revision);
         self.set_readiness(reached(as_count(documents.len()), total));
         Ok(())
     }
@@ -793,7 +824,8 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// The semantic ranking, or nothing when the tier cannot answer.
+    /// The semantic ranking for `tree_revision`, or nothing when the tier cannot answer
+    /// for that tree.
     ///
     /// The scan runs over the corpus the last pass published, and the query
     /// path reads no vector row of its own: doing that cost one `SELECT` over
@@ -801,9 +833,9 @@ impl SearchIndex {
     /// query. A held corpus with nothing in it ranks nothing, which is the
     /// answer this gave when the store held nothing.
     ///
-    /// A digest the address map does not name is skipped: a pass publishes the
-    /// corpus and the map together, and a digest in only one of them has no
-    /// unit to rank it as.
+    /// A corpus described for another tree ranks nothing either. Embedding runs after
+    /// publication, so a workspace published moments ago is answered by the lexical tier
+    /// alone until the pass for that tree lands, and never by the previous tree's vectors.
     ///
     /// One `tokio::task::spawn_blocking` call carries both the query's forward
     /// pass and the cosine scan over the held corpus. Neither may hold a
@@ -811,28 +843,37 @@ impl SearchIndex {
     /// one call schedules the work once rather than twice. The corpus travels
     /// into that call as the `Arc` this index holds, so the scan borrows the
     /// vectors rather than copying them.
-    async fn semantic(&self, query: &str) -> Result<Vec<UnitAddress>, SearchError> {
+    async fn semantic(
+        &self,
+        query: &str,
+        tree_revision: &str,
+    ) -> Result<Vec<UnitAddress>, SearchError> {
         let Some(model) = self.serving_model() else {
             return Ok(Vec::new());
         };
-        let corpus = self.corpus();
-        if corpus.is_empty() {
+        let Some(held) = self
+            .held()
+            .filter(|held| held.tree_revision == tree_revision)
+        else {
+            return Ok(Vec::new());
+        };
+        if held.vectors.is_empty() {
             return Ok(Vec::new());
         }
-        let addresses = self.addresses();
         let depth = self.limits.depth();
         let asked = query.to_owned();
+        let scanned = Arc::clone(&held);
         let matched = tokio::task::spawn_blocking(move || {
             let embedded = model.encoder.embed_query(&asked)?;
-            nearest(&embedded, &corpus, depth)
+            nearest(&embedded, &scanned.vectors, depth)
         })
         .await
         .map_err(task_failed)??;
-        let placed = placed(&matched, &addresses);
+        let placed = placed(&matched, &held.addresses);
         let spread = spread_per_file(&placed, as_usize(self.limits.per_file_max));
         Ok(resolved(
             &spread,
-            &addresses,
+            &held.addresses,
             as_usize(self.limits.candidates),
         ))
     }
@@ -865,46 +906,33 @@ impl SearchIndex {
         held.as_ref().map(Arc::clone)
     }
 
-    /// The published digest-to-unit map.
-    fn addresses(&self) -> Arc<Addresses> {
-        let held = self
-            .addresses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(&held)
+    /// What the last pass published, or nothing when no pass has published yet.
+    fn held(&self) -> Option<Arc<HeldCorpus>> {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.as_ref().map(Arc::clone)
     }
 
-    /// The published corpus the semantic tier scans.
-    fn corpus(&self) -> Arc<Corpus> {
-        let held = self.corpus.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(&held)
-    }
-
-    /// Publishes what this pass built: the corpus, then the map that says
-    /// which unit each of its vectors belongs to, each replacing the previous
-    /// one whole.
+    /// Publishes what this pass built, replacing the previous publication whole.
     ///
-    /// The two are held apart, so a query that reads between the two swaps
-    /// reads this pass's corpus against the previous pass's map. Nothing is
-    /// mispaired by that: a digest only one of the two names is skipped, and
-    /// the next query reads both from this pass.
-    fn publish(&self, documents: &[UnitDocument], corpus: Corpus) {
+    /// One swap publishes the vectors, the map that places them, and the tree they were
+    /// described for together, so no query can read one pass's vectors against another
+    /// pass's map or against a tree neither answers for.
+    fn publish(&self, documents: &[UnitDocument], vectors: Corpus, tree_revision: &str) {
         let addresses: Addresses = documents
             .iter()
             .map(|one| (one.digest.clone(), one.address.clone()))
             .collect();
-        self.publish_corpus(corpus);
-        let mut held = self
-            .addresses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *held = Arc::new(addresses);
+        self.publish_held(Some(HeldCorpus {
+            tree_revision: tree_revision.to_owned(),
+            addresses,
+            vectors,
+        }));
     }
 
-    /// Publishes the corpus the semantic tier scans from here on.
-    fn publish_corpus(&self, corpus: Corpus) {
-        let mut held = self.corpus.lock().unwrap_or_else(PoisonError::into_inner);
-        *held = Arc::new(corpus);
+    /// Installs what the semantic tier scans from here on, or clears it.
+    fn publish_held(&self, corpus: Option<HeldCorpus>) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = corpus.map(Arc::new);
     }
 
     /// Records that a pass embedded nothing, without clearing a tier that is

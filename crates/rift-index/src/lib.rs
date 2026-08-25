@@ -12,7 +12,7 @@ pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDi
 pub use glob::PathMatcher;
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
-    LexicalMatch, LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
+    LexicalMatch, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, RevisionScoped,
 };
 pub use vector::{SemanticVectorStore, StoredVector};
 pub use workspace::{

@@ -1067,7 +1067,11 @@ pub(crate) async fn populate_search(
     }
     let units = published.reads.lexical_units();
     let described = published.reads.described_units(&units);
-    if let Err(error) = index.embed_described(&described, embedding).await {
+    let tree_revision = published.reads.tree_revision();
+    if let Err(error) = index
+        .embed_described(&described, embedding, tree_revision)
+        .await
+    {
         tracing::warn!(
             component = "search",
             operation = "search.populate",
@@ -1239,13 +1243,12 @@ fn lexical_unavailable(detail: &str) -> ReadError {
 /// an earlier one still waits overwrites it, and the lane always runs the newest tree it
 /// was handed rather than a backlog of superseded ones.
 ///
-/// An answer computed while a pass is pending needs nothing new: the store still carries the
-/// tree revision the previous pass stamped, so the search-time revision guard ranks by
-/// identifier matching alone and the answer names the two revisions that disagree.
+/// An answer computed while a pass is pending needs nothing new: the lexical tier already
+/// holds the published tree, and the semantic tier ranks nothing until the pass for that
+/// tree publishes its corpus.
 #[derive(Clone, Debug)]
 pub(crate) struct PopulationLane {
     publications: Arc<watch::Sender<Option<Arc<PublishedWorkspace>>>>,
-    settled: Arc<AtomicBool>,
 }
 
 impl PopulationLane {
@@ -1261,8 +1264,6 @@ impl PopulationLane {
     /// mid-pass is safe: [`populate_search`] documents what a dropped pass leaves behind.
     pub(crate) fn spawn(index: Arc<SearchIndex>, cancellation: CancellationToken) -> Self {
         let (publications, mut requests) = watch::channel::<Option<Arc<PublishedWorkspace>>>(None);
-        let settled = Arc::new(AtomicBool::new(false));
-        let reached = Arc::clone(&settled);
         tokio::spawn(async move {
             let mut embedding = Embedding::Every;
             loop {
@@ -1282,25 +1283,11 @@ impl PopulationLane {
                     () = populate_search(&index, &published, embedding) => {}
                 }
                 embedding = Embedding::Missing;
-                reached.store(true, Ordering::Release);
             }
         });
         Self {
             publications: Arc::new(publications),
-            settled,
         }
-    }
-
-    /// Whether the lane has yet finished a pass, so an unstamped store means a pass still
-    /// running rather than one that failed.
-    ///
-    /// Startup used to await the first pass, which left an unstamped store meaning exactly
-    /// one thing: the store could not be read and an operator has to act. The lane answers
-    /// before that pass runs, so the same unstamped store now also covers the ordinary
-    /// window while the first pass is still writing, and a search answered in that window
-    /// must not tell a caller that anything failed.
-    pub(crate) fn has_settled(&self) -> bool {
-        self.settled.load(Ordering::Acquire)
     }
 
     /// Hands `published` to the lane and returns, never awaiting the pass it asks for.
@@ -1695,7 +1682,7 @@ mod tests {
     use rift_core::{SourceVisibility, TextFileInclusion};
     use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits, WorkspaceSourcePolicy};
     use rift_protocol::configuration::ServerConfiguration;
-    use rift_search::{SearchIndex, SearchIndexLimits, SemanticReadiness};
+    use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, SemanticReadiness};
     use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
@@ -2726,7 +2713,7 @@ mod tests {
             Some(published.reads.tree_revision()),
             "the commit must succeed and stamp the published tree revision, not merely warn"
         );
-        let ranked = index.search("word", 64).await?;
+        let ranked = ranked_at(&index, published.reads.tree_revision(), "word", 64).await?;
         for unit in units
             .iter()
             .filter(|unit| unit.path().as_str() == "guide.txt")
@@ -2795,7 +2782,9 @@ mod tests {
             "the store holds the published tree the moment that tree becomes current"
         );
         assert!(
-            !index.search("secondgamma", 8).await?.is_empty(),
+            !ranked_at(&index, current.reads.tree_revision(), "secondgamma", 8)
+                .await?
+                .is_empty(),
             "the published tree's units are searchable as soon as it publishes"
         );
         cancellation.cancel();
@@ -2878,7 +2867,9 @@ mod tests {
             "the commit stamps the tree revision the candidate answers under"
         );
         assert!(
-            !index.search("beacon", 8).await?.is_empty(),
+            !ranked_at(&index, published.reads.tree_revision(), "beacon", 8)
+                .await?
+                .is_empty(),
             "the commit leaves the published unit set searchable"
         );
         cancellation.cancel();
@@ -2928,15 +2919,21 @@ mod tests {
             "the change commit stamps the revision its candidate answers under"
         );
         assert!(
-            !index.search("secondgamma", 8).await?.is_empty(),
+            !ranked_at(&index, second.reads.tree_revision(), "secondgamma", 8)
+                .await?
+                .is_empty(),
             "the changed path's new units are searchable"
         );
         assert!(
-            index.search("firstbeta", 8).await?.is_empty(),
+            ranked_at(&index, second.reads.tree_revision(), "firstbeta", 8)
+                .await?
+                .is_empty(),
             "the changed path's previous units are gone"
         );
         assert!(
-            !index.search("keptalpha", 8).await?.is_empty(),
+            !ranked_at(&index, second.reads.tree_revision(), "keptalpha", 8)
+                .await?
+                .is_empty(),
             "a path the change set never named keeps its units"
         );
         cancellation.cancel();
@@ -3031,6 +3028,20 @@ mod tests {
         Ok(index)
     }
 
+    /// The units one revision-qualified search ranked, refusing an answer the store could
+    /// not place under `tree_revision`.
+    async fn ranked_at(
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &str,
+        limit: u32,
+    ) -> TestResult<Vec<rift_search::RankedUnit>> {
+        match index.search(tree_revision, query, limit).await? {
+            RevisionScoped::Matched(ranked) => Ok(ranked),
+            other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
+        }
+    }
+
     /// Waits until the lane's readiness names `total` declarations.
     async fn described_within_bound(index: &SearchIndex, total: u64) -> TestResult {
         for _attempt in 0..LANE_ATTEMPTS_MAX {
@@ -3059,10 +3070,6 @@ mod tests {
         let described = published.reads.described_units(&units).len() as u64;
         lane.request(Arc::clone(&published));
         described_within_bound(&index, described).await?;
-        assert!(
-            lane.has_settled(),
-            "the lane reports the pass it ran as settled"
-        );
 
         cancellation.cancel();
         Ok(())

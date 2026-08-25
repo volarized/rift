@@ -18,12 +18,12 @@ use rift_protocol::configuration::{
 };
 use rift_protocol::error as wire;
 use rift_protocol::read::{
-    DiagnosticCode, Digest, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult,
-    ReadWarning, SearchParams, SearchResult,
+    DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, ReadWarning,
+    SearchParams, SearchResult,
 };
 use rift_search::{
-    AcquisitionLimits, ModelSource, RankedUnit, SearchError, SearchIndex, SearchIndexLimits,
-    SemanticReadiness,
+    AcquisitionLimits, ModelSource, RankedUnit, RevisionScoped, SearchError, SearchIndex,
+    SearchIndexLimits, SemanticReadiness,
 };
 use rift_server::{
     ChangeService, EnginePool, HookStatus, MoveResolution, ReadError, ReadFault, ReadService,
@@ -508,10 +508,10 @@ async fn embed_prepared(published: &RwLock<IndexState>, population: &PopulationL
 /// The ranking one search request merges, and what the search index's own state adds to
 /// that answer's warnings.
 ///
-/// One answer may carry two `stale_index` warnings with different digest pairs: the read
-/// index raises one for its own lag, and [`SearchRanking::lagging`] raises one for the
-/// search store's. Both are correct - they are two stores over one tree - and each
-/// `detail` names the store it came from.
+/// The search store is read under the tree revision the request captured, so a store that
+/// holds another tree contributes no ranking and no warning: the request recaptures
+/// instead. What remains here is a store that will not answer at all until an operator
+/// acts, which is a different thing to tell a caller.
 #[derive(Debug, Default)]
 struct SearchRanking {
     units: Vec<RankedUnit>,
@@ -528,38 +528,6 @@ impl SearchRanking {
             }],
         }
     }
-
-    /// No ranking this time: the store holds `stamped` and is repopulating for `captured`.
-    ///
-    /// This is a lag, not an absent tier, so it warns `stale_index` with the two revisions
-    /// that disagree. The repopulation is already under way and no operator action is
-    /// wanted, which is exactly what `lexical_ranking_unavailable` must never be spent on.
-    fn lagging(stamped: String, captured: &str) -> Self {
-        let detail = format!(
-            "the full-text tier is stamped with tree revision {stamped} while this answer \
-             was computed from tree revision {captured}, so the answer was ranked by \
-             identifier matching alone; resend the request once the tier has repopulated"
-        );
-        Self {
-            units: Vec::new(),
-            warnings: vec![ReadWarning::StaleIndex {
-                index_tree_revision: Digest(stamped),
-                captured_tree_revision: Digest(captured.to_owned()),
-                detail,
-            }],
-        }
-    }
-}
-
-/// What the search store's own stamp says about the tree one answer was computed from.
-#[derive(Debug, Eq, PartialEq)]
-enum StoreRevision {
-    /// The store holds the tree this answer was computed from.
-    Current,
-    /// The store holds another tree, and a repopulation for this one is under way.
-    Lagging(String),
-    /// The store carries no stamp at all, or could not be read.
-    Absent,
 }
 
 /// The paths one applied change asks the next snapshot to reparse, or nothing when that
@@ -593,18 +561,28 @@ fn changed_paths_to_reparse(
     Some(paths)
 }
 
-/// Places the search store's stamp against the tree revision `published` answers under.
+/// What one revision-qualified store answer means for the request that asked for it.
 ///
-/// A store carrying no stamp has never held a tree: its startup population did not land.
-/// That is an absent tier rather than a lagging one, so it reports as `Absent` and the
-/// repopulation window - which always carries the previous stamp - is the only case that
-/// reports `Lagging`. A store that cannot be read joins `Absent` so the request degrades
-/// instead of failing.
-async fn store_revision(index: &SearchIndex, published: &PublishedWorkspace) -> StoreRevision {
-    match index.tree_revision().await {
-        Ok(Some(stamped)) if stamped == published.reads.tree_revision() => StoreRevision::Current,
-        Ok(Some(stamped)) => StoreRevision::Lagging(stamped),
-        Ok(None) | Err(_) => StoreRevision::Absent,
+/// Nothing means the store holds a tree other than the one this request captured, which
+/// asks the request to capture the publication the store already answers for. A store
+/// holding no tree at all ranks nothing and says so: no pass has ever landed in it, which
+/// waits on an operator rather than on work already under way.
+fn ranking_of(
+    searched: RevisionScoped<Vec<RankedUnit>>,
+    readiness: SemanticReadiness,
+    files: u64,
+) -> Option<SearchRanking> {
+    match searched {
+        RevisionScoped::Matched(units) => Some(SearchRanking {
+            units,
+            warnings: readiness_warnings(readiness, files),
+        }),
+        RevisionScoped::OtherRevision(_) => None,
+        RevisionScoped::NoRevision => Some(SearchRanking::unavailable(
+            "the workspace search database holds no indexed tree, or could not be read, so \
+             the answer was ranked by identifier matching alone; the server log names the \
+             failure, and a restart retries it",
+        )),
     }
 }
 
@@ -978,13 +956,7 @@ impl RiftMcp {
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let Some(rev) = params.rev.clone() else {
-            let published = self.published_workspace(wire::ErrorPhase::Read).await?;
-            let SearchRanking { units, warnings } = self.ranking(&params, &published).await?;
-            let mut answer = self
-                .current_tree_read(&published, move |reads| reads.search(&params, &units))
-                .await?;
-            answer.0.warnings.extend(warnings);
-            return Ok(answer);
+            return self.current_tree_search(params).await;
         };
         // The search index only ever holds the current tree, so a revision-addressed
         // search never consults it.
@@ -992,66 +964,76 @@ impl RiftMcp {
             .await
     }
 
+    /// Ranks and reads one current-tree search against one publication.
+    ///
+    /// The store answers only for the tree it was stamped with, so a store that has moved
+    /// past the captured publication ends this attempt rather than ranking rows the answer
+    /// cannot place. The next attempt captures the publication the store already holds, and
+    /// the bound is the same one `reconcile_workspace` applies to a tree that keeps moving.
+    async fn current_tree_search(
+        &self,
+        params: SearchParams,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
+            let published = self.published_workspace(wire::ErrorPhase::Read).await?;
+            let Some(SearchRanking { units, warnings }) = self.ranking(&params, &published).await?
+            else {
+                continue;
+            };
+            let executed = params.clone();
+            let mut answer = self
+                .current_tree_read(&published, move |reads| reads.search(&executed, &units))
+                .await?;
+            answer.0.warnings.extend(warnings);
+            return Ok(answer);
+        }
+        Err(ReadFault::unavailable(
+            "current workspace search",
+            "the search store moved past the captured tree across bounded attempts",
+        )
+        .tool_error(wire::ErrorPhase::Read))
+    }
+
     /// Runs the search index for one request against `published` - the exact snapshot the
-    /// caller also runs `ReadService::search` against, never a separately resolved one -
-    /// when the index is available and its stamped tree revision still matches
-    /// `published`'s. Either way identifier search proceeds alone rather than serving a
-    /// possibly stale index, and the answer says which of the two it met: a store still
-    /// repopulating warns `stale_index` with the two revisions that disagree, and a store
-    /// that will not answer without operator action warns `lexical_ranking_unavailable`.
-    /// A query-term limit the index refuses surfaces as this request's own `limit_exceeded`
-    /// error, never a silent degrade.
+    /// caller also runs `ReadService::search` against, never a separately resolved one.
+    ///
+    /// Returns nothing when the store holds a tree other than `published`'s, which asks the
+    /// caller to capture the publication the store already answers for. Every other outcome
+    /// ranks: an index that could not be opened, and one holding no tree at all, warn
+    /// `lexical_ranking_unavailable` and leave identifier search to answer alone, because
+    /// both wait on an operator rather than on a pass already under way. A query-term limit
+    /// the index refuses surfaces as this request's own `limit_exceeded` error, never a
+    /// silent degrade.
     async fn ranking(
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
-    ) -> Result<SearchRanking, ErrorData> {
+    ) -> Result<Option<SearchRanking>, ErrorData> {
         let Some(index) = self.search_index.as_ref() else {
-            return Ok(SearchRanking::unavailable(
+            return Ok(Some(SearchRanking::unavailable(
                 "the workspace search database could not be opened, so the answer was ranked \
                  by identifier matching alone; the server log names the open failure, and a \
                  restart retries it",
-            ));
+            )));
         };
         // An absent or empty query is refused by `ReadService::search` itself; warning
         // about a tier that was never consulted would only crowd that refusal.
         let Some(query) = params.query.as_deref().filter(|query| !query.is_empty()) else {
-            return Ok(SearchRanking::default());
+            return Ok(Some(SearchRanking::default()));
         };
-        match store_revision(index, published).await {
-            StoreRevision::Current => {}
-            StoreRevision::Lagging(stamped) => {
-                let captured = published.reads.tree_revision();
-                return Ok(SearchRanking::lagging(stamped, captured));
-            }
-            StoreRevision::Absent
-                if self
-                    .population
-                    .as_ref()
-                    .is_some_and(|lane| !lane.has_settled()) =>
-            {
-                return Ok(SearchRanking::unavailable(
-                    "the workspace search database is being populated for the first time \
-                     since this server started, so the answer was ranked by identifier \
-                     matching alone; resend the request once that pass has landed",
-                ));
-            }
-            StoreRevision::Absent => {
-                return Ok(SearchRanking::unavailable(
-                    "the workspace search database holds no indexed tree, or could not be \
-                     read, so the answer was ranked by identifier matching alone; the server \
-                     log names the failure, and a restart retries it",
-                ));
-            }
-        }
-        let units = index
-            .search(query, self.fetch_limit(params))
+        let searched = index
+            .search(
+                published.reads.tree_revision(),
+                query,
+                self.fetch_limit(params),
+            )
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-        Ok(SearchRanking {
-            units,
-            warnings: readiness_warnings(index.readiness(), published.reads.file_count()),
-        })
+        Ok(ranking_of(
+            searched,
+            index.readiness(),
+            published.reads.file_count(),
+        ))
     }
 
     /// How deep the search index is read for one request.
@@ -1689,7 +1671,7 @@ mod tests {
         Duration as WireDuration, SearchConfiguration, SemanticSearchConfiguration, SemanticSource,
     };
     use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
-    use rift_search::{ModelSource, SemanticReadiness};
+    use rift_search::{ModelSource, RevisionScoped, SemanticReadiness};
     use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault};
 
     use rmcp::ServiceError;
@@ -3394,128 +3376,63 @@ pub fn beacon() -> u64 {
         Err("a model directory without weights never ended preparation".into())
     }
 
-    /// One workspace holding `source`, published as a candidate, with a search index over
-    /// its own temporary database populated from it.
-    async fn populated_index(
-        directory: &std::path::Path,
-        source: &str,
-    ) -> TestResult<(Arc<PublishedWorkspace>, rift_search::SearchIndex)> {
-        fs::write(directory.join("lib.rs"), source)?;
-        let published = stable_candidate(directory, 0)?;
-        let limits =
-            rift_search::SearchIndexLimits::builder(rift_index::LexicalIndexLimits::default())
-                .disable_semantic()
-                .build();
-        let database = directory.join("search.db");
-        let index = rift_search::SearchIndex::open(&database, limits).await?;
-        // The lexical set is what a store revision reports on, and it commits before a
-        // candidate publishes rather than in a pass behind it.
-        index
-            .replace_lexical(
-                &published.reads.lexical_units(),
-                published.reads.tree_revision(),
+    #[test]
+    fn a_store_holding_another_tree_asks_the_request_to_recapture() {
+        assert!(
+            super::ranking_of(
+                RevisionScoped::OtherRevision("aaaaaaaa".to_owned()),
+                SemanticReadiness::Ready,
+                10,
             )
-            .await?;
-        Ok((published, index))
+            .is_none(),
+            "rows from another tree are never merged into this answer, and no warning \
+             stands in for the recapture"
+        );
     }
 
-    #[tokio::test]
-    async fn a_store_stamped_with_another_tree_reads_as_lagging_not_absent() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let (first, index) = populated_index(directory.path(), "pub fn beacon() {}\n").await?;
-        assert_eq!(
-            super::store_revision(&index, &first).await,
-            super::StoreRevision::Current,
-            "a store populated from this very snapshot holds its tree"
-        );
-
-        // The same workspace, moved on: the store still holds the previous tree.
-        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
-        let moved = stable_candidate(directory.path(), 1)?;
-        let stamped = first.reads.tree_revision().to_owned();
-        assert_ne!(
-            stamped,
-            moved.reads.tree_revision(),
-            "the fixture must actually move the tree revision"
-        );
-        assert_eq!(
-            super::store_revision(&index, &moved).await,
-            super::StoreRevision::Lagging(stamped),
-            "a repopulation window is a lag, never an absent tier"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn an_unstamped_store_reads_as_absent() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let published = stable_candidate(directory.path(), 0)?;
-        let limits =
-            rift_search::SearchIndexLimits::builder(rift_index::LexicalIndexLimits::default())
-                .disable_semantic()
-                .build();
-        let database = directory.path().join("search.db");
-        // Opened and never populated, so nothing stamped a tree on it.
-        let index = rift_search::SearchIndex::open(&database, limits).await?;
-        assert_eq!(
-            super::store_revision(&index, &published).await,
-            super::StoreRevision::Absent
-        );
+    #[test]
+    fn a_store_holding_no_tree_warns_that_it_will_not_answer() -> TestResult {
+        let ranking = super::ranking_of(RevisionScoped::NoRevision, SemanticReadiness::Ready, 10)
+            .ok_or("a store holding no tree still ranks, by identifier matching alone")?;
+        assert!(ranking.units.is_empty());
+        let warnings = serde_json::to_value(&ranking.warnings)?;
+        assert_eq!(warnings[0]["code"], json!("lexical_ranking_unavailable"));
+        assert_eq!(warnings[1], json!(null), "exactly one warning is raised");
         Ok(())
     }
 
     #[test]
-    fn a_lagging_store_warns_stale_index_carrying_both_revisions() -> TestResult {
-        let ranking = super::SearchRanking::lagging("aaaaaaaa".to_owned(), "bbbbbbbb");
-        assert!(
-            ranking.units.is_empty(),
-            "a lagging store contributes no ranked unit"
-        );
+    fn a_matched_store_ranks_its_units_and_carries_the_readiness_warning() -> TestResult {
+        let ranking = super::ranking_of(
+            RevisionScoped::Matched(Vec::new()),
+            SemanticReadiness::Preparing {
+                prepared: 1,
+                total: 4,
+            },
+            10,
+        )
+        .ok_or("a matched store ranks")?;
+        assert!(ranking.units.is_empty());
         let warnings = serde_json::to_value(&ranking.warnings)?;
-        assert_eq!(warnings[0]["code"], json!("stale_index"));
-        assert_eq!(warnings[0]["index_tree_revision"], json!("aaaaaaaa"));
-        assert_eq!(warnings[0]["captured_tree_revision"], json!("bbbbbbbb"));
-        assert_eq!(warnings[1], json!(null), "exactly one warning is raised");
-        let detail = warnings[0]["detail"].as_str().unwrap_or_default();
-        assert!(
-            detail.contains("full-text tier"),
-            "the detail must name which of the two stores lagged: {detail}"
-        );
+        assert_eq!(warnings[0]["code"], json!("semantic_index_preparing"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_search_over_a_tree_the_store_never_held_warns_stale_index() -> TestResult {
+    async fn a_search_over_a_tree_the_store_never_held_asks_for_a_recapture() -> TestResult {
         let (_directory, server) = fixture().await?;
-        // A store the run's first pass has not reached yet holds no stamp at all, which is
-        // the absent tier rather than the lag this proves. Wait for that pass first.
+        // The store holds the served workspace's tree once the first pass has landed.
         search_after_population(&server, "beacon").await?;
-        // A snapshot of an unrelated workspace stands in for the repopulation window: its
+        // A snapshot of an unrelated workspace stands in for a superseded publication: its
         // tree revision is one the server's store was never populated for. Nothing writes
         // into the served workspace, so no rebuild can close the window mid-test.
         let other = tempfile::tempdir()?;
         fs::write(other.path().join("lib.rs"), "pub fn lantern() {}\n")?;
         let moved = stable_candidate(other.path(), 0)?;
         let params: SearchParams = serde_json::from_value(json!({"query": "lantern"}))?;
-        let ranking = server.ranking(&params, &moved).await?;
         assert!(
-            ranking.units.is_empty(),
-            "a store that never held this tree contributes no ranked unit"
-        );
-        let warnings = serde_json::to_value(&ranking.warnings)?;
-        assert_eq!(
-            warnings[0]["code"],
-            json!("stale_index"),
-            "a repopulation window is a lag, never the operator-action warning: {warnings:#}"
-        );
-        assert_eq!(
-            warnings[0]["captured_tree_revision"],
-            json!(moved.reads.tree_revision())
-        );
-        assert_ne!(
-            warnings[0]["index_tree_revision"], warnings[0]["captured_tree_revision"],
-            "the two revisions that disagree must both be named: {warnings:#}"
+            server.ranking(&params, &moved).await?.is_none(),
+            "a store that never held this tree ends the attempt rather than ranking"
         );
         Ok(())
     }
@@ -3695,6 +3612,23 @@ pub fn beacon() -> u64 {
     /// # Errors
     ///
     /// Returns the warnings the last answer still carried once the bound runs out.
+    /// The units the store ranks for whatever tree it is stamped with right now.
+    ///
+    /// A store is read under one revision, so a poll that watches for a pass to land reads
+    /// the stamp first and asks that same tree for its rows.
+    async fn ranked_now(
+        index: &rift_search::SearchIndex,
+        query: &str,
+    ) -> TestResult<Vec<rift_search::RankedUnit>> {
+        let Some(stamped) = index.tree_revision().await? else {
+            return Ok(Vec::new());
+        };
+        match index.search(&stamped, query, 8).await? {
+            RevisionScoped::Matched(ranked) => Ok(ranked),
+            other => Err(format!("the store moved while it was being read: {other:?}").into()),
+        }
+    }
+
     async fn search_after_population(server: &RiftMcp, query: &str) -> TestResult<SearchResult> {
         let mut answer = run_search(server, query).await?;
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
@@ -3784,7 +3718,7 @@ pub fn beacon() -> u64 {
             "the run's first pass must stamp the published tree revision"
         );
         assert!(
-            !index.search("beacon", 8).await?.is_empty(),
+            !ranked_now(&index, "beacon").await?.is_empty(),
             "the run's first pass must leave the published unit set searchable"
         );
 
@@ -3803,7 +3737,7 @@ pub fn beacon() -> u64 {
         // supersedes it hands the supervisor's instead. Poll under a bound rather than
         // racing which of the two passes ran.
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
-            if !index.search("lantern", 8).await?.is_empty() {
+            if !ranked_now(&index, "lantern").await?.is_empty() {
                 return Ok(());
             }
             tokio::time::sleep(SEARCH_TIER_POLL).await;

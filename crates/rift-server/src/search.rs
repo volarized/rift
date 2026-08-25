@@ -1637,9 +1637,13 @@ pub fn compute() -> i32 {
         let revision = service.tree_revision();
         index.replace_lexical(&units, revision).await?;
         index
-            .embed_described(&described, rift_search::Embedding::Every)
+            .embed_described(&described, rift_search::Embedding::Every, revision)
             .await?;
-        let ranked = index.search(query, 32).await?;
+        let rift_search::RevisionScoped::Matched(ranked) =
+            index.search(revision, query, 32).await?
+        else {
+            return Err("the store must hold the revision it was just stamped with".into());
+        };
         assert!(!ranked.is_empty(), "the fixture query must rank something");
         Ok(ranked)
     }

@@ -199,6 +199,22 @@ impl LexicalUnit {
     }
 }
 
+/// What one revision-qualified read of the store found.
+///
+/// A caller reads the store to answer for one published tree, so the stored stamp is part
+/// of the read rather than a separate lookup before it: the two run in one transaction,
+/// over one database snapshot, and a commit landing between them cannot go unseen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionScoped<T> {
+    /// The store held the expected tree revision, and this is what it answered.
+    Matched(T),
+    /// The store held another tree revision, named here. The caller's published tree was
+    /// superseded, and the answer it wanted is under the publication it has yet to see.
+    OtherRevision(String),
+    /// The store carries no tree revision at all, so no publication has ever landed in it.
+    NoRevision,
+}
+
 /// One lexical search hit.
 ///
 /// `bm25` is negative; lower is better. `rank` is only comparable within the
@@ -769,6 +785,19 @@ async fn delete_path_units(
     Ok(())
 }
 
+/// The tree revision the store is stamped with, read through `executor` so a caller can
+/// place it in the same transaction as the query it qualifies.
+async fn stored_tree_revision(
+    executor: &mut dyn Executor,
+) -> Result<Option<String>, LexicalIndexError> {
+    let record = LexicalIndexStateRecord::filter_by_id(LEXICAL_INDEX_STATE_ID)
+        .first()
+        .exec(executor)
+        .await
+        .map_err(storage_error)?;
+    Ok(record.map(|record| record.tree_revision))
+}
+
 /// How many units the typed table holds right now.
 async fn indexed_unit_count(executor: &mut dyn Executor) -> Result<usize, LexicalIndexError> {
     let rows = toasty::sql::query("SELECT count(*) FROM lexical_units")
@@ -1090,10 +1119,16 @@ impl LexicalSearchIndex {
         transaction.commit().await.map_err(storage_error)
     }
 
-    /// Searches indexed units, best matches first.
+    /// Searches the units stamped with `tree_revision`, best matches first.
     ///
-    /// An empty or all-punctuation `query` returns an empty result. The
-    /// effective result count is `limit` capped by `matches_max`.
+    /// The stored stamp and the matching rows are read in one transaction, so a commit
+    /// that lands between them cannot slip rows from another tree into the answer.
+    /// A store holding another tree returns [`RevisionScoped::OtherRevision`] rather than
+    /// rows the caller cannot place, and one holding no tree at all returns
+    /// [`RevisionScoped::NoRevision`].
+    ///
+    /// An empty or all-punctuation `query` matches nothing. The effective result count is
+    /// `limit` capped by `matches_max`.
     ///
     /// # Errors
     ///
@@ -1103,20 +1138,31 @@ impl LexicalSearchIndex {
     ///
     /// # Cancel safety
     ///
-    /// Cancellation performs no writes; the search issues one read-only
-    /// query.
+    /// Cancellation performs no writes; the transaction is read-only and is
+    /// rolled back when it is dropped.
     pub async fn search(
         &self,
+        tree_revision: &str,
         query: &str,
         limit: u32,
-    ) -> Result<Vec<LexicalMatch>, LexicalIndexError> {
+    ) -> Result<RevisionScoped<Vec<LexicalMatch>>, LexicalIndexError> {
         let terms_max = bound_as_usize(self.limits.query_terms_max());
-        let Some(expression) = match_expression(query, terms_max)? else {
-            return Ok(Vec::new());
-        };
+        let expression = match_expression(query, terms_max)?;
         let effective_limit = i64::from(limit.min(self.limits.matches_max()));
 
         let mut connection = self.configured_connection().await?;
+        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        let stored = stored_tree_revision(&mut transaction).await?;
+        match stored {
+            None => return Ok(RevisionScoped::NoRevision),
+            Some(stored) if stored != tree_revision => {
+                return Ok(RevisionScoped::OtherRevision(stored));
+            }
+            Some(_) => {}
+        }
+        let Some(expression) = expression else {
+            return Ok(RevisionScoped::Matched(Vec::new()));
+        };
         let rows = toasty::sql::query(lexical_search_sql())
             .bind(expression)
             .bind(effective_limit)
@@ -1127,11 +1173,14 @@ impl LexicalSearchIndex {
                 Type::String,
                 Type::F64,
             ])
-            .exec(&mut connection)
+            .exec(&mut transaction)
             .await
             .map_err(storage_error)?;
 
-        rows.iter().map(decode_lexical_match).collect()
+        rows.iter()
+            .map(decode_lexical_match)
+            .collect::<Result<Vec<_>, _>>()
+            .map(RevisionScoped::Matched)
     }
 
     /// Returns one unit's indexed content by its identity, or `None` when no
@@ -1166,12 +1215,7 @@ impl LexicalSearchIndex {
     /// Cancellation performs no writes; this issues one read-only lookup.
     pub async fn tree_revision(&self) -> Result<Option<String>, LexicalIndexError> {
         let mut connection = self.configured_connection().await?;
-        let record = LexicalIndexStateRecord::filter_by_id(LEXICAL_INDEX_STATE_ID)
-            .first()
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        Ok(record.map(|record| record.tree_revision))
+        stored_tree_revision(&mut connection).await
     }
 }
 
