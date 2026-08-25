@@ -20,6 +20,7 @@ rift-index.workspace = true
 rift-lsp.workspace = true
 rift-protocol.workspace = true
 rift-provider.workspace = true
+rift-search.workspace = true
 rift-syntax.workspace = true
 sha2.workspace = true
 tokio.workspace = true
