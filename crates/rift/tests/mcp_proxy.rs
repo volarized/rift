@@ -75,8 +75,18 @@ fn engine_workspace(behavior: &str, files: &[(&str, &str)]) -> TestResult<tempfi
     laid_out_workspace(files, &engine_table(behavior)?)
 }
 
-/// One fixture workspace holding `files` and a `rift.toml` carrying the
-/// orphan-safety idle timeout plus `engine`.
+/// The `[search.semantic]` table every fixture here declares.
+///
+/// Rift ships the semantic tier on, so a fixture carrying no such table would acquire
+/// the default model from the hub. A hermetic suite must not write into the developer's
+/// own Hugging Face cache, and on a runner with no network a default-on tier would spend
+/// its whole retry budget inside a detached task nobody waits on. `rift-mcp`'s
+/// `tests/hermetic_search.rs` states the same policy for that crate's suites, and its
+/// `live_semantic_search` suite is the one place the shipped default is exercised.
+const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
+
+/// One fixture workspace holding `files` and a `rift.toml` carrying the disabled
+/// semantic tier, the orphan-safety idle timeout, and `engine`.
 fn laid_out_workspace(files: &[(&str, &str)], engine: &str) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     for (name, source) in files {
@@ -84,7 +94,7 @@ fn laid_out_workspace(files: &[(&str, &str)], engine: &str) -> TestResult<tempfi
     }
     fs::write(
         directory.path().join("rift.toml"),
-        format!("[server]\nidle_timeout = \"60s\"\n{engine}"),
+        format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n{engine}"),
     )?;
     Ok(directory)
 }

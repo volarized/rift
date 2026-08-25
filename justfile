@@ -58,12 +58,15 @@ clean:
         fi
     done
 
-# One run of every suite, live engines included: the engine tier's own code
-# is only exercised against a real language server, so a hermetic run would
-# report it uncovered. Needs rust-analyzer on the default toolchain and bun
-# on the PATH. Coverage is this run's artifact, not a second run.
+# One run of every suite, live engines and the live model hub included: the
+# engine tier's own code is only exercised against a real language server, and
+# the semantic search tier's acquisition only against the real hub, so a
+# hermetic run would report both uncovered. Needs rust-analyzer on the default
+# toolchain, bun on the PATH, and network reach to huggingface.co; the model is
+# cached per machine, so only the first run pays for the download. Coverage is
+# this run's artifact, not a second run.
 test:
-    RIFT_ENGINE_LIVE=1 cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
 
 # The live-engine suites alone, for iterating on them without paying for
 # the instrumented workspace run.
@@ -72,6 +75,11 @@ engine-test:
     RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer
     RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_typescript
     RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_typescript
+
+# The live semantic-search suite alone, for iterating on it without paying for
+# the instrumented workspace run. Reaches the real model hub.
+search-test:
+    RIFT_SEARCH_LIVE=1 cargo test -p rift-mcp --test live_semantic_search
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py

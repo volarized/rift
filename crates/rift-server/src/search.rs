@@ -8,13 +8,14 @@ use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT};
 use rift_core::line;
 use rift_index::{
-    IndexedFile, LexicalMatch, LexicalUnitKind, PathMatcher, SymbolMatch, SymbolMatchRank,
+    IndexedFile, LexicalUnit, LexicalUnitKind, PathMatcher, SymbolMatch, SymbolMatchRank,
     TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     File, FileContent, MatchedField, PathPattern, PathSelector, SearchHit, SearchHitTarget,
     SearchParams, SearchParamsTarget, SearchResult, SymbolId,
 };
+use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::read::{
@@ -24,10 +25,10 @@ use crate::read::{
 
 impl ReadService {
     /// Searches indexed declarations and source lines, optionally narrowed or extended by
-    /// `params.paths`, merged with `lexical_matches` from the caller's lexical search-index
-    /// tier. `lexical_matches` is empty when that tier is unavailable or its stamped
-    /// revision no longer matches what is published - the caller decides that, this method
-    /// only merges what it is handed.
+    /// `params.paths`, merged with `ranked` from the caller's search index - the lexical
+    /// and semantic rankings already fused into one score. `ranked` is empty when that
+    /// index is unavailable or its stamped revision no longer matches what is published -
+    /// the caller decides that, this method only merges what it is handed.
     ///
     /// # Errors
     ///
@@ -36,7 +37,7 @@ impl ReadService {
     pub fn search(
         &self,
         params: &SearchParams,
-        lexical_matches: &[LexicalMatch],
+        ranked: &[RankedUnit],
     ) -> Result<SearchResult, ReadError> {
         validate_search(params)?;
         if self.revision().is_some() && force_include_requested(params) {
@@ -81,13 +82,7 @@ impl ReadService {
                 &mut results,
             )?;
         }
-        collect_lexical_hits(
-            self.index(),
-            query,
-            params.target,
-            lexical_matches,
-            &mut results,
-        );
+        collect_ranked_hits(self.index(), query, params.target, ranked, &mut results);
         order_by_relevance(&mut results);
         let (results, pagination) = page(results, params.page_index, limit);
         Ok(SearchResult {
@@ -95,6 +90,48 @@ impl ReadService {
             pagination,
             warnings: self.warnings(),
         })
+    }
+
+    /// Pairs each symbol unit in `units` with the declaration the semantic tier embeds for
+    /// it.
+    ///
+    /// Only a symbol unit carries a declaration: a text file's chunk describes none, so it
+    /// has no entry and the two slices are never parallel. Each pair is built from one
+    /// unit's own resolution, so a unit can never pick up another unit's declaration.
+    ///
+    /// The declaration's own source is the whole document: [`LexicalUnit::content`] already
+    /// holds the bytes the symbol was indexed from, and the text builder prefers source
+    /// over any metadata line.
+    ///
+    /// The walk runs over `units`, whose length this snapshot's own file and symbol bounds
+    /// already fixed, and each symbol unit costs one scan of the file it names, which is
+    /// how `resolve_symbol` narrows the lookup.
+    #[must_use]
+    pub fn described_units<'a>(&'a self, units: &'a [LexicalUnit]) -> Vec<DescribedUnit<'a>> {
+        units
+            .iter()
+            .filter(|unit| unit.kind() == LexicalUnitKind::Symbol)
+            .filter_map(|unit| self.described_unit(unit))
+            .collect()
+    }
+
+    /// How many files this snapshot indexes: visible source files and included text files
+    /// alike, which together are what [`ReadService::described_units`] derives from.
+    ///
+    /// A caller estimates the semantic tier's preparation work from this count.
+    #[must_use]
+    pub fn file_count(&self) -> u64 {
+        let files = self.index().files().len() + self.index().text_files().len();
+        u64::try_from(files).unwrap_or(u64::MAX)
+    }
+
+    /// One symbol unit paired with its declaration, or nothing when this snapshot no longer
+    /// holds the symbol the unit names.
+    fn described_unit<'a>(&'a self, unit: &'a LexicalUnit) -> Option<DescribedUnit<'a>> {
+        let (_, symbol) = resolve_symbol(self.index(), unit.path(), unit.identity())?;
+        let declaration =
+            Declaration::new(symbol.kind, &symbol.qualified_name).source(unit.content());
+        Some(DescribedUnit::new(unit, declaration))
     }
 }
 
@@ -175,7 +212,7 @@ fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> b
     matcher.is_none_or(|matcher| matcher.includes(&root.join(path.as_str())))
 }
 
-/// Symbol and lexical hits from the index, filtered by `matcher` and collected up to
+/// Symbol and source-line hits from the index, filtered by `matcher` and collected up to
 /// `fetch_limit` - the index's `results_max` bound, never the smaller page size - because
 /// [`order_by_relevance`] sorts this whole pool before one page is cut out of it: stopping
 /// collection at the page size could drop a later, higher-scoring candidate, and the page
@@ -266,9 +303,9 @@ fn symbol_search_hit(matched: SymbolMatch<'_>) -> SearchHit {
     build_symbol_hit(matched, score, vec![MatchedField::Name])
 }
 
-/// Builds one symbol hit's wire shape. `symbol_search_hit` and the lexical merge's
-/// `lexical_symbol_hit` share this: both surface the same declaration, differing only in
-/// score and which indexed field produced the match.
+/// Builds one symbol hit's wire shape. `symbol_search_hit` and `merge_symbol_hit` share
+/// this: both surface the same declaration, differing only in score and which indexed field
+/// produced the match.
 fn build_symbol_hit(
     matched: SymbolMatch<'_>,
     score: f64,
@@ -333,55 +370,50 @@ const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
     }
 }
 
-/// Maps lexical `bm25`'s negative best-first rank into a `(0, 1)` score, monotone and
-/// comparable within one request. A later dense-ranking layer fuses upstream of this merge,
-/// so the mapping stays deliberately local instead of trying to anticipate that fusion.
-fn lexical_score(rank: f64) -> f64 {
-    let magnitude = (-rank).max(0.0);
-    magnitude / (1.0 + magnitude)
-}
-
-/// Merges lexical search-index matches into `results`: a resolved symbol becomes a hit
-/// scored by [`lexical_score`], and a text file's best-ranked chunk becomes a file hit whose
-/// line is the first line containing a query term. Each merges against an
-/// identifier-matched hit already in `results` by identity, rather than duplicating it.
-fn collect_lexical_hits(
+/// Merges the search index's ranked units into `results`: a resolved symbol becomes a hit
+/// at its fused score, and a text file's best-scoring chunk becomes a file hit whose line is
+/// the first line containing a query term. Each merges against an identifier-matched hit
+/// already in `results` by identity, rather than duplicating it.
+///
+/// The score arrives already fused into 0 to 1, so nothing here converts a rank: two
+/// requests' scores mean the same thing because one fusion produced both.
+fn collect_ranked_hits(
     index: &WorkspaceIndex,
     query: &str,
     target: SearchParamsTarget,
-    lexical_matches: &[LexicalMatch],
+    ranked: &[RankedUnit],
     results: &mut Vec<SearchHit>,
 ) {
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
-        for matched in lexical_matches
+        for matched in ranked
             .iter()
             .filter(|matched| matched.kind() == LexicalUnitKind::Symbol)
         {
             let Some((file, symbol)) = resolve_symbol(index, matched.path(), matched.identity())
             else {
-                // The lexical tier indexed this symbol at a tree revision the request's
+                // The search index held this symbol at a tree revision the request's
                 // revision guard already proved current, but a symbol it named can still be
                 // gone from this exact index (a race the guard narrows, never closes to
                 // zero); skipping it silently is correct, not a defect to surface.
                 continue;
             };
-            merge_symbol_hit(results, file, symbol, lexical_score(matched.rank()));
+            merge_symbol_hit(results, file, symbol, matched.score());
         }
     }
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::File) {
-        for (path, rank) in best_rank_per_text_file(lexical_matches) {
+        for (path, score) in best_score_per_text_file(ranked) {
             let Some(file) = index.text_files().iter().find(|file| file.path() == &path) else {
                 continue;
             };
             let (line_number, range, text) = locate_query_line(file.content(), query);
-            merge_file_hit(results, file, line_number, range, text, lexical_score(rank));
+            merge_file_hit(results, file, line_number, range, text, score);
         }
     }
 }
 
-/// Resolves one lexical symbol match's identity back to its declaration in `index`. `path`
-/// narrows the search to the one file the lexical unit named, so this stays a scan of that
-/// file's own symbols rather than the whole index.
+/// Resolves one ranked symbol unit's identity back to its declaration in `index`. `path`
+/// narrows the search to the one file the unit named, so this stays a scan of that file's
+/// own symbols rather than the whole index.
 fn resolve_symbol<'a>(
     index: &'a WorkspaceIndex,
     path: &ProjectPath,
@@ -399,18 +431,18 @@ fn resolve_symbol<'a>(
     Some((file, symbol))
 }
 
-/// Collapses text-file lexical matches to one entry per path, keeping the best (most
-/// negative) `bm25` rank when a file contributed more than one chunk match.
-fn best_rank_per_text_file(lexical_matches: &[LexicalMatch]) -> Vec<(ProjectPath, f64)> {
+/// Collapses ranked text-file units to one entry per path, keeping the best - the highest -
+/// fused score when a file contributed more than one chunk.
+fn best_score_per_text_file(ranked: &[RankedUnit]) -> Vec<(ProjectPath, f64)> {
     let mut best: Vec<(ProjectPath, f64)> = Vec::new();
-    for matched in lexical_matches
+    for matched in ranked
         .iter()
         .filter(|matched| matched.kind() == LexicalUnitKind::TextFile)
     {
         if let Some(entry) = best.iter_mut().find(|(path, _)| path == matched.path()) {
-            entry.1 = entry.1.min(matched.rank());
+            entry.1 = entry.1.max(matched.score());
         } else {
-            best.push((matched.path().clone(), matched.rank()));
+            best.push((matched.path().clone(), matched.score()));
         }
     }
     best
@@ -439,8 +471,8 @@ fn locate_query_line(content: &str, query: &str) -> (u64, ByteRange, String) {
     (1, ByteRange { start: 0, end }, content.to_owned())
 }
 
-/// Merges one resolved lexical symbol hit: an identifier-matched hit for the same symbol
-/// keeps its place and absorbs `score`; otherwise the lexical hit joins `results` new.
+/// Merges one resolved ranked symbol unit: an identifier-matched hit for the same symbol
+/// keeps its place and absorbs `score`; otherwise the ranked hit joins `results` new.
 fn merge_symbol_hit(
     results: &mut Vec<SearchHit>,
     file: &IndexedFile,
@@ -462,8 +494,8 @@ fn merge_symbol_hit(
     let matched = SymbolMatch {
         file,
         symbol,
-        // Unused: `lexical_symbol_hit`'s caller supplies `score` directly, never
-        // `symbol_match_score`, so no identifier rank need be a genuine one here.
+        // Unused: this caller supplies `score` directly, never `symbol_match_score`, so
+        // no identifier rank need be a genuine one here.
         rank: SymbolMatchRank::Substring,
     };
     results.push(build_symbol_hit(
@@ -473,8 +505,8 @@ fn merge_symbol_hit(
     ));
 }
 
-/// Merges one lexical text-file hit: an identifier-matched hit at the same path and line
-/// keeps its place and absorbs `score`; otherwise the lexical hit joins `results` new.
+/// Merges one ranked text-file unit: an identifier-matched hit at the same path and line
+/// keeps its place and absorbs `score`; otherwise the ranked hit joins `results` new.
 fn merge_file_hit(
     results: &mut Vec<SearchHit>,
     file: &TextSourceFile,
@@ -493,7 +525,7 @@ fn merge_file_hit(
         absorb_content_match(existing, score);
         return;
     }
-    results.push(lexical_file_hit(file, line_number, range, text, score));
+    results.push(ranked_file_hit(file, line_number, range, text, score));
 }
 
 /// Records that `existing` also matched by content: adds [`MatchedField::Content`] when
@@ -505,7 +537,7 @@ fn absorb_content_match(existing: &mut SearchHit, score: f64) {
     existing.score = existing.score.max(score);
 }
 
-fn lexical_file_hit(
+fn ranked_file_hit(
     file: &TextSourceFile,
     line_number: u64,
     range: ByteRange,
@@ -567,12 +599,13 @@ mod tests {
 
     use rift_core::SourceVisibility;
     use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
-    use rift_index::{LexicalMatch, LexicalUnitKind, WorkspaceIndexLimits};
+    use rift_index::{LexicalIndexLimits, LexicalUnitKind, WorkspaceIndexLimits};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
         ExactKind, Extensions, FileContent, FileId, MatchedField, Node, NodeId, SearchParams,
         SearchParamsTarget, TextRange,
     };
+    use rift_search::{RankedUnit, SearchIndex, SearchIndexLimits};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1514,36 +1547,6 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "lexical_score is deterministic pure arithmetic over exact literals; the \
-                  equality it proves is exact, not a measurement subject to rounding drift"
-    )]
-    fn lexical_score_stays_within_zero_one_and_is_monotone_in_rank() {
-        let ranks = [-100.0, -10.0, -5.0, -1.0, -0.5, -0.001];
-        let scores: Vec<f64> = ranks
-            .iter()
-            .map(|&rank| super::lexical_score(rank))
-            .collect();
-        for (rank, score) in ranks.iter().zip(&scores) {
-            assert!(
-                *score > 0.0 && *score < 1.0,
-                "score for rank {rank} must lie in (0, 1): {score}"
-            );
-        }
-        for pair in scores.windows(2) {
-            assert!(
-                pair[0] > pair[1],
-                "a more negative bm25 rank must score strictly higher: {pair:?}"
-            );
-        }
-        // bm25 never produces a non-negative rank, but the mapping still clamps rather than
-        // producing a negative or out-of-range score.
-        assert_eq!(super::lexical_score(0.0), 0.0);
-        assert_eq!(super::lexical_score(5.0), 0.0);
-    }
-
     fn indexed_symbol<'a>(
         service: &'a ReadService,
         path: &str,
@@ -1602,23 +1605,95 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// One search index over `database`, semantic tier off, holding `service`'s own units,
+    /// searched for `query`. A [`RankedUnit`] carries no constructor of its own, so the tier
+    /// that produces them is the only way a test obtains one.
+    async fn ranked_units(
+        database: &std::path::Path,
+        service: &ReadService,
+        query: &str,
+    ) -> TestResult<Vec<RankedUnit>> {
+        let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
+            .disable_semantic()
+            .build();
+        let index = SearchIndex::open(database, limits).await?;
+        let units = service.lexical_units();
+        let described = service.described_units(&units);
+        let revision = service.tree_revision();
+        index.build(&units, &described, revision).await?;
+        let ranked = index.search(query, 32).await?;
+        assert!(!ranked.is_empty(), "the fixture query must rank something");
+        Ok(ranked)
+    }
+
+    /// One workspace holding neither the fixture's declarations nor its text file, so every
+    /// address the fixture ranked is one this index cannot resolve.
+    fn unrelated_workspace() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("other.rs"), "pub fn unrelated() {}\n")?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let root = directory.path();
+        let service = ReadService::build(root, limits, &visibility, &text_inclusion, history)?;
+        Ok((directory, service))
+    }
+
     #[test]
-    fn collect_lexical_hits_skips_a_symbol_identity_the_index_no_longer_carries() -> TestResult {
+    fn described_units_pair_every_symbol_and_no_text_file_with_its_own_declaration() -> TestResult {
         let (_directory, service) = fixture()?;
-        let path = rift_core::ProjectPath::new("src/lib.rs")?;
-        let vanished = LexicalMatch::new(
-            "rift://symbol/rust/src/lib.rs/Vanished",
-            path,
-            LexicalUnitKind::Symbol,
-            Some("Vanished".to_owned()),
-            -5.0,
+        let units = service.lexical_units();
+        let described = service.described_units(&units);
+        let symbols: Vec<_> = units
+            .iter()
+            .filter(|unit| unit.kind() == LexicalUnitKind::Symbol)
+            .collect();
+        let texts = units
+            .iter()
+            .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+            .count();
+        assert!(texts > 0, "the fixture must contribute a text-file unit");
+        assert_eq!(
+            described.len(),
+            symbols.len(),
+            "every symbol unit is described and no text-file unit is"
         );
+        for one in &described {
+            assert_eq!(
+                one.unit().kind(),
+                LexicalUnitKind::Symbol,
+                "a text-file unit must never be described"
+            );
+            let identity = one.unit().identity();
+            let text = rift_search::document(one.declaration()).into_text();
+            assert!(
+                text.contains(one.unit().content()),
+                "each description must carry its own unit's declaration: {identity} {text}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_ranked_hits_skips_a_symbol_identity_the_index_no_longer_carries() -> TestResult
+    {
+        let (directory, service) = fixture()?;
+        let database = directory.path().join("search.db");
+        let ranked = ranked_units(&database, &service, "Beacon").await?;
+        assert!(
+            ranked
+                .iter()
+                .any(|unit| unit.kind() == LexicalUnitKind::Symbol),
+            "the fixture query must rank a symbol unit: {ranked:#?}"
+        );
+        let (_other, unrelated) = unrelated_workspace()?;
         let mut results = Vec::new();
-        super::collect_lexical_hits(
-            service.index(),
+        super::collect_ranked_hits(
+            unrelated.index(),
             "Beacon",
-            SearchParamsTarget::All,
-            &[vanished],
+            SearchParamsTarget::Symbol,
+            &ranked,
             &mut results,
         );
         assert!(
@@ -1628,24 +1703,25 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[test]
-    fn collect_lexical_hits_skips_a_text_file_path_the_index_no_longer_carries() -> TestResult {
-        // `fixture()` includes `README.txt` as its only text file, so `guide.txt` is a path
-        // the index never carried.
-        let (_directory, service) = fixture()?;
-        let vanished = LexicalMatch::new(
-            "guide.txt",
-            rift_core::ProjectPath::new("guide.txt")?,
-            LexicalUnitKind::TextFile,
-            Some("guide".to_owned()),
-            -5.0,
+    #[tokio::test]
+    async fn collect_ranked_hits_skips_a_text_file_path_the_index_no_longer_carries() -> TestResult
+    {
+        let (directory, service) = fixture()?;
+        let database = directory.path().join("search.db");
+        let ranked = ranked_units(&database, &service, "Beacon").await?;
+        assert!(
+            ranked
+                .iter()
+                .any(|unit| unit.kind() == LexicalUnitKind::TextFile),
+            "the fixture query must rank the text file: {ranked:#?}"
         );
+        let (_other, unrelated) = unrelated_workspace()?;
         let mut results = Vec::new();
-        super::collect_lexical_hits(
-            service.index(),
+        super::collect_ranked_hits(
+            unrelated.index(),
             "Beacon",
-            SearchParamsTarget::All,
-            &[vanished],
+            SearchParamsTarget::File,
+            &ranked,
             &mut results,
         );
         assert!(
@@ -1655,54 +1731,88 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         clippy::float_cmp,
-        reason = "the winning score is `lexical_score` applied to the exact literal rank the \
-                  test supplies, not a measurement subject to rounding drift"
+        reason = "the surviving score is one of the fused scores the tier returned, compared \
+                  against that exact value rather than a measurement"
     )]
-    fn text_file_lexical_matches_dedupe_to_one_hit_at_the_best_rank() -> TestResult {
+    async fn text_file_chunk_units_collapse_to_one_hit_at_the_best_score() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let content = "intro\nsearch replace all units here\nend\n";
-        fs::write(directory.path().join("guide.txt"), content)?;
-        let limits = WorkspaceIndexLimits::default();
-        let visibility = SourceVisibility::default();
-        let text_inclusion = rift_core::TextFileInclusion::default();
+        fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
+        // The smallest accepted chunk bound against a several-kilobyte guide forces the file
+        // into more than one lexical unit, each of which the query matches.
+        let text_inclusion = rift_core::TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
         let service = ReadService::build(
             directory.path(),
-            limits,
-            &visibility,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
             &text_inclusion,
             HistoryConfiguration::default(),
         )?;
-        let worse = LexicalMatch::new(
-            "guide.txt#0",
-            rift_core::ProjectPath::new("guide.txt")?,
-            LexicalUnitKind::TextFile,
-            Some("guide".to_owned()),
-            -1.0,
+        let database = directory.path().join("search.db");
+        let ranked = ranked_units(&database, &service, "word").await?;
+        let chunks = ranked
+            .iter()
+            .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+            .count();
+        assert!(
+            chunks > 1,
+            "the oversized guide must rank more than one chunk: {ranked:#?}"
         );
-        let better = LexicalMatch::new(
-            "guide.txt#1",
-            rift_core::ProjectPath::new("guide.txt")?,
-            LexicalUnitKind::TextFile,
-            Some("guide".to_owned()),
-            -9.0,
-        );
+        let best = ranked
+            .iter()
+            .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+            .map(rift_search::RankedUnit::score)
+            .fold(f64::MIN, f64::max);
         let mut results = Vec::new();
-        super::collect_lexical_hits(
+        super::collect_ranked_hits(
             service.index(),
-            "units",
-            SearchParamsTarget::All,
-            &[worse, better],
+            "word",
+            SearchParamsTarget::File,
+            &ranked,
             &mut results,
         );
         assert_eq!(
             results.len(),
             1,
-            "chunk matches for the same file must collapse to one hit: {results:#?}"
+            "chunk units for the same file must collapse to one hit: {results:#?}"
         );
-        assert_eq!(results[0].score, super::lexical_score(-9.0));
+        assert_eq!(results[0].score, best, "the best fused score must survive");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_merges_every_ranked_unit_while_the_semantic_tier_is_off() -> TestResult {
+        let (directory, service) = fixture()?;
+        let database = directory.path().join("search.db");
+        let ranked = ranked_units(&database, &service, "Beacon").await?;
+        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon"}))?;
+        let answer = service.search(&params, &ranked)?;
+        for unit in &ranked {
+            let path = unit.path().as_str();
+            assert!(
+                answer
+                    .results
+                    .iter()
+                    .any(|hit| hit.path.as_ref().map(|found| found.0.as_str()) == Some(path)),
+                "every ranked unit must reach the answer: path={path} answer={answer:#?}"
+            );
+        }
+        assert!(
+            answer
+                .results
+                .iter()
+                .all(|hit| hit.score > 0.0 && hit.score <= 1.0),
+            "a fused score reaches the wire unchanged, inside 0 to 1: {answer:#?}"
+        );
+        assert!(
+            answer
+                .results
+                .iter()
+                .any(|hit| hit.matched_by.contains(&MatchedField::Content)),
+            "a ranked unit merges as a content match: {answer:#?}"
+        );
         Ok(())
     }
 

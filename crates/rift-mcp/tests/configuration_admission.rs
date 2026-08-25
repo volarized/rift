@@ -2,6 +2,8 @@
 //! rmcp client: an invalid file fails every tool as `configuration_invalid`,
 //! and fixing the file recovers without a restart.
 
+mod hermetic_search;
+
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -63,12 +65,20 @@ extensions = ["md", "rst"]
 max_chunk = "2mb"
 "#;
 
+/// One workspace whose `rift.toml` turns the semantic tier off and then carries
+/// `configuration`, so the suite still proves what acceptance does with that block.
+///
+/// A fixture serving a block acceptance refuses falls back to the shipped tables,
+/// the disabling one included; the server's own acquisition gate is what keeps that
+/// case from reaching the hub.
 fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-    if let Some(contents) = configuration {
-        fs::write(directory.path().join("rift.toml"), contents)?;
+    let mut contents = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    if let Some(configuration) = configuration {
+        contents.push_str(configuration);
     }
+    fs::write(directory.path().join("rift.toml"), contents)?;
     Ok(directory)
 }
 
@@ -146,7 +156,11 @@ async fn fixing_the_file_recovers_without_a_restart() -> TestResult {
     let client = client_for(directory.path()).await?;
 
     refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    fs::write(directory.path().join("rift.toml"), VALID_CONFIGURATION)?;
+    let contents = format!(
+        "{}{VALID_CONFIGURATION}",
+        hermetic_search::SEMANTIC_DISABLED
+    );
+    fs::write(directory.path().join("rift.toml"), contents)?;
 
     let recovered = client
         .call_tool(
@@ -176,7 +190,11 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
         .await?;
     assert!(served.structured_content.is_some());
 
-    fs::write(directory.path().join("rift.toml"), INVALID_CONFIGURATION)?;
+    let contents = format!(
+        "{}{INVALID_CONFIGURATION}",
+        hermetic_search::SEMANTIC_DISABLED
+    );
+    fs::write(directory.path().join("rift.toml"), contents)?;
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
     assert_eq!(refused["code"], json!("configuration_invalid"));
 
