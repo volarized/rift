@@ -7,12 +7,26 @@ use std::path::{Path, PathBuf};
 use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_index::{
     LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalSearchIndex,
-    LexicalUnit, LexicalUnitKind,
+    LexicalUnit, LexicalUnitKind, RevisionScoped,
 };
 use tempfile::TempDir;
 use toasty::Db;
 use toasty::stmt::Type;
 use toasty_driver_sqlite::Sqlite;
+
+/// The matches one revision-qualified search returned, refusing any answer the store could
+/// not place under `tree_revision`.
+async fn search_matches(
+    index: &LexicalSearchIndex,
+    tree_revision: &str,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<LexicalMatch>, Box<dyn std::error::Error>> {
+    match index.search(tree_revision, query, limit).await? {
+        RevisionScoped::Matched(matches) => Ok(matches),
+        other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
+    }
+}
 
 /// Builds one text-file unit; its identity is its own path, per convention.
 fn text_unit(path: &str, content: &str) -> Result<LexicalUnit, Box<dyn std::error::Error>> {
@@ -61,7 +75,7 @@ async fn test_lexical_search_index_replace_all_and_search_multi_word_query_hits(
     ];
     index.replace_all(&units, "revision-1").await?;
 
-    let hits = index.search("alpha other", 10).await?;
+    let hits = search_matches(&index, "revision-1", "alpha other", 10).await?;
     let identities: Vec<&str> = hits.iter().map(LexicalMatch::identity).collect();
     assert_eq!(
         identities.len(),
@@ -86,7 +100,7 @@ async fn test_lexical_search_index_search_orders_better_match_first()
     ];
     index.replace_all(&units, "revision-1").await?;
 
-    let hits = index.search("beacon", 10).await?;
+    let hits = search_matches(&index, "revision-1", "beacon", 10).await?;
     assert_eq!(hits.len(), 2);
     assert_eq!(
         hits[0].identity(),
@@ -114,14 +128,14 @@ async fn test_lexical_search_index_search_limit_and_matches_max_cap_results()
     }
     index.replace_all(&units, "revision-1").await?;
 
-    let capped_by_matches_max = index.search("shared", 10).await?;
+    let capped_by_matches_max = search_matches(&index, "revision-1", "shared", 10).await?;
     assert_eq!(
         capped_by_matches_max.len(),
         2,
         "matches_max must cap results"
     );
 
-    let capped_by_limit = index.search("shared", 1).await?;
+    let capped_by_limit = search_matches(&index, "revision-1", "shared", 1).await?;
     assert_eq!(capped_by_limit.len(), 1, "explicit limit must cap results");
     Ok(())
 }
@@ -136,7 +150,7 @@ async fn test_lexical_search_index_search_empty_query_returns_empty()
     let units = [text_unit("docs/a.md", "content")?];
     index.replace_all(&units, "revision-1").await?;
 
-    let hits = index.search("   ", 10).await?;
+    let hits = search_matches(&index, "revision-1", "   ", 10).await?;
     assert_eq!(hits, Vec::new());
     Ok(())
 }
@@ -152,7 +166,7 @@ async fn test_lexical_search_index_open_with_single_pool_slot_still_serves_searc
     let units = [text_unit("docs/a.md", "single slot content")?];
     index.replace_all(&units, "revision-1").await?;
 
-    let hits = index.search("single", 10).await?;
+    let hits = search_matches(&index, "revision-1", "single", 10).await?;
     assert_eq!(
         hits.len(),
         1,
@@ -180,7 +194,7 @@ async fn test_lexical_search_index_replace_all_over_units_max_refuses_and_prior_
     let error = outcome.expect_err("batch bound violation must refuse");
     assert_eq!(error.fault().violation(), LexicalIndexViolation::UnitLimit);
 
-    let hits = index.search("kept", 10).await?;
+    let hits = search_matches(&index, "revision-1", "kept", 10).await?;
     assert_eq!(
         hits.len(),
         1,
@@ -253,9 +267,9 @@ async fn test_lexical_search_index_second_replace_all_fully_supersedes_first()
     let second = [text_unit("docs/b.md", "secondwordonly content")?];
     index.replace_all(&second, "revision-2").await?;
 
-    let stale_hits = index.search("firstwordonly", 10).await?;
+    let stale_hits = search_matches(&index, "revision-2", "firstwordonly", 10).await?;
     assert_eq!(stale_hits, Vec::new(), "old rows must be unfindable");
-    let hits = index.search("secondwordonly", 10).await?;
+    let hits = search_matches(&index, "revision-2", "secondwordonly", 10).await?;
     assert_eq!(hits.len(), 1);
     assert_eq!(index.tree_revision().await?, Some("revision-2".to_owned()));
     Ok(())
@@ -314,7 +328,7 @@ async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows()
         reopened.tree_revision().await?,
         Some("revision-1".to_owned())
     );
-    let hits = reopened.search("persisted", 10).await?;
+    let hits = search_matches(&reopened, "revision-1", "persisted", 10).await?;
     assert_eq!(
         hits.len(),
         1,
@@ -339,13 +353,13 @@ async fn test_lexical_search_index_symbol_and_text_file_units_coexist()
     let text = text_unit("docs/widgets.md", "widget documentation prose")?;
     index.replace_all(&[symbol, text], "revision-1").await?;
 
-    let symbol_hits = index.search("paint_surface", 10).await?;
+    let symbol_hits = search_matches(&index, "revision-1", "paint_surface", 10).await?;
     assert_eq!(symbol_hits.len(), 1);
     assert_eq!(symbol_hits[0].kind(), LexicalUnitKind::Symbol);
     assert_eq!(symbol_hits[0].path().as_str(), "src/widgets.rs");
     assert_eq!(symbol_hits[0].name(), Some("render"));
 
-    let text_hits = index.search("prose", 10).await?;
+    let text_hits = search_matches(&index, "revision-1", "prose", 10).await?;
     assert_eq!(text_hits.len(), 1);
     assert_eq!(text_hits[0].kind(), LexicalUnitKind::TextFile);
     assert_eq!(text_hits[0].path().as_str(), "docs/widgets.md");
@@ -374,7 +388,7 @@ async fn test_lexical_search_index_search_name_match_outranks_body_only_match()
     )?;
     index.replace_all(&[named, bodied], "revision-1").await?;
 
-    let hits = index.search("search", 10).await?;
+    let hits = search_matches(&index, "revision-1", "search", 10).await?;
     assert_eq!(hits.len(), 2, "both name and body matches must be found");
     assert_eq!(
         hits[0].identity(),
@@ -399,7 +413,7 @@ async fn test_lexical_search_index_search_finds_camel_case_name_by_expanded_word
     )?;
     index.replace_all(&[unit], "revision-1").await?;
 
-    let hits = index.search("user name", 10).await?;
+    let hits = search_matches(&index, "revision-1", "user name", 10).await?;
     assert_eq!(
         hits.len(),
         1,
@@ -511,6 +525,9 @@ async fn test_lexical_search_index_search_stored_invalid_path_refuses()
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    // The stamp qualifies the query, so the store carries one before the corrupt row
+    // reaches it; the decode this test is about runs only for a store holding this tree.
+    index.replace_all(&[], "revision-1").await?;
 
     let probe_database = open_concurrent_probe(&path).await?;
     insert_corrupt_lexical_row(
@@ -522,7 +539,7 @@ async fn test_lexical_search_index_search_stored_invalid_path_refuses()
     )
     .await?;
 
-    let outcome = index.search("corrupt", 10).await;
+    let outcome = index.search("revision-1", "corrupt", 10).await;
     let error = outcome.expect_err("a stored row with an invalid path must refuse");
     assert_eq!(
         error.fault().violation(),
@@ -537,6 +554,7 @@ async fn test_lexical_search_index_search_stored_invalid_kind_refuses()
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    index.replace_all(&[], "revision-1").await?;
 
     let probe_database = open_concurrent_probe(&path).await?;
     insert_corrupt_lexical_row(
@@ -548,7 +566,7 @@ async fn test_lexical_search_index_search_stored_invalid_kind_refuses()
     )
     .await?;
 
-    let outcome = index.search("corrupt", 10).await;
+    let outcome = index.search("revision-1", "corrupt", 10).await;
     let error = outcome.expect_err("a stored row with an unknown kind must refuse");
     assert_eq!(
         error.fault().violation(),
@@ -690,9 +708,23 @@ async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest()
         index.tree_revision().await?,
         Some("revision-two".to_owned())
     );
-    assert_eq!(index.search("secondgamma", 8).await?.len(), 1);
-    assert!(index.search("firstbeta", 8).await?.is_empty());
-    assert_eq!(index.search("keptalpha", 8).await?.len(), 1);
+    assert_eq!(
+        search_matches(&index, "revision-two", "secondgamma", 8)
+            .await?
+            .len(),
+        1
+    );
+    assert!(
+        search_matches(&index, "revision-two", "firstbeta", 8)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        search_matches(&index, "revision-two", "keptalpha", 8)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -719,11 +751,20 @@ async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_pat
         "chapter betatwo",
     )?;
     index.replace_all(&[first, second], "revision-one").await?;
-    assert_eq!(index.search("chapter", 8).await?.len(), 2);
+    assert_eq!(
+        search_matches(&index, "revision-one", "chapter", 8)
+            .await?
+            .len(),
+        2
+    );
 
     let change = LexicalChange::new(vec![ProjectPath::new("docs/guide.md")?], Vec::new());
     index.apply(&change, "revision-two").await?;
-    assert!(index.search("chapter", 8).await?.is_empty());
+    assert!(
+        search_matches(&index, "revision-two", "chapter", 8)
+            .await?
+            .is_empty()
+    );
     assert_eq!(
         index.tree_revision().await?,
         Some("revision-two".to_owned())
@@ -760,7 +801,12 @@ async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max(
         Some("revision-one".to_owned()),
         "a refused apply leaves the previous stamp intact"
     );
-    assert_eq!(index.search("alphaone", 8).await?.len(), 1);
+    assert_eq!(
+        search_matches(&index, "revision-one", "alphaone", 8)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -818,8 +864,17 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
         reopened.tree_revision().await?,
         Some("revision-two".to_owned())
     );
-    assert_eq!(reopened.search("betatwo", 8).await?.len(), 1);
-    assert!(reopened.search("alphaone", 8).await?.is_empty());
+    assert_eq!(
+        search_matches(&reopened, "revision-two", "betatwo", 8)
+            .await?
+            .len(),
+        1
+    );
+    assert!(
+        search_matches(&reopened, "revision-two", "alphaone", 8)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -845,6 +900,61 @@ async fn test_lexical_search_index_deletes_one_path_through_its_own_index()
     assert!(
         plan.contains("lexical_units_path"),
         "a per-path delete must use the path index: plan={plan}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_search_under_another_revision_names_the_stored_one()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let index =
+        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    index
+        .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-two")
+        .await?;
+
+    // A caller holding the previous publication asks for a tree the store has moved past.
+    // Naming what it holds is what lets that caller recapture instead of ranking rows it
+    // cannot place.
+    assert_eq!(
+        index.search("revision-one", "alphaone", 8).await?,
+        RevisionScoped::OtherRevision("revision-two".to_owned())
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_search_before_any_population_reports_no_revision()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let index =
+        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+
+    assert_eq!(
+        index.search("revision-one", "alphaone", 8).await?,
+        RevisionScoped::NoRevision
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_too()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let index =
+        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+
+    // A query with no term matches nothing, but the store still has to be the one the
+    // caller asked for: an empty answer from another tree is not the same answer.
+    assert_eq!(
+        index.search("revision-one", "   ", 8).await?,
+        RevisionScoped::NoRevision
+    );
+    index.replace_all(&[], "revision-one").await?;
+    assert_eq!(
+        index.search("revision-one", "   ", 8).await?,
+        RevisionScoped::Matched(Vec::new())
     );
     Ok(())
 }

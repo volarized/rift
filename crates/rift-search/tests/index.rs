@@ -13,8 +13,8 @@ use rift_index::{
 };
 use rift_search::{
     AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, ModelSource,
-    RankedUnit, SearchError, SearchIndex, SearchIndexLimits, SearchViolation, SemanticReadiness,
-    document,
+    RankedUnit, RevisionScoped, SearchError, SearchIndex, SearchIndexLimits, SearchViolation,
+    SemanticReadiness, document,
 };
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::processors::bert::BertProcessing;
@@ -316,12 +316,22 @@ async fn drop_stored_vectors(root: &Path, name: &str) -> TestResult {
 /// The order the lexical tier alone puts a query in.
 async fn lexical_order(root: &Path, query: &str, limit: u32) -> Fallible<Vec<String>> {
     let index = LexicalSearchIndex::open(&database(root), lexical_limits()).await?;
-    Ok(index
-        .search(query, limit)
-        .await?
+    let RevisionScoped::Matched(matches) = index.search(REVISION, query, limit).await? else {
+        return Err("the lexical store must hold the fixture revision".into());
+    };
+    Ok(matches
         .iter()
         .map(|matched| matched.identity().to_owned())
         .collect())
+}
+
+/// The units one search ranked, refusing an answer the store could not place under
+/// `REVISION`.
+async fn ranked_units(index: &SearchIndex, query: &str, limit: u32) -> Fallible<Vec<RankedUnit>> {
+    match index.search(REVISION, query, limit).await? {
+        RevisionScoped::Matched(ranked) => Ok(ranked),
+        other => Err(format!("the store must hold {REVISION}: {other:?}").into()),
+    }
 }
 
 fn identities(ranked: &[RankedUnit]) -> Vec<&str> {
@@ -414,7 +424,9 @@ async fn whole_pass(
     tree_revision: &str,
 ) -> Result<(), SearchError> {
     index.replace_lexical(units, tree_revision).await?;
-    index.embed_described(described, Embedding::Every).await
+    index
+        .embed_described(described, Embedding::Every, tree_revision)
+        .await
 }
 
 /// The same pass incrementally: only declarations the store has no vector for are embedded.
@@ -425,7 +437,9 @@ async fn incremental_pass(
     tree_revision: &str,
 ) -> Result<(), SearchError> {
     index.replace_lexical(units, tree_revision).await?;
-    index.embed_described(described, Embedding::Missing).await
+    index
+        .embed_described(described, Embedding::Missing, tree_revision)
+        .await
 }
 
 #[tokio::test]
@@ -447,7 +461,7 @@ async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> Te
     let reopened = opened(root.path(), limits()).await?;
     assert_eq!(reopened.tree_revision().await?, Some(REVISION.to_owned()));
     assert_eq!(
-        identities(&reopened.search("load config", 10).await?),
+        identities(&ranked_units(&reopened, "load config", 10).await?),
         ["one"],
         "the units the first index wrote are still there"
     );
@@ -467,7 +481,7 @@ async fn a_build_with_no_declarations_leaves_the_semantic_tier_ready() -> TestRe
     assert_eq!(index.tree_revision().await?, Some(REVISION.to_owned()));
     assert!(stored(root.path(), "model").await?.is_empty());
     assert!(
-        index.search("load config", 10).await?.is_empty(),
+        ranked_units(&index, "load config", 10).await?.is_empty(),
         "a tier holding no vector ranks nothing, and neither tier refuses"
     );
     Ok(())
@@ -625,7 +639,7 @@ async fn a_disabled_tier_answers_in_the_lexical_order_alone() -> TestResult {
         "a disabled tier embeds nothing"
     );
 
-    let ranked = index.search("load config read index", 10).await?;
+    let ranked = ranked_units(&index, "load config read index", 10).await?;
     assert_eq!(
         identities(&ranked),
         lexical_order(root.path(), "load config read index", 10).await?,
@@ -652,7 +666,7 @@ async fn a_query_the_lexical_tier_cannot_answer_is_still_ranked_through_the_sema
         lexical_order(root.path(), "search", 10).await?.is_empty(),
         "the query shares no token with either unit"
     );
-    let ranked = index.search("search", 10).await?;
+    let ranked = ranked_units(&index, "search", 10).await?;
     let reached = identities(&ranked);
     assert!(
         reached.contains(&"one") && reached.contains(&"two"),
@@ -681,7 +695,7 @@ async fn a_vector_lands_on_the_unit_whose_declaration_produced_it() -> TestResul
 
     assert_eq!(stored(root.path(), "model").await?.len(), 2);
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
-    let ranked = index.search("search", 10).await?;
+    let ranked = ranked_units(&index, "search", 10).await?;
     let reached = placed(&ranked);
     assert_eq!(
         reached,
@@ -716,7 +730,7 @@ async fn more_units_than_described_entries_leave_the_undescribed_ones_without_a_
     );
     assert_eq!(vectors[0].digest(), digest_of(&declarations[0]));
     assert_eq!(
-        identities(&index.search("search", 10).await?),
+        identities(&ranked_units(&index, "search", 10).await?),
         ["sym-one"],
         "the only vector resolves to the only described unit"
     );
@@ -740,7 +754,7 @@ async fn more_described_entries_than_units_still_land_each_vector_on_its_own_uni
     let vectors = stored(root.path(), "model").await?;
     let held: Vec<&str> = vectors.iter().map(StoredVector::digest).collect();
     assert_eq!(held.len(), 2, "every described unit is embedded: {held:?}");
-    let ranked = index.search("search", 10).await?;
+    let ranked = ranked_units(&index, "search", 10).await?;
     assert_eq!(
         placed(&ranked),
         [("one", "src/one.rs"), ("two", "src/two.rs")],
@@ -772,7 +786,7 @@ async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestR
     assert_eq!(index.readiness(), SemanticReadiness::Unavailable);
 
     assert_eq!(
-        identities(&index.search("load config", 10).await?),
+        identities(&ranked_units(&index, "load config", 10).await?),
         ["one"],
         "the lexical tier keeps answering"
     );
@@ -796,12 +810,12 @@ async fn an_empty_query_answers_nothing_and_a_limit_of_one_answers_once() -> Tes
     let fixture = two()?;
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
 
-    assert!(index.search("", 10).await?.is_empty());
+    assert!(ranked_units(&index, "", 10).await?.is_empty());
     assert!(
-        index.search("   ", 10).await?.is_empty(),
+        ranked_units(&index, "   ", 10).await?.is_empty(),
         "a query of blanks has no term either"
     );
-    assert_eq!(index.search("load config", 1).await?.len(), 1);
+    assert_eq!(ranked_units(&index, "load config", 1).await?.len(), 1);
     Ok(())
 }
 
@@ -830,7 +844,7 @@ async fn one_files_declarations_cannot_fill_the_candidate_list() -> TestResult {
     whole_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
 
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
-    let ranked = index.search("search", 10).await?;
+    let ranked = ranked_units(&index, "search", 10).await?;
     let reached = paths(&ranked);
     assert_eq!(
         reached.len(),
@@ -887,11 +901,11 @@ async fn vectors_with_no_unit_to_rank_them_as_leave_the_lexical_ranking_alone() 
         "the vectors the first index wrote are still stored"
     );
     assert!(
-        reopened.search("search", 10).await?.is_empty(),
+        ranked_units(&reopened, "search", 10).await?.is_empty(),
         "no pass has said which unit each digest belongs to"
     );
     assert_eq!(
-        identities(&reopened.search("load config", 10).await?),
+        identities(&ranked_units(&reopened, "load config", 10).await?),
         ["one"],
         "the lexical tier answers on its own"
     );
@@ -934,7 +948,7 @@ async fn a_query_ranks_from_the_held_corpus_after_the_stored_rows_are_gone() -> 
         lexical_order(root.path(), "search", 10).await?.is_empty(),
         "the query shares no token with either unit, so only the semantic tier can answer it"
     );
-    let answered = index.search("search", 10).await?;
+    let answered = ranked_units(&index, "search", 10).await?;
     let ranked = placed(&answered);
     assert_eq!(ranked, [("one", "src/one.rs"), ("two", "src/two.rs")]);
 
@@ -944,7 +958,7 @@ async fn a_query_ranks_from_the_held_corpus_after_the_stored_rows_are_gone() -> 
         "no vector row is left for a query to read"
     );
     assert_eq!(
-        placed(&index.search("search", 10).await?),
+        placed(&ranked_units(&index, "search", 10).await?),
         ranked,
         "the ranking still answers, so the query path never read the vector table"
     );
@@ -982,7 +996,7 @@ async fn a_refresh_publishes_what_it_embedded_beside_what_the_build_left() -> Te
     drop_stored_vectors(root.path(), "model").await?;
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
     assert_eq!(
-        placed(&index.search("search", 10).await?),
+        placed(&ranked_units(&index, "search", 10).await?),
         [("one", "src/one.rs"), ("three", "src/three.rs")],
         "the corpus the refresh published holds the vector it never embedded itself"
     );
@@ -999,7 +1013,7 @@ async fn a_model_change_leaves_none_of_the_previous_models_vectors_held() -> Tes
     let fixture = two()?;
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
-        placed(&index.search("search", 10).await?),
+        placed(&ranked_units(&index, "search", 10).await?),
         [("one", "src/one.rs"), ("two", "src/two.rs")]
     );
 
@@ -1007,18 +1021,18 @@ async fn a_model_change_leaves_none_of_the_previous_models_vectors_held() -> Tes
         .prepare(&model_source(root.path(), "other")?, acquisition_limits())
         .await?;
     assert!(
-        index.search("search", 10).await?.is_empty(),
+        ranked_units(&index, "search", 10).await?.is_empty(),
         "the corpus the previous model filled is held nowhere, and the lexical tier cannot answer this query"
     );
     assert_eq!(
-        identities(&index.search("load config", 10).await?),
+        identities(&ranked_units(&index, "load config", 10).await?),
         ["one"],
         "the lexical tier keeps answering"
     );
 
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
-        placed(&index.search("search", 10).await?),
+        placed(&ranked_units(&index, "search", 10).await?),
         [("one", "src/one.rs"), ("two", "src/two.rs")],
         "a pass under the model now held publishes a corpus of its own"
     );
@@ -1044,7 +1058,7 @@ async fn the_held_corpus_stops_at_the_vector_bound() -> TestResult {
     drop_stored_vectors(root.path(), "model").await?;
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
     assert_eq!(
-        identities(&index.search("search", 10).await?),
+        identities(&ranked_units(&index, "search", 10).await?),
         ["one"],
         "the corpus carries the one vector the bound left room for, and no more"
     );
@@ -1112,5 +1126,74 @@ async fn opening_a_store_that_cannot_be_created_is_refused() -> TestResult {
         .await
         .expect_err("a directory is not a database file");
     assert_eq!(error.fault().violation(), SearchViolation::StoreFailed);
+    Ok(())
+}
+
+/// A query for a tree the store has moved past reads no row: the caller's publication was
+/// superseded, and the answer it asked for is under a publication it has yet to capture.
+#[tokio::test]
+async fn a_search_for_a_tree_the_store_moved_past_names_the_stored_revision() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+    let fixture = two()?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+
+    assert_eq!(
+        index.search("another-revision", "load config", 10).await?,
+        RevisionScoped::OtherRevision(REVISION.to_owned())
+    );
+    Ok(())
+}
+
+/// A store no pass has ever stamped answers for no tree at all, which is not the same as a
+/// store holding another one: nothing has landed in it yet.
+#[tokio::test]
+async fn a_search_before_any_population_reports_no_revision() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+
+    assert_eq!(
+        index.search(REVISION, "load config", 10).await?,
+        RevisionScoped::NoRevision
+    );
+    Ok(())
+}
+
+/// Embedding runs after publication, so a newly published tree meets a corpus described
+/// for the previous one. That corpus ranks nothing: the lexical tier answers alone until
+/// the pass for this tree lands.
+#[tokio::test]
+async fn a_corpus_described_for_the_previous_tree_ranks_nothing() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+    let fixture = two()?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    assert!(
+        lexical_order(root.path(), "search", 10).await?.is_empty(),
+        "the query shares no token with either unit, so only the semantic tier can answer it"
+    );
+    assert_eq!(ranked_units(&index, "search", 10).await?.len(), 2);
+
+    // The lexical half of the next publication lands first, as the publication path runs it.
+    index.replace_lexical(fixture.units(), "rev-two").await?;
+    let RevisionScoped::Matched(ranked) = index.search("rev-two", "search", 10).await? else {
+        return Err("the store holds the tree that was just stamped".into());
+    };
+    assert!(
+        ranked.is_empty(),
+        "the previous tree's vectors must not rank a tree they were not described for"
+    );
+
+    index
+        .embed_described(&fixture.described(), Embedding::Missing, "rev-two")
+        .await?;
+    let RevisionScoped::Matched(ranked) = index.search("rev-two", "search", 10).await? else {
+        return Err("the store still holds the tree that was stamped".into());
+    };
+    assert_eq!(
+        ranked.len(),
+        2,
+        "the pass for this tree publishes a corpus that ranks it"
+    );
     Ok(())
 }
