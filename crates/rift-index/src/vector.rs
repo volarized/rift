@@ -94,11 +94,17 @@ impl SemanticVectorStore {
         Ok(Self { database, limits })
     }
 
-    /// Every vector one model has produced, in digest order.
+    /// At most `max` of one model's vectors, in digest order.
     ///
     /// A row whose stored width differs from `dimension` is skipped: the model
     /// identifier alone cannot rule out a checkpoint that changed shape, and a
     /// vector of another width is noise rather than an answer.
+    ///
+    /// The cut is the query's own `LIMIT`, so a caller that may hold `max`
+    /// vectors decodes `max` blobs rather than every row the file happens to
+    /// hold. Digest order is what makes the cut repeatable: one store and one
+    /// `max` answer with the same rows every time, whatever the file's page
+    /// order.
     ///
     /// # Errors
     ///
@@ -111,14 +117,16 @@ impl SemanticVectorStore {
         &self,
         model: &str,
         dimension: usize,
+        max: usize,
     ) -> Result<Vec<StoredVector>, LexicalIndexError> {
         let mut connection = self.connection().await?;
         let rows = toasty::sql::query(
             "SELECT digest, vector FROM semantic_vectors
-             WHERE model = ?1 AND dimension = ?2 ORDER BY digest",
+             WHERE model = ?1 AND dimension = ?2 ORDER BY digest LIMIT ?3",
         )
         .bind(model.to_owned())
         .bind(width_as_i64(dimension))
+        .bind(bound_as_i64(max))
         .column_types([Type::String, Type::Bytes])
         .exec(&mut connection)
         .await
@@ -322,6 +330,12 @@ fn width_as_i64(dimension: usize) -> i64 {
     i64::try_from(dimension).unwrap_or(i64::MAX)
 }
 
+/// One row bound as the integer a `LIMIT` takes. A bound past `i64::MAX` is
+/// more rows than a store can hold, so the read answers with all of them.
+fn bound_as_i64(max: usize) -> i64 {
+    i64::try_from(max).unwrap_or(i64::MAX)
+}
+
 /// Vector values as stored: little-endian single precision, no header, so a row
 /// is a slice.
 fn encode(values: &[f32]) -> Vec<u8> {
@@ -368,6 +382,8 @@ mod tests {
     const MODEL: &str = "BAAI/bge-small-en-v1.5";
     const OTHER_MODEL: &str = "nomic-ai/CodeRankEmbed";
     const WIDTH: usize = 4;
+    /// A row bound no suite here reaches, so a read answers with every row.
+    const EVERY: usize = usize::MAX;
 
     fn limits() -> LexicalIndexLimits {
         LexicalIndexLimits::new(64, 1 << 20, 32, 64, 4, 1_000)
@@ -401,7 +417,7 @@ mod tests {
         store
             .store(MODEL, WIDTH, &[vector("bbb", 1.0), vector("aaa", 2.0)])
             .await?;
-        let read = store.vectors(MODEL, WIDTH).await?;
+        let read = store.vectors(MODEL, WIDTH, EVERY).await?;
         assert_eq!(
             read.iter().map(StoredVector::digest).collect::<Vec<_>>(),
             ["aaa", "bbb"]
@@ -412,12 +428,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_read_stops_at_the_row_bound_it_was_given() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = opened(directory.path()).await?;
+        store
+            .store(
+                MODEL,
+                WIDTH,
+                &[vector("aaa", 1.0), vector("bbb", 2.0), vector("ccc", 3.0)],
+            )
+            .await?;
+        let bounded = store.vectors(MODEL, WIDTH, 2).await?;
+        assert_eq!(
+            bounded.iter().map(StoredVector::digest).collect::<Vec<_>>(),
+            ["aaa", "bbb"],
+            "the bound cuts the tail of the digest order, not a page order"
+        );
+        assert!(
+            store.vectors(MODEL, WIDTH, 0).await?.is_empty(),
+            "a bound of nothing reads nothing"
+        );
+        assert_eq!(
+            store.vectors(MODEL, WIDTH, EVERY).await?.len(),
+            3,
+            "the rows the bound left unread are still stored"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_storing_one_digest_twice_replaces_rather_than_duplicates() -> TestResult {
         let directory = tempfile::tempdir()?;
         let store = opened(directory.path()).await?;
         store.store(MODEL, WIDTH, &[vector("aaa", 1.0)]).await?;
         store.store(MODEL, WIDTH, &[vector("aaa", 9.0)]).await?;
-        let read = store.vectors(MODEL, WIDTH).await?;
+        let read = store.vectors(MODEL, WIDTH, EVERY).await?;
         assert_eq!(read.len(), 1, "one address holds one vector");
         assert_eq!(read[0].values(), [9.0, 10.0, 11.0, 12.0]);
         Ok(())
@@ -442,10 +487,10 @@ mod tests {
         let store = opened(directory.path()).await?;
         store.store(MODEL, WIDTH, &[vector("aaa", 1.0)]).await?;
         assert!(
-            store.vectors(MODEL, WIDTH + 1).await?.is_empty(),
+            store.vectors(MODEL, WIDTH + 1, EVERY).await?.is_empty(),
             "a checkpoint that changed shape invalidates rather than corrupts"
         );
-        assert_eq!(store.vectors(MODEL, WIDTH).await?.len(), 1);
+        assert_eq!(store.vectors(MODEL, WIDTH, EVERY).await?.len(), 1);
         Ok(())
     }
 
@@ -458,11 +503,11 @@ mod tests {
             .store(OTHER_MODEL, WIDTH, &[vector("aaa", 5.0)])
             .await?;
         assert!(is_value(
-            store.vectors(MODEL, WIDTH).await?[0].values()[0],
+            store.vectors(MODEL, WIDTH, EVERY).await?[0].values()[0],
             1.0
         ));
         assert!(is_value(
-            store.vectors(OTHER_MODEL, WIDTH).await?[0].values()[0],
+            store.vectors(OTHER_MODEL, WIDTH, EVERY).await?[0].values()[0],
             5.0
         ));
         Ok(())
@@ -526,7 +571,7 @@ mod tests {
             .store(MODEL, WIDTH, &[vector("aaa", 1.0)])
             .await?;
         let reopened = opened(directory.path()).await?;
-        assert_eq!(reopened.vectors(MODEL, WIDTH).await?.len(), 1);
+        assert_eq!(reopened.vectors(MODEL, WIDTH, EVERY).await?.len(), 1);
         Ok(())
     }
 
