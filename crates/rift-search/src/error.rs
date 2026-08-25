@@ -33,6 +33,9 @@ pub enum SearchViolation {
     RankingWeightsInvalid,
     /// Fusion was handed a rank constant outside the accepted range.
     FusionConstantInvalid,
+    /// The lexical index or the vector store refused, and its own violation
+    /// rides as the cause.
+    StoreFailed,
 }
 
 impl SearchViolation {
@@ -48,7 +51,7 @@ impl SearchViolation {
             | Self::FusionConstantInvalid
             | Self::ModelSourceInvalid
             | Self::ModelCacheUnavailable => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
-            Self::EncodeFailed => ErrorName::Wire(ErrorCode::InternalError),
+            Self::EncodeFailed | Self::StoreFailed => ErrorName::Wire(ErrorCode::InternalError),
             Self::TextLimit | Self::ModelDownloadTooLarge => {
                 ErrorName::Wire(ErrorCode::LimitExceeded)
             }
@@ -192,6 +195,11 @@ mod tests {
                 SearchViolation::ModelDownloadTooLarge,
                 ErrorCode::LimitExceeded,
                 "model_download_too_large",
+            ),
+            (
+                SearchViolation::StoreFailed,
+                ErrorCode::InternalError,
+                "store_failed",
             ),
         ];
         for (violation, code, label) in cases {

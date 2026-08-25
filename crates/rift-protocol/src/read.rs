@@ -4,6 +4,7 @@
 //! the server accepts and returns, and the MCP server derives its advertised
 //! request and response schemas from these definitions.
 
+use crate::configuration::Duration;
 use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -953,6 +954,41 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// The semantic ranking is still being built, so the answer was ranked lexically
+    /// alone. A query that shares no token with the code it describes reaches nothing
+    /// until every declaration carries a vector; the counts state how far that has got,
+    /// and `ready_in` estimates the wait from the rate the pass has held so far.
+    SemanticIndexPreparing {
+        /// Declarations that already carry a vector.
+        prepared: u64,
+        /// Declarations the published set holds.
+        total: u64,
+        /// Estimated wait before the semantic ranking joins an answer. It is read from
+        /// the rate the pass has held, so a slower machine states a longer wait.
+        ready_in: Duration,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// The semantic ranking will not answer for the life of this server, so every answer
+    /// is ranked lexically alone. The weights could not be acquired or the model could
+    /// not load; no retry is coming, and a caller that needs the semantic ranking fixes
+    /// the `[search.semantic]` configuration and starts the server again.
+    SemanticRankingUnavailable {
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// The full-text tier is not answering, so the answer came from identifier matching
+    /// alone. Ranking reaches what a name match reaches and no further, and a query
+    /// phrased as prose finds nothing. `stale_index` covers an index that lags the tree;
+    /// this covers a tier that refused to load, which a caller cannot otherwise tell from
+    /// a tier that searched and found nothing.
+    LexicalRankingUnavailable {
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
 }
 
 /// One named part of a node. A language marks these out inside a declaration, so an
@@ -1622,8 +1658,8 @@ pub struct TypeExpression {
 #[cfg(test)]
 mod tests {
     use super::{
-        Digest, GetSymbolParams, Language, PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX, RevisionId,
-        RevisionIdViolation, SourceUnitId,
+        Digest, Duration, GetSymbolParams, Language, PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX,
+        ReadWarning, RevisionId, RevisionIdViolation, SourceUnitId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -1733,6 +1769,73 @@ mod tests {
                 r"^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$"
             )
         );
+    }
+
+    /// The tier warnings carry the evidence a caller weighs, so each one is pinned to the
+    /// `code` its consumers match on and to the members that carry that evidence.
+    #[test]
+    fn every_tier_warning_round_trips_under_its_code_tag() {
+        let cases = [
+            (
+                ReadWarning::SemanticIndexPreparing {
+                    prepared: 1_200,
+                    total: 4_800,
+                    ready_in: Duration::from_millis(45_000),
+                    detail: "Semantic search is being prepared".to_owned(),
+                },
+                json!({
+                    "code": "semantic_index_preparing",
+                    "prepared": 1_200,
+                    "total": 4_800,
+                    "ready_in": "45s",
+                    "detail": "Semantic search is being prepared",
+                }),
+            ),
+            (
+                ReadWarning::SemanticRankingUnavailable {
+                    detail: "the model weights could not be acquired".to_owned(),
+                },
+                json!({
+                    "code": "semantic_ranking_unavailable",
+                    "detail": "the model weights could not be acquired",
+                }),
+            ),
+            (
+                ReadWarning::LexicalRankingUnavailable {
+                    detail: "the full-text index did not open".to_owned(),
+                },
+                json!({
+                    "code": "lexical_ranking_unavailable",
+                    "detail": "the full-text index did not open",
+                }),
+            ),
+        ];
+        for (warning, wire) in cases {
+            assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+            let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+            assert_eq!(parsed, warning);
+        }
+    }
+
+    #[test]
+    fn the_read_warning_schema_advertises_every_tier_warning() {
+        let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
+        let arms = schema["oneOf"].as_array().cloned().unwrap_or_default();
+        let codes: Vec<serde_json::Value> = arms
+            .iter()
+            .map(|arm| arm["properties"]["code"].clone())
+            .collect();
+        for code in [
+            "stale_index",
+            "semantic_index_preparing",
+            "semantic_ranking_unavailable",
+            "lexical_ranking_unavailable",
+        ] {
+            assert!(
+                codes.contains(&json!({ "const": code, "type": "string" })),
+                "the schema must advertise {code}: {codes:?}"
+            );
+        }
     }
 
     #[test]
