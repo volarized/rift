@@ -25,12 +25,20 @@ use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource, registry};
 use sha2::{Digest as _, Sha256};
 
 use crate::move_file::MovePlan;
-use crate::patch::{self, FileRewrite, RewriteKind};
+use crate::patch;
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id, node_witness};
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
+use crate::rewrite::{FileRewrite, ReplacedRegion, RewriteKind};
 
 /// Most re-parse findings one applied change reports.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
+
+/// Most edits one applied change reports, mirroring the bound the
+/// `ChangeSummary.edits` field advertises. A batch whose replaced regions
+/// outnumber it reports one whole-file edit per rewrite instead of one
+/// edit per region, which every writing lane's own file bound keeps under
+/// the same ceiling.
+const CHANGE_EDITS_MAX: usize = 256;
 
 /// Serialized change application against one workspace tree.
 #[derive(Debug)]
@@ -220,18 +228,11 @@ impl ChangeService {
             Err(error) => return Err(ReadFault::storage(path.as_str(), "read", &error)),
         };
         let rewrite = match existing {
-            Some(content) => FileRewrite {
-                previous_len: content.len() as u64,
-                next_source: spliced_at_file_edge(&content, position, body),
-                kind: RewriteKind::Modify,
-                path,
-            },
-            None if create_missing => FileRewrite {
-                path,
-                kind: RewriteKind::Create,
-                previous_len: 0,
-                next_source: body.to_owned(),
-            },
+            Some(content) => {
+                let (next_source, region) = spliced_at_file_edge(&content, position, body);
+                FileRewrite::modify(path, &content, next_source, vec![region])
+            }
+            None if create_missing => FileRewrite::create(path, body.to_owned()),
             None => {
                 return Ok(ChangeResult::refused(
                     RefusalReason::UnmetPrecondition,
@@ -400,18 +401,11 @@ impl ChangeService {
             ));
         }
         let mut rewrites: Vec<FileRewrite> = plan.rewrites.iter().map(modify_rewrite).collect();
-        rewrites.push(FileRewrite {
-            path: plan.to.clone(),
-            kind: RewriteKind::Create,
-            previous_len: 0,
-            next_source: plan.moved_next.clone(),
-        });
-        rewrites.push(FileRewrite {
-            path: plan.from.clone(),
-            kind: RewriteKind::Delete,
-            previous_len: plan.moved_source.len() as u64,
-            next_source: String::new(),
-        });
+        rewrites.push(FileRewrite::create(
+            plan.to.clone(),
+            plan.moved_next.clone(),
+        ));
+        rewrites.push(FileRewrite::delete(plan.from.clone(), &plan.moved_source));
         rewrites.sort_by(|first, second| first.path.as_str().cmp(second.path.as_str()));
         let mut result = self.apply_rewrites(reads, &rewrites)?;
         if let ChangeResult::Applied { summary } = &mut result
@@ -496,6 +490,10 @@ impl ChangeService {
                 Err(refusal) => return Ok(refusal),
             }
         }
+        // A diff may address its files in any order; the summary's paths and
+        // edits are documented in canonical file order, and the change id
+        // digests the rewrites in the order they are applied.
+        rewrites.sort_by(|first, second| first.path.as_str().cmp(second.path.as_str()));
         self.apply_rewrites(reads, &rewrites)
     }
 
@@ -508,11 +506,11 @@ impl ChangeService {
     fn roll_back_published(&self, reads: &ReadService, published: &[&FileRewrite]) {
         for landed in published {
             let absolute = self.root.join(landed.path.as_str());
-            match landed.kind {
+            match &landed.kind {
                 RewriteKind::Create => {
                     let _ = fs::remove_file(&absolute);
                 }
-                RewriteKind::Modify | RewriteKind::Delete => {
+                RewriteKind::Modify { .. } | RewriteKind::Delete => {
                     if let Some(file) = reads.index().file(&landed.path) {
                         let _ = fs::write(&absolute, file.source());
                     }
@@ -533,12 +531,12 @@ impl ChangeService {
     ) -> Result<ChangeResult, ReadError> {
         let mut staged: Vec<Option<PathBuf>> = Vec::with_capacity(rewrites.len());
         for rewrite in rewrites {
-            if rewrite.kind == RewriteKind::Delete {
+            if rewrite.kind.removes_file() {
                 staged.push(None);
                 continue;
             }
             let absolute = self.root.join(rewrite.path.as_str());
-            if rewrite.kind == RewriteKind::Create
+            if matches!(rewrite.kind, RewriteKind::Create)
                 && let Some(parent) = absolute.parent()
                 && let Err(error) = fs::create_dir_all(parent)
             {
@@ -560,7 +558,7 @@ impl ChangeService {
         let mut published: Vec<&FileRewrite> = Vec::with_capacity(rewrites.len());
         for (rewrite, staged_path) in rewrites.iter().zip(&staged) {
             let absolute = self.root.join(rewrite.path.as_str());
-            let outcome = match (rewrite.kind, staged_path) {
+            let outcome = match (&rewrite.kind, staged_path) {
                 (RewriteKind::Delete, _) => fs::remove_file(&absolute),
                 (_, Some(staged_path)) => fs::rename(staged_path, &absolute),
                 (_, None) => Err(std::io::Error::other(
@@ -574,6 +572,7 @@ impl ChangeService {
             }
             published.push(rewrite);
         }
+        let ranged = regions_fit_the_edit_bound(rewrites);
         let mut identity = Sha256::new();
         let mut paths = Vec::with_capacity(rewrites.len());
         let mut edits = Vec::with_capacity(rewrites.len());
@@ -592,17 +591,8 @@ impl ChangeService {
                     rift_core::encode_path(rewrite.path.as_str())
                 )),
             };
-            edits.push(Edit::Replace {
-                span: SourceSpan {
-                    unit: unit.clone(),
-                    range: TextRange {
-                        start: 0,
-                        end: rewrite.previous_len,
-                    },
-                },
-                text: rewrite.next_source.clone(),
-            });
-            if rewrite.kind != RewriteKind::Delete {
+            edits.extend(rewrite_edits(rewrite, &unit, ranged));
+            if !rewrite.kind.removes_file() {
                 diagnostics.extend(reparse_diagnostics(
                     unit,
                     &rewrite.path,
@@ -752,13 +742,67 @@ impl ChangeService {
     }
 }
 
-/// One planned rewrite as the in-place modification of its file.
+/// One planned rewrite as the in-place modification of its file, carrying
+/// the regions the engine's own edits named.
 fn modify_rewrite(rewrite: &PlannedRewrite) -> FileRewrite {
-    FileRewrite {
-        path: rewrite.path.clone(),
-        kind: RewriteKind::Modify,
-        previous_len: rewrite.base_source.len() as u64,
-        next_source: rewrite.next_source.clone(),
+    FileRewrite::modify(
+        rewrite.path.clone(),
+        &rewrite.base_source,
+        rewrite.next_source.clone(),
+        rewrite.replaced.clone(),
+    )
+}
+
+/// Whether this batch's replaced regions fit the bound a change result
+/// carries. Past it every rewrite reports its whole file instead, which
+/// the file bound each writing lane enforces keeps within the same
+/// ceiling.
+fn regions_fit_the_edit_bound(rewrites: &[FileRewrite]) -> bool {
+    rewrites
+        .iter()
+        .map(|rewrite| match &rewrite.kind {
+            RewriteKind::Modify { replaced } => replaced.len(),
+            RewriteKind::Create | RewriteKind::Delete => 1,
+        })
+        .sum::<usize>()
+        <= CHANGE_EDITS_MAX
+}
+
+/// The edits one rewrite contributes to a change result: one per replaced
+/// region for a modification, and the whole file for a create or a delete,
+/// where the whole file is the change. A batch whose regions did not fit
+/// the edit bound passes `ranged` as false and reports whole files
+/// throughout.
+fn rewrite_edits(rewrite: &FileRewrite, unit: &FileId, ranged: bool) -> Vec<Edit> {
+    match &rewrite.kind {
+        RewriteKind::Modify { replaced } if ranged => replaced
+            .iter()
+            .map(|region| {
+                replace_edit(
+                    unit,
+                    region.range.start,
+                    region.range.end,
+                    region.text.clone(),
+                )
+            })
+            .collect(),
+        _ => vec![replace_edit(
+            unit,
+            0,
+            rewrite.previous_len,
+            rewrite.next_source.clone(),
+        )],
+    }
+}
+
+/// One replacement of `unit`'s bytes from `start` to `end` by `text`.
+fn replace_edit(unit: &FileId, start: u64, end: u64, text: String) -> Edit {
+    Edit::Replace {
+        span: SourceSpan {
+            unit: unit.clone(),
+            range: TextRange { start, end },
+        },
+        text,
     }
 }
 
@@ -771,11 +815,27 @@ fn discard_staged<'a>(staged_paths: impl IntoIterator<Item = &'a PathBuf>) {
 
 /// Splices new content at a file boundary, matching the anchor-insert spacing
 /// policy: one blank line separates the new content from what was already there.
-fn spliced_at_file_edge(existing: &str, position: InsertPosition, body: &str) -> String {
-    match position {
-        InsertPosition::Before => format!("{body}\n\n{existing}"),
-        InsertPosition::After => format!("{existing}\n\n{body}"),
-    }
+/// The region names where the splice lands in the existing bytes, so the
+/// result reports the insert rather than the whole file.
+fn spliced_at_file_edge(
+    existing: &str,
+    position: InsertPosition,
+    body: &str,
+) -> (String, ReplacedRegion) {
+    let (at, text) = match position {
+        InsertPosition::Before => (0, format!("{body}\n\n")),
+        InsertPosition::After => (existing.len(), format!("\n\n{body}")),
+    };
+    let mut next_source = existing.to_owned();
+    next_source.insert_str(at, &text);
+    let at = at as u64;
+    (
+        next_source,
+        ReplacedRegion {
+            range: ByteRange { start: at, end: at },
+            text,
+        },
+    )
 }
 
 /// A parsed witnessed node address.
@@ -1049,8 +1109,8 @@ mod tests {
     use rift_core::SourceVisibility;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
-        ChangeResult, InsertPosition, InsertSymbolParams, OperationPreconditionKind,
-        PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams,
+        ChangeResult, Edit, InsertPosition, InsertSymbolParams, OperationPreconditionKind,
+        PatchParams, PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams,
         ReplaceSymbolParams,
     };
     use rift_protocol::configuration::HistoryConfiguration;
@@ -1061,6 +1121,7 @@ mod tests {
 
     use super::ChangeService;
     use crate::read::{ReadService, node_witness};
+    use crate::rewrite::{FileRewrite, ReplacedRegion};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -2233,6 +2294,30 @@ mod tests {
         Ok((directory, reads, changes))
     }
 
+    /// The single region two images differ over, standing in for the engine
+    /// edits a real plan carries. Fixture sources are ASCII, so the byte
+    /// scan lands on character boundaries.
+    fn differing_region(base: &str, next: &str) -> ReplacedRegion {
+        let prefix = base
+            .bytes()
+            .zip(next.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let suffix = base[prefix..]
+            .bytes()
+            .rev()
+            .zip(next[prefix..].bytes().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        ReplacedRegion {
+            range: ByteRange {
+                start: prefix as u64,
+                end: (base.len() - suffix) as u64,
+            },
+            text: next[prefix..next.len() - suffix].to_owned(),
+        }
+    }
+
     fn rename_plan(rewrites: Vec<(&str, &str, &str)>) -> crate::rename::RenamePlan {
         crate::rename::RenamePlan {
             symbol: SymbolId("rift://symbol/rust/lib.rs/beacon".to_owned()),
@@ -2244,6 +2329,7 @@ mod tests {
                         path: CoreProjectPath::new(path).expect("fixture path is valid"),
                         base_source: base_source.to_owned(),
                         next_source: next_source.to_owned(),
+                        replaced: vec![differing_region(base_source, next_source)],
                     },
                 )
                 .collect(),
@@ -2262,7 +2348,14 @@ mod tests {
         ]);
         let summary = applied_summary(changes.apply_rename(&reads, &plan)?);
         assert_eq!(summary.paths.len(), 2);
-        assert_eq!(summary.edits.len(), 2, "one whole-file edit per rewrite");
+        assert_eq!(summary.edits.len(), 2, "one edit per replaced region");
+        let Edit::Replace { span, text } = &summary.edits[0];
+        assert_eq!(
+            (span.range.start, span.range.end),
+            (7, 13),
+            "the edit names the renamed identifier, not the whole file"
+        );
+        assert_eq!(text, "flare");
         assert!(
             summary
                 .diagnostics
@@ -2372,6 +2465,7 @@ mod tests {
                         path: CoreProjectPath::new(path).expect("fixture path is valid"),
                         base_source: base_source.to_owned(),
                         next_source: next_source.to_owned(),
+                        replaced: vec![differing_region(base_source, next_source)],
                     },
                 )
                 .collect(),
@@ -2569,6 +2663,227 @@ mod tests {
             fs::read_to_string(directory.path().join("old/hub.rs"))?,
             hub,
             "the source never left"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_against_a_multi_hunk_file_reports_one_edit_per_hunk_at_its_own_span() -> TestResult {
+        let filler = "// pad\n".repeat(50);
+        let source = format!("one();\ntwo();\nthree();\nfour();\nfive();\n{filler}");
+        let (_directory, reads, changes) = fixture(&source)?;
+        let patch =
+            "--- a/lib.rs\n+++ b/lib.rs\n@@ -2 +2 @@\n-two();\n+TWO();\n@@ -4 +4 @@\n-four();\n+FOUR();\n"
+                .to_owned();
+        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        assert_eq!(
+            summary.edits.len(),
+            2,
+            "one edit per hunk, not one edit for the whole file"
+        );
+        let Edit::Replace {
+            span: first_span,
+            text: first_text,
+        } = &summary.edits[0];
+        assert_eq!(
+            (first_span.range.start, first_span.range.end),
+            (7, 14),
+            "the first hunk's span is its own `two();\\n` line, not the file"
+        );
+        assert_eq!(first_text, "TWO();\n");
+        let Edit::Replace {
+            span: second_span,
+            text: second_text,
+        } = &summary.edits[1];
+        assert_eq!((second_span.range.start, second_span.range.end), (23, 31));
+        assert_eq!(second_text, "FOUR();\n");
+        let total_edit_bytes: usize = summary
+            .edits
+            .iter()
+            .map(|edit| {
+                let Edit::Replace { text, .. } = edit;
+                text.len()
+            })
+            .sum();
+        assert!(
+            total_edit_bytes < source.len() / 10,
+            "edits ({total_edit_bytes} bytes) must be far smaller than the file they patch \
+             ({} bytes)",
+            source.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_creates_a_file_and_reports_one_edit_at_the_empty_range() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n".to_owned();
+        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        assert_eq!(summary.edits.len(), 1);
+        let Edit::Replace { span, text } = &summary.edits[0];
+        assert_eq!(
+            (span.range.start, span.range.end),
+            (0, 0),
+            "a created file has no previous image, so its edit spans the empty range"
+        );
+        assert_eq!(text, "pub fn fresh() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_deletes_a_file_and_reports_one_edit_across_the_whole_previous_image() -> TestResult {
+        let source = "pub fn beacon() {}\npub fn steady() {}\n";
+        let (_directory, reads, changes) = fixture(source)?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ /dev/null",
+            "@@ -1,2 +0,0 @@",
+            "-pub fn beacon() {}",
+            "-pub fn steady() {}",
+            "",
+        ]
+        .join("\n");
+        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        assert_eq!(summary.edits.len(), 1);
+        let Edit::Replace { span, text } = &summary.edits[0];
+        assert_eq!(
+            (span.range.start, span.range.end),
+            (0, source.len() as u64),
+            "a deleted file's edit spans its whole previous image"
+        );
+        assert_eq!(text, "");
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_file_target_before_reports_a_zero_width_edit_at_the_start() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let params = InsertSymbolParams {
+            anchor: None,
+            file: Some(ProjectPath("lib.rs".to_owned())),
+            position: InsertPosition::Before,
+            body: "//! Module docs.".to_owned(),
+            create_missing: false,
+        };
+        let summary = applied_summary(changes.insert_symbol(&reads, &params)?);
+        assert_eq!(
+            summary.edits.len(),
+            1,
+            "a file-target insert reports one edit, not the whole file"
+        );
+        let Edit::Replace { span, text } = &summary.edits[0];
+        assert_eq!(
+            (span.range.start, span.range.end),
+            (0, 0),
+            "a `before` insert at a file target lands at the empty range at byte 0"
+        );
+        assert_eq!(text, "//! Module docs.\n\n");
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_file_target_after_reports_a_zero_width_edit_at_the_end() -> TestResult {
+        let source = "pub fn beacon() {}\n";
+        let (_directory, reads, changes) = fixture(source)?;
+        let params = InsertSymbolParams {
+            anchor: None,
+            file: Some(ProjectPath("lib.rs".to_owned())),
+            position: InsertPosition::After,
+            body: "pub fn late() {}".to_owned(),
+            create_missing: false,
+        };
+        let summary = applied_summary(changes.insert_symbol(&reads, &params)?);
+        assert_eq!(summary.edits.len(), 1);
+        let Edit::Replace { span, text } = &summary.edits[0];
+        let end = source.len() as u64;
+        assert_eq!(
+            (span.range.start, span.range.end),
+            (end, end),
+            "an `after` insert at a file target lands at the empty range at the file's own end"
+        );
+        assert_eq!(text, "\n\npub fn late() {}");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rename_batch_past_the_edit_bound_falls_back_to_one_whole_file_edit() -> TestResult {
+        let region_count = super::CHANGE_EDITS_MAX + 1;
+        let base_source = "x\n".repeat(region_count);
+        let next_source = "y\n".repeat(region_count);
+        let (directory, reads, changes) = multi_file_fixture(&[("lib.rs", base_source.as_str())])?;
+        let replaced: Vec<ReplacedRegion> = (0..region_count)
+            .map(|index| {
+                let start = (index * 2) as u64;
+                ReplacedRegion {
+                    range: ByteRange {
+                        start,
+                        end: start + 2,
+                    },
+                    text: "y\n".to_owned(),
+                }
+            })
+            .collect();
+        let rewrite = crate::rename::PlannedRewrite {
+            path: CoreProjectPath::new("lib.rs")?,
+            base_source: base_source.clone(),
+            next_source: next_source.clone(),
+            replaced,
+        };
+        let plan = crate::rename::RenamePlan {
+            symbol: SymbolId("rift://symbol/rust/lib.rs/beacon".to_owned()),
+            old_name: "beacon".to_owned(),
+            rewrites: vec![rewrite],
+        };
+        let summary = applied_summary(changes.apply_rename(&reads, &plan)?);
+        assert_eq!(
+            summary.edits.len(),
+            1,
+            "{region_count} regions exceed CHANGE_EDITS_MAX, so the batch must fall back to one \
+             whole-file edit"
+        );
+        let Edit::Replace { span, text } = &summary.edits[0];
+        assert_eq!(
+            (span.range.start, span.range.end),
+            (0, base_source.len() as u64),
+            "the fallback edit spans the whole previous image"
+        );
+        assert_eq!(text, &next_source);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, next_source);
+        Ok(())
+    }
+
+    /// A `Modify` rewrite of `lib.rs` carrying `count` non-overlapping,
+    /// single-byte regions, standing in for a batch whose region count alone
+    /// decides whether it fits the edit bound.
+    fn rewrite_with_region_count(count: usize) -> TestResult<FileRewrite> {
+        let replaced: Vec<ReplacedRegion> = (0..count)
+            .map(|index| ReplacedRegion {
+                range: ByteRange {
+                    start: index as u64,
+                    end: index as u64 + 1,
+                },
+                text: "x".to_owned(),
+            })
+            .collect();
+        let path = CoreProjectPath::new("lib.rs")?;
+        Ok(FileRewrite::modify(path, "", String::new(), replaced))
+    }
+
+    #[test]
+    fn regions_fit_the_edit_bound_is_true_at_the_cap_and_false_one_past_it() -> TestResult {
+        let at_cap = vec![rewrite_with_region_count(super::CHANGE_EDITS_MAX)?];
+        assert!(
+            super::regions_fit_the_edit_bound(&at_cap),
+            "exactly {} regions must still fit the edit bound",
+            super::CHANGE_EDITS_MAX
+        );
+        let over_cap = vec![rewrite_with_region_count(super::CHANGE_EDITS_MAX + 1)?];
+        assert!(
+            !super::regions_fit_the_edit_bound(&over_cap),
+            "{} regions must exceed the edit bound of {}",
+            super::CHANGE_EDITS_MAX + 1,
+            super::CHANGE_EDITS_MAX
         );
         Ok(())
     }
