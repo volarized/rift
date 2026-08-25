@@ -223,6 +223,11 @@
               }
             ]
           },
+          "Duration": {
+            "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
+            "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
+            "type": "string"
+          },
           "ExactKind": {
             "description": "A provider-local kind preserving the construct name used by that language implementation.",
             "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
@@ -691,6 +696,85 @@
                   "code",
                   "index_tree_revision",
                   "captured_tree_revision",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got,\nand `ready_in` estimates the wait from the rate the pass has held so far.",
+                "properties": {
+                  "code": {
+                    "const": "semantic_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Declarations that already carry a vector.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "ready_in": {
+                    "$ref": "#/$defs/Duration",
+                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                  },
+                  "total": {
+                    "description": "Declarations the published set holds.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "total",
+                  "ready_in",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. The weights could not be acquired or the model could\nnot load; no retry is coming, and a caller that needs the semantic ranking fixes\nthe `[search.semantic]` configuration and starts the server again.",
+                "properties": {
+                  "code": {
+                    "const": "semantic_ranking_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers an index that lags the tree;\nthis covers a tier that refused to load, which a caller cannot otherwise tell from\na tier that searched and found nothing.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
                   "detail"
                 ],
                 "type": "object"
@@ -3778,6 +3862,11 @@
             "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
+          "Duration": {
+            "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
+            "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
+            "type": "string"
+          },
           "ExactKind": {
             "description": "A provider-local kind preserving the construct name used by that language implementation.",
             "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
@@ -4081,6 +4170,85 @@
                   "code",
                   "index_tree_revision",
                   "captured_tree_revision",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got,\nand `ready_in` estimates the wait from the rate the pass has held so far.",
+                "properties": {
+                  "code": {
+                    "const": "semantic_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Declarations that already carry a vector.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "ready_in": {
+                    "$ref": "#/$defs/Duration",
+                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                  },
+                  "total": {
+                    "description": "Declarations the published set holds.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "total",
+                  "ready_in",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. The weights could not be acquired or the model could\nnot load; no retry is coming, and a caller that needs the semantic ranking fixes\nthe `[search.semantic]` configuration and starts the server again.",
+                "properties": {
+                  "code": {
+                    "const": "semantic_ranking_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers an index that lags the tree;\nthis covers a tier that refused to load, which a caller cannot otherwise tell from\na tier that searched and found nothing.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
                   "detail"
                 ],
                 "type": "object"
@@ -9423,6 +9591,11 @@
               }
             ]
           },
+          "Duration": {
+            "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
+            "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
+            "type": "string"
+          },
           "ExactKind": {
             "description": "A provider-local kind preserving the construct name used by that language implementation.",
             "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
@@ -10053,6 +10226,85 @@
                   "code",
                   "index_tree_revision",
                   "captured_tree_revision",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got,\nand `ready_in` estimates the wait from the rate the pass has held so far.",
+                "properties": {
+                  "code": {
+                    "const": "semantic_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Declarations that already carry a vector.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "ready_in": {
+                    "$ref": "#/$defs/Duration",
+                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                  },
+                  "total": {
+                    "description": "Declarations the published set holds.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "total",
+                  "ready_in",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. The weights could not be acquired or the model could\nnot load; no retry is coming, and a caller that needs the semantic ranking fixes\nthe `[search.semantic]` configuration and starts the server again.",
+                "properties": {
+                  "code": {
+                    "const": "semantic_ranking_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. `stale_index` covers an index that lags the tree;\nthis covers a tier that refused to load, which a caller cannot otherwise tell from\na tier that searched and found nothing.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
                   "detail"
                 ],
                 "type": "object"
