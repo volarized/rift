@@ -586,7 +586,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `pool_slots` and\n`busy_timeout` bound the `SQLite` connections behind the lexical tier, and\n`text` includes non-source text files in the lexical index.",
+      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `fusion_k` sets\nhow sharply a top rank counts, `pool_slots` and `busy_timeout` bound the\n`SQLite` connections behind the lexical tier, and `text` includes\nnon-source text files in the lexical index.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
@@ -596,6 +596,14 @@
             "max": "30s",
             "min": "100ms"
           }
+        },
+        "fusion_k": {
+          "default": 60,
+          "description": "The reciprocal-rank fusion constant, 1 to 1000. A result scores as the\nweighted sum of `1 / (k + rank)` over the rankings that returned it, so\na larger value flattens the contribution curve and lets agreement\nbetween the two rankings outweigh one ranking's top position.",
+          "format": "uint64",
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
         },
         "lexical": {
           "$ref": "#/$defs/LexicalSearchConfiguration",
@@ -891,6 +899,7 @@
       "$ref": "#/$defs/SearchConfiguration",
       "default": {
         "busy_timeout": "1s",
+        "fusion_k": 60,
         "lexical": {
           "weight": 0.7
         },

@@ -636,9 +636,10 @@ impl ExecutionConfiguration {
 }
 
 /// The `[search]` table. Search fuses a lexical ranking with a semantic one:
-/// `lexical` and `semantic` weigh the two against each other, `pool_slots` and
-/// `busy_timeout` bound the `SQLite` connections behind the lexical tier, and
-/// `text` includes non-source text files in the lexical index.
+/// `lexical` and `semantic` weigh the two against each other, `fusion_k` sets
+/// how sharply a top rank counts, `pool_slots` and `busy_timeout` bound the
+/// `SQLite` connections behind the lexical tier, and `text` includes
+/// non-source text files in the lexical index.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
@@ -651,6 +652,13 @@ pub struct SearchConfiguration {
     /// The embedding model that adds semantic ranking, and the bounds its
     /// preparation runs under.
     pub semantic: SemanticSearchConfiguration,
+    /// The reciprocal-rank fusion constant, 1 to 1000. A result scores as the
+    /// weighted sum of `1 / (k + rank)` over the rankings that returned it, so
+    /// a larger value flattens the contribution curve and lets agreement
+    /// between the two rankings outweigh one ranking's top position.
+    #[schemars(range(min = 1, max = 1000))]
+    #[serde(default = "default_search_fusion_k")]
+    pub fusion_k: u64,
     /// Pooled `SQLite` connections the lexical search index may open at
     /// once, 1 to 16.
     #[schemars(range(min = 1, max = 16))]
@@ -668,6 +676,7 @@ impl Default for SearchConfiguration {
             text: TextSearchConfiguration::default(),
             lexical: LexicalSearchConfiguration::default(),
             semantic: SemanticSearchConfiguration::default(),
+            fusion_k: SEARCH_FUSION_K_DEFAULT,
             pool_slots: SEARCH_POOL_SLOTS_DEFAULT,
             busy_timeout: default_search_busy_timeout(),
         }
@@ -684,6 +693,12 @@ impl SearchConfiguration {
             .or_else(|| self.text.violation())
             .or_else(|| {
                 first_out_of_range([
+                    (
+                        "search.fusion_k",
+                        self.fusion_k,
+                        SEARCH_FUSION_K_MIN,
+                        SEARCH_FUSION_K_MAX,
+                    ),
                     (
                         "search.pool_slots",
                         self.pool_slots,
@@ -713,6 +728,18 @@ pub const SEARCH_BUSY_TIMEOUT_MS_MIN: u64 = 100;
 pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Milliseconds `search.busy_timeout` holds when the key is absent.
 const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 1_000;
+
+/// `search.fusion_k` accepted, at least.
+pub const SEARCH_FUSION_K_MIN: u64 = 1;
+/// `search.fusion_k` accepted, at most.
+pub const SEARCH_FUSION_K_MAX: u64 = 1_000;
+/// `search.fusion_k` when the key is absent: the value the reciprocal-rank
+/// fusion paper uses, and the one the fusion library defaults to.
+const SEARCH_FUSION_K_DEFAULT: u64 = 60;
+
+fn default_search_fusion_k() -> u64 {
+    SEARCH_FUSION_K_DEFAULT
+}
 
 fn default_search_pool_slots() -> u64 {
     SEARCH_POOL_SLOTS_DEFAULT
@@ -2130,6 +2157,7 @@ mod tests {
         assert_eq!(semantic.candidates, 200);
         assert_eq!(semantic.max_vectors, 200_000);
         assert_eq!(configuration.search.pool_slots, 4);
+        assert_eq!(configuration.search.fusion_k, 60);
         assert_eq!(
             configuration.search.busy_timeout,
             Duration::from_millis(1_000)
@@ -2547,6 +2575,28 @@ mod tests {
             configuration.validate(),
             Err(ConfigurationViolation::LimitOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn test_search_fusion_k_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for accepted in [SEARCH_FUSION_K_MIN, SEARCH_FUSION_K_MAX] {
+            configuration.search.fusion_k = accepted;
+            assert_eq!(configuration.validate(), Ok(()), "{accepted} is in range");
+        }
+        for refused in [SEARCH_FUSION_K_MIN - 1, SEARCH_FUSION_K_MAX + 1] {
+            configuration.search.fusion_k = refused;
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "search.fusion_k",
+                        ..
+                    })
+                ),
+                "{refused} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -3677,13 +3727,24 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_schema_bounds_equal_the_enforced_constants() {
+    fn test_fusion_schema_bounds_equal_the_enforced_constants() {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let definitions = &schema["$defs"];
+        let search = &definitions["SearchConfiguration"]["properties"];
         let lexical = &definitions["LexicalSearchConfiguration"]["properties"];
         let semantic = &definitions["SemanticSearchConfiguration"]["properties"];
         let cases = [
+            (
+                "fusion k min",
+                &search["fusion_k"]["minimum"],
+                json!(SEARCH_FUSION_K_MIN),
+            ),
+            (
+                "fusion k max",
+                &search["fusion_k"]["maximum"],
+                json!(SEARCH_FUSION_K_MAX),
+            ),
             ("model min", &semantic["model"]["minLength"], json!(1)),
             (
                 "model max",
