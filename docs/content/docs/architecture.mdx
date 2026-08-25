@@ -359,11 +359,14 @@ The walk stops after one edge by default and accepts at most two. It also stops 
 Each graph hit carries the shortest path from the seed, including every relationship's
 source-node evidence, derivation, and the direction Rift followed it.
 
-Search is lexical by default. Naming an embedding model in
-[`search.embedding`](/docs/configuration#search) adds dense ranking on top: the server
-embeds indexed declarations, stores the vectors per model, and fuses cosine similarity into the
-lexical score. Per model, because two models' vectors aren't comparable - changing the
-configured model rebuilds the dense index rather than mixing spaces.
+Search fuses two rankings. The lexical one answers a query sharing a token with the code; the
+semantic one answers a query that shares none, because an embedding puts the query and the
+declaration in one space. [`[search.semantic]`](/docs/configuration#search) names the model,
+and the two `weight` keys set each ranking's share of a fused score.
+
+The server embeds indexed declarations and stores the vectors per model, because two models'
+vectors aren't comparable - changing the configured model embeds the workspace again rather
+than mixing spaces.
 
 ### Retrieve symbol
 

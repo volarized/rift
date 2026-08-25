@@ -455,6 +455,21 @@
         }
       ]
     },
+    "LexicalSearchConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[search.lexical]` table: what the lexical ranking contributes to a\nfused score.",
+      "properties": {
+        "weight": {
+          "default": 0.7,
+          "description": "The lexical ranking's share of a fused score, 0.0 to 1.0. It and\n`[search.semantic].weight` must sum to 1: a fused score is the weighted\naverage of the two rankings, and a pair summing to anything else scales\nevery score rather than trading one ranking against the other.",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
     "PathPattern": {
       "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
       "examples": [
@@ -571,7 +586,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search runs on a lexical index; `pool_slots` and\n`busy_timeout` bound the `SQLite` connections behind it, `embedding`\nnames the model that adds dense ranking on top, and `text` includes\nnon-source text files in the lexical index.",
+      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `pool_slots` and\n`busy_timeout` bound the `SQLite` connections behind the lexical tier, and\n`text` includes non-source text files in the lexical index.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
@@ -582,14 +597,12 @@
             "min": "100ms"
           }
         },
-        "embedding": {
-          "description": "The embedding model identifier. Vectors are stored per model, so\nchanging the value rebuilds the dense index; absent keeps search\nlexical.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
+        "lexical": {
+          "$ref": "#/$defs/LexicalSearchConfiguration",
+          "default": {
+            "weight": 0.7
+          },
+          "description": "The lexical ranking's share of a fused score."
         },
         "pool_slots": {
           "default": 4,
@@ -598,6 +611,22 @@
           "maximum": 16,
           "minimum": 1,
           "type": "integer"
+        },
+        "semantic": {
+          "$ref": "#/$defs/SemanticSearchConfiguration",
+          "default": {
+            "batch_declarations": 32,
+            "candidates": 200,
+            "disabled": false,
+            "download_attempts": 3,
+            "download_timeout": "5m",
+            "max_tokens": 256,
+            "max_vectors": 200000,
+            "model": "BAAI/bge-small-en-v1.5",
+            "revision": "main",
+            "weight": 0.3
+          },
+          "description": "The embedding model that adds semantic ranking, and the bounds its\npreparation runs under."
         },
         "text": {
           "$ref": "#/$defs/TextSearchConfiguration",
@@ -610,6 +639,89 @@
             "max_chunk": "1mb"
           },
           "description": "Which non-source text files join the lexical index alongside code\nsymbols."
+        }
+      },
+      "type": "object"
+    },
+    "SemanticSearchConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[search.semantic]` table: the embedding model that ranks a query\nagainst code sharing no word with it, and the bounds its preparation runs\nunder.\n\nPreparation runs behind the answers. A search issued before the vectors are\nin is answered lexically and carries a warning naming what is still\nmissing.",
+      "properties": {
+        "batch_declarations": {
+          "default": 32,
+          "description": "Declarations one embedding pass hands the encoder at once, 1 to 256.\nAttention memory grows with the square of `max_tokens`, so a raised\ntoken window wants a lowered batch.",
+          "format": "uint64",
+          "maximum": 256,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "candidates": {
+          "default": 200,
+          "description": "Declarations the semantic ranking returns before the two rankings are\nfused, 1 to 1000.",
+          "format": "uint64",
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "disabled": {
+          "default": false,
+          "description": "Whether semantic ranking is off. Set it when the workspace must not\nfetch model weights: search then answers lexically alone and raises no\npreparation warning.",
+          "type": "boolean"
+        },
+        "download_attempts": {
+          "default": 3,
+          "description": "Attempts one model download makes before semantic ranking degrades to\nlexical for the life of the server, 1 to 10.",
+          "format": "uint64",
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "download_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "5m",
+          "description": "Wall-clock budget one model download has, 10s to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "10s"
+          }
+        },
+        "max_tokens": {
+          "default": 256,
+          "description": "Tokens the encoder reads from one declaration, 32 to 512. What follows\nthem is truncated.",
+          "format": "uint64",
+          "maximum": 512,
+          "minimum": 32,
+          "type": "integer"
+        },
+        "max_vectors": {
+          "default": 200000,
+          "description": "Vectors the workspace may hold, 1000 to 1000000. Embedding stops at the\nbound and the search warning says so; each vector costs the model's\ndimension in single-precision floats.",
+          "format": "uint64",
+          "maximum": 1000000,
+          "minimum": 1000,
+          "type": "integer"
+        },
+        "model": {
+          "default": "BAAI/bge-small-en-v1.5",
+          "description": "The embedding model: a Hugging Face repository identifier such as\n`BAAI/bge-small-en-v1.5`, or a workspace-relative directory holding the\nweights. Vectors are stored per model, so changing the value embeds the\nworkspace again.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "revision": {
+          "default": "main",
+          "description": "The model revision fetched from the hub: a branch, tag, or commit. It is\nignored when `model` names a directory.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "weight": {
+          "default": 0.3,
+          "description": "The semantic ranking's share of a fused score, 0.0 to 1.0. It and\n`[search.lexical].weight` must sum to 1.",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
         }
       },
       "type": "object"
@@ -787,7 +899,22 @@
       "$ref": "#/$defs/SearchConfiguration",
       "default": {
         "busy_timeout": "1s",
+        "lexical": {
+          "weight": 0.7
+        },
         "pool_slots": 4,
+        "semantic": {
+          "batch_declarations": 32,
+          "candidates": 200,
+          "disabled": false,
+          "download_attempts": 3,
+          "download_timeout": "5m",
+          "max_tokens": 256,
+          "max_vectors": 200000,
+          "model": "BAAI/bge-small-en-v1.5",
+          "revision": "main",
+          "weight": 0.3
+        },
         "text": {
           "extensions": [
             "md",

@@ -177,8 +177,13 @@ max_concurrent = 2
 enabled = true
 max_revisions = 500
 
-[search]
-embedding = "potion-retrieval-32M"
+[search.lexical]
+weight = 0.6
+
+[search.semantic]
+weight = 0.4
+model = "BAAI/bge-small-en-v1.5"
+download_timeout = "5m"
 {DOCUMENTED_HOOK}
 "#
         );
@@ -190,9 +195,11 @@ embedding = "potion-retrieval-32M"
             configuration.execution.max_code,
             ByteSize::from_bytes(16 << 10)
         );
+        assert!((configuration.search.lexical.weight - 0.6).abs() < f64::EPSILON);
+        assert!((configuration.search.semantic.weight - 0.4).abs() < f64::EPSILON);
         assert_eq!(
-            configuration.search.embedding.as_deref(),
-            Some("potion-retrieval-32M")
+            configuration.search.semantic.model,
+            "BAAI/bge-small-en-v1.5"
         );
         let hook = &configuration.hooks[0];
         assert_eq!(hook.id, "tests");

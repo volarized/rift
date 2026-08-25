@@ -176,17 +176,49 @@ busy_timeout = "1s"
 
 <VersionBadge version="planned" />
 
-`embedding` names the model that adds dense ranking on top of the lexical index:
+`[search.lexical]` and `[search.semantic]` weigh two rankings against each other, and
+`[search.semantic]` names the model the second one runs on:
 
 ```toml
-[search]
-embedding = "potion-retrieval-32M"
+[search.lexical]
+weight = 0.7
+
+[search.semantic]
+weight = 0.3
+model = "BAAI/bge-small-en-v1.5"
+revision = "main"
+download_timeout = "5m"
+download_attempts = 3
+batch_declarations = 32
+max_tokens = 256
+candidates = 200
+max_vectors = 200000
 ```
 
-With `embedding` set, the server embeds indexed declarations and fuses cosine similarity into
-the lexical score. The server stores vectors per model - two models' vectors aren't
-comparable - so changing the value rebuilds the dense index. Leaving the key out keeps search
-lexical.
+- `weight` is each ranking's share of a fused score, 0.0 to 1.0; the two must sum to 1,
+  because a fused score is the weighted average of the two rankings
+- `model` names a Hugging Face repository or a workspace-relative directory holding the
+  weights; the server stores vectors per model - two models' vectors aren't comparable - so
+  changing the value embeds the workspace again
+- `revision` is the branch, tag, or commit fetched from the hub, ignored when `model` names a
+  directory
+- `download_timeout` and `download_attempts` bound one model acquisition, 10s to 1h and 1 to
+  10; a spent budget leaves search lexical for the life of the server
+- `batch_declarations` and `max_tokens` bound one embedding pass, 1 to 256 and 32 to 512;
+  attention memory grows with the square of the token window, so a raised window wants a
+  lowered batch
+- `candidates` bounds how many declarations the semantic ranking returns before the two
+  rankings are fused, 1 to 1000
+- `max_vectors` bounds how many vectors the workspace holds, 1000 to 1000000; each vector
+  costs the model's dimension in single-precision floats
+
+`disabled` keeps the workspace lexical without emptying the rest of the table. Set it where
+the workspace must not fetch model weights:
+
+```toml
+[search.semantic]
+disabled = true
+```
 
 ## Engines
 
