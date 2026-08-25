@@ -636,7 +636,7 @@ impl WorkspaceIndex {
     pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, WorkspaceIndexError> {
         let mut files = self.files.clone();
         let mut text_files = self.text_files.clone();
-        for path in changes.dropped() {
+        for path in changes.paths() {
             files.remove(path);
             text_files.remove(path);
         }
@@ -1959,6 +1959,32 @@ mod tests {
             "a removed text file leaves the index"
         );
         assert_eq!(next.file_count(), index.file_count() + 1);
+    }
+
+    #[test]
+    fn test_rebuilt_applied_twice_leaves_what_applying_it_once_left() {
+        let directory = fixture();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        fs::write(root.join("src/added.rs"), "pub fn added() {}\n").expect("added source");
+
+        // Two rebuilds can be captured from one publication, so the second still calls the
+        // path added after the first has written it. Both write what they read, and the
+        // second replaces rather than adds to what the first left.
+        let changes = resolved(&index, root, &["src/added.rs"]);
+        let once = index
+            .rebuilt(&changes)
+            .expect("the first rebuild must land");
+        let twice = once
+            .rebuilt(&changes)
+            .expect("the same change set must apply again");
+
+        assert_eq!(once.file_count(), twice.file_count());
+        assert_eq!(
+            once.fingerprint(),
+            twice.fingerprint(),
+            "one change set applied twice leaves the tree it left once"
+        );
     }
 
     #[test]

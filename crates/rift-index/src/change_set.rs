@@ -76,10 +76,15 @@ impl PathChanges {
         self.paths_where(|change| matches!(change, PathChange::Added | PathChange::Modified))
     }
 
-    /// The paths the rebuild drops from the index: removed and modified alike, since a
-    /// modified file's previous entries are replaced rather than merged.
-    pub fn dropped(&self) -> impl Iterator<Item = &ProjectPath> {
-        self.paths_where(|change| matches!(change, PathChange::Modified | PathChange::Removed))
+    /// Every classified path, whose previous entries the rebuild replaces outright.
+    ///
+    /// All three classes belong here, added paths included. A rebuild that named a path
+    /// writes what it read there and nothing else, so a store that already holds entries
+    /// under that path - because a superseded rebuild for the same tree reached it first -
+    /// is replaced rather than added to. That is what makes one change set's write
+    /// repeatable: applying it twice leaves exactly what applying it once left.
+    pub fn paths(&self) -> impl Iterator<Item = &ProjectPath> {
+        self.0.keys()
     }
 
     fn paths_where(
@@ -303,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_indexed_and_dropped_split_the_classified_paths() -> TestResult {
+    fn test_indexed_paths_are_the_read_half_of_every_replaced_path() -> TestResult {
         let published = published(&[("a.md", "a"), ("b.md", "b")])?;
         let observed = vec![
             (path("a.md")?, Some(FileDigest::of(b"a2"))),
@@ -313,9 +318,9 @@ mod tests {
         let resolved = PathChanges::resolve(observed, |path| published.get(path).copied());
         let changes = &resolved;
         let indexed: Vec<_> = changes.indexed().map(ProjectPath::as_str).collect();
-        let dropped: Vec<_> = changes.dropped().map(ProjectPath::as_str).collect();
+        let replaced: Vec<_> = changes.paths().map(ProjectPath::as_str).collect();
         assert_eq!(indexed, vec!["a.md", "c.md"]);
-        assert_eq!(dropped, vec!["a.md", "b.md"]);
+        assert_eq!(replaced, vec!["a.md", "b.md", "c.md"]);
         assert_eq!(changes.len(), 3);
         Ok(())
     }
