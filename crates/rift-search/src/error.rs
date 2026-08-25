@@ -25,6 +25,8 @@ pub enum SearchViolation {
     WeightsUnreadable,
     /// The encoder's forward pass failed.
     EncodeFailed,
+    /// A blocking task the encoder or the ranking ran on did not return.
+    TaskFailed,
     /// One call handed the encoder more texts than its bound allows.
     TextLimit,
     /// A query vector and a stored vector are not of one width.
@@ -51,7 +53,9 @@ impl SearchViolation {
             | Self::FusionConstantInvalid
             | Self::ModelSourceInvalid
             | Self::ModelCacheUnavailable => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
-            Self::EncodeFailed | Self::StoreFailed => ErrorName::Wire(ErrorCode::InternalError),
+            Self::EncodeFailed | Self::StoreFailed | Self::TaskFailed => {
+                ErrorName::Wire(ErrorCode::InternalError)
+            }
             Self::TextLimit | Self::ModelDownloadTooLarge => {
                 ErrorName::Wire(ErrorCode::LimitExceeded)
             }
@@ -191,6 +195,11 @@ mod tests {
                 SearchViolation::EncodeFailed,
                 ErrorCode::InternalError,
                 "encode_failed",
+            ),
+            (
+                SearchViolation::TaskFailed,
+                ErrorCode::InternalError,
+                "task_failed",
             ),
             (
                 SearchViolation::TextLimit,

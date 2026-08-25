@@ -4,11 +4,13 @@
 //! database file, so a caller drives search through it and never opens either
 //! store itself. One `search` runs both tiers and fuses what they returned.
 //!
-//! Nothing here spawns a task, blocks on a runtime, or knows what a server is.
-//! The caller drives [`SearchIndex::prepare`], [`SearchIndex::build`], and
+//! Nothing here knows what a server is. The caller drives
+//! [`SearchIndex::prepare`], [`SearchIndex::build`], and
 //! [`SearchIndex::refresh`] on whatever task it likes. The encoder's forward
-//! pass runs on the calling task, so a caller that must keep a runtime worker
-//! free places these calls where blocking work is allowed.
+//! pass does not run on the calling task: candle would hold a runtime worker
+//! for the length of a batch, so every call into the encoder goes through
+//! `tokio::task::spawn_blocking` and the runtime's workers stay free for
+//! whatever else the caller is serving.
 //!
 //! What the semantic tier can answer right now is [`SemanticReadiness`]. This
 //! crate reports it and stops there: the wire warning a caller attaches to a
@@ -665,7 +667,7 @@ impl SearchIndex {
     /// far it got.
     async fn embed(
         &self,
-        model: &LoadedModel,
+        model: &Arc<LoadedModel>,
         described: &[DescribedUnit<'_>],
         embedding: Embedding,
     ) -> Result<(), SearchError> {
@@ -695,14 +697,25 @@ impl SearchIndex {
     /// At most `max_vectors / batch_declarations` passes run: `wanted` was cut
     /// to `max_vectors` before the pairing that produced it. Storing per pass
     /// is what makes a cancelled build keep the work it already paid for.
+    ///
+    /// The pass hands each batch to the encoder through
+    /// `tokio::task::spawn_blocking`, because candle's forward pass would
+    /// otherwise hold a runtime worker for the length of the batch. Dropping
+    /// this future does not cancel a batch already handed over: it finishes
+    /// unread, its vectors are never stored, and the next pass embeds it
+    /// again.
     async fn embed_batches(
         &self,
-        model: &LoadedModel,
+        model: &Arc<LoadedModel>,
         wanted: &[&UnitDocument],
     ) -> Result<(), SearchError> {
         for chunk in wanted.chunks(batch_size(self.limits.batch_declarations)) {
             let texts: Vec<String> = chunk.iter().map(|one| one.text.clone()).collect();
-            let embedded = model.encoder.embed_documents(&texts)?;
+            let held = Arc::clone(model);
+            let embedded =
+                tokio::task::spawn_blocking(move || held.encoder.embed_documents(&texts))
+                    .await
+                    .map_err(task_failed)??;
             let vectors = paired(chunk, embedded);
             self.vectors
                 .store(&model.identity, model.encoder.dimension(), &vectors)
@@ -717,6 +730,11 @@ impl SearchIndex {
     /// A digest the address map does not name is skipped: the store holds
     /// vectors from before this process opened it, and until a pass publishes
     /// the map there is no unit to rank them as.
+    ///
+    /// One `tokio::task::spawn_blocking` call carries both the query's forward
+    /// pass and the cosine scan over every stored vector. Neither may hold a
+    /// runtime worker while another request waits, and running the two under
+    /// one call schedules the work once rather than twice.
     async fn semantic(&self, query: &str) -> Result<Vec<UnitAddress>, SearchError> {
         let Some(model) = self.serving_model() else {
             return Ok(Vec::new());
@@ -730,8 +748,14 @@ impl SearchIndex {
             return Ok(Vec::new());
         }
         let addresses = self.addresses();
-        let embedded = model.encoder.embed_query(query)?;
-        let matched = nearest(&embedded, &stored, self.limits.depth())?;
+        let depth = self.limits.depth();
+        let asked = query.to_owned();
+        let matched = tokio::task::spawn_blocking(move || {
+            let embedded = model.encoder.embed_query(&asked)?;
+            nearest(&embedded, &stored, depth)
+        })
+        .await
+        .map_err(task_failed)??;
         let placed = placed(&matched, &addresses);
         let spread = spread_per_file(&placed, as_usize(self.limits.per_file_max));
         Ok(resolved(
@@ -961,6 +985,17 @@ fn store_failed(source: LexicalIndexError) -> SearchError {
     let fault = SearchFault::new(SearchViolation::StoreFailed)
         .about(subject)
         .carrying(source.fault());
+    SearchError::new(fault.caused_by(source))
+}
+
+/// One blocking task that never returned what it was given to compute.
+///
+/// A join fails only when the task panicked or the runtime shut down under
+/// it, so there is no encoder or store refusal to report and the join failure
+/// itself is the evidence.
+fn task_failed(source: tokio::task::JoinError) -> SearchError {
+    let subject = source.to_string();
+    let fault = SearchFault::new(SearchViolation::TaskFailed).about(subject);
     SearchError::new(fault.caused_by(source))
 }
 
