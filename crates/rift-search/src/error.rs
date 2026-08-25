@@ -1,6 +1,6 @@
 //! Registry identity for the search tier's failures.
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
+use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, fault_label};
 use serde::Serialize;
 
 /// What the search tier refused, and why.
@@ -33,6 +33,9 @@ pub enum SearchViolation {
     RankingWeightsInvalid,
     /// Fusion was handed a rank constant outside the accepted range.
     FusionConstantInvalid,
+    /// The lexical index or the vector store refused, and its own violation
+    /// rides as the cause.
+    StoreFailed,
 }
 
 impl SearchViolation {
@@ -48,7 +51,7 @@ impl SearchViolation {
             | Self::FusionConstantInvalid
             | Self::ModelSourceInvalid
             | Self::ModelCacheUnavailable => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
-            Self::EncodeFailed => ErrorName::Wire(ErrorCode::InternalError),
+            Self::EncodeFailed | Self::StoreFailed => ErrorName::Wire(ErrorCode::InternalError),
             Self::TextLimit | Self::ModelDownloadTooLarge => {
                 ErrorName::Wire(ErrorCode::LimitExceeded)
             }
@@ -63,6 +66,20 @@ pub struct SearchFault {
     violation: SearchViolation,
     subject: Option<String>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    carried: Option<CarriedIdentity>,
+}
+
+/// The registry identity a wrapped failure already carried.
+///
+/// A store this tier calls classifies its own refusals: a query past the
+/// store's term bound is `limit_exceeded` with the bound and what the request
+/// needed. Restating it as this tier's own violation would tell the caller the
+/// server failed when the caller can fix the request, so the identity and the
+/// evidence travel with the failure.
+#[derive(Debug)]
+struct CarriedIdentity {
+    name: ErrorName,
+    limit: Option<LimitEvidence>,
 }
 
 impl SearchFault {
@@ -73,6 +90,7 @@ impl SearchFault {
             violation,
             subject: None,
             source: None,
+            carried: None,
         }
     }
 
@@ -90,6 +108,18 @@ impl SearchFault {
         self
     }
 
+    /// Adopts the registry identity and limit evidence `carried` already
+    /// classified itself as, so a bound a wrapped store enforced still reaches
+    /// the caller as that bound.
+    #[must_use]
+    pub fn carrying(mut self, carried: &dyn Fault) -> Self {
+        self.carried = Some(CarriedIdentity {
+            name: carried.name(),
+            limit: carried.limit_evidence(),
+        });
+        self
+    }
+
     /// The violation this failure reports.
     #[must_use]
     pub const fn violation(&self) -> SearchViolation {
@@ -99,7 +129,16 @@ impl SearchFault {
 
 impl Fault for SearchFault {
     fn name(&self) -> ErrorName {
-        self.violation.name()
+        match &self.carried {
+            Some(carried) => carried.name,
+            None => self.violation.name(),
+        }
+    }
+
+    fn limit_evidence(&self) -> Option<LimitEvidence> {
+        self.carried
+            .as_ref()
+            .and_then(|carried| carried.limit.clone())
     }
 
     fn context(&self) -> Vec<ErrorContext> {
@@ -192,6 +231,11 @@ mod tests {
                 SearchViolation::ModelDownloadTooLarge,
                 ErrorCode::LimitExceeded,
                 "model_download_too_large",
+            ),
+            (
+                SearchViolation::StoreFailed,
+                ErrorCode::InternalError,
+                "store_failed",
             ),
         ];
         for (violation, code, label) in cases {
