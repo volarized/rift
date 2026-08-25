@@ -194,7 +194,7 @@ weight = 0.7
 [search.semantic]
 weight = 0.3
 source = "hf"
-model = "BAAI/bge-small-en-v1.5"
+model = "minishlab/potion-retrieval-32M"
 download_timeout = "5m"
 download_attempts = 3
 batch_declarations = 32
@@ -214,15 +214,21 @@ max_vectors = 200000
   machine caches them, `directory` reads a directory the workspace already holds and
   downloads nothing
 - `model` names which weights, in the form the semantic tier's `source` sets: under `hf` a
-  repository identifier such as `BAAI/bge-small-en-v1.5`, optionally carrying a revision
-  after `@`; under `directory` a workspace-relative directory. The server stores vectors per
-  model - two models' vectors aren't comparable - so changing the value embeds the workspace
-  again
+  repository identifier such as `minishlab/potion-retrieval-32M`, optionally carrying a
+  revision after `@`; under `directory` a workspace-relative directory. The server stores
+  vectors per model - two models' vectors aren't comparable - so changing the value embeds
+  the workspace again
+- The model's own `config.json` decides how the server reads it. A `model_type` of
+  `model2vec` names a static model, which embeds a declaration by averaging one row per
+  token; anything else is read as a BERT checkpoint, which runs a forward pass per batch.
+  The shipped default is static, because a forward pass over every declaration in a
+  workspace costs minutes on a laptop CPU and a row gather costs seconds
 - `download_timeout` and `download_attempts` bound one model acquisition, 10s to 1h and 1 to
   10; a spent budget leaves search lexical for the life of the server
-- `batch_declarations` and `max_tokens` bound one embedding pass, 1 to 256 and 32 to 512;
-  attention memory grows with the square of the token window, so a raised window wants a
-  lowered batch
+- `batch_declarations` and `max_tokens` bound one embedding pass, 1 to 256 and 32 to 512.
+  A BERT checkpoint's attention memory grows with the square of the token window, so a
+  raised window wants a lowered batch; a static model reads one row per token, so its cost
+  grows with the window rather than with its square
 - `candidates` bounds how many declarations the semantic ranking returns before the two
   rankings are fused, 1 to 1000, and `candidates_per_file` bounds any one file's share of them
 - `candidates_per_file` bounds how many declarations one file contributes to that list, 1 to

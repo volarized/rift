@@ -23,7 +23,9 @@ pub enum SearchViolation {
     TokenizerUnreadable,
     /// A model's weights could not be read, or the architecture refused them.
     WeightsUnreadable,
-    /// The encoder's forward pass failed.
+    /// The encoder could not turn one text into a vector: the BERT path's
+    /// forward pass failed, or the static path met a token its weights hold
+    /// no row for.
     EncodeFailed,
     /// A blocking task the encoder or the ranking ran on did not return.
     TaskFailed,
