@@ -360,7 +360,7 @@ pub struct WorkspaceSourcePolicy {
     root: PathBuf,
     watched_root: PathBuf,
     matcher: PathMatcher,
-    gitignore: Option<Gitignore>,
+    gitignore: Option<GitignoreChain>,
     text_inclusion: TextFileInclusion,
 }
 
@@ -421,7 +421,7 @@ impl WorkspaceSourcePolicy {
         let matcher = PathMatcher::build(&root, visibility.include(), visibility.exclude())?;
         let gitignore = visibility
             .respect_gitignore()
-            .then(|| build_gitignore(&root, limits))
+            .then(|| GitignoreChain::build(&root, limits))
             .transpose()?;
         Ok(Self {
             root,
@@ -447,12 +447,10 @@ impl WorkspaceSourcePolicy {
             return false;
         }
         let configuration_includes = self.matcher.includes(path);
-        let gitignore_includes = self.gitignore.as_ref().is_none_or(|gitignore| {
-            !matches!(
-                gitignore.matched_path_or_any_parents(path, false),
-                Match::Ignore(_)
-            )
-        });
+        let gitignore_includes = self
+            .gitignore
+            .as_ref()
+            .is_none_or(|gitignore| !gitignore.excludes(path, false));
         configuration_includes && gitignore_includes
     }
 
@@ -468,12 +466,10 @@ impl WorkspaceSourcePolicy {
             return false;
         }
         let configuration_includes = self.matcher.may_include_descendant(path);
-        let gitignore_includes = self.gitignore.as_ref().is_none_or(|gitignore| {
-            !matches!(
-                gitignore.matched_path_or_any_parents(path, true),
-                Match::Ignore(_)
-            )
-        });
+        let gitignore_includes = self
+            .gitignore
+            .as_ref()
+            .is_none_or(|gitignore| !gitignore.excludes(path, true));
         configuration_includes && gitignore_includes
     }
 
@@ -961,36 +957,79 @@ fn discover(
 }
 
 /// Compiles bounded workspace `.gitignore` chain for direct event matching.
-fn build_gitignore(
-    root: &Path,
-    limits: WorkspaceIndexLimits,
-) -> Result<Gitignore, WorkspaceIndexError> {
-    let mut builder = GitignoreBuilder::new(root);
-    let mut ignore_files = 0_usize;
-    for entry in source_walk(root, limits.directory_depth_max, GitignorePolicy::Ignore) {
-        let entry = entry.map_err(|error| walk_error(root, error))?;
-        let path = entry.path();
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-            || path.file_name() != Some(OsStr::new(".gitignore"))
-        {
-            continue;
+/// The workspace's `.gitignore` files, each compiled against the directory that declares
+/// it, shallowest first.
+///
+/// Git reads every ignore file relative to its own directory, and a deeper file decides
+/// over a shallower one. Compiling them all against the workspace root moves every pattern
+/// up: a `.ruff_cache/.gitignore` holding `*` - which `ruff` writes into any workspace it
+/// runs in - would then exclude every file in the workspace, and the watcher that consults
+/// this policy would see no source event at all.
+#[derive(Debug)]
+pub(crate) struct GitignoreChain {
+    layers: Vec<Gitignore>,
+}
+
+impl GitignoreChain {
+    /// Compiles every `.gitignore` below `root`, each against its own directory.
+    ///
+    /// Work is bounded by [`WorkspaceIndexLimits::files_max`], counted over ignore files.
+    fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, WorkspaceIndexError> {
+        let mut layers = Vec::new();
+        let mut ignore_files = 0_usize;
+        for entry in source_walk(root, limits.directory_depth_max, GitignorePolicy::Ignore) {
+            let entry = entry.map_err(|error| walk_error(root, error))?;
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+                || path.file_name() != Some(OsStr::new(".gitignore"))
+            {
+                continue;
+            }
+            if ignore_files >= limits.files_max {
+                return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+            }
+            ignore_files += 1;
+            layers.push(compiled_gitignore(path)?);
         }
-        if ignore_files >= limits.files_max {
-            return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+        layers.sort_by_key(|layer| layer.path().components().count());
+        Ok(Self { layers })
+    }
+
+    /// Whether the workspace's ignore files exclude `path`.
+    ///
+    /// Each layer whose directory contains `path` answers in turn, and the deepest one that
+    /// matches decides, which is git's own precedence.
+    fn excludes(&self, path: &Path, is_directory: bool) -> bool {
+        let mut excluded = false;
+        for layer in &self.layers {
+            if !path.starts_with(layer.path()) {
+                continue;
+            }
+            match layer.matched_path_or_any_parents(path, is_directory) {
+                Match::Ignore(_) => excluded = true,
+                Match::Whitelist(_) => excluded = false,
+                Match::None => {}
+            }
         }
-        ignore_files += 1;
-        if let Some(error) = builder.add(path) {
-            return Err(index_error_caused_by(
-                WorkspaceIndexViolation::Filesystem,
-                Some(path),
-                error,
-            ));
-        }
+        excluded
+    }
+}
+
+/// Compiles one `.gitignore` file against the directory that declares it.
+fn compiled_gitignore(path: &Path) -> Result<Gitignore, WorkspaceIndexError> {
+    let directory = path.parent().unwrap_or(path);
+    let mut builder = GitignoreBuilder::new(directory);
+    if let Some(error) = builder.add(path) {
+        return Err(index_error_caused_by(
+            WorkspaceIndexViolation::Filesystem,
+            Some(path),
+            error,
+        ));
     }
     builder.build().map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(root), error)
+        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })
 }
 
@@ -1466,6 +1505,132 @@ mod tests {
         .expect("fixture source");
         fs::write(directory.path().join("README.txt"), "ignored").expect("fixture prose");
         directory
+    }
+
+    #[test]
+    fn test_policy_and_index_agree_on_a_tree_with_a_nested_ignore_file() {
+        // `ruff` writes `.ruff_cache/.gitignore` holding `*` into any workspace it runs in.
+        // Read against the workspace root that pattern excludes every file; read against
+        // its own directory it excludes only the cache. The policy the watcher consults and
+        // the walk the index runs have to reach the same verdict, or the watcher goes deaf
+        // while the index stays full.
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::create_dir_all(root.join(".ruff_cache")).expect("fixture directory");
+        fs::write(root.join(".ruff_cache/.gitignore"), "*\n").expect("fixture ignore file");
+        fs::write(root.join(".ruff_cache/cached.rs"), "pub fn cached() {}\n").expect("cache");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("fixture source");
+
+        let index = WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("the fixture workspace must index");
+        let policy = WorkspaceSourcePolicy::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("the fixture policy must compile");
+
+        let canonical = root.canonicalize().expect("canonical fixture root");
+        assert!(
+            index
+                .file(&ProjectPath::new("src/lib.rs").expect("fixture path"))
+                .is_some(),
+            "the walk keeps a source file the nested ignore file does not name"
+        );
+        assert!(
+            policy.includes(&canonical.join("src/lib.rs")),
+            "the policy keeps the same file the walk kept"
+        );
+        assert!(
+            index
+                .file(&ProjectPath::new(".ruff_cache/cached.rs").expect("fixture path"))
+                .is_none(),
+            "the walk drops what the nested ignore file names"
+        );
+        assert!(
+            !policy.includes(&canonical.join(".ruff_cache/cached.rs")),
+            "the policy drops the same file the walk dropped"
+        );
+    }
+
+    #[test]
+    fn test_nested_ignore_file_narrows_only_its_own_directory() {
+        // A pattern in a nested file addresses paths under that file's directory, so a
+        // root-level file spelling the same name stays visible.
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("nested")).expect("fixture directory");
+        fs::write(root.join("nested/.gitignore"), "hidden.rs\n").expect("fixture ignore file");
+        fs::write(root.join("nested/hidden.rs"), "pub fn hidden() {}\n").expect("fixture source");
+        fs::write(root.join("hidden.rs"), "pub fn visible() {}\n").expect("fixture source");
+
+        let policy = WorkspaceSourcePolicy::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("the fixture policy must compile");
+        let canonical = root.canonicalize().expect("canonical fixture root");
+        assert!(
+            !policy.includes(&canonical.join("nested/hidden.rs")),
+            "the nested file excludes the path it names"
+        );
+        assert!(
+            policy.includes(&canonical.join("hidden.rs")),
+            "the same spelling above that directory stays visible"
+        );
+    }
+
+    #[test]
+    fn test_a_deeper_ignore_file_decides_over_a_shallower_one() {
+        // Git lets a deeper file re-include what a shallower one excluded, and the policy
+        // has to reach the same verdict as the walk that indexes the tree.
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("nested")).expect("fixture directory");
+        fs::write(root.join(".gitignore"), "*.rs\n").expect("root ignore file");
+        fs::write(root.join("nested/.gitignore"), "!kept.rs\n").expect("nested ignore file");
+        fs::write(root.join("nested/kept.rs"), "pub fn kept() {}\n").expect("fixture source");
+        fs::write(root.join("dropped.rs"), "pub fn dropped() {}\n").expect("fixture source");
+
+        let index = WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("the fixture workspace must index");
+        let policy = WorkspaceSourcePolicy::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("the fixture policy must compile");
+        let canonical = root.canonicalize().expect("canonical fixture root");
+
+        assert_eq!(
+            index
+                .file(&ProjectPath::new("nested/kept.rs").expect("fixture path"))
+                .is_some(),
+            policy.includes(&canonical.join("nested/kept.rs")),
+            "the walk and the policy must agree on a re-included path"
+        );
+        assert_eq!(
+            index
+                .file(&ProjectPath::new("dropped.rs").expect("fixture path"))
+                .is_some(),
+            policy.includes(&canonical.join("dropped.rs")),
+            "the walk and the policy must agree on an excluded path"
+        );
     }
 
     #[test]
