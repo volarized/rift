@@ -631,6 +631,7 @@
             "max_tokens": 256,
             "max_vectors": 200000,
             "model": "BAAI/bge-small-en-v1.5",
+            "source": "hf",
             "weight": 0.3
           },
           "description": "The embedding model that adds semantic ranking, and the bounds its\npreparation runs under."
@@ -710,10 +711,15 @@
         },
         "model": {
           "default": "BAAI/bge-small-en-v1.5",
-          "description": "The embedding model: a Hugging Face repository identifier such as\n`BAAI/bge-small-en-v1.5`, the same identifier with a pinned model\nrevision after `@`, or a workspace-relative directory holding the\nweights. Vectors are stored per model, so changing the value embeds the\nworkspace again.",
+          "description": "Which weights: under `hf` a repository identifier such as\n`BAAI/bge-small-en-v1.5`, optionally carrying a revision after `@`;\nunder `directory` a workspace-relative directory holding them. Vectors\nare stored per model, so changing the value embeds the workspace\nagain.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/SemanticSource",
+          "default": "hf",
+          "description": "Where the weights come from, which decides how `model` reads."
         },
         "weight": {
           "default": 0.3,
@@ -725,6 +731,21 @@
         }
       },
       "type": "object"
+    },
+    "SemanticSource": {
+      "description": "Where the semantic ranking's model weights come from.",
+      "oneOf": [
+        {
+          "const": "hf",
+          "description": "Weights come from a Hugging Face repository, cached where every\nother Hugging Face client on the machine caches them.",
+          "type": "string"
+        },
+        {
+          "const": "directory",
+          "description": "Weights are a directory the workspace already holds. Nothing is\ndownloaded.",
+          "type": "string"
+        }
+      ]
     },
     "ServerConfiguration": {
       "additionalProperties": false,
@@ -913,6 +934,7 @@
           "max_tokens": 256,
           "max_vectors": 200000,
           "model": "BAAI/bge-small-en-v1.5",
+          "source": "hf",
           "weight": 0.3
         },
         "text": {
