@@ -308,17 +308,17 @@ mod tests {
     }
 
     /// JavaScript allows redeclaring a function name; the walk emits both
-    /// declarations under one qualified name rather than renaming or
-    /// dropping either.
+    /// declarations rather than dropping either, and each takes a `~N`
+    /// suffix so the two address distinct identities.
     #[test]
-    fn test_redeclared_function_emits_both_declarations_under_one_qualified_name() {
+    fn test_redeclared_function_emits_both_declarations_under_distinct_names() {
         let document = analyze("function dup() { return 1; }\nfunction dup() { return 2; }\n");
         let names = document
             .symbols()
             .iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["dup", "dup"]);
+        assert_eq!(names, ["dup~1", "dup~2"]);
         assert_ne!(
             document.symbols()[0].range,
             document.symbols()[1].range,
