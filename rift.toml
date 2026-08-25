@@ -7,6 +7,10 @@ include = []
 exclude = [".claude/**", ".agents/**"]
 respect_gitignore = true
 
+[engines.rust]
+program = "rust-analyzer"
+languages = ["rust"]
+
 [[hooks]]
 type = "command"
 id = "format"
