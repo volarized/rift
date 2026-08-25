@@ -958,3 +958,32 @@ async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_t
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_unit_set()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let index =
+        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    index.replace_all(&[], "revision-one").await?;
+
+    // Two rebuilds captured from one publication both name the file as added, and the
+    // second commits after the first has written it. A change replaces the paths it names,
+    // so the second commit is the first one repeated rather than a second insert of one
+    // identity.
+    let change = LexicalChange::new(
+        vec![ProjectPath::new("docs/added.md")?],
+        vec![text_unit("docs/added.md", "alphaone content")?],
+    );
+    index.apply(&change, "revision-two").await?;
+    index.apply(&change, "revision-two").await?;
+
+    assert_eq!(
+        search_matches(&index, "revision-two", "alphaone", 8)
+            .await?
+            .len(),
+        1,
+        "the repeated commit leaves one unit, not two rows under one identity"
+    );
+    Ok(())
+}
