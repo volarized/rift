@@ -1,5 +1,6 @@
 //! In-memory indexing and retrieval.
 
+mod change_set;
 mod chunk;
 mod glob;
 mod lexical;
@@ -7,6 +8,7 @@ mod revision;
 mod vector;
 mod workspace;
 
+pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 pub use glob::PathMatcher;
 pub use lexical::{
     LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch,
@@ -16,7 +18,8 @@ pub use vector::{SemanticVectorStore, StoredVector};
 pub use workspace::{
     IndexedFile, SymbolMatch, SymbolMatchRank, TextSourceFile, WorkspaceFingerprint,
     WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits,
-    WorkspaceIndexViolation, WorkspaceSourcePolicy, source_line_matches, symbol_matches,
+    WorkspaceIndexViolation, WorkspaceSourcePolicy, capture_digests, source_line_matches,
+    symbol_matches,
 };
 
 /// Compile-time marker for index-layer ownership.
