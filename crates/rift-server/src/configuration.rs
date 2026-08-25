@@ -214,6 +214,15 @@ download_timeout = "5m"
         assert_eq!(hook.determinism, Determinism::Deterministic);
     }
 
+    #[test]
+    fn test_semantic_candidate_bounds_parse_from_toml() {
+        let configuration =
+            accept_configuration("[search.semantic]\ncandidates = 100\ncandidates_per_file = 8\n")
+                .expect("both candidate bounds must be accepted");
+        assert_eq!(configuration.search.semantic.candidates, 100);
+        assert_eq!(configuration.search.semantic.candidates_per_file, 8);
+    }
+
     /// The repository's own `rift.toml`, exercised so the committed file accepts cleanly
     /// under the exact model this module validates against.
     #[test]
