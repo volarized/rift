@@ -117,7 +117,7 @@ intersection per language.
 
 <VersionBadge
   version="v0.0.7"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 The built-in providers run without configuration; the `providers` table exists to bound or
@@ -176,7 +176,7 @@ busy_timeout = "1s"
 
 <VersionBadge
   version="v0.0.16"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 The two rankings are combined by reciprocal-rank fusion: a result scores as the weighted sum
@@ -366,6 +366,18 @@ refuses `unsupported`.
 A segment no syntax provider knows is accepted, because the engine tier may serve a language the
 syntax tier does not. A misspelled segment therefore fails nothing at load and simply never
 matches an address.
+
+A minimal engine needs only `program` and `languages`. This table names
+[tombi](https://github.com/tombi-toml/tombi), a TOML formatter, linter, and language server:
+
+```toml
+[engines.toml]
+program = "tombi"
+arguments = ["lsp"]
+languages = ["toml"]
+```
+
+`lsp` is the subcommand that starts tombi's language server over stdio.
 
 An engine that ships as a package runs through its package runner. This table serves both
 TypeScript dialects through `bunx`, with the language server version pinned so a registry

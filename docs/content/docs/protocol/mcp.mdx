@@ -4,7 +4,7 @@ title: MCP
 
 <VersionBadge
   version="v0.0.13"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 `rift mcp` serves MCP over stdio for harnesses that launch servers as subprocesses. Stdout carries
@@ -55,7 +55,7 @@ when both are absent. The server refuses a read naming a `projection` with
 
 <VersionBadge
   version="v0.0.7"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
@@ -164,7 +164,7 @@ This request names a `traversal`, which the server does not serve:
 
 <VersionBadge
   version="v0.0.9"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 `query` matches declaration names, file contents, and declaration sources through a full-text
