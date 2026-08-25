@@ -3502,6 +3502,7 @@ dependencies = [
  "candle-transformers",
  "data-encoding",
  "rayon",
+ "reqwest",
  "rift-core",
  "rift-index",
  "serde",
@@ -3509,6 +3510,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers",
+ "tokio",
  "tracing",
 ]
 

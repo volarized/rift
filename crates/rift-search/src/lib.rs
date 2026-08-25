@@ -12,12 +12,14 @@
 //! is the stronger side, and the semantic tier is measurably worse at exactly
 //! that.
 
+mod acquisition;
 mod document;
 mod encoder;
 mod error;
 mod fusion;
 mod similarity;
 
+pub use acquisition::{AcquisitionLimits, FetchedFile, ModelSource, acquire};
 pub use document::{
     DOCUMENT_SOURCE_BYTES_MAX, Declaration, Document, DocumentDigest, digests, document,
 };

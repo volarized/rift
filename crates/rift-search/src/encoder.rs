@@ -16,11 +16,11 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use crate::error::{SearchError, SearchFault, SearchViolation};
 
 /// The file a model's architecture and dimensions are read from.
-const CONFIGURATION_FILE: &str = "config.json";
+pub(crate) const CONFIGURATION_FILE: &str = "config.json";
 /// The file a model's tokenizer is read from.
-const TOKENIZER_FILE: &str = "tokenizer.json";
+pub(crate) const TOKENIZER_FILE: &str = "tokenizer.json";
 /// The file a model's weights are read from.
-const WEIGHTS_FILE: &str = "model.safetensors";
+pub(crate) const WEIGHTS_FILE: &str = "model.safetensors";
 
 /// The prefix a retrieval query carries and a document does not.
 ///
