@@ -60,7 +60,45 @@ impl<'a> Declaration<'a> {
     }
 }
 
-/// The text one declaration is embedded as.
+/// One declaration's embedding text, and the source bytes that did not fit.
+///
+/// The dropped count is carried rather than discarded so a caller can report a
+/// declaration it could not embed whole. A refresh reads it to decide whether
+/// the workspace holds declarations larger than the encoder ever sees.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Document {
+    text: String,
+    source_bytes_dropped: usize,
+}
+
+impl Document {
+    /// The text handed to the encoder.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Source bytes cut to reach [`DOCUMENT_SOURCE_BYTES_MAX`], zero when the
+    /// declaration fit whole.
+    #[must_use]
+    pub const fn source_bytes_dropped(&self) -> usize {
+        self.source_bytes_dropped
+    }
+
+    /// Whether the declaration's source reached the encoder whole.
+    #[must_use]
+    pub const fn is_source_complete(&self) -> bool {
+        self.source_bytes_dropped == 0
+    }
+
+    /// The text alone, for a caller that has already read the dropped count.
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+}
+
+/// The text one declaration is embedded as, and what did not fit.
 ///
 /// The declaration's own source is the document wherever it can be read: the
 /// encoder was trained on code, and a declaration's identifiers and doc comment
@@ -72,8 +110,14 @@ impl<'a> Declaration<'a> {
 /// The path is deliberately absent. It is the weakest signal the lexical tier
 /// already covers, and it is the furthest thing from the function bodies the
 /// encoder was trained against.
+///
+/// A declaration longer than [`DOCUMENT_SOURCE_BYTES_MAX`] is cut on a
+/// character boundary, and the result says how many bytes were dropped. The cut
+/// is a work bound rather than a ranking decision: the encoder truncates the
+/// same text again at its own token bound, which is the narrower of the two for
+/// any declaration this cap reaches.
 #[must_use]
-pub fn document(declaration: &Declaration<'_>) -> String {
+pub fn document(declaration: &Declaration<'_>) -> Document {
     let mut text = String::with_capacity(256);
     text.push_str(declaration.kind);
     text.push(' ');
@@ -81,10 +125,17 @@ pub fn document(declaration: &Declaration<'_>) -> String {
     text.push('\n');
     if declaration.source.is_empty() {
         push_metadata(&mut text, declaration);
-    } else {
-        text.push_str(bounded_source(declaration.source));
+        return Document {
+            text,
+            source_bytes_dropped: 0,
+        };
     }
-    text
+    let kept = bounded_source(declaration.source);
+    text.push_str(kept);
+    Document {
+        text,
+        source_bytes_dropped: declaration.source.len() - kept.len(),
+    }
 }
 
 /// The signature and documentation, for a declaration whose source is absent.
@@ -165,10 +216,13 @@ mod tests {
             .signature("pub struct Encoder")
             .documentation("The BERT encoder.")
             .source("pub struct Encoder {\n    dimension: usize,\n}");
+        let built = document(&declaration);
         assert_eq!(
-            document(&declaration),
+            built.text(),
             "struct rift_search::Encoder\npub struct Encoder {\n    dimension: usize,\n}"
         );
+        assert!(built.is_source_complete());
+        assert_eq!(built.source_bytes_dropped(), 0);
     }
 
     #[test]
@@ -176,29 +230,46 @@ mod tests {
         let declaration = Declaration::new("struct", "rift_search::Encoder")
             .signature("pub struct Encoder")
             .documentation("The BERT encoder.");
+        let built = document(&declaration);
         assert_eq!(
-            document(&declaration),
+            built.text(),
             "struct rift_search::Encoder\npub struct Encoder\nThe BERT encoder."
+        );
+        assert!(
+            built.is_source_complete(),
+            "an absent source drops no bytes"
         );
     }
 
     #[test]
     fn test_document_without_signature_or_source_is_the_name_line_alone() {
         let declaration = Declaration::new("struct", "rift_search::Encoder");
-        assert_eq!(document(&declaration), "struct rift_search::Encoder\n");
+        assert_eq!(
+            document(&declaration).into_text(),
+            "struct rift_search::Encoder\n"
+        );
     }
 
     #[test]
-    fn test_document_source_is_cut_on_a_character_boundary() {
+    fn test_document_source_is_cut_on_a_character_boundary_and_says_how_much() {
         let source = "\u{1f600}".repeat(DOCUMENT_SOURCE_BYTES_MAX);
         let declaration = Declaration::new("const", "emoji").source(&source);
-        let text = document(&declaration);
-        assert!(text.len() < source.len(), "the source must be cut");
-        let cut = text.strip_prefix("const emoji\n").expect("the name line");
+        let built = document(&declaration);
+        assert!(!built.is_source_complete(), "the source must be cut");
+        let cut = built
+            .text()
+            .strip_prefix("const emoji\n")
+            .expect("the name line")
+            .to_owned();
         assert!(cut.len() <= DOCUMENT_SOURCE_BYTES_MAX);
         assert!(
             cut.chars().all(|character| character == '\u{1f600}'),
             "the cut must not split a character"
+        );
+        assert_eq!(
+            built.source_bytes_dropped(),
+            source.len() - cut.len(),
+            "the dropped count is what the text lost"
         );
     }
 
@@ -206,7 +277,16 @@ mod tests {
     fn test_source_at_the_bound_is_carried_whole() {
         let source = "a".repeat(DOCUMENT_SOURCE_BYTES_MAX);
         let declaration = Declaration::new("const", "letters").source(&source);
-        assert!(document(&declaration).ends_with(&source));
+        let built = document(&declaration);
+        assert!(built.text().ends_with(&source));
+        assert!(built.is_source_complete());
+    }
+
+    #[test]
+    fn test_one_byte_past_the_bound_drops_exactly_one_byte() {
+        let source = "a".repeat(DOCUMENT_SOURCE_BYTES_MAX + 1);
+        let declaration = Declaration::new("const", "letters").source(&source);
+        assert_eq!(document(&declaration).source_bytes_dropped(), 1);
     }
 
     #[test]

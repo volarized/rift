@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use rift_core::LoopBudget;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::error::{SearchError, SearchFault, SearchViolation};
@@ -192,6 +191,10 @@ impl Encoder {
     /// holds its own activations; candle's own kernels already spread one pass
     /// across the pool.
     ///
+    /// The loop is bounded by the check above it: at most
+    /// [`EncoderLimits::texts_max`] texts arrive, so at most
+    /// `texts_max / batch_declarations` passes run.
+    ///
     /// # Errors
     ///
     /// Returns `text_limit` when the call carries more texts than
@@ -206,16 +209,8 @@ impl Encoder {
                 )),
             ));
         }
-        let mut budget = LoopBudget::new(passes_max(texts.len(), self.limits.batch_declarations()));
         let mut vectors = Vec::with_capacity(texts.len());
         for batch in texts.chunks(self.limits.batch_declarations()) {
-            budget.consume().map_err(|exhausted| {
-                SearchError::new(
-                    SearchFault::new(SearchViolation::TextLimit)
-                        .about(exhausted.limit().to_string())
-                        .caused_by(exhausted),
-                )
-            })?;
             vectors.extend(self.embed_batch(batch)?);
         }
         Ok(vectors)
@@ -278,14 +273,6 @@ impl Encoder {
             .and_then(|pooled| pooled.to_vec2::<f32>())
             .map_err(|error| encode_failure("reading the pooled vectors", error))
     }
-}
-
-/// Passes one call makes over `texts` at `batch` per pass, at least one.
-const fn passes_max(texts: usize, batch: usize) -> usize {
-    if batch == 0 {
-        return 1;
-    }
-    texts.div_ceil(batch).saturating_add(1)
 }
 
 /// The model's architecture and dimensions, from its `config.json`.
@@ -352,4 +339,45 @@ fn encode_failure(stage: &str, source: candle_core::Error) -> SearchError {
             .about(stage.to_owned())
             .caused_by(source),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EncoderLimits, boxed_encode_failure, encode_failure};
+    use crate::error::SearchViolation;
+
+    #[test]
+    fn test_limits_report_what_they_were_built_with() {
+        let limits = EncoderLimits::new(32, 256, 4096);
+        assert_eq!(limits.batch_declarations(), 32);
+        assert_eq!(limits.tokens_max(), 256);
+        assert_eq!(limits.texts_max(), 4096);
+    }
+
+    #[test]
+    fn test_encode_failure_names_its_stage_and_keeps_the_candle_cause() {
+        let cause = candle_core::Error::Msg("shape mismatch".to_owned());
+        let error = encode_failure("the forward pass", cause);
+        assert_eq!(error.fault().violation(), SearchViolation::EncodeFailed);
+        let rendered = error.to_string();
+        assert!(rendered.contains("encode_failed"), "{rendered}");
+        assert!(rendered.contains("the forward pass"), "{rendered}");
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the candle failure rides as the source"
+        );
+    }
+
+    #[test]
+    fn test_boxed_encode_failure_folds_its_cause_into_the_subject() {
+        let cause = std::io::Error::other("vocabulary missing");
+        let error = boxed_encode_failure("tokenizing a batch", &cause);
+        assert_eq!(error.fault().violation(), SearchViolation::EncodeFailed);
+        let rendered = error.to_string();
+        assert!(rendered.contains("tokenizing a batch"), "{rendered}");
+        assert!(
+            rendered.contains("vocabulary missing"),
+            "a boxed cause has no typed source, so it is folded into the subject: {rendered}"
+        );
+    }
 }

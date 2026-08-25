@@ -58,6 +58,13 @@ fn write_configuration(directory: &Path) -> TestResult {
 }
 
 fn write_tokenizer(directory: &Path) -> TestResult {
+    write_tokenizer_with(directory, true)
+}
+
+/// Writes the tokenizer, optionally without the post-processor that adds
+/// `[CLS]` and `[SEP]`. Without it an empty string encodes to no tokens at all,
+/// which is the only way to reach the encoder's empty-batch refusal.
+fn write_tokenizer_with(directory: &Path, post_process: bool) -> TestResult {
     let vocabulary = directory.join("vocab.txt");
     std::fs::write(&vocabulary, format!("{}\n", WORDS.join("\n")))?;
     let model = WordPiece::from_file(vocabulary.to_str().unwrap_or_default())
@@ -66,10 +73,12 @@ fn write_tokenizer(directory: &Path) -> TestResult {
     let mut tokenizer = Tokenizer::new(model);
     tokenizer.with_normalizer(Some(normalizers::BertNormalizer::default()));
     tokenizer.with_pre_tokenizer(Some(pre_tokenizers::bert::BertPreTokenizer));
-    tokenizer.with_post_processor(Some(BertProcessing::new(
-        ("[SEP]".to_owned(), 2),
-        ("[CLS]".to_owned(), 1),
-    )));
+    if post_process {
+        tokenizer.with_post_processor(Some(BertProcessing::new(
+            ("[SEP]".to_owned(), 2),
+            ("[CLS]".to_owned(), 1),
+        )));
+    }
     tokenizer.save(directory.join("tokenizer.json"), false)?;
     Ok(())
 }
@@ -252,8 +261,8 @@ fn documents_embed_to_unit_vectors_of_the_models_width() -> TestResult {
     let encoder = loaded(directory.path())?;
     assert_eq!(encoder.dimension(), HIDDEN);
     let texts = vec![
-        document(&Declaration::new("fn", "load_config").source("fn load config")),
-        document(&Declaration::new("fn", "read_index").source("fn read index")),
+        document(&Declaration::new("fn", "load_config").source("fn load config")).into_text(),
+        document(&Declaration::new("fn", "read_index").source("fn read index")).into_text(),
     ];
     let vectors = encoder.embed_documents(&texts)?;
     assert_eq!(vectors.len(), 2);
@@ -274,7 +283,7 @@ fn a_batch_larger_than_one_pass_is_split_and_keeps_its_order() -> TestResult {
     let encoder = loaded(directory.path())?;
     let texts: Vec<String> = ["load", "config", "read", "search", "index"]
         .iter()
-        .map(|word| document(&Declaration::new("fn", word).source(word)))
+        .map(|word| document(&Declaration::new("fn", word).source(word)).into_text())
         .collect();
     let batched = encoder.embed_documents(&texts)?;
     assert_eq!(batched.len(), texts.len());
@@ -333,6 +342,42 @@ fn a_query_embeds_to_a_unit_vector_and_differs_from_the_bare_text() -> TestResul
     assert!(
         difference > 1e-6,
         "the query prefix must reach the encoder, difference {difference}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_debug_render_names_the_models_shape_without_its_weights() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let encoder = loaded(directory.path())?;
+    let rendered = format!("{encoder:?}");
+    assert!(rendered.starts_with("Encoder"), "{rendered}");
+    assert!(rendered.contains("dimension: 8"), "{rendered}");
+    assert!(rendered.contains("EncoderLimits"), "{rendered}");
+    assert!(
+        !rendered.contains("weight"),
+        "the weights have no useful rendering: {rendered}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_batch_the_tokenizer_empties_is_refused_rather_than_embedded() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    write_configuration(directory.path())?;
+    write_tokenizer_with(directory.path(), false)?;
+    write_weights(directory.path())?;
+    let files = ModelFiles::in_directory(directory.path())?;
+    let encoder = Encoder::load(&files, limits())?;
+    let error = encoder
+        .embed_documents(&[String::new()])
+        .expect_err("no tokens means no vector");
+    assert_eq!(error.fault().violation(), SearchViolation::EncodeFailed);
+    assert!(
+        error
+            .to_string()
+            .contains("the tokenizer produced no tokens"),
+        "{error}"
     );
     Ok(())
 }
