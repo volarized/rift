@@ -16,12 +16,14 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 data-encoding.workspace = true
 rayon.workspace = true
+reqwest.workspace = true
 rift-core.workspace = true
 rift-index.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokenizers.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

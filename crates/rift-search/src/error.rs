@@ -9,6 +9,14 @@ use serde::Serialize;
 pub enum SearchViolation {
     /// A model directory does not hold one of the three files an encoder loads.
     ModelFileMissing,
+    /// A model identifier does not name a repository or a directory.
+    ModelSourceInvalid,
+    /// No Hugging Face cache directory could be resolved on this machine.
+    ModelCacheUnavailable,
+    /// Every attempt at one model file failed at its origin.
+    ModelDownloadFailed,
+    /// One model file's body was empty or ran past its ceiling.
+    ModelDownloadTooLarge,
     /// A model's `config.json` is not a BERT configuration this encoder serves.
     ModelConfigurationInvalid,
     /// A model's `tokenizer.json` could not be read.
@@ -37,9 +45,14 @@ impl SearchViolation {
             | Self::WeightsUnreadable
             | Self::VectorWidthMismatch
             | Self::RankingWeightsInvalid
-            | Self::FusionConstantInvalid => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
+            | Self::FusionConstantInvalid
+            | Self::ModelSourceInvalid
+            | Self::ModelCacheUnavailable => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
             Self::EncodeFailed => ErrorName::Wire(ErrorCode::InternalError),
-            Self::TextLimit => ErrorName::Wire(ErrorCode::LimitExceeded),
+            Self::TextLimit | Self::ModelDownloadTooLarge => {
+                ErrorName::Wire(ErrorCode::LimitExceeded)
+            }
+            Self::ModelDownloadFailed => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
         }
     }
 }
@@ -159,6 +172,26 @@ mod tests {
                 SearchViolation::FusionConstantInvalid,
                 ErrorCode::ConfigurationInvalid,
                 "fusion_constant_invalid",
+            ),
+            (
+                SearchViolation::ModelSourceInvalid,
+                ErrorCode::ConfigurationInvalid,
+                "model_source_invalid",
+            ),
+            (
+                SearchViolation::ModelCacheUnavailable,
+                ErrorCode::ConfigurationInvalid,
+                "model_cache_unavailable",
+            ),
+            (
+                SearchViolation::ModelDownloadFailed,
+                ErrorCode::TemporarilyUnavailable,
+                "model_download_failed",
+            ),
+            (
+                SearchViolation::ModelDownloadTooLarge,
+                ErrorCode::LimitExceeded,
+                "model_download_too_large",
             ),
         ];
         for (violation, code, label) in cases {
