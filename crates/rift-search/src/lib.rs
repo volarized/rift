@@ -16,7 +16,9 @@ mod document;
 mod encoder;
 mod error;
 
-pub use document::{DOCUMENT_SOURCE_BYTES_MAX, Declaration, DocumentDigest, digests, document};
+pub use document::{
+    DOCUMENT_SOURCE_BYTES_MAX, Declaration, Document, DocumentDigest, digests, document,
+};
 pub use encoder::{Encoder, EncoderLimits, ModelFiles};
 pub use error::{SearchError, SearchFault, SearchViolation};
 
