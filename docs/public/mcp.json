@@ -721,7 +721,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -4185,7 +4185,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -10221,7 +10221,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. It is read from\nthe rate the pass has held, so a slower machine states a longer wait."
+                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",

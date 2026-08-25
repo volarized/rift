@@ -965,8 +965,10 @@ pub enum ReadWarning {
         prepared: u64,
         /// Declarations the published set holds.
         total: u64,
-        /// Estimated wait before the semantic ranking joins an answer. It is read from
-        /// the rate the pass has held, so a slower machine states a longer wait.
+        /// Estimated wait before the semantic ranking joins an answer. The server derives
+        /// it from how large the workspace is and how much of it is embedded, not from
+        /// this machine's measured rate, so it is worth reporting and must not be
+        /// scheduled against.
         ready_in: Duration,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
