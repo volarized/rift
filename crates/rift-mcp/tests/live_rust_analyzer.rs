@@ -137,7 +137,9 @@ async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
 }
 
 /// The engine resolves every reference itself, so the rewrite covers both
-/// files and the word-boundary sweep finds no survivor to report.
+/// files and the word-boundary sweep finds no survivor to report. Each of
+/// the engine's own edits reaches the result as its own replacement, so
+/// three identifier-sized edits stand where two whole files once did.
 ///
 /// The workspace is served under a root spelled relative to the process
 /// working directory, the spelling `rift mcp` and `rift server start` hand
@@ -161,12 +163,26 @@ async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
         "the declaration and its cross-file reference both carry the rename: {structured:#}"
     );
     assert_eq!(
-        structured["summary"]["edits"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        2,
-        "one whole-file edit per rewritten file: {structured:#}"
+        structured["summary"]["edits"],
+        json!([
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/caller.rs", "range": { "start": 16, "end": 22 } },
+                "text": "flare"
+            },
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/caller.rs", "range": { "start": 53, "end": 59 } },
+                "text": "flare"
+            },
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/hub.rs", "range": { "start": 7, "end": 13 } },
+                "text": "flare"
+            }
+        ]),
+        "each edit names the identifier the engine resolved, not the file it stood in: \
+         {structured:#}"
     );
     assert!(
         coded_findings(&structured, "rift.rename.survivor").is_empty(),
