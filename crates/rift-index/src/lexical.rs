@@ -885,27 +885,27 @@ fn lexical_search_sql() -> String {
 
 /// What one change set does to the lexical index.
 ///
-/// A rebuild that replaced one file has to drop that file's previous units before it
-/// inserts its new ones, so a modified path appears in both halves: `dropped` names the
-/// paths whose stored units go, and `inserted` carries what the rebuilt index derived for
-/// the paths it read.
+/// A rebuild writes what it read under each path it named and nothing else, so `replaced`
+/// names every one of those paths and `inserted` carries the units the rebuilt index
+/// derived for them. A path the rebuild read appears in both halves; a path it found gone
+/// appears only in the first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LexicalChange {
-    dropped: Vec<ProjectPath>,
+    replaced: Vec<ProjectPath>,
     inserted: Vec<LexicalUnit>,
 }
 
 impl LexicalChange {
     /// Builds one change from the paths whose units go and the units that replace them.
     #[must_use]
-    pub fn new(dropped: Vec<ProjectPath>, inserted: Vec<LexicalUnit>) -> Self {
-        Self { dropped, inserted }
+    pub fn new(replaced: Vec<ProjectPath>, inserted: Vec<LexicalUnit>) -> Self {
+        Self { replaced, inserted }
     }
 
-    /// The paths whose stored units this change deletes.
+    /// The paths whose stored units this change deletes before it inserts.
     #[must_use]
-    pub fn dropped(&self) -> &[ProjectPath] {
-        &self.dropped
+    pub fn replaced(&self) -> &[ProjectPath] {
+        &self.replaced
     }
 
     /// The units this change inserts.
@@ -918,7 +918,7 @@ impl LexicalChange {
     /// that produced it.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.dropped.is_empty() && self.inserted.is_empty()
+        self.replaced.is_empty() && self.inserted.is_empty()
     }
 }
 
@@ -1071,7 +1071,7 @@ impl LexicalSearchIndex {
         let mut connection = self.configured_connection().await?;
         let mut transaction = connection.transaction().await.map_err(storage_error)?;
 
-        for path in change.dropped() {
+        for path in change.replaced() {
             delete_path_units(&mut transaction, path).await?;
         }
         let stored = indexed_unit_count(&mut transaction).await?;
