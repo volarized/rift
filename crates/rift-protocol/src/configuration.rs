@@ -15,6 +15,7 @@ use crate::retry::{
     RETRY_ATTEMPTS_MAX, RETRY_ATTEMPTS_MIN, RETRY_DELAY_LIMIT_MS_MAX, RETRY_DELAY_LIMIT_MS_MIN,
     RETRY_DELAY_MS_MAX, RETRY_DELAY_MS_MIN, RestartPolicy, RetryPolicy,
 };
+use crate::search::path_pattern_violation;
 use crate::source::SourceConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
@@ -761,32 +762,51 @@ fn search_weights_violation(lexical: f64, semantic: f64) -> Option<Configuration
     (!valid).then_some(ConfigurationViolation::SearchWeightsInvalid { lexical, semantic })
 }
 
-/// Whether `value` is a model or revision identifier: nonempty, within
-/// `bytes_max`, and built from `A-Z a-z 0-9 . _ - /`. The charset admits a
-/// workspace-relative directory as well as a hub repository identifier,
-/// which is what `search.semantic.model` accepts.
+/// Classifies one model value against the form its declared source sets.
+/// Arms are ordered by precedence: the byte bound both sources share, then
+/// the declared source's own form.
 fn model_violation(
     field: &'static str,
+    source: SemanticSource,
     value: &str,
     bytes_max: usize,
 ) -> Option<ConfigurationViolation> {
-    let nonempty = !value.is_empty();
-    let within_length = value.len() <= bytes_max;
-    let charset_accepted = value.chars().all(is_model_identifier_character);
-    let valid = nonempty && within_length && charset_accepted;
-    (!valid).then(|| ConfigurationViolation::SemanticModelInvalid {
+    let refused = match (source, value.as_bytes()) {
+        (_, []) => true,
+        (_, bytes) if bytes.len() > bytes_max => true,
+        (SemanticSource::Hf, _) => repository_refused(value),
+        (SemanticSource::Directory, _) => path_pattern_violation(value).is_some(),
+    };
+    refused.then(|| ConfigurationViolation::SemanticModelInvalid {
         field,
         value: value.to_owned(),
     })
 }
 
-/// Whether `character` may appear in an embedding model identifier.
-///
-/// The charset spans the three forms `search.semantic.model` accepts: a hub
-/// repository identifier, that identifier with a model revision pinned after
-/// `@`, and a workspace-relative directory.
-fn is_model_identifier_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/' | '@')
+/// Whether `value` breaks the Hugging Face repository form: an owner and a
+/// name around one `/`, carrying at most one revision after `@`.
+fn repository_refused(value: &str) -> bool {
+    let (repository, revision) = match value.split_once('@') {
+        Some((repository, revision)) => (repository, Some(revision)),
+        None => (value, None),
+    };
+    let mut segments = repository.split('/');
+    let named = match (segments.next(), segments.next(), segments.next()) {
+        (Some(owner), Some(name), None) => is_repository_word(owner) && is_repository_word(name),
+        _ => false,
+    };
+    !(named && revision.is_none_or(is_repository_word))
+}
+
+/// Whether `word` is one repository segment or one revision: nonempty,
+/// neither `.` nor `..`, and built from `A-Z a-z 0-9 . _ -`. The charset
+/// leaves out `/` and `@`, so a revision carrying either is refused.
+fn is_repository_word(word: &str) -> bool {
+    !word.is_empty()
+        && !matches!(word, "." | "..")
+        && word.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
 }
 
 /// The `[search.lexical]` table: what the lexical ranking contributes to a
@@ -811,6 +831,18 @@ impl Default for LexicalSearchConfiguration {
     }
 }
 
+/// Where the semantic ranking's model weights come from.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticSource {
+    /// Weights come from a Hugging Face repository, cached where every
+    /// other Hugging Face client on the machine caches them.
+    Hf,
+    /// Weights are a directory the workspace already holds. Nothing is
+    /// downloaded.
+    Directory,
+}
+
 /// The `[search.semantic]` table: the embedding model that ranks a query
 /// against code sharing no word with it, and the bounds its preparation runs
 /// under.
@@ -831,11 +863,14 @@ pub struct SemanticSearchConfiguration {
     #[schemars(range(min = 0.0, max = 1.0))]
     #[serde(default = "default_semantic_weight")]
     pub weight: f64,
-    /// The embedding model: a Hugging Face repository identifier such as
-    /// `BAAI/bge-small-en-v1.5`, the same identifier with a pinned model
-    /// revision after `@`, or a workspace-relative directory holding the
-    /// weights. Vectors are stored per model, so changing the value embeds the
-    /// workspace again.
+    /// Where the weights come from, which decides how `model` reads.
+    #[serde(default = "default_semantic_source")]
+    pub source: SemanticSource,
+    /// Which weights: under `hf` a repository identifier such as
+    /// `BAAI/bge-small-en-v1.5`, optionally carrying a revision after `@`;
+    /// under `directory` a workspace-relative directory holding them. Vectors
+    /// are stored per model, so changing the value embeds the workspace
+    /// again.
     #[schemars(length(min = 1, max = 128))]
     #[serde(default = "default_semantic_model")]
     pub model: String,
@@ -876,6 +911,7 @@ impl Default for SemanticSearchConfiguration {
         Self {
             disabled: false,
             weight: SEMANTIC_WEIGHT_DEFAULT,
+            source: SEMANTIC_SOURCE_DEFAULT,
             model: default_semantic_model(),
             download_timeout: default_semantic_download_timeout(),
             download_attempts: SEMANTIC_DOWNLOAD_ATTEMPTS_DEFAULT,
@@ -893,6 +929,7 @@ impl SemanticSearchConfiguration {
     fn violation(&self) -> Option<ConfigurationViolation> {
         model_violation(
             "search.semantic.model",
+            self.source,
             &self.model,
             SEMANTIC_MODEL_BYTES_MAX,
         )
@@ -947,6 +984,9 @@ pub const LEXICAL_WEIGHT_DEFAULT: f64 = 0.7;
 pub const SEMANTIC_WEIGHT_DEFAULT: f64 = 0.3;
 /// How far the two ranking weights may sum from 1 and still be accepted.
 pub const SEARCH_WEIGHT_SUM_TOLERANCE: f64 = 1e-9;
+/// `search.semantic.source` when the key is absent: the default model is a
+/// Hugging Face repository.
+pub const SEMANTIC_SOURCE_DEFAULT: SemanticSource = SemanticSource::Hf;
 /// `search.semantic.model` when the key is absent: 33M parameters, 384
 /// dimensions, MIT, and a plain BERT encoder that runs without a C++
 /// toolchain.
@@ -996,6 +1036,10 @@ fn default_lexical_weight() -> f64 {
 
 fn default_semantic_weight() -> f64 {
     SEMANTIC_WEIGHT_DEFAULT
+}
+
+fn default_semantic_source() -> SemanticSource {
+    SEMANTIC_SOURCE_DEFAULT
 }
 
 fn default_semantic_model() -> String {
@@ -1340,8 +1384,9 @@ pub enum ConfigurationViolation {
         /// The rejected entry.
         selector: String,
     },
-    /// A `[search.semantic]` identifier is empty, too long, or uses characters
-    /// outside `A-Z a-z 0-9 . _ - /`.
+    /// A `[search.semantic]` identifier is empty, too long, or breaks the form
+    /// its declared source sets: `owner/name` with at most one revision after
+    /// `@` under `hf`, a workspace-relative directory under `directory`.
     SemanticModelInvalid {
         /// The key's path in the file, such as `search.semantic.model`.
         field: &'static str,
@@ -2145,6 +2190,7 @@ mod tests {
         ));
         assert!(is_weight(semantic.weight, SEMANTIC_WEIGHT_DEFAULT));
         assert!(!semantic.disabled);
+        assert_eq!(semantic.source, SemanticSource::Hf);
         assert_eq!(semantic.model, SEMANTIC_MODEL_DEFAULT);
         assert!(is_weight(
             configuration.search.lexical.weight + semantic.weight,
@@ -2452,34 +2498,146 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_semantic_model_identifier_is_checked() {
+    /// The verdict `[search.semantic]` reaches on one model value under one
+    /// declared source.
+    fn semantic_model_verdict(
+        source: SemanticSource,
+        model: &str,
+    ) -> Result<(), ConfigurationViolation> {
         let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.semantic.source = source;
+        configuration.search.semantic.model = model.to_owned();
+        configuration.validate()
+    }
+
+    /// The refusal every rejected model value must draw.
+    fn semantic_model_refusal(model: &str) -> Result<(), ConfigurationViolation> {
+        Err(ConfigurationViolation::SemanticModelInvalid {
+            field: "search.semantic.model",
+            value: model.to_owned(),
+        })
+    }
+
+    #[test]
+    fn test_hf_model_names_a_repository_and_an_optional_revision() {
         for accepted in [
             "models/bge-small",
             "BAAI/bge-small-en-v1.5",
-            "BAAI/bge-small-en-v1.5@5c38ec7",
+            "BAAI/bge-small-en-v1.5@a5beb1e",
         ] {
-            configuration.search.semantic.model = accepted.to_owned();
             assert_eq!(
-                configuration.validate(),
+                semantic_model_verdict(SemanticSource::Hf, accepted),
                 Ok(()),
                 "{accepted} must be accepted"
             );
         }
-        for rejected in ["", "spaced out", &"a".repeat(SEMANTIC_MODEL_BYTES_MAX + 1)] {
-            configuration.search.semantic.model = rejected.to_owned();
-            assert!(
-                matches!(
-                    configuration.validate(),
-                    Err(ConfigurationViolation::SemanticModelInvalid {
-                        field: "search.semantic.model",
-                        ..
-                    })
-                ),
-                "{rejected:?} must be refused"
+        for refused in [
+            "",
+            "/bge-small",
+            "BAAI/",
+            "BAAI/bge-small@",
+            "BAAI/bge-small@a5beb1e@2c9f4d1",
+            "BAAI/bge-small@a5beb1e/weights",
+            "bge-small",
+            "BAAI/bge-small/weights",
+            "./bge-small",
+            "BAAI/..",
+            "spaced out",
+        ] {
+            assert_eq!(
+                semantic_model_verdict(SemanticSource::Hf, refused),
+                semantic_model_refusal(refused),
+                "{refused:?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn test_directory_model_names_a_workspace_relative_directory() {
+        assert_eq!(
+            semantic_model_verdict(SemanticSource::Directory, "vendor/bge-small"),
+            Ok(())
+        );
+        for refused in [
+            "",
+            "/vendor/bge-small",
+            "vendor\\bge-small",
+            "vendor/../bge-small",
+        ] {
+            assert_eq!(
+                semantic_model_verdict(SemanticSource::Directory, refused),
+                semantic_model_refusal(refused),
+                "{refused:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_semantic_model_byte_bound_holds_under_both_sources() {
+        let bound = SEMANTIC_MODEL_BYTES_MAX;
+        let cases = [
+            (
+                SemanticSource::Hf,
+                format!("{}/{}", "a".repeat(63), "b".repeat(64)),
+            ),
+            (SemanticSource::Directory, "a".repeat(bound)),
+        ];
+        for (source, accepted) in cases {
+            assert_eq!(accepted.len(), bound, "the case must sit on the bound");
+            assert_eq!(
+                semantic_model_verdict(source, &accepted),
+                Ok(()),
+                "{bound} bytes must be accepted"
+            );
+            let refused = format!("{accepted}a");
+            assert_eq!(
+                semantic_model_verdict(source, &refused),
+                semantic_model_refusal(&refused),
+                "one byte past the bound must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_semantic_source_parses_both_declared_values() {
+        for (spelling, declared) in [
+            ("hf", SemanticSource::Hf),
+            ("directory", SemanticSource::Directory),
+        ] {
+            let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
+                "search": {
+                    "semantic": { "source": spelling, "model": "vendor/bge-small" }
+                }
+            }))
+            .expect("a declared source must parse");
+            assert_eq!(configuration.search.semantic.source, declared);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_semantic_source_outside_the_declared_pair_is_refused() {
+        let error = serde_json::from_value::<WorkspaceConfiguration>(json!({
+            "search": { "semantic": { "source": "hub" } }
+        }))
+        .expect_err("a source outside the declared pair must be refused");
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "the refusal must name the unknown variant: {error}"
+        );
+    }
+
+    #[test]
+    fn test_omitted_semantic_source_keeps_the_default() {
+        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
+            "search": { "semantic": { "model": SEMANTIC_MODEL_DEFAULT } }
+        }))
+        .expect("an omitted source must keep its default");
+        assert_eq!(
+            configuration.search.semantic.source,
+            SEMANTIC_SOURCE_DEFAULT
+        );
+        assert_eq!(configuration.validate(), Ok(()));
     }
 
     #[test]
@@ -3828,6 +3986,20 @@ mod tests {
             ),
         ];
         assert_schema_bounds(&cases);
+    }
+
+    #[test]
+    fn test_semantic_source_schema_default_equals_the_enforced_constant() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let semantic = &schema["$defs"]["SemanticSearchConfiguration"]["properties"];
+        let enforced = serde_json::to_value(SEMANTIC_SOURCE_DEFAULT)
+            .expect("the default source must serialize");
+        assert_schema_bounds(&[(
+            "semantic source default",
+            &semantic["source"]["default"],
+            enforced,
+        )]);
     }
 
     #[test]

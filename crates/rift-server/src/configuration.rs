@@ -126,7 +126,9 @@ fn accept_configuration(raw: &str) -> Result<WorkspaceConfiguration, Configurati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift_protocol::configuration::{ByteSize, ChangedPaths, Determinism, HookKind};
+    use rift_protocol::configuration::{
+        ByteSize, ChangedPaths, Determinism, HookKind, SemanticSource,
+    };
 
     /// The `[[hooks]]` example the configuration docs show, keys complete.
     const DOCUMENTED_HOOK: &str = r#"
@@ -182,6 +184,7 @@ weight = 0.6
 
 [search.semantic]
 weight = 0.4
+source = "hf"
 model = "BAAI/bge-small-en-v1.5"
 download_timeout = "5m"
 {DOCUMENTED_HOOK}
@@ -197,6 +200,7 @@ download_timeout = "5m"
         );
         assert!((configuration.search.lexical.weight - 0.6).abs() < f64::EPSILON);
         assert!((configuration.search.semantic.weight - 0.4).abs() < f64::EPSILON);
+        assert_eq!(configuration.search.semantic.source, SemanticSource::Hf);
         assert_eq!(
             configuration.search.semantic.model,
             "BAAI/bge-small-en-v1.5"
