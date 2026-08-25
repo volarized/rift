@@ -25,7 +25,7 @@ use rift_server::{
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -123,8 +123,9 @@ pub(crate) struct IndexSupervisorContext {
     pub(crate) change_lane: Arc<ChangeLane>,
     pub(crate) validation: Arc<IndexValidation>,
     pub(crate) blocking: BlockingExecutor,
-    /// The workspace's search index, absent when it could not be opened at startup.
-    pub(crate) search_index: Option<Arc<SearchIndex>>,
+    /// The workspace's population lane, absent when the search index could not be opened
+    /// at startup.
+    pub(crate) population: Option<PopulationLane>,
 }
 
 /// The last acceptance of the workspace's `rift.toml`, kept with the file
@@ -724,6 +725,112 @@ pub(crate) async fn populate_search(
     }
 }
 
+/// The population lane: one long-lived task owning every search index population, and the
+/// handle a caller hands one publication to.
+///
+/// Population used to run wherever it was wanted, and the wait was the caller's. Startup
+/// awaited its own pass before the server answered anything, which held the first answer
+/// for around fifteen seconds on a real workspace, and every change awaited a whole lexical
+/// replacement plus the embedding of each new declaration inside the request path. The lane
+/// runs one pass per publication on its own task instead, so no request and no startup step
+/// awaits a pass.
+///
+/// Requests coalesce. The channel holds exactly one publication, so a request landing while
+/// an earlier one still waits overwrites it, and the lane always runs the newest tree it
+/// was handed rather than a backlog of superseded ones.
+///
+/// An answer computed while a pass is pending needs nothing new: the store still carries the
+/// tree revision the previous pass stamped, so the search-time revision guard ranks by
+/// identifier matching alone and the answer names the two revisions that disagree.
+#[derive(Clone, Debug)]
+pub(crate) struct PopulationLane {
+    publications: Arc<watch::Sender<Option<Arc<PublishedWorkspace>>>>,
+    settled: Arc<AtomicBool>,
+}
+
+impl PopulationLane {
+    /// Spawns the lane's task over `index` and returns the handle a caller requests on.
+    ///
+    /// The task runs [`SearchPass::Build`] first and [`SearchPass::Refresh`] for every pass
+    /// after it, which is the order startup used to establish by itself: a store this
+    /// process found on disk was written by an earlier one, possibly under another model,
+    /// so the run's first pass establishes the vector set and later passes trust what is
+    /// stored.
+    ///
+    /// The task ends when the server does. It races the same cancellation token the index
+    /// supervisor runs under, which the last server clone's drop guard cancels. Cancelling
+    /// mid-pass is safe: [`populate_search`] documents what a dropped pass leaves behind.
+    pub(crate) fn spawn(index: Arc<SearchIndex>, cancellation: CancellationToken) -> Self {
+        let (publications, mut requests) = watch::channel::<Option<Arc<PublishedWorkspace>>>(None);
+        let settled = Arc::new(AtomicBool::new(false));
+        let reached = Arc::clone(&settled);
+        tokio::spawn(async move {
+            let mut pass = SearchPass::Build;
+            loop {
+                let received = tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    received = requests.changed() => received,
+                };
+                if received.is_err() {
+                    return;
+                }
+                let requested = requests.borrow_and_update().clone();
+                let Some(published) = requested else {
+                    continue;
+                };
+                tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    () = populate_search(&index, &published, pass) => {}
+                }
+                pass = SearchPass::Refresh;
+                reached.store(true, Ordering::Release);
+            }
+        });
+        Self {
+            publications: Arc::new(publications),
+            settled,
+        }
+    }
+
+    /// Whether the lane has yet finished a pass, so an unstamped store means a pass still
+    /// running rather than one that failed.
+    ///
+    /// Startup used to await the first pass, which left an unstamped store meaning exactly
+    /// one thing: the store could not be read and an operator has to act. The lane answers
+    /// before that pass runs, so the same unstamped store now also covers the ordinary
+    /// window while the first pass is still writing, and a search answered in that window
+    /// must not tell a caller that anything failed.
+    pub(crate) fn has_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
+
+    /// Hands `published` to the lane and returns, never awaiting the pass it asks for.
+    ///
+    /// A closed channel is a server already shutting down: the lane's task ended with the
+    /// cancellation token, and no later search will read the store this pass would have
+    /// written. That is a debug line rather than a caller's failure, because the work this
+    /// publication came from already landed.
+    pub(crate) fn request(&self, published: Arc<PublishedWorkspace>) {
+        if self.publications.send(Some(published)).is_err() {
+            tracing::debug!(
+                component = "search",
+                operation = "search.populate",
+                "the population lane has ended, so this publication is not populated for"
+            );
+        }
+    }
+
+    /// Whether the lane's task has ended, which a cancelled token causes.
+    ///
+    /// The task holds the channel's only receiver, so releasing it is the one observable
+    /// end of the lane. A test that must run without the lane waits on this rather than on
+    /// the cancellation it asked for, which the task has not necessarily seen yet.
+    #[cfg(test)]
+    pub(crate) fn has_ended(&self) -> bool {
+        self.publications.receiver_count() == 0
+    }
+}
+
 /// Outcome of one background reconciliation attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RebuildOutcome {
@@ -734,6 +841,10 @@ pub(crate) enum RebuildOutcome {
 }
 
 /// Owns native watcher and reconciles coalesced invalidations until shutdown.
+///
+/// A published rebuild hands its snapshot to the population lane and moves on to the next
+/// batch. The supervisor awaiting a pass itself would hold the whole reconciliation loop
+/// for as long as that pass ran, and the filesystem does not stop moving meanwhile.
 pub(crate) async fn run_index_supervisor(
     _watcher: notify::RecommendedWatcher,
     mut invalidations: mpsc::Receiver<()>,
@@ -746,7 +857,7 @@ pub(crate) async fn run_index_supervisor(
         change_lane,
         validation,
         blocking,
-        search_index,
+        population,
     } = context;
     loop {
         let received = tokio::select! {
@@ -785,9 +896,9 @@ pub(crate) async fn run_index_supervisor(
         .await;
         match result {
             Ok(RebuildOutcome::Published) => {
-                if let Some(index) = search_index.as_ref() {
+                if let Some(lane) = population.as_ref() {
                     let (current, _) = published.read().await.snapshot();
-                    populate_search(index, &current, SearchPass::Refresh).await;
+                    lane.request(current);
                 }
             }
             Ok(RebuildOutcome::Superseded) => {}
@@ -988,9 +1099,10 @@ mod tests {
     use rift_search::{SearchIndex, SearchIndexLimits, SemanticReadiness};
     use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        ConfigurationFingerprint, ConfigurationState, IndexState, IndexValidation,
+        ConfigurationFingerprint, ConfigurationState, IndexState, IndexValidation, PopulationLane,
         PublishedWorkspace, RebuildOutcome, SearchPass, WorkspaceCandidate,
         build_workspace_candidate, populate_search, publish_rebuild, publish_rebuild_after,
         record_rebuild_failure, relevant_watch_event,
@@ -1580,7 +1692,7 @@ mod tests {
                 change_lane: Arc::new(crate::server::ChangeLane::default()),
                 validation: Arc::clone(&validation),
                 blocking,
-                search_index: None,
+                population: None,
             },
         ));
         let notified = validation.changed.notified();
@@ -1636,7 +1748,7 @@ mod tests {
                 change_lane: Arc::new(crate::server::ChangeLane::default()),
                 validation: Arc::clone(&validation),
                 blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
-                search_index: None,
+                population: None,
             },
         ));
         let notified = validation.changed.notified();
@@ -1785,6 +1897,119 @@ mod tests {
         Ok(())
     }
 
+    /// Polls one lane pass a test waits on before it gives up: three seconds, at
+    /// [`LANE_POLL`] each.
+    const LANE_ATTEMPTS_MAX: usize = 60;
+    /// Wait between two reads of a store the lane has not stamped yet.
+    const LANE_POLL: Duration = Duration::from_millis(50);
+
+    /// Polls `index` until it carries `revision`, which the lane's pass stamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stamp the store still carried once the bound runs out.
+    async fn stamped_within_bound(index: &SearchIndex, revision: &str) -> TestResult {
+        let mut stamped = index.tree_revision().await?;
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            if stamped.as_deref() == Some(revision) {
+                return Ok(());
+            }
+            tokio::time::sleep(LANE_POLL).await;
+            stamped = index.tree_revision().await?;
+        }
+        Err(format!(
+            "the lane never stamped tree revision {revision}; the store still carries \
+             {stamped:?}"
+        )
+        .into())
+    }
+
+    #[tokio::test]
+    async fn the_lane_runs_the_pass_one_request_asks_for() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
+
+        lane.request(Arc::clone(&published));
+        stamped_within_bound(&index, published.reads.tree_revision()).await?;
+        assert!(
+            !index.search("beacon", 8).await?.is_empty(),
+            "the lane's pass must leave the published unit set searchable"
+        );
+
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// Two requests with no await between them, so the lane's task cannot have run for the
+    /// first one: the channel holds one publication, and the second overwrites it.
+    ///
+    /// The lane runs the newest tree it was handed. This is what keeps a run of changes
+    /// from queueing one whole pass each.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_lane_runs_the_newest_publication_when_two_requests_coalesce() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let earlier = stable_candidate(directory.path(), 0)?;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let newest = stable_candidate(directory.path(), 1)?;
+        assert_ne!(
+            earlier.reads.tree_revision(),
+            newest.reads.tree_revision(),
+            "the fixture must actually move the tree revision"
+        );
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
+
+        lane.request(Arc::clone(&earlier));
+        lane.request(Arc::clone(&newest));
+        stamped_within_bound(&index, newest.reads.tree_revision()).await?;
+
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// A request after the lane's task ended is a shutting-down server, which is a debug
+    /// line rather than a caller's failure: the request path must not learn that the lane
+    /// is gone.
+    #[tokio::test]
+    async fn a_request_after_the_lane_ended_leaves_the_store_as_it_was() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let earlier = stable_candidate(directory.path(), 0)?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
+        lane.request(Arc::clone(&earlier));
+        stamped_within_bound(&index, earlier.reads.tree_revision()).await?;
+
+        cancellation.cancel();
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            if lane.has_ended() {
+                break;
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        assert!(
+            lane.has_ended(),
+            "the lane's task must end with the cancellation it races"
+        );
+
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let newest = stable_candidate(directory.path(), 1)?;
+        lane.request(Arc::clone(&newest));
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(earlier.reads.tree_revision()),
+            "a request the ended lane refused must leave the previous pass's stamp alone"
+        );
+        Ok(())
+    }
+
     /// One search index over `database` with the semantic tier off, so a test drives the
     /// full-text half without acquiring model weights.
     async fn search_index(database: &std::path::Path) -> TestResult<SearchIndex> {
@@ -1842,7 +2067,7 @@ mod tests {
                 change_lane: Arc::new(crate::server::ChangeLane::default()),
                 validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
-                search_index: None,
+                population: None,
             },
         ));
 

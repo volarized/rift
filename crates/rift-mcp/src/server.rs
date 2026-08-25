@@ -41,8 +41,8 @@ use tracing::Instrument as _;
 use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
 use crate::validation::{
     ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, INDEX_FRESHNESS_TIMEOUT, IndexState,
-    IndexSupervisor, IndexSupervisorContext, IndexValidation, PublishedWorkspace, RebuildOutcome,
-    SearchPass, configuration_fingerprint, initial_workspace, populate_search, publish_rebuild,
+    IndexSupervisor, IndexSupervisorContext, IndexValidation, PopulationLane, PublishedWorkspace,
+    RebuildOutcome, configuration_fingerprint, initial_workspace, publish_rebuild,
     run_index_supervisor, workspace_watcher,
 };
 
@@ -457,8 +457,9 @@ async fn open_search_index(root: &Path, limits: SearchIndexLimits) -> Option<Arc
 /// Loads the semantic model behind the answers, so startup waits on nothing.
 ///
 /// A search arriving while this runs is answered by the full-text tier alone and carries the
-/// preparation warning. A loaded model then embeds the published set through
-/// [`embed_prepared`], because the startup pass ran before any model was held.
+/// preparation warning. A loaded model then asks the population lane for the pass that
+/// embeds the published set, through [`embed_prepared`], because the run's first pass may
+/// have run before any model was held.
 ///
 /// The task ends when the server does. It races the same cancellation token the index
 /// supervisor runs under, which the last server clone's drop guard cancels.
@@ -466,6 +467,7 @@ fn spawn_semantic_preparation(
     index: Arc<SearchIndex>,
     acquisition: ModelAcquisition,
     published: Arc<RwLock<IndexState>>,
+    population: PopulationLane,
     cancellation: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -474,7 +476,7 @@ fn spawn_semantic_preparation(
             prepared = index.prepare(&acquisition.source, acquisition.limits) => prepared,
         };
         match prepared {
-            Ok(()) => embed_prepared(&index, &published, &cancellation).await,
+            Ok(()) => embed_prepared(&published, &population).await,
             Err(error) => tracing::warn!(
                 component = "search",
                 operation = "search.prepare",
@@ -486,26 +488,22 @@ fn spawn_semantic_preparation(
     });
 }
 
-/// Embeds the published set once the model is loaded.
+/// Asks the population lane for the pass that embeds the published set, once the model is
+/// loaded.
 ///
-/// The startup pass already replaced the unit set with no model held, so this is the pass
-/// that gives the workspace its vectors. Without it nothing would embed until the next
-/// filesystem event, and a workspace nobody writes to would never rank semantically.
-async fn embed_prepared(
-    index: &SearchIndex,
-    published: &RwLock<IndexState>,
-    cancellation: &CancellationToken,
-) {
+/// The run's first pass may already have replaced the unit set with no model held, so this
+/// request is what gives the workspace its vectors. Without it nothing would embed until
+/// the next filesystem event, and a workspace nobody writes to would never rank
+/// semantically. The lane runs that pass rather than this task, so a pass a change or the
+/// supervisor already asked for is never run twice over.
+async fn embed_prepared(published: &RwLock<IndexState>, population: &PopulationLane) {
     tracing::info!(
         component = "search",
         operation = "search.prepare",
         "the semantic tier is prepared"
     );
     let (current, _) = published.read().await.snapshot();
-    tokio::select! {
-        () = cancellation.cancelled() => {}
-        () = populate_search(index, &current, SearchPass::Refresh) => {}
-    }
+    population.request(current);
 }
 
 /// The ranking one search request merges, and what the search index's own state adds to
@@ -708,13 +706,17 @@ pub struct RiftMcp {
     /// startup; `search` then serves identifier matching alone and says so in
     /// every answer's warnings.
     search_index: Option<Arc<SearchIndex>>,
+    /// The population lane, absent exactly when [`Self::search_index`] is: with
+    /// no index open there is no store to populate. A landed change hands its
+    /// publication here and returns, rather than awaiting the pass itself.
+    population: Option<PopulationLane>,
     engines: Arc<EngineHold>,
     tool_router: ToolRouter<Self>,
 }
 
 /// One already-serialized change's outcome, threaded out of the blocking executor so the
-/// async `change` method can await search population against exactly the workspace this
-/// change published, without a second, possibly-superseded read of shared state.
+/// async `change` method hands exactly the workspace this change published to the
+/// population lane, without a second, possibly-superseded read of shared state.
 struct SerializedChange {
     result: Result<Json<ChangeResult>, ErrorData>,
     published: Option<Arc<PublishedWorkspace>>,
@@ -785,10 +787,17 @@ impl RiftMcp {
             .flatten();
         let search_limits = search_index_limits(&search_configuration, acquisition.as_ref());
         let search_index = open_search_index(&root, search_limits).await;
-        if let Some(index) = search_index.as_ref() {
-            // The first pass of a run establishes the vector set: a store found on disk was
-            // written by an earlier process, possibly under another model.
-            populate_search(index, &published, SearchPass::Build).await;
+        // The lane runs the run's first pass, which establishes the vector set: a store
+        // found on disk was written by an earlier process, possibly under another model.
+        // Awaiting that pass here held the first answer for around fifteen seconds on a
+        // real workspace, and a search arriving before it lands is already answered - the
+        // store carries no stamp yet, so the answer is ranked by identifier matching alone
+        // and says so.
+        let population = search_index
+            .as_ref()
+            .map(|index| PopulationLane::spawn(Arc::clone(index), validation.cancellation.clone()));
+        if let Some(lane) = population.as_ref() {
+            lane.request(Arc::clone(&published));
         }
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
@@ -805,17 +814,20 @@ impl RiftMcp {
                 change_lane: Arc::clone(&change_lane),
                 validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
-                search_index: search_index.clone(),
+                population: population.clone(),
             },
         ));
         let mut task = validation.task.lock().await;
         *task = Some(supervisor_task);
         drop(task);
-        if let (Some(index), Some(acquisition)) = (search_index.as_ref(), acquisition) {
+        if let (Some(index), Some(lane), Some(acquisition)) =
+            (search_index.as_ref(), population.as_ref(), acquisition)
+        {
             spawn_semantic_preparation(
                 Arc::clone(index),
                 acquisition,
                 Arc::clone(&published),
+                lane.clone(),
                 validation.cancellation.clone(),
             );
         }
@@ -834,6 +846,7 @@ impl RiftMcp {
             change_lane,
             blocking,
             search_index,
+            population,
             engines,
             tool_router: Self::tool_router(),
         })
@@ -955,6 +968,18 @@ impl RiftMcp {
             StoreRevision::Lagging(stamped) => {
                 let captured = published.reads.tree_revision();
                 return Ok(SearchRanking::lagging(stamped, captured));
+            }
+            StoreRevision::Absent
+                if self
+                    .population
+                    .as_ref()
+                    .is_some_and(|lane| !lane.has_settled()) =>
+            {
+                return Ok(SearchRanking::unavailable(
+                    "the workspace search database is being populated for the first time \
+                     since this server started, so the answer was ranked by identifier \
+                     matching alone; resend the request once that pass has landed",
+                ));
             }
             StoreRevision::Absent => {
                 return Ok(SearchRanking::unavailable(
@@ -1285,6 +1310,13 @@ impl RiftMcp {
     /// engine failure at this point is a warning on the summary, never a
     /// failed call - the change already applied.
     ///
+    /// Search index population does not run here. The change hands its
+    /// publication to the population lane and returns; awaiting that pass made
+    /// every edit pay a whole lexical replacement plus the embedding of each
+    /// new declaration before the caller heard that the write landed. A search
+    /// issued before the pass lands is ranked by identifier matching alone and
+    /// names the two tree revisions that disagree.
+    ///
     /// Dropping this future after blocking work starts does not cancel that
     /// work. The serialized operation finishes through snapshot publication
     /// before releasing its lane.
@@ -1317,9 +1349,8 @@ impl RiftMcp {
             })
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        if let (Some(index), Some(next)) = (self.search_index.as_ref(), outcome.published.as_ref())
-        {
-            populate_search(index, next, SearchPass::Refresh).await;
+        if let (Some(lane), Some(next)) = (self.population.as_ref(), outcome.published.as_ref()) {
+            lane.request(Arc::clone(next));
         }
         let mut result = outcome.result?;
         if let Json(ChangeResult::Applied { summary }) = &mut result
@@ -2347,15 +2378,10 @@ mod tests {
         });
         let client = ().serve(client_transport).await?;
 
-        let search = client
-            .call_tool(
-                CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": "replace all units"}))?),
-            )
-            .await?;
-        let structured = search
-            .structured_content
-            .ok_or("search must return structured content")?;
+        // The population lane runs the run's first pass off the request path, so `build`
+        // returned before the tier could answer. Poll for the file hit under a bound: the
+        // same pass carries the symbol hit asserted below.
+        let structured = search_until_hit(client.peer(), "replace all units", "guide.txt").await?;
         let results = structured["results"]
             .as_array()
             .ok_or("results must be an array")?;
@@ -2411,30 +2437,18 @@ mod tests {
         });
         let client = ().serve(client_transport).await?;
 
-        let search = client
-            .call_tool(
-                CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": "beacon subsystem"}))?),
-            )
-            .await?;
-        let structured = search
-            .structured_content
-            .ok_or("search must return structured content")?;
-        let results = structured["results"]
-            .as_array()
-            .ok_or("results must be an array")?;
-        assert!(
-            results.iter().any(|hit| hit["path"] == json!("guide.txt")),
-            "the recreated lexical database must be populated and serve results: {structured:#}"
-        );
+        // The recreated database is populated by the population lane, after `build`
+        // returned. Poll for the hit under a bound; the helper's failure names the last
+        // answer that still missed it.
+        search_until_hit(client.peer(), "beacon subsystem", "guide.txt").await?;
 
         client.cancel().await?;
         server_task.await?;
         Ok(())
     }
 
-    /// A text file created after startup exists only because the change-applied rebuild
-    /// path repopulates the lexical tier; the initial population at `build` never saw it.
+    /// A text file created after startup is searchable only because the change's own
+    /// publication reached the population lane; the run's first pass never saw it.
     #[tokio::test]
     async fn client_change_creating_a_text_file_populates_lexical_search() -> TestResult {
         let (_directory, server) = fixture().await?;
@@ -2460,41 +2474,52 @@ mod tests {
             .ok_or("patch must return structured content")?;
         assert_eq!(structured["status"], json!("applied"));
 
-        // The change's own writes wake the watcher, whose rebuild republishes a newer
-        // revision; until the supervisor repopulates, the revision guard serves
-        // identifier-only results. Retry within a bound instead of asserting the first
-        // answer, because that degraded window is advertised behavior.
-        let repopulation_attempts_max = 50;
-        let mut lexical_hit_observed = false;
-        let mut last_answer = json!(null);
-        for _ in 0..repopulation_attempts_max {
-            let search = client
-                .call_tool(
-                    CallToolRequestParams::new("search")
-                        .with_arguments(arguments(&json!({"query": "replacing legacy unit"}))?),
-                )
-                .await?;
-            let structured = search
-                .structured_content
-                .ok_or("search must return structured content")?;
-            let results = structured["results"]
-                .as_array()
-                .ok_or("results must be an array")?;
-            if results.iter().any(|hit| hit["path"] == json!("notes.txt")) {
-                lexical_hit_observed = true;
-                break;
-            }
-            last_answer = structured;
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(
-            lexical_hit_observed,
-            "the change-applied rebuild must repopulate the lexical tier with the new file: \
-             {last_answer:#}"
-        );
+        // The change hands its publication to the population lane and returns, and the
+        // change's own writes also wake the watcher, whose rebuild hands over a newer one.
+        // Until one of those passes lands, the revision guard serves identifier-only
+        // results. Poll within a bound instead of asserting the first answer, because that
+        // degraded window is advertised behavior.
+        search_until_hit(client.peer(), "replacing legacy unit", "notes.txt").await?;
 
         client.cancel().await?;
         server_task.await?;
+        Ok(())
+    }
+
+    /// `build` returns before the population lane runs the run's first pass.
+    ///
+    /// Awaiting that pass inside `build` is what held the first answer for around fifteen
+    /// seconds on a real workspace. The caller sees the fix directly: the first search a
+    /// freshly built server answers is ranked without the store, and names the degraded
+    /// ranking rather than carrying the store's own hits. A `build` that awaited its pass
+    /// could not answer that way at all, whatever the machine.
+    ///
+    /// `max_chunk` at its enforced minimum against a megabyte of text is what puts a
+    /// thousand lexical units in that pass, so the pass is real work next to the one
+    /// in-process call that follows `build`.
+    #[tokio::test]
+    async fn build_returns_before_the_population_lane_runs_the_first_pass() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("guide.txt"),
+            "the earlier guide covers every legacy sensor ".repeat(24_000),
+        )?;
+        super::hermetic_workspace(directory.path(), "[search.text]\nmax_chunk = \"1kb\"\n")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let pending = run_search(&server, "legacy sensor").await?;
+        assert!(
+            !store_ranked(&pending),
+            "build must return while the first pass is still running: {pending:#?}"
+        );
+
+        // The lane does run that pass, and the same query is then ranked by the store.
+        let ranked = search_after_population(&server, "legacy sensor").await?;
+        assert!(
+            !ranked.results.is_empty(),
+            "the first pass must leave the published unit set searchable: {ranked:#?}"
+        );
         Ok(())
     }
 
@@ -2628,11 +2653,17 @@ pub fn beacon() -> u64 {
 
     /// Calls one tool expecting a Rift wire error and returns the JSON-RPC
     /// error object.
+    ///
+    /// The population lane's first pass is waited for before the call, because a refusal
+    /// the search index itself raises - the query-term limit - is only reached once the
+    /// revision guard trusts the store. Nothing writes into the fixture, so the store stays
+    /// stamped for the call that follows.
     async fn failing_call(
         arguments_value: &serde_json::Value,
         tool: &'static str,
     ) -> TestResult<rmcp::ErrorData> {
         let (_directory, server) = fixture().await?;
+        search_after_population(&server, "beacon").await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -3142,7 +3173,10 @@ pub fn beacon() -> u64 {
             SemanticReadiness::Disabled,
             "a refused model disables the tier rather than leaving it preparing"
         );
-        let result = run_search(&server, "beacon").await?;
+        // The run's first pass lands after `build` returns, and until it does the answer
+        // carries the revision guard's own warning. Wait for the pass, then prove the
+        // disabled tier adds nothing of its own on top.
+        let result = search_after_population(&server, "beacon").await?;
         assert!(
             !result.results.is_empty(),
             "the full-text tier must still serve: {result:#?}"
@@ -3231,7 +3265,12 @@ pub fn beacon() -> u64 {
                 .build();
         let database = directory.join("search.db");
         let index = rift_search::SearchIndex::open(&database, limits).await?;
-        crate::validation::populate_search(&index, &published, super::SearchPass::Build).await;
+        crate::validation::populate_search(
+            &index,
+            &published,
+            crate::validation::SearchPass::Build,
+        )
+        .await;
         Ok((published, index))
     }
 
@@ -3304,6 +3343,9 @@ pub fn beacon() -> u64 {
     #[tokio::test]
     async fn a_search_over_a_tree_the_store_never_held_warns_stale_index() -> TestResult {
         let (_directory, server) = fixture().await?;
+        // A store the run's first pass has not reached yet holds no stamp at all, which is
+        // the absent tier rather than the lag this proves. Wait for that pass first.
+        search_after_population(&server, "beacon").await?;
         // A snapshot of an unrelated workspace stands in for the repopulation window: its
         // tree revision is one the server's store was never populated for. Nothing writes
         // into the served workspace, so no rebuild can close the window mid-test.
@@ -3486,6 +3528,86 @@ pub fn beacon() -> u64 {
     /// Wait between two reads of a search tier still catching up.
     const SEARCH_TIER_POLL: Duration = Duration::from_millis(50);
 
+    /// Whether the search index itself ranked this answer, rather than the revision guard
+    /// degrading it to identifier matching while a pass is still pending.
+    fn store_ranked(answer: &SearchResult) -> bool {
+        !answer.warnings.iter().any(|warning| {
+            matches!(
+                warning,
+                ReadWarning::LexicalRankingUnavailable { .. } | ReadWarning::StaleIndex { .. }
+            )
+        })
+    }
+
+    /// Polls one in-process search until the population lane's pass has landed, and answers
+    /// with the first answer the store itself ranked.
+    ///
+    /// The lane runs every pass off the request path, so neither [`RiftMcp::build`] nor a
+    /// landed change hands back an already-populated store. Until the pass lands the
+    /// revision guard ranks by identifier matching alone and says so, which is exactly the
+    /// condition polled here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the warnings the last answer still carried once the bound runs out.
+    async fn search_after_population(server: &RiftMcp, query: &str) -> TestResult<SearchResult> {
+        let mut answer = run_search(server, query).await?;
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            if store_ranked(&answer) {
+                return Ok(answer);
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+            answer = run_search(server, query).await?;
+        }
+        Err(format!(
+            "the population lane never stamped the served tree for query {query}; the last \
+             answer still carried {:?}",
+            answer.warnings
+        )
+        .into())
+    }
+
+    /// Calls `search` through the wire until one hit carries `path`.
+    ///
+    /// The population lane runs the pass off the request path, so a text file is searchable
+    /// only once the pass its publication asked for has landed; identifier matching alone
+    /// never reaches a non-source file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last answer that still missed `path` once the bound runs out.
+    async fn search_until_hit(
+        peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
+        query: &str,
+        path: &str,
+    ) -> TestResult<serde_json::Value> {
+        let mut last_answer = json!(null);
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            let answer = peer
+                .call_tool(
+                    CallToolRequestParams::new("search")
+                        .with_arguments(arguments(&json!({"query": query}))?),
+                )
+                .await?;
+            let structured = answer
+                .structured_content
+                .ok_or("search must return structured content")?;
+            let results = structured["results"]
+                .as_array()
+                .ok_or("results must be an array")?;
+            if results.iter().any(|hit| hit["path"] == json!(path)) {
+                return Ok(structured);
+            }
+            last_answer = structured;
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+        }
+        Err(format!(
+            "the population lane never ranked {path} for query {query}; the last answer was \
+             {last_answer:#}"
+        )
+        .into())
+    }
+
     #[tokio::test]
     async fn startup_populates_the_index_and_a_landed_change_repopulates_it() -> TestResult {
         let (_directory, server) = fixture().await?;
@@ -3501,14 +3623,24 @@ pub fn beacon() -> u64 {
             .reads
             .tree_revision()
             .to_owned();
+        // `build` hands the initial publication to the population lane and returns, so the
+        // stamp arrives after it rather than with it. Poll under a bound.
+        let mut stamped = index.tree_revision().await?;
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            if stamped.as_deref() == Some(published.as_str()) {
+                break;
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+            stamped = index.tree_revision().await?;
+        }
         assert_eq!(
-            index.tree_revision().await?.as_deref(),
+            stamped.as_deref(),
             Some(published.as_str()),
-            "the startup pass must stamp the published tree revision"
+            "the run's first pass must stamp the published tree revision"
         );
         assert!(
             !index.search("beacon", 8).await?.is_empty(),
-            "the startup pass must leave the published unit set searchable"
+            "the run's first pass must leave the published unit set searchable"
         );
 
         let insert = json!({
@@ -3522,9 +3654,9 @@ pub fn beacon() -> u64 {
             matches!(applied, rift_protocol::change::ChangeResult::Applied { .. }),
             "the fixture insert must land: {applied:#?}"
         );
-        // The change's own rebuild repopulates before the call returns; a filesystem rebuild
-        // that supersedes it repopulates from the supervisor instead, after it. Poll under a
-        // bound rather than racing which of the two ran.
+        // The change hands its publication to the population lane; a filesystem rebuild that
+        // supersedes it hands the supervisor's instead. Poll under a bound rather than
+        // racing which of the two passes ran.
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             if !index.search("lantern", 8).await?.is_empty() {
                 return Ok(());
