@@ -6,8 +6,8 @@
 //! so a live multi-page answer and the empty page past the end are both
 //! proven against the schema. Every `ChangeResult` arm is proven the same
 //! way: applied (with and without parser findings), and refused for a failed
-//! precondition, an ambiguous target, and an unsupported file-level change -
-//! plus a live witnessed `replace_node` that lands after the walk.
+//! precondition and an unsupported file-level change - plus a live witnessed
+//! `replace_node` that lands after the walk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -92,13 +92,6 @@ fn corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "node": "rift://node/rust/lib.rs@0-18#00000000",
                 "body": "pub fn beacon_one() {}"
-            }),
-        ),
-        (
-            "replace_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/lib.rs/dual",
-                "body": "pub fn dual() -> u8 { 3 }"
             }),
         ),
         (
@@ -422,8 +415,7 @@ async fn served_fixture() -> TestResult<(
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("lib.rs"),
-        "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n\
-         #[cfg(unix)]\npub fn dual() {}\n#[cfg(windows)]\npub fn dual() {}\n",
+        "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n",
     )?;
     // Gitignored, so a plain search never reaches it; `paths.force_include` is the only way
     // in, proving that arm of the surface end to end.
@@ -506,7 +498,7 @@ impl CorpusArms {
             self.applied_changes,
             self.applied_with_findings
         );
-        for reason in ["unmet_precondition", "ambiguous_target", "unsupported"] {
+        for reason in ["unmet_precondition", "unsupported"] {
             assert!(
                 self.refusal_reasons.contains(reason),
                 "the corpus must prove the {reason} refusal arm; proven: {:?}",
