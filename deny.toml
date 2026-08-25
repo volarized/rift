@@ -10,6 +10,9 @@ ignore = [
   # update can satisfy the gate. Drop this entry once gix-protocol sheds
   # bisync or a non-yanked version returns.
   { crate = "bisync@0.3.0", reason = "all bisync releases yanked; gix-protocol pins ^0.3.0" },
+  # gemm, candle-core's CPU matrix kernel, uses paste for its macro expansion. No candle
+  # release drops it, and the crate is a build-time proc macro with no runtime surface.
+  { id = "RUSTSEC-2024-0436", reason = "paste is a build-time proc macro reached only through gemm <- candle-core" },
 ]
 
 [licenses]
@@ -38,6 +41,16 @@ allow-wildcard-paths = true
 # lsp-types 0.97 still pins fluent-uri 0.1 while jsonschema's referencing and
 # toasty-core are on 0.4, and lsp-types with fluent-uri 0.1 still pin
 # bitflags 1 while the rest of the graph is on 2.
+#
+# The entries below the blank line are the candle embedding stack's. Every one is
+# reached only through candle-core or the tokenizers copy candle-core requires, and
+# none can be aligned from this workspace: candle 0.11 pins them itself.
+# spm_precompiled, tokenizers' precompiled-charsmap reader, is on base64 0.13.
+# tokenizers builds its own types with derive_builder, which is on darling 0.20 while
+# rmcp-macros is on 0.24. candle-core is on rand 0.10 and tokenizers on rand 0.9, and
+# rand_core, getrandom and r-efi follow that split. candle-core and candle-nn are on
+# thiserror 1 while the rest of the graph is on 2. fancy-regex 0.17, which
+# candle-transformers pins, brings bit-set 0.11 and bit-vec 0.10 beside toasty's 0.8.
 skip = [
   { name = "syn", version = "2.0.119" },
   { name = "fluent-uri", version = "0.1.4" },
@@ -46,6 +59,19 @@ skip = [
   { name = "windows-sys", version = "0.60.2" },
   { name = "cpufeatures", version = "0.2.17" },
   { name = "base64", version = "0.22.1" },
+
+  { name = "base64", version = "0.13.1" },
+  { name = "bit-set", version = "0.11.1" },
+  { name = "bit-vec", version = "0.10.1" },
+  { name = "darling", version = "0.20.11" },
+  { name = "darling_core", version = "0.20.11" },
+  { name = "darling_macro", version = "0.20.11" },
+  { name = "getrandom", version = "0.3.4" },
+  { name = "r-efi", version = "5.3.0" },
+  { name = "rand", version = "0.9.5" },
+  { name = "rand_core", version = "0.9.5" },
+  { name = "thiserror", version = "1.0.69" },
+  { name = "thiserror-impl", version = "1.0.69" },
 ]
 
 [sources]

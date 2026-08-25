@@ -64,7 +64,7 @@ fn write_tokenizer(directory: &Path) -> TestResult {
         .unk_token("[UNK]".to_owned())
         .build()?;
     let mut tokenizer = Tokenizer::new(model);
-    tokenizer.with_normalizer(Some(normalizers::BertNormalizer::default()))?;
+    tokenizer.with_normalizer(Some(normalizers::BertNormalizer::default()));
     tokenizer.with_pre_tokenizer(Some(pre_tokenizers::bert::BertPreTokenizer));
     tokenizer.with_post_processor(Some(BertProcessing::new(
         ("[SEP]".to_owned(), 2),

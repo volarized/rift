@@ -49,7 +49,10 @@ sha2 = "=0.10.9"
 tar = "0.4.46"
 toasty = { version = "=0.10.0", default-features = false, features = ["migration", "sqlite"] }
 toasty-driver-sqlite = "=0.10.0"
-tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+# candle-core has a non-optional `tokenizers 0.22` dependency with the `onig` backend on
+# every non-wasm target, so the version is pinned to match it: a second tokenizers would
+# be a duplicate the dependency policy refuses, and could not avoid onig either.
+tokenizers = { version = "0.22.2", default-features = false }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }
