@@ -871,7 +871,7 @@ pub(crate) fn survivor_findings(reads: &ReadService, plan: &RenamePlan) -> Vec<D
         .collect();
     let mut findings = Vec::new();
     let mut scanned_bytes: usize = 0;
-    for file in reads.index().files().iter().take(RENAME_SWEEP_FILES_MAX) {
+    for file in reads.index().files().take(RENAME_SWEEP_FILES_MAX) {
         if findings.len() >= RENAME_SWEEP_FINDINGS_MAX || scanned_bytes >= RENAME_SWEEP_BYTES_MAX {
             break;
         }

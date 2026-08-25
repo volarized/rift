@@ -95,7 +95,7 @@ impl WorkspaceIndex {
             Vec::new(),
             composition,
             limits,
-            rift_core::TextFileInclusion::default().chunk_bytes_max(),
+            rift_core::TextFileInclusion::default(),
         ))
     }
 }
@@ -204,11 +204,7 @@ mod tests {
             !has_symbol(&index, "drifted"),
             "working-tree drift is invisible"
         );
-        let paths: Vec<&str> = index
-            .files()
-            .iter()
-            .map(|file| file.path().as_str())
-            .collect();
+        let paths: Vec<&str> = index.files().map(|file| file.path().as_str()).collect();
         assert_eq!(paths, ["src/lib.rs"], "prose files stay outside the index");
         let path = ProjectPath::new("src/lib.rs").expect("path");
         assert!(

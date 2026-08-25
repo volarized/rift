@@ -402,7 +402,7 @@ fn collect_ranked_hits(
     }
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::File) {
         for (path, score) in best_score_per_text_file(ranked) {
-            let Some(file) = index.text_files().iter().find(|file| file.path() == &path) else {
+            let Some(file) = index.text_file(&path) else {
                 continue;
             };
             let (line_number, range, text) = locate_query_line(file.content(), query);
@@ -1838,7 +1838,7 @@ pub fn compute() -> i32 {
         let file = service
             .index()
             .text_files()
-            .first()
+            .next()
             .ok_or("fixture text file must be indexed")?;
         let range = ByteRange { start: 0, end: 17 };
         let mut results = Vec::new();
