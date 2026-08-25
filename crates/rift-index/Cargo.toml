@@ -16,7 +16,6 @@ rift-core.workspace = true
 rift-history.workspace = true
 serde.workspace = true
 sha2.workspace = true
-rift-model.workspace = true
 rift-provider.workspace = true
 rift-syntax.workspace = true
 toasty.workspace = true
