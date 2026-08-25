@@ -1243,7 +1243,7 @@ fn capture_paths(
 ) -> Result<WorkspaceDigests, WorkspaceIndexError> {
     let mut digests = BTreeMap::new();
     let mut workspace_bytes = 0_usize;
-    absorb_fingerprint_paths(
+    capture_path_class(
         &mut digests,
         &mut workspace_bytes,
         root,
@@ -1251,7 +1251,7 @@ fn capture_paths(
         limits,
         PathClass::Source,
     )?;
-    absorb_fingerprint_paths(
+    capture_path_class(
         &mut digests,
         &mut workspace_bytes,
         root,
@@ -1281,9 +1281,9 @@ pub fn capture_digests(
     capture_paths(&root, &classified, limits)
 }
 
-/// Reads one path list into the digest set one fingerprint folds, applying the per-file
-/// byte bound only to [`PathClass::Source`] paths.
-fn absorb_fingerprint_paths(
+/// Reads one class's path list into the digest set a capture returns, applying the
+/// per-file byte bound only to [`PathClass::Source`] paths.
+fn capture_path_class(
     digests: &mut BTreeMap<ProjectPath, FileDigest>,
     workspace_bytes: &mut usize,
     root: &Path,
@@ -2924,7 +2924,7 @@ mod tests {
     }
 
     /// Builds a [`DiscoveredPaths`] with `source` classified as source and no text paths, for
-    /// tests exercising [`fingerprint_paths`] directly.
+    /// tests exercising [`capture_paths`] directly.
     fn source_only(source: Vec<PathBuf>) -> DiscoveredPaths {
         DiscoveredPaths {
             source,
@@ -2933,7 +2933,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_paths_preserves_bound_and_path_failures() {
+    fn test_capture_paths_preserves_bound_and_path_failures() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = fs::canonicalize(directory.path()).expect("canonical root");
         let limits = WorkspaceIndexLimits::new(5, 8, 10, 4, 5).expect("limits");
@@ -2990,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_paths_text_class_has_no_per_file_bound_but_counts_toward_workspace_bound() {
+    fn test_capture_paths_text_class_has_no_per_file_bound_but_counts_toward_workspace_bound() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = fs::canonicalize(directory.path()).expect("canonical root");
         // file_bytes_max is 4: a text file far larger must not refuse as FileTooLarge, and
@@ -3021,7 +3021,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_paths_text_class_still_refuses_invalid_utf8() {
+    fn test_capture_paths_text_class_still_refuses_invalid_utf8() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = fs::canonicalize(directory.path()).expect("canonical root");
         let limits = WorkspaceIndexLimits::default();
