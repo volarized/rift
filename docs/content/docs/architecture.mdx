@@ -399,7 +399,7 @@ A change through MCP - [`replace_symbol`](/docs/protocol/mcp#tool-replace_symbol
 [`replace_node`](/docs/protocol/mcp#tool-replace_node),
 [`patch`](/docs/protocol/mcp#tool-patch), any of them - is resolved before Rift writes
 anything. If resolution produced no bytes to write, that's a refusal and the tree is untouched:
-the address was ambiguous, the witness failed. If it produced edits, the change lands, is
+the address named nothing, the witness failed. If it produced edits, the change lands, is
 recorded in the tree's changeset, and comes back carrying everything Rift learned about it.
 
 What rides on the result is the part that changes agent behavior. Each applied change carries:
