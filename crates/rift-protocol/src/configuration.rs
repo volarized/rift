@@ -867,10 +867,16 @@ pub struct SemanticSearchConfiguration {
     #[serde(default = "default_semantic_source")]
     pub source: SemanticSource,
     /// Which weights: under `hf` a repository identifier such as
-    /// `BAAI/bge-small-en-v1.5`, optionally carrying a revision after `@`;
-    /// under `directory` a workspace-relative directory holding them. Vectors
-    /// are stored per model, so changing the value embeds the workspace
-    /// again.
+    /// `minishlab/potion-retrieval-32M`, optionally carrying a revision after
+    /// `@`; under `directory` a workspace-relative directory holding them.
+    /// Vectors are stored per model, so changing the value embeds the
+    /// workspace again.
+    ///
+    /// The model's own `config.json` decides how it is read. A `model_type` of
+    /// `model2vec` is a static model, which embeds a declaration by averaging
+    /// one row per token; anything else is read as a BERT checkpoint, which
+    /// runs a forward pass per batch and costs minutes rather than seconds
+    /// over a whole workspace.
     #[schemars(length(min = 1, max = 128))]
     #[serde(default = "default_semantic_model")]
     pub model: String,
@@ -1002,10 +1008,18 @@ pub const SEARCH_WEIGHT_SUM_TOLERANCE: f64 = 1e-9;
 /// `search.semantic.source` when the key is absent: the default model is a
 /// Hugging Face repository.
 pub const SEMANTIC_SOURCE_DEFAULT: SemanticSource = SemanticSource::Hf;
-/// `search.semantic.model` when the key is absent: 33M parameters, 384
-/// dimensions, MIT, and a plain BERT encoder that runs without a C++
-/// toolchain.
-pub const SEMANTIC_MODEL_DEFAULT: &str = "BAAI/bge-small-en-v1.5";
+/// `search.semantic.model` when the key is absent: 32M parameters, 512
+/// dimensions, MIT, and a static model that carries no transformer at all.
+///
+/// A workspace is embedded once before its first search can rank
+/// semantically, so what the default costs is the wait a new workspace pays.
+/// A 12-layer encoder spends a forward pass on every declaration and takes
+/// minutes over a workspace of this size on a laptop CPU; this model gathers
+/// one row per token and averages them, which is the same answer shape for
+/// arithmetic a machine finishes in seconds. It ranks less sharply than a
+/// transformer, and the lexical tier carries the larger share of a fused
+/// score anyway.
+pub const SEMANTIC_MODEL_DEFAULT: &str = "minishlab/potion-retrieval-32M";
 /// Milliseconds `search.semantic.download_timeout` may hold, at least.
 pub const SEMANTIC_DOWNLOAD_TIMEOUT_MS_MIN: u64 = 10_000;
 /// Milliseconds `search.semantic.download_timeout` may hold, at most: one hour.
@@ -2987,7 +3001,6 @@ mod tests {
                 "lexical": { "weight": 0.8 },
                 "semantic": {
                     "weight": 0.2,
-                    "model": "BAAI/bge-small-en-v1.5",
                     "download_timeout": "5m",
                     "max_vectors": 50000,
                 },

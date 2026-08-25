@@ -631,7 +631,7 @@
             "download_timeout": "5m",
             "max_tokens": 256,
             "max_vectors": 200000,
-            "model": "BAAI/bge-small-en-v1.5",
+            "model": "minishlab/potion-retrieval-32M",
             "source": "hf",
             "weight": 0.3
           },
@@ -719,8 +719,8 @@
           "type": "integer"
         },
         "model": {
-          "default": "BAAI/bge-small-en-v1.5",
-          "description": "Which weights: under `hf` a repository identifier such as\n`BAAI/bge-small-en-v1.5`, optionally carrying a revision after `@`;\nunder `directory` a workspace-relative directory holding them. Vectors\nare stored per model, so changing the value embeds the workspace\nagain.",
+          "default": "minishlab/potion-retrieval-32M",
+          "description": "Which weights: under `hf` a repository identifier such as\n`minishlab/potion-retrieval-32M`, optionally carrying a revision after\n`@`; under `directory` a workspace-relative directory holding them.\nVectors are stored per model, so changing the value embeds the\nworkspace again.\n\nThe model's own `config.json` decides how it is read. A `model_type` of\n`model2vec` is a static model, which embeds a declaration by averaging\none row per token; anything else is read as a BERT checkpoint, which\nruns a forward pass per batch and costs minutes rather than seconds\nover a whole workspace.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -943,7 +943,7 @@
           "download_timeout": "5m",
           "max_tokens": 256,
           "max_vectors": 200000,
-          "model": "BAAI/bge-small-en-v1.5",
+          "model": "minishlab/potion-retrieval-32M",
           "source": "hf",
           "weight": 0.3
         },
