@@ -317,6 +317,10 @@ only a hint. Resolution starts each hunk's search at its header position, correc
 already found from earlier hunks in the same file, then widens outward - nearer positions first,
 the earlier position breaking a tie.
 
+A header's line counts are a hint on the same footing. The server derives each hunk's counts
+from the hunk's own body before parsing it, the way `git apply` derives them, so a miscounted
+header applies and only a body whose context resolves nowhere refuses.
+
 A `--- /dev/null` header creates the named file; a `+++ /dev/null` header deletes it. A hunk that
 renames or copies a file refuses as `unsupported`, because `patch` carries no rename or copy
 support.
@@ -386,6 +390,10 @@ address hit several targets, or a witness or patch context no longer matches the
 **Applied**, when it produced edits. The change lands in the targeted tree, and the result's
 `summary` carries the change `id`, the changed `paths`, the concrete `edits`, resolution
 `diagnostics`, and the `guarantees` the workspace's passing hooks established.
+
+Each entry in `edits` names the bytes it replaced: one entry per hunk for `patch`, one per
+engine-proposed edit for `rename_symbol` and `move_file`, and one spanning the whole file for a
+file the change created or removed.
 
 ## Projections
 

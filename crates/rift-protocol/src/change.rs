@@ -211,7 +211,9 @@ pub struct ChangeSummary {
     /// Paths whose entries differ because of this change, sorted bytewise.
     #[schemars(length(max = 256))]
     pub paths: Vec<ProjectPath>,
-    /// Concrete edits in canonical file-and-range order.
+    /// Concrete edits in canonical file-and-range order. A modification carries one
+    /// edit per replaced range; a file the change created or removed carries one edit
+    /// spanning the whole file.
     #[schemars(length(max = 256))]
     pub edits: Vec<Edit>,
     /// Resolution findings in source order, then one finding per hook that
@@ -515,8 +517,9 @@ pub struct MoveFileParams {
     }
 ]))]
 pub struct PatchParams {
-    /// A unified diff. Hunk context guards the change; header line numbers are hints,
-    /// as with `git apply`. `/dev/null` headers create or delete files.
+    /// A unified diff. Hunk context guards the change: a header's line numbers are
+    /// hints and its line counts are read from the hunk's own body, as with
+    /// `git apply`. `/dev/null` headers create or delete files.
     #[schemars(length(min = 1, max = 4_194_304))]
     pub patch: String,
 }
