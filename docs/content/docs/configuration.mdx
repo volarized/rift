@@ -193,6 +193,7 @@ weight = 0.7
 
 [search.semantic]
 weight = 0.3
+source = "hf"
 model = "BAAI/bge-small-en-v1.5"
 download_timeout = "5m"
 download_attempts = 3
@@ -207,10 +208,15 @@ max_vectors = 200000
 - `fusion_k` sets how sharply a top rank counts, 1 to 1000; a larger value flattens the
   contribution curve and lets agreement between the two rankings outweigh one ranking's top
   position
-- `model` names a Hugging Face repository or a workspace-relative directory holding the
-  weights; the server stores vectors per model - two models' vectors aren't comparable - so
-  changing the value embeds the workspace again, and a hub repository may pin a model
-  revision after `@`
+- `[search.semantic].source` names where the weights come from: `hf` downloads them from a
+  Hugging Face repository and caches them where every other Hugging Face client on the
+  machine caches them, `directory` reads a directory the workspace already holds and
+  downloads nothing
+- `model` names which weights, in the form the semantic tier's `source` sets: under `hf` a
+  repository identifier such as `BAAI/bge-small-en-v1.5`, optionally carrying a revision
+  after `@`; under `directory` a workspace-relative directory. The server stores vectors per
+  model - two models' vectors aren't comparable - so changing the value embeds the workspace
+  again
 - `download_timeout` and `download_attempts` bound one model acquisition, 10s to 1h and 1 to
   10; a spent budget leaves search lexical for the life of the server
 - `batch_declarations` and `max_tokens` bound one embedding pass, 1 to 256 and 32 to 512;
