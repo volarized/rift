@@ -8,8 +8,8 @@ use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT};
 use rift_core::line;
 use rift_index::{
-    IndexedFile, LexicalUnit, LexicalUnitKind, PathMatcher, SymbolMatch, SymbolMatchRank,
-    TextSourceFile, WorkspaceIndex,
+    IndexedFile, LexicalChange, LexicalUnit, LexicalUnitKind, PathChanges, PathMatcher,
+    SymbolMatch, SymbolMatchRank, TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     File, FileContent, MatchedField, PathPattern, PathSelector, SearchHit, SearchHitTarget,
@@ -90,6 +90,20 @@ impl ReadService {
             pagination,
             warnings: self.warnings(),
         })
+    }
+
+    /// Derives the lexical write one change set owes: the paths whose stored units go, and
+    /// the units this snapshot derived for the paths it read.
+    ///
+    /// A modified path appears in both halves - its stored units are deleted and its new
+    /// ones inserted - and a removed path appears only in the first, because this snapshot
+    /// holds no file to derive from.
+    #[must_use]
+    pub fn lexical_change(&self, changes: &PathChanges) -> LexicalChange {
+        LexicalChange::new(
+            changes.dropped().cloned().collect(),
+            self.index().lexical_units_for(changes.indexed()),
+        )
     }
 
     /// Pairs each symbol unit in `units` with the declaration the semantic tier embeds for
@@ -1620,7 +1634,10 @@ pub fn compute() -> i32 {
         let units = service.lexical_units();
         let described = service.described_units(&units);
         let revision = service.tree_revision();
-        index.build(&units, &described, revision).await?;
+        index.replace_lexical(&units, revision).await?;
+        index
+            .embed_described(&described, rift_search::Embedding::Every)
+            .await?;
         let ranked = index.search(query, 32).await?;
         assert!(!ranked.is_empty(), "the fixture query must rank something");
         Ok(ranked)

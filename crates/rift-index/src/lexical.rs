@@ -636,15 +636,36 @@ fn validate_lexical_batch(
     units: &[LexicalUnit],
     limits: LexicalIndexLimits,
 ) -> Result<(), LexicalIndexError> {
-    if units.len() > bound_as_usize(limits.units_max()) {
+    validate_indexed_count(units.len(), limits)?;
+    validate_lexical_units(units, limits)
+}
+
+/// Refuses an indexed set larger than `units_max`.
+///
+/// A whole replacement knows its resulting size before it opens a transaction. An
+/// incremental apply knows it only after its deletions have run, so it counts the table
+/// inside the transaction and checks the same bound here.
+fn validate_indexed_count(
+    units: usize,
+    limits: LexicalIndexLimits,
+) -> Result<(), LexicalIndexError> {
+    if units > bound_as_usize(limits.units_max()) {
         return Err(lexical_error_over_limit(
             LexicalIndexViolation::UnitLimit,
             None,
             "units_max",
-            limit_count(units.len()),
+            limit_count(units),
             u64::from(limits.units_max()),
         ));
     }
+    Ok(())
+}
+
+/// Refuses a unit whose fields break their bounds, and a batch spelling one identity twice.
+fn validate_lexical_units(
+    units: &[LexicalUnit],
+    limits: LexicalIndexLimits,
+) -> Result<(), LexicalIndexError> {
     let mut identities_seen = std::collections::HashSet::with_capacity(units.len());
     for unit in units {
         if let Some(name) = unit.name()
@@ -719,6 +740,56 @@ fn require_pragma_row(rows: &[Value], expected: &[Value]) -> Result<(), LexicalI
 }
 
 /// Inserts one unit's typed row and its derived FTS row.
+/// Deletes every unit filed under one path, from the typed table and the FTS index alike.
+///
+/// The FTS rows go first, while `lexical_units` still holds the identities that name them:
+/// the virtual table carries no path column of its own.
+async fn delete_path_units(
+    executor: &mut dyn Executor,
+    path: &ProjectPath,
+) -> Result<(), LexicalIndexError> {
+    toasty::sql::statement(
+        "DELETE FROM lexical_units_fts WHERE identity IN \
+         (SELECT identity FROM lexical_units WHERE path = ?1)",
+    )
+    .bind(path.as_str().to_owned())
+    .exec(executor)
+    .await
+    .map_err(storage_error)?;
+    toasty::sql::statement("DELETE FROM lexical_units WHERE path = ?1")
+        .bind(path.as_str().to_owned())
+        .exec(executor)
+        .await
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+/// How many units the typed table holds right now.
+async fn indexed_unit_count(executor: &mut dyn Executor) -> Result<usize, LexicalIndexError> {
+    let rows = toasty::sql::query("SELECT count(*) FROM lexical_units")
+        .column_types([Type::I64])
+        .exec(executor)
+        .await
+        .map_err(storage_error)?;
+    let [Value::Record(record)] = rows.as_slice() else {
+        return Err(
+            lexical_error(LexicalIndexViolation::Storage).with_context(ErrorContext::new(
+                "count",
+                format!("unexpected unit-count rows: rows={rows:?}"),
+            )),
+        );
+    };
+    let [Value::I64(counted)] = record.as_slice() else {
+        return Err(
+            lexical_error(LexicalIndexViolation::Storage).with_context(ErrorContext::new(
+                "count",
+                format!("unexpected unit-count row: row={record:?}"),
+            )),
+        );
+    };
+    Ok(usize::try_from(*counted).unwrap_or(usize::MAX))
+}
+
 async fn insert_lexical_unit(
     executor: &mut dyn Executor,
     unit: &LexicalUnit,
@@ -805,6 +876,45 @@ fn lexical_search_sql() -> String {
          WHERE lexical_units_fts MATCH ?1 \
          ORDER BY rank LIMIT ?2"
     )
+}
+
+/// What one change set does to the lexical index.
+///
+/// A rebuild that replaced one file has to drop that file's previous units before it
+/// inserts its new ones, so a modified path appears in both halves: `dropped` names the
+/// paths whose stored units go, and `inserted` carries what the rebuilt index derived for
+/// the paths it read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LexicalChange {
+    dropped: Vec<ProjectPath>,
+    inserted: Vec<LexicalUnit>,
+}
+
+impl LexicalChange {
+    /// Builds one change from the paths whose units go and the units that replace them.
+    #[must_use]
+    pub fn new(dropped: Vec<ProjectPath>, inserted: Vec<LexicalUnit>) -> Self {
+        Self { dropped, inserted }
+    }
+
+    /// The paths whose stored units this change deletes.
+    #[must_use]
+    pub fn dropped(&self) -> &[ProjectPath] {
+        &self.dropped
+    }
+
+    /// The units this change inserts.
+    #[must_use]
+    pub fn inserted(&self) -> &[LexicalUnit] {
+        &self.inserted
+    }
+
+    /// Whether this change writes nothing, so the stored set already answers for the tree
+    /// that produced it.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.dropped.is_empty() && self.inserted.is_empty()
+    }
 }
 
 /// `SQLite` FTS5-backed lexical search index.
@@ -912,6 +1022,57 @@ impl LexicalSearchIndex {
             .map_err(storage_error)?;
 
         for unit in units {
+            insert_lexical_unit(&mut transaction, unit).await?;
+        }
+
+        LexicalIndexStateRecord::upsert_by_id(LEXICAL_INDEX_STATE_ID)
+            .tree_revision(tree_revision.to_owned())
+            .exec(&mut transaction)
+            .await
+            .map_err(storage_error)?;
+
+        transaction.commit().await.map_err(storage_error)
+    }
+
+    /// Applies one change set's units and stamps `tree_revision`, in one transaction.
+    ///
+    /// The transaction deletes every unit filed under a dropped path, inserts the units the
+    /// change derived, and stamps the revision. Deleting by path is what makes this
+    /// incremental: a text file split into chunks files every chunk under its own path, so
+    /// one delete reaches all of them.
+    ///
+    /// The resulting set is counted inside the transaction, after the deletions and before
+    /// the inserts, because an incremental apply cannot know its own resulting size any
+    /// earlier - and `units_max` binds the indexed set, not one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when one unit breaks a field bound, when two units
+    /// share one identity, when the resulting set would exceed `units_max`, or on storage
+    /// failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation before commit leaves the previously indexed units and tree-revision
+    /// stamp fully intact. Cancellation after commit has the same durable result as
+    /// completion.
+    pub async fn apply(
+        &self,
+        change: &LexicalChange,
+        tree_revision: &str,
+    ) -> Result<(), LexicalIndexError> {
+        validate_lexical_units(change.inserted(), self.limits)?;
+
+        let mut connection = self.configured_connection().await?;
+        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+
+        for path in change.dropped() {
+            delete_path_units(&mut transaction, path).await?;
+        }
+        let stored = indexed_unit_count(&mut transaction).await?;
+        validate_indexed_count(stored.saturating_add(change.inserted().len()), self.limits)?;
+
+        for unit in change.inserted() {
             insert_lexical_unit(&mut transaction, unit).await?;
         }
 

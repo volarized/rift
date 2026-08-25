@@ -21,10 +21,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use rift_core::ProjectPath;
 use rift_index::{
-    LexicalIndexError, LexicalIndexLimits, LexicalMatch, LexicalSearchIndex, LexicalUnit,
-    LexicalUnitKind, SemanticVectorStore, StoredVector,
+    LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalMatch, LexicalSearchIndex,
+    LexicalUnit, LexicalUnitKind, SemanticVectorStore, StoredVector,
 };
 
 use crate::acquisition::{AcquisitionLimits, ModelSource, acquire};
@@ -397,7 +399,7 @@ struct UnitDocument {
 
 /// Which declarations one pass embeds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Embedding {
+pub enum Embedding {
     /// Every declaration the pass was handed, whatever the store holds.
     Every,
     /// Only declarations whose digest the store does not already hold.
@@ -430,6 +432,15 @@ type Corpus = Vec<StoredVector>;
 /// than embedding it again.
 #[derive(Debug)]
 pub struct SearchIndex {
+    /// Serializes every write to the database file.
+    ///
+    /// `SQLite` admits one writer at a time and answers a second with `SQLITE_BUSY` once
+    /// its busy budget is spent. The lexical commit is on the publication path and the
+    /// vector store's batches are not, so leaving the two to race would let a background
+    /// batch refuse a caller's rebuild. Holding this across each write makes the order
+    /// explicit: a commit waits for at most one vector batch, and neither meets a busy
+    /// database.
+    writes: AsyncMutex<()>,
     lexical: LexicalSearchIndex,
     vectors: SemanticVectorStore,
     model: Mutex<Option<Arc<LoadedModel>>>,
@@ -465,6 +476,7 @@ impl SearchIndex {
             .await
             .map_err(store_failed)?;
         Ok(Self {
+            writes: AsyncMutex::new(()),
             lexical,
             vectors,
             model: Mutex::new(None),
@@ -516,66 +528,84 @@ impl SearchIndex {
     ///
     /// This is the pass that establishes a set rather than following one: the
     /// vector it writes for a declaration is the vector this encoder produces
-    /// now, whatever the store held before. Use [`SearchIndex::refresh`] for
-    /// every later pass, which is the one that trusts what is stored.
+    /// Replaces the whole lexical set and stamps `tree_revision`, in one transaction.
     ///
-    /// The lexical set is replaced whole here and in every later pass, because
-    /// a lexical row costs an insert: reconciling one row against the tree
-    /// costs more than writing all of them. A vector costs an embedding pass,
-    /// which is why the vector side is the one that reconciles.
-    ///
-    /// `units` is everything the lexical tier indexes. `described` is the
-    /// subset the semantic tier embeds, each entry carrying its own unit, so a
-    /// text file chunk that no declaration describes simply has no entry.
+    /// Startup and every rebuild that reads the whole workspace take this path: a set the
+    /// index cannot name the difference against is cheaper to write whole than to
+    /// reconcile row by row.
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when either store refuses, and the encoder's own
-    /// refusal when a pass fails.
+    /// Returns `store_failed` when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
-    /// Cancellation before the lexical commit leaves the previous unit set
-    /// intact. Cancellation during embedding keeps the vectors already
-    /// written, and the next pass embeds what is still missing.
-    pub async fn build(
+    /// Cancellation before the commit leaves the previous unit set and stamp intact.
+    pub async fn replace_lexical(
         &self,
         units: &[LexicalUnit],
-        described: &[DescribedUnit<'_>],
         tree_revision: &str,
     ) -> Result<(), SearchError> {
-        self.pass(units, described, tree_revision, Embedding::Every)
-            .await
+        let writing = self.writes.lock().await;
+        let written = self.lexical.replace_all(units, tree_revision).await;
+        drop(writing);
+        written.map_err(store_failed)
     }
 
-    /// Same, incrementally: only declarations whose digest is not already
-    /// stored are embedded, and vectors no live declaration addresses are
-    /// pruned.
+    /// Applies one change set's lexical units and stamps `tree_revision`, in one
+    /// transaction.
     ///
-    /// The lexical side is replaced whole and the vector side is not, because
-    /// the two cost different things: a lexical row costs an insert, and a
-    /// vector costs an embedding pass. A vector is addressed by the digest of
-    /// the text it came from, so a declaration that was renamed or moved
-    /// without its own bytes changing keeps the vector already stored.
+    /// A rebuild that named the files it read pays one delete and one insert batch per
+    /// changed path, against a rewrite of every indexed unit.
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when either store refuses, and the encoder's own
-    /// refusal when a pass fails.
+    /// Returns `store_failed` when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
-    /// Cancellation before the lexical commit leaves the previous unit set
-    /// intact. Cancellation during embedding keeps the vectors already
-    /// written, and the next pass embeds what is still missing.
-    pub async fn refresh(
+    /// Cancellation before the commit leaves the previous unit set and stamp intact.
+    pub async fn apply_lexical(
         &self,
-        units: &[LexicalUnit],
-        described: &[DescribedUnit<'_>],
+        change: &LexicalChange,
         tree_revision: &str,
     ) -> Result<(), SearchError> {
-        self.pass(units, described, tree_revision, Embedding::Missing)
-            .await
+        let writing = self.writes.lock().await;
+        let written = self.lexical.apply(change, tree_revision).await;
+        drop(writing);
+        written.map_err(store_failed)
+    }
+
+    /// Embeds the declarations one publication describes, prunes the vectors no live
+    /// declaration addresses, and publishes the corpus the semantic tier scans.
+    ///
+    /// This is the half a request never waits for. A vector costs an embedding pass, which
+    /// can run for longer than any freshness deadline, while a lexical row costs an insert.
+    ///
+    /// `Embedding::Every` establishes the vector set, which the first pass of a run does
+    /// because a store found on disk was written by an earlier process, possibly under
+    /// another model. `Embedding::Missing` trusts what is stored and embeds only what a
+    /// declaration's own bytes changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the vector store refuses, and the encoder's own refusal
+    /// when a pass fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation keeps the vectors already written, and the next pass embeds what is
+    /// still missing.
+    pub async fn embed_described(
+        &self,
+        described: &[DescribedUnit<'_>],
+        embedding: Embedding,
+    ) -> Result<(), SearchError> {
+        let Some(model) = self.serving_model() else {
+            self.note_nothing_embedded(described.len());
+            return Ok(());
+        };
+        self.embed(&model, described, embedding).await
     }
 
     /// Runs both tiers and fuses them.
@@ -658,34 +688,14 @@ impl SearchIndex {
     /// model beside the previous one's vectors; the next pass reads the corpus
     /// back under the model held here.
     async fn hold(&self, model: LoadedModel) -> Result<(), SearchError> {
-        let _dropped = self
-            .vectors
-            .prune_other_models(&model.identity)
-            .await
-            .map_err(store_failed)?;
+        let writing = self.writes.lock().await;
+        let pruned = self.vectors.prune_other_models(&model.identity).await;
+        drop(writing);
+        let _dropped = pruned.map_err(store_failed)?;
         self.publish_corpus(Corpus::new());
         let mut held = self.model.lock().unwrap_or_else(PoisonError::into_inner);
         *held = Some(Arc::new(model));
         Ok(())
-    }
-
-    /// One pass: the lexical set whole, then the vectors it still needs.
-    async fn pass(
-        &self,
-        units: &[LexicalUnit],
-        described: &[DescribedUnit<'_>],
-        tree_revision: &str,
-        embedding: Embedding,
-    ) -> Result<(), SearchError> {
-        self.lexical
-            .replace_all(units, tree_revision)
-            .await
-            .map_err(store_failed)?;
-        let Some(model) = self.serving_model() else {
-            self.note_nothing_embedded(described.len());
-            return Ok(());
-        };
-        self.embed(&model, described, embedding).await
     }
 
     /// Embeds what this pass owes, prunes what it orphaned, reads the corpus
@@ -717,11 +727,10 @@ impl SearchIndex {
         self.embed_batches(model, &selected(&documents, &stored, embedding))
             .await?;
         let live: BTreeSet<String> = documents.iter().map(|one| one.digest.clone()).collect();
-        let _pruned = self
-            .vectors
-            .prune_absent(&model.identity, &live)
-            .await
-            .map_err(store_failed)?;
+        let writing = self.writes.lock().await;
+        let pruned = self.vectors.prune_absent(&model.identity, &live).await;
+        drop(writing);
+        let _pruned = pruned.map_err(store_failed)?;
         let corpus = self.read_corpus(model).await?;
         self.publish(&documents, corpus);
         self.set_readiness(reached(as_count(documents.len()), total));
@@ -774,10 +783,13 @@ impl SearchIndex {
                     .await
                     .map_err(task_failed)??;
             let vectors = paired(chunk, embedded);
-            self.vectors
+            let writing = self.writes.lock().await;
+            let stored = self
+                .vectors
                 .store(&model.identity, model.encoder.dimension(), &vectors)
-                .await
-                .map_err(store_failed)?;
+                .await;
+            drop(writing);
+            stored.map_err(store_failed)?;
         }
         Ok(())
     }
