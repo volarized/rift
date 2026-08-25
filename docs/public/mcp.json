@@ -2622,11 +2622,6 @@
                 "const": "unmet_precondition",
                 "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
                 "type": "string"
-              },
-              {
-                "const": "ambiguous_target",
-                "description": "The address resolves to several targets. Narrow it and ask again.",
-                "type": "string"
               }
             ]
           },
@@ -3536,11 +3531,6 @@
               {
                 "const": "unmet_precondition",
                 "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
-                "type": "string"
-              },
-              {
-                "const": "ambiguous_target",
-                "description": "The address resolves to several targets. Narrow it and ask again.",
                 "type": "string"
               }
             ]
@@ -5244,11 +5234,6 @@
                 "const": "unmet_precondition",
                 "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
                 "type": "string"
-              },
-              {
-                "const": "ambiguous_target",
-                "description": "The address resolves to several targets. Narrow it and ask again.",
-                "type": "string"
               }
             ]
           },
@@ -6161,11 +6146,6 @@
               {
                 "const": "unmet_precondition",
                 "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
-                "type": "string"
-              },
-              {
-                "const": "ambiguous_target",
-                "description": "The address resolves to several targets. Narrow it and ask again.",
                 "type": "string"
               }
             ]
@@ -7130,11 +7110,6 @@
                 "const": "unmet_precondition",
                 "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
                 "type": "string"
-              },
-              {
-                "const": "ambiguous_target",
-                "description": "The address resolves to several targets. Narrow it and ask again.",
-                "type": "string"
               }
             ]
           },
@@ -8097,11 +8072,6 @@
               {
                 "const": "unmet_precondition",
                 "description": "A condition checked before resolution failed. The failed entry is in\n`preconditions`.",
-                "type": "string"
-              },
-              {
-                "const": "ambiguous_target",
-                "description": "The address resolves to several targets. Narrow it and ask again.",
                 "type": "string"
               }
             ]

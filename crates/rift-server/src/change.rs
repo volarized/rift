@@ -624,7 +624,7 @@ impl ChangeService {
     }
 
     /// Resolves one symbol address to its declaration span and builds the
-    /// plan through `plan`, refusing when the target is missing or ambiguous.
+    /// plan through `plan`, refusing when the target is missing.
     fn resolve_symbol_spans(
         &self,
         reads: &ReadService,
@@ -827,9 +827,12 @@ pub(crate) enum SymbolResolution<'reads> {
     },
 }
 
-/// Resolves one symbol address to its single declaration, refusing when the
-/// file is missing, the name resolves to nothing, or it resolves to several
-/// declarations.
+/// Resolves one symbol address to its declaration, refusing when the file is
+/// missing or the name resolves to nothing.
+///
+/// One document holds at most one declaration under a qualified name: the
+/// syntax layer suffixes every repeated name apart, so an address naming
+/// several declarations cannot be written.
 ///
 /// # Errors
 ///
@@ -860,28 +863,14 @@ pub(crate) fn resolve_symbol<'reads>(
         return Ok(missing_target());
     };
     verified_address_language("symbol", &address.language_segment, file.syntax())?;
-    let declarations: Vec<&rift_syntax::SyntaxSymbol> = file
+    let declaration = file
         .syntax()
         .symbols()
         .iter()
-        .filter(|symbol| symbol.qualified_name == address.qualified_name)
-        .collect();
-    match declarations.as_slice() {
-        [] => Ok(missing_target()),
-        [only] => Ok(SymbolResolution::Declared { file, symbol: only }),
-        several => Ok(SymbolResolution::Refused {
-            reason: RefusalReason::AmbiguousTarget,
-            preconditions: vec![OperationPrecondition::new(
-                OperationPreconditionKind::TargetExists,
-                OperationPreconditionStatus::Failed,
-                symbol_addresses(),
-                vec![path.as_str().to_owned()],
-                PreconditionValue::Count { value: 1 },
-                PreconditionValue::Count {
-                    value: several.len() as u64,
-                },
-            )],
-        }),
+        .find(|symbol| symbol.qualified_name == address.qualified_name);
+    match declaration {
+        Some(symbol) => Ok(SymbolResolution::Declared { file, symbol }),
+        None => Ok(missing_target()),
     }
 }
 
@@ -1345,47 +1334,69 @@ mod tests {
         Ok(())
     }
 
+    /// Two declarations spelling one name are suffixed apart, so no
+    /// declaration holds the bare name: the bare address refuses as a
+    /// missing target rather than landing silently on the first twin, and
+    /// each suffixed address rewrites its own declaration.
     #[test]
-    fn replace_symbol_refuses_missing_and_ambiguous_targets() -> TestResult {
-        let (_directory, reads, changes) =
-            fixture("#[cfg(unix)]\npub fn beacon() {}\n#[cfg(windows)]\npub fn beacon() {}\n")?;
-        let missing = changes.replace_symbol(
-            &reads,
-            &ReplaceSymbolParams {
-                symbol: symbol("vanished"),
-                region: None,
-                body: "pub fn vanished() {}".to_owned(),
-            },
-        )?;
-        let ChangeResult::Refused { preconditions, .. } = missing else {
-            panic!("missing symbol must refuse");
-        };
-        assert_eq!(
-            preconditions[0].kind,
-            OperationPreconditionKind::TargetExists
-        );
-
-        let ambiguous = changes.replace_symbol(
-            &reads,
-            &ReplaceSymbolParams {
-                symbol: symbol("beacon"),
+    fn replace_symbol_refuses_the_bare_name_of_repeated_declarations() -> TestResult {
+        const TWINS: &str =
+            "#[cfg(unix)]\npub fn beacon() {}\n#[cfg(windows)]\npub fn beacon() {}\n";
+        let (_directory, reads, changes) = fixture(TWINS)?;
+        for absent in ["vanished", "beacon"] {
+            let refused = changes.replace_symbol(
+                &reads,
+                &ReplaceSymbolParams {
+                    symbol: symbol(absent),
+                    region: None,
+                    body: "pub fn replaced() {}".to_owned(),
+                },
+            )?;
+            let ChangeResult::Refused {
+                reason,
+                preconditions,
+                ..
+            } = refused
+            else {
+                panic!("no declaration holds {absent}, so it must refuse");
+            };
+            assert_eq!(reason, RefusalReason::UnmetPrecondition);
+            assert_eq!(
+                preconditions[0].kind,
+                OperationPreconditionKind::TargetExists
+            );
+            assert_eq!(
+                preconditions[0].observed,
+                PreconditionValue::Boolean { value: false }
+            );
+        }
+        for (suffixed, twin, own) in [
+            ("beacon~1", "#[cfg(windows)]", "#[cfg(unix)]"),
+            ("beacon~2", "#[cfg(unix)]", "#[cfg(windows)]"),
+        ] {
+            let (directory, reads, changes) = fixture(TWINS)?;
+            let params = ReplaceSymbolParams {
+                symbol: symbol(suffixed),
                 region: None,
                 body: "pub fn beacon() -> u8 { 7 }".to_owned(),
-            },
-        )?;
-        let ChangeResult::Refused {
-            reason,
-            preconditions,
-            ..
-        } = ambiguous
-        else {
-            panic!("two declarations must refuse");
-        };
-        assert_eq!(reason, RefusalReason::AmbiguousTarget);
-        assert_eq!(
-            preconditions[0].observed,
-            PreconditionValue::Count { value: 2 }
-        );
+            };
+            let summary = applied_summary(changes.replace_symbol(&reads, &params)?);
+            assert_eq!(
+                summary.edits.len(),
+                1,
+                "{suffixed} rewrites one declaration"
+            );
+            let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+            assert!(written.contains("-> u8 { 7 }"), "{suffixed}: {written}");
+            assert!(
+                written.contains(twin),
+                "{suffixed} keeps its twin: {written}"
+            );
+            assert!(
+                !written.contains(own),
+                "{suffixed} takes its own: {written}"
+            );
+        }
         Ok(())
     }
 
