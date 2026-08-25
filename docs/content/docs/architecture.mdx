@@ -359,14 +359,39 @@ The walk stops after one edge by default and accepts at most two. It also stops 
 Each graph hit carries the shortest path from the seed, including every relationship's
 source-node evidence, derivation, and the direction Rift followed it.
 
-Search fuses two rankings. The lexical one answers a query sharing a token with the code; the
-semantic one answers a query that shares none, because an embedding puts the query and the
-declaration in one space. [`[search.semantic]`](/docs/configuration#search) names the model,
-and the two `weight` keys set each ranking's share of a fused score.
+#### Semantic ranking
 
-The server embeds indexed declarations and stores the vectors per model, because two models'
-vectors aren't comparable - changing the configured model embeds the workspace again rather
-than mixing spaces.
+<VersionBadge
+  version="v0.0.16"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+/>
+
+The lexical ranking answers a query that shares a token with the code. A query that shares
+none - a description of what a declaration does, in the words a bug report would use - reaches
+nothing lexically, and no amount of ranking repairs that, because the words are not there.
+
+An embedding puts the query and the declaration in one space, so a paraphrase finds code it
+has no word in common with. It replaces nothing. A caller who quotes a real name - a symbol, a
+configuration key, a line from a traceback - has handed the lexical ranking an exact token to
+score, while the embedding maps that name into a space where its near neighbours crowd it.
+
+A declaration is embedded as its own source under its qualified name. The name carries the
+module the source doesn't state; the source carries the identifiers and documentation an
+encoder trained on code reads best. The path is left out, because the lexical ranking already
+covers it.
+
+The two rankings are combined by reciprocal rank rather than by averaging their scores. A
+full-text relevance score and a cosine similarity share no scale, so a weighted average of the
+two is decided by whichever side happens to spread wider.
+[`fusion_k`](/docs/configuration#search) sets how sharply a top rank counts, and the two
+`weight` keys set each ranking's share.
+
+Preparation runs behind the answers. A search issued before the vectors are in is answered
+lexically and says so, rather than waiting for a model to load.
+
+Vectors are stored per model and addressed by the text they were embedded from. A declaration
+that moves or is renamed keeps its text, so it keeps its vector; changing the configured model
+embeds the workspace again rather than mixing two spaces.
 
 ### Retrieve symbol
 
