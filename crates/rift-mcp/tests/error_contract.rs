@@ -3,6 +3,8 @@
 //! the registry composes the wire `ErrorCode` enum directly, so the two
 //! cannot name different code sets.
 
+mod hermetic_search;
+
 use std::error::Error;
 use std::fs;
 
@@ -20,6 +22,10 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     let server_task = tokio::spawn(async move {
@@ -143,6 +149,10 @@ async fn failing_wire_error(
 async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
     let wire = failing_wire_error(
         directory.path(),
         "get_symbol",
@@ -163,6 +173,10 @@ async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
 async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
     let wire = failing_wire_error(
         directory.path(),
         "get_symbol",
@@ -185,7 +199,10 @@ async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        "[providers.history]\nenabled = false\n",
+        format!(
+            "{}[providers.history]\nenabled = false\n",
+            hermetic_search::SEMANTIC_DISABLED
+        ),
     )?;
     let wire = failing_wire_error(
         directory.path(),
@@ -208,7 +225,10 @@ async fn revision_read_with_history_disabled_is_refused() -> TestResult {
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        "[providers.history]\nenabled = false\n",
+        format!(
+            "{}[providers.history]\nenabled = false\n",
+            hermetic_search::SEMANTIC_DISABLED
+        ),
     )?;
     let wire = failing_wire_error(
         directory.path(),

@@ -28,6 +28,7 @@ rmcp = { workspace = true, features = [
 rift-core.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
+rift-search.workspace = true
 rift-server.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
@@ -63,6 +64,10 @@ path = "tests/http_serve.rs"
 [[test]]
 name = "live_rust_analyzer"
 path = "tests/live_rust_analyzer.rs"
+
+[[test]]
+name = "live_semantic_search"
+path = "tests/live_semantic_search.rs"
 
 [[test]]
 name = "live_typescript"

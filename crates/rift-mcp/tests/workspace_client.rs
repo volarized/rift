@@ -1,10 +1,12 @@
 //! Shared scaffolding for the engine integration suites.
 //!
-//! Every suite builds a workspace whose own `rift.toml` carries an
+//! Every suite builds a workspace whose own `rift.toml` turns the semantic
+//! search tier off and, where the suite drives an engine, carries an
 //! `[engines.<name>]` table - the scripted fake engine, or the real one -
 //! and drives the tools through a live rmcp client. Engine-specific
 //! helpers live beside this module: `fake_engine.rs` for the scripted
-//! suites, `live_engine_gate.rs` for the gated live suite.
+//! suites, `live_engine_gate.rs` for the gated live suite, and
+//! `hermetic_search.rs` for the table and why every fixture declares it.
 
 use std::error::Error;
 use std::fs;
@@ -57,7 +59,11 @@ pub(crate) async fn served_relative_workspace(
     Ok((directory, client, server_task))
 }
 
-/// One temporary workspace holding `files` and, when given, a `rift.toml`.
+/// One temporary workspace holding `files` and a `rift.toml`: the table that turns
+/// the semantic tier off, then the engine table when the suite drives one.
+///
+/// A table header ends where the next one begins, so the engine table follows
+/// unchanged and each suite still proves whatever its own table carries.
 fn laid_out_workspace(
     files: &[(&str, &str)],
     engine: Option<String>,
@@ -66,9 +72,12 @@ fn laid_out_workspace(
     for (name, source) in files {
         fs::write(directory.path().join(name), source)?;
     }
-    if let Some(configuration) = engine {
-        fs::write(directory.path().join("rift.toml"), configuration)?;
+    let mut configuration = crate::hermetic_search::SEMANTIC_DISABLED.to_owned();
+    if let Some(engine) = engine {
+        configuration.push('\n');
+        configuration.push_str(&engine);
     }
+    fs::write(directory.path().join("rift.toml"), configuration)?;
     Ok(directory)
 }
 

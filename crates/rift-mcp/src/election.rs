@@ -931,6 +931,7 @@ mod tests {
     #[tokio::test]
     async fn shut_down_unpublished_returns_the_fabricated_failure() -> TestResult {
         let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
         let shutdown = CancellationToken::new();
         let serving_stop = shutdown.child_token();
         let server = serve_http(directory.path(), serving_stop.clone()).await?;
@@ -950,6 +951,7 @@ mod tests {
     #[tokio::test]
     async fn serve_elected_shuts_down_when_the_publish_fails() -> TestResult {
         let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
         fs::create_dir_all(document_path(directory.path()))?;
         let shutdown = CancellationToken::new();
         let error = serve_elected(directory.path(), shutdown)

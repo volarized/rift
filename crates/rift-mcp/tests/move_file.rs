@@ -7,6 +7,7 @@
 #![cfg(unix)]
 
 mod fake_engine;
+mod hermetic_search;
 mod workspace_client;
 
 use std::fs;

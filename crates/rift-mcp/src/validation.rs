@@ -12,14 +12,13 @@ use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use rift_core::constants::{WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES};
 use rift_core::{SourceVisibility, TextFileInclusion};
-use rift_index::{
-    LexicalSearchIndex, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
-};
+use rift_index::{WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy};
 use rift_protocol::configuration::{
     EngineConfiguration, HistoryConfiguration, SearchConfiguration, ServerConfiguration,
     WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
+use rift_search::SearchIndex;
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ReadError, ReadFault, ReadService,
     load_configuration,
@@ -124,8 +123,8 @@ pub(crate) struct IndexSupervisorContext {
     pub(crate) change_lane: Arc<ChangeLane>,
     pub(crate) validation: Arc<IndexValidation>,
     pub(crate) blocking: BlockingExecutor,
-    /// The lexical search database, absent when it could not be opened at startup.
-    pub(crate) lexical: Option<Arc<LexicalSearchIndex>>,
+    /// The workspace's search index, absent when it could not be opened at startup.
+    pub(crate) search_index: Option<Arc<SearchIndex>>,
 }
 
 /// The last acceptance of the workspace's `rift.toml`, kept with the file
@@ -157,6 +156,15 @@ impl ConfigurationState {
             Ok(configuration) => Ok(configuration.clone()),
             Err(error) => Err(error.tool_error(phase)),
         }
+    }
+
+    /// Whether the last acceptance of `rift.toml` succeeded.
+    ///
+    /// Every table accessor below answers the shipped default while it did not, so a
+    /// caller that must tell "the operator asked for this" from "nobody could read what
+    /// the operator asked for" reads this first.
+    pub(crate) const fn is_accepted(&self) -> bool {
+        self.accepted.is_ok()
     }
 
     /// The `[server]` table from the last acceptance, or the default table
@@ -650,27 +658,47 @@ pub(crate) fn build_workspace_candidate(
     })))
 }
 
-/// Derives `published`'s lexical units and replaces the lexical search database's whole
-/// content with them, stamped with the same tree revision `published`'s wire answers
-/// report - the exact string a search request compares its query-time lexical revision
-/// against before trusting that tier's matches.
+/// Which pass one population runs over the vector store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchPass {
+    /// Every declaration is embedded again, whatever the store already holds.
+    Build,
+    /// Only declarations the store has no vector for are embedded.
+    Refresh,
+}
+
+/// Derives `published`'s lexical units and the declarations that describe them, and replaces
+/// the search index's whole unit set with them, stamped with the same tree revision
+/// `published`'s wire answers report - the exact string a search request compares its
+/// query-time index revision against before trusting that ranking.
+///
+/// Startup passes [`SearchPass::Build`] and every later call passes [`SearchPass::Refresh`].
+/// A store this process found on disk was written by an earlier one, possibly under another
+/// model, so the first pass of a run establishes the vector set rather than trusting it.
+/// Later passes embed only what is missing, because a vector costs an embedding pass and a
+/// declaration whose own bytes did not change keeps the vector already stored.
 ///
 /// Population failure is a warning, never a request failure: the search-time revision guard
 /// keeps served results honest whether or not this population landed, and the next
-/// successful rebuild repopulates from scratch regardless.
+/// successful rebuild repopulates regardless.
 ///
 /// # Cancel safety
 ///
-/// `replace_all` runs inside one `SQLite` transaction. Dropping this future before that
-/// transaction commits leaves the previously indexed units and tree-revision stamp fully
-/// intact - never partially overwritten. That stamp then no longer names the tree revision
-/// this call was populating for, so the search-time revision guard serves identifier-only
-/// results until the next successful publication repopulates the lexical tier.
-pub(crate) async fn populate_lexical(lexical: &LexicalSearchIndex, published: &PublishedWorkspace) {
+/// The unit-set replacement runs inside one `SQLite` transaction. Dropping this future
+/// before that transaction commits leaves the previously indexed units and tree-revision
+/// stamp fully intact - never partially overwritten. That stamp then no longer names the
+/// tree revision this call was populating for, so the search-time revision guard serves
+/// identifier-only results until the next successful publication repopulates the index.
+/// Dropping it during embedding keeps every vector already written.
+pub(crate) async fn populate_search(
+    index: &SearchIndex,
+    published: &PublishedWorkspace,
+    pass: SearchPass,
+) {
     for (path, chunks) in published.reads.chunked_text_files() {
         tracing::warn!(
             component = "search",
-            operation = "lexical.populate",
+            operation = "search.populate",
             path = %path.as_str(),
             chunks,
             "a [search.text] file exceeds max_chunk and was indexed in chunks; exclude it in \
@@ -678,15 +706,20 @@ pub(crate) async fn populate_lexical(lexical: &LexicalSearchIndex, published: &P
         );
     }
     let units = published.reads.lexical_units();
+    let described = published.reads.described_units(&units);
     let tree_revision = published.reads.tree_revision();
-    if let Err(error) = lexical.replace_all(&units, tree_revision).await {
+    let populated = match pass {
+        SearchPass::Build => index.build(&units, &described, tree_revision).await,
+        SearchPass::Refresh => index.refresh(&units, &described, tree_revision).await,
+    };
+    if let Err(error) = populated {
         tracing::warn!(
             component = "search",
-            operation = "lexical.populate",
+            operation = "search.populate",
             tree_revision,
             error = %error,
-            "lexical search index population failed; identifier search continues to serve \
-             results until the next successful rebuild repopulates it"
+            "search index population failed; identifier search continues to serve results \
+             until the next successful rebuild repopulates it"
         );
     }
 }
@@ -713,7 +746,7 @@ pub(crate) async fn run_index_supervisor(
         change_lane,
         validation,
         blocking,
-        lexical,
+        search_index,
     } = context;
     loop {
         let received = tokio::select! {
@@ -752,9 +785,9 @@ pub(crate) async fn run_index_supervisor(
         .await;
         match result {
             Ok(RebuildOutcome::Published) => {
-                if let Some(lexical) = lexical.as_ref() {
+                if let Some(index) = search_index.as_ref() {
                     let (current, _) = published.read().await.snapshot();
-                    populate_lexical(lexical, &current).await;
+                    populate_search(index, &current, SearchPass::Refresh).await;
                 }
             }
             Ok(RebuildOutcome::Superseded) => {}
@@ -951,17 +984,16 @@ mod tests {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use rift_core::{SourceVisibility, TextFileInclusion};
-    use rift_index::{
-        LexicalIndexLimits, LexicalSearchIndex, WorkspaceIndexLimits, WorkspaceSourcePolicy,
-    };
+    use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits, WorkspaceSourcePolicy};
+    use rift_search::{SearchIndex, SearchIndexLimits, SemanticReadiness};
     use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
 
     use super::{
         ConfigurationFingerprint, ConfigurationState, IndexState, IndexValidation,
-        PublishedWorkspace, RebuildOutcome, WorkspaceCandidate, build_workspace_candidate,
-        populate_lexical, publish_rebuild, publish_rebuild_after, record_rebuild_failure,
-        relevant_watch_event,
+        PublishedWorkspace, RebuildOutcome, SearchPass, WorkspaceCandidate,
+        build_workspace_candidate, populate_search, publish_rebuild, publish_rebuild_after,
+        record_rebuild_failure, relevant_watch_event,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1548,7 +1580,7 @@ mod tests {
                 change_lane: Arc::new(crate::server::ChangeLane::default()),
                 validation: Arc::clone(&validation),
                 blocking,
-                lexical: None,
+                search_index: None,
             },
         ));
         let notified = validation.changed.notified();
@@ -1604,7 +1636,7 @@ mod tests {
                 change_lane: Arc::new(crate::server::ChangeLane::default()),
                 validation: Arc::clone(&validation),
                 blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
-                lexical: None,
+                search_index: None,
             },
         ));
         let notified = validation.changed.notified();
@@ -1671,7 +1703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn populate_lexical_persists_every_chunk_of_an_oversized_text_file() -> TestResult {
+    async fn populate_search_persists_every_chunk_of_an_oversized_text_file() -> TestResult {
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_writer(std::io::sink)
@@ -1707,28 +1739,61 @@ mod tests {
             "the oversized file must contribute more than one lexical unit: {guide_units}"
         );
 
-        let lexical = LexicalSearchIndex::open(
-            &directory.path().join("lexical.db"),
-            LexicalIndexLimits::default(),
-        )
-        .await?;
-        populate_lexical(&lexical, &published).await;
+        let index = search_index(&directory.path().join("search.db")).await?;
+        populate_search(&index, &published, SearchPass::Build).await;
 
-        let stamped = lexical.tree_revision().await?;
+        let stamped = index.tree_revision().await?;
         assert_eq!(
             stamped.as_deref(),
             Some(published.reads.tree_revision()),
             "population must succeed and stamp the published tree revision, not merely warn"
         );
-        for unit in &units {
-            let content = lexical.content(unit.identity()).await?;
+        let ranked = index.search("word", 64).await?;
+        for unit in units
+            .iter()
+            .filter(|unit| unit.path().as_str() == "guide.txt")
+        {
             assert!(
-                content.is_some(),
-                "every chunk unit must have been persisted: identity={}",
+                ranked.iter().any(|one| one.identity() == unit.identity()),
+                "every chunk unit must have been persisted: identity={} ranked={ranked:#?}",
                 unit.identity()
             );
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_passes_populate_the_index_and_stamp_the_published_revision() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let index = search_index(&directory.path().join("search.db")).await?;
+        for pass in [SearchPass::Build, SearchPass::Refresh] {
+            populate_search(&index, &published, pass).await;
+            let stamped = index.tree_revision().await?;
+            assert_eq!(
+                stamped.as_deref(),
+                Some(published.reads.tree_revision()),
+                "the {pass:?} pass must stamp the published tree revision"
+            );
+            let ranked = index.search("beacon", 8).await?;
+            assert!(
+                !ranked.is_empty(),
+                "the {pass:?} pass must leave the unit set searchable"
+            );
+        }
+        Ok(())
+    }
+
+    /// One search index over `database` with the semantic tier off, so a test drives the
+    /// full-text half without acquiring model weights.
+    async fn search_index(database: &std::path::Path) -> TestResult<SearchIndex> {
+        let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
+            .disable_semantic()
+            .build();
+        let index = SearchIndex::open(database, limits).await?;
+        assert_eq!(index.readiness(), SemanticReadiness::Disabled);
+        Ok(index)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1777,7 +1842,7 @@ mod tests {
                 change_lane: Arc::new(crate::server::ChangeLane::default()),
                 validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
-                lexical: None,
+                search_index: None,
             },
         ));
 
