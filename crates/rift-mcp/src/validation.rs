@@ -24,7 +24,7 @@ use rift_protocol::configuration::{
     WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
-use rift_search::SearchIndex;
+use rift_search::{Embedding, SearchIndex};
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ReadError, ReadFault, ReadService,
     load_configuration,
@@ -1034,9 +1034,13 @@ pub(crate) async fn populate_search(
     let units = published.reads.lexical_units();
     let described = published.reads.described_units(&units);
     let tree_revision = published.reads.tree_revision();
-    let populated = match pass {
-        SearchPass::Build => index.build(&units, &described, tree_revision).await,
-        SearchPass::Refresh => index.refresh(&units, &described, tree_revision).await,
+    let embedding = match pass {
+        SearchPass::Build => Embedding::Every,
+        SearchPass::Refresh => Embedding::Missing,
+    };
+    let populated = match index.replace_lexical(&units, tree_revision).await {
+        Ok(()) => index.embed_described(&described, embedding).await,
+        Err(error) => Err(error),
     };
     if let Err(error) = populated {
         tracing::warn!(

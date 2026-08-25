@@ -11,8 +11,8 @@ mod workspace;
 pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 pub use glob::PathMatcher;
 pub use lexical::{
-    LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch,
-    LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
+    LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
+    LexicalMatch, LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
 };
 pub use vector::{SemanticVectorStore, StoredVector};
 pub use workspace::{

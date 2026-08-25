@@ -12,8 +12,9 @@ use rift_index::{
     StoredVector,
 };
 use rift_search::{
-    AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, ModelSource, RankedUnit,
-    SearchIndex, SearchIndexLimits, SearchViolation, SemanticReadiness, document,
+    AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, ModelSource,
+    RankedUnit, SearchError, SearchIndex, SearchIndexLimits, SearchViolation, SemanticReadiness,
+    document,
 };
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::processors::bert::BertProcessing;
@@ -404,6 +405,29 @@ fn text_unit(identity: &str, path: &str, name: &str, content: &str) -> Fallible<
     )?)
 }
 
+/// Runs one whole build pass the way the server's population path does: the lexical set is
+/// replaced and stamped, then every described declaration is embedded.
+async fn whole_pass(
+    index: &SearchIndex,
+    units: &[LexicalUnit],
+    described: &[DescribedUnit<'_>],
+    tree_revision: &str,
+) -> Result<(), SearchError> {
+    index.replace_lexical(units, tree_revision).await?;
+    index.embed_described(described, Embedding::Every).await
+}
+
+/// The same pass incrementally: only declarations the store has no vector for are embedded.
+async fn incremental_pass(
+    index: &SearchIndex,
+    units: &[LexicalUnit],
+    described: &[DescribedUnit<'_>],
+    tree_revision: &str,
+) -> Result<(), SearchError> {
+    index.replace_lexical(units, tree_revision).await?;
+    index.embed_described(described, Embedding::Missing).await
+}
+
 #[tokio::test]
 async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> TestResult {
     let root = workspace()?;
@@ -417,9 +441,7 @@ async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> Te
     );
     assert_eq!(index.tree_revision().await?, None, "nothing has been built");
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     drop(index);
 
     let reopened = opened(root.path(), limits()).await?;
@@ -436,7 +458,7 @@ async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> Te
 async fn a_build_with_no_declarations_leaves_the_semantic_tier_ready() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    index.build(&[], &[], REVISION).await?;
+    whole_pass(&index, &[], &[], REVISION).await?;
     assert_eq!(
         index.readiness(),
         SemanticReadiness::Ready,
@@ -457,9 +479,7 @@ async fn a_build_gives_every_declaration_a_vector_and_stamps_the_tree_revision()
     let index = prepared(root.path(), limits()).await?;
     let units = two_units()?;
     let declarations = two_declarations();
-    index
-        .build(&units, &described(&units, &declarations), REVISION)
-        .await?;
+    whole_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
 
     assert_eq!(index.readiness(), SemanticReadiness::Ready);
     assert_eq!(index.tree_revision().await?, Some(REVISION.to_owned()));
@@ -482,9 +502,7 @@ async fn a_refresh_leaves_a_moved_declaration_the_vector_it_already_had() -> Tes
     let index = prepared(root.path(), limits()).await?;
     let units = two_units()?;
     let declarations = two_declarations();
-    index
-        .build(&units, &described(&units, &declarations), REVISION)
-        .await?;
+    whole_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
     let carried = digest_of(&declarations[0]);
     mark(root.path(), &carried).await?;
 
@@ -492,9 +510,7 @@ async fn a_refresh_leaves_a_moved_declaration_the_vector_it_already_had() -> Tes
         unit("moved", "src/moved.rs", "load_config", "fn load config")?,
         unit("two", "src/two.rs", "read_index", "fn read index")?,
     ];
-    index
-        .refresh(&moved, &described(&moved, &declarations), "rev-two")
-        .await?;
+    incremental_pass(&index, &moved, &described(&moved, &declarations), "rev-two").await?;
 
     let vectors = stored(root.path(), "model").await?;
     assert_eq!(vectors.len(), 2, "a move embeds nothing new");
@@ -513,9 +529,7 @@ async fn a_refresh_prunes_what_left_and_embeds_what_arrived() -> TestResult {
     let index = prepared(root.path(), limits()).await?;
     let built = two_units()?;
     let declarations = two_declarations();
-    index
-        .build(&built, &described(&built, &declarations), REVISION)
-        .await?;
+    whole_pass(&index, &built, &described(&built, &declarations), REVISION).await?;
     let kept = digest_of(&declarations[0]);
     let removed = digest_of(&declarations[1]);
     mark(root.path(), &kept).await?;
@@ -526,9 +540,7 @@ async fn a_refresh_prunes_what_left_and_embeds_what_arrived() -> TestResult {
     ];
     let arrived = Declaration::new("fn", "search_index").source("fn search index");
     let declarations = vec![declarations[0], arrived];
-    index
-        .refresh(&units, &described(&units, &declarations), REVISION)
-        .await?;
+    incremental_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
 
     let vectors = stored(root.path(), "model").await?;
     let held: Vec<&str> = vectors.iter().map(StoredVector::digest).collect();
@@ -554,11 +566,11 @@ async fn a_full_pass_embeds_a_declaration_the_store_already_holds() -> TestResul
     let units = two_units()?;
     let declarations = two_declarations();
     let described = described(&units, &declarations);
-    index.build(&units, &described, REVISION).await?;
+    whole_pass(&index, &units, &described, REVISION).await?;
     let carried = digest_of(&declarations[0]);
     mark(root.path(), &carried).await?;
 
-    index.build(&units, &described, REVISION).await?;
+    whole_pass(&index, &units, &described, REVISION).await?;
     assert!(
         !is_marked(&stored(root.path(), "model").await?, &carried),
         "a build does not trust what is stored, so the mark is overwritten"
@@ -576,9 +588,7 @@ async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult 
         .build();
     let index = prepared(root.path(), bounded).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
         SemanticReadiness::Preparing {
@@ -608,9 +618,7 @@ async fn a_disabled_tier_answers_in_the_lexical_order_alone() -> TestResult {
         "a disabled tier acquires nothing"
     );
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(index.readiness(), SemanticReadiness::Disabled);
     assert!(
         stored(root.path(), "model").await?.is_empty(),
@@ -638,9 +646,7 @@ async fn a_query_the_lexical_tier_cannot_answer_is_still_ranked_through_the_sema
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
 
     assert!(
         lexical_order(root.path(), "search", 10).await?.is_empty(),
@@ -671,7 +677,7 @@ async fn a_vector_lands_on_the_unit_whose_declaration_produced_it() -> TestResul
         DescribedUnit::new(&units[1], declarations[0]),
         DescribedUnit::new(&units[3], declarations[1]),
     ];
-    index.build(&units, &described, REVISION).await?;
+    whole_pass(&index, &units, &described, REVISION).await?;
 
     assert_eq!(stored(root.path(), "model").await?.len(), 2);
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
@@ -700,7 +706,7 @@ async fn more_units_than_described_entries_leave_the_undescribed_ones_without_a_
     ];
     let declarations = two_declarations();
     let described = vec![DescribedUnit::new(&units[0], declarations[0])];
-    index.build(&units, &described, REVISION).await?;
+    whole_pass(&index, &units, &described, REVISION).await?;
 
     let vectors = stored(root.path(), "model").await?;
     assert_eq!(
@@ -729,7 +735,7 @@ async fn more_described_entries_than_units_still_land_each_vector_on_its_own_uni
         DescribedUnit::new(&indexed[0], declarations[0]),
         DescribedUnit::new(&apart, declarations[1]),
     ];
-    index.build(&indexed, &described, REVISION).await?;
+    whole_pass(&index, &indexed, &described, REVISION).await?;
 
     let vectors = stored(root.path(), "model").await?;
     let held: Vec<&str> = vectors.iter().map(StoredVector::digest).collect();
@@ -748,9 +754,7 @@ async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestR
     let root = workspace()?;
     let index = opened(root.path(), limits()).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
         SemanticReadiness::Preparing {
@@ -776,9 +780,7 @@ async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestR
         stored(root.path(), "model").await?.is_empty(),
         "an unavailable tier embeds nothing"
     );
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
         SemanticReadiness::Unavailable,
@@ -792,9 +794,7 @@ async fn an_empty_query_answers_nothing_and_a_limit_of_one_answers_once() -> Tes
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
 
     assert!(index.search("", 10).await?.is_empty());
     assert!(
@@ -827,9 +827,7 @@ async fn one_files_declarations_cannot_fill_the_candidate_list() -> TestResult {
         Declaration::new("fn", "read").source("fn read"),
         Declaration::new("fn", "index").source("fn index"),
     ];
-    index
-        .build(&units, &described(&units, &declarations), REVISION)
-        .await?;
+    whole_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
 
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
     let ranked = index.search("search", 10).await?;
@@ -858,9 +856,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
         }
     );
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
         SemanticReadiness::Preparing {
@@ -871,9 +867,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
     index
         .prepare(&model_source(root.path(), "model")?, acquisition_limits())
         .await?;
-    index
-        .refresh(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    incremental_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(index.readiness(), SemanticReadiness::Ready);
     Ok(())
 }
@@ -883,9 +877,7 @@ async fn vectors_with_no_unit_to_rank_them_as_leave_the_lexical_ranking_alone() 
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     drop(index);
 
     let reopened = prepared(root.path(), limits()).await?;
@@ -912,9 +904,7 @@ async fn a_model_change_drops_the_vectors_the_previous_model_wrote() -> TestResu
     write_model(&root.path().join("other"))?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(stored(root.path(), "model").await?.len(), 2);
     drop(index);
 
@@ -926,9 +916,7 @@ async fn a_model_change_drops_the_vectors_the_previous_model_wrote() -> TestResu
         stored(root.path(), "model").await?.is_empty(),
         "two models address different spaces, so the previous rows can never be read"
     );
-    changed
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&changed, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(stored(root.path(), "other").await?.len(), 2);
     Ok(())
 }
@@ -941,9 +929,7 @@ async fn a_query_ranks_from_the_held_corpus_after_the_stored_rows_are_gone() -> 
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert!(
         lexical_order(root.path(), "search", 10).await?.is_empty(),
         "the query shares no token with either unit, so only the semantic tier can answer it"
@@ -973,18 +959,20 @@ async fn a_refresh_publishes_what_it_embedded_beside_what_the_build_left() -> Te
     let index = prepared(root.path(), limits()).await?;
     let built = vec![unit("one", "src/one.rs", "load_config", "fn load config")?];
     let carried = Declaration::new("fn", "load_config").source("fn load config");
-    index
-        .build(&built, &described(&built, &[carried]), REVISION)
-        .await?;
+    whole_pass(&index, &built, &described(&built, &[carried]), REVISION).await?;
 
     let units = vec![
         unit("one", "src/one.rs", "load_config", "fn load config")?,
         unit("three", "src/three.rs", "read_index", "fn read index")?,
     ];
     let arrived = Declaration::new("fn", "read_index").source("fn read index");
-    index
-        .refresh(&units, &described(&units, &[carried, arrived]), REVISION)
-        .await?;
+    incremental_pass(
+        &index,
+        &units,
+        &described(&units, &[carried, arrived]),
+        REVISION,
+    )
+    .await?;
     assert_eq!(
         stored(root.path(), "model").await?.len(),
         2,
@@ -1009,9 +997,7 @@ async fn a_model_change_leaves_none_of_the_previous_models_vectors_held() -> Tes
     write_model(&root.path().join("other"))?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         placed(&index.search("search", 10).await?),
         [("one", "src/one.rs"), ("two", "src/two.rs")]
@@ -1030,9 +1016,7 @@ async fn a_model_change_leaves_none_of_the_previous_models_vectors_held() -> Tes
         "the lexical tier keeps answering"
     );
 
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         placed(&index.search("search", 10).await?),
         [("one", "src/one.rs"), ("two", "src/two.rs")],
@@ -1054,9 +1038,7 @@ async fn the_held_corpus_stops_at_the_vector_bound() -> TestResult {
         .build();
     let index = prepared(root.path(), bounded).await?;
     let fixture = two()?;
-    index
-        .build(fixture.units(), &fixture.described(), REVISION)
-        .await?;
+    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(stored(root.path(), "model").await?.len(), 1);
 
     drop_stored_vectors(root.path(), "model").await?;
@@ -1077,8 +1059,7 @@ async fn a_store_refusal_carries_the_stores_own_violation() -> TestResult {
         .build();
     let index = opened(root.path(), narrow).await?;
     let fixture = two()?;
-    let error = index
-        .build(fixture.units(), &fixture.described(), REVISION)
+    let error = whole_pass(&index, fixture.units(), &fixture.described(), REVISION)
         .await
         .expect_err("two units pass the one-unit bound");
     assert_eq!(error.fault().violation(), SearchViolation::StoreFailed);
@@ -1106,8 +1087,7 @@ async fn a_store_bound_keeps_its_registry_identity_and_its_limit_evidence() -> T
         .build();
     let index = opened(root.path(), narrow).await?;
     let fixture = two()?;
-    let error = index
-        .build(fixture.units(), &fixture.described(), REVISION)
+    let error = whole_pass(&index, fixture.units(), &fixture.described(), REVISION)
         .await
         .expect_err("two units pass the one-unit bound");
 

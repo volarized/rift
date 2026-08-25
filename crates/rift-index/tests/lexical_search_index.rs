@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 
 use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_index::{
-    LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalSearchIndex, LexicalUnit,
-    LexicalUnitKind,
+    LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalSearchIndex,
+    LexicalUnit, LexicalUnitKind,
 };
 use tempfile::TempDir;
 use toasty::Db;
+use toasty::stmt::Type;
 use toasty_driver_sqlite::Sqlite;
 
 /// Builds one text-file unit; its identity is its own path, per convention.
@@ -648,6 +649,229 @@ async fn test_lexical_search_index_replace_all_against_readonly_directory_surfac
     assert!(
         std::error::Error::source(&error).is_some(),
         "storage_error must preserve the underlying toasty/SQLite cause"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let index =
+        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    let units = [
+        symbol_unit(
+            "rift://symbol/rust/kept.rs/keptalpha",
+            "kept.rs",
+            "keptalpha",
+            "pub fn keptalpha() {}",
+        ),
+        symbol_unit(
+            "rift://symbol/rust/moved.rs/firstbeta",
+            "moved.rs",
+            "firstbeta",
+            "pub fn firstbeta() {}",
+        ),
+    ];
+    let units: Result<Vec<_>, _> = units.into_iter().collect();
+    let units = units?;
+    index.replace_all(&units, "revision-one").await?;
+
+    let replacement = symbol_unit(
+        "rift://symbol/rust/moved.rs/secondgamma",
+        "moved.rs",
+        "secondgamma",
+        "pub fn secondgamma() {}",
+    )?;
+    let change = LexicalChange::new(vec![ProjectPath::new("moved.rs")?], vec![replacement]);
+    index.apply(&change, "revision-two").await?;
+
+    assert_eq!(
+        index.tree_revision().await?,
+        Some("revision-two".to_owned())
+    );
+    assert_eq!(index.search("secondgamma", 8).await?.len(), 1);
+    assert!(index.search("firstbeta", 8).await?.is_empty());
+    assert_eq!(index.search("keptalpha", 8).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let index =
+        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    // A chunked text file files every chunk under its own path, so one delete by path has
+    // to reach all of them.
+    let first = LexicalUnit::new(
+        "docs/guide.md#0",
+        ProjectPath::new("docs/guide.md")?,
+        LexicalUnitKind::TextFile,
+        None,
+        "chapter alphaone",
+    )?;
+    let second = LexicalUnit::new(
+        "docs/guide.md#1",
+        ProjectPath::new("docs/guide.md")?,
+        LexicalUnitKind::TextFile,
+        None,
+        "chapter betatwo",
+    )?;
+    index.replace_all(&[first, second], "revision-one").await?;
+    assert_eq!(index.search("chapter", 8).await?.len(), 2);
+
+    let change = LexicalChange::new(vec![ProjectPath::new("docs/guide.md")?], Vec::new());
+    index.apply(&change, "revision-two").await?;
+    assert!(index.search("chapter", 8).await?.is_empty());
+    assert_eq!(
+        index.tree_revision().await?,
+        Some("revision-two".to_owned())
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let limits = LexicalIndexLimits::new(2, 65_536, 32, 64, 4, 1_000);
+    let index = LexicalSearchIndex::open(&database_path(&directory), limits).await?;
+    index
+        .replace_all(
+            &[
+                text_unit("docs/a.md", "alphaone")?,
+                text_unit("docs/b.md", "betatwo")?,
+            ],
+            "revision-one",
+        )
+        .await?;
+
+    // Nothing is dropped, so the two stored units plus one insert cross the bound the
+    // stored set is measured against, not the batch.
+    let change = LexicalChange::new(Vec::new(), vec![text_unit("docs/c.md", "gammathree")?]);
+    let error = index
+        .apply(&change, "revision-two")
+        .await
+        .expect_err("a resulting set past units_max must refuse");
+    assert_eq!(error.fault().violation(), LexicalIndexViolation::UnitLimit);
+    assert_eq!(
+        index.tree_revision().await?,
+        Some("revision-one".to_owned()),
+        "a refused apply leaves the previous stamp intact"
+    );
+    assert_eq!(index.search("alphaone", 8).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_apply_refuses_two_units_sharing_one_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let index =
+        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    index
+        .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-one")
+        .await?;
+
+    let change = LexicalChange::new(
+        Vec::new(),
+        vec![
+            text_unit("docs/b.md", "betatwo")?,
+            text_unit("docs/b.md", "betatwo")?,
+        ],
+    );
+    let error = index
+        .apply(&change, "revision-two")
+        .await
+        .expect_err("two units sharing one identity must refuse");
+    assert_eq!(
+        error.fault().violation(),
+        LexicalIndexViolation::DuplicateIdentity
+    );
+    assert_eq!(
+        index.tree_revision().await?,
+        Some("revision-one".to_owned()),
+        "the refusal lands before any transaction opens"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    index
+        .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-one")
+        .await?;
+    let change = LexicalChange::new(
+        vec![ProjectPath::new("docs/a.md")?],
+        vec![text_unit("docs/a.md", "betatwo")?],
+    );
+    index.apply(&change, "revision-two").await?;
+    drop(index);
+
+    let reopened = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    assert_eq!(
+        reopened.tree_revision().await?,
+        Some("revision-two".to_owned())
+    );
+    assert_eq!(reopened.search("betatwo", 8).await?.len(), 1);
+    assert!(reopened.search("alphaone", 8).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_deletes_one_path_through_its_own_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    drop(index);
+
+    // `apply` deletes by path on every incremental publication, so the planner
+    // has to reach those rows through `lexical_units_path` rather than scanning
+    // every unit the workspace indexed.
+    let probe_database = open_concurrent_probe(&path).await?;
+    let mut probe_connection = probe_database.connection().await?;
+    let rows = toasty::sql::query("EXPLAIN QUERY PLAN DELETE FROM lexical_units WHERE path = ?1")
+        .bind("src/lib.rs".to_owned())
+        .column_types([Type::I64, Type::I64, Type::I64, Type::String])
+        .exec(&mut probe_connection)
+        .await?;
+    let plan = format!("{rows:?}");
+    assert!(
+        plan.contains("lexical_units_path"),
+        "a per-path delete must use the path index: plan={plan}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_unit_set()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let index =
+        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    index.replace_all(&[], "revision-one").await?;
+
+    // Two rebuilds captured from one publication both name the file as added, and the
+    // second commits after the first has written it. A change replaces the paths it names,
+    // so the second commit is the first one repeated rather than a second insert of one
+    // identity.
+    let change = LexicalChange::new(
+        vec![ProjectPath::new("docs/added.md")?],
+        vec![text_unit("docs/added.md", "alphaone content")?],
+    );
+    index.apply(&change, "revision-two").await?;
+    index.apply(&change, "revision-two").await?;
+
+    assert_eq!(
+        index.search("alphaone", 8).await?.len(),
+        1,
+        "the repeated commit leaves one unit, not two rows under one identity"
     );
     Ok(())
 }

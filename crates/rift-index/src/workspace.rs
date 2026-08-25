@@ -801,6 +801,30 @@ impl WorkspaceIndex {
         units
     }
 
+    /// Derives lexical units for the named paths alone, in the same shapes
+    /// [`Self::lexical_units`] derives for the whole index.
+    ///
+    /// A path this index no longer holds contributes nothing, which is what a removed file
+    /// owes: its stored units are deleted by path rather than replaced.
+    #[must_use]
+    pub fn lexical_units_for<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a ProjectPath>,
+    ) -> Vec<LexicalUnit> {
+        let mut units = Vec::new();
+        for path in paths {
+            if let Some(file) = self.files.get(path) {
+                for symbol in file.syntax().symbols() {
+                    units.push(symbol_lexical_unit(file, symbol));
+                }
+            }
+            if let Some(file) = self.text_files.get(path) {
+                push_text_lexical_units(&mut units, file, self.text_chunk_bytes_max());
+            }
+        }
+        units
+    }
+
     /// Returns each text file split into more than one lexical chunk, paired with its chunk
     /// count, so a caller can report the split instead of the index silently absorbing it.
     #[must_use]
