@@ -96,10 +96,15 @@ lock. Each request clones the published value under a read lock and retains that
 its result, so reads never combine state from two index revisions.
 
 Watcher events and Rift-applied changes advance one workspace change counter and enter the same
-serialized rebuild lane. Before each current-tree read, the server reconciles watcher state
-against an exact fingerprint of the included workspace files, then waits until the published
-index counter matches it; when the index still lags, the result carries a `stale_index` entry
-in `warnings` with the two tree revision digests.
+serialized rebuild lane. Each observation carries the paths it saw, and the rebuild reads only
+those files, sharing every other file with the previous index; an observation that names no
+trustworthy path set - a watch failure, a written `rift.toml` or `.gitignore`, a directory
+appearing or disappearing - reads the whole workspace instead.
+
+Before each current-tree read, the server captures an exact digest of every included workspace
+file, then waits until the published index counter matches its observation. That capture already
+read the tree, so a read that finds the index behind names the files that moved rather than
+asking for a whole rebuild.
 
 ## Rift FS
 
@@ -132,8 +137,14 @@ rows, not trees. Access goes through [Toasty](https://github.com/tokio-rs/toasty
 full-text surface is raw SQL, because Toasty 0.10 has no typed virtual-table or `MATCH` API,
 and the raw boundary stays confined to the FTS table and its rows.
 
-Publication replaces the whole unit set and restamps the revision, so the store is never a
-partial mix of two trees.
+One transaction writes the units and the stamp together, so the store is never a partial mix of
+two trees. A rebuild that read the whole workspace replaces the whole unit set; a rebuild that
+named the files it read deletes those paths' rows and inserts their new ones, which costs one
+delete and one insert batch per changed path instead of a rewrite of every row.
+
+The transaction commits before the rebuilt index becomes current, and one owner runs every write
+to the database, so a commit waits for at most one vector batch rather than meeting a busy
+database. A commit that refuses publishes nothing and leaves the previous rows and stamp intact.
 
 The lexical index's tables:
 
