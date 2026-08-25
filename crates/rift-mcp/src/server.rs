@@ -7,21 +7,25 @@ use std::time::Duration;
 use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::{
-    LexicalIndexLimits, LexicalMatch, LexicalSearchIndex, WorkspaceFingerprint,
-    WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    LexicalIndexLimits, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, MoveFileParams,
     PatchParams, RenameSymbolParams, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
-    CommandHook, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX,
-    SERVER_NUM_WORKERS_MAX, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+    CommandHook, Duration as WireDuration, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
+    SEARCH_POOL_SLOTS_MAX, SERVER_NUM_WORKERS_MAX, SearchConfiguration,
+    SemanticSearchConfiguration, SemanticSource, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
 use rift_protocol::read::{
-    DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, SearchParams,
-    SearchResult,
+    DiagnosticCode, Digest, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult,
+    ReadWarning, SearchParams, SearchResult,
+};
+use rift_search::{
+    AcquisitionLimits, ModelSource, RankedUnit, SearchError, SearchIndex, SearchIndexLimits,
+    SemanticReadiness,
 };
 use rift_server::{
     ChangeService, EnginePool, HookStatus, MoveResolution, ReadError, ReadFault, ReadService,
@@ -31,21 +35,54 @@ use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
 use crate::validation::{
     ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, INDEX_FRESHNESS_TIMEOUT, IndexState,
     IndexSupervisor, IndexSupervisorContext, IndexValidation, PublishedWorkspace, RebuildOutcome,
-    configuration_fingerprint, initial_workspace, populate_lexical, publish_rebuild,
+    SearchPass, configuration_fingerprint, initial_workspace, populate_search, publish_rebuild,
     run_index_supervisor, workspace_watcher,
 };
 
-/// Overfetches lexical matches beyond the caller's requested `limit` before the identifier
-/// and lexical hit lists merge: the merge can collapse a lexical hit into an
-/// identifier-matched one it duplicates, so asking for exactly `limit` lexical matches would
-/// under-fill the final page whenever duplicates exist.
-const LEXICAL_OVERFETCH_FACTOR: u32 = 4;
+/// Overfetches ranked units beyond the caller's requested `limit` before the identifier and
+/// ranked hit lists merge: the merge can collapse a ranked hit into an identifier-matched
+/// one it duplicates, so asking for exactly `limit` ranked units would under-fill the final
+/// page whenever duplicates exist.
+const SEARCH_OVERFETCH_FACTOR: u32 = 4;
+
+/// Semantic candidates one file may contribute to a fused ranking.
+///
+/// Provisional: the `[search.semantic] per_file_max` key replaces it once that key lands,
+/// and [`search_index_limits`] is the one place that reads it, so the swap is one line
+/// there and nowhere else. Three lets a module that genuinely answers the query place its
+/// overloads without one file's declarations filling the whole candidate list on their own.
+const SEMANTIC_PER_FILE_MAX: u64 = 3;
+
+/// Files a workspace holds before [`PREPARATION_SPAN_LARGE`] applies.
+const PREPARATION_FILES_LARGE: u64 = 10_000;
+/// Files a workspace holds before [`PREPARATION_SPAN_MEDIUM`] applies.
+const PREPARATION_FILES_MEDIUM: u64 = 5_000;
+/// Files a workspace holds before [`PREPARATION_SPAN_SMALL`] applies.
+const PREPARATION_FILES_SMALL: u64 = 1_000;
+
+/// Preparing a workspace past [`PREPARATION_FILES_LARGE`]: a couple of minutes.
+const PREPARATION_SPAN_LARGE: WireDuration = WireDuration::from_millis(120_000);
+/// Preparing a workspace past [`PREPARATION_FILES_MEDIUM`]: around a minute.
+const PREPARATION_SPAN_MEDIUM: WireDuration = WireDuration::from_millis(60_000);
+/// Preparing a workspace past [`PREPARATION_FILES_SMALL`]: several seconds.
+const PREPARATION_SPAN_SMALL: WireDuration = WireDuration::from_millis(10_000);
+/// Preparing a workspace no larger than [`PREPARATION_FILES_SMALL`]: a few seconds.
+const PREPARATION_SPAN_MINIMAL: WireDuration = WireDuration::from_millis(3_000);
+
+/// Wait before a model file's second download attempt. No `[search.semantic]` key sets it;
+/// each further attempt doubles the wait up to [`MODEL_RETRY_DELAY_LIMIT`].
+const MODEL_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Wait no model-download retry grows past. No `[search.semantic]` key sets it: the
+/// download's own `download_timeout` is the budget an operator tunes.
+const MODEL_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(30);
 
 /// Bounded Tokio acceptance for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
@@ -268,56 +305,383 @@ fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
     )
 }
 
-/// Opens the workspace's lexical search database at `.rift/db`, creating `.rift` first.
+/// Where one `[search.semantic]` table's weights come from, and what fetching them may
+/// spend.
+#[derive(Clone, Debug)]
+struct ModelAcquisition {
+    source: ModelSource,
+    limits: AcquisitionLimits,
+}
+
+/// The acquisition one `[search.semantic]` table describes, or nothing when the tier is off
+/// or its `model` value is one [`ModelSource`] refuses.
+///
+/// Acceptance bounds `model` by byte length and by the form its declared source sets;
+/// `ModelSource` enforces the narrower rule. A value that passes the first and fails the
+/// second is a warning and a disabled semantic tier, never a startup failure: the workspace
+/// still has a full-text tier.
+fn model_acquisition(
+    semantic: &SemanticSearchConfiguration,
+    root: &Path,
+) -> Option<ModelAcquisition> {
+    if semantic.disabled {
+        return None;
+    }
+    let source = match semantic_model_source(semantic, root) {
+        Ok(source) => source,
+        Err(error) => {
+            let model = semantic.model.as_str();
+            tracing::warn!(
+                component = "search",
+                operation = "search.prepare",
+                model,
+                error = %error,
+                "the semantic model could not be read; the workspace serves the full-text \
+                 tier alone"
+            );
+            return None;
+        }
+    };
+    Some(ModelAcquisition {
+        source,
+        limits: acquisition_limits(semantic),
+    })
+}
+
+/// The model one `[search.semantic]` table names, read as its `source` key declares: a hub
+/// repository, or a directory resolved against the workspace root.
+///
+/// # Errors
+///
+/// Returns `model_source_invalid` naming the value and the form that was expected.
+fn semantic_model_source(
+    semantic: &SemanticSearchConfiguration,
+    root: &Path,
+) -> Result<ModelSource, SearchError> {
+    match semantic.source {
+        SemanticSource::Hf => ModelSource::repository(&semantic.model),
+        SemanticSource::Directory => ModelSource::directory(&semantic.model, root),
+    }
+}
+
+/// What one model acquisition may spend, from the `[search.semantic]` table.
+///
+/// Acceptance bounds `download_attempts` to 1 through 10, so the clamp only guards the
+/// narrowing conversion. The retry delay and its ceiling are this release's fixed values.
+fn acquisition_limits(semantic: &SemanticSearchConfiguration) -> AcquisitionLimits {
+    let attempts = u32::try_from(semantic.download_attempts)
+        .unwrap_or(1)
+        .max(1);
+    AcquisitionLimits::new(
+        Duration::from_millis(semantic.download_timeout.milliseconds()),
+        attempts,
+        MODEL_RETRY_DELAY,
+        MODEL_RETRY_DELAY_LIMIT,
+    )
+}
+
+/// Sizes one search index from an accepted `[search]` table and the acquisition its
+/// `[search.semantic]` half resolved to.
+///
+/// `acquisition` is absent when the semantic tier is off or its `model` value could not be
+/// read; either way the tier is disabled here, so the index reports `Disabled` rather than
+/// a preparation that never runs.
+fn search_index_limits(
+    search: &SearchConfiguration,
+    acquisition: Option<&ModelAcquisition>,
+) -> SearchIndexLimits {
+    let builder = SearchIndexLimits::builder(lexical_index_limits(search))
+        .weights(search.lexical.weight, search.semantic.weight)
+        .fusion_k(search.fusion_k)
+        .candidates(search.semantic.candidates)
+        .max_vectors(search.semantic.max_vectors)
+        .batch_declarations(search.semantic.batch_declarations)
+        .max_tokens(search.semantic.max_tokens)
+        .per_file_max(SEMANTIC_PER_FILE_MAX);
+    if acquisition.is_some() {
+        builder.build()
+    } else {
+        builder.disable_semantic().build()
+    }
+}
+
+/// Opens the workspace's search database at `.rift/db`, creating `.rift` first.
 ///
 /// The database is a derived index, rebuildable from the workspace tree at any time: an
 /// open failure deletes the file and retries exactly once before this run gives up on the
-/// lexical tier, rather than refusing to start the server over a file Rift itself can
+/// search tier, rather than refusing to start the server over a file Rift itself can
 /// always regenerate. The server serves identifier search alone when both attempts fail.
-async fn open_lexical_index(
-    root: &Path,
-    limits: LexicalIndexLimits,
-) -> Option<Arc<LexicalSearchIndex>> {
+async fn open_search_index(root: &Path, limits: SearchIndexLimits) -> Option<Arc<SearchIndex>> {
     let state_directory = root.join(RIFT_STATE_DIRECTORY);
     if let Err(error) = tokio::fs::create_dir_all(&state_directory).await {
         tracing::warn!(
             component = "search",
-            operation = "lexical.open",
+            operation = "search.open",
             path = %state_directory.display(),
             error = %error,
             "could not create the workspace state directory; the server starts without the \
-             lexical search tier"
+             search index"
         );
         return None;
     }
     let database_path = state_directory.join(WORKSPACE_DATABASE_FILE_NAME);
-    match LexicalSearchIndex::open(&database_path, limits).await {
+    match SearchIndex::open(&database_path, limits).await {
         Ok(index) => return Some(Arc::new(index)),
         Err(error) => {
             tracing::warn!(
                 component = "search",
-                operation = "lexical.open",
+                operation = "search.open",
                 path = %database_path.display(),
                 error = %error,
-                "lexical search database failed to open; deleting and recreating it once"
+                "search database failed to open; deleting and recreating it once"
             );
         }
     }
     let _ = tokio::fs::remove_file(&database_path).await;
-    match LexicalSearchIndex::open(&database_path, limits).await {
+    match SearchIndex::open(&database_path, limits).await {
         Ok(index) => Some(Arc::new(index)),
         Err(error) => {
             tracing::warn!(
                 component = "search",
-                operation = "lexical.open",
+                operation = "search.open",
                 path = %database_path.display(),
                 error = %error,
-                "lexical search database failed to open after recreation; the server starts \
-                 without the lexical search tier"
+                "search database failed to open after recreation; the server starts without \
+                 the search index"
             );
             None
         }
     }
+}
+
+/// Loads the semantic model behind the answers, so startup waits on nothing.
+///
+/// A search arriving while this runs is answered by the full-text tier alone and carries the
+/// preparation warning. A loaded model then embeds the published set through
+/// [`embed_prepared`], because the startup pass ran before any model was held.
+///
+/// The task ends when the server does. It races the same cancellation token the index
+/// supervisor runs under, which the last server clone's drop guard cancels.
+fn spawn_semantic_preparation(
+    index: Arc<SearchIndex>,
+    acquisition: ModelAcquisition,
+    published: Arc<RwLock<IndexState>>,
+    cancellation: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let prepared = tokio::select! {
+            () = cancellation.cancelled() => return,
+            prepared = index.prepare(&acquisition.source, acquisition.limits) => prepared,
+        };
+        match prepared {
+            Ok(()) => embed_prepared(&index, &published, &cancellation).await,
+            Err(error) => tracing::warn!(
+                component = "search",
+                operation = "search.prepare",
+                error = %error,
+                "the semantic tier could not be prepared; the workspace serves the full-text \
+                 tier alone for the life of this server"
+            ),
+        }
+    });
+}
+
+/// Embeds the published set once the model is loaded.
+///
+/// The startup pass already replaced the unit set with no model held, so this is the pass
+/// that gives the workspace its vectors. Without it nothing would embed until the next
+/// filesystem event, and a workspace nobody writes to would never rank semantically.
+async fn embed_prepared(
+    index: &SearchIndex,
+    published: &RwLock<IndexState>,
+    cancellation: &CancellationToken,
+) {
+    tracing::info!(
+        component = "search",
+        operation = "search.prepare",
+        "the semantic tier is prepared"
+    );
+    let (current, _) = published.read().await.snapshot();
+    tokio::select! {
+        () = cancellation.cancelled() => {}
+        () = populate_search(index, &current, SearchPass::Refresh) => {}
+    }
+}
+
+/// The ranking one search request merges, and what the search index's own state adds to
+/// that answer's warnings.
+///
+/// One answer may carry two `stale_index` warnings with different digest pairs: the read
+/// index raises one for its own lag, and [`SearchRanking::lagging`] raises one for the
+/// search store's. Both are correct - they are two stores over one tree - and each
+/// `detail` names the store it came from.
+#[derive(Debug, Default)]
+struct SearchRanking {
+    units: Vec<RankedUnit>,
+    warnings: Vec<ReadWarning>,
+}
+
+impl SearchRanking {
+    /// No ranking at all: the tier will not answer until an operator acts.
+    fn unavailable(detail: &str) -> Self {
+        Self {
+            units: Vec::new(),
+            warnings: vec![ReadWarning::LexicalRankingUnavailable {
+                detail: detail.to_owned(),
+            }],
+        }
+    }
+
+    /// No ranking this time: the store holds `stamped` and is repopulating for `captured`.
+    ///
+    /// This is a lag, not an absent tier, so it warns `stale_index` with the two revisions
+    /// that disagree. The repopulation is already under way and no operator action is
+    /// wanted, which is exactly what `lexical_ranking_unavailable` must never be spent on.
+    fn lagging(stamped: String, captured: &str) -> Self {
+        let detail = format!(
+            "the full-text tier is stamped with tree revision {stamped} while this answer \
+             was computed from tree revision {captured}, so the answer was ranked by \
+             identifier matching alone; resend the request once the tier has repopulated"
+        );
+        Self {
+            units: Vec::new(),
+            warnings: vec![ReadWarning::StaleIndex {
+                index_tree_revision: Digest(stamped),
+                captured_tree_revision: Digest(captured.to_owned()),
+                detail,
+            }],
+        }
+    }
+}
+
+/// What the search store's own stamp says about the tree one answer was computed from.
+#[derive(Debug, Eq, PartialEq)]
+enum StoreRevision {
+    /// The store holds the tree this answer was computed from.
+    Current,
+    /// The store holds another tree, and a repopulation for this one is under way.
+    Lagging(String),
+    /// The store carries no stamp at all, or could not be read.
+    Absent,
+}
+
+/// Places the search store's stamp against the tree revision `published` answers under.
+///
+/// A store carrying no stamp has never held a tree: its startup population did not land.
+/// That is an absent tier rather than a lagging one, so it reports as `Absent` and the
+/// repopulation window - which always carries the previous stamp - is the only case that
+/// reports `Lagging`. A store that cannot be read joins `Absent` so the request degrades
+/// instead of failing.
+async fn store_revision(index: &SearchIndex, published: &PublishedWorkspace) -> StoreRevision {
+    match index.tree_revision().await {
+        Ok(Some(stamped)) if stamped == published.reads.tree_revision() => StoreRevision::Current,
+        Ok(Some(stamped)) => StoreRevision::Lagging(stamped),
+        Ok(None) | Err(_) => StoreRevision::Absent,
+    }
+}
+
+/// The warnings one search index's readiness adds to an answer, for a workspace of `files`
+/// files.
+///
+/// `Ready` and `Disabled` add none: the first ranks with both tiers, and the second is the
+/// workspace's own decision, which a caller does not need told on every answer.
+fn readiness_warnings(readiness: SemanticReadiness, files: u64) -> Vec<ReadWarning> {
+    match readiness {
+        SemanticReadiness::Disabled | SemanticReadiness::Ready => Vec::new(),
+        SemanticReadiness::Preparing { prepared, total } => {
+            vec![semantic_preparing(files, prepared, total)]
+        }
+        SemanticReadiness::Unavailable => vec![ReadWarning::SemanticRankingUnavailable {
+            detail: "the semantic ranking's model could not be loaded, so the answer was \
+                     ranked lexically alone; correct `[search.semantic]` and start the \
+                     server again"
+                .to_owned(),
+        }],
+    }
+}
+
+/// The preparation warning, with the wait scaled by what is still missing.
+fn semantic_preparing(files: u64, prepared: u64, total: u64) -> ReadWarning {
+    ReadWarning::SemanticIndexPreparing {
+        prepared,
+        total,
+        ready_in: ready_in(files, prepared, total),
+        detail: format!(
+            "{prepared} of {total} declarations carry a vector, so the answer was ranked \
+             lexically alone; resend the request once the semantic tier has caught up"
+        ),
+    }
+}
+
+/// How long preparing a whole workspace of `files` files takes, as a declared step rule
+/// rather than a measurement: past [`PREPARATION_FILES_LARGE`] a couple of minutes, past
+/// [`PREPARATION_FILES_MEDIUM`] around a minute, past [`PREPARATION_FILES_SMALL`] several
+/// seconds, and anything smaller a few seconds.
+///
+/// Nothing times a real pass. The rule states the order of magnitude a reader can plan
+/// around, and it is not timing data.
+const fn preparation_span(files: u64) -> WireDuration {
+    if files > PREPARATION_FILES_LARGE {
+        PREPARATION_SPAN_LARGE
+    } else if files > PREPARATION_FILES_MEDIUM {
+        PREPARATION_SPAN_MEDIUM
+    } else if files > PREPARATION_FILES_SMALL {
+        PREPARATION_SPAN_SMALL
+    } else {
+        PREPARATION_SPAN_MINIMAL
+    }
+}
+
+/// The wait before the semantic ranking joins an answer: the whole workspace's declared
+/// span, scaled by the declarations still to embed over the declarations the set holds, so
+/// the value shrinks as the pass runs.
+///
+/// A `total` of zero is not a preparing tier, but the arithmetic does not lean on that: the
+/// division is checked and the whole span answers instead. The product runs in `u128`, where
+/// two `u64` factors cannot overflow, and the quotient is at most the span itself, so the
+/// conversion back is only fallible on paper.
+///
+/// The result is an estimate a caller reports. Nothing may be scheduled against it.
+fn ready_in(files: u64, prepared: u64, total: u64) -> WireDuration {
+    let whole = preparation_span(files);
+    let remaining = total.saturating_sub(prepared);
+    let scaled = u128::from(whole.milliseconds())
+        .saturating_mul(u128::from(remaining))
+        .checked_div(u128::from(total));
+    match scaled.and_then(|milliseconds| u64::try_from(milliseconds).ok()) {
+        Some(milliseconds) => WireDuration::from_millis(milliseconds),
+        None => whole,
+    }
+}
+
+/// The `[search.semantic]` table every unit-test fixture in this crate declares.
+///
+/// Rift ships the semantic tier on, so a fixture carrying no `rift.toml` would acquire the
+/// default model from the hub. A hermetic suite must not write into the developer's own
+/// Hugging Face cache, and on a runner with no network a default-on tier would spend its
+/// whole retry budget inside a detached task nobody waits on. The integration suites
+/// declare the same table from `tests/hermetic_search.rs`: a unit test and an integration
+/// test are two crates, and one value shared between them would have to leave the
+/// library's public surface.
+///
+/// Three fixtures do not use it. Two drive `[search.semantic]` themselves and neither
+/// reaches a network. The third serves a `rift.toml` acceptance refuses, where
+/// [`RiftMcp::build`]'s own gate is what holds the acquisition back.
+#[cfg(test)]
+pub(crate) const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
+
+/// Writes `root`'s `rift.toml`: the disabling table, then `configuration`.
+///
+/// A table header ends where the next one begins, so a fixture's own table follows
+/// unchanged and still proves whatever it carries.
+///
+/// # Errors
+///
+/// Returns the write's own failure.
+#[cfg(test)]
+pub(crate) fn hermetic_workspace(root: &Path, configuration: &str) -> std::io::Result<()> {
+    let contents = format!("{SEMANTIC_DISABLED}{configuration}");
+    std::fs::write(root.join("rift.toml"), contents)
 }
 
 /// Workspace MCP server: reads serve an immutable snapshot, changes
@@ -340,15 +704,16 @@ pub struct RiftMcp {
     changes: Arc<ChangeService>,
     change_lane: Arc<ChangeLane>,
     blocking: BlockingExecutor,
-    /// The lexical search database, absent when it could not be opened at
-    /// startup; `search` then serves identifier matching alone.
-    lexical: Option<Arc<LexicalSearchIndex>>,
+    /// The workspace's search index, absent when it could not be opened at
+    /// startup; `search` then serves identifier matching alone and says so in
+    /// every answer's warnings.
+    search_index: Option<Arc<SearchIndex>>,
     engines: Arc<EngineHold>,
     tool_router: ToolRouter<Self>,
 }
 
 /// One already-serialized change's outcome, threaded out of the blocking executor so the
-/// async `change` method can await lexical population against exactly the workspace this
+/// async `change` method can await search population against exactly the workspace this
 /// change published, without a second, possibly-superseded read of shared state.
 struct SerializedChange {
     result: Result<Json<ChangeResult>, ErrorData>,
@@ -405,14 +770,25 @@ impl RiftMcp {
             ))
             .await?;
         let published = initial_workspace(&root, limits, &validation, &blocking).await?;
-        // The lexical database lives under the workspace's own `.rift` directory, so it
+        // The search database lives under the workspace's own `.rift` directory, so it
         // opens only once the workspace root itself is proven real by a successful initial
         // scan - never before, or a missing root would be silently fabricated by creating
         // `.rift` under it.
-        let lexical_limits = lexical_index_limits(&startup_configuration.search_configuration());
-        let lexical = open_lexical_index(&root, lexical_limits).await;
-        if let Some(lexical) = lexical.as_ref() {
-            populate_lexical(lexical, &published).await;
+        let search_configuration = startup_configuration.search_configuration();
+        // While `rift.toml` is invalid every request is refused until it is fixed, and the
+        // table naming the model is the very part that could not be read. Acquiring the
+        // shipped default would spend a download on a server that answers nothing, so the
+        // tier waits for a workspace whose configuration was accepted.
+        let acquisition = startup_configuration
+            .is_accepted()
+            .then(|| model_acquisition(&search_configuration.semantic, &root))
+            .flatten();
+        let search_limits = search_index_limits(&search_configuration, acquisition.as_ref());
+        let search_index = open_search_index(&root, search_limits).await;
+        if let Some(index) = search_index.as_ref() {
+            // The first pass of a run establishes the vector set: a store found on disk was
+            // written by an earlier process, possibly under another model.
+            populate_search(index, &published, SearchPass::Build).await;
         }
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
@@ -429,12 +805,20 @@ impl RiftMcp {
                 change_lane: Arc::clone(&change_lane),
                 validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
-                lexical: lexical.clone(),
+                search_index: search_index.clone(),
             },
         ));
         let mut task = validation.task.lock().await;
         *task = Some(supervisor_task);
         drop(task);
+        if let (Some(index), Some(acquisition)) = (search_index.as_ref(), acquisition) {
+            spawn_semantic_preparation(
+                Arc::clone(index),
+                acquisition,
+                Arc::clone(&published),
+                validation.cancellation.clone(),
+            );
+        }
         let supervisor_cancellation = Arc::new(validation.cancellation.clone().drop_guard());
         let engines = Arc::new(EngineHold::new(
             root.clone(),
@@ -449,7 +833,7 @@ impl RiftMcp {
             changes: Arc::new(ChangeService::new(&root)),
             change_lane,
             blocking,
-            lexical,
+            search_index,
             engines,
             tool_router: Self::tool_router(),
         })
@@ -516,9 +900,9 @@ impl RiftMcp {
     /// when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
-    /// threaded through both the lexical tier's revision check and the executed
+    /// threaded through both the search index's revision check and the executed
     /// `ReadService::search` call: a concurrent rebuild between two separate resolutions
-    /// could otherwise validate lexical matches against one snapshot and merge them into
+    /// could otherwise validate ranked units against one snapshot and merge them into
     /// results computed from another.
     #[tool]
     async fn search(
@@ -527,59 +911,82 @@ impl RiftMcp {
     ) -> Result<Json<SearchResult>, ErrorData> {
         let Some(rev) = params.rev.clone() else {
             let published = self.published_workspace(wire::ErrorPhase::Read).await?;
-            let lexical_matches = self.lexical_search_matches(&params, &published).await?;
-            return self
-                .current_tree_read(&published, move |reads| {
-                    reads.search(&params, &lexical_matches)
-                })
-                .await;
+            let SearchRanking { units, warnings } = self.ranking(&params, &published).await?;
+            let mut answer = self
+                .current_tree_read(&published, move |reads| reads.search(&params, &units))
+                .await?;
+            answer.0.warnings.extend(warnings);
+            return Ok(answer);
         };
-        // The lexical tier only ever holds the current tree, so a revision-addressed
+        // The search index only ever holds the current tree, so a revision-addressed
         // search never consults it.
         self.read_at(Some(rev), move |reads| reads.search(&params, &[]))
             .await
     }
 
-    /// Runs the lexical search-index tier for one search request against `published` -
-    /// the exact snapshot the caller also runs `ReadService::search` against, never a
-    /// separately resolved one - when the tier is available and its stamped tree revision
-    /// still matches `published`'s. A revision mismatch or an absent handle answers with no
-    /// lexical matches, so identifier search proceeds alone rather than serving a possibly
-    /// stale tier. A query-term limit the adapter refuses surfaces as this request's own
-    /// `limit_exceeded` error, never a silent degrade.
-    async fn lexical_search_matches(
+    /// Runs the search index for one request against `published` - the exact snapshot the
+    /// caller also runs `ReadService::search` against, never a separately resolved one -
+    /// when the index is available and its stamped tree revision still matches
+    /// `published`'s. Either way identifier search proceeds alone rather than serving a
+    /// possibly stale index, and the answer says which of the two it met: a store still
+    /// repopulating warns `stale_index` with the two revisions that disagree, and a store
+    /// that will not answer without operator action warns `lexical_ranking_unavailable`.
+    /// A query-term limit the index refuses surfaces as this request's own `limit_exceeded`
+    /// error, never a silent degrade.
+    async fn ranking(
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
-    ) -> Result<Vec<LexicalMatch>, ErrorData> {
-        let Some(lexical) = self.lexical.as_ref() else {
-            return Ok(Vec::new());
+    ) -> Result<SearchRanking, ErrorData> {
+        let Some(index) = self.search_index.as_ref() else {
+            return Ok(SearchRanking::unavailable(
+                "the workspace search database could not be opened, so the answer was ranked \
+                 by identifier matching alone; the server log names the open failure, and a \
+                 restart retries it",
+            ));
         };
+        // An absent or empty query is refused by `ReadService::search` itself; warning
+        // about a tier that was never consulted would only crowd that refusal.
         let Some(query) = params.query.as_deref().filter(|query| !query.is_empty()) else {
-            return Ok(Vec::new());
+            return Ok(SearchRanking::default());
         };
-        let Ok(current_revision) = lexical.tree_revision().await else {
-            return Ok(Vec::new());
-        };
-        if current_revision.as_deref() != Some(published.reads.tree_revision()) {
-            return Ok(Vec::new());
+        match store_revision(index, published).await {
+            StoreRevision::Current => {}
+            StoreRevision::Lagging(stamped) => {
+                let captured = published.reads.tree_revision();
+                return Ok(SearchRanking::lagging(stamped, captured));
+            }
+            StoreRevision::Absent => {
+                return Ok(SearchRanking::unavailable(
+                    "the workspace search database holds no indexed tree, or could not be \
+                     read, so the answer was ranked by identifier matching alone; the server \
+                     log names the failure, and a restart retries it",
+                ));
+            }
         }
-        // The enforced ceiling identifier search itself would refuse past (`results_max`),
-        // so the lexical tier never overfetches beyond what a merge could ever keep; this
-        // also keeps the later `u32` conversion within range without needing its
-        // saturating fallback in practice.
+        let units = index
+            .search(query, self.fetch_limit(params))
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        Ok(SearchRanking {
+            units,
+            warnings: readiness_warnings(index.readiness(), published.reads.file_count()),
+        })
+    }
+
+    /// How deep the search index is read for one request.
+    ///
+    /// The enforced ceiling identifier search itself would refuse past (`results_max`), so
+    /// the index never overfetches beyond what a merge could ever keep; this also keeps the
+    /// `u32` conversion within range without needing its saturating fallback in practice.
+    fn fetch_limit(&self, params: &SearchParams) -> u32 {
         let results_max = u64::try_from(self.limits.results_max()).unwrap_or(u64::MAX);
         let requested_limit = params
             .limit
             .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64)
             .min(results_max);
-        let fetch_limit =
-            u32::try_from(requested_limit.saturating_mul(u64::from(LEXICAL_OVERFETCH_FACTOR)))
-                .unwrap_or(u32::MAX);
-        lexical
-            .search(query, fetch_limit)
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+        u32::try_from(requested_limit.saturating_mul(u64::from(SEARCH_OVERFETCH_FACTOR)))
+            .unwrap_or(u32::MAX)
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
@@ -910,8 +1317,9 @@ impl RiftMcp {
             })
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        if let (Some(lexical), Some(next)) = (self.lexical.as_ref(), outcome.published.as_ref()) {
-            populate_lexical(lexical, next).await;
+        if let (Some(index), Some(next)) = (self.search_index.as_ref(), outcome.published.as_ref())
+        {
+            populate_search(index, next, SearchPass::Refresh).await;
         }
         let mut result = outcome.result?;
         if let Json(ChangeResult::Applied { summary }) = &mut result
@@ -1121,7 +1529,11 @@ mod tests {
 
     use rift_index::WorkspaceIndexLimits;
 
-    use rift_protocol::read::{GetSymbolResult, SearchParams, SearchResult};
+    use rift_protocol::configuration::{
+        Duration as WireDuration, SearchConfiguration, SemanticSearchConfiguration, SemanticSource,
+    };
+    use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
+    use rift_search::{ModelSource, SemanticReadiness};
     use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault};
 
     use rmcp::ServiceError;
@@ -1140,6 +1552,7 @@ mod tests {
     async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         Ok((directory, server))
     }
@@ -1215,8 +1628,8 @@ mod tests {
     async fn engine_pool_serves_the_published_engine_tables() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(
-            directory.path().join("rift.toml"),
+        super::hermetic_workspace(
+            directory.path(),
             "[engines.ty]\nprogram = \"uvx\"\nlanguages = [\"python\"]\n",
         )?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
@@ -1334,6 +1747,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("lib.rs");
         fs::write(&path, "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
         let tight =
             WorkspaceIndexLimits::new(4, 60, 60, 4, 100).map_err(|error| error.to_string())?;
         let server = RiftMcp::build(directory.path(), tight).await?;
@@ -1411,7 +1825,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let configured = "[server]\nnum_workers = 2\nworker_queue_timeout = \"1250ms\"\n";
-        fs::write(directory.path().join("rift.toml"), configured)?;
+        super::hermetic_workspace(directory.path(), configured)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert_eq!(server.blocking.queue_timeout_ms, 1_250);
         assert_eq!(server.blocking.operations.available_permits(), 2);
@@ -1921,6 +2335,7 @@ mod tests {
         fs::write(directory.path().join("lib.rs"), lib_rs)?;
         let guide_txt = "This document explains how to replace all safely.\n";
         fs::write(directory.path().join("guide.txt"), guide_txt)?;
+        super::hermetic_workspace(directory.path(), "")?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
@@ -1981,6 +2396,7 @@ mod tests {
         let state_directory = directory.path().join(".rift");
         fs::create_dir_all(&state_directory)?;
         fs::write(state_directory.join("db"), b"not a sqlite database")?;
+        super::hermetic_workspace(directory.path(), "")?;
 
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
             .await
@@ -2161,6 +2577,7 @@ mod tests {
     async fn applied_change_reports_failed_snapshot_rebuild_as_warning() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
         let server = RiftMcp::build(directory.path(), tight).await?;
@@ -2553,7 +2970,7 @@ pub fn beacon() -> u64 {
     }
 
     #[tokio::test]
-    async fn build_disables_lexical_tier_when_rift_state_path_is_a_file() -> TestResult {
+    async fn build_disables_search_index_when_rift_state_path_is_a_file() -> TestResult {
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_writer(std::io::sink)
@@ -2563,17 +2980,18 @@ pub fn beacon() -> u64 {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A regular file already occupies `.rift`, so `create_dir_all` cannot make the
         // state directory the lexical database needs.
+        super::hermetic_workspace(directory.path(), "")?;
         fs::write(directory.path().join(".rift"), b"not a directory")?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(
-            server.lexical.is_none(),
-            "a blocked state directory must degrade to no lexical tier, not fail startup"
+            server.search_index.is_none(),
+            "a blocked state directory must degrade to no search index, not fail startup"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn build_disables_lexical_tier_when_database_path_is_a_directory() -> TestResult {
+    async fn build_disables_search_index_when_database_path_is_a_directory() -> TestResult {
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_writer(std::io::sink)
@@ -2584,21 +3002,536 @@ pub fn beacon() -> u64 {
         // A directory at the database path fails the initial open; `remove_file` cannot
         // remove a directory, so the recreate-once retry also fails against it unchanged -
         // this is also the deterministic way to drive the recreate-once arm itself.
+        super::hermetic_workspace(directory.path(), "")?;
         fs::create_dir_all(directory.path().join(".rift/db"))?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(
-            server.lexical.is_none(),
+            server.search_index.is_none(),
             "a database path occupied by a directory must exhaust the recreate-once retry \
-             and still leave the server running without the lexical tier"
+             and still leave the server running without the search index"
         );
 
-        // With no lexical tier, identifier search still serves results rather than failing.
+        // With no search index, identifier search still serves results rather than failing.
         let result = run_search(&server, "beacon").await?;
         assert!(
             !result.results.is_empty(),
-            "identifier search must still serve results without the lexical tier"
+            "identifier search must still serve results without the search index"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::LexicalRankingUnavailable { .. })),
+            "an absent index must say so on the answer: {result:#?}"
         );
         Ok(())
+    }
+
+    fn shipped_search_configuration() -> SearchConfiguration {
+        SearchConfiguration::default()
+    }
+
+    #[test]
+    fn search_index_limits_carry_every_accepted_search_key() -> TestResult {
+        let search = shipped_search_configuration();
+        let root = std::path::Path::new("/workspace");
+        let acquisition = super::model_acquisition(&search.semantic, root)
+            .ok_or("the shipped table must resolve an acquisition")?;
+        let limits = super::search_index_limits(&search, Some(&acquisition));
+        assert!(!limits.is_semantic_disabled());
+        assert_eq!(limits.lexical(), super::lexical_index_limits(&search));
+        assert_eq!(limits.fusion_k(), search.fusion_k);
+        assert_eq!(limits.candidates(), search.semantic.candidates);
+        assert_eq!(limits.max_vectors(), search.semantic.max_vectors);
+        assert_eq!(
+            limits.batch_declarations(),
+            search.semantic.batch_declarations
+        );
+        assert_eq!(limits.max_tokens(), search.semantic.max_tokens);
+        assert_eq!(
+            limits.per_file_max(),
+            3,
+            "no key sets the per-file candidate bound yet"
+        );
+        assert!((limits.lexical_weight() - search.lexical.weight).abs() < f64::EPSILON);
+        assert!((limits.semantic_weight() - search.semantic.weight).abs() < f64::EPSILON);
+        assert_eq!(acquisition.limits.attempts(), 3);
+        assert_eq!(
+            acquisition.limits.timeout(),
+            Duration::from_millis(search.semantic.download_timeout.milliseconds())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_disabled_semantic_tier_resolves_no_acquisition_and_disables_the_index() {
+        let mut search = shipped_search_configuration();
+        search.semantic.disabled = true;
+        let root = std::path::Path::new("/workspace");
+        assert!(super::model_acquisition(&search.semantic, root).is_none());
+        let limits = super::search_index_limits(&search, None);
+        assert!(
+            limits.is_semantic_disabled(),
+            "an unresolved acquisition must disable the tier rather than leave it preparing"
+        );
+    }
+
+    #[test]
+    fn each_semantic_source_reads_its_own_model_form() -> TestResult {
+        let root = std::path::Path::new("/workspace");
+        let hub = SemanticSearchConfiguration {
+            model: "BAAI/bge-small-en-v1.5@dd0a482".to_owned(),
+            ..SemanticSearchConfiguration::default()
+        };
+        let acquired =
+            super::model_acquisition(&hub, root).ok_or("a hub repository must resolve")?;
+        assert_eq!(
+            acquired.source,
+            ModelSource::Repository {
+                repository: "BAAI/bge-small-en-v1.5".to_owned(),
+                revision: "dd0a482".to_owned(),
+            }
+        );
+        let held = SemanticSearchConfiguration {
+            source: SemanticSource::Directory,
+            model: "models/bge".to_owned(),
+            ..SemanticSearchConfiguration::default()
+        };
+        let acquired =
+            super::model_acquisition(&held, root).ok_or("a held directory must resolve")?;
+        assert_eq!(
+            acquired.source,
+            ModelSource::Directory(root.join("models/bge")),
+            "a directory model resolves against the workspace root"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_model_the_source_refuses_leaves_the_tier_off_and_full_text_serving() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // Acceptance's path rule allows an empty segment; `ModelSource` refuses one, so this
+        // value passes the first gate and fails the second.
+        let refused = SemanticSearchConfiguration {
+            source: SemanticSource::Directory,
+            model: "models//bge".to_owned(),
+            ..SemanticSearchConfiguration::default()
+        };
+        assert!(
+            super::semantic_model_source(&refused, std::path::Path::new("/workspace")).is_err(),
+            "the model value must be one ModelSource refuses"
+        );
+        assert!(super::model_acquisition(&refused, std::path::Path::new("/workspace")).is_none());
+
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let rift_toml = directory.path().join("rift.toml");
+        let table = "[search.semantic]\nsource = \"directory\"\nmodel = \"models//bge\"\n";
+        fs::write(rift_toml, table)?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let index = server
+            .search_index
+            .clone()
+            .ok_or("a refused model must not stop the search index from opening")?;
+        assert_eq!(
+            index.readiness(),
+            SemanticReadiness::Disabled,
+            "a refused model disables the tier rather than leaving it preparing"
+        );
+        let result = run_search(&server, "beacon").await?;
+        assert!(
+            !result.results.is_empty(),
+            "the full-text tier must still serve: {result:#?}"
+        );
+        assert_eq!(
+            result.warnings,
+            Vec::new(),
+            "a disabled tier adds no warning: {result:#?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_invalid_configuration_holds_the_acquisition_back() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        // The table naming the model is the very part acceptance could not read.
+        let rift_toml = directory.path().join("rift.toml");
+        fs::write(rift_toml, "[search.semantic]\nnot_a_key = 1\n")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let index = server
+            .search_index
+            .clone()
+            .ok_or("an invalid configuration must not stop the search index from opening")?;
+        assert_eq!(
+            index.readiness(),
+            SemanticReadiness::Disabled,
+            "a server that answers nothing must not spend a download first"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_model_directory_without_weights_ends_preparation_and_the_answer_says_so()
+    -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        // An empty directory holds none of the three files an encoder loads, so acquisition
+        // refuses without reaching a network.
+        fs::create_dir_all(directory.path().join("weights"))?;
+        let rift_toml = directory.path().join("rift.toml");
+        let table = "[search.semantic]\nsource = \"directory\"\nmodel = \"weights\"\n";
+        fs::write(rift_toml, table)?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        // Preparation runs behind startup, so poll for its verdict under a bound rather
+        // than racing the task that carries it.
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            let result = run_search(&server, "beacon").await?;
+            let refused = result
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::SemanticRankingUnavailable { .. }));
+            if refused {
+                assert!(
+                    !result.results.is_empty(),
+                    "the full-text tier must keep serving: {result:#?}"
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+        }
+        Err("a model directory without weights never ended preparation".into())
+    }
+
+    /// One workspace holding `source`, published as a candidate, with a search index over
+    /// its own temporary database populated from it.
+    async fn populated_index(
+        directory: &std::path::Path,
+        source: &str,
+    ) -> TestResult<(Arc<PublishedWorkspace>, rift_search::SearchIndex)> {
+        fs::write(directory.join("lib.rs"), source)?;
+        let published = stable_candidate(directory, 0)?;
+        let limits =
+            rift_search::SearchIndexLimits::builder(rift_index::LexicalIndexLimits::default())
+                .disable_semantic()
+                .build();
+        let database = directory.join("search.db");
+        let index = rift_search::SearchIndex::open(&database, limits).await?;
+        crate::validation::populate_search(&index, &published, super::SearchPass::Build).await;
+        Ok((published, index))
+    }
+
+    #[tokio::test]
+    async fn a_store_stamped_with_another_tree_reads_as_lagging_not_absent() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (first, index) = populated_index(directory.path(), "pub fn beacon() {}\n").await?;
+        assert_eq!(
+            super::store_revision(&index, &first).await,
+            super::StoreRevision::Current,
+            "a store populated from this very snapshot holds its tree"
+        );
+
+        // The same workspace, moved on: the store still holds the previous tree.
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let moved = stable_candidate(directory.path(), 1)?;
+        let stamped = first.reads.tree_revision().to_owned();
+        assert_ne!(
+            stamped,
+            moved.reads.tree_revision(),
+            "the fixture must actually move the tree revision"
+        );
+        assert_eq!(
+            super::store_revision(&index, &moved).await,
+            super::StoreRevision::Lagging(stamped),
+            "a repopulation window is a lag, never an absent tier"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unstamped_store_reads_as_absent() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let limits =
+            rift_search::SearchIndexLimits::builder(rift_index::LexicalIndexLimits::default())
+                .disable_semantic()
+                .build();
+        let database = directory.path().join("search.db");
+        // Opened and never populated, so nothing stamped a tree on it.
+        let index = rift_search::SearchIndex::open(&database, limits).await?;
+        assert_eq!(
+            super::store_revision(&index, &published).await,
+            super::StoreRevision::Absent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_lagging_store_warns_stale_index_carrying_both_revisions() -> TestResult {
+        let ranking = super::SearchRanking::lagging("aaaaaaaa".to_owned(), "bbbbbbbb");
+        assert!(
+            ranking.units.is_empty(),
+            "a lagging store contributes no ranked unit"
+        );
+        let warnings = serde_json::to_value(&ranking.warnings)?;
+        assert_eq!(warnings[0]["code"], json!("stale_index"));
+        assert_eq!(warnings[0]["index_tree_revision"], json!("aaaaaaaa"));
+        assert_eq!(warnings[0]["captured_tree_revision"], json!("bbbbbbbb"));
+        assert_eq!(warnings[1], json!(null), "exactly one warning is raised");
+        let detail = warnings[0]["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("full-text tier"),
+            "the detail must name which of the two stores lagged: {detail}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_search_over_a_tree_the_store_never_held_warns_stale_index() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        // A snapshot of an unrelated workspace stands in for the repopulation window: its
+        // tree revision is one the server's store was never populated for. Nothing writes
+        // into the served workspace, so no rebuild can close the window mid-test.
+        let other = tempfile::tempdir()?;
+        fs::write(other.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let moved = stable_candidate(other.path(), 0)?;
+        let params: SearchParams = serde_json::from_value(json!({"query": "lantern"}))?;
+        let ranking = server.ranking(&params, &moved).await?;
+        assert!(
+            ranking.units.is_empty(),
+            "a store that never held this tree contributes no ranked unit"
+        );
+        let warnings = serde_json::to_value(&ranking.warnings)?;
+        assert_eq!(
+            warnings[0]["code"],
+            json!("stale_index"),
+            "a repopulation window is a lag, never the operator-action warning: {warnings:#}"
+        );
+        assert_eq!(
+            warnings[0]["captured_tree_revision"],
+            json!(moved.reads.tree_revision())
+        );
+        assert_ne!(
+            warnings[0]["index_tree_revision"], warnings[0]["captured_tree_revision"],
+            "the two revisions that disagree must both be named: {warnings:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_absent_store_warns_lexical_ranking_unavailable() -> TestResult {
+        let ranking = super::SearchRanking::unavailable("the database could not be opened");
+        let warnings = serde_json::to_value(&ranking.warnings)?;
+        assert_eq!(warnings[0]["code"], json!("lexical_ranking_unavailable"));
+        assert_eq!(
+            warnings[0]["detail"],
+            json!("the database could not be opened")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn each_readiness_state_produces_its_own_warning() {
+        assert_eq!(
+            super::readiness_warnings(SemanticReadiness::Ready, 10),
+            Vec::new()
+        );
+        assert_eq!(
+            super::readiness_warnings(SemanticReadiness::Disabled, 10),
+            Vec::new()
+        );
+        let unavailable = super::readiness_warnings(SemanticReadiness::Unavailable, 10);
+        assert!(matches!(
+            unavailable.as_slice(),
+            [ReadWarning::SemanticRankingUnavailable { .. }]
+        ));
+        let readiness = SemanticReadiness::Preparing {
+            prepared: 1,
+            total: 4,
+        };
+        let expected = ReadWarning::SemanticIndexPreparing {
+            prepared: 1,
+            total: 4,
+            // Three of four declarations left is three quarters of a small workspace's span.
+            ready_in: WireDuration::from_millis(2_250),
+            detail: "1 of 4 declarations carry a vector, so the answer was ranked lexically \
+                     alone; resend the request once the semantic tier has caught up"
+                .to_owned(),
+        };
+        assert_eq!(super::readiness_warnings(readiness, 10), vec![expected]);
+    }
+
+    #[test]
+    fn the_preparation_span_steps_exactly_at_each_declared_file_count() {
+        assert_eq!(super::preparation_span(0), WireDuration::from_millis(3_000));
+        assert_eq!(
+            super::preparation_span(1_000),
+            WireDuration::from_millis(3_000)
+        );
+        assert_eq!(
+            super::preparation_span(1_001),
+            WireDuration::from_millis(10_000)
+        );
+        assert_eq!(
+            super::preparation_span(5_000),
+            WireDuration::from_millis(10_000)
+        );
+        assert_eq!(
+            super::preparation_span(5_001),
+            WireDuration::from_millis(60_000)
+        );
+        assert_eq!(
+            super::preparation_span(10_000),
+            WireDuration::from_millis(60_000)
+        );
+        assert_eq!(
+            super::preparation_span(10_001),
+            WireDuration::from_millis(120_000)
+        );
+    }
+
+    #[test]
+    fn ready_in_scales_the_declared_span_by_the_work_left() {
+        let files = 20_000;
+        assert_eq!(
+            super::ready_in(files, 0, 100),
+            WireDuration::from_millis(120_000),
+            "nothing prepared waits the whole span"
+        );
+        assert_eq!(
+            super::ready_in(files, 50, 100),
+            WireDuration::from_millis(60_000),
+            "half prepared waits half the span"
+        );
+        assert_eq!(
+            super::ready_in(files, 99, 100),
+            WireDuration::from_millis(1_200),
+            "one declaration left waits a hundredth of the span"
+        );
+        assert_eq!(
+            super::ready_in(files, 0, 0),
+            WireDuration::from_millis(120_000),
+            "a set of no declarations divides by nothing and answers the whole span"
+        );
+        assert_eq!(
+            super::ready_in(files, 5, 1),
+            WireDuration::from_millis(0),
+            "more prepared than the set holds is no work left, never a negative wait"
+        );
+        assert_eq!(
+            super::ready_in(files, 0, u64::MAX),
+            WireDuration::from_millis(120_000),
+            "the widest set still divides exactly, because the product runs in u128"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revision_search_never_consults_the_search_index() -> TestResult {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        super::hermetic_workspace(directory.path(), "")?;
+        // A directory at the database path exhausts the open retry, so the handle is absent
+        // and a current-tree search says so. A revision search must stay silent about it.
+        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert!(server.search_index.is_none());
+        let current = run_search(&server, "beacon").await?;
+        assert!(
+            current
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::LexicalRankingUnavailable { .. })),
+            "a current-tree search must report the absent index: {current:#?}"
+        );
+        let params: SearchParams =
+            serde_json::from_value(json!({"query": "beacon", "rev": "main"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert!(
+            !answer.results.is_empty(),
+            "a revision search must still answer: {answer:#?}"
+        );
+        assert_eq!(
+            answer.warnings,
+            Vec::new(),
+            "a revision search passes no ranked units and consults no index: {answer:#?}"
+        );
+        Ok(())
+    }
+
+    /// Polls one search-tier pass a test waits on before it gives up: three seconds, at
+    /// [`SEARCH_TIER_POLL`] each.
+    const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
+    /// Wait between two reads of a search tier still catching up.
+    const SEARCH_TIER_POLL: Duration = Duration::from_millis(50);
+
+    #[tokio::test]
+    async fn startup_populates_the_index_and_a_landed_change_repopulates_it() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let index = server
+            .search_index
+            .clone()
+            .ok_or("the fixture must open a search index")?;
+        let published = server
+            .published
+            .read()
+            .await
+            .current
+            .reads
+            .tree_revision()
+            .to_owned();
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(published.as_str()),
+            "the startup pass must stamp the published tree revision"
+        );
+        assert!(
+            !index.search("beacon", 8).await?.is_empty(),
+            "the startup pass must leave the published unit set searchable"
+        );
+
+        let insert = json!({
+            "anchor": "rift://symbol/rust/lib.rs/beacon",
+            "position": "after",
+            "body": "pub fn lantern() {}"
+        });
+        let params = serde_json::from_value(insert)?;
+        let applied = server.insert_symbol(Parameters(params)).await?.0;
+        assert!(
+            matches!(applied, rift_protocol::change::ChangeResult::Applied { .. }),
+            "the fixture insert must land: {applied:#?}"
+        );
+        // The change's own rebuild repopulates before the call returns; a filesystem rebuild
+        // that supersedes it repopulates from the supervisor instead, after it. Poll under a
+        // bound rather than racing which of the two ran.
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            if !index.search("lantern", 8).await?.is_empty() {
+                return Ok(());
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+        }
+        Err("the pass after a landed change never ranked the inserted declaration".into())
     }
 
     #[tokio::test(start_paused = true)]

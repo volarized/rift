@@ -8293,7 +8293,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the lexical tier's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate lexical matches against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "ElementFilter": {
