@@ -254,13 +254,18 @@
                 ],
                 "description": "The declaration source when the request asked for bodies and the provider can read\nit. Absent for source-less declarations."
               },
+              "span": {
+                "$ref": "#/$defs/SourceUnitSpan",
+                "description": "Where the declaration lives: its source unit and byte range. Set whether or not\n`include_body` was requested, so a caller can address the hit without reading its\nbody first."
+              },
               "symbol": {
                 "$ref": "#/$defs/Symbol",
                 "description": "The declaration that matched."
               }
             },
             "required": [
-              "symbol"
+              "symbol",
+              "span"
             ],
             "type": "object"
           },
@@ -465,7 +470,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -1681,6 +1686,13 @@
                   },
                   "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
                 },
+                "span": {
+                  "range": {
+                    "end": 355,
+                    "start": 162
+                  },
+                  "unit": "rift://source/project/src/config.rs"
+                },
                 "symbol": {
                   "document_local": false,
                   "documentation": [
@@ -2398,7 +2410,7 @@
             "type": "object"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -3318,7 +3330,7 @@
             "type": "object"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -3799,7 +3811,7 @@
             "description": "Project-relative file to inspect."
           },
           "position": {
-            "description": "UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes\nthemselves carry the spans.",
+            "description": "UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes\nthemselves carry the spans. A position inside a multi-byte character is valid and\nanswers with its enclosing nodes; a position at or past the file's byte length\nrefuses.",
             "format": "uint64",
             "maximum": 9007199254740991,
             "minimum": 0,
@@ -4086,7 +4098,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -4544,7 +4556,7 @@
             "type": "array"
           },
           "source": {
-            "description": "The source of each node, in the same order.",
+            "description": "One excerpt per node in `nodes`, in the same order, each spanning that node's own\nrange. Empty when `nodes` is empty.",
             "items": {
               "$ref": "#/$defs/SourceExcerpt"
             },
@@ -5051,7 +5063,7 @@
             "type": "object"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -5501,7 +5513,7 @@
       "input_schema": {
         "$defs": {
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -5972,7 +5984,7 @@
             "type": "object"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -6893,7 +6905,7 @@
             "type": "object"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -7816,7 +7828,7 @@
             "type": "object"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -8289,7 +8301,7 @@
             "description": "Where a write tool's body bytes come from: written inline in the request, or read\nfrom a file. `patch`, and every write tool's `body`, accepts either form; the object\nform is refused when it carries an unknown or additional field.\n\nBoth forms are bounded by the field that embeds this type; the schema states the\nbound as the inline string's `maxLength`, and the server enforces the same bound\nagainst the resolved content of either form."
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -8812,7 +8824,7 @@
             "type": "object"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -9808,7 +9820,7 @@
             "type": "object"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],
@@ -10963,7 +10975,7 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
+            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution refuses a range that does not land\non an indexed node's own bytes, and otherwise recomputes the witness, refusing with a\nfailed `source_unchanged` precondition when the bytes have drifted - so an address read\nfrom a stale listing, or one naming no real node, cannot splice into the wrong code.",
             "examples": [
               "rift://node/rust/lib.rs@220-268#3f9a1c2e"
             ],

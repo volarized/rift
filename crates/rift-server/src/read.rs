@@ -476,7 +476,8 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for invalid paths or missing files.
+    /// Returns [`ReadError`] for invalid paths, missing files, or a `position` at or past the
+    /// file's byte length.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
         validate_common(params.rev.is_some())?;
         let path = CoreProjectPath::new(params.path.0).map_err(|error| {
@@ -486,19 +487,22 @@ impl ReadService {
             .index
             .file(&path)
             .ok_or_else(|| self.missing_file_fault(&path))?;
-        let nodes = file
-            .syntax()
-            .nodes_at(params.position)
-            .into_iter()
-            .map(|node| wire_node(file, node))
+        let source_len = file.source().len() as u64;
+        if params.position >= source_len {
+            return Err(ReadFault::invalid(
+                "position",
+                format!(
+                    "{} is at or past the file's byte length {source_len}",
+                    params.position
+                ),
+            ));
+        }
+        let matched = file.syntax().nodes_at(params.position);
+        let nodes = matched.iter().map(|node| wire_node(file, node)).collect();
+        let source = matched
+            .iter()
+            .map(|node| excerpt(file, node.range))
             .collect();
-        let source = vec![excerpt(
-            file,
-            ByteRange {
-                start: params.position,
-                end: params.position,
-            },
-        )];
         Ok(NodesResult {
             nodes,
             source,
@@ -595,6 +599,7 @@ impl ReadService {
             };
             hits.push(GetSymbolHit {
                 symbol: wire_symbol(matched),
+                span: source_span(matched.file.path(), matched.symbol.range),
                 node: params.include_body.then(|| symbol_node(matched)),
                 source: params
                     .include_body
@@ -955,14 +960,82 @@ fn workspace_digest(index: &WorkspaceIndex) -> String {
 /// The witness a node address carries: the first eight lowercase hex characters of the
 /// SHA-256 of the node's source bytes. Recomputing it is how resolution proves the bytes
 /// behind an address have not drifted.
+///
+/// `range` must already land inside `source`: minting hashes a real indexed node's own
+/// range, and [`resolve_node_range`] proves a caller-supplied range lands before calling
+/// this. Neither caller clamps, so this does not either.
+///
+/// # Panics
+///
+/// Panics when `range` does not land inside `source` - a programmer error, since every
+/// caller proves the range first.
 pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
-    let start = usize::try_from(range.start)
-        .unwrap_or(source.len())
-        .min(source.len());
-    let end = usize::try_from(range.end)
-        .unwrap_or(source.len())
-        .min(source.len());
-    digest_hex8(source.get(start..end).unwrap_or_default())
+    let start = usize::try_from(range.start).expect("node range start fits this platform's usize");
+    let end = usize::try_from(range.end).expect("node range end fits this platform's usize");
+    let bytes = source
+        .get(start..end)
+        .expect("node range lands inside the source it was minted or resolved against");
+    digest_hex8(bytes)
+}
+
+/// One witnessed node range, resolved and verified against an indexed file: whether the
+/// bytes it now hashes to still match the address's own witness.
+#[derive(Debug)]
+pub(crate) enum NodeRangeResolution {
+    /// The range lands on an indexed node and its bytes still hash to the given witness.
+    Verified,
+    /// The range lands on an indexed node, but its bytes hash to a different witness.
+    WitnessChanged {
+        /// The witness recomputed from the file's current bytes.
+        observed: String,
+    },
+}
+
+/// Resolves one witnessed node range against `file`: every witnessed node read and write
+/// proves its range through this call, and nothing else compares or clamps a node witness.
+///
+/// The range must land on an indexed node's exact bytes - in bounds, on a UTF-8 character
+/// boundary at both ends, and equal to one of `file.syntax().nodes()`'s own ranges - before
+/// its witness is even computed. A range that does not land refuses here, naming the range
+/// rather than silently clamping it to whatever the file can still offer. A range that lands
+/// but hashes to a different witness is reported as [`NodeRangeResolution::WitnessChanged`]
+/// instead, so the caller can build its own `source_unchanged` precondition.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] naming `range outside the addressed file` when the range does not
+/// land on an indexed node.
+pub(crate) fn resolve_node_range(
+    file: &IndexedFile,
+    range: ByteRange,
+    witness: &str,
+) -> Result<NodeRangeResolution, ReadError> {
+    if !range_names_an_indexed_node(file, range) {
+        return Err(ReadFault::invalid(
+            "span",
+            "range outside the addressed file",
+        ));
+    }
+    let observed = node_witness(file.source(), range);
+    Ok(if observed == witness {
+        NodeRangeResolution::Verified
+    } else {
+        NodeRangeResolution::WitnessChanged { observed }
+    })
+}
+
+/// Whether `range` lands exactly on one of `file`'s indexed syntax nodes: in bounds, on a
+/// UTF-8 character boundary at both ends, and equal to a real node's own range.
+fn range_names_an_indexed_node(file: &IndexedFile, range: ByteRange) -> bool {
+    let source = file.source();
+    let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end)) else {
+        return false;
+    };
+    start <= end
+        && end <= source.len()
+        && source.is_char_boundary(start)
+        && source.is_char_boundary(end)
+        && file.syntax().nodes().iter().any(|node| node.range == range)
 }
 
 /// First `DIGEST_WIRE_CHARS` lowercase hex characters of the SHA-256 of `source` - the sole
@@ -1008,6 +1081,7 @@ mod tests {
         GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult, ProjectPath, ReadWarning,
         RevisionId,
     };
+    use rift_syntax::ByteRange;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1129,6 +1203,215 @@ pub fn compute() -> i32 {
                 .is_some_and(|id| id.starts_with("rift://node/rust/"))
         );
         assert_eq!(value["warnings"], json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_at_the_source_length_and_beyond_refuse_naming_the_position() -> TestResult {
+        let (directory, service) = fixture()?;
+        let source = fs::read_to_string(directory.path().join("src/lib.rs"))?;
+        let length = source.len() as u64;
+
+        for position in [length, length + 1] {
+            let error = service
+                .nodes(NodesParams {
+                    path: ProjectPath("src/lib.rs".to_owned()),
+                    position,
+                    rev: None,
+                })
+                .expect_err("a position at or past the file's byte length must refuse");
+            let ReadFault::Invalid { field, .. } = error.fault() else {
+                panic!("expected Invalid, got {:?}", error.fault());
+            };
+            assert_eq!(*field, "position");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_at_the_last_in_bounds_byte_position_still_answers() -> TestResult {
+        let (directory, service) = fixture()?;
+        let source = fs::read_to_string(directory.path().join("src/lib.rs"))?;
+        let length = source.len() as u64;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: length - 1,
+            rev: None,
+        })?;
+        assert!(
+            !result.nodes.is_empty(),
+            "the last in-bounds byte position must still answer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_at_a_byte_inside_a_multi_byte_character_returns_its_enclosing_nodes() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        let source = "pub fn beacon() -> &'static str {\n    \"café\"\n}\n";
+        fs::write(directory.path().join("src/lib.rs"), source)?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let cafe_index = source.find("café").ok_or("fixture must hold café")?;
+        // 'é' starts right after "caf" and is two bytes wide; one byte past its start sits
+        // inside its encoding, off any character boundary.
+        let mid_character_position = cafe_index + "caf".len() + 1;
+        assert!(
+            !source.is_char_boundary(mid_character_position),
+            "the chosen position must sit inside the multi-byte character"
+        );
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: u64::try_from(mid_character_position)
+                .expect("the fixture offset fits in u64"),
+            rev: None,
+        })?;
+        assert!(
+            !result.nodes.is_empty(),
+            "a position mid-character still returns its enclosing nodes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_source_carries_one_excerpt_per_node_in_order_spanning_its_own_range() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: 5,
+            rev: None,
+        })?;
+        assert!(
+            result.nodes.len() > 1,
+            "the fixture position must be covered by more than one node"
+        );
+        assert_eq!(
+            result.nodes.len(),
+            result.source.len(),
+            "one excerpt must ride per listed node"
+        );
+        for (node, source) in result.nodes.iter().zip(result.source.iter()) {
+            assert_eq!(
+                source.span.range, node.range,
+                "each excerpt must span its own node's range, not the requested position"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_node_range_verifies_a_real_node_and_reports_a_changed_witness() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let file = service.index().file(&path).ok_or("fixture file indexed")?;
+        // A real address, read back through `nodes` the way a caller would, so its witness
+        // is the one production minting already computed rather than a second call here.
+        let listing = service.nodes(NodesParams {
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: 0,
+            rev: None,
+        })?;
+        let listed = &listing.nodes[0];
+        let witness = listed
+            .id
+            .0
+            .rsplit_once('#')
+            .map(|(_, witness)| witness.to_owned())
+            .ok_or("a listed node id must carry a witness")?;
+        let range = ByteRange {
+            start: listed.range.start,
+            end: listed.range.end,
+        };
+
+        let verified = super::resolve_node_range(file, range, &witness)?;
+        assert!(matches!(verified, super::NodeRangeResolution::Verified));
+
+        let changed = super::resolve_node_range(file, range, "00000000")?;
+        let super::NodeRangeResolution::WitnessChanged { observed } = changed else {
+            panic!("a wrong witness must report the change, not refuse the range");
+        };
+        assert_eq!(observed, witness);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_node_range_refuses_a_range_past_the_source_length() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let file = service.index().file(&path).ok_or("fixture file indexed")?;
+        let source_len = file.source().len() as u64;
+        let range = ByteRange {
+            start: 0,
+            end: source_len + 10,
+        };
+        let error = super::resolve_node_range(file, range, "00000000")
+            .expect_err("a range past the source length must refuse");
+        let ReadFault::Invalid { field, violation } = error.fault() else {
+            panic!("expected Invalid, got {:?}", error.fault());
+        };
+        assert_eq!(*field, "span");
+        assert!(violation.contains("outside the addressed file"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_node_range_refuses_an_in_bounds_range_naming_no_syntax_node() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let file = service.index().file(&path).ok_or("fixture file indexed")?;
+        // One byte into the file: inside the leading `pub` keyword, but not equal to any
+        // node's own range.
+        let range = ByteRange { start: 1, end: 2 };
+        let witness = super::digest_hex8(&file.source()[1..2]);
+        let error = super::resolve_node_range(file, range, &witness)
+            .expect_err("a range naming no syntax node must refuse");
+        let ReadFault::Invalid { field, violation } = error.fault() else {
+            panic!("expected Invalid, got {:?}", error.fault());
+        };
+        assert_eq!(*field, "span");
+        assert!(
+            violation.contains("outside the addressed file"),
+            "the refusal must name the range, not a witness mismatch: {violation}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_symbol_span_is_set_whether_or_not_the_body_was_requested() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let with_body: GetSymbolParams =
+            serde_json::from_value(json!({ "name": "signal", "include_body": true }))?;
+        let without_body: GetSymbolParams =
+            serde_json::from_value(json!({ "name": "signal", "include_body": false }))?;
+        let with_body_value = serde_json::to_value(service.get_symbol(&with_body)?)?;
+        let without_body_value = serde_json::to_value(service.get_symbol(&without_body)?)?;
+        assert!(
+            without_body_value["hits"][0].get("source").is_none(),
+            "include_body: false must carry no source excerpt"
+        );
+        assert_eq!(
+            with_body_value["hits"][0]["span"], without_body_value["hits"][0]["span"],
+            "the span must not depend on include_body"
+        );
+        assert_eq!(
+            without_body_value["hits"][0]["span"]["unit"],
+            json!("rift://source/project/src/lib.rs")
+        );
+        assert!(
+            without_body_value["hits"][0]["span"]["range"]["start"]
+                .as_u64()
+                .is_some_and(|start| start
+                    < without_body_value["hits"][0]["span"]["range"]["end"]
+                        .as_u64()
+                        .unwrap_or_default()),
+            "the span must name a real byte range: {without_body_value:#}"
+        );
         Ok(())
     }
 

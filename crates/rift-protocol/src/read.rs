@@ -201,6 +201,10 @@ pub struct FileId(
 pub struct GetSymbolHit {
     /// The declaration that matched.
     pub symbol: Symbol,
+    /// Where the declaration lives: its source unit and byte range. Set whether or not
+    /// `include_body` was requested, so a caller can address the hit without reading its
+    /// body first.
+    pub span: SourceUnitSpan,
     /// The declaration node, whose identity `replace_symbol` can act on. Absent when
     /// source is unavailable or outside the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -388,6 +392,13 @@ fn default_get_symbol_params_page_index() -> u64 {
                     ],
                     "extensions": {},
                     "document_local": false
+                },
+                "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                        "start": 162,
+                        "end": 355
+                    }
                 },
                 "node": {
                     "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
@@ -600,10 +611,10 @@ pub enum NodeFacet {
 
 /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
 /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-/// of the SHA-256 of the node's source bytes. Resolution recomputes the witness before
-/// acting on the address and refuses with a failed `source_unchanged` precondition when the
-/// bytes have drifted, so an address read from a stale listing cannot splice into the wrong
-/// code.
+/// of the SHA-256 of the node's source bytes. Resolution refuses a range that does not land
+/// on an indexed node's own bytes, and otherwise recomputes the witness, refusing with a
+/// failed `source_unchanged` precondition when the bytes have drifted - so an address read
+/// from a stale listing, or one naming no real node, cannot splice into the wrong code.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
@@ -642,7 +653,9 @@ pub struct NodesParams {
     #[schemars(length(min = 1))]
     pub path: ProjectPath,
     /// UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes
-    /// themselves carry the spans.
+    /// themselves carry the spans. A position inside a multi-byte character is valid and
+    /// answers with its enclosing nodes; a position at or past the file's byte length
+    /// refuses.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub position: u64,
     /// The version-control revision to read - a branch, tag, or commit id as the
@@ -818,7 +831,8 @@ pub struct NodesParams {
 pub struct NodesResult {
     /// Nodes covering the position, outermost first.
     pub nodes: Vec<Node>,
-    /// The source of each node, in the same order.
+    /// One excerpt per node in `nodes`, in the same order, each spanning that node's own
+    /// range. Empty when `nodes` is empty.
     pub source: Vec<SourceExcerpt>,
     /// Warnings attached to this result, empty when there is nothing to warn about.
     pub warnings: Vec<ReadWarning>,
