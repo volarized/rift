@@ -972,8 +972,9 @@ pub(crate) fn lexical_write(
     }
 }
 
-/// Scans every visible file, compiling the `[source]` policy the accepted configuration
-/// describes.
+/// Scans every visible file, taking the `[source]` policy `reads` already compiled
+/// rather than compiling a second one - one predicate per snapshot, one walk of the
+/// tree's `.gitignore` files instead of two.
 fn whole_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
@@ -989,13 +990,14 @@ fn whole_workspace_candidate(
         &text_inclusion,
         configuration.history_configuration(),
     )?;
-    let source_policy = WorkspaceSourcePolicy::build(root, limits, &visibility, &text_inclusion)
-        .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+    let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
+        unreachable!("a current-tree read service always compiles its source policy")
+    });
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration,
-        source_policy: Arc::new(source_policy),
+        source_policy,
         epoch,
     })
 }
@@ -1896,8 +1898,9 @@ mod tests {
             (
                 EventKind::Modify(ModifyKind::Any),
                 "src/rift.toml",
-                super::WatchImpact::None,
-                "only the root configuration file is the workspace's",
+                source_path("src/rift.toml")?,
+                "a nested rift.toml is an ordinary visible source file; only the root \
+                 configuration file drives a whole-workspace rebuild",
             ),
             (
                 EventKind::Modify(ModifyKind::Any),

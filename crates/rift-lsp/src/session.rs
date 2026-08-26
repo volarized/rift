@@ -20,17 +20,17 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    DocumentDiagnosticRequest, Initialize, PrepareRenameRequest, RegisterCapability, Rename,
-    Request, Shutdown, WillRenameFiles, WorkDoneProgressCreate, WorkspaceConfiguration,
+    DocumentDiagnosticRequest, Initialize, PrepareRenameRequest, References, RegisterCapability,
+    Rename, Request, Shutdown, WillRenameFiles, WorkDoneProgressCreate, WorkspaceConfiguration,
 };
 use lsp_types::{
     ConfigurationParams, Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentChangeOperation, DocumentChanges, DocumentDiagnosticParams, DocumentDiagnosticReport,
-    DocumentDiagnosticReportResult, FileRename, InitializeParams, InitializedParams,
+    DocumentDiagnosticReportResult, FileRename, InitializeParams, InitializedParams, Location,
     PartialResultParams, Position, PrepareRenameResponse, ProgressParams, ProgressParamsValue,
-    ProgressToken, PublishDiagnosticsParams, RenameFilesParams, RenameParams,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, WorkDoneProgress,
-    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
+    ProgressToken, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RenameFilesParams,
+    RenameParams, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
 };
 use rift_core::{
     CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath,
@@ -726,6 +726,38 @@ impl EngineSession {
             proposes_no_edit(edit.as_ref()),
         );
         Ok(edit)
+    }
+
+    /// The locations referencing the declaration at one position.
+    ///
+    /// `context.include_declaration` is `false`: the declaration itself is what a caller is
+    /// about to remove, so counting it would refuse every removal. An engine answering
+    /// `null` reports no references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when references are not advertised or the exchange breaks.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future leaves the request pending; a later call discards the engine's
+    /// stale response.
+    pub async fn references(
+        &mut self,
+        path: &ProjectPath,
+        position: Position,
+    ) -> Result<Vec<Location>, EngineError> {
+        require(self.capabilities.references, References::METHOD)?;
+        let params = ReferenceParams {
+            text_document_position: self.position_params(path, position)?,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: ReferenceContext {
+                include_declaration: false,
+            },
+        };
+        let locations = self.request::<References>(params).await?;
+        Ok(locations.unwrap_or_default())
     }
 
     /// Pulls the engine's current diagnostics for one document.

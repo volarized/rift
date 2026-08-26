@@ -32,11 +32,12 @@ use rift_protocol::read::{
     Diagnostic, DiagnosticCode, DiagnosticContinuation, DiagnosticReliability, Extensions,
     Language, Severity, SourceSpan, SymbolId, TextRange,
 };
-use rift_syntax::SyntaxSymbol;
+use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::change::{SymbolAddress, SymbolResolution, parse_symbol_address, resolve_symbol};
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id};
+use crate::rewrite::ReplacedRegion;
 
 /// Most files one engine rename proposal may rewrite.
 pub const RENAME_FILES_MAX: usize = 64;
@@ -76,13 +77,14 @@ impl RenamePlan {
     }
 }
 
-/// One file's rewrite: the bytes the plan was compiled against, and the
-/// bytes that replace them.
+/// One file's rewrite: the bytes the plan was compiled against, the bytes
+/// that replace them, and the regions the engine's own edits named.
 #[derive(Debug)]
 pub(crate) struct PlannedRewrite {
     pub(crate) path: CoreProjectPath,
     pub(crate) base_source: String,
     pub(crate) next_source: String,
+    pub(crate) replaced: Vec<ReplacedRegion>,
 }
 
 /// What planning decided: a plan ready for the change lane, or the refusal
@@ -247,7 +249,7 @@ fn resolved_target(reads: &ReadService, address: &SymbolAddress) -> Result<Renam
 /// occurrence of the short name inside the item's bytes, or the item start
 /// when the provider's name is not spelled there - the engine's own
 /// verdict then decides whether the position renames.
-fn declaration_name_offset(source: &str, symbol: &SyntaxSymbol) -> usize {
+pub(crate) fn declaration_name_offset(source: &str, symbol: &SyntaxSymbol) -> usize {
     let start = bounded_offset(symbol.item_range.start, source.len());
     let end = bounded_offset(symbol.item_range.end, source.len());
     let item = source.get(start..end).unwrap_or_default();
@@ -297,14 +299,14 @@ async fn verified_disk_target(
 /// The declaration name's position in both offered encodings, decided by
 /// the negotiated encoding once the engine has spawned.
 #[derive(Clone, Copy, Debug)]
-struct NamePositions {
+pub(crate) struct NamePositions {
     utf8: Position,
     utf16: Position,
 }
 
 impl NamePositions {
     /// The position in the encoding one session negotiated.
-    fn negotiated(self, encoding: PositionEncoding) -> Position {
+    pub(crate) fn negotiated(self, encoding: PositionEncoding) -> Position {
         match encoding {
             PositionEncoding::Utf8 => self.utf8,
             PositionEncoding::Utf16 => self.utf16,
@@ -315,7 +317,7 @@ impl NamePositions {
 /// Converts the name offset into both offered encodings. The offset came
 /// from the same source bytes, so a conversion failure is an internal
 /// fault, never a caller mistake.
-fn name_positions(source: &str, name_offset: usize) -> Result<NamePositions, PlanEnd> {
+pub(crate) fn name_positions(source: &str, name_offset: usize) -> Result<NamePositions, PlanEnd> {
     let index = LineIndex::new(source);
     let converted = |encoding| {
         index.position(encoding, name_offset).map_err(|error| {
@@ -540,7 +542,9 @@ pub(crate) fn workspace_tree_root(workspace_root: &Path) -> Result<TreeRoot, Pla
 }
 
 /// Compiles per-file text edits into whole-file rewrites, dropping a file
-/// whose edits change nothing.
+/// whose edits change nothing. Each rewrite writes its file whole and
+/// carries the regions the engine's own edits named, which is what the
+/// result reports.
 pub(crate) async fn compiled_rewrites(
     workspace_root: &Path,
     documents: Vec<(CoreProjectPath, Vec<TextEdit>)>,
@@ -551,13 +555,14 @@ pub(crate) async fn compiled_rewrites(
     for (path, edits) in documents {
         let base = document_base(workspace_root, context, &path).await?;
         refused_oversized(&path, base.len(), context.operation)?;
-        let next = rewritten_source(context, &path, &base, &edits, encoding)?;
+        let (next, replaced) = rewritten_source(context, &path, &base, &edits, encoding)?;
         refused_oversized(&path, next.len(), context.operation)?;
         if next != base {
             rewrites.push(PlannedRewrite {
                 path,
                 base_source: base,
                 next_source: next,
+                replaced,
             });
         }
     }
@@ -797,13 +802,23 @@ fn rewritten_source(
     base: &str,
     edits: &[TextEdit],
     encoding: PositionEncoding,
-) -> Result<String, PlanEnd> {
+) -> Result<(String, Vec<ReplacedRegion>), PlanEnd> {
     let spans = edit_spans(context, path, base, edits, encoding)?;
     let mut next = base.to_owned();
     for (range, text) in spans.iter().rev() {
         next.replace_range(range.clone(), text);
     }
-    Ok(next)
+    let replaced = spans
+        .into_iter()
+        .map(|(range, text)| ReplacedRegion {
+            range: ByteRange {
+                start: range.start as u64,
+                end: range.end as u64,
+            },
+            text: text.to_owned(),
+        })
+        .collect();
+    Ok((next, replaced))
 }
 
 /// Each edit's byte range and replacement, sorted ascending and proven
@@ -1292,7 +1307,7 @@ mod tests {
             edit((0, 3), (0, 9), "flare"),
             edit((1, 14), (1, 20), "flare"),
         ];
-        let next = rewritten_source(
+        let (next, _) = rewritten_source(
             &plain_context(),
             &project_path("lib.rs"),
             base,
@@ -1311,7 +1326,7 @@ mod tests {
             u32::try_from(base[..target].chars().map(char::len_utf16).sum::<usize>())
                 .expect("the fixture line fits in u32");
         let utf8_column = u32::try_from(target).expect("the fixture line fits in u32");
-        let by_utf16 = rewritten_source(
+        let (by_utf16, _) = rewritten_source(
             &plain_context(),
             &project_path("lib.rs"),
             base,
@@ -1319,7 +1334,7 @@ mod tests {
             PositionEncoding::Utf16,
         )
         .expect("the utf-16 edit compiles");
-        let by_utf8 = rewritten_source(
+        let (by_utf8, _) = rewritten_source(
             &plain_context(),
             &project_path("lib.rs"),
             base,
@@ -1334,7 +1349,7 @@ mod tests {
     #[test]
     fn crlf_sources_keep_their_endings_through_an_edit() {
         let base = "fn beacon() {}\r\nfn caller() { beacon(); }\r\n";
-        let next = rewritten_source(
+        let (next, _) = rewritten_source(
             &plain_context(),
             &project_path("lib.rs"),
             base,
@@ -1510,6 +1525,7 @@ mod tests {
             path: project_path("lib.rs"),
             base_source: "pub fn beacon() {}\n".to_owned(),
             next_source: "pub fn flare() {}\n".to_owned(),
+            replaced: Vec::new(),
         }]);
         let findings = survivor_findings(&reads, &renamed);
         assert_eq!(
@@ -1537,6 +1553,7 @@ mod tests {
             path: project_path("notes.md"),
             base_source: occurrences.clone(),
             next_source: "all clear\n".to_owned(),
+            replaced: Vec::new(),
         }]);
         let findings = survivor_findings(&reads, &clean);
         assert_eq!(

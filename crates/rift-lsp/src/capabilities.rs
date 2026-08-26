@@ -7,8 +7,8 @@
 use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DiagnosticServerCapabilities,
     FileOperationFilter, GeneralClientCapabilities, InitializeResult, OneOf, PositionEncodingKind,
-    RenameClientCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
-    WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+    ReferenceClientCapabilities, RenameClientCapabilities, TextDocumentClientCapabilities,
+    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
     WorkspaceFileOperationsClientCapabilities,
 };
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
@@ -52,6 +52,11 @@ impl Fault for CapabilitiesFault {
 pub type CapabilitiesError = Error<CapabilitiesFault>;
 
 /// What one engine advertised at initialize.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independently negotiated LSP capability, mirroring the \
+              protocol's own capability grid, not a boolean mode parameter"
+)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Capabilities {
     /// The negotiated position encoding.
@@ -60,6 +65,8 @@ pub struct Capabilities {
     pub rename: bool,
     /// Whether the engine serves `textDocument/prepareRename`.
     pub prepare_rename: bool,
+    /// Whether the engine serves `textDocument/references`.
+    pub references: bool,
     /// The `workspace/willRenameFiles` filters; absent when unserved.
     pub will_rename_filters: Option<Vec<FileOperationFilter>>,
     /// Whether the engine serves `textDocument/diagnostic`.
@@ -75,6 +82,7 @@ impl Default for Capabilities {
             position_encoding: PositionEncoding::Utf16,
             rename: false,
             prepare_rename: false,
+            references: false,
             will_rename_filters: None,
             pull_diagnostics: false,
             diagnostic_identifier: None,
@@ -108,6 +116,11 @@ impl Capabilities {
             Some(OneOf::Right(options)) => (true, options.prepare_provider == Some(true)),
             None => (false, false),
         };
+        let references = match advertised.references_provider.as_ref() {
+            Some(OneOf::Left(served)) => *served,
+            Some(OneOf::Right(_options)) => true,
+            None => false,
+        };
         let will_rename_filters = advertised
             .workspace
             .as_ref()
@@ -128,6 +141,7 @@ impl Capabilities {
             position_encoding,
             rename,
             prepare_rename,
+            references,
             will_rename_filters,
             pull_diagnostics,
             diagnostic_identifier,
@@ -205,6 +219,13 @@ fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
 /// doing: the protocol forbids server-initiated progress unless the client
 /// declares it, so without this entry an engine loading a project reports
 /// nothing and every answer it gives while loading reads as settled.
+///
+/// `textDocument.diagnostic.dynamicRegistration` is what makes an engine
+/// advertise `diagnostic_provider` at all when its own pull-diagnostics
+/// support is conditional on that flag: tombi, the TOML engine, sets
+/// `diagnostic_provider` only when the client declares dynamic
+/// registration, so without this entry its pull-diagnostics chain never
+/// closes.
 #[must_use]
 pub fn offered() -> ClientCapabilities {
     ClientCapabilities {
@@ -231,7 +252,11 @@ pub fn offered() -> ClientCapabilities {
                 prepare_support: Some(true),
                 ..RenameClientCapabilities::default()
             }),
-            diagnostic: Some(DiagnosticClientCapabilities::default()),
+            references: Some(ReferenceClientCapabilities::default()),
+            diagnostic: Some(DiagnosticClientCapabilities {
+                dynamic_registration: Some(true),
+                ..DiagnosticClientCapabilities::default()
+            }),
             ..TextDocumentClientCapabilities::default()
         }),
         window: Some(WindowClientCapabilities {
@@ -263,9 +288,45 @@ mod tests {
             Capabilities::negotiated(&answer(ServerCapabilities::default())).expect("record");
         assert_eq!(record.position_encoding, PositionEncoding::Utf16);
         assert!(!record.rename && !record.prepare_rename);
+        assert!(!record.references);
         assert!(!record.will_rename_files());
         assert!(!record.pull_diagnostics);
         assert_eq!(record.diagnostic_identifier, None);
+    }
+
+    #[test]
+    fn references_forms_map_to_the_references_flag() {
+        let absent = answer(ServerCapabilities::default());
+        assert!(
+            !Capabilities::negotiated(&absent)
+                .expect("record")
+                .references
+        );
+        let plain = answer(ServerCapabilities {
+            references_provider: Some(OneOf::Left(true)),
+            ..ServerCapabilities::default()
+        });
+        assert!(Capabilities::negotiated(&plain).expect("record").references);
+        let refused = answer(ServerCapabilities {
+            references_provider: Some(OneOf::Left(false)),
+            ..ServerCapabilities::default()
+        });
+        assert!(
+            !Capabilities::negotiated(&refused)
+                .expect("record")
+                .references
+        );
+        let options = answer(ServerCapabilities {
+            references_provider: Some(OneOf::Right(lsp_types::ReferencesOptions {
+                work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+            })),
+            ..ServerCapabilities::default()
+        });
+        assert!(
+            Capabilities::negotiated(&options)
+                .expect("record")
+                .references
+        );
     }
 
     #[test]
@@ -458,11 +519,27 @@ mod tests {
             .file_operations
             .expect("file operations are offered");
         assert_eq!(operations.will_rename, Some(true));
+        let text_document = offered
+            .text_document
+            .expect("text document capabilities are offered");
+        assert!(
+            text_document.references.is_some(),
+            "the remove tools stand on textDocument/references being offered"
+        );
         let window = offered.window.expect("window capabilities are offered");
         assert_eq!(
             window.work_done_progress,
             Some(true),
             "an engine only reports its work when the client declares this"
+        );
+        let diagnostic = text_document
+            .diagnostic
+            .expect("diagnostic capabilities are offered");
+        assert_eq!(
+            diagnostic.dynamic_registration,
+            Some(true),
+            "an engine that gates diagnostic_provider on dynamic \
+             registration only advertises it when the client declares this"
         );
     }
 }

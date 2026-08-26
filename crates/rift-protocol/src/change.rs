@@ -123,6 +123,9 @@ pub enum OperationPreconditionKind {
     /// Wire value `source_unchanged`.
     #[serde(rename = "source_unchanged")]
     SourceUnchanged,
+    /// Wire value `no_references`.
+    #[serde(rename = "no_references")]
+    NoReferences,
 }
 
 /// Result of this check.
@@ -211,7 +214,9 @@ pub struct ChangeSummary {
     /// Paths whose entries differ because of this change, sorted bytewise.
     #[schemars(length(max = 256))]
     pub paths: Vec<ProjectPath>,
-    /// Concrete edits in canonical file-and-range order.
+    /// Concrete edits in canonical file-and-range order. A modification carries one
+    /// edit per replaced range; a file the change created or removed carries one edit
+    /// spanning the whole file.
     #[schemars(length(max = 256))]
     pub edits: Vec<Edit>,
     /// Resolution findings in source order, then one finding per hook that
@@ -340,6 +345,10 @@ impl ChangeResult {
 /// Replaces one declaration addressed by symbol. The parser derives the span, so the
 /// caller supplies no offsets. The whole declaration includes attached outer attributes
 /// and doc comments.
+///
+/// `body` is spliced in verbatim at the declaration's own start byte: its first line
+/// inherits the declaration's column, and every later line carries whatever indentation it
+/// is written with.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.6"))]
@@ -365,6 +374,12 @@ pub struct ReplaceSymbolParams {
 /// Inserts a new declaration beside an anchor symbol, or content at a file target.
 /// The request carries exactly one of `anchor` or `file`; an anchored insertion lands
 /// beside the whole declaration, attached outer attributes and doc comments included.
+///
+/// `body` inserted `before` its anchor is spliced in verbatim at the anchor's start byte,
+/// so its first line inherits the anchor's column and every later line carries its own.
+/// `body` inserted `after` its anchor, or at a file target either side, always starts a
+/// fresh line at column zero: it lands past the blank line that separates it from what
+/// came before.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.6"))]
@@ -505,6 +520,59 @@ pub struct MoveFileParams {
     pub to: ProjectPath,
 }
 
+/// Removes one declaration addressed by symbol, checked against the configured language
+/// engine's references first. The removed span reaches back over the declaration's attached
+/// outer attributes and doc comments and forward over the separator that followed it, so no
+/// blank-line run stands where the declaration stood.
+///
+/// With an engine advertising `textDocument/references`, a standing reference refuses
+/// `unmet_precondition` naming `no_references` and the reference paths, unless `force`
+/// applies the removal anyway and carries them as a warning instead. Without such an engine,
+/// the removal applies and carries a warning naming why it was not checked.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.19"))]
+#[schemars(extend("examples" = [
+    {
+        "symbol": "rift://symbol/rust/src/config.rs/default_config",
+        "force": false
+    }
+]))]
+pub struct RemoveSymbolParams {
+    /// The declaration to remove.
+    pub symbol: SymbolId,
+    /// Applies the removal even when references stand, carrying them as a warning instead
+    /// of refusing.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Removes one syntax node through a witnessed address from `nodes`, checked against the
+/// configured language engine's references first when the node names a declaration. The
+/// server recomputes the witness before writing and refuses when the bytes drifted.
+///
+/// The removed span reaches forward over the separator that followed the node, so no
+/// blank-line run stands where it stood. A node naming no declaration is not checked: the
+/// removal applies and carries a warning saying so. A node that does name one follows
+/// `remove_symbol`'s reference check and its `force` override.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.19"))]
+#[schemars(extend("examples" = [
+    {
+        "node": "rift://node/rust/src/config.rs@334-353#4df4426e",
+        "force": false
+    }
+]))]
+pub struct RemoveNodeParams {
+    /// The node to remove, witness included.
+    pub node: NodeId,
+    /// Applies the removal even when references stand, carrying them as a warning instead
+    /// of refusing.
+    #[serde(default)]
+    pub force: bool,
+}
+
 /// Applies unified-diff hunks to workspace files atomically.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -515,8 +583,11 @@ pub struct MoveFileParams {
     }
 ]))]
 pub struct PatchParams {
-    /// A unified diff. Hunk context guards the change; header line numbers are hints,
-    /// as with `git apply`. `/dev/null` headers create or delete files.
+    /// A unified diff. The addressed file is any workspace file the `[source]` policy
+    /// makes visible, whether or not a syntax provider parses it. Hunk context guards
+    /// the change: a header's line numbers are hints and its line counts are read
+    /// from the hunk's own body, as with `git apply`. `/dev/null` headers create or
+    /// delete files.
     #[schemars(length(min = 1, max = 4_194_304))]
     pub patch: String,
 }

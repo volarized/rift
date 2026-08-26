@@ -1,0 +1,27 @@
+[workspace.package]
+version = "0.0.18"
+edition = "2024"
+
+[server]
+num_workers = 4
+worker_queue_timeout = "5s"
+
+[server.tls]
+cert = "server.pem"
+
+[[hooks]]
+id = "format"
+program = "cargo"
+
+[[hooks]]
+id = "lint"
+program = "cargo"
+
+"quoted key" = "value"
+'literal key' = "value"
+dotted.pair.key = 1
+inline = { host = "a", port = 1 }
+list = [1, 2, 3]
+flag = true
+stamp = 1979-05-27T07:32:00Z
+day = 1979-05-27

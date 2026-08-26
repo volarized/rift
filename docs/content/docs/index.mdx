@@ -5,7 +5,7 @@ description: Install Rift, connect its MCP server, and read a workspace.
 
 <VersionBadge
   version="v0.0.13"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 Rift is an agentic development toolkit for reading, discovering, and editing codebases.
@@ -14,7 +14,7 @@ Rift provides [MCP](https://modelcontextprotocol.io/specification/2026-07-28) ag
 reads and edits for various programming languages in the project workspace.
 
 <Callout type="info">
-Currently, Rust, JavaScript and TypeScript (including TSX), Markdown, JSON, and YAML are
+Currently, Rust, JavaScript and TypeScript (including TSX), Markdown, JSON, YAML, and TOML are
 supported, and more languages will be added in upcoming releases.
 </Callout>
 
@@ -107,6 +107,11 @@ interleaved bytes:
   reference the configured [language engine](/docs/configuration#engines) resolves.
 - [`move_file`](/docs/protocol/mcp#tool-move_file) moves one file, and an engine that supports it
   updates the imports that pointed at the old path.
+- [`remove_symbol`](/docs/protocol/mcp#tool-remove_symbol) removes one declaration addressed by
+  symbol, checked against the configured language engine's references first; a standing
+  reference refuses unless `force` applies it anyway.
+- [`remove_node`](/docs/protocol/mcp#tool-remove_node) removes one syntax node through a
+  witnessed address from `nodes`, checked the same way when the node names a declaration.
 
 A change that cannot land returns a refusal naming the failed precondition, and the tree is
 untouched. After a change applies, the server re-parses what it touched and reports parser

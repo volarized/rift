@@ -4,7 +4,7 @@ title: MCP
 
 <VersionBadge
   version="v0.0.13"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 `rift mcp` serves MCP over stdio for harnesses that launch servers as subprocesses. Stdout carries
@@ -55,7 +55,7 @@ when both are absent. The server refuses a read naming a `projection` with
 
 <VersionBadge
   version="v0.0.7"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
@@ -164,7 +164,7 @@ This request names a `traversal`, which the server does not serve:
 
 <VersionBadge
   version="v0.0.9"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML"]}
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
 `query` matches declaration names, file contents, and declaration sources through a full-text
@@ -261,6 +261,9 @@ the hit's symbol or file, `path`, `span`, and `line` alone, as both hits above d
 Each identity carries the witness a later
 [`replace_node`](#tool-replace_node) verifies.
 
+A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
+`capability_unavailable`, naming the extension, or stating that the path carries none.
+
 ## Resources
 
 <VersionBadge version="planned" />
@@ -321,6 +324,15 @@ only a hint. Resolution starts each hunk's search at its header position, correc
 already found from earlier hunks in the same file, then widens outward - nearer positions first,
 the earlier position breaking a tie.
 
+The target is any file the workspace's [`[source]`](/docs/configuration#source) policy makes
+visible, parsed or not: `justfile` and `docs/content/docs/configuration.mdx` both resolve, the
+second through the same text index [`search`](#tool-search) reads. A path the policy excludes
+refuses `unsupported`, naming the policy.
+
+A header's line counts are a hint on the same footing. The server derives each hunk's counts
+from the hunk's own body before parsing it, the way `git apply` derives them, so a miscounted
+header applies and only a body whose context resolves nowhere refuses.
+
 A `--- /dev/null` header creates the named file; a `+++ /dev/null` header deletes it. A hunk that
 renames or copies a file refuses as `unsupported`, because `patch` carries no rename or copy
 support.
@@ -343,6 +355,26 @@ An engine advertising `workspace/willRenameFiles` proposes the reference updates
 with the move as one change. Without such an engine the file still moves, and the result carries
 a warning saying references were not updated.
 
+<McpTool name="remove_symbol" />
+
+The removed span reaches back over the declaration's attached outer attributes and doc comments,
+the same span `replace_symbol` uses, and forward over the separator that followed it, so removing
+a free function leaves no blank-line run where it stood.
+
+Before it writes, the server checks the declaration's references against the [language
+engine](/docs/architecture#semantic-edits) configured for its language. A standing reference
+refuses `unmet_precondition` naming `no_references`, unless `force` applies the removal anyway
+and carries the references as a warning. Without a configured engine, or one that does not
+advertise `textDocument/references`, the removal applies and carries a warning naming why it was
+not checked.
+
+<McpTool name="remove_node" />
+
+`remove_node` reaches below a declaration through a witnessed node address from
+[`nodes`](#tool-nodes), the same way `replace_node` does. When the node names a declaration, its
+references are checked the way `remove_symbol` checks them; a node naming no declaration applies
+unchecked, with a warning saying so.
+
 ### Change results
 
 The change tools return the same `ChangeResult`. A request whose shape is wrong - an
@@ -353,8 +385,9 @@ of two things.
 
 **Refused**, when resolution produced no edits. The targeted tree is untouched and
 [`RefusalReason`](/docs/protocol/reference#RefusalReason) says what stopped it: the
-address hit several targets, or a witness or patch context no longer matches the bytes. A
-`replace_node` whose listing went stale shows the shape:
+address hit several targets, a witness or patch context no longer matches the bytes, or a
+`no_references` precondition failed because `remove_symbol` or `remove_node` found a reference
+still standing. A `replace_node` whose listing went stale shows the shape:
 
 **Request:**
 
@@ -390,6 +423,10 @@ address hit several targets, or a witness or patch context no longer matches the
 **Applied**, when it produced edits. The change lands in the targeted tree, and the result's
 `summary` carries the change `id`, the changed `paths`, the concrete `edits`, resolution
 `diagnostics`, and the `guarantees` the workspace's passing hooks established.
+
+Each entry in `edits` names the bytes it replaced: one entry per hunk for `patch`, one per
+engine-proposed edit for `rename_symbol` and `move_file`, and one spanning the whole file for a
+file the change created or removed.
 
 ## Projections
 
