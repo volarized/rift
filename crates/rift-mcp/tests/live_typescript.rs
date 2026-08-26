@@ -198,12 +198,36 @@ async fn applied_rename_rewrites_the_module_the_importer_and_the_component() -> 
         "the declaration and both importers carry the rename: {structured:#}"
     );
     assert_eq!(
-        structured["summary"]["edits"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        3,
-        "one whole-file edit per rewritten file: {structured:#}"
+        structured["summary"]["edits"],
+        json!([
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/caller.ts", "range": { "start": 9, "end": 15 } },
+                "text": "flare"
+            },
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/caller.ts", "range": { "start": 109, "end": 115 } },
+                "text": "flare"
+            },
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/hub.ts", "range": { "start": 16, "end": 22 } },
+                "text": "flare"
+            },
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/view.tsx", "range": { "start": 9, "end": 15 } },
+                "text": "flare"
+            },
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/view.tsx", "range": { "start": 76, "end": 82 } },
+                "text": "flare"
+            }
+        ]),
+        "each edit names one identifier the engine resolved, so the import and the call in \
+         one file are two edits: {structured:#}"
     );
     assert!(
         coded_findings(&structured, "rift.rename.survivor").is_empty(),

@@ -10,6 +10,7 @@ mod move_file;
 mod patch;
 mod read;
 mod rename;
+mod rewrite;
 mod search;
 
 pub use change::ChangeService;

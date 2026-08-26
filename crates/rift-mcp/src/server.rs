@@ -1158,8 +1158,10 @@ impl RiftMcp {
     }
 
     /// Applies unified-diff hunks to workspace files atomically. Hunk
-    /// context guards the change; header line numbers are hints, as with
-    /// `git apply`. A `/dev/null` header creates or deletes the file.
+    /// context guards the change: a header's line numbers are hints and
+    /// its line counts are read from the hunk's own body, as with
+    /// `git apply`. A `/dev/null` header creates or deletes the file. The
+    /// result carries one edit per hunk, spanning the bytes it replaced.
     #[tool]
     async fn patch(
         &self,

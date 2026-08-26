@@ -154,6 +154,15 @@ fn patch_corpus() -> Vec<(&'static str, Value)> {
         (
             "patch",
             json!({
+                // The header counts 9 old and 4 new lines over a body
+                // carrying one of each, proving the counts are read from
+                // the body the way `git apply` reads them.
+                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,9 +1,4 @@\n-pub fn beacon_two() {}\n+pub fn beacon_two() -> u8 { 2 }\n"
+            }),
+        ),
+        (
+            "patch",
+            json!({
                 "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
             }),
         ),
@@ -756,6 +765,46 @@ async fn rename_symbol_schema_rejects_invalid_requests() -> TestResult {
             "rename_symbol request must fail its advertised schema: {request:#}"
         );
     }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A hunk whose header counts disagree with its body applies, and the
+/// applied summary names the hunk's own region rather than the whole file.
+#[tokio::test]
+async fn miscounted_hunk_header_applies_and_reports_its_own_region() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+
+    // The body carries one old and one new line under a header claiming 9
+    // and 4. `git apply` reads the counts from the body; so does the server.
+    let miscounted = json!({
+        "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,9 +1,4 @@\n-pub fn beacon_two() {}\n+pub fn beacon_two() -> u8 { 2 }\n"
+    });
+    let arguments = arguments(&miscounted)?;
+    let request = CallToolRequestParams::new("patch").with_arguments(arguments);
+    let applied = client.call_tool(request).await?;
+    let applied = applied
+        .structured_content
+        .ok_or("patch must return structured content")?;
+    assert_eq!(
+        applied["status"],
+        json!("applied"),
+        "a miscounted header must apply on its context alone: {applied:#}"
+    );
+
+    let edits = applied["summary"]["edits"]
+        .as_array()
+        .ok_or("an applied patch must carry its edits")?;
+    assert_eq!(edits.len(), 1, "one hunk mints one edit: {applied:#}");
+    let span = &edits[0]["span"]["range"];
+    assert_eq!(
+        (span["start"].as_u64(), span["end"].as_u64()),
+        (Some(23), Some(46)),
+        "the edit names the second declaration's own line: {applied:#}"
+    );
+    assert_eq!(edits[0]["text"], json!("pub fn beacon_two() -> u8 { 2 }\n"));
 
     client.cancel().await?;
     server_task.await?;
